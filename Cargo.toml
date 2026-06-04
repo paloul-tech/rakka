@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rakka-core",
+    "crates/rakka-persistence",
+    "crates/rakka-persistence-postgres",
+    "crates/rakka-remote",
+    "crates/rakka-cluster",
+    "crates/rakka-sharding",
+    "crates/rakka-workflow",
+    "crates/rakka-stream",
+    "crates/rakka-process",
+    "crates/rakka-http",
+    "crates/rakka-grpc",
+    "crates/rakka-k8s",
+    "crates/rakka-testkit",
+    "examples/minimal-system",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rakka-rs/rakka"
+homepage = "https://github.com/rakka-rs/rakka"
+documentation = "https://docs.rs/rakka"
+readme = "README.md"
+
+[workspace.dependencies]
+futures-util = "0.3"
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tonic = { version = "0.12", features = ["transport"] }
+tracing = "0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
