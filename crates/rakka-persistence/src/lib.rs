@@ -1,10 +1,27 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Durable state API foundation.
+//! Durable state APIs, in-memory store, and local durable actor adapter.
+
+pub mod actor;
+pub mod effect;
+pub mod error;
+pub mod memory;
+pub mod store;
 
 use rakka_core::Subsystem;
-use serde::{Deserialize, Serialize};
+
+pub use actor::{
+    durable_actor_future, spawn_durable_actor, spawn_durable_actor_factory,
+    spawn_durable_actor_factory_with_options, spawn_durable_actor_with_options, DurableActor,
+    DurableActorContext, DurableActorFuture,
+};
+pub use effect::{DurableEffect, DurableStateChange};
+pub use error::{DurableError, DurableResult};
+pub use memory::InMemoryDurableStateStore;
+pub use store::{
+    DurableState, DurableStateStore, PersistenceId, Revision, StateCodec, StateRecord, StoreFuture,
+};
 
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-persistence";
@@ -13,28 +30,4 @@ pub const CRATE_NAME: &str = "rakka-persistence";
 #[must_use]
 pub const fn subsystem() -> Subsystem {
     Subsystem::Persistence
-}
-
-/// Stable durable identity for an actor or entity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PersistenceId(String);
-
-impl PersistenceId {
-    /// Creates a new persistence id.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Returns the persistence id as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Marker trait for future durable state stores.
-pub trait DurableStateStore: Send + Sync {
-    /// Stable backend name used in telemetry.
-    fn backend_name(&self) -> &'static str;
 }

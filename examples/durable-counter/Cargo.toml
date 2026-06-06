@@ -1,5 +1,5 @@
 [package]
-name = "rakka-persistence"
+name = "rakka-example-durable-counter"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -8,12 +8,11 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
+publish = false
 
 [dependencies]
-rakka-core = { path = "../rakka-core" }
-serde.workspace = true
-
-[dev-dependencies]
+rakka-core = { path = "../../crates/rakka-core" }
+rakka-persistence = { path = "../../crates/rakka-persistence" }
 tokio.workspace = true
 
 [lints]

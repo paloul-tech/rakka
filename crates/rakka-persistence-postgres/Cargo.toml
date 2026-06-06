@@ -12,6 +12,10 @@ readme.workspace = true
 [dependencies]
 rakka-core = { path = "../rakka-core" }
 rakka-persistence = { path = "../rakka-persistence" }
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true
