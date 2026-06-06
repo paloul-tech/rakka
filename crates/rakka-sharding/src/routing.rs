@@ -27,6 +27,10 @@ pub enum EntityDeliveryFailure {
     },
     /// Entity actor could not be spawned.
     SpawnFailed(String),
+    /// Message could not be encoded for remote entity delivery.
+    RemoteEncode(String),
+    /// Encoded remote entity envelope could not be sent.
+    RemoteSend(String),
     /// Transport or route handler rejected the message.
     Rejected(String),
 }
@@ -38,6 +42,8 @@ impl Display for EntityDeliveryFailure {
             Self::MailboxClosed => f.write_str("entity route mailbox was closed"),
             Self::NotLocal { owner } => write!(f, "entity shard is owned by remote node {owner}"),
             Self::SpawnFailed(message) => write!(f, "entity actor spawn failed: {message}"),
+            Self::RemoteEncode(message) => write!(f, "remote entity encode failed: {message}"),
+            Self::RemoteSend(message) => write!(f, "remote entity send failed: {message}"),
             Self::Rejected(message) => write!(f, "entity route rejected message: {message}"),
         }
     }
@@ -81,6 +87,10 @@ impl<M> EntityTellError<M> {
                 EntityDeliveryFailure::MailboxClosed => EntityAskError::MailboxClosed,
                 EntityDeliveryFailure::NotLocal { owner } => EntityAskError::NotLocal { owner },
                 EntityDeliveryFailure::SpawnFailed(message) => EntityAskError::SpawnFailed(message),
+                EntityDeliveryFailure::RemoteEncode(message) => {
+                    EntityAskError::RemoteEncode(message)
+                }
+                EntityDeliveryFailure::RemoteSend(message) => EntityAskError::RemoteSend(message),
                 EntityDeliveryFailure::Rejected(message) => EntityAskError::Rejected(message),
             },
         }
@@ -103,6 +113,10 @@ pub enum EntityAskError {
     },
     /// Entity actor could not be spawned.
     SpawnFailed(String),
+    /// Message could not be encoded for remote entity delivery.
+    RemoteEncode(String),
+    /// Encoded remote entity envelope could not be sent.
+    RemoteSend(String),
     /// Route handler rejected delivery.
     Rejected(String),
     /// Timed out waiting for a reply.
@@ -119,6 +133,8 @@ impl Display for EntityAskError {
             Self::MailboxClosed => f.write_str("entity route mailbox was closed"),
             Self::NotLocal { owner } => write!(f, "entity shard is owned by remote node {owner}"),
             Self::SpawnFailed(message) => write!(f, "entity actor spawn failed: {message}"),
+            Self::RemoteEncode(message) => write!(f, "remote entity encode failed: {message}"),
+            Self::RemoteSend(message) => write!(f, "remote entity send failed: {message}"),
             Self::Rejected(message) => write!(f, "entity route rejected message: {message}"),
             Self::Timeout => f.write_str("entity ask timed out"),
             Self::ReplyDropped => f.write_str("entity ask reply channel was dropped"),
@@ -310,7 +326,6 @@ impl ShardOwnerCache {
 }
 
 /// Local shard region routing surface for one entity message protocol.
-#[derive(Clone)]
 pub struct ShardRegion<M>
 where
     M: Message,
@@ -430,6 +445,18 @@ where
                 expected: self.entity_type().clone(),
                 actual: entity.entity_type().clone(),
             })
+        }
+    }
+}
+
+impl<M> Clone for ShardRegion<M>
+where
+    M: Message,
+{
+    fn clone(&self) -> Self {
+        Self {
+            owner_cache: self.owner_cache.clone(),
+            route: self.route.clone(),
         }
     }
 }

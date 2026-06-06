@@ -7,6 +7,7 @@ pub mod coordinator;
 pub mod error;
 pub mod identity;
 pub mod local;
+pub mod remote;
 pub mod routing;
 
 use rakka_core::Subsystem;
@@ -18,6 +19,10 @@ pub use coordinator::{
 pub use error::{ShardingError, ShardingResult};
 pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingConfig};
 pub use local::{LocalEntityContext, LocalEntityRoute};
+pub use remote::{
+    RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute,
+    RemoteEntitySendFailure,
+};
 pub use routing::{
     EntityAskError, EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage,
     ShardOwnerCache, ShardRegion,

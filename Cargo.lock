@@ -912,8 +912,10 @@ dependencies = [
 name = "rakka-sharding"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "rakka-cluster",
  "rakka-core",
+ "rakka-remote",
  "serde",
  "tokio",
 ]
