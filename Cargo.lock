@@ -904,6 +904,7 @@ name = "rakka-remote"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "rakka-cluster",
  "rakka-core",
  "serde",
 ]

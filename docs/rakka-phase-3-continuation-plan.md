@@ -35,6 +35,8 @@ Minimum completion criteria:
 
 ## Slice 3A: In-Memory Remote Transport and Endpoint Router
 
+Status: implemented.
+
 Goal: turn the outbound/inbound envelope boundary into a working end-to-end remote entity path inside tests.
 
 Scope:
@@ -206,4 +208,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Start with Slice 3A: in-memory remote transport and endpoint router. It is the shortest path from the current envelope boundary to a real end-to-end remote entity routing test.
+Continue with Slice 3B: remote ask and reply correlation. Slice 3A established the in-memory endpoint/transport path needed to carry request and reply envelopes between logical nodes.

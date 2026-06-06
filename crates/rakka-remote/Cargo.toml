@@ -11,6 +11,7 @@ readme.workspace = true
 
 [dependencies]
 prost.workspace = true
+rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }
 serde.workspace = true
 

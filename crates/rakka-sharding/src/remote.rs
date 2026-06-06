@@ -6,7 +6,10 @@ use std::marker::PhantomData;
 
 use rakka_cluster::NodeId;
 use rakka_core::Message;
-use rakka_remote::{RemoteDestination, RemoteEnvelope, RemoteError, SerializationRegistry};
+use rakka_remote::{
+    RemoteDestination, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeHandler, RemoteError,
+    RemoteTransport, SerializationRegistry,
+};
 
 use crate::identity::{EntityId, EntityRef, EntityType};
 use crate::routing::{
@@ -204,6 +207,83 @@ where
         f.debug_struct("RemoteEntityInbound")
             .field("region", &self.region)
             .finish_non_exhaustive()
+    }
+}
+
+impl<M> RemoteEnvelopeHandler for RemoteEntityInbound<M>
+where
+    M: Message + Sync,
+{
+    fn handle(&self, envelope: RemoteEnvelope) -> Result<(), RemoteEndpointError> {
+        let destination = envelope.destination.clone();
+        RemoteEntityInbound::handle(self, envelope).map_err(|error| {
+            RemoteEndpointError::HandlerRejected {
+                destination,
+                message: error.to_string(),
+            }
+        })
+    }
+}
+
+/// Outbound adapter that sends remote entity envelopes through a remote transport.
+pub struct RemoteTransportEntityOutbound<T>
+where
+    T: RemoteTransport,
+{
+    transport: T,
+}
+
+impl<T> RemoteTransportEntityOutbound<T>
+where
+    T: RemoteTransport,
+{
+    /// Creates a remote entity outbound adapter from a remote transport.
+    #[must_use]
+    pub const fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    /// Returns the wrapped transport.
+    #[must_use]
+    pub const fn transport(&self) -> &T {
+        &self.transport
+    }
+}
+
+impl<T> Clone for RemoteTransportEntityOutbound<T>
+where
+    T: RemoteTransport + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            transport: self.transport.clone(),
+        }
+    }
+}
+
+impl<T> Debug for RemoteTransportEntityOutbound<T>
+where
+    T: RemoteTransport + Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteTransportEntityOutbound")
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+impl<T> RemoteEntityOutbound for RemoteTransportEntityOutbound<T>
+where
+    T: RemoteTransport,
+{
+    fn send(
+        &self,
+        owner: &NodeId,
+        envelope: RemoteEnvelope,
+    ) -> Result<(), RemoteEntitySendFailure> {
+        self.transport
+            .send(owner, envelope)
+            .map_err(|error| RemoteEntitySendFailure::Rejected(error.to_string()))
     }
 }
 

@@ -3,13 +3,18 @@
 
 //! Remote envelopes, typed transport errors, and payload serialization registry.
 
+pub mod endpoint;
 pub mod envelope;
 pub mod error;
 mod proto;
 pub mod registry;
+pub mod transport;
 
 use rakka_core::Subsystem;
 
+pub use endpoint::{
+    RemoteEndpoint, RemoteEndpointError, RemoteEndpointResult, RemoteEnvelopeHandler,
+};
 pub use envelope::{
     EncodedPayload, ProtobufEnvelopeCodec, RemoteDestination, RemoteEnvelope,
     RemoteEnvelopeMetadata,
@@ -17,6 +22,9 @@ pub use envelope::{
 pub use error::{RemoteError, RemoteResult};
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SerializationRegistry,
+};
+pub use transport::{
+    InMemoryRemoteTransport, RemoteTransport, RemoteTransportError, RemoteTransportResult,
 };
 
 /// Crate name used in diagnostics.

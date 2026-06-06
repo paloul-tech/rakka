@@ -21,7 +21,7 @@ pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingC
 pub use local::{LocalEntityContext, LocalEntityRoute};
 pub use remote::{
     RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute,
-    RemoteEntitySendFailure,
+    RemoteEntitySendFailure, RemoteTransportEntityOutbound,
 };
 pub use routing::{
     EntityAskError, EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage,

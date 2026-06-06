@@ -9,13 +9,16 @@ use rakka_cluster::{
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
 };
-use rakka_remote::{RemoteDestination, RemoteEnvelope, SerializationRegistry};
+use rakka_remote::{
+    InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope,
+    SerializationRegistry,
+};
 use rakka_sharding::{
     EntityAskError, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
     LocalEntityContext, LocalEntityRoute, RemoteEntityInbound, RemoteEntityInboundError,
-    RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure, RoutedEntityMessage,
-    ShardCoordinator, ShardDecision, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion,
-    ShardingConfig, ShardingError,
+    RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
+    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision, ShardId,
+    ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -895,6 +898,84 @@ fn remote_entity_route_returns_message_when_outbound_rejects() {
         error.into_message(),
         RemoteCartCommand { action } if action == "add-apple"
     ));
+}
+
+#[tokio::test]
+async fn in_memory_transport_routes_remote_entity_to_owning_node() {
+    let membership =
+        membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
+    let node_a = NodeId::new("rakka-0", "uid-a");
+    let node_b = NodeId::new("rakka-1", "uid-b");
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(8).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let snapshot = coordinator.snapshot();
+    let remote_entity_id = entity_owned_by(&coordinator, "rakka-1");
+    let registry = remote_registry();
+    let transport = InMemoryRemoteTransport::new();
+
+    let local_route_a = LocalEntityRoute::new(
+        node_a,
+        ActorSystem::new("remote-transport-node-a-test"),
+        |_context: LocalEntityContext| RemoteCartEntity,
+    );
+    let outbound = RemoteTransportEntityOutbound::new(transport.clone());
+    let remote_route_a = RemoteEntityRoute::new(local_route_a.clone(), registry.clone(), outbound)
+        .with_source("rakka-0#uid-a");
+    let region_a = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &snapshot,
+        remote_route_a,
+    )
+    .unwrap();
+
+    let (delivered, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let local_route_b = LocalEntityRoute::new(
+        node_b.clone(),
+        ActorSystem::new("remote-transport-node-b-test"),
+        move |context: LocalEntityContext| NotifyingRemoteCartEntity {
+            context,
+            delivered: delivered.clone(),
+        },
+    );
+    let region_b = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config,
+        &snapshot,
+        local_route_b.clone(),
+    )
+    .unwrap();
+    let endpoint_b = RemoteEndpoint::new(node_b);
+    endpoint_b
+        .register_entity_handler("Cart", RemoteEntityInbound::new(region_b, registry.clone()))
+        .unwrap();
+    transport.register_endpoint(endpoint_b).unwrap();
+    let remote_entity = EntityRef::<RemoteCartCommand>::new(entity_type, remote_entity_id.clone());
+
+    remote_entity
+        .tell(
+            &region_a,
+            RemoteCartCommand {
+                action: "add-apple".to_string(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(local_route_a.entity_count(), 0);
+    assert_eq!(local_route_b.entity_count(), 1);
+    let delivered = tokio::time::timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        delivered,
+        (
+            remote_entity_id.as_str().to_string(),
+            "add-apple".to_string()
+        )
+    );
 }
 
 #[tokio::test]

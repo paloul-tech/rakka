@@ -1,10 +1,13 @@
 //! Integration tests for the remote envelope and serialization boundary.
 
 use prost::Message;
+use rakka_cluster::NodeId;
 use rakka_remote::{
-    EncodedPayload, ProtobufEnvelopeCodec, RemoteDestination, RemoteEnvelope,
-    RemoteEnvelopeMetadata, RemoteError, SerializationRegistry,
+    EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteDestination,
+    RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
+    RemoteTransport, RemoteTransportError, SerializationRegistry,
 };
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, PartialEq, Message)]
 struct Ping {
@@ -181,4 +184,111 @@ fn invalid_envelope_bytes_fail_as_decode_error() {
     let error = ProtobufEnvelopeCodec::decode(&[255, 255, 255]).unwrap_err();
 
     assert!(matches!(error, RemoteError::Decode { .. }));
+}
+
+#[test]
+fn endpoint_dispatches_entity_envelope_received_over_in_memory_transport() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Ping>("rakka.test.Ping", 1)
+        .unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let received_for_handler = received.clone();
+    let registry_for_handler = registry.clone();
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-1", "uid-b"));
+    endpoint
+        .register_entity_handler("cart", move |envelope: RemoteEnvelope| {
+            let ping: Ping = registry_for_handler.decode_envelope(&envelope).unwrap();
+            received_for_handler
+                .lock()
+                .expect("received mutex poisoned")
+                .push(ping.value);
+            Ok(())
+        })
+        .unwrap();
+    let transport = InMemoryRemoteTransport::new();
+    transport.register_endpoint(endpoint).unwrap();
+    let envelope = RemoteEnvelope::new(
+        RemoteDestination::Entity {
+            entity_type: "cart".to_string(),
+            entity_id: "cart-42".to_string(),
+        },
+        registry
+            .encode(&Ping {
+                value: "hello".to_string(),
+            })
+            .unwrap(),
+    );
+
+    transport
+        .send(&NodeId::new("rakka-1", "uid-b"), envelope)
+        .unwrap();
+
+    assert_eq!(
+        *received.lock().expect("received mutex poisoned"),
+        vec!["hello".to_string()]
+    );
+}
+
+#[test]
+fn in_memory_transport_reports_unknown_destination_node() {
+    let transport = InMemoryRemoteTransport::new();
+    let envelope = RemoteEnvelope::new(
+        RemoteDestination::Entity {
+            entity_type: "cart".to_string(),
+            entity_id: "cart-42".to_string(),
+        },
+        EncodedPayload::new(
+            RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+            Vec::new(),
+        ),
+    );
+
+    let error = transport
+        .send(&NodeId::new("rakka-missing", "uid-z"), envelope)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteTransportError::UnknownNode { node_id }
+            if node_id == NodeId::new("rakka-missing", "uid-z")
+    ));
+}
+
+#[test]
+fn endpoint_fails_closed_for_unhandled_destination_and_entity_type() {
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-1", "uid-b"));
+    let payload = EncodedPayload::new(
+        RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+        Vec::new(),
+    );
+    let service_error = endpoint
+        .receive_envelope(RemoteEnvelope::new(
+            RemoteDestination::Service {
+                service_key: "payments".to_string(),
+            },
+            payload.clone(),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        service_error,
+        RemoteEndpointError::UnexpectedDestination {
+            destination: RemoteDestination::Service { service_key },
+        } if service_key == "payments"
+    ));
+
+    let entity_error = endpoint
+        .receive_envelope(RemoteEnvelope::new(
+            RemoteDestination::Entity {
+                entity_type: "cart".to_string(),
+                entity_id: "cart-42".to_string(),
+            },
+            payload,
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        entity_error,
+        RemoteEndpointError::UnregisteredEntityType { entity_type }
+            if entity_type == "cart"
+    ));
 }
