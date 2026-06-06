@@ -10,8 +10,10 @@ documentation.workspace = true
 readme.workspace = true
 
 [dependencies]
+rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }
 serde.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

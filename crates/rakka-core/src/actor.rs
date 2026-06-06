@@ -341,7 +341,9 @@ impl<R> ReplyTo<R>
 where
     R: Send + 'static,
 {
-    fn new(sender: oneshot::Sender<R>) -> Self {
+    /// Creates a reply capability from a Tokio one-shot sender.
+    #[must_use]
+    pub fn new(sender: oneshot::Sender<R>) -> Self {
         Self { sender }
     }
 

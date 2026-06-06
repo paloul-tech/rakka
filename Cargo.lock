@@ -867,7 +867,9 @@ dependencies = [
 name = "rakka-k8s"
 version = "0.1.0"
 dependencies = [
+ "rakka-cluster",
  "rakka-core",
+ "serde",
 ]
 
 [[package]]
@@ -910,8 +912,10 @@ dependencies = [
 name = "rakka-sharding"
 version = "0.1.0"
 dependencies = [
+ "rakka-cluster",
  "rakka-core",
  "serde",
+ "tokio",
 ]
 
 [[package]]

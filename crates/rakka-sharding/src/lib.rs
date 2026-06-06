@@ -3,8 +3,25 @@
 
 //! Cluster sharding and entity routing foundation.
 
+pub mod coordinator;
+pub mod error;
+pub mod identity;
+pub mod local;
+pub mod routing;
+
 use rakka_core::Subsystem;
-use serde::{Deserialize, Serialize};
+
+pub use coordinator::{
+    ShardAssignment, ShardCoordinator, ShardDecision, ShardMoveReason, ShardOwnershipSnapshot,
+    ShardRebalancePlan,
+};
+pub use error::{ShardingError, ShardingResult};
+pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingConfig};
+pub use local::{LocalEntityContext, LocalEntityRoute};
+pub use routing::{
+    EntityAskError, EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage,
+    ShardOwnerCache, ShardRegion,
+};
 
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-sharding";
@@ -13,22 +30,4 @@ pub const CRATE_NAME: &str = "rakka-sharding";
 #[must_use]
 pub const fn subsystem() -> Subsystem {
     Subsystem::Sharding
-}
-
-/// Named actor type for sharded entities.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntityType(String);
-
-impl EntityType {
-    /// Creates a new entity type name.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Returns the entity type as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
