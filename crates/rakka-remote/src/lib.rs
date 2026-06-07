@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod error;
 mod proto;
 pub mod registry;
+pub mod request;
 pub mod transport;
 
 use rakka_core::Subsystem;
@@ -22,6 +23,9 @@ pub use envelope::{
 pub use error::{RemoteError, RemoteResult};
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SerializationRegistry,
+};
+pub use request::{
+    RemotePendingReply, RemoteRequestError, RemoteRequestRegistry, RemoteRequestResult,
 };
 pub use transport::{
     InMemoryRemoteTransport, RemoteTransport, RemoteTransportError, RemoteTransportResult,

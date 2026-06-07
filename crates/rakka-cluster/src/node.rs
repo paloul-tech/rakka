@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,42 @@ impl Display for NodeId {
         write!(f, "{}#{}", self.logical_id, self.incarnation)
     }
 }
+
+impl FromStr for NodeId {
+    type Err = ParseNodeIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (logical_id, incarnation) = value.split_once('#').ok_or_else(|| ParseNodeIdError {
+            value: value.to_string(),
+        })?;
+
+        if logical_id.is_empty() || incarnation.is_empty() {
+            return Err(ParseNodeIdError {
+                value: value.to_string(),
+            });
+        }
+
+        Ok(Self::new(logical_id, incarnation))
+    }
+}
+
+/// Failure returned when parsing a node id string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseNodeIdError {
+    value: String,
+}
+
+impl Display for ParseNodeIdError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid node id '{}'; expected logical#incarnation",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for ParseNodeIdError {}
 
 /// Direct remoting address for a Rakka node.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

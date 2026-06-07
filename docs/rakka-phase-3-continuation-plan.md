@@ -74,6 +74,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 ## Slice 3B: Remote Ask and Reply Correlation
 
+Status: implemented.
+
 Goal: make remote `ask` work across nodes instead of only remote `tell`.
 
 Scope:
@@ -97,6 +99,8 @@ Out of scope:
 - Workflow reliability; that remains a `rakka-workflow` concern.
 
 ## Slice 3C: Cluster Runtime Loop and Region Ownership Refresh
+
+Status: implemented.
 
 Goal: connect discovery, membership, coordinator reconciliation, and shard-region owner refresh into a small runtime surface.
 
@@ -208,4 +212,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 3B: remote ask and reply correlation. Slice 3A established the in-memory endpoint/transport path needed to carry request and reply envelopes between logical nodes.
+Continue with Slice 3D: graceful shard handoff protocol. Slice 3C established a deterministic cluster/sharding runtime facade that applies discovery snapshots, promotes members after contact-point readiness, reconciles shard ownership, and refreshes registered shard regions after join, leave, unreachable, and compatibility-rejection scenarios.

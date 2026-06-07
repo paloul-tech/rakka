@@ -3,12 +3,15 @@
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rakka_cluster::NodeId;
-use rakka_core::Message;
+use rakka_core::{Message, ReplyTo};
 use rakka_remote::{
     RemoteDestination, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeHandler, RemoteError,
-    RemoteTransport, SerializationRegistry,
+    RemoteRequestError, RemoteRequestRegistry, RemoteTransport, SerializationRegistry,
 };
 
 use crate::identity::{EntityId, EntityRef, EntityType};
@@ -91,6 +94,121 @@ impl<M> Display for RemoteEntityInboundError<M> {
 }
 
 impl<M> Error for RemoteEntityInboundError<M> where M: Debug {}
+
+/// Failure returned by a remote entity ask client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEntityAskError {
+    /// Routing failed before remote delivery because the owner could not be resolved.
+    NoRoute {
+        /// Routing error.
+        error: crate::ShardingError,
+    },
+    /// Request payload could not be encoded for remote entity delivery.
+    Encode {
+        /// Encode failure reported by the serialization registry.
+        error: RemoteError,
+    },
+    /// Pending reply registration failed.
+    Register {
+        /// Request registry failure.
+        error: RemoteRequestError,
+    },
+    /// Request envelope could not be sent to the owning node.
+    Send {
+        /// Failure reported by the remote transport.
+        message: String,
+    },
+    /// Waiting for the remote reply failed.
+    Reply {
+        /// Reply correlation failure.
+        error: RemoteRequestError,
+    },
+}
+
+impl Display for RemoteEntityAskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoRoute { error } => Display::fmt(error, f),
+            Self::Encode { error } => write!(f, "remote entity ask encode failed: {error}"),
+            Self::Register { error } => write!(f, "remote entity ask registration failed: {error}"),
+            Self::Send { message } => write!(f, "remote entity ask send failed: {message}"),
+            Self::Reply { error } => write!(f, "remote entity ask reply failed: {error}"),
+        }
+    }
+}
+
+impl Error for RemoteEntityAskError {}
+
+/// Failure returned while accepting an inbound remote entity ask envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEntityAskInboundError<M> {
+    /// Envelope was addressed to a destination kind other than a sharded entity.
+    UnexpectedDestination {
+        /// Destination carried by the remote envelope.
+        destination: RemoteDestination,
+    },
+    /// Envelope was addressed to a different entity type than this inbound handler accepts.
+    EntityTypeMismatch {
+        /// Entity type expected by the local shard region.
+        expected: EntityType,
+        /// Entity type carried by the remote envelope.
+        actual: EntityType,
+    },
+    /// Request envelope did not contain request id metadata.
+    MissingRequestId,
+    /// Request envelope did not contain source node metadata.
+    MissingSource,
+    /// Source node metadata could not be parsed as a node id.
+    InvalidSource {
+        /// Source metadata carried by the request envelope.
+        source: String,
+    },
+    /// Request payload could not be decoded into the request protocol.
+    Decode {
+        /// Decode failure reported by the serialization registry.
+        error: RemoteError,
+    },
+    /// Decoded request could not be delivered through the local shard region.
+    Delivery {
+        /// Delivery failure, including the local actor message when available.
+        error: EntityTellError<M>,
+    },
+}
+
+impl<M> Display for RemoteEntityAskInboundError<M> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedDestination { destination } => {
+                write!(
+                    f,
+                    "remote ask envelope is not addressed to an entity: {destination:?}"
+                )
+            }
+            Self::EntityTypeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "remote ask envelope for {actual} cannot be handled by region for {expected}"
+                )
+            }
+            Self::MissingRequestId => f.write_str("remote ask envelope is missing request_id"),
+            Self::MissingSource => f.write_str("remote ask envelope is missing source node"),
+            Self::InvalidSource { source } => {
+                write!(f, "remote ask envelope source is not a node id: {source}")
+            }
+            Self::Decode { error } => write!(f, "remote ask envelope decode failed: {error}"),
+            Self::Delivery { error } => match error {
+                EntityTellError::NoRoute { error, .. } => {
+                    write!(f, "remote ask delivery could not resolve route: {error}")
+                }
+                EntityTellError::Delivery { failure, .. } => {
+                    write!(f, "remote ask delivery failed: {failure}")
+                }
+            },
+        }
+    }
+}
+
+impl<M> Error for RemoteEntityAskInboundError<M> where M: Debug {}
 
 /// Outbound transport for already encoded remote entity envelopes.
 pub trait RemoteEntityOutbound: Send + Sync + 'static {
@@ -284,6 +402,296 @@ where
         self.transport
             .send(owner, envelope)
             .map_err(|error| RemoteEntitySendFailure::Rejected(error.to_string()))
+    }
+}
+
+/// Remote ask client for sharded entities.
+pub struct RemoteEntityAskClient<T>
+where
+    T: RemoteTransport,
+{
+    local_node_id: NodeId,
+    requests: RemoteRequestRegistry,
+    transport: T,
+}
+
+impl<T> RemoteEntityAskClient<T>
+where
+    T: RemoteTransport,
+{
+    /// Creates a remote entity ask client.
+    #[must_use]
+    pub const fn new(local_node_id: NodeId, requests: RemoteRequestRegistry, transport: T) -> Self {
+        Self {
+            local_node_id,
+            requests,
+            transport,
+        }
+    }
+
+    /// Local node id used as the request source.
+    #[must_use]
+    pub fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    /// Pending reply registry used by this client.
+    #[must_use]
+    pub const fn requests(&self) -> &RemoteRequestRegistry {
+        &self.requests
+    }
+
+    /// Wrapped remote transport.
+    #[must_use]
+    pub const fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    /// Sends a remote entity request and waits for its reply.
+    pub async fn ask<Q, M, R>(
+        &self,
+        region: &ShardRegion<M>,
+        entity: &EntityRef<M>,
+        request: Q,
+        timeout: Duration,
+    ) -> Result<R, RemoteEntityAskError>
+    where
+        Q: Message + Sync,
+        M: Message,
+        R: Send + Sync + 'static,
+    {
+        let (owner, _shard_id) = region
+            .resolve(entity)
+            .map_err(|error| RemoteEntityAskError::NoRoute { error })?;
+        let encoded_payload = self
+            .requests
+            .registry()
+            .encode(&request)
+            .map_err(|error| RemoteEntityAskError::Encode { error })?;
+        let request_id = self
+            .requests
+            .next_request_id(self.local_node_id.to_string());
+        let pending = self
+            .requests
+            .register::<R>(request_id.clone())
+            .map_err(|error| RemoteEntityAskError::Register { error })?;
+        let envelope = RemoteEnvelope::new(
+            RemoteDestination::Entity {
+                entity_type: entity.entity_type().as_str().to_string(),
+                entity_id: entity.entity_id().as_str().to_string(),
+            },
+            encoded_payload,
+        )
+        .with_source(self.local_node_id.to_string())
+        .with_request_id(request_id.clone());
+
+        if let Err(error) = self.transport.send(&owner, envelope) {
+            let _ = self.requests.remove(&request_id);
+            return Err(RemoteEntityAskError::Send {
+                message: error.to_string(),
+            });
+        }
+
+        pending
+            .wait(timeout)
+            .await
+            .map_err(|error| RemoteEntityAskError::Reply { error })
+    }
+}
+
+impl<T> Clone for RemoteEntityAskClient<T>
+where
+    T: RemoteTransport + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            local_node_id: self.local_node_id.clone(),
+            requests: self.requests.clone(),
+            transport: self.transport.clone(),
+        }
+    }
+}
+
+impl<T> Debug for RemoteEntityAskClient<T>
+where
+    T: RemoteTransport + Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteEntityAskClient")
+            .field("local_node_id", &self.local_node_id)
+            .field("requests", &self.requests)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// Inbound handler that turns remote entity ask envelopes into local actor asks.
+pub struct RemoteEntityAskInbound<Q, M, R, T, B>
+where
+    Q: Message + Sync,
+    M: Message,
+    R: Send + Sync + 'static,
+    T: RemoteTransport,
+    B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+{
+    local_node_id: NodeId,
+    region: ShardRegion<M>,
+    registry: SerializationRegistry,
+    transport: T,
+    build: Arc<B>,
+    _request: PhantomData<fn() -> Q>,
+    _reply: PhantomData<fn() -> R>,
+}
+
+impl<Q, M, R, T, B> RemoteEntityAskInbound<Q, M, R, T, B>
+where
+    Q: Message + Sync,
+    M: Message,
+    R: Send + Sync + 'static,
+    T: RemoteTransport + Clone,
+    B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+{
+    /// Creates an inbound remote ask handler for one sharded entity type.
+    #[must_use]
+    pub fn new(
+        local_node_id: NodeId,
+        region: ShardRegion<M>,
+        registry: SerializationRegistry,
+        transport: T,
+        build: B,
+    ) -> Self {
+        Self {
+            local_node_id,
+            region,
+            registry,
+            transport,
+            build: Arc::new(build),
+            _request: PhantomData,
+            _reply: PhantomData,
+        }
+    }
+
+    /// Handles one remote entity ask envelope.
+    pub fn handle(&self, envelope: RemoteEnvelope) -> Result<(), RemoteEntityAskInboundError<M>> {
+        let request_id = envelope
+            .request_id
+            .clone()
+            .ok_or(RemoteEntityAskInboundError::MissingRequestId)?;
+        let source = envelope
+            .source
+            .clone()
+            .ok_or(RemoteEntityAskInboundError::MissingSource)?;
+        let requester = NodeId::from_str(&source)
+            .map_err(|_error| RemoteEntityAskInboundError::InvalidSource { source })?;
+        let (entity_type, entity_id) = match &envelope.destination {
+            RemoteDestination::Entity {
+                entity_type,
+                entity_id,
+            } => (
+                EntityType::new(entity_type.clone()),
+                EntityId::new(entity_id.clone()),
+            ),
+            destination => {
+                return Err(RemoteEntityAskInboundError::UnexpectedDestination {
+                    destination: destination.clone(),
+                });
+            }
+        };
+
+        if &entity_type != self.region.entity_type() {
+            return Err(RemoteEntityAskInboundError::EntityTypeMismatch {
+                expected: self.region.entity_type().clone(),
+                actual: entity_type,
+            });
+        }
+
+        let request = self
+            .registry
+            .decode_envelope::<Q>(&envelope)
+            .map_err(|error| RemoteEntityAskInboundError::Decode { error })?;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let message = (self.build)(request, ReplyTo::new(sender));
+        let entity = EntityRef::new(entity_type, entity_id);
+        self.region
+            .tell(&entity, message)
+            .map_err(|error| RemoteEntityAskInboundError::Delivery { error })?;
+
+        let local_node_id = self.local_node_id.clone();
+        let registry = self.registry.clone();
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            if let Ok(reply) = receiver.await {
+                if let Ok(encoded_payload) = registry.encode(&reply) {
+                    let envelope = RemoteEnvelope::new(
+                        RemoteDestination::Reply {
+                            request_id: request_id.clone(),
+                        },
+                        encoded_payload,
+                    )
+                    .with_source(local_node_id.to_string())
+                    .with_request_id(request_id);
+                    let _ = transport.send(&requester, envelope);
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+impl<Q, M, R, T, B> Clone for RemoteEntityAskInbound<Q, M, R, T, B>
+where
+    Q: Message + Sync,
+    M: Message,
+    R: Send + Sync + 'static,
+    T: RemoteTransport + Clone,
+    B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            local_node_id: self.local_node_id.clone(),
+            region: self.region.clone(),
+            registry: self.registry.clone(),
+            transport: self.transport.clone(),
+            build: self.build.clone(),
+            _request: PhantomData,
+            _reply: PhantomData,
+        }
+    }
+}
+
+impl<Q, M, R, T, B> Debug for RemoteEntityAskInbound<Q, M, R, T, B>
+where
+    Q: Message + Sync,
+    M: Message,
+    R: Send + Sync + 'static,
+    T: RemoteTransport + Debug,
+    B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteEntityAskInbound")
+            .field("local_node_id", &self.local_node_id)
+            .field("region", &self.region)
+            .field("transport", &self.transport)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Q, M, R, T, B> RemoteEnvelopeHandler for RemoteEntityAskInbound<Q, M, R, T, B>
+where
+    Q: Message + Sync,
+    M: Message,
+    R: Send + Sync + 'static,
+    T: RemoteTransport + Clone,
+    B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+{
+    fn handle(&self, envelope: RemoteEnvelope) -> Result<(), RemoteEndpointError> {
+        let destination = envelope.destination.clone();
+        RemoteEntityAskInbound::handle(self, envelope).map_err(|error| {
+            RemoteEndpointError::HandlerRejected {
+                destination,
+                message: error.to_string(),
+            }
+        })
     }
 }
 

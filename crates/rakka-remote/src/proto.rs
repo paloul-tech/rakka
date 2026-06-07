@@ -34,6 +34,8 @@ pub(crate) struct ProtoRemoteDestination {
     pub(crate) service_key: String,
     #[prost(string, tag = "6")]
     pub(crate) route_key: String,
+    #[prost(string, tag = "7")]
+    pub(crate) request_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Enumeration)]
@@ -43,4 +45,5 @@ pub(crate) enum ProtoDestinationKind {
     Entity = 2,
     Service = 3,
     RouteKey = 4,
+    Reply = 5,
 }

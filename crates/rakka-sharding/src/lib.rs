@@ -9,6 +9,7 @@ pub mod identity;
 pub mod local;
 pub mod remote;
 pub mod routing;
+pub mod runtime;
 
 use rakka_core::Subsystem;
 
@@ -20,12 +21,18 @@ pub use error::{ShardingError, ShardingResult};
 pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingConfig};
 pub use local::{LocalEntityContext, LocalEntityRoute};
 pub use remote::{
-    RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute,
-    RemoteEntitySendFailure, RemoteTransportEntityOutbound,
+    RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
+    RemoteEntityAskInboundError, RemoteEntityInbound, RemoteEntityInboundError,
+    RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
+    RemoteTransportEntityOutbound,
 };
 pub use routing::{
     EntityAskError, EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage,
     ShardOwnerCache, ShardRegion,
+};
+pub use runtime::{
+    ClusterShardingError, ClusterShardingResult, ClusterShardingRuntime, ClusterShardingUpdate,
+    EntityShardRebalance,
 };
 
 /// Crate name used in diagnostics.

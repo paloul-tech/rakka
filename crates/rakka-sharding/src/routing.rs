@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rakka_cluster::NodeId;
@@ -330,7 +330,9 @@ pub struct ShardRegion<M>
 where
     M: Message,
 {
-    owner_cache: ShardOwnerCache,
+    entity_type: EntityType,
+    config: ShardingConfig,
+    owner_cache: Arc<Mutex<ShardOwnerCache>>,
     route: Arc<dyn EntityRoute<M>>,
 }
 
@@ -346,7 +348,12 @@ where
         route: impl EntityRoute<M>,
     ) -> Self {
         Self {
-            owner_cache: ShardOwnerCache::empty(entity_type, config),
+            owner_cache: Arc::new(Mutex::new(ShardOwnerCache::empty(
+                entity_type.clone(),
+                config.clone(),
+            ))),
+            entity_type,
+            config,
             route: Arc::new(route),
         }
     }
@@ -359,7 +366,13 @@ where
         route: impl EntityRoute<M>,
     ) -> ShardingResult<Self> {
         Ok(Self {
-            owner_cache: ShardOwnerCache::from_snapshot(entity_type, config, snapshot)?,
+            owner_cache: Arc::new(Mutex::new(ShardOwnerCache::from_snapshot(
+                entity_type.clone(),
+                config.clone(),
+                snapshot,
+            )?)),
+            entity_type,
+            config,
             route: Arc::new(route),
         })
     }
@@ -367,19 +380,22 @@ where
     /// Entity type routed by this region.
     #[must_use]
     pub fn entity_type(&self) -> &EntityType {
-        self.owner_cache.entity_type()
+        &self.entity_type
     }
 
     /// Sharding configuration.
     #[must_use]
     pub const fn config(&self) -> &ShardingConfig {
-        self.owner_cache.config()
+        &self.config
     }
 
     /// Current owner cache revision.
     #[must_use]
-    pub const fn owner_revision(&self) -> u64 {
-        self.owner_cache.revision()
+    pub fn owner_revision(&self) -> u64 {
+        self.owner_cache
+            .lock()
+            .expect("shard owner cache mutex poisoned")
+            .revision()
     }
 
     /// Returns a typed logical entity reference for this region's entity type.
@@ -389,14 +405,21 @@ where
     }
 
     /// Refreshes the shard owner cache.
-    pub fn refresh_ownership(&mut self, snapshot: &ShardOwnershipSnapshot) -> ShardingResult<()> {
-        self.owner_cache.refresh(snapshot)
+    pub fn refresh_ownership(&self, snapshot: &ShardOwnershipSnapshot) -> ShardingResult<()> {
+        self.owner_cache
+            .lock()
+            .expect("shard owner cache mutex poisoned")
+            .refresh(snapshot)
     }
 
     /// Returns the owner and shard id for an entity reference.
-    pub fn resolve(&self, entity: &EntityRef<M>) -> ShardingResult<(&NodeId, ShardId)> {
+    pub fn resolve(&self, entity: &EntityRef<M>) -> ShardingResult<(NodeId, ShardId)> {
         self.ensure_entity_type(entity)?;
-        self.owner_cache.owner_for_entity(entity.entity_id())
+        self.owner_cache
+            .lock()
+            .expect("shard owner cache mutex poisoned")
+            .owner_for_entity(entity.entity_id())
+            .map(|(owner, shard_id)| (owner.clone(), shard_id))
     }
 
     /// Sends a message without waiting for a reply.
@@ -409,7 +432,7 @@ where
             entity.entity_type().clone(),
             entity.entity_id().clone(),
             shard_id,
-            owner.clone(),
+            owner,
             message,
         );
         self.route.deliver(routed)
@@ -455,6 +478,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            entity_type: self.entity_type.clone(),
+            config: self.config.clone(),
             owner_cache: self.owner_cache.clone(),
             route: self.route.clone(),
         }

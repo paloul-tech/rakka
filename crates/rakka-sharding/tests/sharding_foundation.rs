@@ -4,19 +4,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rakka_cluster::{
-    ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
+    ClusterError, ClusterMembership, ClusterNode, ClusterProtocol, CompatibilityRange,
+    DiscoverySnapshot, MembershipConfig, MembershipEvent, NodeAddress, NodeId, ProtocolVersion,
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
 };
 use rakka_remote::{
     InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope,
-    SerializationRegistry,
+    RemoteRequestRegistry, SerializationRegistry,
 };
 use rakka_sharding::{
-    EntityAskError, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
-    LocalEntityContext, LocalEntityRoute, RemoteEntityInbound, RemoteEntityInboundError,
-    RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
+    ClusterShardingError, ClusterShardingRuntime, EntityAskError, EntityDeliveryFailure, EntityId,
+    EntityRef, EntityTellError, EntityType, LocalEntityContext, LocalEntityRoute,
+    RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound,
+    RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
     RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision, ShardId,
     ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
@@ -38,11 +40,36 @@ struct RemoteCartCommand {
     action: String,
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoteCartGet {
+    #[prost(string, tag = "1")]
+    prefix: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemoteCartReply {
+    #[prost(string, tag = "1")]
+    summary: String,
+}
+
 struct RemoteCartEntity;
+
+struct RemoteAskCartEntity {
+    context: LocalEntityContext,
+}
+
+struct SilentRemoteAskCartEntity;
 
 struct NotifyingRemoteCartEntity {
     context: LocalEntityContext,
     delivered: tokio::sync::mpsc::UnboundedSender<(String, String)>,
+}
+
+enum RemoteAskCartCommand {
+    Get {
+        prefix: String,
+        reply_to: ReplyTo<RemoteCartReply>,
+    },
 }
 
 impl Actor for CartEntity {
@@ -68,6 +95,40 @@ impl Actor for CartEntity {
 
 impl Actor for RemoteCartEntity {
     type Msg = RemoteCartCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        _msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        actor_future(async { Ok(ActorAction::Continue) })
+    }
+}
+
+impl Actor for RemoteAskCartEntity {
+    type Msg = RemoteAskCartCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entity_id = self.context.entity_id().as_str().to_string();
+        actor_future(async move {
+            match msg {
+                RemoteAskCartCommand::Get { prefix, reply_to } => {
+                    let _ = reply_to.reply(RemoteCartReply {
+                        summary: format!("{entity_id}:{prefix}"),
+                    });
+                }
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+impl Actor for SilentRemoteAskCartEntity {
+    type Msg = RemoteAskCartCommand;
 
     fn handle<'a>(
         &'a mut self,
@@ -143,12 +204,13 @@ fn node(logical_id: &str, incarnation: &str) -> ClusterNode {
     )
 }
 
+fn membership_config() -> MembershipConfig {
+    MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100))
+}
+
 fn membership_with_up_nodes(nodes: Vec<ClusterNode>) -> ClusterMembership {
     let local = nodes[0].clone();
-    let mut membership = ClusterMembership::new(
-        local,
-        MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100)),
-    );
+    let mut membership = ClusterMembership::new(local, membership_config());
 
     membership
         .record_discovery(DiscoverySnapshot::new("test", 1, nodes))
@@ -184,6 +246,12 @@ fn remote_registry() -> SerializationRegistry {
         .register_protobuf::<RemoteCartCommand>("rakka.test.RemoteCartCommand", 1)
         .unwrap();
     registry
+        .register_protobuf::<RemoteCartGet>("rakka.test.RemoteCartGet", 1)
+        .unwrap();
+    registry
+        .register_protobuf::<RemoteCartReply>("rakka.test.RemoteCartReply", 1)
+        .unwrap();
+    registry
 }
 
 fn remote_cart_envelope(
@@ -204,6 +272,26 @@ fn remote_cart_envelope(
         },
         encoded,
     )
+}
+
+fn runtime_with_local(local: ClusterNode) -> ClusterShardingRuntime {
+    ClusterShardingRuntime::new(ClusterMembership::new(local, membership_config()))
+}
+
+fn runtime_region(entity_type: EntityType, config: ShardingConfig) -> ShardRegion<CartCommand> {
+    ShardRegion::new(
+        entity_type,
+        config,
+        |_message: RoutedEntityMessage<CartCommand>| Ok(()),
+    )
+}
+
+fn coordinator_owners_exclude(coordinator: &ShardCoordinator, node_id: &NodeId) -> bool {
+    coordinator
+        .snapshot()
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner() != node_id)
 }
 
 #[test]
@@ -363,6 +451,180 @@ fn down_member_triggers_failover_decisions() {
             } if from == &down_id && to.logical_id() == "rakka-0"
         )
     }));
+}
+
+#[test]
+fn cluster_sharding_runtime_rebalances_and_refreshes_region_when_node_joins() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let remote = node("rakka-1", "uid-b");
+    let remote_id = remote.id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut runtime = runtime_with_local(local.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region(region.clone()).unwrap();
+    assert_eq!(region.owner_revision(), 0);
+
+    let local_update = runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local.clone()]))
+        .unwrap();
+
+    assert_eq!(
+        local_update.membership_events(),
+        &[MembershipEvent::MemberUp { node_id: local_id }]
+    );
+    assert_eq!(region.owner_revision(), 1);
+
+    let join_update = runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 2, [local, remote]))
+        .unwrap();
+
+    assert!(join_update
+        .membership_events()
+        .contains(&MembershipEvent::MemberDiscovered {
+            node_id: remote_id.clone(),
+        }));
+    assert!(join_update
+        .membership_events()
+        .contains(&MembershipEvent::MemberUp {
+            node_id: remote_id.clone(),
+        }));
+    assert!(join_update
+        .rebalances()
+        .iter()
+        .any(|rebalance| rebalance.entity_type() == &entity_type && !rebalance.plan().is_empty()));
+
+    let coordinator = runtime.coordinator(&entity_type).unwrap();
+    assert_eq!(region.owner_revision(), coordinator.revision());
+    assert_eq!(
+        coordinator.owner_for_shard(ShardId::new(1)).unwrap(),
+        &remote_id
+    );
+}
+
+#[test]
+fn cluster_sharding_runtime_moves_shards_from_leaving_node() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let remote_id = remote.id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut runtime = runtime_with_local(local.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region(region.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, remote]))
+        .unwrap();
+
+    let leave_update = runtime.mark_leaving(&remote_id, 3).unwrap();
+
+    assert!(leave_update
+        .membership_events()
+        .contains(&MembershipEvent::MemberLeaving {
+            node_id: remote_id.clone(),
+        }));
+    assert!(leave_update.rebalances().iter().any(|rebalance| {
+        rebalance.entity_type() == &entity_type
+            && rebalance.plan().decisions().iter().any(|decision| {
+                matches!(
+                    decision,
+                    ShardDecision::Move {
+                        from,
+                        reason: ShardMoveReason::GracefulLeave,
+                        ..
+                    } if from == &remote_id
+                )
+            })
+    }));
+
+    let coordinator = runtime.coordinator(&entity_type).unwrap();
+    assert!(coordinator_owners_exclude(coordinator, &remote_id));
+    assert_eq!(region.owner_revision(), coordinator.revision());
+}
+
+#[test]
+fn cluster_sharding_runtime_failover_refreshes_regions_after_unreachable_tick() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let remote_id = remote.id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut runtime = runtime_with_local(local.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region(region.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, remote]))
+        .unwrap();
+
+    let failover_update = runtime.tick(51).unwrap();
+
+    assert_eq!(
+        failover_update.membership_events(),
+        &[MembershipEvent::MemberUnreachable {
+            node_id: remote_id.clone(),
+        }]
+    );
+    assert!(failover_update.rebalances().iter().any(|rebalance| {
+        rebalance.entity_type() == &entity_type
+            && rebalance.plan().decisions().iter().any(|decision| {
+                matches!(
+                    decision,
+                    ShardDecision::Move {
+                        from,
+                        reason: ShardMoveReason::OwnerUnavailable,
+                        ..
+                    } if from == &remote_id
+                )
+            })
+    }));
+
+    let coordinator = runtime.coordinator(&entity_type).unwrap();
+    assert!(coordinator_owners_exclude(coordinator, &remote_id));
+    assert_eq!(region.owner_revision(), coordinator.revision());
+}
+
+#[test]
+fn cluster_sharding_runtime_rejects_incompatible_nodes_before_ownership() {
+    let local = node("rakka-0", "uid-a");
+    let incompatible_protocol = ClusterProtocol::new(
+        ProtocolVersion::new(2, 0),
+        CompatibilityRange::new(ProtocolVersion::new(2, 0), ProtocolVersion::new(2, 0)),
+    );
+    let remote = node("rakka-1", "uid-b").with_protocol(incompatible_protocol);
+    let remote_id = remote.id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut runtime = runtime_with_local(local.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region(region.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local.clone()]))
+        .unwrap();
+
+    let error = runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 2, vec![local, remote]))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Cluster {
+            error: ClusterError::IncompatibleNode {
+                node_id,
+                remote,
+                ..
+            },
+        } if node_id == remote_id && remote == incompatible_protocol
+    ));
+    assert_eq!(runtime.membership().snapshot().members().len(), 1);
+
+    let coordinator = runtime.coordinator(&entity_type).unwrap();
+    assert!(coordinator_owners_exclude(coordinator, &remote_id));
+    assert_eq!(region.owner_revision(), coordinator.revision());
 }
 
 #[test]
@@ -976,6 +1238,175 @@ async fn in_memory_transport_routes_remote_entity_to_owning_node() {
             "add-apple".to_string()
         )
     );
+}
+
+#[tokio::test]
+async fn remote_entity_ask_routes_reply_back_to_requesting_node() {
+    let membership =
+        membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
+    let node_a = NodeId::new("rakka-0", "uid-a");
+    let node_b = NodeId::new("rakka-1", "uid-b");
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(8).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let snapshot = coordinator.snapshot();
+    let remote_entity_id = entity_owned_by(&coordinator, "rakka-1");
+    let registry = remote_registry();
+    let transport = InMemoryRemoteTransport::new();
+
+    let local_route_a = LocalEntityRoute::new(
+        node_a.clone(),
+        ActorSystem::new("remote-ask-node-a-test"),
+        |context: LocalEntityContext| RemoteAskCartEntity { context },
+    );
+    let region_a = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &snapshot,
+        local_route_a.clone(),
+    )
+    .unwrap();
+    let request_registry = RemoteRequestRegistry::new(registry.clone());
+    let ask_client =
+        RemoteEntityAskClient::new(node_a.clone(), request_registry.clone(), transport.clone());
+    let endpoint_a = RemoteEndpoint::new(node_a);
+    endpoint_a.register_reply_handler(request_registry.clone());
+    transport.register_endpoint(endpoint_a).unwrap();
+
+    let local_route_b = LocalEntityRoute::new(
+        node_b.clone(),
+        ActorSystem::new("remote-ask-node-b-test"),
+        |context: LocalEntityContext| RemoteAskCartEntity { context },
+    );
+    let region_b = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config,
+        &snapshot,
+        local_route_b.clone(),
+    )
+    .unwrap();
+    let endpoint_b = RemoteEndpoint::new(node_b);
+    endpoint_b
+        .register_entity_handler(
+            "Cart",
+            RemoteEntityAskInbound::new(
+                NodeId::new("rakka-1", "uid-b"),
+                region_b,
+                registry.clone(),
+                transport.clone(),
+                |request: RemoteCartGet, reply_to| RemoteAskCartCommand::Get {
+                    prefix: request.prefix,
+                    reply_to,
+                },
+            ),
+        )
+        .unwrap();
+    transport.register_endpoint(endpoint_b).unwrap();
+    let remote_entity =
+        EntityRef::<RemoteAskCartCommand>::new(entity_type, remote_entity_id.clone());
+
+    let reply: RemoteCartReply = ask_client
+        .ask(
+            &region_a,
+            &remote_entity,
+            RemoteCartGet {
+                prefix: "items".to_string(),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reply.summary,
+        format!("{}:items", remote_entity_id.as_str())
+    );
+    assert_eq!(local_route_a.entity_count(), 0);
+    assert_eq!(local_route_b.entity_count(), 1);
+    assert_eq!(request_registry.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn remote_entity_ask_timeout_removes_pending_request() {
+    let membership =
+        membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
+    let node_a = NodeId::new("rakka-0", "uid-a");
+    let node_b = NodeId::new("rakka-1", "uid-b");
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(8).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let snapshot = coordinator.snapshot();
+    let remote_entity_id = entity_owned_by(&coordinator, "rakka-1");
+    let registry = remote_registry();
+    let transport = InMemoryRemoteTransport::new();
+    let local_route_a = LocalEntityRoute::new(
+        node_a.clone(),
+        ActorSystem::new("remote-ask-timeout-node-a-test"),
+        |_context: LocalEntityContext| SilentRemoteAskCartEntity,
+    );
+    let region_a = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &snapshot,
+        local_route_a.clone(),
+    )
+    .unwrap();
+    let request_registry = RemoteRequestRegistry::new(registry.clone());
+    let ask_client =
+        RemoteEntityAskClient::new(node_a.clone(), request_registry.clone(), transport.clone());
+    let endpoint_a = RemoteEndpoint::new(node_a);
+    endpoint_a.register_reply_handler(request_registry.clone());
+    transport.register_endpoint(endpoint_a).unwrap();
+
+    let local_route_b = LocalEntityRoute::new(
+        node_b.clone(),
+        ActorSystem::new("remote-ask-timeout-node-b-test"),
+        |_context: LocalEntityContext| SilentRemoteAskCartEntity,
+    );
+    let region_b =
+        ShardRegion::from_snapshot(entity_type.clone(), config, &snapshot, local_route_b).unwrap();
+    let endpoint_b = RemoteEndpoint::new(node_b.clone());
+    endpoint_b
+        .register_entity_handler(
+            "Cart",
+            RemoteEntityAskInbound::new(
+                node_b,
+                region_b,
+                registry.clone(),
+                transport.clone(),
+                |request: RemoteCartGet, reply_to| RemoteAskCartCommand::Get {
+                    prefix: request.prefix,
+                    reply_to,
+                },
+            ),
+        )
+        .unwrap();
+    transport.register_endpoint(endpoint_b).unwrap();
+    let remote_entity =
+        EntityRef::<RemoteAskCartCommand>::new(entity_type, remote_entity_id.clone());
+
+    let error = ask_client
+        .ask::<RemoteCartGet, RemoteAskCartCommand, RemoteCartReply>(
+            &region_a,
+            &remote_entity,
+            RemoteCartGet {
+                prefix: "items".to_string(),
+            },
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEntityAskError::Reply {
+            error: rakka_remote::RemoteRequestError::Timeout
+        }
+    ));
+    assert_eq!(request_registry.pending_count(), 0);
+    assert_eq!(local_route_a.entity_count(), 0);
 }
 
 #[tokio::test]

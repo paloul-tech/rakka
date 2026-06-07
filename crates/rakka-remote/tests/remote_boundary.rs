@@ -5,7 +5,8 @@ use rakka_cluster::NodeId;
 use rakka_remote::{
     EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteDestination,
     RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
-    RemoteTransport, RemoteTransportError, SerializationRegistry,
+    RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
+    SerializationRegistry,
 };
 use std::sync::{Arc, Mutex};
 
@@ -86,6 +87,9 @@ fn all_destination_variants_round_trip_through_envelope_codec() {
         },
         RemoteDestination::RouteKey {
             route_key: "tenant-a/orders".to_string(),
+        },
+        RemoteDestination::Reply {
+            request_id: "request-1".to_string(),
         },
     ];
 
@@ -290,5 +294,138 @@ fn endpoint_fails_closed_for_unhandled_destination_and_entity_type() {
         entity_error,
         RemoteEndpointError::UnregisteredEntityType { entity_type }
             if entity_type == "cart"
+    ));
+}
+
+#[tokio::test]
+async fn request_registry_routes_reply_to_pending_waiter() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Pong>("rakka.test.Pong", 1)
+        .unwrap();
+    let requests = RemoteRequestRegistry::new(registry.clone());
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-0", "uid-a"));
+    endpoint.register_reply_handler(requests.clone());
+    let pending = requests.register::<Pong>("request-1").unwrap();
+    let reply = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "request-1".to_string(),
+        },
+        registry
+            .encode(&Pong {
+                value: "world".to_string(),
+            })
+            .unwrap(),
+    )
+    .with_request_id("request-1");
+
+    endpoint.receive_envelope(reply).unwrap();
+
+    let received = pending
+        .wait(std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(received.value, "world");
+    assert_eq!(requests.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn request_registry_timeout_removes_pending_request_and_rejects_late_reply() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Pong>("rakka.test.Pong", 1)
+        .unwrap();
+    let requests = RemoteRequestRegistry::new(registry.clone());
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-0", "uid-a"));
+    endpoint.register_reply_handler(requests.clone());
+    let pending = requests.register::<Pong>("request-timeout").unwrap();
+
+    let error = pending
+        .wait(std::time::Duration::from_millis(1))
+        .await
+        .unwrap_err();
+    assert_eq!(error, RemoteRequestError::Timeout);
+    assert_eq!(requests.pending_count(), 0);
+
+    let late_reply = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "request-timeout".to_string(),
+        },
+        registry
+            .encode(&Pong {
+                value: "late".to_string(),
+            })
+            .unwrap(),
+    )
+    .with_request_id("request-timeout");
+    let error = endpoint.receive_envelope(late_reply).unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("request-timeout") && message.contains("not pending")
+    ));
+}
+
+#[tokio::test]
+async fn request_registry_rejects_duplicate_reply_after_completion() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Pong>("rakka.test.Pong", 1)
+        .unwrap();
+    let requests = RemoteRequestRegistry::new(registry.clone());
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-0", "uid-a"));
+    endpoint.register_reply_handler(requests.clone());
+    let pending = requests.register::<Pong>("request-duplicate").unwrap();
+    let reply = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "request-duplicate".to_string(),
+        },
+        registry
+            .encode(&Pong {
+                value: "first".to_string(),
+            })
+            .unwrap(),
+    )
+    .with_request_id("request-duplicate");
+
+    endpoint.receive_envelope(reply.clone()).unwrap();
+    assert_eq!(
+        pending
+            .wait(std::time::Duration::from_secs(1))
+            .await
+            .unwrap()
+            .value,
+        "first"
+    );
+
+    let error = endpoint.receive_envelope(reply).unwrap_err();
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("request-duplicate") && message.contains("not pending")
+    ));
+}
+
+#[test]
+fn endpoint_fails_closed_when_reply_handler_is_missing() {
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-0", "uid-a"));
+    let reply = RemoteEnvelope::new(
+        RemoteDestination::Reply {
+            request_id: "request-1".to_string(),
+        },
+        EncodedPayload::new(
+            RemoteEnvelopeMetadata::protobuf("rakka.test.Pong", 1),
+            Vec::new(),
+        ),
+    )
+    .with_request_id("request-1");
+
+    let error = endpoint.receive_envelope(reply).unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::UnregisteredReplyHandler { request_id }
+            if request_id == "request-1"
     ));
 }

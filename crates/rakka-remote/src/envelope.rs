@@ -83,6 +83,11 @@ pub enum RemoteDestination {
         /// Route key.
         route_key: String,
     },
+    /// Route a reply to a pending remote request.
+    Reply {
+        /// Request id being completed.
+        request_id: String,
+    },
 }
 
 /// Wire envelope for remote messages.
@@ -235,6 +240,7 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 entity_id: String::new(),
                 service_key: String::new(),
                 route_key: String::new(),
+                request_id: String::new(),
             },
             RemoteDestination::Entity {
                 entity_type,
@@ -246,6 +252,7 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 entity_id,
                 service_key: String::new(),
                 route_key: String::new(),
+                request_id: String::new(),
             },
             RemoteDestination::Service { service_key } => Self {
                 kind: ProtoDestinationKind::Service as i32,
@@ -254,6 +261,7 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 entity_id: String::new(),
                 service_key,
                 route_key: String::new(),
+                request_id: String::new(),
             },
             RemoteDestination::RouteKey { route_key } => Self {
                 kind: ProtoDestinationKind::RouteKey as i32,
@@ -262,6 +270,16 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 entity_id: String::new(),
                 service_key: String::new(),
                 route_key,
+                request_id: String::new(),
+            },
+            RemoteDestination::Reply { request_id } => Self {
+                kind: ProtoDestinationKind::Reply as i32,
+                path: String::new(),
+                entity_type: String::new(),
+                entity_id: String::new(),
+                service_key: String::new(),
+                route_key: String::new(),
+                request_id,
             },
         }
     }
@@ -294,6 +312,8 @@ impl TryFrom<ProtoRemoteDestination> for RemoteDestination {
                 .map(|service_key| Self::Service { service_key }),
             ProtoDestinationKind::RouteKey => require_non_empty("route_key", proto.route_key)
                 .map(|route_key| Self::RouteKey { route_key }),
+            ProtoDestinationKind::Reply => require_non_empty("request_id", proto.request_id)
+                .map(|request_id| Self::Reply { request_id }),
         }
     }
 }

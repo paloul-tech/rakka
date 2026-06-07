@@ -30,6 +30,11 @@ pub enum RemoteEndpointError {
         /// Entity type carried by the remote envelope.
         entity_type: String,
     },
+    /// No handler is registered for remote replies.
+    UnregisteredReplyHandler {
+        /// Request id carried by the reply destination.
+        request_id: String,
+    },
     /// An entity handler is already registered for this entity type.
     DuplicateEntityHandler {
         /// Entity type that already has a handler.
@@ -56,6 +61,12 @@ impl Display for RemoteEndpointError {
             }
             Self::UnregisteredEntityType { entity_type } => {
                 write!(f, "remote endpoint has no entity handler for {entity_type}")
+            }
+            Self::UnregisteredReplyHandler { request_id } => {
+                write!(
+                    f,
+                    "remote endpoint has no reply handler for request {request_id}"
+                )
             }
             Self::DuplicateEntityHandler { entity_type } => {
                 write!(
@@ -133,6 +144,14 @@ impl RemoteEndpoint {
         Ok(())
     }
 
+    /// Registers the handler for reply envelopes.
+    pub fn register_reply_handler(&self, handler: impl RemoteEnvelopeHandler) {
+        self.handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .reply = Some(Arc::new(handler));
+    }
+
     /// Receives encoded envelope bytes and dispatches the decoded envelope.
     pub fn receive_wire(&self, bytes: &[u8]) -> RemoteEndpointResult<()> {
         let envelope = ProtobufEnvelopeCodec::decode(bytes)
@@ -145,6 +164,10 @@ impl RemoteEndpoint {
         match &envelope.destination {
             RemoteDestination::Entity { entity_type, .. } => {
                 let handler = self.entity_handler(entity_type)?;
+                handler.handle(envelope)
+            }
+            RemoteDestination::Reply { request_id } => {
+                let handler = self.reply_handler(request_id)?;
                 handler.handle(envelope)
             }
             destination => Err(RemoteEndpointError::UnexpectedDestination {
@@ -167,6 +190,20 @@ impl RemoteEndpoint {
                 entity_type: entity_type.to_string(),
             })
     }
+
+    fn reply_handler(
+        &self,
+        request_id: &str,
+    ) -> RemoteEndpointResult<Arc<dyn RemoteEnvelopeHandler>> {
+        self.handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .reply
+            .clone()
+            .ok_or_else(|| RemoteEndpointError::UnregisteredReplyHandler {
+                request_id: request_id.to_string(),
+            })
+    }
 }
 
 impl Debug for RemoteEndpoint {
@@ -177,9 +214,16 @@ impl Debug for RemoteEndpoint {
             .expect("remote endpoint handler mutex poisoned")
             .entities
             .len();
+        let has_reply_handler = self
+            .handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .reply
+            .is_some();
         f.debug_struct("RemoteEndpoint")
             .field("node_id", &self.node_id)
             .field("entity_handler_count", &entity_handler_count)
+            .field("has_reply_handler", &has_reply_handler)
             .finish_non_exhaustive()
     }
 }
@@ -187,4 +231,5 @@ impl Debug for RemoteEndpoint {
 #[derive(Default)]
 struct RemoteEndpointHandlers {
     entities: BTreeMap<String, Arc<dyn RemoteEnvelopeHandler>>,
+    reply: Option<Arc<dyn RemoteEnvelopeHandler>>,
 }

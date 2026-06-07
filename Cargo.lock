@@ -907,6 +907,7 @@ dependencies = [
  "rakka-cluster",
  "rakka-core",
  "serde",
+ "tokio",
 ]
 
 [[package]]
