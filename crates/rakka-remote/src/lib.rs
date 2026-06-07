@@ -22,7 +22,8 @@ pub use envelope::{
 };
 pub use error::{RemoteError, RemoteResult};
 pub use registry::{
-    CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SerializationRegistry,
+    CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SchemaCompatibilityPolicy,
+    SerializationRegistry,
 };
 pub use request::{
     RemotePendingReply, RemoteRequestError, RemoteRequestRegistry, RemoteRequestResult,

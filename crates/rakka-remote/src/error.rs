@@ -20,6 +20,15 @@ pub enum RemoteError {
         /// Message schema version.
         schema_version: u32,
     },
+    /// A schema compatibility policy was invalid.
+    InvalidSchemaCompatibilityPolicy {
+        /// Minimum supported schema version.
+        min_supported: u32,
+        /// Maximum supported schema version.
+        max_supported: u32,
+        /// Current schema version used for encoding.
+        current: u32,
+    },
     /// No codec was registered for the requested key.
     UnknownCodec {
         /// Codec id.
@@ -72,6 +81,7 @@ impl RemoteError {
     fn code(&self) -> &'static str {
         match self {
             Self::DuplicateCodec { .. } => "duplicate-codec",
+            Self::InvalidSchemaCompatibilityPolicy { .. } => "invalid-schema-compatibility-policy",
             Self::UnknownCodec { .. } => "unknown-codec",
             Self::UnknownMessageType { .. } => "unknown-message-type",
             Self::CodecTypeMismatch { .. } => "codec-type-mismatch",
@@ -92,6 +102,14 @@ impl Display for RemoteError {
             } => write!(
                 f,
                 "codec {codec_id}/{message_type_id}@{schema_version} is already registered"
+            ),
+            Self::InvalidSchemaCompatibilityPolicy {
+                min_supported,
+                max_supported,
+                current,
+            } => write!(
+                f,
+                "schema compatibility policy {min_supported}..={max_supported} does not support current schema {current}"
             ),
             Self::UnknownCodec {
                 codec_id,

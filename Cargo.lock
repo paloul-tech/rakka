@@ -849,6 +849,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-multi-node-sharding"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-remote",
+ "rakka-sharding",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-grpc"
 version = "0.1.0"
 dependencies = [

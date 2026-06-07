@@ -11,6 +11,82 @@ use crate::envelope::{EncodedPayload, RemoteEnvelope};
 use crate::error::{RemoteError, RemoteResult};
 use crate::DEFAULT_CODEC_ID;
 
+/// Inclusive schema-version policy for one remote message type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SchemaCompatibilityPolicy {
+    min_supported: u32,
+    max_supported: u32,
+}
+
+impl SchemaCompatibilityPolicy {
+    /// Creates an exact-version policy for incompatible migrations.
+    #[must_use]
+    pub const fn exact(schema_version: u32) -> Self {
+        Self {
+            min_supported: schema_version,
+            max_supported: schema_version,
+        }
+    }
+
+    /// Creates an additive compatibility window.
+    pub fn additive_window(min_supported: u32, max_supported: u32) -> RemoteResult<Self> {
+        let policy = Self {
+            min_supported,
+            max_supported,
+        };
+        policy.validate(max_supported)?;
+        Ok(policy)
+    }
+
+    /// Creates the standard N/N+1 schema rolling window for `current_schema_version`.
+    #[must_use]
+    pub fn n_plus_one(current_schema_version: u32) -> Self {
+        Self {
+            min_supported: current_schema_version.saturating_sub(1).max(1),
+            max_supported: current_schema_version,
+        }
+    }
+
+    /// Minimum accepted schema version.
+    #[must_use]
+    pub const fn min_supported(self) -> u32 {
+        self.min_supported
+    }
+
+    /// Maximum accepted schema version.
+    #[must_use]
+    pub const fn max_supported(self) -> u32 {
+        self.max_supported
+    }
+
+    /// Returns true when a schema version is accepted by this policy.
+    #[must_use]
+    pub const fn supports(self, schema_version: u32) -> bool {
+        self.min_supported <= schema_version && schema_version <= self.max_supported
+    }
+
+    /// Iterates all schema versions accepted by this policy.
+    #[must_use]
+    pub fn versions(self) -> std::ops::RangeInclusive<u32> {
+        self.min_supported..=self.max_supported
+    }
+
+    fn validate(self, current_schema_version: u32) -> RemoteResult<()> {
+        if self.min_supported == 0
+            || self.max_supported == 0
+            || self.min_supported > self.max_supported
+            || !self.supports(current_schema_version)
+        {
+            return Err(RemoteError::InvalidSchemaCompatibilityPolicy {
+                min_supported: self.min_supported,
+                max_supported: self.max_supported,
+                current: current_schema_version,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Marker trait for messages that can use the default Protobuf payload codec.
 pub trait ProtobufMessage: Message + Default + Send + Sync + 'static {}
 
@@ -158,24 +234,7 @@ impl SerializationRegistry {
         M: Send + Sync + 'static,
         C: PayloadCodec<M>,
     {
-        let key = CodecKey::new(
-            codec.codec_id(),
-            codec.message_type_id(),
-            codec.schema_version(),
-        );
-
-        if self.codecs.contains_key(&key) {
-            return Err(RemoteError::DuplicateCodec {
-                codec_id: key.codec_id,
-                message_type_id: key.message_type_id,
-                schema_version: key.schema_version,
-            });
-        }
-
-        self.defaults.insert(TypeId::of::<M>(), key.clone());
-        self.codecs
-            .insert(key, Arc::new(CodecEntry::<M, C>::new(codec)));
-        Ok(())
+        self.insert_codec::<M, C>(codec, true)
     }
 
     /// Registers the default Protobuf payload codec for a message type.
@@ -191,6 +250,50 @@ impl SerializationRegistry {
             message_type_id,
             schema_version,
         ))
+    }
+
+    /// Registers a Protobuf codec with explicit schema compatibility aliases.
+    pub fn register_protobuf_compatible<M>(
+        &mut self,
+        message_type_id: impl Into<String>,
+        current_schema_version: u32,
+        policy: SchemaCompatibilityPolicy,
+    ) -> RemoteResult<()>
+    where
+        M: ProtobufMessage,
+    {
+        policy.validate(current_schema_version)?;
+        let message_type_id = message_type_id.into();
+        let keys = policy
+            .versions()
+            .map(|schema_version| {
+                CodecKey::new(DEFAULT_CODEC_ID, message_type_id.clone(), schema_version)
+            })
+            .collect::<Vec<_>>();
+
+        for key in &keys {
+            if self.codecs.contains_key(key) {
+                return Err(RemoteError::DuplicateCodec {
+                    codec_id: key.codec_id.clone(),
+                    message_type_id: key.message_type_id.clone(),
+                    schema_version: key.schema_version,
+                });
+            }
+        }
+
+        for key in keys {
+            self.codecs.insert(
+                key,
+                Arc::new(CodecEntry::<M, ProtobufPayloadCodec<M>>::new(
+                    ProtobufPayloadCodec::<M>::new(message_type_id.clone(), current_schema_version),
+                )),
+            );
+        }
+        self.defaults.insert(
+            TypeId::of::<M>(),
+            CodecKey::new(DEFAULT_CODEC_ID, message_type_id, current_schema_version),
+        );
+        Ok(())
     }
 
     /// Encodes a typed message using that Rust type's default registered codec.
@@ -250,6 +353,33 @@ impl SerializationRegistry {
                 message_type_id: key.message_type_id.clone(),
                 schema_version: key.schema_version,
             })
+    }
+
+    fn insert_codec<M, C>(&mut self, codec: C, is_default: bool) -> RemoteResult<()>
+    where
+        M: Send + Sync + 'static,
+        C: PayloadCodec<M>,
+    {
+        let key = CodecKey::new(
+            codec.codec_id(),
+            codec.message_type_id(),
+            codec.schema_version(),
+        );
+
+        if self.codecs.contains_key(&key) {
+            return Err(RemoteError::DuplicateCodec {
+                codec_id: key.codec_id,
+                message_type_id: key.message_type_id,
+                schema_version: key.schema_version,
+            });
+        }
+
+        if is_default {
+            self.defaults.insert(TypeId::of::<M>(), key.clone());
+        }
+        self.codecs
+            .insert(key, Arc::new(CodecEntry::<M, C>::new(codec)));
+        Ok(())
     }
 }
 

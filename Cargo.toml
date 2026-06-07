@@ -16,6 +16,7 @@ members = [
     "crates/rakka-testkit",
     "examples/durable-counter",
     "examples/minimal-system",
+    "examples/multi-node-sharding",
 ]
 
 [workspace.package]

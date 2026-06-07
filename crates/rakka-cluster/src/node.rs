@@ -185,6 +185,21 @@ impl CompatibilityRange {
         Self { min, max }
     }
 
+    /// Creates a range that only accepts one exact protocol version.
+    #[must_use]
+    pub const fn exact(version: ProtocolVersion) -> Self {
+        Self::new(version, version)
+    }
+
+    /// Creates the standard N/N+1 minor-version rolling update window.
+    #[must_use]
+    pub const fn n_to_n_plus_one(major: u16, minor: u16) -> Self {
+        Self::new(
+            ProtocolVersion::new(major, minor),
+            ProtocolVersion::new(major, minor.saturating_add(1)),
+        )
+    }
+
     /// Minimum compatible protocol version.
     #[must_use]
     pub const fn min(self) -> ProtocolVersion {
@@ -227,6 +242,21 @@ impl ClusterProtocol {
         }
     }
 
+    /// Creates a protocol that only accepts one exact protocol version.
+    #[must_use]
+    pub const fn exact(version: ProtocolVersion) -> Self {
+        Self::new(version, CompatibilityRange::exact(version))
+    }
+
+    /// Creates a protocol using a standard N/N+1 minor-version rolling update window.
+    #[must_use]
+    pub const fn n_to_n_plus_one(version: ProtocolVersion, base_minor: u16) -> Self {
+        Self::new(
+            version,
+            CompatibilityRange::n_to_n_plus_one(version.major(), base_minor),
+        )
+    }
+
     /// Protocol version used by this node.
     #[must_use]
     pub const fn version(self) -> ProtocolVersion {
@@ -250,7 +280,7 @@ impl ClusterProtocol {
     pub const fn v1() -> Self {
         Self::new(
             ProtocolVersion::new(1, 0),
-            CompatibilityRange::new(ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 1)),
+            CompatibilityRange::n_to_n_plus_one(1, 0),
         )
     }
 }

@@ -209,6 +209,59 @@ fn incompatible_node_protocol_is_rejected() {
 }
 
 #[test]
+fn n_to_n_plus_one_protocols_can_coexist_during_rolling_update() {
+    let rolling_window = CompatibilityRange::n_to_n_plus_one(1, 0);
+    let local_protocol = ClusterProtocol::n_to_n_plus_one(ProtocolVersion::new(1, 0), 0);
+    let remote_protocol = ClusterProtocol::n_to_n_plus_one(ProtocolVersion::new(1, 1), 0);
+    let local = node("rakka-0", "uid-a", 2552).with_protocol(local_protocol);
+    let remote = node("rakka-1", "uid-b", 2552).with_protocol(remote_protocol);
+    let remote_id = remote.id().clone();
+    let mut membership = ClusterMembership::new(local, config(1));
+
+    let events = membership
+        .record_discovery(DiscoverySnapshot::new("static", 10, [remote]))
+        .unwrap();
+
+    assert_eq!(local_protocol.compatible_with(), rolling_window);
+    assert_eq!(remote_protocol.compatible_with(), rolling_window);
+    assert_eq!(
+        events,
+        vec![MembershipEvent::MemberDiscovered {
+            node_id: remote_id.clone(),
+        }]
+    );
+    assert_eq!(
+        membership.mark_up(&remote_id, 11).unwrap(),
+        Some(MembershipEvent::MemberUp { node_id: remote_id })
+    );
+    assert_eq!(membership.routable_members().len(), 1);
+}
+
+#[test]
+fn exact_protocol_policy_rejects_minor_version_mismatch() {
+    let local_protocol = ClusterProtocol::exact(ProtocolVersion::new(1, 0));
+    let remote_protocol = ClusterProtocol::exact(ProtocolVersion::new(1, 1));
+    let local = node("rakka-0", "uid-a", 2552).with_protocol(local_protocol);
+    let remote = node("rakka-1", "uid-b", 2552).with_protocol(remote_protocol);
+    let remote_id = remote.id().clone();
+    let mut membership = ClusterMembership::new(local, config(1));
+
+    let error = membership
+        .record_discovery(DiscoverySnapshot::new("static", 10, [remote]))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterError::IncompatibleNode {
+            node_id,
+            local,
+            remote,
+        } if node_id == remote_id && local == local_protocol && remote == remote_protocol
+    ));
+    assert_eq!(membership.snapshot().members().len(), 1);
+}
+
+#[test]
 fn local_discovery_registry_updates_snapshots() {
     let discovery = LocalDiscovery::new();
     let first = node("rakka-0", "uid-a", 2552);

@@ -6,7 +6,7 @@ use rakka_remote::{
     EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteDestination,
     RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
     RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
-    SerializationRegistry,
+    SchemaCompatibilityPolicy, SerializationRegistry,
 };
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +20,20 @@ struct Ping {
 struct Pong {
     #[prost(string, tag = "1")]
     value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompatPingV1 {
+    #[prost(string, tag = "1")]
+    value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CompatPingV2 {
+    #[prost(string, tag = "1")]
+    value: String,
+    #[prost(string, tag = "2")]
+    suffix: String,
 }
 
 #[test]
@@ -181,6 +195,133 @@ fn wrong_rust_type_for_registered_codec_fails_closed() {
             expected,
         } if message_type_id == "rakka.test.Ping" && expected.ends_with("Pong")
     ));
+}
+
+#[test]
+fn schema_policy_accepts_additive_n_plus_one_versions() {
+    let mut old_registry = SerializationRegistry::new();
+    old_registry
+        .register_protobuf::<CompatPingV1>("rakka.test.CompatPing", 1)
+        .unwrap();
+    let old_payload = old_registry
+        .encode(&CompatPingV1 {
+            value: "hello".to_string(),
+        })
+        .unwrap();
+    let mut new_registry = SerializationRegistry::new();
+    let policy = SchemaCompatibilityPolicy::n_plus_one(2);
+
+    new_registry
+        .register_protobuf_compatible::<CompatPingV2>("rakka.test.CompatPing", 2, policy)
+        .unwrap();
+
+    let decoded_old: CompatPingV2 = new_registry.decode(&old_payload).unwrap();
+    let encoded_new = new_registry
+        .encode(&CompatPingV2 {
+            value: "hello".to_string(),
+            suffix: "new".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(policy.min_supported(), 1);
+    assert_eq!(policy.max_supported(), 2);
+    assert!(policy.supports(1));
+    assert!(policy.supports(2));
+    assert!(!policy.supports(3));
+    assert_eq!(decoded_old.value, "hello");
+    assert_eq!(decoded_old.suffix, "");
+    assert_eq!(encoded_new.metadata.schema_version, 2);
+}
+
+#[test]
+fn exact_schema_policy_rejects_old_schema_versions() {
+    let mut old_registry = SerializationRegistry::new();
+    old_registry
+        .register_protobuf::<CompatPingV1>("rakka.test.CompatPing", 1)
+        .unwrap();
+    let old_payload = old_registry
+        .encode(&CompatPingV1 {
+            value: "hello".to_string(),
+        })
+        .unwrap();
+    let mut registry = SerializationRegistry::new();
+
+    registry
+        .register_protobuf_compatible::<CompatPingV2>(
+            "rakka.test.CompatPing",
+            2,
+            SchemaCompatibilityPolicy::exact(2),
+        )
+        .unwrap();
+
+    let error = registry.decode::<CompatPingV2>(&old_payload).unwrap_err();
+
+    assert_eq!(
+        error,
+        RemoteError::UnknownCodec {
+            codec_id: "protobuf".to_string(),
+            message_type_id: "rakka.test.CompatPing".to_string(),
+            schema_version: 1,
+        }
+    );
+}
+
+#[test]
+fn unsupported_schema_versions_fail_closed_with_typed_errors() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf_compatible::<CompatPingV2>(
+            "rakka.test.CompatPing",
+            2,
+            SchemaCompatibilityPolicy::additive_window(1, 2).unwrap(),
+        )
+        .unwrap();
+    let unsupported = EncodedPayload::new(
+        RemoteEnvelopeMetadata::protobuf("rakka.test.CompatPing", 3),
+        Vec::new(),
+    );
+
+    let error = registry.decode::<CompatPingV2>(&unsupported).unwrap_err();
+
+    assert_eq!(
+        error,
+        RemoteError::UnknownCodec {
+            codec_id: "protobuf".to_string(),
+            message_type_id: "rakka.test.CompatPing".to_string(),
+            schema_version: 3,
+        }
+    );
+}
+
+#[test]
+fn invalid_schema_policy_is_rejected_before_registration() {
+    let error = SchemaCompatibilityPolicy::additive_window(2, 1).unwrap_err();
+    assert_eq!(
+        error,
+        RemoteError::InvalidSchemaCompatibilityPolicy {
+            min_supported: 2,
+            max_supported: 1,
+            current: 1,
+        }
+    );
+
+    let mut registry = SerializationRegistry::new();
+    let error = registry
+        .register_protobuf_compatible::<CompatPingV2>(
+            "rakka.test.CompatPing",
+            3,
+            SchemaCompatibilityPolicy::additive_window(1, 2).unwrap(),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RemoteError::InvalidSchemaCompatibilityPolicy {
+            min_supported: 1,
+            max_supported: 2,
+            current: 3,
+        }
+    );
 }
 
 #[test]

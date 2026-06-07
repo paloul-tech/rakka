@@ -1,0 +1,22 @@
+[package]
+name = "rakka-example-multi-node-sharding"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+publish = false
+
+[dependencies]
+prost.workspace = true
+rakka-cluster = { path = "../../crates/rakka-cluster" }
+rakka-core = { path = "../../crates/rakka-core" }
+rakka-remote = { path = "../../crates/rakka-remote" }
+rakka-sharding = { path = "../../crates/rakka-sharding" }
+tokio.workspace = true
+
+[lints]
+workspace = true

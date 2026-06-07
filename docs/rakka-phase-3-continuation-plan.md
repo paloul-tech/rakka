@@ -176,6 +176,8 @@ Out of scope:
 
 ## Slice 3F: Compatibility Hardening
 
+Status: implemented.
+
 Goal: make rolling-update compatibility enforceable and testable beyond node admission.
 
 Scope:
@@ -199,6 +201,8 @@ Out of scope:
 
 ## Slice 3G: Phase 3 Examples and Documentation
 
+Status: implemented.
+
 Goal: make the Phase 3 behavior reviewable by humans, not only tests.
 
 Scope:
@@ -216,4 +220,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 3F: compatibility hardening. Slice 3E established route-driven passivation, actor self-passivation through normal `ActorAction::Stop`, idle-timeout passivation with stale timer protection, registry cleanup for terminated/passivated entities, and recreate-on-next-message behavior.
+Phase 3 continuation is complete. The next major work should follow `docs/rakka-v1-implementation-plan.md` into productionization: real remote transport, Kubernetes runtime integration, distributed coordination hardening, and end-to-end examples that combine sharding with durable state.
