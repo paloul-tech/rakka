@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use rakka_cluster::NodeId;
 use rakka_core::{Actor, ActorOptions, ActorRef, ActorSystem, Message, TellError};
 
+use crate::handoff::ShardHandoffState;
 use crate::identity::{EntityId, EntityType, ShardId};
 use crate::routing::{EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage};
 
@@ -82,8 +83,29 @@ where
     system: ActorSystem,
     actor_options: ActorOptions,
     factory: Arc<F>,
-    actors: Arc<Mutex<BTreeMap<EntityId, ActorRef<M>>>>,
+    actors: Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
+    shard_states: Arc<Mutex<BTreeMap<ShardId, ShardHandoffState>>>,
     _actor: PhantomData<fn() -> A>,
+}
+
+struct LocalEntityHandle<M>
+where
+    M: Message,
+{
+    shard_id: ShardId,
+    actor_ref: ActorRef<M>,
+}
+
+impl<M> Clone for LocalEntityHandle<M>
+where
+    M: Message,
+{
+    fn clone(&self) -> Self {
+        Self {
+            shard_id: self.shard_id,
+            actor_ref: self.actor_ref.clone(),
+        }
+    }
 }
 
 impl<M, A, F> LocalEntityRoute<M, A, F>
@@ -101,6 +123,7 @@ where
             actor_options: ActorOptions::default(),
             factory: Arc::new(factory),
             actors: Arc::new(Mutex::new(BTreeMap::new())),
+            shard_states: Arc::new(Mutex::new(BTreeMap::new())),
             _actor: PhantomData,
         }
     }
@@ -121,20 +144,65 @@ where
     /// Number of currently cached local entity actors.
     #[must_use]
     pub fn entity_count(&self) -> usize {
-        self.actors
+        let mut actors = self
+            .actors
             .lock()
-            .expect("local entity registry mutex poisoned")
-            .len()
+            .expect("local entity registry mutex poisoned");
+        actors.retain(|_entity_id, handle| !handle.actor_ref.is_terminated());
+        actors.len()
     }
 
     /// Returns a cached local entity actor ref.
     #[must_use]
     pub fn entity_actor(&self, entity_id: &EntityId) -> Option<ActorRef<M>> {
-        self.actors
+        let mut actors = self
+            .actors
             .lock()
-            .expect("local entity registry mutex poisoned")
+            .expect("local entity registry mutex poisoned");
+        if actors
             .get(entity_id)
-            .cloned()
+            .is_some_and(|handle| handle.actor_ref.is_terminated())
+        {
+            actors.remove(entity_id);
+            None
+        } else {
+            actors.get(entity_id).map(|handle| handle.actor_ref.clone())
+        }
+    }
+
+    /// Current handoff state for a shard.
+    #[must_use]
+    pub fn shard_handoff_state(&self, shard_id: ShardId) -> ShardHandoffState {
+        self.shard_states
+            .lock()
+            .expect("local shard state registry mutex poisoned")
+            .get(&shard_id)
+            .copied()
+            .unwrap_or(ShardHandoffState::Owning)
+    }
+
+    /// Marks a shard as draining and rejects new local deliveries.
+    pub fn mark_shard_draining(&self, shard_id: ShardId) -> usize {
+        self.set_shard_state(shard_id, ShardHandoffState::Draining);
+        0
+    }
+
+    /// Stops local entities for a shard and marks it as transferring.
+    pub fn mark_shard_transferring(&self, shard_id: ShardId) -> usize {
+        self.set_shard_state(shard_id, ShardHandoffState::Transferring);
+        self.stop_entities_for_shard(shard_id)
+    }
+
+    /// Marks a shard as acquired by this local route.
+    pub fn mark_shard_acquired(&self, shard_id: ShardId) -> usize {
+        self.set_shard_state(shard_id, ShardHandoffState::Acquired);
+        0
+    }
+
+    /// Marks a shard as normally owned by this local route.
+    pub fn mark_shard_owning(&self, shard_id: ShardId) -> usize {
+        self.set_shard_state(shard_id, ShardHandoffState::Owning);
+        0
     }
 
     fn actor_for(
@@ -143,16 +211,18 @@ where
         entity_id: &EntityId,
         shard_id: ShardId,
     ) -> Result<ActorRef<M>, EntityDeliveryFailure> {
+        self.ensure_shard_accepts_delivery(shard_id)?;
+
         let mut actors = self
             .actors
             .lock()
             .expect("local entity registry mutex poisoned");
 
-        if let Some(actor_ref) = actors
+        if let Some(handle) = actors
             .get(entity_id)
-            .filter(|actor_ref| !actor_ref.is_terminated())
+            .filter(|handle| !handle.actor_ref.is_terminated())
         {
-            return Ok(actor_ref.clone());
+            return Ok(handle.actor_ref.clone());
         }
 
         let context = LocalEntityContext::new(
@@ -173,8 +243,55 @@ where
             )
             .map_err(|error| EntityDeliveryFailure::SpawnFailed(error.to_string()))?;
 
-        actors.insert(entity_id.clone(), actor_ref.clone());
+        actors.insert(
+            entity_id.clone(),
+            LocalEntityHandle {
+                shard_id,
+                actor_ref: actor_ref.clone(),
+            },
+        );
         Ok(actor_ref)
+    }
+
+    fn set_shard_state(&self, shard_id: ShardId, state: ShardHandoffState) {
+        self.shard_states
+            .lock()
+            .expect("local shard state registry mutex poisoned")
+            .insert(shard_id, state);
+    }
+
+    fn ensure_shard_accepts_delivery(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<(), EntityDeliveryFailure> {
+        match self.shard_handoff_state(shard_id) {
+            ShardHandoffState::Owning | ShardHandoffState::Acquired => Ok(()),
+            state @ (ShardHandoffState::Draining | ShardHandoffState::Transferring) => {
+                Err(EntityDeliveryFailure::ShardHandoff { shard_id, state })
+            }
+        }
+    }
+
+    fn stop_entities_for_shard(&self, shard_id: ShardId) -> usize {
+        let mut actors = self
+            .actors
+            .lock()
+            .expect("local entity registry mutex poisoned");
+        let entity_ids = actors
+            .iter()
+            .filter(|(_entity_id, handle)| handle.shard_id == shard_id)
+            .map(|(entity_id, _handle)| entity_id.clone())
+            .collect::<Vec<_>>();
+        let mut stopped = 0;
+
+        for entity_id in entity_ids {
+            if let Some(handle) = actors.remove(&entity_id) {
+                let _ = handle.actor_ref.stop();
+                stopped += 1;
+            }
+        }
+
+        stopped
     }
 }
 
@@ -191,6 +308,7 @@ where
             actor_options: self.actor_options.clone(),
             factory: self.factory.clone(),
             actors: self.actors.clone(),
+            shard_states: self.shard_states.clone(),
             _actor: PhantomData,
         }
     }
@@ -252,6 +370,26 @@ where
                     failure: EntityDeliveryFailure::MailboxClosed,
                 },
             })
+    }
+
+    fn local_node_id(&self) -> Option<&NodeId> {
+        Some(&self.local_node_id)
+    }
+
+    fn begin_shard_handoff(&self, shard_id: ShardId) -> crate::ShardingResult<usize> {
+        Ok(self.mark_shard_draining(shard_id))
+    }
+
+    fn complete_shard_handoff(&self, shard_id: ShardId) -> crate::ShardingResult<usize> {
+        Ok(self.mark_shard_transferring(shard_id))
+    }
+
+    fn acquire_shard(&self, shard_id: ShardId) -> crate::ShardingResult<usize> {
+        Ok(self.mark_shard_acquired(shard_id))
+    }
+
+    fn shard_handoff_state(&self, shard_id: ShardId) -> Option<ShardHandoffState> {
+        Some(LocalEntityRoute::shard_handoff_state(self, shard_id))
     }
 }
 

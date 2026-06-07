@@ -125,6 +125,8 @@ Out of scope:
 
 ## Slice 3D: Graceful Shard Handoff Protocol
 
+Status: implemented.
+
 Goal: make shard movement an explicit runtime flow instead of only a coordinator decision.
 
 Scope:
@@ -212,4 +214,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 3D: graceful shard handoff protocol. Slice 3C established a deterministic cluster/sharding runtime facade that applies discovery snapshots, promotes members after contact-point readiness, reconciles shard ownership, and refreshes registered shard regions after join, leave, unreachable, and compatibility-rejection scenarios.
+Continue with Slice 3E: entity passivation. Slice 3D established explicit graceful shard handoff states, deterministic local delivery rejection while shards drain or transfer, runtime handoff steps around graceful-leave moves, old-owner entity stopping/removal, and new-owner acquisition before ownership refresh is published.

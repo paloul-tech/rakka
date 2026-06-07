@@ -19,8 +19,9 @@ use rakka_sharding::{
     EntityRef, EntityTellError, EntityType, LocalEntityContext, LocalEntityRoute,
     RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound,
     RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
-    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision, ShardId,
-    ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
+    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision,
+    ShardHandoffState, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig,
+    ShardingError,
 };
 
 #[derive(Debug)]
@@ -545,6 +546,97 @@ fn cluster_sharding_runtime_moves_shards_from_leaving_node() {
     assert_eq!(region.owner_revision(), coordinator.revision());
 }
 
+#[tokio::test]
+async fn cluster_sharding_runtime_runs_graceful_handoff_before_ownership_publish() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let leaving = node("rakka-1", "uid-b");
+    let leaving_id = leaving.id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let route_a = LocalEntityRoute::new(
+        local_id.clone(),
+        ActorSystem::new("handoff-node-a-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let route_b = LocalEntityRoute::new(
+        leaving_id.clone(),
+        ActorSystem::new("handoff-node-b-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region_a = ShardRegion::new(entity_type.clone(), config.clone(), route_a.clone());
+    let region_b = ShardRegion::new(entity_type.clone(), config.clone(), route_b.clone());
+    let mut runtime = runtime_with_local(local.clone());
+
+    runtime.register_region(region_a.clone()).unwrap();
+    runtime.register_region(region_b.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, leaving]))
+        .unwrap();
+
+    let entity_id = entity_owned_by(runtime.coordinator(&entity_type).unwrap(), "rakka-1");
+    let entity = EntityRef::<CartCommand>::new(entity_type.clone(), entity_id);
+    let shard_key = entity.shard_key(&config);
+    let shard_id = shard_key.shard_id();
+
+    entity
+        .tell(&region_b, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    assert_eq!(route_b.entity_count(), 1);
+
+    let leave_update = runtime.mark_leaving(&leaving_id, 2).unwrap();
+    let states = leave_update
+        .handoffs()
+        .iter()
+        .filter(|handoff| handoff.shard() == &shard_key)
+        .map(|handoff| handoff.state())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        states,
+        vec![
+            ShardHandoffState::Draining,
+            ShardHandoffState::Transferring,
+            ShardHandoffState::Acquired,
+        ]
+    );
+    assert_eq!(
+        leave_update
+            .handoffs()
+            .iter()
+            .find(|handoff| {
+                handoff.shard() == &shard_key && handoff.state() == ShardHandoffState::Transferring
+            })
+            .unwrap()
+            .stopped_entities(),
+        1
+    );
+    assert_eq!(
+        route_b.shard_handoff_state(shard_id),
+        ShardHandoffState::Transferring
+    );
+    assert_eq!(route_b.entity_count(), 0);
+    assert_eq!(
+        route_a.shard_handoff_state(shard_id),
+        ShardHandoffState::Acquired
+    );
+
+    let coordinator = runtime.coordinator(&entity_type).unwrap();
+    assert_eq!(coordinator.owner_for_shard(shard_id).unwrap(), &local_id);
+    assert_eq!(region_a.owner_revision(), coordinator.revision());
+
+    entity
+        .tell(&region_a, CartCommand::Add("banana".to_string()))
+        .unwrap();
+    assert_eq!(route_a.entity_count(), 1);
+}
+
 #[test]
 fn cluster_sharding_runtime_failover_refreshes_regions_after_unreachable_tick() {
     let local = node("rakka-0", "uid-a");
@@ -911,6 +1003,56 @@ async fn local_entity_route_spawns_and_reuses_entity_actors() {
     assert_eq!(created[0].entity_id(), &EntityId::new("cart-42"));
     assert_eq!(created[0].entity_type(), &EntityType::new("Cart"));
     assert!(created[0].actor_name().contains("cart-42"));
+}
+
+#[tokio::test]
+async fn local_entity_route_rejects_new_delivery_while_shard_is_draining() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-shard-draining-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap();
+    let entity = region.entity_ref("cart-42");
+    let shard_id = entity.shard_id(region.config());
+
+    assert_eq!(route.mark_shard_draining(shard_id), 0);
+    let error = entity
+        .tell(&region, CartCommand::Add("apple".to_string()))
+        .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        EntityTellError::Delivery {
+            failure: EntityDeliveryFailure::ShardHandoff {
+                shard_id: failed_shard,
+                state: ShardHandoffState::Draining,
+            },
+            ..
+        } if *failed_shard == shard_id
+    ));
+    assert!(matches!(
+        error.into_message(),
+        CartCommand::Add(value) if value == "apple"
+    ));
+    assert_eq!(route.entity_count(), 0);
+
+    assert_eq!(route.mark_shard_acquired(shard_id), 0);
+    entity
+        .tell(&region, CartCommand::Add("banana".to_string()))
+        .unwrap();
+    assert_eq!(route.entity_count(), 1);
 }
 
 #[test]

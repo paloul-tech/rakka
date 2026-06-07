@@ -11,6 +11,7 @@ use rakka_core::{Message, ReplyTo};
 
 use crate::coordinator::ShardOwnershipSnapshot;
 use crate::error::{ShardingError, ShardingResult};
+use crate::handoff::ShardHandoffState;
 use crate::identity::{EntityId, EntityRef, EntityType, ShardId, ShardingConfig};
 
 /// Delivery failure reported by an entity route handler.
@@ -31,6 +32,13 @@ pub enum EntityDeliveryFailure {
     RemoteEncode(String),
     /// Encoded remote entity envelope could not be sent.
     RemoteSend(String),
+    /// Shard is temporarily unavailable during graceful handoff.
+    ShardHandoff {
+        /// Shard id being handed off.
+        shard_id: ShardId,
+        /// Current handoff state.
+        state: ShardHandoffState,
+    },
     /// Transport or route handler rejected the message.
     Rejected(String),
 }
@@ -44,6 +52,9 @@ impl Display for EntityDeliveryFailure {
             Self::SpawnFailed(message) => write!(f, "entity actor spawn failed: {message}"),
             Self::RemoteEncode(message) => write!(f, "remote entity encode failed: {message}"),
             Self::RemoteSend(message) => write!(f, "remote entity send failed: {message}"),
+            Self::ShardHandoff { shard_id, state } => {
+                write!(f, "shard {shard_id} is {state} during graceful handoff")
+            }
             Self::Rejected(message) => write!(f, "entity route rejected message: {message}"),
         }
     }
@@ -91,6 +102,9 @@ impl<M> EntityTellError<M> {
                     EntityAskError::RemoteEncode(message)
                 }
                 EntityDeliveryFailure::RemoteSend(message) => EntityAskError::RemoteSend(message),
+                EntityDeliveryFailure::ShardHandoff { shard_id, state } => {
+                    EntityAskError::ShardHandoff { shard_id, state }
+                }
                 EntityDeliveryFailure::Rejected(message) => EntityAskError::Rejected(message),
             },
         }
@@ -117,6 +131,13 @@ pub enum EntityAskError {
     RemoteEncode(String),
     /// Encoded remote entity envelope could not be sent.
     RemoteSend(String),
+    /// Shard is temporarily unavailable during graceful handoff.
+    ShardHandoff {
+        /// Shard id being handed off.
+        shard_id: ShardId,
+        /// Current handoff state.
+        state: ShardHandoffState,
+    },
     /// Route handler rejected delivery.
     Rejected(String),
     /// Timed out waiting for a reply.
@@ -135,6 +156,9 @@ impl Display for EntityAskError {
             Self::SpawnFailed(message) => write!(f, "entity actor spawn failed: {message}"),
             Self::RemoteEncode(message) => write!(f, "remote entity encode failed: {message}"),
             Self::RemoteSend(message) => write!(f, "remote entity send failed: {message}"),
+            Self::ShardHandoff { shard_id, state } => {
+                write!(f, "shard {shard_id} is {state} during graceful handoff")
+            }
             Self::Rejected(message) => write!(f, "entity route rejected message: {message}"),
             Self::Timeout => f.write_str("entity ask timed out"),
             Self::ReplyDropped => f.write_str("entity ask reply channel was dropped"),
@@ -217,6 +241,31 @@ where
 {
     /// Delivers a message after the region resolves its shard owner.
     fn deliver(&self, message: RoutedEntityMessage<M>) -> Result<(), EntityTellError<M>>;
+
+    /// Returns the local node id when this route represents local entity ownership.
+    fn local_node_id(&self) -> Option<&NodeId> {
+        None
+    }
+
+    /// Marks a shard as draining before ownership is published to a new owner.
+    fn begin_shard_handoff(&self, _shard_id: ShardId) -> ShardingResult<usize> {
+        Ok(0)
+    }
+
+    /// Stops local entities for a shard and marks it as transferring.
+    fn complete_shard_handoff(&self, _shard_id: ShardId) -> ShardingResult<usize> {
+        Ok(0)
+    }
+
+    /// Marks a shard as acquired by this route's local node.
+    fn acquire_shard(&self, _shard_id: ShardId) -> ShardingResult<usize> {
+        Ok(0)
+    }
+
+    /// Current known local handoff state for a shard, when tracked by this route.
+    fn shard_handoff_state(&self, _shard_id: ShardId) -> Option<ShardHandoffState> {
+        None
+    }
 }
 
 impl<M, F> EntityRoute<M> for F
@@ -410,6 +459,33 @@ where
             .lock()
             .expect("shard owner cache mutex poisoned")
             .refresh(snapshot)
+    }
+
+    /// Local node id for routes that host local entities.
+    #[must_use]
+    pub fn local_node_id(&self) -> Option<&NodeId> {
+        self.route.local_node_id()
+    }
+
+    /// Marks a shard as draining before ownership is published to a new owner.
+    pub fn begin_shard_handoff(&self, shard_id: ShardId) -> ShardingResult<usize> {
+        self.route.begin_shard_handoff(shard_id)
+    }
+
+    /// Stops local entities for a shard and marks it as transferring.
+    pub fn complete_shard_handoff(&self, shard_id: ShardId) -> ShardingResult<usize> {
+        self.route.complete_shard_handoff(shard_id)
+    }
+
+    /// Marks a shard as acquired by this region's local route.
+    pub fn acquire_shard(&self, shard_id: ShardId) -> ShardingResult<usize> {
+        self.route.acquire_shard(shard_id)
+    }
+
+    /// Current known local handoff state for a shard, when tracked by this route.
+    #[must_use]
+    pub fn shard_handoff_state(&self, shard_id: ShardId) -> Option<ShardHandoffState> {
+        self.route.shard_handoff_state(shard_id)
     }
 
     /// Returns the owner and shard id for an entity reference.

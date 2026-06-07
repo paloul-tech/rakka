@@ -835,6 +835,26 @@ where
             Err(error) => Err(error),
         }
     }
+
+    fn local_node_id(&self) -> Option<&NodeId> {
+        self.local_route.local_node_id()
+    }
+
+    fn begin_shard_handoff(&self, shard_id: crate::ShardId) -> crate::ShardingResult<usize> {
+        self.local_route.begin_shard_handoff(shard_id)
+    }
+
+    fn complete_shard_handoff(&self, shard_id: crate::ShardId) -> crate::ShardingResult<usize> {
+        self.local_route.complete_shard_handoff(shard_id)
+    }
+
+    fn acquire_shard(&self, shard_id: crate::ShardId) -> crate::ShardingResult<usize> {
+        self.local_route.acquire_shard(shard_id)
+    }
+
+    fn shard_handoff_state(&self, shard_id: crate::ShardId) -> Option<crate::ShardHandoffState> {
+        self.local_route.shard_handoff_state(shard_id)
+    }
 }
 
 struct RemoteRoutedEntityMessage<M> {

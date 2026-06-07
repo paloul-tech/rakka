@@ -5,6 +5,7 @@
 
 pub mod coordinator;
 pub mod error;
+pub mod handoff;
 pub mod identity;
 pub mod local;
 pub mod remote;
@@ -18,6 +19,7 @@ pub use coordinator::{
     ShardRebalancePlan,
 };
 pub use error::{ShardingError, ShardingResult};
+pub use handoff::{ShardHandoff, ShardHandoffState};
 pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingConfig};
 pub use local::{LocalEntityContext, LocalEntityRoute};
 pub use remote::{
