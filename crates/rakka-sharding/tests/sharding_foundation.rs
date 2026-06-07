@@ -28,6 +28,7 @@ use rakka_sharding::{
 enum CartCommand {
     Add(String),
     Get(ReplyTo<String>),
+    Passivate,
 }
 
 struct CartEntity {
@@ -88,6 +89,7 @@ impl Actor for CartEntity {
                     let value = format!("{}:{}", self.context.entity_id(), self.items.join(","));
                     let _ = reply_to.reply(value);
                 }
+                CartCommand::Passivate => return Ok(ActorAction::Stop),
             }
             Ok(ActorAction::Continue)
         })
@@ -293,6 +295,34 @@ fn coordinator_owners_exclude(coordinator: &ShardCoordinator, node_id: &NodeId) 
         .assignments()
         .iter()
         .all(|assignment| assignment.owner() != node_id)
+}
+
+fn entity_ref_in_different_shard(
+    entity_type: &EntityType,
+    config: &ShardingConfig,
+    avoided_shard: ShardId,
+) -> EntityRef<CartCommand> {
+    (0..1024)
+        .map(|index| EntityRef::new(entity_type.clone(), EntityId::new(format!("cart-{index}"))))
+        .find(|entity| entity.shard_id(config) != avoided_shard)
+        .expect("expected at least one entity to map to another shard")
+}
+
+async fn wait_for_entity_count<A, F>(
+    route: &LocalEntityRoute<CartCommand, A, F>,
+    expected_count: usize,
+) where
+    A: Actor<Msg = CartCommand>,
+    F: Fn(LocalEntityContext) -> A + Send + Sync + 'static,
+{
+    for _attempt in 0..20 {
+        if route.entity_count() == expected_count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(route.entity_count(), expected_count);
 }
 
 #[test]
@@ -822,6 +852,7 @@ fn shard_region_tell_routes_resolved_messages() {
             let payload = match message.into_message() {
                 CartCommand::Add(value) => value,
                 CartCommand::Get(_reply_to) => "unexpected-get".to_string(),
+                CartCommand::Passivate => "unexpected-passivate".to_string(),
             };
             delivered_for_route
                 .lock()
@@ -862,6 +893,7 @@ async fn shard_region_ask_routes_and_receives_replies() {
                     let _ = reply_to.reply("cart-is-ready".to_string());
                 }
                 CartCommand::Add(_value) => {}
+                CartCommand::Passivate => {}
             }
             Ok(())
         },
@@ -1003,6 +1035,163 @@ async fn local_entity_route_spawns_and_reuses_entity_actors() {
     assert_eq!(created[0].entity_id(), &EntityId::new("cart-42"));
     assert_eq!(created[0].entity_type(), &EntityType::new("Cart"));
     assert!(created[0].actor_name().contains("cart-42"));
+}
+
+#[tokio::test]
+async fn local_entity_route_recreates_entity_after_self_passivation() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let created_for_factory = created.clone();
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-self-passivation-test"),
+        move |context: LocalEntityContext| {
+            created_for_factory
+                .lock()
+                .expect("created mutex poisoned")
+                .push(context.clone());
+            CartEntity {
+                context,
+                items: Vec::new(),
+            }
+        },
+    );
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap();
+    let entity = region.entity_ref("cart-42");
+
+    entity
+        .tell(&region, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    let reply = entity
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+    assert_eq!(reply, "cart-42:apple");
+
+    entity.tell(&region, CartCommand::Passivate).unwrap();
+    wait_for_entity_count(&route, 0).await;
+    assert!(route.entity_actor(entity.entity_id()).is_none());
+
+    entity
+        .tell(&region, CartCommand::Add("banana".to_string()))
+        .unwrap();
+    let reply = entity
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "cart-42:banana");
+    assert_eq!(route.entity_count(), 1);
+    let created = created.lock().expect("created mutex poisoned");
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].entity_id(), created[1].entity_id());
+    assert_eq!(created[0].shard_id(), created[1].shard_id());
+}
+
+#[tokio::test]
+async fn local_entity_route_passivates_one_entity_without_affecting_other_shards() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(8).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-explicit-passivation-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &coordinator.snapshot(),
+        route.clone(),
+    )
+    .unwrap();
+    let first = region.entity_ref("cart-42");
+    let second =
+        entity_ref_in_different_shard(&entity_type, &config, first.shard_id(region.config()));
+
+    first
+        .tell(&region, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    second
+        .tell(&region, CartCommand::Add("pear".to_string()))
+        .unwrap();
+    assert_eq!(route.entity_count(), 2);
+
+    assert!(route.passivate_entity(first.entity_id()));
+    assert_eq!(route.entity_count(), 1);
+    let second_reply = second
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+    assert_eq!(
+        second_reply,
+        format!("{}:pear", second.entity_id().as_str())
+    );
+
+    first
+        .tell(&region, CartCommand::Add("banana".to_string()))
+        .unwrap();
+    let first_reply = first
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+
+    assert_eq!(first_reply, "cart-42:banana");
+    assert_eq!(route.entity_count(), 2);
+}
+
+#[tokio::test]
+async fn local_entity_route_idle_timeout_passivates_and_recreates_entity() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("Cart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-idle-passivation-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    )
+    .with_idle_passivation(Duration::from_millis(20));
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap();
+    let entity = region.entity_ref("cart-42");
+
+    entity
+        .tell(&region, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    assert_eq!(route.entity_count(), 1);
+
+    wait_for_entity_count(&route, 0).await;
+
+    entity
+        .tell(&region, CartCommand::Add("banana".to_string()))
+        .unwrap();
+    let reply = entity
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "cart-42:banana");
+    assert_eq!(route.entity_count(), 1);
 }
 
 #[tokio::test]

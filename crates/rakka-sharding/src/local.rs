@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rakka_cluster::NodeId;
 use rakka_core::{Actor, ActorOptions, ActorRef, ActorSystem, Message, TellError};
@@ -85,6 +87,8 @@ where
     factory: Arc<F>,
     actors: Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
     shard_states: Arc<Mutex<BTreeMap<ShardId, ShardHandoffState>>>,
+    next_idle_token: Arc<AtomicU64>,
+    idle_passivation_timeout: Option<Duration>,
     _actor: PhantomData<fn() -> A>,
 }
 
@@ -94,6 +98,7 @@ where
 {
     shard_id: ShardId,
     actor_ref: ActorRef<M>,
+    idle_token: u64,
 }
 
 impl<M> Clone for LocalEntityHandle<M>
@@ -104,6 +109,7 @@ where
         Self {
             shard_id: self.shard_id,
             actor_ref: self.actor_ref.clone(),
+            idle_token: self.idle_token,
         }
     }
 }
@@ -124,6 +130,8 @@ where
             factory: Arc::new(factory),
             actors: Arc::new(Mutex::new(BTreeMap::new())),
             shard_states: Arc::new(Mutex::new(BTreeMap::new())),
+            next_idle_token: Arc::new(AtomicU64::new(1)),
+            idle_passivation_timeout: None,
             _actor: PhantomData,
         }
     }
@@ -135,39 +143,69 @@ where
         self
     }
 
+    /// Enables idle passivation for local entities after the given timeout.
+    #[must_use]
+    pub fn with_idle_passivation(mut self, timeout: Duration) -> Self {
+        self.idle_passivation_timeout = Some(timeout);
+        self
+    }
+
     /// Local cluster node id accepted by this route.
     #[must_use]
     pub fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
 
+    /// Configured idle passivation timeout, when enabled.
+    #[must_use]
+    pub const fn idle_passivation_timeout(&self) -> Option<Duration> {
+        self.idle_passivation_timeout
+    }
+
     /// Number of currently cached local entity actors.
     #[must_use]
     pub fn entity_count(&self) -> usize {
-        let mut actors = self
+        let _removed = self.reap_terminated_entities();
+        let actors = self
             .actors
             .lock()
             .expect("local entity registry mutex poisoned");
-        actors.retain(|_entity_id, handle| !handle.actor_ref.is_terminated());
         actors.len()
     }
 
     /// Returns a cached local entity actor ref.
     #[must_use]
     pub fn entity_actor(&self, entity_id: &EntityId) -> Option<ActorRef<M>> {
+        self.remove_terminated_entity(entity_id);
+        let actors = self
+            .actors
+            .lock()
+            .expect("local entity registry mutex poisoned");
+        actors.get(entity_id).map(|handle| handle.actor_ref.clone())
+    }
+
+    /// Removes terminated entity actors from the local registry.
+    #[must_use]
+    pub fn reap_terminated_entities(&self) -> usize {
         let mut actors = self
             .actors
             .lock()
             .expect("local entity registry mutex poisoned");
-        if actors
-            .get(entity_id)
-            .is_some_and(|handle| handle.actor_ref.is_terminated())
-        {
-            actors.remove(entity_id);
-            None
-        } else {
-            actors.get(entity_id).map(|handle| handle.actor_ref.clone())
-        }
+        let before = actors.len();
+        actors.retain(|_entity_id, handle| !handle.actor_ref.is_terminated());
+        before - actors.len()
+    }
+
+    /// Explicitly passivates one local entity actor.
+    #[must_use]
+    pub fn passivate_entity(&self, entity_id: &EntityId) -> bool {
+        passivate_entity_in(&self.actors, entity_id)
+    }
+
+    /// Explicitly passivates every local entity actor in a shard.
+    #[must_use]
+    pub fn passivate_shard(&self, shard_id: ShardId) -> usize {
+        passivate_shard_in(&self.actors, shard_id)
     }
 
     /// Current handoff state for a shard.
@@ -190,7 +228,7 @@ where
     /// Stops local entities for a shard and marks it as transferring.
     pub fn mark_shard_transferring(&self, shard_id: ShardId) -> usize {
         self.set_shard_state(shard_id, ShardHandoffState::Transferring);
-        self.stop_entities_for_shard(shard_id)
+        self.passivate_shard(shard_id)
     }
 
     /// Marks a shard as acquired by this local route.
@@ -212,6 +250,7 @@ where
         shard_id: ShardId,
     ) -> Result<ActorRef<M>, EntityDeliveryFailure> {
         self.ensure_shard_accepts_delivery(shard_id)?;
+        self.remove_terminated_entity(entity_id);
 
         let mut actors = self
             .actors
@@ -248,6 +287,7 @@ where
             LocalEntityHandle {
                 shard_id,
                 actor_ref: actor_ref.clone(),
+                idle_token: self.next_idle_token(),
             },
         );
         Ok(actor_ref)
@@ -272,26 +312,51 @@ where
         }
     }
 
-    fn stop_entities_for_shard(&self, shard_id: ShardId) -> usize {
+    fn schedule_idle_passivation(&self, entity_id: EntityId) {
+        let Some(timeout) = self.idle_passivation_timeout else {
+            return;
+        };
+        let idle_token = {
+            let mut actors = self
+                .actors
+                .lock()
+                .expect("local entity registry mutex poisoned");
+            let Some(handle) = actors
+                .get_mut(&entity_id)
+                .filter(|handle| !handle.actor_ref.is_terminated())
+            else {
+                return;
+            };
+            let idle_token = self.next_idle_token();
+            handle.idle_token = idle_token;
+            idle_token
+        };
+        let actors = self.actors.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            passivate_entity_if_idle(&actors, &entity_id, idle_token);
+        });
+    }
+
+    fn remove_terminated_entity(&self, entity_id: &EntityId) -> bool {
         let mut actors = self
             .actors
             .lock()
             .expect("local entity registry mutex poisoned");
-        let entity_ids = actors
-            .iter()
-            .filter(|(_entity_id, handle)| handle.shard_id == shard_id)
-            .map(|(entity_id, _handle)| entity_id.clone())
-            .collect::<Vec<_>>();
-        let mut stopped = 0;
-
-        for entity_id in entity_ids {
-            if let Some(handle) = actors.remove(&entity_id) {
-                let _ = handle.actor_ref.stop();
-                stopped += 1;
-            }
+        if actors
+            .get(entity_id)
+            .is_some_and(|handle| handle.actor_ref.is_terminated())
+        {
+            actors.remove(entity_id);
+            true
+        } else {
+            false
         }
+    }
 
-        stopped
+    fn next_idle_token(&self) -> u64 {
+        self.next_idle_token.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -309,6 +374,8 @@ where
             factory: self.factory.clone(),
             actors: self.actors.clone(),
             shard_states: self.shard_states.clone(),
+            next_idle_token: self.next_idle_token.clone(),
+            idle_passivation_timeout: self.idle_passivation_timeout,
             _actor: PhantomData,
         }
     }
@@ -358,6 +425,7 @@ where
             }
         };
 
+        let entity_id = message.entity_id().clone();
         actor_ref
             .tell(message.into_message())
             .map_err(|error| match error {
@@ -369,7 +437,9 @@ where
                     message,
                     failure: EntityDeliveryFailure::MailboxClosed,
                 },
-            })
+            })?;
+        self.schedule_idle_passivation(entity_id);
+        Ok(())
     }
 
     fn local_node_id(&self) -> Option<&NodeId> {
@@ -390,6 +460,78 @@ where
 
     fn shard_handoff_state(&self, shard_id: ShardId) -> Option<ShardHandoffState> {
         Some(LocalEntityRoute::shard_handoff_state(self, shard_id))
+    }
+}
+
+fn passivate_entity_in<M>(
+    actors: &Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
+    entity_id: &EntityId,
+) -> bool
+where
+    M: Message,
+{
+    let handle = actors
+        .lock()
+        .expect("local entity registry mutex poisoned")
+        .remove(entity_id);
+
+    if let Some(handle) = handle {
+        let _ = handle.actor_ref.stop();
+        true
+    } else {
+        false
+    }
+}
+
+fn passivate_shard_in<M>(
+    actors: &Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
+    shard_id: ShardId,
+) -> usize
+where
+    M: Message,
+{
+    let mut actors = actors.lock().expect("local entity registry mutex poisoned");
+    let entity_ids = actors
+        .iter()
+        .filter(|(_entity_id, handle)| handle.shard_id == shard_id)
+        .map(|(entity_id, _handle)| entity_id.clone())
+        .collect::<Vec<_>>();
+    let mut passivated = 0;
+
+    for entity_id in entity_ids {
+        if let Some(handle) = actors.remove(&entity_id) {
+            let _ = handle.actor_ref.stop();
+            passivated += 1;
+        }
+    }
+
+    passivated
+}
+
+fn passivate_entity_if_idle<M>(
+    actors: &Arc<Mutex<BTreeMap<EntityId, LocalEntityHandle<M>>>>,
+    entity_id: &EntityId,
+    idle_token: u64,
+) -> bool
+where
+    M: Message,
+{
+    let handle = {
+        let mut actors = actors.lock().expect("local entity registry mutex poisoned");
+        if actors.get(entity_id).is_some_and(|handle| {
+            handle.idle_token == idle_token && !handle.actor_ref.is_terminated()
+        }) {
+            actors.remove(entity_id)
+        } else {
+            None
+        }
+    };
+
+    if let Some(handle) = handle {
+        let _ = handle.actor_ref.stop();
+        true
+    } else {
+        false
     }
 }
 

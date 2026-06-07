@@ -151,6 +151,8 @@ Out of scope:
 
 ## Slice 3E: Entity Passivation
 
+Status: implemented.
+
 Goal: allow idle local sharded entities to stop and be recreated on demand.
 
 Scope:
@@ -214,4 +216,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 3E: entity passivation. Slice 3D established explicit graceful shard handoff states, deterministic local delivery rejection while shards drain or transfer, runtime handoff steps around graceful-leave moves, old-owner entity stopping/removal, and new-owner acquisition before ownership refresh is published.
+Continue with Slice 3F: compatibility hardening. Slice 3E established route-driven passivation, actor self-passivation through normal `ActorAction::Stop`, idle-timeout passivation with stale timer protection, registry cleanup for terminated/passivated entities, and recreate-on-next-message behavior.
