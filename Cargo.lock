@@ -840,6 +840,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-durable-workflow"
+version = "0.1.0"
+dependencies = [
+ "rakka-persistence",
+ "rakka-workflow",
+ "tokio",
+]
+
+[[package]]
+name = "rakka-example-external-binary-wrapper"
+version = "0.1.0"
+dependencies = [
+ "rakka-core",
+ "rakka-process",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-minimal-system"
 version = "0.1.0"
 dependencies = [

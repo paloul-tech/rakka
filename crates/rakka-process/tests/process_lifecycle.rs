@@ -1,10 +1,8 @@
 //! Integration tests for process configuration, lifecycle, and stdio protocols.
 
 use std::fs;
-use std::io::Write;
-use std::net::TcpListener;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rakka_cluster::{
     ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
@@ -12,14 +10,15 @@ use rakka_cluster::{
 use rakka_core::ActorSystem;
 use rakka_process::{
     process_backed_entity_route, run_file_watch, run_one_shot, spawn_process_actor,
-    start_local_grpc_process, start_socket_process, EndpointReadinessConfig, ExecutableAllowlist,
-    FileWatchCleanup, FileWatchCompletion, FileWatchConfig, FileWatchInput, FileWatchOutcome,
-    LocalEndpoint, LocalGrpcEndpoint, LocalGrpcProcessConfig, ManagedProcess, OneShotConfig,
-    OneShotOutcome, ProcessActorCommand, ProcessActorConfig, ProcessActorState,
-    ProcessBackedEntityAction, ProcessBackedEntityBehavior, ProcessBackedEntityContext,
-    ProcessBackedEntityFuture, ProcessBackedEntityProcess, ProcessCheck, ProcessError,
-    ProcessHealth, ProcessRestartPolicy, ProcessShutdownOutcome, ProcessSpec, ProcessStdio,
-    RawLineStdioCodec, SocketProcessConfig, StdioCommand, StdioProtocolConfig, StdioStatus,
+    start_local_grpc_process, start_socket_process, testkit as process_testkit,
+    EndpointReadinessConfig, ExecutableAllowlist, FileWatchCleanup, FileWatchCompletion,
+    FileWatchConfig, FileWatchInput, FileWatchOutcome, LocalEndpoint, LocalGrpcEndpoint,
+    LocalGrpcProcessConfig, ManagedProcess, OneShotConfig, OneShotOutcome, ProcessActorCommand,
+    ProcessActorConfig, ProcessActorState, ProcessBackedEntityAction, ProcessBackedEntityBehavior,
+    ProcessBackedEntityContext, ProcessBackedEntityFuture, ProcessBackedEntityProcess,
+    ProcessCheck, ProcessError, ProcessHealth, ProcessRestartPolicy, ProcessShutdownOutcome,
+    ProcessSpec, ProcessStdio, RawLineStdioCodec, SocketProcessConfig, StdioCommand,
+    StdioProtocolConfig, StdioStatus,
 };
 use rakka_sharding::{
     EntityId, EntityRef, EntityType, ShardCoordinator, ShardRegion, ShardingConfig,
@@ -58,7 +57,7 @@ async fn managed_process_starts_and_stops_gracefully_by_closing_stdin() {
     let mut process = ManagedProcess::spawn(
         fixture_spec("fixture_waits_for_stdin_eof")
             .stdin(ProcessStdio::Piped)
-            .shutdown_timeout(Duration::from_secs(2)),
+            .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
         &fixture_allowlist(),
     )
     .expect("fixture process should spawn");
@@ -156,7 +155,7 @@ async fn process_actor_starts_on_explicit_command_and_reports_status() {
         ProcessActorConfig::new(
             fixture_spec("fixture_waits_for_stdin_eof")
                 .stdin(ProcessStdio::Piped)
-                .shutdown_timeout(Duration::from_secs(2)),
+                .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
             fixture_allowlist(),
         )
         .without_supervision_interval(),
@@ -186,7 +185,7 @@ async fn process_actor_can_start_child_when_actor_starts() {
         ProcessActorConfig::new(
             fixture_spec("fixture_waits_for_stdin_eof")
                 .stdin(ProcessStdio::Piped)
-                .shutdown_timeout(Duration::from_secs(2)),
+                .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
             fixture_allowlist(),
         )
         .start_on_actor_start()
@@ -255,10 +254,7 @@ async fn process_actor_restarts_unexpected_exit_until_budget_is_exhausted() {
 
     let failed = wait_for_state(&actor, ProcessActorState::Failed).await;
     assert_eq!(failed.restart_count(), 1);
-    assert!(matches!(
-        failed.last_error(),
-        Some(ProcessError::RestartBudgetExhausted { max_restarts: 1 })
-    ));
+    process_testkit::assert_restart_budget_exhausted(&failed, 1);
 
     system.shutdown();
 }
@@ -272,7 +268,7 @@ async fn process_actor_health_check_failure_triggers_supervision() {
         ProcessActorConfig::new(
             fixture_spec("fixture_waits_for_stdin_eof")
                 .stdin(ProcessStdio::Piped)
-                .shutdown_timeout(Duration::from_secs(2)),
+                .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
             fixture_allowlist(),
         )
         .health_check(ProcessCheck::unhealthy("not ready"))
@@ -342,8 +338,13 @@ async fn line_json_actor_round_trips_typed_payload_and_captures_stderr() {
             value: "hello json".to_string()
         }
     );
-    let stderr = wait_for_stderr(&actor).await;
-    assert!(stderr.iter().any(|line| line.contains("line-json:stdio-1")));
+    let stderr = process_testkit::wait_for_stderr_line(
+        &actor,
+        "line-json:stdio-1",
+        process_testkit::DEFAULT_TEST_TIMEOUT,
+    )
+    .await;
+    process_testkit::assert_stderr_line_contains(&stderr, "line-json:stdio-1");
 
     system.shutdown();
 }
@@ -539,6 +540,8 @@ async fn one_shot_returns_stdout_stderr_and_exit_status() {
         panic!("one-shot should exit before timeout");
     };
     assert!(output.exit().success());
+    process_testkit::assert_output_contains("stdout", output.stdout(), b"stdout:hello one-shot");
+    process_testkit::assert_output_contains("stderr", output.stderr(), b"stderr:hello one-shot");
     assert_eq!(output.stdout(), b"stdout:hello one-shot\n");
     assert_eq!(output.stderr(), b"stderr:hello one-shot\n");
 }
@@ -553,7 +556,7 @@ async fn one_shot_timeout_returns_typed_timeout_result() {
     .await
     .expect("one-shot timeout should be a typed outcome");
 
-    assert!(matches!(outcome, OneShotOutcome::TimedOut { .. }));
+    process_testkit::assert_one_shot_timed_out(&outcome);
     assert!(!outcome.exit().success());
 }
 
@@ -589,7 +592,7 @@ async fn file_watch_completes_in_sandbox_collects_outputs_and_cleans_up() {
         .input(FileWatchInput::new("input.txt", "payload"))
         .required_output("output.txt")
         .cleanup(FileWatchCleanup::RemoveOnSuccess)
-        .timeout(Duration::from_secs(1)),
+        .timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
     )
     .await
     .expect("file-watch process should complete");
@@ -657,11 +660,12 @@ async fn socket_process_waits_for_tcp_readiness() {
         fixture_spec("fixture_tcp_server")
             .arg(port.to_string())
             .stdin(ProcessStdio::Piped)
-            .shutdown_timeout(Duration::from_secs(1)),
+            .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
         &fixture_allowlist(),
         LocalEndpoint::tcp("127.0.0.1", port),
-        SocketProcessConfig::new()
-            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_secs(1))),
+        SocketProcessConfig::new().readiness(
+            EndpointReadinessConfig::new().timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
+        ),
     )
     .await
     .expect("socket process should become ready");
@@ -703,11 +707,12 @@ async fn socket_process_waits_for_unix_readiness() {
         fixture_spec("fixture_unix_server")
             .arg(socket_path.clone())
             .stdin(ProcessStdio::Piped)
-            .shutdown_timeout(Duration::from_secs(1)),
+            .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
         &fixture_allowlist(),
         LocalEndpoint::unix(socket_path.clone()),
-        SocketProcessConfig::new()
-            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_secs(1))),
+        SocketProcessConfig::new().readiness(
+            EndpointReadinessConfig::new().timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
+        ),
     )
     .await
     .expect("unix socket process should become ready");
@@ -732,11 +737,12 @@ async fn local_grpc_process_waits_for_local_endpoint_readiness() {
         fixture_spec("fixture_tcp_server")
             .arg(port.to_string())
             .stdin(ProcessStdio::Piped)
-            .shutdown_timeout(Duration::from_secs(1)),
+            .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
         &fixture_allowlist(),
         endpoint,
-        LocalGrpcProcessConfig::new()
-            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_secs(1))),
+        LocalGrpcProcessConfig::new().readiness(
+            EndpointReadinessConfig::new().timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
+        ),
     )
     .await
     .expect("local grpc process should become ready");
@@ -784,7 +790,7 @@ async fn process_backed_entity_starts_child_on_first_entity_ref_message_after_re
         .ask(
             &region,
             |reply_to| ProcessEntityCommand::Status { reply_to },
-            Duration::from_secs(2),
+            process_testkit::DEFAULT_TEST_TIMEOUT,
         )
         .await
         .expect("entity ask should route")
@@ -846,7 +852,7 @@ async fn process_backed_entity_handoff_stops_old_child_before_new_owner_activate
         .ask(
             &region_a,
             |reply_to| ProcessEntityCommand::Status { reply_to },
-            Duration::from_secs(2),
+            process_testkit::DEFAULT_TEST_TIMEOUT,
         )
         .await
         .expect("owner a ask should route")
@@ -875,7 +881,7 @@ async fn process_backed_entity_handoff_stops_old_child_before_new_owner_activate
         .ask(
             &region_b,
             |reply_to| ProcessEntityCommand::Status { reply_to },
-            Duration::from_secs(2),
+            process_testkit::DEFAULT_TEST_TIMEOUT,
         )
         .await
         .expect("owner b ask should route")
@@ -889,23 +895,23 @@ async fn process_backed_entity_handoff_stops_old_child_before_new_owner_activate
 }
 
 fn fixture_spec(test_name: &str) -> ProcessSpec {
-    ProcessSpec::new(fixture_executable()).arg(test_name)
+    fixture().spec(test_name)
 }
 
 fn stdio_fixture_spec(test_name: &str) -> ProcessSpec {
-    fixture_spec(test_name)
-        .stdin(ProcessStdio::Piped)
-        .stdout(ProcessStdio::Piped)
-        .stderr(ProcessStdio::Piped)
-        .shutdown_timeout(Duration::from_secs(2))
+    fixture().stdio_spec(test_name)
 }
 
 fn fixture_allowlist() -> ExecutableAllowlist {
-    ExecutableAllowlist::from_exact_paths([fixture_executable()])
+    fixture().allowlist()
 }
 
 fn fixture_executable() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_rakka-process-fixture"))
+    fixture().executable().to_path_buf()
+}
+
+fn fixture() -> process_testkit::ProcessFixture {
+    process_testkit::ProcessFixture::new(env!("CARGO_BIN_EXE_rakka-process-fixture"))
 }
 
 fn process_behavior_factory(
@@ -953,149 +959,59 @@ fn membership_with_up_nodes(nodes: Vec<ClusterNode>) -> ClusterMembership {
 }
 
 fn append_test_line(path: &PathBuf, line: &str) -> Result<(), ProcessError> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| ProcessError::FileIo {
-            path: path.clone(),
-            message: error.to_string(),
-        })?;
-    writeln!(file, "{line}").map_err(|error| ProcessError::FileIo {
+    process_testkit::append_line(path, line).map_err(|error| ProcessError::FileIo {
         path: path.clone(),
         message: error.to_string(),
     })
 }
 
 fn read_lines(path: &PathBuf) -> Vec<String> {
-    fs::read_to_string(path)
-        .expect("log file should be readable")
-        .lines()
-        .map(ToString::to_string)
-        .collect()
+    process_testkit::read_lines(path).expect("log file should be readable")
 }
 
 async fn wait_for_log_line(path: &PathBuf, expected: &str) {
-    for _attempt in 0..100 {
-        if path.exists() && read_lines(path).iter().any(|line| line == expected) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert!(
-        path.exists() && read_lines(path).iter().any(|line| line == expected),
-        "expected log line {expected:?} in {}",
-        path.display()
-    );
+    process_testkit::wait_for_file_line(path, expected, process_testkit::DEFAULT_TEST_TIMEOUT)
+        .await
+        .expect("expected log line should be written");
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "rakka-process-{name}-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-fn unique_short_temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    PathBuf::from("/tmp").join(format!(
-        "rakka-process-{name}-{}-{nanos}",
-        std::process::id()
-    ))
+    process_testkit::unique_temp_dir(format!("rakka-process-{name}"))
 }
 
 #[cfg(unix)]
 fn available_unix_socket_path(name: &str) -> Option<(PathBuf, PathBuf)> {
-    let sandbox = unique_short_temp_dir(name);
-    fs::create_dir_all(&sandbox).expect("sandbox should be created");
-    let socket_path = sandbox.join("fixture.sock");
-    match std::os::unix::net::UnixListener::bind(&socket_path) {
-        Ok(listener) => {
-            drop(listener);
-            fs::remove_file(&socket_path).expect("probe unix socket should be removable");
-            Some((sandbox, socket_path))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            let _removed = fs::remove_dir_all(&sandbox);
-            None
-        }
-        Err(error) => panic!("unix socket should bind: {error}"),
-    }
+    process_testkit::available_unix_socket_path(format!("rakka-process-{name}"))
 }
 
 fn available_tcp_port() -> Option<u16> {
-    let listener = match TcpListener::bind(("127.0.0.1", 0)) {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
-        Err(error) => panic!("ephemeral tcp port should bind: {error}"),
-    };
-    Some(
-        listener
-            .local_addr()
-            .expect("listener address should be available")
-            .port(),
-    )
+    process_testkit::available_tcp_port()
 }
 
 async fn ask_start(
     actor: &rakka_core::ActorRef<ProcessActorCommand>,
 ) -> Result<rakka_process::ProcessActorStatus, ProcessError> {
-    actor
-        .ask(
-            |reply_to| ProcessActorCommand::Start { reply_to },
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("start ask should receive a reply")
+    process_testkit::start_process(actor).await
 }
 
 async fn ask_stop(
     actor: &rakka_core::ActorRef<ProcessActorCommand>,
 ) -> Result<rakka_process::ProcessActorStatus, ProcessError> {
-    actor
-        .ask(
-            |reply_to| ProcessActorCommand::Stop { reply_to },
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("stop ask should receive a reply")
+    process_testkit::stop_process(actor).await
 }
 
 async fn ask_status(
     actor: &rakka_core::ActorRef<ProcessActorCommand>,
 ) -> rakka_process::ProcessActorStatus {
-    actor
-        .ask(
-            |reply_to| ProcessActorCommand::Status { reply_to },
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("status ask should receive a reply")
+    process_testkit::process_status(actor).await
 }
 
 async fn wait_for_state(
     actor: &rakka_core::ActorRef<ProcessActorCommand>,
     expected: ProcessActorState,
 ) -> rakka_process::ProcessActorStatus {
-    for _attempt in 0..100 {
-        let status = ask_status(actor).await;
-        if status.state() == expected {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    let status = ask_status(actor).await;
-    assert_eq!(status.state(), expected);
-    status
+    process_testkit::wait_for_process_state(actor, expected, process_testkit::DEFAULT_TEST_TIMEOUT)
+        .await
 }
 
 async fn ask_stdio<Req, Resp>(
@@ -1107,17 +1023,7 @@ where
     Req: Send + 'static,
     Resp: Send + 'static,
 {
-    actor
-        .ask(
-            |reply_to| StdioCommand::RequestWithTimeout {
-                request,
-                timeout,
-                reply_to,
-            },
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("stdio ask should receive a reply")
+    process_testkit::request_stdio(actor, request, timeout).await
 }
 
 async fn ask_stdio_status<Req, Resp>(
@@ -1127,29 +1033,7 @@ where
     Req: Send + 'static,
     Resp: Send + 'static,
 {
-    actor
-        .ask(
-            |reply_to| StdioCommand::Status { reply_to },
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("stdio status ask should receive a reply")
-}
-
-async fn ask_stdio_stderr<Req, Resp>(
-    actor: &rakka_core::ActorRef<StdioCommand<Req, Resp>>,
-) -> Vec<String>
-where
-    Req: Send + 'static,
-    Resp: Send + 'static,
-{
-    actor
-        .ask(
-            |reply_to| StdioCommand::Stderr { reply_to },
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("stdio stderr ask should receive a reply")
+    process_testkit::stdio_status(actor).await
 }
 
 async fn wait_for_pending_count<Req, Resp>(
@@ -1159,32 +1043,12 @@ async fn wait_for_pending_count<Req, Resp>(
     Req: Send + 'static,
     Resp: Send + 'static,
 {
-    for _attempt in 0..100 {
-        if ask_stdio_status(actor).await.pending_count() == expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert_eq!(ask_stdio_status(actor).await.pending_count(), expected);
-}
-
-async fn wait_for_stderr<Req, Resp>(
-    actor: &rakka_core::ActorRef<StdioCommand<Req, Resp>>,
-) -> Vec<String>
-where
-    Req: Send + 'static,
-    Resp: Send + 'static,
-{
-    for _attempt in 0..100 {
-        let stderr = ask_stdio_stderr(actor).await;
-        if !stderr.is_empty() {
-            return stderr;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    ask_stdio_stderr(actor).await
+    process_testkit::wait_for_stdio_pending_count(
+        actor,
+        expected,
+        process_testkit::DEFAULT_TEST_TIMEOUT,
+    )
+    .await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1218,7 +1082,7 @@ impl ProcessBackedEntityBehavior<ProcessEntityCommand> for ProcessEntityBehavior
             fixture_spec("fixture_process_entity_lifecycle")
                 .arg(self.log_path.clone())
                 .stdin(ProcessStdio::Piped)
-                .shutdown_timeout(Duration::from_secs(1)),
+                .shutdown_timeout(process_testkit::DEFAULT_TEST_TIMEOUT),
             fixture_allowlist(),
         )
     }

@@ -269,7 +269,7 @@ Out of scope:
 
 ## Slice 4H: Phase 4 Examples, Testkit, and Documentation
 
-Status: planned.
+Status: implemented.
 
 Goal: make Phase 4 behavior reviewable by humans and reusable in tests.
 
@@ -289,6 +289,14 @@ Acceptance criteria:
 - Docs explain process actor ownership, process-backed entities, and durable workflow reliability boundaries.
 - Phase 4 completion status is clear.
 
+Implementation notes:
+
+- Added `rakka-example-external-binary-wrapper`, a self-contained line-json child-process wrapper runnable with `cargo run`.
+- Added `rakka-example-durable-workflow`, a durable inbox/outbox example covering deduplication, restart recovery, retry, and success telemetry.
+- Added `rakka_process::testkit` helpers for fixture specs, temp paths, endpoint probes, output assertions, process actor state waits, stdio requests, stderr waits, and one-shot timeout assertions.
+- Updated process lifecycle tests to use the reusable process testkit helpers.
+- Added `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, process-backed entity boundaries, workflow reliability boundaries, and the v1 sidecar out-of-scope note.
+
 ## Suggested Next Slice
 
-Continue with Slice 4H: Phase 4 examples, testkit, and documentation. Slice 4G added durable outbox scheduling, retry/backoff handling, timeout and exhaustion telemetry, outbound deduplication, restart recovery, and dispatch ordering guarantees on top of `rakka-workflow`.
+Phase 4 is complete. The next planning step is Phase 5: public streams, HTTP, gRPC, and Kubernetes operational integrations, while preserving the Phase 4 boundary that process actors own local child processes inside Rakka node containers for v1.

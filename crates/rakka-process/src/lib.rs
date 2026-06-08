@@ -17,6 +17,7 @@ mod oneshot;
 mod sharded;
 mod spec;
 mod stdio;
+pub mod testkit;
 
 pub use actor::{
     spawn_process_actor, ProcessActor, ProcessActorCommand, ProcessActorConfig,
