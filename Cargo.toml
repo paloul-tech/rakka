@@ -32,6 +32,7 @@ readme = "README.md"
 futures-util = "0.3"
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = [
     "io-util",
     "macros",

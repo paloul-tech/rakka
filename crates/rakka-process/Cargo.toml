@@ -11,6 +11,8 @@ readme.workspace = true
 
 [dependencies]
 rakka-core = { path = "../rakka-core" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [lints]

@@ -59,7 +59,7 @@ Minimum completion criteria:
 
 ## Slice 4A: Process Configuration and Lifecycle Primitives
 
-Status: planned.
+Status: implemented.
 
 Goal: define the typed configuration and low-level process ownership primitives that every process mode will share.
 
@@ -96,7 +96,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 ## Slice 4B: Process Actor Runtime and Supervision
 
-Status: planned.
+Status: implemented.
 
 Goal: turn process lifecycle primitives into an actor-owned runtime with supervision behavior.
 
@@ -124,7 +124,7 @@ Out of scope:
 
 ## Slice 4C: Stdio and Line-JSON Process Protocols
 
-Status: planned.
+Status: implemented.
 
 Goal: support the two most important long-running child-process protocols for legacy wrappers.
 
@@ -283,4 +283,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Start with Slice 4A: process configuration and lifecycle primitives. This creates the shared process foundation needed by every later process actor mode and keeps the first implementation slice reviewable before actor supervision and protocol complexity arrive.
+Continue with Slice 4D: one-shot, file-watch, socket, and local gRPC modes. Slice 4C established raw line stdio and line-json request/reply protocol actors with request ids, bounded pending requests, request timeouts, stdout/stderr reader tasks, malformed-output failure, process-exit cleanup, actor-stop cleanup, and dedicated fixture binaries for protocol tests.

@@ -908,6 +908,8 @@ name = "rakka-process"
 version = "0.1.0"
 dependencies = [
  "rakka-core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

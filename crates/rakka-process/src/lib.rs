@@ -7,6 +7,27 @@ use std::ffi::OsStr;
 
 use rakka_core::Subsystem;
 
+mod actor;
+mod error;
+mod managed;
+mod spec;
+mod stdio;
+
+pub use actor::{
+    spawn_process_actor, ProcessActor, ProcessActorCommand, ProcessActorConfig,
+    ProcessActorStartMode, ProcessActorState, ProcessActorStatus, ProcessCheck, ProcessHealth,
+    ProcessRestartJitter, ProcessRestartPolicy, ProcessSupervisionEvent,
+};
+pub use error::{ProcessError, ProcessResult};
+pub use managed::{
+    ManagedProcess, ProcessExit, ProcessShutdown, ProcessShutdownOutcome, ProcessStart,
+};
+pub use spec::{ExecutableAllowlist, GracefulShutdown, ProcessSpec, ProcessStdio, ResourceHints};
+pub use stdio::{
+    spawn_stdio_actor, LineJsonCodec, LineJsonFrame, RawLineStdioCodec, StdioActor, StdioCodec,
+    StdioCommand, StdioProtocolConfig, StdioReply, StdioStatus,
+};
+
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-process";
 
