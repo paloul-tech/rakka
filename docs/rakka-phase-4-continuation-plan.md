@@ -207,7 +207,7 @@ Out of scope:
 
 ## Slice 4F: Workflow Data Model and Durable Inbox
 
-Status: planned.
+Status: implemented.
 
 Goal: establish durable workflow state and idempotent command acceptance.
 
@@ -283,4 +283,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 4F: workflow data model and durable inbox. Slice 4E established a process-backed sharded entity actor pattern that plugs into `LocalEntityRoute` and `EntityRef<M>`, starts the child process on first routed message after a recovery hook, derives working-directory/log/fencing identity from sharding context, and shuts down child processes during explicit passivation and shard handoff.
+Continue with Slice 4G: durable outbox, retries, and recovery. Slice 4F established the workflow data model, deterministic workflow clocks, durable inbox snapshots on top of `rakka-persistence`, inbox deduplication keys, persisted inbox status transitions, recovery from in-memory durable state, and typed revision-conflict workflow failures.

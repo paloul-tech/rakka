@@ -5,6 +5,19 @@
 
 use rakka_core::Subsystem;
 
+mod clock;
+mod error;
+mod inbox;
+mod model;
+
+pub use clock::{ManualWorkflowClock, SystemWorkflowClock, WorkflowClock};
+pub use error::{WorkflowError, WorkflowResult};
+pub use inbox::{DurableInbox, InboxAcceptance, InboxCommand};
+pub use model::{
+    DeduplicationKey, InboxEntry, InboxStatus, OutboxEntry, OutboxMessageId, OutboxStatus,
+    RetryAttempt, WorkflowId, WorkflowMessageId, WorkflowState, WorkflowStatus, WorkflowTimestamp,
+};
+
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-workflow";
 

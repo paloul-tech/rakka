@@ -958,6 +958,9 @@ name = "rakka-workflow"
 version = "0.1.0"
 dependencies = [
  "rakka-core",
+ "rakka-persistence",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
