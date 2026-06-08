@@ -234,7 +234,7 @@ Out of scope:
 
 ## Slice 4G: Durable Outbox, Retries, and Recovery
 
-Status: planned.
+Status: implemented.
 
 Goal: add reliable side-effect scheduling on top of workflow state.
 
@@ -253,6 +253,14 @@ Acceptance criteria:
 - Exhausted retries become observable durable state rather than disappearing.
 - Duplicate outbound deduplication keys do not dispatch duplicate effects.
 - Recovery does not process the next workflow command until required persistence has succeeded.
+
+Implementation notes:
+
+- Added durable outbox scheduling to `rakka-workflow` with actor, entity, and application dispatch targets.
+- Added retry policies with max attempts, bounded exponential backoff, deterministic jitter, due-time scheduling, and exhausted terminal state.
+- Added dispatcher APIs that persist `Dispatching` before external side effects and then persist success, retry, timeout, or exhaustion.
+- Added outbox deduplication by message id or stable deduplication key.
+- Covered restart recovery, retry timing, timeout telemetry, exhausted state, deduplication, and dispatch ordering in workflow integration tests.
 
 Out of scope:
 
@@ -283,4 +291,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 4G: durable outbox, retries, and recovery. Slice 4F established the workflow data model, deterministic workflow clocks, durable inbox snapshots on top of `rakka-persistence`, inbox deduplication keys, persisted inbox status transitions, recovery from in-memory durable state, and typed revision-conflict workflow failures.
+Continue with Slice 4H: Phase 4 examples, testkit, and documentation. Slice 4G added durable outbox scheduling, retry/backoff handling, timeout and exhaustion telemetry, outbound deduplication, restart recovery, and dispatch ordering guarantees on top of `rakka-workflow`.

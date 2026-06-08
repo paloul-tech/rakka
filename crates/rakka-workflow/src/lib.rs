@@ -12,10 +12,15 @@ mod model;
 
 pub use clock::{ManualWorkflowClock, SystemWorkflowClock, WorkflowClock};
 pub use error::{WorkflowError, WorkflowResult};
-pub use inbox::{DurableInbox, InboxAcceptance, InboxCommand};
+pub use inbox::{
+    DurableInbox, InboxAcceptance, InboxCommand, OutboxAcceptance, OutboxCommand,
+    OutboxDispatchFuture, OutboxDispatchResult, OutboxDispatcher,
+};
 pub use model::{
-    DeduplicationKey, InboxEntry, InboxStatus, OutboxEntry, OutboxMessageId, OutboxStatus,
-    RetryAttempt, WorkflowId, WorkflowMessageId, WorkflowState, WorkflowStatus, WorkflowTimestamp,
+    DeduplicationKey, InboxEntry, InboxStatus, OutboxEntry, OutboxFailureTransition,
+    OutboxMessageId, OutboxStatus, OutboxTarget, RetryAttempt, RetryJitter, RetryPolicy,
+    WorkflowId, WorkflowMessageId, WorkflowState, WorkflowStatus, WorkflowTelemetryEvent,
+    WorkflowTimestamp,
 };
 
 /// Crate name used in diagnostics.

@@ -6,7 +6,7 @@ use std::fmt::{self, Display, Formatter};
 use rakka_core::{RakkaError, Subsystem};
 use rakka_persistence::{DurableError, Revision};
 
-use crate::{WorkflowId, WorkflowMessageId};
+use crate::{OutboxMessageId, WorkflowId, WorkflowMessageId};
 
 /// Convenient result alias for workflow operations.
 pub type WorkflowResult<T> = Result<T, WorkflowError>;
@@ -40,6 +40,13 @@ pub enum WorkflowError {
         /// Message id.
         message_id: WorkflowMessageId,
     },
+    /// Outbox entry was not found.
+    OutboxEntryNotFound {
+        /// Workflow id.
+        workflow_id: WorkflowId,
+        /// Message id.
+        message_id: OutboxMessageId,
+    },
 }
 
 impl WorkflowError {
@@ -55,6 +62,7 @@ impl WorkflowError {
             Self::RevisionConflict { .. } => "revision-conflict",
             Self::Persistence { .. } => "persistence-error",
             Self::InboxEntryNotFound { .. } => "inbox-entry-not-found",
+            Self::OutboxEntryNotFound { .. } => "outbox-entry-not-found",
         }
     }
 }
@@ -80,6 +88,13 @@ impl Display for WorkflowError {
             } => write!(
                 f,
                 "workflow {workflow_id} inbox entry {message_id} was not found"
+            ),
+            Self::OutboxEntryNotFound {
+                workflow_id,
+                message_id,
+            } => write!(
+                f,
+                "workflow {workflow_id} outbox entry {message_id} was not found"
             ),
         }
     }
