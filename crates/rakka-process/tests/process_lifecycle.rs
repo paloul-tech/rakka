@@ -1,14 +1,19 @@
 //! Integration tests for process configuration, lifecycle, and stdio protocols.
 
+use std::fs;
+use std::net::TcpListener;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rakka_core::ActorSystem;
 use rakka_process::{
-    spawn_process_actor, ExecutableAllowlist, ManagedProcess, ProcessActorCommand,
-    ProcessActorConfig, ProcessActorState, ProcessCheck, ProcessError, ProcessHealth,
-    ProcessRestartPolicy, ProcessShutdownOutcome, ProcessSpec, ProcessStdio, RawLineStdioCodec,
-    StdioCommand, StdioProtocolConfig, StdioStatus,
+    run_file_watch, run_one_shot, spawn_process_actor, start_local_grpc_process,
+    start_socket_process, EndpointReadinessConfig, ExecutableAllowlist, FileWatchCleanup,
+    FileWatchCompletion, FileWatchConfig, FileWatchInput, FileWatchOutcome, LocalEndpoint,
+    LocalGrpcEndpoint, LocalGrpcProcessConfig, ManagedProcess, OneShotConfig, OneShotOutcome,
+    ProcessActorCommand, ProcessActorConfig, ProcessActorState, ProcessCheck, ProcessError,
+    ProcessHealth, ProcessRestartPolicy, ProcessShutdownOutcome, ProcessSpec, ProcessStdio,
+    RawLineStdioCodec, SocketProcessConfig, StdioCommand, StdioProtocolConfig, StdioStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -511,6 +516,236 @@ async fn actor_stop_fails_pending_stdio_requests() {
     system.shutdown();
 }
 
+#[tokio::test]
+async fn one_shot_returns_stdout_stderr_and_exit_status() {
+    let outcome = run_one_shot(
+        fixture_spec("fixture_one_shot_echo"),
+        &fixture_allowlist(),
+        OneShotConfig::new().stdin("hello one-shot"),
+    )
+    .await
+    .expect("one-shot process should run");
+
+    let OneShotOutcome::Exited(output) = outcome else {
+        panic!("one-shot should exit before timeout");
+    };
+    assert!(output.exit().success());
+    assert_eq!(output.stdout(), b"stdout:hello one-shot\n");
+    assert_eq!(output.stderr(), b"stderr:hello one-shot\n");
+}
+
+#[tokio::test]
+async fn one_shot_timeout_returns_typed_timeout_result() {
+    let outcome = run_one_shot(
+        fixture_spec("fixture_one_shot_sleeps"),
+        &fixture_allowlist(),
+        OneShotConfig::new().runtime_timeout(Duration::from_millis(25)),
+    )
+    .await
+    .expect("one-shot timeout should be a typed outcome");
+
+    assert!(matches!(outcome, OneShotOutcome::TimedOut { .. }));
+    assert!(!outcome.exit().success());
+}
+
+#[tokio::test]
+async fn one_shot_enforces_output_capture_limits() {
+    let error = run_one_shot(
+        fixture_spec("fixture_one_shot_large_stdout"),
+        &fixture_allowlist(),
+        OneShotConfig::new().stdout_limit(16),
+    )
+    .await
+    .expect_err("stdout limit should fail the run");
+
+    assert!(matches!(
+        error,
+        ProcessError::OutputLimitExceeded {
+            stream,
+            limit: 16
+        } if stream == "stdout"
+    ));
+}
+
+#[tokio::test]
+async fn file_watch_completes_in_sandbox_collects_outputs_and_cleans_up() {
+    let sandbox = unique_temp_dir("file-watch-success");
+    let outcome = run_file_watch(
+        fixture_spec("fixture_file_watch_success"),
+        &fixture_allowlist(),
+        FileWatchConfig::new(
+            sandbox.clone(),
+            FileWatchCompletion::file_exists("output.txt"),
+        )
+        .input(FileWatchInput::new("input.txt", "payload"))
+        .required_output("output.txt")
+        .cleanup(FileWatchCleanup::RemoveOnSuccess)
+        .timeout(Duration::from_secs(1)),
+    )
+    .await
+    .expect("file-watch process should complete");
+
+    let FileWatchOutcome::Completed(completed) = outcome else {
+        panic!("file-watch should complete");
+    };
+    assert_eq!(completed.outputs.len(), 1);
+    assert_eq!(completed.outputs[0].contents(), b"processed:payload");
+    assert!(completed
+        .stderr
+        .windows(b"file-watch-ready".len())
+        .any(|window| window == b"file-watch-ready"));
+    assert!(!sandbox.exists());
+}
+
+#[tokio::test]
+async fn file_watch_rejects_paths_that_escape_the_sandbox() {
+    let sandbox = unique_temp_dir("file-watch-escape");
+    let error = run_file_watch(
+        fixture_spec("fixture_file_watch_success"),
+        &fixture_allowlist(),
+        FileWatchConfig::new(
+            sandbox.clone(),
+            FileWatchCompletion::file_exists("../output.txt"),
+        ),
+    )
+    .await
+    .expect_err("escaping completion path should fail");
+
+    assert!(matches!(error, ProcessError::SandboxPathEscape { .. }));
+    let _removed = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn file_watch_timeout_shuts_down_child_process() {
+    let sandbox = unique_temp_dir("file-watch-timeout");
+    let outcome = run_file_watch(
+        fixture_spec("fixture_waits_for_stdin_eof"),
+        &fixture_allowlist(),
+        FileWatchConfig::new(
+            sandbox.clone(),
+            FileWatchCompletion::file_exists("missing.txt"),
+        )
+        .cleanup(FileWatchCleanup::RemoveAlways)
+        .timeout(Duration::from_millis(25)),
+    )
+    .await
+    .expect("file-watch timeout should be a typed outcome");
+
+    let FileWatchOutcome::TimedOut(timed_out) = outcome else {
+        panic!("file-watch should time out");
+    };
+    assert!(timed_out.shutdown.exit().success());
+    assert!(!sandbox.exists());
+}
+
+#[tokio::test]
+async fn socket_process_waits_for_tcp_readiness() {
+    let Some(port) = available_tcp_port() else {
+        eprintln!("skipping tcp readiness test because local tcp bind is unavailable");
+        return;
+    };
+    let mut socket_process = start_socket_process(
+        fixture_spec("fixture_tcp_server")
+            .arg(port.to_string())
+            .stdin(ProcessStdio::Piped)
+            .shutdown_timeout(Duration::from_secs(1)),
+        &fixture_allowlist(),
+        LocalEndpoint::tcp("127.0.0.1", port),
+        SocketProcessConfig::new()
+            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_secs(1))),
+    )
+    .await
+    .expect("socket process should become ready");
+
+    assert!(socket_process.ready().attempts() >= 1);
+    assert!(socket_process
+        .shutdown()
+        .await
+        .expect("socket process should stop")
+        .exit()
+        .success());
+}
+
+#[tokio::test]
+async fn socket_process_times_out_when_endpoint_never_opens() {
+    let Some(port) = available_tcp_port() else {
+        eprintln!("skipping tcp timeout test because local tcp bind is unavailable");
+        return;
+    };
+    let error = start_socket_process(
+        fixture_spec("fixture_waits_for_stdin_eof")
+            .stdin(ProcessStdio::Piped)
+            .shutdown_timeout(Duration::from_secs(1)),
+        &fixture_allowlist(),
+        LocalEndpoint::tcp("127.0.0.1", port),
+        SocketProcessConfig::new()
+            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_millis(25))),
+    )
+    .await
+    .expect_err("socket process should fail readiness");
+
+    assert!(matches!(error, ProcessError::EndpointTimeout { .. }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn socket_process_waits_for_unix_readiness() {
+    let Some((sandbox, socket_path)) = available_unix_socket_path("unix-socket") else {
+        eprintln!("skipping unix socket readiness test because local unix bind is unavailable");
+        return;
+    };
+    let mut socket_process = start_socket_process(
+        fixture_spec("fixture_unix_server")
+            .arg(socket_path.clone())
+            .stdin(ProcessStdio::Piped)
+            .shutdown_timeout(Duration::from_secs(1)),
+        &fixture_allowlist(),
+        LocalEndpoint::unix(socket_path.clone()),
+        SocketProcessConfig::new()
+            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_secs(1))),
+    )
+    .await
+    .expect("unix socket process should become ready");
+
+    assert_eq!(socket_process.endpoint(), &LocalEndpoint::unix(socket_path));
+    socket_process
+        .shutdown()
+        .await
+        .expect("unix socket process should stop");
+    let _removed = fs::remove_dir_all(sandbox);
+}
+
+#[tokio::test]
+async fn local_grpc_process_waits_for_local_endpoint_readiness() {
+    let Some(port) = available_tcp_port() else {
+        eprintln!("skipping local grpc readiness test because local tcp bind is unavailable");
+        return;
+    };
+    let endpoint =
+        LocalGrpcEndpoint::tcp("127.0.0.1", port).with_service_name("fixture.EchoService");
+    let mut grpc_process = start_local_grpc_process(
+        fixture_spec("fixture_tcp_server")
+            .arg(port.to_string())
+            .stdin(ProcessStdio::Piped)
+            .shutdown_timeout(Duration::from_secs(1)),
+        &fixture_allowlist(),
+        endpoint,
+        LocalGrpcProcessConfig::new()
+            .readiness(EndpointReadinessConfig::new().timeout(Duration::from_secs(1))),
+    )
+    .await
+    .expect("local grpc process should become ready");
+
+    assert_eq!(
+        grpc_process.endpoint().service_name(),
+        Some("fixture.EchoService")
+    );
+    grpc_process
+        .shutdown()
+        .await
+        .expect("local grpc process should stop");
+}
+
 fn fixture_spec(test_name: &str) -> ProcessSpec {
     ProcessSpec::new(fixture_executable()).arg(test_name)
 }
@@ -529,6 +764,61 @@ fn fixture_allowlist() -> ExecutableAllowlist {
 
 fn fixture_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rakka-process-fixture"))
+}
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "rakka-process-{name}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+fn unique_short_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    PathBuf::from("/tmp").join(format!(
+        "rakka-process-{name}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+#[cfg(unix)]
+fn available_unix_socket_path(name: &str) -> Option<(PathBuf, PathBuf)> {
+    let sandbox = unique_short_temp_dir(name);
+    fs::create_dir_all(&sandbox).expect("sandbox should be created");
+    let socket_path = sandbox.join("fixture.sock");
+    match std::os::unix::net::UnixListener::bind(&socket_path) {
+        Ok(listener) => {
+            drop(listener);
+            fs::remove_file(&socket_path).expect("probe unix socket should be removable");
+            Some((sandbox, socket_path))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let _removed = fs::remove_dir_all(&sandbox);
+            None
+        }
+        Err(error) => panic!("unix socket should bind: {error}"),
+    }
+}
+
+fn available_tcp_port() -> Option<u16> {
+    let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(error) => panic!("ephemeral tcp port should bind: {error}"),
+    };
+    Some(
+        listener
+            .local_addr()
+            .expect("listener address should be available")
+            .port(),
+    )
 }
 
 async fn ask_start(

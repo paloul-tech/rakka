@@ -152,7 +152,7 @@ Out of scope:
 
 ## Slice 4D: One-Shot, File-Watch, Socket, and Local gRPC Modes
 
-Status: planned.
+Status: implemented.
 
 Goal: cover the remaining v1 process interaction modes without crossing into Phase 5 integration adapters.
 
@@ -283,4 +283,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 4D: one-shot, file-watch, socket, and local gRPC modes. Slice 4C established raw line stdio and line-json request/reply protocol actors with request ids, bounded pending requests, request timeouts, stdout/stderr reader tasks, malformed-output failure, process-exit cleanup, actor-stop cleanup, and dedicated fixture binaries for protocol tests.
+Continue with Slice 4E: process-backed sharded entities. Slice 4D established one-shot process execution with bounded runtime and output capture, sandboxed file-watch completion with explicit cleanup policy, local TCP and Unix-domain endpoint readiness foundations, and local gRPC process readiness wrappers without introducing public HTTP/gRPC adapters.

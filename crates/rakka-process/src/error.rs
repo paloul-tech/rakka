@@ -128,6 +128,13 @@ pub enum ProcessError {
         /// Operating-system error message.
         message: String,
     },
+    /// Captured stdout or stderr exceeded its configured byte limit.
+    OutputLimitExceeded {
+        /// Standard IO stream name.
+        stream: String,
+        /// Configured byte limit.
+        limit: usize,
+    },
     /// The pending request table reached its configured capacity.
     PendingCapacity {
         /// Configured pending request capacity.
@@ -164,6 +171,32 @@ pub enum ProcessError {
     ProtocolClosed {
         /// Closure detail.
         message: String,
+    },
+    /// A file-watch sandbox directory was missing or unsafe.
+    InvalidSandboxDirectory {
+        /// Sandbox directory path that was rejected.
+        path: PathBuf,
+    },
+    /// A configured sandbox-relative path escaped the sandbox.
+    SandboxPathEscape {
+        /// Path that was rejected.
+        path: PathBuf,
+    },
+    /// Reading, writing, creating, or removing a sandbox file failed.
+    FileIo {
+        /// File or directory path involved in the failure.
+        path: PathBuf,
+        /// Operating-system error message.
+        message: String,
+    },
+    /// A local endpoint did not become reachable before timeout.
+    EndpointTimeout {
+        /// Human-readable endpoint description.
+        endpoint: String,
+        /// Timeout that elapsed.
+        timeout: Duration,
+        /// Last connection error observed before timing out.
+        last_error: Option<String>,
     },
 }
 
@@ -257,6 +290,12 @@ impl Display for ProcessError {
             Self::StdioWrite { message } => {
                 write!(f, "failed to write process stdin: {message}")
             }
+            Self::OutputLimitExceeded { stream, limit } => {
+                write!(
+                    f,
+                    "captured process {stream} exceeded configured limit of {limit} bytes"
+                )
+            }
             Self::PendingCapacity { capacity } => {
                 write!(
                     f,
@@ -292,6 +331,33 @@ impl Display for ProcessError {
             }
             Self::ProtocolClosed { message } => {
                 write!(f, "process protocol is closed: {message}")
+            }
+            Self::InvalidSandboxDirectory { path } => {
+                write!(
+                    f,
+                    "file-watch sandbox directory is invalid: {}",
+                    path.display()
+                )
+            }
+            Self::SandboxPathEscape { path } => {
+                write!(f, "file-watch path escapes sandbox: {}", path.display())
+            }
+            Self::FileIo { path, message } => {
+                write!(f, "file-watch IO failed for {}: {message}", path.display())
+            }
+            Self::EndpointTimeout {
+                endpoint,
+                timeout,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "local endpoint {endpoint} did not become ready within {timeout:?}"
+                )?;
+                if let Some(last_error) = last_error {
+                    write!(f, ": {last_error}")?;
+                }
+                Ok(())
             }
         }
     }

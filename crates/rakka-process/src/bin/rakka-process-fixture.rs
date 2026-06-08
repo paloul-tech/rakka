@@ -3,6 +3,7 @@
 //! Child-process fixture executable for `rakka-process` integration tests.
 
 use std::io::{BufRead, Read, Write};
+use std::net::TcpListener;
 use std::time::Duration;
 
 fn main() {
@@ -22,6 +23,13 @@ fn main() {
         "fixture_line_json_delayed" => line_json_delayed(),
         "fixture_line_json_malformed" => line_json_malformed(),
         "fixture_line_json_crash" => line_json_crash(),
+        "fixture_one_shot_echo" => one_shot_echo(),
+        "fixture_one_shot_sleeps" => one_shot_sleeps(),
+        "fixture_one_shot_large_stdout" => one_shot_large_stdout(),
+        "fixture_file_watch_success" => file_watch_success(),
+        "fixture_tcp_server" => tcp_server(),
+        #[cfg(unix)]
+        "fixture_unix_server" => unix_server(),
         unknown => {
             eprintln!("unknown fixture command: {unknown}");
             std::process::exit(2);
@@ -117,6 +125,55 @@ fn line_json_crash() {
         .expect("stdin should receive a request")
         .expect("stdin line should be readable");
     std::process::exit(17);
+}
+
+fn one_shot_echo() {
+    let mut stdin = std::io::stdin();
+    let mut input = String::new();
+    stdin
+        .read_to_string(&mut input)
+        .expect("stdin should be readable");
+    println!("stdout:{input}");
+    eprintln!("stderr:{input}");
+}
+
+fn one_shot_sleeps() {
+    std::thread::sleep(Duration::from_secs(5));
+}
+
+fn one_shot_large_stdout() {
+    let chunk = vec![b'x'; 4096];
+    std::io::stdout()
+        .write_all(&chunk)
+        .expect("stdout should be writable");
+}
+
+fn file_watch_success() {
+    let input = std::fs::read_to_string("input.txt").expect("input.txt should be readable");
+    std::fs::write("output.txt", format!("processed:{input}")).expect("output.txt should write");
+    eprintln!("file-watch-ready");
+    waits_for_stdin_eof();
+}
+
+fn tcp_server() {
+    let port = std::env::args()
+        .nth(2)
+        .expect("fixture_tcp_server requires a port")
+        .parse::<u16>()
+        .expect("port should parse");
+    let _listener = TcpListener::bind(("127.0.0.1", port)).expect("tcp listener should bind");
+    waits_for_stdin_eof();
+}
+
+#[cfg(unix)]
+fn unix_server() {
+    let path = std::env::args()
+        .nth(2)
+        .expect("fixture_unix_server requires a path");
+    let _removed = std::fs::remove_file(&path);
+    let _listener =
+        std::os::unix::net::UnixListener::bind(&path).expect("unix listener should bind");
+    waits_for_stdin_eof();
 }
 
 fn json_frame(line: &str) -> serde_json::Value {
