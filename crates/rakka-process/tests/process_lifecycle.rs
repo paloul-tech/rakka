@@ -1,19 +1,28 @@
 //! Integration tests for process configuration, lifecycle, and stdio protocols.
 
 use std::fs;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rakka_cluster::{
+    ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
+};
 use rakka_core::ActorSystem;
 use rakka_process::{
-    run_file_watch, run_one_shot, spawn_process_actor, start_local_grpc_process,
-    start_socket_process, EndpointReadinessConfig, ExecutableAllowlist, FileWatchCleanup,
-    FileWatchCompletion, FileWatchConfig, FileWatchInput, FileWatchOutcome, LocalEndpoint,
-    LocalGrpcEndpoint, LocalGrpcProcessConfig, ManagedProcess, OneShotConfig, OneShotOutcome,
-    ProcessActorCommand, ProcessActorConfig, ProcessActorState, ProcessCheck, ProcessError,
+    process_backed_entity_route, run_file_watch, run_one_shot, spawn_process_actor,
+    start_local_grpc_process, start_socket_process, EndpointReadinessConfig, ExecutableAllowlist,
+    FileWatchCleanup, FileWatchCompletion, FileWatchConfig, FileWatchInput, FileWatchOutcome,
+    LocalEndpoint, LocalGrpcEndpoint, LocalGrpcProcessConfig, ManagedProcess, OneShotConfig,
+    OneShotOutcome, ProcessActorCommand, ProcessActorConfig, ProcessActorState,
+    ProcessBackedEntityAction, ProcessBackedEntityBehavior, ProcessBackedEntityContext,
+    ProcessBackedEntityFuture, ProcessBackedEntityProcess, ProcessCheck, ProcessError,
     ProcessHealth, ProcessRestartPolicy, ProcessShutdownOutcome, ProcessSpec, ProcessStdio,
     RawLineStdioCodec, SocketProcessConfig, StdioCommand, StdioProtocolConfig, StdioStatus,
+};
+use rakka_sharding::{
+    EntityId, EntityRef, EntityType, ShardCoordinator, ShardRegion, ShardingConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -668,16 +677,12 @@ async fn socket_process_waits_for_tcp_readiness() {
 
 #[tokio::test]
 async fn socket_process_times_out_when_endpoint_never_opens() {
-    let Some(port) = available_tcp_port() else {
-        eprintln!("skipping tcp timeout test because local tcp bind is unavailable");
-        return;
-    };
     let error = start_socket_process(
         fixture_spec("fixture_waits_for_stdin_eof")
             .stdin(ProcessStdio::Piped)
             .shutdown_timeout(Duration::from_secs(1)),
         &fixture_allowlist(),
-        LocalEndpoint::tcp("127.0.0.1", port),
+        LocalEndpoint::tcp("127.0.0.1", 0),
         SocketProcessConfig::new()
             .readiness(EndpointReadinessConfig::new().timeout(Duration::from_millis(25))),
     )
@@ -746,6 +751,143 @@ async fn local_grpc_process_waits_for_local_endpoint_readiness() {
         .expect("local grpc process should stop");
 }
 
+#[tokio::test]
+async fn process_backed_entity_starts_child_on_first_entity_ref_message_after_recovery() {
+    let system = ActorSystem::new("process-backed-entity-start");
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let entity_type = EntityType::new("Legacy");
+    let config = ShardingConfig::new(1).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership_with_up_nodes(vec![cluster_node(
+        "rakka-0", "uid-a",
+    )]));
+    let log_dir = unique_temp_dir("process-backed-start");
+    fs::create_dir_all(&log_dir).expect("log directory should be created");
+    let log_path = log_dir.join("entity.log");
+    let working_root = log_dir.join("work");
+    let route = process_backed_entity_route(
+        node_id,
+        system.clone(),
+        process_behavior_factory(log_path.clone(), working_root.clone()),
+    );
+    let region = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &coordinator.snapshot(),
+        route.clone(),
+    )
+    .unwrap();
+    let entity_id = EntityId::new("legacy-1");
+    let entity = EntityRef::<ProcessEntityCommand>::new(entity_type, entity_id.clone());
+
+    let status = entity
+        .ask(
+            &region,
+            |reply_to| ProcessEntityCommand::Status { reply_to },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("entity ask should route")
+        .expect("process-backed status should succeed");
+
+    assert!(status.pid.is_some());
+    assert_eq!(status.fencing_key, "Legacy:legacy-1");
+    assert!(status.log_label.contains("Legacy:legacy-1"));
+    assert_eq!(
+        status.working_dir,
+        working_root.join("Legacy").join("shard-0").join("legacy-1")
+    );
+    wait_for_log_line(&log_path, "start").await;
+    assert_eq!(read_lines(&log_path)[..2], ["recover", "start"]);
+    assert_eq!(route.entity_count(), 1);
+
+    assert!(route.passivate_entity(&entity_id));
+    wait_for_log_line(&log_path, "stop").await;
+    system.shutdown();
+    let _removed = fs::remove_dir_all(log_dir);
+}
+
+#[tokio::test]
+async fn process_backed_entity_handoff_stops_old_child_before_new_owner_activates() {
+    let system_a = ActorSystem::new("process-backed-handoff-a");
+    let system_b = ActorSystem::new("process-backed-handoff-b");
+    let node_a = NodeId::new("rakka-0", "uid-a");
+    let node_b = NodeId::new("rakka-1", "uid-b");
+    let entity_type = EntityType::new("Legacy");
+    let config = ShardingConfig::new(1).unwrap();
+    let mut coordinator_a = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator_a.reconcile(&membership_with_up_nodes(vec![cluster_node(
+        "rakka-0", "uid-a",
+    )]));
+    let mut coordinator_b = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator_b.reconcile(&membership_with_up_nodes(vec![cluster_node(
+        "rakka-1", "uid-b",
+    )]));
+    let root = unique_temp_dir("process-backed-handoff");
+    fs::create_dir_all(&root).expect("root directory should be created");
+    let log_a = root.join("owner-a.log");
+    let log_b = root.join("owner-b.log");
+    let entity_id = EntityId::new("legacy-1");
+
+    let route_a = process_backed_entity_route(
+        node_a,
+        system_a.clone(),
+        process_behavior_factory(log_a.clone(), root.join("work-a")),
+    );
+    let region_a = ShardRegion::from_snapshot(
+        entity_type.clone(),
+        config.clone(),
+        &coordinator_a.snapshot(),
+        route_a.clone(),
+    )
+    .unwrap();
+    let entity = EntityRef::<ProcessEntityCommand>::new(entity_type.clone(), entity_id.clone());
+    entity
+        .ask(
+            &region_a,
+            |reply_to| ProcessEntityCommand::Status { reply_to },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("owner a ask should route")
+        .expect("owner a status should succeed");
+    wait_for_log_line(&log_a, "start").await;
+    assert_eq!(read_lines(&log_a)[..2], ["recover", "start"]);
+
+    let shard_id = entity.shard_id(&config);
+    assert_eq!(region_a.begin_shard_handoff(shard_id).unwrap(), 0);
+    assert_eq!(region_a.complete_shard_handoff(shard_id).unwrap(), 1);
+    wait_for_log_line(&log_a, "stop").await;
+
+    let route_b = process_backed_entity_route(
+        node_b,
+        system_b.clone(),
+        process_behavior_factory(log_b.clone(), root.join("work-b")),
+    );
+    let region_b = ShardRegion::from_snapshot(
+        entity_type,
+        config,
+        &coordinator_b.snapshot(),
+        route_b.clone(),
+    )
+    .unwrap();
+    entity
+        .ask(
+            &region_b,
+            |reply_to| ProcessEntityCommand::Status { reply_to },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("owner b ask should route")
+        .expect("owner b status should succeed");
+
+    wait_for_log_line(&log_b, "start").await;
+    assert_eq!(read_lines(&log_b)[..2], ["recover", "start"]);
+    system_a.shutdown();
+    system_b.shutdown();
+    let _removed = fs::remove_dir_all(root);
+}
+
 fn fixture_spec(test_name: &str) -> ProcessSpec {
     ProcessSpec::new(fixture_executable()).arg(test_name)
 }
@@ -764,6 +906,88 @@ fn fixture_allowlist() -> ExecutableAllowlist {
 
 fn fixture_executable() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rakka-process-fixture"))
+}
+
+fn process_behavior_factory(
+    log_path: PathBuf,
+    working_root: PathBuf,
+) -> impl Fn(ProcessBackedEntityContext) -> ProcessEntityBehavior + Send + Sync + 'static {
+    move |_context| ProcessEntityBehavior {
+        log_path: log_path.clone(),
+        working_root: working_root.clone(),
+    }
+}
+
+fn cluster_node(logical_id: &str, incarnation: &str) -> ClusterNode {
+    ClusterNode::new(
+        NodeId::new(logical_id, incarnation),
+        NodeAddress::new(format!("{logical_id}.rakka.default.svc"), 2552),
+    )
+}
+
+fn membership_config() -> MembershipConfig {
+    MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100))
+}
+
+fn membership_with_up_nodes(nodes: Vec<ClusterNode>) -> ClusterMembership {
+    let local = nodes[0].clone();
+    let mut membership = ClusterMembership::new(local, membership_config());
+
+    membership
+        .record_discovery(DiscoverySnapshot::new("test", 1, nodes))
+        .expect("discovery snapshot should be accepted");
+
+    for member in membership
+        .snapshot()
+        .members()
+        .iter()
+        .map(|member| member.node().id().clone())
+        .collect::<Vec<_>>()
+    {
+        membership
+            .mark_up(&member, 2)
+            .expect("member should be marked up");
+    }
+
+    membership
+}
+
+fn append_test_line(path: &PathBuf, line: &str) -> Result<(), ProcessError> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| ProcessError::FileIo {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    writeln!(file, "{line}").map_err(|error| ProcessError::FileIo {
+        path: path.clone(),
+        message: error.to_string(),
+    })
+}
+
+fn read_lines(path: &PathBuf) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("log file should be readable")
+        .lines()
+        .map(ToString::to_string)
+        .collect()
+}
+
+async fn wait_for_log_line(path: &PathBuf, expected: &str) {
+    for _attempt in 0..100 {
+        if path.exists() && read_lines(path).iter().any(|line| line == expected) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        path.exists() && read_lines(path).iter().any(|line| line == expected),
+        "expected log line {expected:?} in {}",
+        path.display()
+    );
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -966,4 +1190,74 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct JsonPayload {
     value: String,
+}
+
+#[derive(Debug)]
+enum ProcessEntityCommand {
+    Status {
+        reply_to: rakka_core::ReplyTo<Result<ProcessEntityStatus, ProcessError>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessEntityStatus {
+    pid: Option<u32>,
+    fencing_key: String,
+    log_label: String,
+    working_dir: PathBuf,
+}
+
+struct ProcessEntityBehavior {
+    log_path: PathBuf,
+    working_root: PathBuf,
+}
+
+impl ProcessBackedEntityBehavior<ProcessEntityCommand> for ProcessEntityBehavior {
+    fn process(&self, _context: &ProcessBackedEntityContext) -> ProcessBackedEntityProcess {
+        ProcessBackedEntityProcess::new(
+            fixture_spec("fixture_process_entity_lifecycle")
+                .arg(self.log_path.clone())
+                .stdin(ProcessStdio::Piped)
+                .shutdown_timeout(Duration::from_secs(1)),
+            fixture_allowlist(),
+        )
+    }
+
+    fn recover<'a>(
+        &'a mut self,
+        _context: &'a ProcessBackedEntityContext,
+    ) -> ProcessBackedEntityFuture<'a, ()> {
+        let log_path = self.log_path.clone();
+        Box::pin(async move {
+            if let Some(parent) = log_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| ProcessError::FileIo {
+                    path: parent.to_path_buf(),
+                    message: error.to_string(),
+                })?;
+            }
+            append_test_line(&log_path, "recover")?;
+            Ok(())
+        })
+    }
+
+    fn handle<'a>(
+        &'a mut self,
+        context: &'a ProcessBackedEntityContext,
+        process: &'a mut ManagedProcess,
+        message: ProcessEntityCommand,
+    ) -> ProcessBackedEntityFuture<'a, ProcessBackedEntityAction> {
+        Box::pin(async move {
+            match message {
+                ProcessEntityCommand::Status { reply_to } => {
+                    let _sent = reply_to.reply(Ok(ProcessEntityStatus {
+                        pid: process.pid(),
+                        fencing_key: context.fencing_key().to_string(),
+                        log_label: context.log_label().to_string(),
+                        working_dir: context.working_dir_under(&self.working_root),
+                    }));
+                }
+            }
+            Ok(ProcessBackedEntityAction::Continue)
+        })
+    }
 }

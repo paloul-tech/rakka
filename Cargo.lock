@@ -907,7 +907,9 @@ dependencies = [
 name = "rakka-process"
 version = "0.1.0"
 dependencies = [
+ "rakka-cluster",
  "rakka-core",
+ "rakka-sharding",
  "serde",
  "serde_json",
  "tokio",

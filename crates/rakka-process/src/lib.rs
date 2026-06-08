@@ -14,6 +14,7 @@ mod error;
 mod file_watch;
 mod managed;
 mod oneshot;
+mod sharded;
 mod spec;
 mod stdio;
 
@@ -37,6 +38,11 @@ pub use managed::{
     ManagedProcess, ProcessExit, ProcessShutdown, ProcessShutdownOutcome, ProcessStart,
 };
 pub use oneshot::{run_one_shot, OneShotConfig, OneShotOutcome, OneShotOutput};
+pub use sharded::{
+    process_backed_entity_route, ProcessBackedEntity, ProcessBackedEntityAction,
+    ProcessBackedEntityBehavior, ProcessBackedEntityContext, ProcessBackedEntityFuture,
+    ProcessBackedEntityProcess, ProcessBackedEntityState, ProcessBackedEntityStatus,
+};
 pub use spec::{ExecutableAllowlist, GracefulShutdown, ProcessSpec, ProcessStdio, ResourceHints};
 pub use stdio::{
     spawn_stdio_actor, LineJsonCodec, LineJsonFrame, RawLineStdioCodec, StdioActor, StdioCodec,

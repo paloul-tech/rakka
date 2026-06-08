@@ -27,6 +27,7 @@ fn main() {
         "fixture_one_shot_sleeps" => one_shot_sleeps(),
         "fixture_one_shot_large_stdout" => one_shot_large_stdout(),
         "fixture_file_watch_success" => file_watch_success(),
+        "fixture_process_entity_lifecycle" => process_entity_lifecycle(),
         "fixture_tcp_server" => tcp_server(),
         #[cfg(unix)]
         "fixture_unix_server" => unix_server(),
@@ -155,6 +156,15 @@ fn file_watch_success() {
     waits_for_stdin_eof();
 }
 
+fn process_entity_lifecycle() {
+    let log_path = std::env::args()
+        .nth(2)
+        .expect("fixture_process_entity_lifecycle requires a log path");
+    append_line(&log_path, "start");
+    waits_for_stdin_eof();
+    append_line(&log_path, "stop");
+}
+
 fn tcp_server() {
     let port = std::env::args()
         .nth(2)
@@ -198,4 +208,13 @@ fn write_json_response(
     });
     writeln!(stdout, "{response}").expect("stdout should be writable");
     stdout.flush().expect("stdout should flush");
+}
+
+fn append_line(path: &str, line: &str) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("log file should open");
+    writeln!(file, "{line}").expect("log file should write");
 }

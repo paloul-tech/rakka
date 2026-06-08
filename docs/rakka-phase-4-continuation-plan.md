@@ -179,7 +179,7 @@ Out of scope:
 
 ## Slice 4E: Process-Backed Sharded Entities
 
-Status: planned.
+Status: implemented.
 
 Goal: make external binaries usable as routable services behind `EntityRef<M>`.
 
@@ -283,4 +283,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Continue with Slice 4E: process-backed sharded entities. Slice 4D established one-shot process execution with bounded runtime and output capture, sandboxed file-watch completion with explicit cleanup policy, local TCP and Unix-domain endpoint readiness foundations, and local gRPC process readiness wrappers without introducing public HTTP/gRPC adapters.
+Continue with Slice 4F: workflow data model and durable inbox. Slice 4E established a process-backed sharded entity actor pattern that plugs into `LocalEntityRoute` and `EntityRef<M>`, starts the child process on first routed message after a recovery hook, derives working-directory/log/fencing identity from sharding context, and shuts down child processes during explicit passivation and shard handoff.
