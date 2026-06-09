@@ -227,7 +227,7 @@ Implementation notes:
 
 ## Slice 5E: gRPC Unary Adapter Foundations
 
-Status: planned.
+Status: implemented.
 
 Goal: map generated protobuf unary RPCs to actors, entities, and service handlers.
 
@@ -254,6 +254,17 @@ Out of scope:
 
 - Server, client, or bidirectional streaming RPCs.
 - Code generation tooling beyond what tonic/prost already provide.
+
+Implementation notes:
+
+- Added `rakka-grpc` unary config with a default request timeout, tonic runtime marker, and explicit Protobuf N/N+1 compatibility guidance for rolling Kubernetes updates.
+- Added stable `GrpcError` to `tonic::Status` mapping with a `rakka-error-code` metadata key so generated clients can distinguish decode, validation, service, actor, and entity failures.
+- Added unary service handler adapters that fit tonic generated service methods and enforce the effective timeout.
+- Added unary actor ask/tell adapters using typed `ActorRef<M>` messages and caller-provided protobuf request-to-message builders.
+- Added unary entity ask/tell adapters through `ShardRegion` and `EntityRef<M>`.
+- Added `grpc-timeout` metadata parsing so client deadlines reduce the configured server-side timeout ceiling.
+- Verified cancellation does not spawn detached wait work: dropping/aborting the unary adapter future drops the pending actor reply receiver.
+- Added protobuf-shaped tests for service success, actor success, entity success, actor timeout, entity deadline metadata, validation error mapping, cancellation, and tell acceptance.
 
 ## Slice 5F: gRPC Streaming Adapter Foundations
 

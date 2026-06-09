@@ -11,7 +11,13 @@ readme.workspace = true
 
 [dependencies]
 rakka-core = { path = "../rakka-core" }
+rakka-sharding = { path = "../rakka-sharding" }
+tokio.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+prost.workspace = true
+rakka-cluster = { path = "../rakka-cluster" }
 
 [lints]
 workspace = true

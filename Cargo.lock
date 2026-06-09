@@ -958,7 +958,11 @@ dependencies = [
 name = "rakka-grpc"
 version = "0.1.0"
 dependencies = [
+ "prost",
+ "rakka-cluster",
  "rakka-core",
+ "rakka-sharding",
+ "tokio",
  "tonic",
 ]
 
