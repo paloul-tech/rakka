@@ -16,6 +16,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rakka_core::{RakkaError, Subsystem};
 use tokio::sync::Notify;
 
+mod adapters;
+mod process_io;
+
+pub use adapters::{
+    broadcast_stream, fan_in_streams, pipe_stream, spawn_actor_source, ActorSink, ActorSinkError,
+    ActorSinkResult, ActorSource, ActorSourceSpawnError, BroadcastError, BroadcastResult,
+    EntitySink, EntitySinkError, EntitySinkResult, StreamPipeError, StreamPipeResult,
+    StreamPipeSummary,
+};
+pub use process_io::{
+    managed_process_stderr_stream, managed_process_stdin_sink, managed_process_stdout_stream,
+    process_input_sink_from_writer, process_output_stream_from_reader,
+    protocol_actor_process_stream_unsupported, ManagedProcessStdinSink, ProcessInputSink,
+    ProcessIoOwner, ProcessIoStream, ProcessOutputConfig, ProcessOutputStream, ProcessStreamError,
+    ProcessStreamPump, ProcessStreamResult, DEFAULT_PROCESS_IO_CHUNK_SIZE,
+};
+
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-stream";
 

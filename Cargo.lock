@@ -962,7 +962,10 @@ dependencies = [
 name = "rakka-stream"
 version = "0.1.0"
 dependencies = [
+ "rakka-cluster",
  "rakka-core",
+ "rakka-process",
+ "rakka-sharding",
  "tokio",
 ]
 

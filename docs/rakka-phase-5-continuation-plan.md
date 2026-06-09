@@ -108,7 +108,7 @@ Implementation notes:
 
 ## Slice 5B: Actor, Entity, and Process IO Stream Adapters
 
-Status: planned.
+Status: implemented.
 
 Goal: connect stream primitives to the runtime pieces that already exist.
 
@@ -134,6 +134,15 @@ Out of scope:
 - Public HTTP streaming.
 - Public gRPC streaming.
 - Exactly-once message delivery.
+
+Implementation notes:
+
+- Added actor adapters: `ActorSink`, `ActorSinkError`, and `spawn_actor_source`/`ActorSource` for actor-to-stream ingress.
+- Added entity adapters: `EntitySink` and `EntitySinkError` over `ShardRegion`/`EntityRef` with message-preserving no-route and delivery failures.
+- Added stream pipe helpers: `pipe_stream`, `fan_in_streams`, and `broadcast_stream`.
+- Added process IO adapters: bounded stdout/stderr byte streams, stdin byte sink, managed-process helpers, output pump cancellation, read/write error mapping, and typed unsupported-owner errors for protocol-actor-owned pipes.
+- Covered actor source, actor sink ordering, mailbox full/closed, entity no-route/delivery, process EOF, process read error, process cancellation, stdin drain, and protocol-owned pipe rejection in stream adapter tests.
+- Continue with Slice 5C for HTTP server and unary adapter foundations.
 
 ## Slice 5C: HTTP Server and Unary Adapter Foundations
 
