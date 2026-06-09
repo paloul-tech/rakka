@@ -9,6 +9,9 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
+[lib]
+name = "rakka_http"
+
 [dependencies]
 axum.workspace = true
 futures-util.workspace = true

@@ -9,6 +9,9 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
+[lib]
+name = "rakka_process"
+
 [dependencies]
 rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }

@@ -9,9 +9,25 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
+[lib]
+name = "rakka_testkit"
+
 [dependencies]
+axum.workspace = true
+futures-util.workspace = true
 rakka-core = { path = "../rakka-core" }
+rakka-grpc = { path = "../rakka-grpc" }
+rakka-http = { path = "../rakka-http" }
+rakka-k8s = { path = "../rakka-k8s" }
+rakka-stream = { path = "../rakka-stream" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tower = { workspace = true, features = ["util"] }
+
+[dev-dependencies]
+rakka-cluster = { path = "../rakka-cluster" }
 
 [lints]
 workspace = true

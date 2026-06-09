@@ -17,6 +17,7 @@ members = [
     "examples/durable-counter",
     "examples/durable-workflow",
     "examples/external-binary-wrapper",
+    "examples/edge-gateway",
     "examples/minimal-system",
     "examples/multi-node-sharding",
 ]

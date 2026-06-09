@@ -924,6 +924,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-edge-gateway"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "prost",
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-grpc",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-process",
+ "rakka-sharding",
+ "rakka-stream",
+ "rakka-testkit",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "rakka-example-external-binary-wrapper"
 version = "0.1.0"
 dependencies = [
@@ -1073,8 +1095,19 @@ dependencies = [
 name = "rakka-testkit"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "futures-util",
+ "rakka-cluster",
  "rakka-core",
+ "rakka-grpc",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-stream",
+ "serde",
+ "serde_json",
  "tokio",
+ "tonic",
+ "tower 0.5.3",
 ]
 
 [[package]]

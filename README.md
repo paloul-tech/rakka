@@ -2,10 +2,11 @@
 
 Rakka is a Rust actor framework planned around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
 
-The current repository state includes Phase 4 foundations: local typed actors, durable state APIs, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, Protobuf remote envelopes, deterministic cluster sharding, supervised process actors, process-backed entities, and durable workflow inbox/outbox reliability.
+The current repository state includes Phase 5 foundations: local typed actors, durable state APIs, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, Protobuf remote envelopes, deterministic cluster sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, and reviewable Kubernetes manifests.
 
 See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
+See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kubernetes, and metrics integration boundaries.
 
 ## Validation Commands
 
@@ -97,6 +98,27 @@ Expected output:
 ```text
 Rakka wrapped legacy-calculator and received result 42.
 Captured child stderr: ["legacy child handled increment"]
+```
+
+### Edge Gateway
+
+This end-to-end Phase 5 example runs an in-process HTTP gateway, gRPC unary and bidirectional-streaming adapters, bounded stream ingestion, a process-backed legacy service, Kubernetes readiness/drain checks, and in-memory metrics. It does not bind public ports or require Kubernetes; it exercises the public adapter surfaces directly.
+
+```sh
+cargo run -p rakka-example-edge-gateway
+```
+
+Expected output:
+
+```text
+HTTP actor gateway returned counter value 7.
+HTTP entity gateway accepted book for cart-1.
+HTTP process-backed legacy service returned 42.
+gRPC unary actor value 10 and entity SKU pencil.
+gRPC bidirectional stream routed 2 cart updates.
+Streaming ingestion transformed 2 items into entity commands.
+Kubernetes readiness passed before drain; drain outcome Complete.
+Metrics captured HTTP route /counter/add and gRPC method Add.
 ```
 
 ## Kubernetes Example

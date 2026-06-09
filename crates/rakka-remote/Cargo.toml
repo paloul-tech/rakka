@@ -9,6 +9,9 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
+[lib]
+name = "rakka_remote"
+
 [dependencies]
 prost.workspace = true
 rakka-cluster = { path = "../rakka-cluster" }

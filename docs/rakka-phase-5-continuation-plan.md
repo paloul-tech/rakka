@@ -434,7 +434,7 @@ Implementation notes:
 
 ## Slice 5J: End-to-End Examples, Testkit, and Documentation
 
-Status: planned.
+Status: implemented.
 
 Goal: make Phase 5 behavior reviewable by humans and reusable in tests.
 
@@ -461,6 +461,16 @@ Out of scope:
 - Public API stability guarantee beyond v1 draft expectations.
 - Full application template generator.
 
+Implementation notes:
+
+- Added `rakka-example-edge-gateway`, a self-contained end-to-end example that exercises HTTP JSON actor/entity routes, a process-backed HTTP service, gRPC unary actor/entity calls, gRPC bidirectional streaming, bounded stream ingestion, Kubernetes readiness/drain, and in-memory metrics.
+- Added reusable `rakka-testkit` helpers for in-process HTTP requests, gRPC unary and response-stream assertions, bounded stream assertions, Kubernetes probe/drain assertions, and in-memory metric observation checks.
+- Added `rakka-testkit` integration coverage proving the helpers can exercise HTTP, gRPC, streams, Kubernetes health/drain, and metrics without host-specific external services.
+- Added `docs/rakka-phase-5-integration-surfaces.md` documenting public HTTP/gRPC integration surfaces versus internal remoting, plus stream back-pressure, HTTP disconnect, gRPC cancellation, Kubernetes drain, and metrics boundaries.
+- Updated the README with the edge gateway run command, expected output, and Phase 5 documentation pointer.
+- Made the `rakka-k8s` library target name explicit as `rakka_k8s` so downstream crates can depend on it reliably.
+- Phase 5 is complete at the v1 draft foundation level. Remaining production work belongs in later hardening phases: real network remoting, generated gRPC service examples, application templates, production metrics exporters, and cloud-specific Kubernetes overlays.
+
 ## Suggested Next Slice
 
-Continue with Slice 5J: end-to-end examples, testkit, and documentation. The Kubernetes wiring is now reviewable and gated; the final Phase 5 slice should make HTTP, gRPC, streams, process-backed services, health, drain, and metrics easy to exercise together.
+Phase 5 is complete. A useful next phase would be V1 hardening: real network remoting, public API review, compatibility test matrices, generated service examples, production observability exporters, and release packaging.
