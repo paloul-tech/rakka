@@ -15,8 +15,8 @@ pub mod runtime;
 use rakka_core::Subsystem;
 
 pub use coordinator::{
-    ShardAssignment, ShardCoordinator, ShardDecision, ShardMoveReason, ShardOwnershipSnapshot,
-    ShardRebalancePlan,
+    ShardAssignment, ShardCoordinator, ShardDecision, ShardMoveReason, ShardOwnerCount,
+    ShardOwnershipSnapshot, ShardRebalancePlan,
 };
 pub use error::{ShardingError, ShardingResult};
 pub use handoff::{ShardHandoff, ShardHandoffState};

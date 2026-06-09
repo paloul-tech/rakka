@@ -7,6 +7,7 @@ use rakka_cluster::{
     DiscoveryProvider, DiscoverySnapshot, LocalDiscovery, MembershipConfig, MembershipEvent,
     MembershipState, NodeAddress, NodeId, ProtocolVersion, StaticDiscovery,
 };
+use rakka_core::{InMemoryMetricsRecorder, METRIC_CLUSTER_MEMBERS};
 
 fn node(logical_id: &str, incarnation: &str, port: u16) -> ClusterNode {
     ClusterNode::new(
@@ -91,6 +92,36 @@ fn membership_tracks_join_up_leave_and_remove() {
         membership.member(&remote_id).unwrap().state(),
         MembershipState::Removed
     );
+}
+
+#[test]
+fn membership_operational_snapshot_records_member_counts_by_state() {
+    let local = node("rakka-0", "uid-a", 2552);
+    let remote = node("rakka-1", "uid-b", 2552);
+    let mut membership = ClusterMembership::new(local, config(1));
+    membership
+        .record_discovery(DiscoverySnapshot::new("static", 1, [remote]))
+        .expect("remote discovery should be accepted");
+    let local_id = membership.local_node_id().clone();
+    membership.mark_up(&local_id, 2).expect("local up");
+
+    let recorder = InMemoryMetricsRecorder::new();
+    let snapshot = membership.record_metrics(&recorder);
+
+    assert_eq!(snapshot.total_members(), 2);
+    assert!(snapshot
+        .states()
+        .iter()
+        .any(|state| state.state() == MembershipState::Up && state.count() == 1));
+    assert!(snapshot
+        .states()
+        .iter()
+        .any(|state| state.state() == MembershipState::Joining && state.count() == 1));
+    assert!(recorder
+        .snapshot()
+        .observations_named(METRIC_CLUSTER_MEMBERS)
+        .iter()
+        .any(|observation| observation.attribute("state") == Some("up")));
 }
 
 #[test]

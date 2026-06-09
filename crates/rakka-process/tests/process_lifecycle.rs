@@ -7,7 +7,7 @@ use std::time::Duration;
 use rakka_cluster::{
     ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
 };
-use rakka_core::ActorSystem;
+use rakka_core::{ActorSystem, InMemoryMetricsRecorder, METRIC_PROCESS_EXITS};
 use rakka_process::{
     process_backed_entity_route, run_file_watch, run_one_shot, spawn_process_actor,
     start_local_grpc_process, start_socket_process, testkit as process_testkit,
@@ -16,9 +16,9 @@ use rakka_process::{
     LocalGrpcProcessConfig, ManagedProcess, OneShotConfig, OneShotOutcome, ProcessActorCommand,
     ProcessActorConfig, ProcessActorState, ProcessBackedEntityAction, ProcessBackedEntityBehavior,
     ProcessBackedEntityContext, ProcessBackedEntityFuture, ProcessBackedEntityProcess,
-    ProcessCheck, ProcessError, ProcessHealth, ProcessRestartPolicy, ProcessShutdownOutcome,
-    ProcessSpec, ProcessStdio, RawLineStdioCodec, SocketProcessConfig, StdioCommand,
-    StdioProtocolConfig, StdioStatus,
+    ProcessCheck, ProcessError, ProcessExit, ProcessHealth, ProcessRestartPolicy,
+    ProcessShutdownOutcome, ProcessSpec, ProcessStdio, RawLineStdioCodec, SocketProcessConfig,
+    StdioCommand, StdioProtocolConfig, StdioStatus,
 };
 use rakka_sharding::{
     EntityId, EntityRef, EntityType, ShardCoordinator, ShardRegion, ShardingConfig,
@@ -50,6 +50,40 @@ fn process_spec_validation_rejects_unsafe_or_incomplete_specs() {
             .validate(&allowlist),
         Err(ProcessError::RelativeWorkingDirectory { .. })
     ));
+}
+
+#[test]
+fn process_status_records_exit_metrics_and_serializes_snapshot() {
+    let status = rakka_process::ProcessActorStatus::new(
+        ProcessActorState::Failed,
+        None,
+        2,
+        ProcessHealth::unhealthy("exited"),
+        Some(ProcessExit::new(Some(42), false, Some(17), None)),
+        Some(ProcessError::UnexpectedExit {
+            code: Some(17),
+            signal: None,
+        }),
+        None,
+    );
+    let recorder = InMemoryMetricsRecorder::new();
+
+    let snapshot = status.record_metrics(&recorder, "legacy-service");
+
+    assert_eq!(snapshot.process_name(), "legacy-service");
+    assert_eq!(snapshot.state(), "failed");
+    assert_eq!(snapshot.last_exit_code(), Some(17));
+    assert!(serde_json::to_string(&snapshot)
+        .expect("process snapshot should serialize")
+        .contains("\"restart_count\":2"));
+    assert_eq!(recorder.snapshot().counter_total(METRIC_PROCESS_EXITS), 1.0);
+    assert_eq!(
+        recorder
+            .snapshot()
+            .last_observation(METRIC_PROCESS_EXITS, rakka_core::MetricKind::Counter)
+            .and_then(|observation| observation.attribute("code")),
+        Some("17")
+    );
 }
 
 #[tokio::test]

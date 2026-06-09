@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use rakka_cluster::{ClusterMembership, MembershipState, NodeId};
+use rakka_core::{MetricsRecorder, METRIC_SHARD_OWNERSHIP_COUNT};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ShardingError, ShardingResult};
@@ -139,6 +140,76 @@ impl ShardOwnershipSnapshot {
     #[must_use]
     pub fn assignments(&self) -> &[ShardAssignment] {
         &self.assignments
+    }
+
+    /// Counts shards currently owned by `owner`.
+    #[must_use]
+    pub fn owned_shard_count(&self, owner: &NodeId) -> usize {
+        self.assignments
+            .iter()
+            .filter(|assignment| assignment.owner() == owner)
+            .count()
+    }
+
+    /// Counts owned shards grouped by node id.
+    #[must_use]
+    pub fn owner_counts(&self) -> Vec<ShardOwnerCount> {
+        let mut counts = BTreeMap::<NodeId, usize>::new();
+        for assignment in &self.assignments {
+            *counts.entry(assignment.owner().clone()).or_default() += 1;
+        }
+
+        counts
+            .into_iter()
+            .map(|(owner, count)| ShardOwnerCount::new(owner, count))
+            .collect()
+    }
+
+    /// Records shard ownership gauges by owner.
+    pub fn record_metrics(&self, recorder: &dyn MetricsRecorder) -> Vec<ShardOwnerCount> {
+        let counts = self.owner_counts();
+        let entity_type = self.entity_type().to_string();
+        let revision = self.revision().to_string();
+        for owner_count in &counts {
+            let owner = owner_count.owner().to_string();
+            recorder.record_gauge(
+                METRIC_SHARD_OWNERSHIP_COUNT,
+                owner_count.count() as f64,
+                &[
+                    ("entity_type", entity_type.as_str()),
+                    ("owner", owner.as_str()),
+                    ("revision", revision.as_str()),
+                ],
+            );
+        }
+        counts
+    }
+}
+
+/// Count of shards owned by one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardOwnerCount {
+    owner: NodeId,
+    count: usize,
+}
+
+impl ShardOwnerCount {
+    /// Creates a shard owner count.
+    #[must_use]
+    pub const fn new(owner: NodeId, count: usize) -> Self {
+        Self { owner, count }
+    }
+
+    /// Owning node id.
+    #[must_use]
+    pub const fn owner(&self) -> &NodeId {
+        &self.owner
+    }
+
+    /// Number of shards owned by this node.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        self.count
     }
 }
 

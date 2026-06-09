@@ -7,6 +7,7 @@ use rakka_core::Subsystem;
 
 mod config;
 mod error;
+mod metrics;
 mod routes;
 mod server;
 mod streaming;
@@ -17,6 +18,7 @@ pub use config::{
     DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_REQUEST_TIMEOUT, V1_HTTP_SERVER_PRIMITIVE,
 };
 pub use error::{HttpError, HttpErrorBody, HttpResult};
+pub use metrics::record_http_request_metrics;
 pub use routes::{
     binary_service_route, into_response, json_actor_ask_route, json_actor_tell_route,
     json_entity_ask_route, json_entity_tell_route, json_service_route, HttpAccepted, HttpRouter,

@@ -7,6 +7,7 @@ use rakka_core::Subsystem;
 
 mod config;
 mod error;
+mod metrics;
 mod streaming;
 mod unary;
 
@@ -19,6 +20,7 @@ pub use error::{
     decode_status, service_status, stream_status, validation_status, GrpcError,
     RAKKA_GRPC_ERROR_CODE_METADATA,
 };
+pub use metrics::record_grpc_request_metrics;
 pub use streaming::{
     bidi_stream_pair, bidi_stream_pair_from_request, bidi_stream_pair_from_stream,
     bidi_streaming_service, bidi_streaming_service_from_stream, client_stream_from_request,

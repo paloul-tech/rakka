@@ -37,6 +37,22 @@ pub struct ProcessExit {
 }
 
 impl ProcessExit {
+    /// Creates typed process exit information from explicit fields.
+    #[must_use]
+    pub const fn new(
+        pid: Option<u32>,
+        success: bool,
+        code: Option<i32>,
+        signal: Option<i32>,
+    ) -> Self {
+        Self {
+            pid,
+            success,
+            code,
+            signal,
+        }
+    }
+
     /// Creates typed exit information from an operating-system exit status.
     #[must_use]
     pub fn from_status(pid: Option<u32>, status: ExitStatus) -> Self {

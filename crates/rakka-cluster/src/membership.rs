@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use rakka_core::{MetricsRecorder, METRIC_CLUSTER_MEMBERS};
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::DiscoverySnapshot;
@@ -25,6 +26,21 @@ pub enum MembershipState {
     Down,
     /// Node has been removed from membership.
     Removed,
+}
+
+impl MembershipState {
+    /// Stable label used for metrics and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Joining => "joining",
+            Self::Up => "up",
+            Self::Leaving => "leaving",
+            Self::Unreachable => "unreachable",
+            Self::Down => "down",
+            Self::Removed => "removed",
+        }
+    }
 }
 
 /// Cluster membership configuration.
@@ -201,6 +217,80 @@ impl MembershipSnapshot {
     }
 }
 
+/// Count of members in one lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipStateCount {
+    state: MembershipState,
+    count: usize,
+}
+
+impl MembershipStateCount {
+    /// Creates a membership state count.
+    #[must_use]
+    pub const fn new(state: MembershipState, count: usize) -> Self {
+        Self { state, count }
+    }
+
+    /// Membership state.
+    #[must_use]
+    pub const fn state(&self) -> MembershipState {
+        self.state
+    }
+
+    /// Number of members in this state.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// Serializable cluster-membership operational snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterMembershipOperationalSnapshot {
+    local_node_id: NodeId,
+    revision: u64,
+    total_members: usize,
+    states: Vec<MembershipStateCount>,
+}
+
+impl ClusterMembershipOperationalSnapshot {
+    /// Creates a cluster-membership operational snapshot.
+    #[must_use]
+    pub fn new(local_node_id: NodeId, revision: u64, states: Vec<MembershipStateCount>) -> Self {
+        let total_members = states.iter().map(MembershipStateCount::count).sum();
+        Self {
+            local_node_id,
+            revision,
+            total_members,
+            states,
+        }
+    }
+
+    /// Local node id.
+    #[must_use]
+    pub fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    /// Membership table revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Total known members.
+    #[must_use]
+    pub const fn total_members(&self) -> usize {
+        self.total_members
+    }
+
+    /// Counts by membership state.
+    #[must_use]
+    pub fn states(&self) -> &[MembershipStateCount] {
+        &self.states
+    }
+}
+
 /// In-memory cluster membership table.
 #[derive(Debug, Clone)]
 pub struct ClusterMembership {
@@ -265,6 +355,53 @@ impl ClusterMembership {
             .values()
             .filter(|record| record.state == MembershipState::Up)
             .collect()
+    }
+
+    /// Returns a compact operational snapshot for diagnostics.
+    #[must_use]
+    pub fn operational_snapshot(&self) -> ClusterMembershipOperationalSnapshot {
+        let states = [
+            MembershipState::Joining,
+            MembershipState::Up,
+            MembershipState::Leaving,
+            MembershipState::Unreachable,
+            MembershipState::Down,
+            MembershipState::Removed,
+        ]
+        .into_iter()
+        .filter_map(|state| {
+            let count = self
+                .members
+                .values()
+                .filter(|record| record.state == state)
+                .count();
+            (count > 0).then_some(MembershipStateCount::new(state, count))
+        })
+        .collect();
+
+        ClusterMembershipOperationalSnapshot::new(self.local_node_id.clone(), self.revision, states)
+    }
+
+    /// Records cluster-member gauges grouped by membership state.
+    pub fn record_metrics(
+        &self,
+        recorder: &dyn MetricsRecorder,
+    ) -> ClusterMembershipOperationalSnapshot {
+        let snapshot = self.operational_snapshot();
+        let local_node = snapshot.local_node_id().to_string();
+        let revision = snapshot.revision().to_string();
+        for state in snapshot.states() {
+            recorder.record_gauge(
+                METRIC_CLUSTER_MEMBERS,
+                state.count() as f64,
+                &[
+                    ("local_node", local_node.as_str()),
+                    ("state", state.state().as_str()),
+                    ("revision", revision.as_str()),
+                ],
+            );
+        }
+        snapshot
     }
 
     /// Returns true once enough non-removed contact points are known.

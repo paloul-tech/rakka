@@ -16,6 +16,7 @@ rakka-sharding = { path = "../rakka-sharding" }
 rakka-stream = { path = "../rakka-stream" }
 tokio.workspace = true
 tonic.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 prost.workspace = true

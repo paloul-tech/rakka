@@ -8,7 +8,8 @@ use rakka_cluster::{
     DiscoverySnapshot, MembershipConfig, MembershipEvent, NodeAddress, NodeId, ProtocolVersion,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem,
+    InMemoryMetricsRecorder, ReplyTo, METRIC_SHARD_OWNERSHIP_COUNT,
 };
 use rakka_remote::{
     InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope,
@@ -338,6 +339,35 @@ fn entity_refs_compute_stable_shard_keys() {
     assert_eq!(first.shard_key(&config).entity_type(), &entity_type);
     assert!(first.shard_id(&config).as_u32() < config.number_of_shards());
     assert_ne!(first.shard_id(&config), other_type.shard_id(&config));
+}
+
+#[test]
+fn shard_ownership_snapshot_records_owner_counts() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local.clone(), remote.clone()]);
+    let mut coordinator = ShardCoordinator::new(
+        EntityType::new("Cart"),
+        ShardingConfig::new(4).expect("valid sharding config"),
+    );
+    let plan = coordinator.reconcile(&membership);
+    assert!(!plan.is_empty());
+
+    let recorder = InMemoryMetricsRecorder::new();
+    let snapshot = coordinator.snapshot();
+    let counts = snapshot.record_metrics(&recorder);
+
+    assert_eq!(snapshot.owned_shard_count(local.id()), 2);
+    assert_eq!(snapshot.owned_shard_count(remote.id()), 2);
+    assert_eq!(counts.len(), 2);
+    assert!(recorder
+        .snapshot()
+        .observations_named(METRIC_SHARD_OWNERSHIP_COUNT)
+        .iter()
+        .any(
+            |observation| observation.attribute("entity_type") == Some("Cart")
+                && observation.value() == 2.0
+        ));
 }
 
 #[test]

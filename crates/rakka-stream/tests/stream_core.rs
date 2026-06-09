@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use rakka_core::{InMemoryMetricsRecorder, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE};
 use rakka_stream::{bounded_channel, StreamError, StreamLifecycle};
 
 #[tokio::test]
@@ -181,4 +182,33 @@ async fn close_wakes_pending_sender_and_drops_buffer() {
 fn zero_capacity_is_rejected() {
     let error = bounded_channel::<String>(0).expect_err("zero capacity should be invalid");
     assert_eq!(error, StreamError::InvalidCapacity { capacity: 0 });
+}
+
+#[test]
+fn stream_status_records_pressure_and_cancellation_metrics() {
+    let (sink, source) = bounded_channel(2).expect("stream should be created");
+    sink.try_send("first".to_string())
+        .expect("first item should enqueue");
+    let recorder = InMemoryMetricsRecorder::new();
+
+    let open_status = source.status();
+    open_status.record_metrics(&recorder, "ingress");
+    assert_eq!(open_status.pressure(), 0.5);
+    assert!(serde_json::to_string(&open_status)
+        .expect("stream status should serialize")
+        .contains("\"depth\":1"));
+
+    source.cancel("client disconnected");
+    let cancelled = source.status();
+    cancelled.record_metrics(&recorder, "ingress");
+
+    let metrics = recorder.snapshot();
+    assert_eq!(metrics.last_gauge(METRIC_STREAM_PRESSURE), Some(0.0));
+    assert_eq!(metrics.counter_total(METRIC_STREAM_CANCELLATIONS), 1.0);
+    assert_eq!(
+        metrics
+            .last_observation(METRIC_STREAM_CANCELLATIONS, rakka_core::MetricKind::Counter)
+            .and_then(|observation| observation.attribute("reason")),
+        Some("client disconnected")
+    );
 }

@@ -9,7 +9,7 @@ pub mod error;
 pub mod memory;
 pub mod store;
 
-use rakka_core::Subsystem;
+use rakka_core::{MetricsRecorder, Subsystem, METRIC_PERSISTENCE_LATENCY_MS};
 
 pub use actor::{
     durable_actor_future, spawn_durable_actor, spawn_durable_actor_factory,
@@ -30,4 +30,23 @@ pub const CRATE_NAME: &str = "rakka-persistence";
 #[must_use]
 pub const fn subsystem() -> Subsystem {
     Subsystem::Persistence
+}
+
+/// Records a durable-state operation latency sample in milliseconds.
+pub fn record_persistence_latency_ms(
+    recorder: &dyn MetricsRecorder,
+    backend: &str,
+    operation: &str,
+    outcome: &str,
+    latency_ms: f64,
+) {
+    recorder.record_histogram(
+        METRIC_PERSISTENCE_LATENCY_MS,
+        latency_ms,
+        &[
+            ("backend", backend),
+            ("operation", operation),
+            ("outcome", outcome),
+        ],
+    );
 }

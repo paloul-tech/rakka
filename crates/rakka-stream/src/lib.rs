@@ -13,7 +13,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rakka_core::{RakkaError, Subsystem};
+use rakka_core::{
+    MetricsRecorder, RakkaError, Subsystem, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
+};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 mod adapters;
@@ -160,7 +163,8 @@ impl<T> Display for StreamSendError<T> {
 }
 
 /// Observable stream lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum StreamLifecycle {
     /// The stream accepts new items and consumers can receive them.
     Open,
@@ -180,10 +184,22 @@ impl StreamLifecycle {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Closed | Self::Cancelled)
     }
+
+    /// Stable lifecycle label used for metrics and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Draining => "draining",
+            Self::Completed => "completed",
+            Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// Snapshot of a bounded stream's lifecycle and buffer state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamStatus {
     capacity: usize,
     depth: usize,
@@ -221,6 +237,52 @@ impl StreamStatus {
     #[must_use]
     pub fn cancel_reason(&self) -> Option<&str> {
         self.cancel_reason.as_deref()
+    }
+
+    /// Ratio of buffered items to configured capacity.
+    #[must_use]
+    pub fn pressure(&self) -> f64 {
+        if self.capacity == 0 {
+            0.0
+        } else {
+            self.depth as f64 / self.capacity as f64
+        }
+    }
+
+    /// Records stream pressure and cancellation metrics for this status.
+    pub fn record_metrics(&self, recorder: &dyn MetricsRecorder, stream_name: &str) {
+        let span = tracing::debug_span!(
+            target: "rakka.stream",
+            "stream.pipeline",
+            stream = stream_name,
+            lifecycle = self.lifecycle.as_str(),
+            capacity = self.capacity,
+            depth = self.depth
+        );
+        let _entered = span.enter();
+        let capacity = self.capacity.to_string();
+        let depth = self.depth.to_string();
+        recorder.record_gauge(
+            METRIC_STREAM_PRESSURE,
+            self.pressure(),
+            &[
+                ("stream", stream_name),
+                ("lifecycle", self.lifecycle.as_str()),
+                ("capacity", capacity.as_str()),
+                ("depth", depth.as_str()),
+            ],
+        );
+
+        if self.lifecycle == StreamLifecycle::Cancelled {
+            recorder.increment_counter(
+                METRIC_STREAM_CANCELLATIONS,
+                1,
+                &[
+                    ("stream", stream_name),
+                    ("reason", self.cancel_reason().unwrap_or("unspecified")),
+                ],
+            );
+        }
     }
 }
 

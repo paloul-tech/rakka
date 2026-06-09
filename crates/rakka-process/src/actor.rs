@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorRef, ActorSystem,
-    RakkaResult, ReplyTo,
+    MetricsRecorder, RakkaResult, ReplyTo, METRIC_PROCESS_EXITS,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ExecutableAllowlist, ManagedProcess, ProcessError, ProcessExit, ProcessResult, ProcessSpec,
@@ -34,6 +35,21 @@ pub enum ProcessActorState {
     Stopped,
     /// The actor reached a terminal failure state.
     Failed,
+}
+
+impl ProcessActorState {
+    /// Stable state label used for metrics and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Restarting => "restarting",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Health status observed by the process actor.
@@ -63,6 +79,16 @@ impl ProcessHealth {
     #[must_use]
     pub const fn is_healthy(&self) -> bool {
         matches!(self, Self::Healthy)
+    }
+
+    /// Stable health label used for metrics and diagnostics.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Healthy => "healthy",
+            Self::Unhealthy { .. } => "unhealthy",
+        }
     }
 }
 
@@ -332,6 +358,133 @@ impl ProcessActorStatus {
     #[must_use]
     pub const fn last_event(&self) -> Option<&ProcessSupervisionEvent> {
         self.last_event.as_ref()
+    }
+
+    /// Returns a serializable operational snapshot for this process actor.
+    #[must_use]
+    pub fn operational_snapshot(
+        &self,
+        process_name: impl Into<String>,
+    ) -> ProcessOperationalSnapshot {
+        ProcessOperationalSnapshot::from_status(process_name, self)
+    }
+
+    /// Records process exit metrics when this status contains a last exit.
+    pub fn record_metrics(
+        &self,
+        recorder: &dyn MetricsRecorder,
+        process_name: &str,
+    ) -> ProcessOperationalSnapshot {
+        let snapshot = self.operational_snapshot(process_name);
+        if let Some(exit) = self.last_exit() {
+            let success = exit.success().to_string();
+            let code = exit
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let signal = exit
+                .signal()
+                .map(|signal| signal.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            recorder.increment_counter(
+                METRIC_PROCESS_EXITS,
+                1,
+                &[
+                    ("process", process_name),
+                    ("state", self.state().as_str()),
+                    ("success", success.as_str()),
+                    ("code", code.as_str()),
+                    ("signal", signal.as_str()),
+                ],
+            );
+        }
+        snapshot
+    }
+}
+
+/// Serializable process actor operational snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessOperationalSnapshot {
+    process_name: String,
+    state: String,
+    pid: Option<u32>,
+    restart_count: usize,
+    health: String,
+    last_exit_code: Option<i32>,
+    last_exit_signal: Option<i32>,
+    last_exit_success: Option<bool>,
+    last_error: Option<String>,
+}
+
+impl ProcessOperationalSnapshot {
+    /// Creates a process operational snapshot from actor status.
+    #[must_use]
+    pub fn from_status(process_name: impl Into<String>, status: &ProcessActorStatus) -> Self {
+        Self {
+            process_name: process_name.into(),
+            state: status.state().as_str().to_string(),
+            pid: status.pid(),
+            restart_count: status.restart_count(),
+            health: status.health().as_str().to_string(),
+            last_exit_code: status.last_exit().and_then(crate::ProcessExit::code),
+            last_exit_signal: status.last_exit().and_then(crate::ProcessExit::signal),
+            last_exit_success: status.last_exit().map(crate::ProcessExit::success),
+            last_error: status.last_error().map(ToString::to_string),
+        }
+    }
+
+    /// Process label supplied by the caller.
+    #[must_use]
+    pub fn process_name(&self) -> &str {
+        &self.process_name
+    }
+
+    /// Process actor state label.
+    #[must_use]
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    /// Running process id, when available.
+    #[must_use]
+    pub const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Restart attempts consumed.
+    #[must_use]
+    pub const fn restart_count(&self) -> usize {
+        self.restart_count
+    }
+
+    /// Health label.
+    #[must_use]
+    pub fn health(&self) -> &str {
+        &self.health
+    }
+
+    /// Last exit code, when available.
+    #[must_use]
+    pub const fn last_exit_code(&self) -> Option<i32> {
+        self.last_exit_code
+    }
+
+    /// Last terminating signal, when available.
+    #[must_use]
+    pub const fn last_exit_signal(&self) -> Option<i32> {
+        self.last_exit_signal
+    }
+
+    /// Last exit success flag, when available.
+    #[must_use]
+    pub const fn last_exit_success(&self) -> Option<bool> {
+        self.last_exit_success
+    }
+
+    /// Last process actor error, when available.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 }
 

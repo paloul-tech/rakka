@@ -900,6 +900,7 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -966,6 +967,7 @@ dependencies = [
  "rakka-stream",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -983,6 +985,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower 0.5.3",
+ "tracing",
 ]
 
 [[package]]
@@ -1060,7 +1063,10 @@ dependencies = [
  "rakka-core",
  "rakka-process",
  "rakka-sharding",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

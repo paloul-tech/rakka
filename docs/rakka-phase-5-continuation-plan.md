@@ -350,7 +350,7 @@ Implementation notes:
 
 ## Slice 5H: Metrics, Tracing, and Operational Snapshots
 
-Status: planned.
+Status: implemented.
 
 Goal: expose operational state needed for Kubernetes decisions and production debugging.
 
@@ -375,6 +375,19 @@ Out of scope:
 - Prometheus exporter implementation unless needed for examples.
 - OpenTelemetry exporter implementation.
 - Dashboards.
+
+Implementation notes:
+
+- Extended `rakka-core` metrics beyond the Phase 0 placeholder with stable metric names, owned metric observations, serializable metrics snapshots, and `InMemoryMetricsRecorder` for tests.
+- Added actor runtime and actor-system operational snapshots with active actor count, total registered actors, mailbox capacity, mailbox depth, termination state, and `ActorSystem::record_metrics`.
+- Added cluster membership operational snapshots and member-count gauges grouped by membership state.
+- Added shard ownership owner-count helpers and shard ownership gauges grouped by entity type and owner.
+- Made `StreamStatus` serializable and added pressure, cancellation metric recording, and lightweight stream pipeline tracing spans.
+- Added process actor operational snapshots and process exit metric recording from `ProcessActorStatus`.
+- Added standard remote failure and durable persistence latency metric hooks using shared metric names and attributes.
+- Added HTTP and gRPC request metric helpers that record latency, outcome, status, stable error labels, and request-boundary tracing spans.
+- Covered in-memory metrics inspection, actor count/mailbox depth, cluster member counts, shard ownership counts, stream pressure/cancellation, process exits, HTTP latency/error labels, gRPC latency/error labels, and snapshot serialization in tests.
+- Continue with Slice 5I for Kubernetes manifests and local cluster examples that can consume the new health/drain/metrics surfaces.
 
 ## Slice 5I: Kubernetes Manifests and Local Cluster Example
 
@@ -438,4 +451,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice 5H: metrics, tracing, and operational snapshots. Health and drain hooks now expose lifecycle decisions; the next useful layer is backend-neutral operational visibility for those decisions and the HTTP/gRPC/stream/process surfaces built earlier in Phase 5.
+Continue with Slice 5I: Kubernetes manifests and local cluster example. Health, drain, and backend-neutral observability are now in place; the next useful layer is reviewable Kubernetes wiring for probes, pre-stop drain, service exposure, and optional local-cluster scenarios.

@@ -13,10 +13,13 @@ readme.workspace = true
 rakka-core = { path = "../rakka-core" }
 rakka-process = { path = "../rakka-process" }
 rakka-sharding = { path = "../rakka-sharding" }
+serde.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rakka-cluster = { path = "../rakka-cluster" }
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use rakka_core::{RakkaError, Subsystem};
+use rakka_core::{MetricsRecorder, RakkaError, Subsystem, METRIC_REMOTE_FAILURES};
 
 /// Convenient result alias for remote operations.
 pub type RemoteResult<T> = Result<T, RemoteError>;
@@ -78,7 +78,9 @@ impl RemoteError {
         RakkaError::new(Subsystem::Remote, self.code(), self.to_string())
     }
 
-    fn code(&self) -> &'static str {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::DuplicateCodec { .. } => "duplicate-codec",
             Self::InvalidSchemaCompatibilityPolicy { .. } => "invalid-schema-compatibility-policy",
@@ -89,6 +91,15 @@ impl RemoteError {
             Self::Decode { .. } => "decode-error",
             Self::InvalidEnvelope { .. } => "invalid-envelope",
         }
+    }
+
+    /// Records this remote failure with a stable operation and error label.
+    pub fn record_metrics(&self, recorder: &dyn MetricsRecorder, operation: &str) {
+        recorder.increment_counter(
+            METRIC_REMOTE_FAILURES,
+            1,
+            &[("operation", operation), ("error", self.code())],
+        );
     }
 }
 

@@ -22,7 +22,8 @@ pub mod testkit;
 pub use actor::{
     spawn_process_actor, ProcessActor, ProcessActorCommand, ProcessActorConfig,
     ProcessActorStartMode, ProcessActorState, ProcessActorStatus, ProcessCheck, ProcessHealth,
-    ProcessRestartJitter, ProcessRestartPolicy, ProcessSupervisionEvent,
+    ProcessOperationalSnapshot, ProcessRestartJitter, ProcessRestartPolicy,
+    ProcessSupervisionEvent,
 };
 pub use endpoint::{
     start_local_grpc_process, start_socket_process, wait_for_local_endpoint,

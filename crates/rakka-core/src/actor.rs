@@ -6,11 +6,12 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::FutureExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -127,6 +128,66 @@ pub struct ActorTerminated {
     pub reason: TerminationReason,
 }
 
+/// Serializable actor runtime snapshot used by operational diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorRuntimeSnapshot {
+    path: ActorPath,
+    mailbox_capacity: usize,
+    mailbox_depth: usize,
+    terminated: bool,
+    termination_reason: Option<String>,
+}
+
+impl ActorRuntimeSnapshot {
+    /// Creates an actor runtime snapshot.
+    #[must_use]
+    pub fn new(
+        path: ActorPath,
+        mailbox_capacity: usize,
+        mailbox_depth: usize,
+        terminated: bool,
+        termination_reason: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            mailbox_capacity,
+            mailbox_depth,
+            terminated,
+            termination_reason,
+        }
+    }
+
+    /// Actor path.
+    #[must_use]
+    pub fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    /// Configured mailbox capacity.
+    #[must_use]
+    pub const fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    /// Current queued mailbox envelopes.
+    #[must_use]
+    pub const fn mailbox_depth(&self) -> usize {
+        self.mailbox_depth
+    }
+
+    /// Returns true after the actor terminates.
+    #[must_use]
+    pub const fn terminated(&self) -> bool {
+        self.terminated
+    }
+
+    /// Stable termination reason label, when terminated.
+    #[must_use]
+    pub fn termination_reason(&self) -> Option<&str> {
+        self.termination_reason.as_deref()
+    }
+}
+
 /// Typed reference to a local actor.
 pub struct ActorRef<M>
 where
@@ -147,13 +208,16 @@ where
             return Err(TellError::Closed(msg));
         }
 
+        self.cell.mark_enqueued();
         match self.sender.try_send(Envelope::User(msg)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(Envelope::User(msg))) => {
+                self.cell.mark_dequeued();
                 self.publish_dead_letter::<M>(DeadLetterReason::MailboxFull);
                 Err(TellError::Full(msg))
             }
             Err(TrySendError::Closed(Envelope::User(msg))) => {
+                self.cell.mark_dequeued();
                 self.publish_dead_letter::<M>(DeadLetterReason::MailboxClosed);
                 Err(TellError::Closed(msg))
             }
@@ -196,10 +260,17 @@ where
             return Ok(());
         }
 
+        self.cell.mark_enqueued();
         match self.sender.try_send(Envelope::Stop) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(StopError::MailboxFull),
-            Err(TrySendError::Closed(_)) => Err(StopError::MailboxClosed),
+            Err(TrySendError::Full(_)) => {
+                self.cell.mark_dequeued();
+                Err(StopError::MailboxFull)
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.cell.mark_dequeued();
+                Err(StopError::MailboxClosed)
+            }
         }
     }
 
@@ -215,9 +286,28 @@ where
         self.cell.terminated.load(Ordering::Acquire)
     }
 
+    /// Configured mailbox capacity.
+    #[must_use]
+    pub fn mailbox_capacity(&self) -> usize {
+        self.cell.mailbox_capacity()
+    }
+
+    /// Current queued mailbox envelopes.
+    #[must_use]
+    pub fn mailbox_depth(&self) -> usize {
+        self.cell.mailbox_depth()
+    }
+
+    /// Returns a serializable runtime snapshot for this actor.
+    #[must_use]
+    pub fn snapshot(&self) -> ActorRuntimeSnapshot {
+        self.cell.snapshot()
+    }
+
     pub(crate) fn stop_handle(&self) -> ActorStopHandle {
         let cloned = self.clone();
         ActorStopHandle {
+            cell: self.cell.clone(),
             stop: Arc::new(move || {
                 let _ = cloned.stop();
             }),
@@ -541,12 +631,17 @@ where
 
 #[derive(Clone)]
 pub(crate) struct ActorStopHandle {
+    cell: Arc<ActorCell>,
     stop: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl ActorStopHandle {
     pub(crate) fn stop(&self) {
         (self.stop)();
+    }
+
+    pub(crate) fn snapshot(&self) -> ActorRuntimeSnapshot {
+        self.cell.snapshot()
     }
 }
 
@@ -561,7 +656,11 @@ where
     F: Fn() -> A + Send + Sync + 'static,
 {
     let (sender, receiver) = mpsc::channel(options.mailbox_capacity);
-    let cell = Arc::new(ActorCell::new(path, system.dead_letters()));
+    let cell = Arc::new(ActorCell::new(
+        path,
+        system.dead_letters(),
+        options.mailbox_capacity,
+    ));
     let actor_ref = ActorRef {
         sender,
         cell: cell.clone(),
@@ -594,6 +693,7 @@ async fn run_actor_task<A, F>(
         termination_reason = reason;
     } else {
         while let Some(envelope) = receiver.recv().await {
+            cell.mark_dequeued();
             match envelope {
                 Envelope::Stop => {
                     termination_reason = TerminationReason::Stopped;
@@ -719,20 +819,66 @@ where
 struct ActorCell {
     path: ActorPath,
     dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
+    mailbox_capacity: usize,
+    mailbox_depth: AtomicUsize,
     terminated: AtomicBool,
     termination_reason: Mutex<Option<TerminationReason>>,
     watchers: Mutex<Vec<DeathRecipient>>,
 }
 
 impl ActorCell {
-    fn new(path: ActorPath, dead_letters: tokio::sync::broadcast::Sender<DeadLetter>) -> Self {
+    fn new(
+        path: ActorPath,
+        dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
+        mailbox_capacity: usize,
+    ) -> Self {
         Self {
             path,
             dead_letters,
+            mailbox_capacity,
+            mailbox_depth: AtomicUsize::new(0),
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
             watchers: Mutex::new(Vec::new()),
         }
+    }
+
+    fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    fn mailbox_depth(&self) -> usize {
+        self.mailbox_depth.load(Ordering::Acquire)
+    }
+
+    fn mark_enqueued(&self) {
+        self.mailbox_depth.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn mark_dequeued(&self) {
+        let _previous =
+            self.mailbox_depth
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                    Some(depth.saturating_sub(1))
+                });
+    }
+
+    fn snapshot(&self) -> ActorRuntimeSnapshot {
+        let termination_reason = self
+            .termination_reason
+            .lock()
+            .expect("termination reason mutex poisoned")
+            .as_ref()
+            .map(termination_reason_label)
+            .map(str::to_string);
+
+        ActorRuntimeSnapshot::new(
+            self.path.clone(),
+            self.mailbox_capacity,
+            self.mailbox_depth(),
+            self.terminated.load(Ordering::Acquire),
+            termination_reason,
+        )
     }
 
     fn watch(&self, recipient: DeathRecipient) {
@@ -765,6 +911,7 @@ impl ActorCell {
                 .termination_reason
                 .lock()
                 .expect("termination reason mutex poisoned") = Some(reason.clone());
+            self.mailbox_depth.store(0, Ordering::Release);
             self.terminated.store(true, Ordering::Release);
             watchers.drain(..).collect::<Vec<_>>()
         };
@@ -777,6 +924,15 @@ impl ActorCell {
         for watcher in watchers {
             watcher.notify(terminated.clone());
         }
+    }
+}
+
+fn termination_reason_label(reason: &TerminationReason) -> &'static str {
+    match reason {
+        TerminationReason::Normal => "normal",
+        TerminationReason::Stopped => "stopped",
+        TerminationReason::Escalated(_) => "escalated",
+        TerminationReason::Failed(_) => "failed",
     }
 }
 

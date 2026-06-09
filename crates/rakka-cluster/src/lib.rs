@@ -13,8 +13,8 @@ use rakka_core::Subsystem;
 pub use discovery::{DiscoveryProvider, DiscoverySnapshot, LocalDiscovery, StaticDiscovery};
 pub use error::{ClusterError, ClusterResult};
 pub use membership::{
-    ClusterMembership, MemberRecord, MembershipConfig, MembershipEvent, MembershipSnapshot,
-    MembershipState,
+    ClusterMembership, ClusterMembershipOperationalSnapshot, MemberRecord, MembershipConfig,
+    MembershipEvent, MembershipSnapshot, MembershipState, MembershipStateCount,
 };
 pub use node::{
     ClusterNode, ClusterProtocol, CompatibilityRange, NodeAddress, NodeId, NodeRole,
