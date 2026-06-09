@@ -146,7 +146,7 @@ Implementation notes:
 
 ## Slice 5C: HTTP Server and Unary Adapter Foundations
 
-Status: planned.
+Status: implemented.
 
 Goal: provide a small HTTP integration toolkit that routes external requests into Rakka protocols without making actors depend on HTTP.
 
@@ -175,6 +175,16 @@ Out of scope:
 - SSE.
 - Streaming request/response bodies.
 - AuthN/AuthZ.
+
+Implementation notes:
+
+- Chose Axum 0.7 on Tokio/Hyper as the v1 HTTP server primitive because it composes with Tower tests, keeps request parsing outside actor state, and remains a thin adapter layer rather than a full framework commitment.
+- Added `HttpRouteConfig`, `HttpServerConfig`, Axum serve helper, request timeout, payload limit, and graceful shutdown configuration.
+- Added typed `HttpError`/`HttpResult` with status mapping and JSON error bodies.
+- Added unary JSON route adapters for service handlers, actor ask/tell, and entity ask/tell through `ShardRegion`.
+- Added unary binary service route support for byte payloads.
+- Covered actor JSON ask, entity JSON ask, binary round trip, actor timeout to gateway timeout, payload limit to typed error, and actor/entity tell acceptance in HTTP tests.
+- Continue with Slice 5D for HTTP streaming, SSE, and WebSocket foundations.
 
 ## Slice 5D: HTTP Streaming, SSE, and WebSocket Foundations
 

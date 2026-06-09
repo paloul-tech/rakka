@@ -10,7 +10,17 @@ documentation.workspace = true
 readme.workspace = true
 
 [dependencies]
+axum.workspace = true
+http-body-util.workspace = true
 rakka-core = { path = "../rakka-core" }
+rakka-sharding = { path = "../rakka-sharding" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rakka-cluster = { path = "../rakka-cluster" }
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true
