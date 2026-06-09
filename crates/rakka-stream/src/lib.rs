@@ -409,6 +409,14 @@ pub struct StreamSource<T> {
     inner: Arc<Inner<T>>,
 }
 
+impl<T> Clone for StreamSource<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<T> fmt::Debug for StreamSource<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamSource")

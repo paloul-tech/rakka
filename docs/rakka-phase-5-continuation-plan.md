@@ -308,7 +308,7 @@ Implementation notes:
 
 ## Slice 5G: Kubernetes Health, Readiness, Liveness, and Drain Hooks
 
-Status: planned.
+Status: implemented.
 
 Goal: make Rakka node lifecycle visible and controllable from Kubernetes.
 
@@ -335,6 +335,18 @@ Out of scope:
 - Kubernetes API watch controller.
 - Helm charts.
 - Cloud load-balancer integration.
+
+Implementation notes:
+
+- Added `KubernetesNodeHealth` and probe snapshots in `rakka-k8s` for readiness/liveness decisions without tying actor runtime state directly to Kubernetes HTTP handlers.
+- Readiness now depends on local membership reaching `Up`, compatibility acceptance, required service registration, and the node not being in drain.
+- Liveness intentionally stays healthy during ordinary shard rebalance and graceful drain, but fails when an explicit stuck-runtime condition is recorded.
+- Added readiness/liveness probe hook helpers so `rakka-http` routes can expose Kubernetes probe endpoints without owning health state.
+- Added `KubernetesDrainController` with named drain steps, complete/partial/timed-out reports, timeout handling, and result details suitable for pre-stop endpoints.
+- Added drain hooks for sharding runtime leave/handoff, stream source/sink drain, and graceful `rakka-process` actor stop.
+- Added `StreamSource` cloning so stream drain hooks can be registered alongside existing stream owners.
+- Covered readiness before/after join, missing service readiness, rebalance/drain liveness, drain readiness, partial/timeout reporting, stream drain, sharding leave/reassignment, and process actor shutdown in `rakka-k8s` tests.
+- Continue with Slice 5H for metrics, tracing, and operational snapshots.
 
 ## Slice 5H: Metrics, Tracing, and Operational Snapshots
 
@@ -426,4 +438,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice 5A: stream core model and backpressure primitives. Streams are the lowest shared layer for HTTP streaming, gRPC streaming, process IO adapters, and ingestion examples, so they should land before public HTTP/gRPC streaming surfaces.
+Continue with Slice 5H: metrics, tracing, and operational snapshots. Health and drain hooks now expose lifecycle decisions; the next useful layer is backend-neutral operational visibility for those decisions and the HTTP/gRPC/stream/process surfaces built earlier in Phase 5.

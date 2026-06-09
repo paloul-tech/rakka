@@ -12,7 +12,11 @@ readme.workspace = true
 [dependencies]
 rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }
+rakka-process = { path = "../rakka-process" }
+rakka-sharding = { path = "../rakka-sharding" }
+rakka-stream = { path = "../rakka-stream" }
 serde.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -10,6 +10,19 @@ use rakka_cluster::{
 use rakka_core::Subsystem;
 use serde::{Deserialize, Serialize};
 
+mod drain;
+mod health;
+
+pub use drain::{
+    KubernetesDrainController, KubernetesDrainFuture, KubernetesDrainOutcome,
+    KubernetesDrainReport, KubernetesDrainStep, KubernetesDrainStepReport,
+    KubernetesDrainStepResult, KubernetesDrainStepStatus,
+};
+pub use health::{
+    liveness_probe_hook, readiness_probe_hook, KubernetesHealthSnapshot, KubernetesNodeHealth,
+    KubernetesProbeHook, KubernetesProbeKind, KubernetesProbeSnapshot,
+};
+
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-k8s";
 

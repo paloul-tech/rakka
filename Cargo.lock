@@ -991,7 +991,11 @@ version = "0.1.0"
 dependencies = [
  "rakka-cluster",
  "rakka-core",
+ "rakka-process",
+ "rakka-sharding",
+ "rakka-stream",
  "serde",
+ "tokio",
 ]
 
 [[package]]
