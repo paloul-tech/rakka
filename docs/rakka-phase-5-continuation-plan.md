@@ -71,7 +71,7 @@ Minimum completion criteria:
 
 ## Slice 5A: Stream Core Model and Backpressure Primitives
 
-Status: planned.
+Status: implemented.
 
 Goal: define the public `rakka-stream` vocabulary that HTTP, gRPC, process IO, and actor adapters will share.
 
@@ -97,6 +97,14 @@ Out of scope:
 - HTTP body adapters.
 - gRPC streaming adapters.
 - Process stdin/stdout adapters.
+
+Implementation notes:
+
+- Added `StreamError`, `StreamResult`, `StreamSendError`, `StreamLifecycle`, `StreamStatus`, and stable telemetry labels in `rakka-stream`.
+- Added `BoundedStream`, `StreamSink`, `StreamSource`, and `bounded_channel` with explicit capacity, blocking send, non-blocking try-send, drain, close, and cancellation.
+- Implemented close/cancel wakeups for pending producers and consumers, with send failures returning ownership of rejected items.
+- Covered bounded capacity, cancellation propagation, graceful drain, forced close, pending wakeups, and invalid capacity in stream core tests.
+- Continue with Slice 5B for actor/entity/process IO adapters that build on these primitives.
 
 ## Slice 5B: Actor, Entity, and Process IO Stream Adapters
 

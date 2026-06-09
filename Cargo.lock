@@ -963,6 +963,7 @@ name = "rakka-stream"
 version = "0.1.0"
 dependencies = [
  "rakka-core",
+ "tokio",
 ]
 
 [[package]]
