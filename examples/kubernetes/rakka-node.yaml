@@ -1,0 +1,252 @@
+# Reviewable Kubernetes example for a three-node Rakka cluster.
+#
+# Replace ghcr.io/rakka-rs/rakka-node:0.1.0 with an application image that
+# exposes:
+# - HTTP readiness at /ready on port 8080
+# - HTTP liveness at /live on port 8080
+# - HTTP drain at /drain on port 8080
+# - Rakka remoting on port 2552
+# - Public gRPC on port 50051
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rakka-system
+  labels:
+    app.kubernetes.io/part-of: rakka
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-node-config
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/part-of: rakka
+data:
+  RAKKA_HEADLESS_SERVICE: rakka-internal
+  RAKKA_CLUSTER_DOMAIN: cluster.local
+  RAKKA_REMOTING_PORT: "2552"
+  RAKKA_HTTP_PORT: "8080"
+  RAKKA_GRPC_PORT: "50051"
+  RAKKA_READINESS_PATH: /ready
+  RAKKA_LIVENESS_PATH: /live
+  RAKKA_DRAIN_PATH: /drain
+  RAKKA_REQUIRED_SERVICES: http,grpc
+  RAKKA_PROTOCOL_VERSION: "1.0"
+  RAKKA_COMPAT_MIN: "1.0"
+  RAKKA_COMPAT_MAX: "1.1"
+  RAKKA_COMPAT_POLICY: n-to-n-plus-one
+  RAKKA_SHARD_COUNT: "128"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-internal
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/part-of: rakka
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/component: node
+  ports:
+    - name: remoting
+      port: 2552
+      targetPort: remoting
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-public
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/part-of: rakka
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/component: node
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rakka-node
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/part-of: rakka
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-node
+      app.kubernetes.io/component: node
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rakka-node
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-node
+    app.kubernetes.io/part-of: rakka
+  annotations:
+    rakka.rs/protocol-version: "1.0"
+    rakka.rs/compatible-min: "1.0"
+    rakka.rs/compatible-max: "1.1"
+spec:
+  serviceName: rakka-internal
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-node
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-node
+        app.kubernetes.io/component: node
+        app.kubernetes.io/part-of: rakka
+      annotations:
+        rakka.rs/protocol-version: "1.0"
+        rakka.rs/compatible-min: "1.0"
+        rakka.rs/compatible-max: "1.1"
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: rakka-node
+          image: ghcr.io/rakka-rs/rakka-node:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: remoting
+              containerPort: 2552
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 50051
+          env:
+            - name: RAKKA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RAKKA_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: RAKKA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RAKKA_HEADLESS_SERVICE
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_HEADLESS_SERVICE
+            - name: RAKKA_CLUSTER_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_CLUSTER_DOMAIN
+            - name: RAKKA_REMOTING_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTING_PORT
+            - name: RAKKA_HTTP_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_HTTP_PORT
+            - name: RAKKA_GRPC_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_GRPC_PORT
+            - name: RAKKA_READINESS_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_READINESS_PATH
+            - name: RAKKA_LIVENESS_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_LIVENESS_PATH
+            - name: RAKKA_DRAIN_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_DRAIN_PATH
+            - name: RAKKA_REQUIRED_SERVICES
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REQUIRED_SERVICES
+            - name: RAKKA_PROTOCOL_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_PROTOCOL_VERSION
+            - name: RAKKA_COMPAT_MIN
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_COMPAT_MIN
+            - name: RAKKA_COMPAT_MAX
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_COMPAT_MAX
+            - name: RAKKA_COMPAT_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_COMPAT_POLICY
+            - name: RAKKA_SHARD_COUNT
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_SHARD_COUNT
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              httpGet:
+                path: /drain
+                port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi

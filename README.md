@@ -99,6 +99,42 @@ Rakka wrapped legacy-calculator and received result 42.
 Captured child stderr: ["legacy child handled increment"]
 ```
 
+## Kubernetes Example
+
+The reviewable Kubernetes example is in `examples/kubernetes`. It includes a three-replica `StatefulSet`, a headless internal service for stable pod DNS, a public HTTP/gRPC service, readiness/liveness probes, a pre-stop drain hook, and a PodDisruptionBudget.
+
+Inspect the manifest:
+
+```sh
+less examples/kubernetes/rakka-node.yaml
+```
+
+Run the manifest contract tests:
+
+```sh
+cargo test -p rakka-k8s kubernetes_manifests
+```
+
+Preview the local-cluster scenario without touching a cluster:
+
+```sh
+RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh
+```
+
+Validate the manifest with `kubectl` against your active context:
+
+```sh
+RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
+```
+
+Run the optional local-cluster scenario against your active kind/minikube context:
+
+```sh
+RAKKA_K8S_IMAGE=your-registry/rakka-node:dev RAKKA_K8S_RUN_LOCAL_CLUSTER=1 cargo test -p rakka-k8s optional_local_cluster_scenario_is_gated -- --nocapture
+```
+
+The local-cluster scenario is gated because it applies resources, calls `/drain`, deletes one pod, and optionally performs a rolling update when `RAKKA_K8S_NEXT_IMAGE` is set.
+
 ## Optional PostgreSQL Test
 
 The PostgreSQL plugin has an optional round-trip test. It is skipped unless `RAKKA_POSTGRES_TEST_DSN` is set:

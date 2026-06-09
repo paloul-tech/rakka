@@ -32,6 +32,9 @@ pub const DEFAULT_READINESS_PATH: &str = "/ready";
 /// Default Kubernetes liveness endpoint.
 pub const DEFAULT_LIVENESS_PATH: &str = "/live";
 
+/// Default Kubernetes pre-stop drain endpoint.
+pub const DEFAULT_DRAIN_PATH: &str = "/drain";
+
 /// Subsystem associated with Kubernetes integration.
 #[must_use]
 pub const fn subsystem() -> Subsystem {

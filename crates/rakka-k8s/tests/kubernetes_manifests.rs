@@ -1,0 +1,160 @@
+//! Kubernetes example manifest contract tests.
+
+use std::path::Path;
+use std::process::Command;
+
+use rakka_k8s::{
+    KubernetesDnsDiscoveryConfig, DEFAULT_DRAIN_PATH, DEFAULT_LIVENESS_PATH, DEFAULT_READINESS_PATH,
+};
+
+const MANIFEST: &str = include_str!("../../../examples/kubernetes/rakka-node.yaml");
+const SCENARIO: &str = include_str!("../../../examples/kubernetes/local-cluster-scenario.sh");
+
+#[test]
+fn manifest_documents_have_required_kubernetes_shape() {
+    let docs = manifest_documents();
+
+    assert_eq!(docs.len(), 6);
+    for doc in docs {
+        assert!(doc.contains("apiVersion:"), "missing apiVersion: {doc}");
+        assert!(doc.contains("kind:"), "missing kind: {doc}");
+        assert!(doc.contains("metadata:"), "missing metadata: {doc}");
+        assert!(doc.contains("  name:"), "missing metadata.name: {doc}");
+    }
+}
+
+#[test]
+fn manifest_references_readiness_liveness_and_drain_hooks() {
+    assert!(MANIFEST.contains(DEFAULT_READINESS_PATH));
+    assert!(MANIFEST.contains(DEFAULT_LIVENESS_PATH));
+    assert!(MANIFEST.contains(DEFAULT_DRAIN_PATH));
+    assert!(MANIFEST.contains("readinessProbe:"));
+    assert!(MANIFEST.contains("livenessProbe:"));
+    assert!(MANIFEST.contains("preStop:"));
+    assert!(MANIFEST.contains("path: /drain"));
+}
+
+#[test]
+fn dns_discovery_config_matches_headless_service_shape() {
+    let dns = KubernetesDnsDiscoveryConfig::new("rakka-system", "rakka-internal", 2552);
+
+    assert_eq!(
+        dns.pod_host("rakka-node-0"),
+        "rakka-node-0.rakka-internal.rakka-system.svc.cluster.local"
+    );
+    assert!(MANIFEST.contains("name: rakka-internal"));
+    assert!(MANIFEST.contains("clusterIP: None"));
+    assert!(MANIFEST.contains("publishNotReadyAddresses: true"));
+    assert!(MANIFEST.contains("serviceName: rakka-internal"));
+    assert!(MANIFEST.contains("RAKKA_HEADLESS_SERVICE"));
+    assert!(MANIFEST.contains("RAKKA_CLUSTER_DOMAIN"));
+}
+
+#[test]
+fn manifest_documents_ports_environment_and_rolling_compatibility() {
+    for expected in [
+        "name: remoting",
+        "containerPort: 2552",
+        "name: http",
+        "containerPort: 8080",
+        "name: grpc",
+        "containerPort: 50051",
+        "RAKKA_PROTOCOL_VERSION",
+        "RAKKA_COMPAT_MIN",
+        "RAKKA_COMPAT_MAX",
+        "RAKKA_COMPAT_POLICY",
+        "n-to-n-plus-one",
+        "minAvailable: 2",
+    ] {
+        assert!(MANIFEST.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn local_cluster_scenario_is_documented_and_dry_run_safe() {
+    for expected in [
+        "RAKKA_K8S_SCENARIO_DRY_RUN",
+        "kubectl apply",
+        "rollout status statefulset/rakka-node",
+        "wait --for=condition=Ready",
+        "http://127.0.0.1:8080/ready",
+        "http://127.0.0.1:8080/live",
+        "http://127.0.0.1:8080/drain",
+        "delete pod/rakka-node-1",
+        "set image statefulset/rakka-node",
+    ] {
+        assert!(SCENARIO.contains(expected), "missing {expected}");
+    }
+
+    let script = repo_root().join("examples/kubernetes/local-cluster-scenario.sh");
+    let output = Command::new("sh")
+        .arg(script)
+        .env("RAKKA_K8S_SCENARIO_DRY_RUN", "1")
+        .output()
+        .expect("dry-run scenario should execute");
+    assert!(
+        output.status.success(),
+        "dry-run scenario failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn optional_kubectl_manifest_validation_is_gated() {
+    if std::env::var("RAKKA_K8S_VALIDATE_MANIFESTS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        eprintln!("skipping kubectl manifest validation; set RAKKA_K8S_VALIDATE_MANIFESTS=1");
+        return;
+    }
+
+    let manifest = repo_root().join("examples/kubernetes/rakka-node.yaml");
+    let output = Command::new("kubectl")
+        .args(["apply", "--dry-run=client", "-f"])
+        .arg(manifest)
+        .output()
+        .expect("kubectl should be available when validation is enabled");
+    assert!(
+        output.status.success(),
+        "kubectl dry-run failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn optional_local_cluster_scenario_is_gated() {
+    if std::env::var("RAKKA_K8S_RUN_LOCAL_CLUSTER").ok().as_deref() != Some("1") {
+        eprintln!("skipping local cluster scenario; set RAKKA_K8S_RUN_LOCAL_CLUSTER=1");
+        return;
+    }
+
+    let script = repo_root().join("examples/kubernetes/local-cluster-scenario.sh");
+    let output = Command::new("sh")
+        .arg(script)
+        .output()
+        .expect("local cluster scenario should execute when enabled");
+    assert!(
+        output.status.success(),
+        "local cluster scenario failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn manifest_documents() -> Vec<&'static str> {
+    MANIFEST
+        .split("\n---")
+        .map(str::trim)
+        .filter(|doc| !doc.is_empty() && !doc.starts_with('#'))
+        .collect()
+}
+
+fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("rakka-k8s crate should live below workspace root")
+}

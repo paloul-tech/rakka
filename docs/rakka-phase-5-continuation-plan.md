@@ -391,7 +391,7 @@ Implementation notes:
 
 ## Slice 5I: Kubernetes Manifests and Local Cluster Example
 
-Status: planned.
+Status: implemented.
 
 Goal: provide reviewable Kubernetes deployment examples and optional local-cluster tests.
 
@@ -419,6 +419,18 @@ Out of scope:
 - Production Helm chart.
 - Cloud-specific ingress, load balancer, or autoscaler resources.
 - Per-actor sidecar containers.
+
+Implementation notes:
+
+- Added `examples/kubernetes/rakka-node.yaml` with a reviewable namespace, config map, headless internal service, public HTTP/gRPC service, PodDisruptionBudget, and three-replica `StatefulSet`.
+- Used a `StatefulSet` so pod DNS names match Rakka Kubernetes DNS discovery, for example `rakka-node-0.rakka-internal.rakka-system.svc.cluster.local`.
+- Documented required ports and env vars for remoting, HTTP, gRPC, readiness, liveness, drain, required services, shard count, and N/N+1 compatibility.
+- Wired readiness to `/ready`, liveness to `/live`, and the pre-stop hook to `/drain` so Slice 5G health and drain surfaces can be used by Kubernetes.
+- Added a local-cluster scenario script with dry-run output, manifest application, readiness checks, liveness checks, drain call, pod deletion, and optional rolling update when `RAKKA_K8S_NEXT_IMAGE` is set.
+- Added default manifest contract tests in `rakka-k8s` for document shape, probe paths, drain hook, DNS discovery shape, ports, environment variables, compatibility settings, and dry-run scenario safety.
+- Added optional gated tests for `kubectl apply --dry-run=client` with `RAKKA_K8S_VALIDATE_MANIFESTS=1` and real local-cluster execution with `RAKKA_K8S_RUN_LOCAL_CLUSTER=1`.
+- Updated the README with commands for manifest review, dry run, gated kubectl validation, and gated local-cluster execution.
+- Continue with Slice 5J for end-to-end HTTP/gRPC/stream/process examples, testkit helpers, and final Phase 5 documentation.
 
 ## Slice 5J: End-to-End Examples, Testkit, and Documentation
 
@@ -451,4 +463,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice 5I: Kubernetes manifests and local cluster example. Health, drain, and backend-neutral observability are now in place; the next useful layer is reviewable Kubernetes wiring for probes, pre-stop drain, service exposure, and optional local-cluster scenarios.
+Continue with Slice 5J: end-to-end examples, testkit, and documentation. The Kubernetes wiring is now reviewable and gated; the final Phase 5 slice should make HTTP, gRPC, streams, process-backed services, health, drain, and metrics easy to exercise together.
