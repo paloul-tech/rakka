@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rakka_core::{AskError, RakkaError, Subsystem, TellError};
 use rakka_sharding::{EntityAskError, EntityDeliveryFailure, EntityTellError, ShardingError};
+use rakka_stream::StreamError;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Status};
 
@@ -35,6 +36,32 @@ pub enum GrpcError {
         /// Timeout that elapsed.
         timeout: Duration,
     },
+    /// Streaming handler or pump did not finish before the effective timeout.
+    StreamTimeout {
+        /// Timeout that elapsed.
+        timeout: Duration,
+    },
+    /// Streaming pump failed outside ordinary stream lifecycle.
+    StreamPump {
+        /// Pump failure detail.
+        message: String,
+    },
+    /// Stream was configured with an invalid bounded capacity.
+    StreamInvalidCapacity {
+        /// Rejected capacity.
+        capacity: usize,
+    },
+    /// Stream buffer was full.
+    StreamFull {
+        /// Configured bounded buffer capacity.
+        capacity: usize,
+    },
+    /// Stream was draining and rejected new work.
+    StreamDraining,
+    /// Stream closed before the operation completed.
+    StreamClosed,
+    /// Stream was cancelled.
+    StreamCancelled,
     /// RPC was cancelled by the caller.
     Cancelled,
     /// Actor mailbox was full.
@@ -117,6 +144,14 @@ impl GrpcError {
         }
     }
 
+    /// Creates a streaming pump failure.
+    #[must_use]
+    pub fn stream_pump(message: impl Into<String>) -> Self {
+        Self::StreamPump {
+            message: message.into(),
+        }
+    }
+
     /// Converts this error to a framework error.
     #[must_use]
     pub fn into_rakka_error(self) -> RakkaError {
@@ -143,6 +178,13 @@ impl GrpcError {
             Self::Validation { .. } => "validation-error",
             Self::Service { .. } => "service-error",
             Self::ServiceTimeout { .. } => "service-timeout",
+            Self::StreamTimeout { .. } => "stream-timeout",
+            Self::StreamPump { .. } => "stream-pump",
+            Self::StreamInvalidCapacity { .. } => "stream-invalid-capacity",
+            Self::StreamFull { .. } => "stream-full",
+            Self::StreamDraining => "stream-draining",
+            Self::StreamClosed => "stream-closed",
+            Self::StreamCancelled => "stream-cancelled",
             Self::Cancelled => "cancelled",
             Self::ActorMailboxFull => "actor-mailbox-full",
             Self::ActorMailboxClosed => "actor-mailbox-closed",
@@ -167,13 +209,18 @@ impl GrpcError {
     pub const fn grpc_code(&self) -> Code {
         match self {
             Self::Decode { .. } | Self::Validation { .. } => Code::InvalidArgument,
-            Self::ServiceTimeout { .. } | Self::ActorTimeout | Self::EntityTimeout => {
-                Code::DeadlineExceeded
+            Self::ServiceTimeout { .. }
+            | Self::StreamTimeout { .. }
+            | Self::ActorTimeout
+            | Self::EntityTimeout => Code::DeadlineExceeded,
+            Self::Cancelled | Self::StreamCancelled => Code::Cancelled,
+            Self::ActorMailboxFull | Self::EntityMailboxFull | Self::StreamFull { .. } => {
+                Code::ResourceExhausted
             }
-            Self::Cancelled => Code::Cancelled,
-            Self::ActorMailboxFull | Self::EntityMailboxFull => Code::ResourceExhausted,
             Self::ActorMailboxClosed
             | Self::ActorReplyDropped
+            | Self::StreamDraining
+            | Self::StreamClosed
             | Self::EntityNoRoute { .. }
             | Self::EntityMailboxClosed
             | Self::EntityNotLocal { .. }
@@ -182,6 +229,8 @@ impl GrpcError {
             | Self::EntityReplyDropped => Code::Unavailable,
             Self::EntityRejected { .. } => Code::FailedPrecondition,
             Self::Service { .. }
+            | Self::StreamPump { .. }
+            | Self::StreamInvalidCapacity { .. }
             | Self::EntitySpawnFailed { .. }
             | Self::EntityRemoteEncode { .. } => Code::Internal,
         }
@@ -239,6 +288,18 @@ impl GrpcError {
         }
     }
 
+    /// Converts a bounded Rakka stream failure to a gRPC adapter error.
+    #[must_use]
+    pub fn from_stream_error(error: StreamError) -> Self {
+        match error {
+            StreamError::InvalidCapacity { capacity } => Self::StreamInvalidCapacity { capacity },
+            StreamError::Full { capacity } => Self::StreamFull { capacity },
+            StreamError::Draining => Self::StreamDraining,
+            StreamError::Closed => Self::StreamClosed,
+            StreamError::Cancelled { .. } => Self::StreamCancelled,
+        }
+    }
+
     fn from_sharding_error(error: ShardingError) -> Self {
         Self::EntityNoRoute {
             message: error.to_string(),
@@ -273,6 +334,22 @@ impl Display for GrpcError {
             Self::ServiceTimeout { timeout } => {
                 write!(f, "gRPC service handler timed out after {timeout:?}")
             }
+            Self::StreamTimeout { timeout } => {
+                write!(f, "gRPC stream timed out after {timeout:?}")
+            }
+            Self::StreamPump { message } => write!(f, "gRPC stream pump failed: {message}"),
+            Self::StreamInvalidCapacity { capacity } => {
+                write!(
+                    f,
+                    "gRPC stream capacity must be greater than zero: {capacity}"
+                )
+            }
+            Self::StreamFull { capacity } => {
+                write!(f, "gRPC stream buffer is full at capacity {capacity}")
+            }
+            Self::StreamDraining => f.write_str("gRPC stream is draining"),
+            Self::StreamClosed => f.write_str("gRPC stream is closed"),
+            Self::StreamCancelled => f.write_str("gRPC stream was cancelled"),
             Self::Cancelled => f.write_str("gRPC request was cancelled"),
             Self::ActorMailboxFull => f.write_str("actor mailbox was full"),
             Self::ActorMailboxClosed => f.write_str("actor mailbox was closed"),
@@ -325,7 +402,13 @@ pub fn validation_status(message: impl Into<String>) -> Status {
     GrpcError::validation(message).into_status()
 }
 
-/// Creates a tonic `internal` status for unary service handler failures.
+/// Creates a tonic status for bounded stream failures.
+#[must_use]
+pub fn stream_status(error: StreamError) -> Status {
+    GrpcError::from_stream_error(error).into_status()
+}
+
+/// Creates a tonic `internal` status for service handler failures.
 #[must_use]
 pub fn service_status(message: impl Into<String>) -> Status {
     GrpcError::service(message).into_status()

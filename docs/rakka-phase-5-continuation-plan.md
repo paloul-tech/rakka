@@ -268,7 +268,7 @@ Implementation notes:
 
 ## Slice 5F: gRPC Streaming Adapter Foundations
 
-Status: planned.
+Status: implemented.
 
 Goal: connect tonic streaming RPCs to `rakka-stream` pipelines.
 
@@ -294,6 +294,17 @@ Out of scope:
 
 - Generated API design guidelines beyond adapter examples.
 - Public exposure of internal remoting envelopes.
+
+Implementation notes:
+
+- Added `GrpcStreamConfig` with bounded buffer capacity, request timeout, and drain timeout settings for streaming methods.
+- Added `GrpcResponseStream<T>` and server-streaming helpers that expose `StreamSource<T>` as tonic-compatible ordered response streams.
+- Added drop guards so client-side response cancellation cancels the backing Rakka stream instead of leaving upstream producers blocked.
+- Added client-streaming inbound pumps that push tonic stream items into bounded `rakka-stream` sources and preserve back-pressure.
+- Added bidirectional bridge helpers that expose independent inbound `StreamSource<Req>` and outbound `StreamSink<Resp>` endpoints while returning a tonic-compatible response stream.
+- Extended gRPC error mapping for stream timeout, pump, invalid capacity, full, draining, closed, and cancelled states using stable `rakka-error-code` metadata.
+- Sanitized stream cancellation statuses so internal cancellation reasons, including remoting details, are not exposed to gRPC clients.
+- Added protobuf-shaped tests for ordered server streaming, response drop cancellation, sanitized stream errors, client-stream back-pressure, deadline cancellation, bidirectional routing, and blocked inbound pump cancellation.
 
 ## Slice 5G: Kubernetes Health, Readiness, Liveness, and Drain Hooks
 

@@ -10,8 +10,10 @@ documentation.workspace = true
 readme.workspace = true
 
 [dependencies]
+futures-util.workspace = true
 rakka-core = { path = "../rakka-core" }
 rakka-sharding = { path = "../rakka-sharding" }
+rakka-stream = { path = "../rakka-stream" }
 tokio.workspace = true
 tonic.workspace = true
 
