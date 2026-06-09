@@ -31,7 +31,7 @@ documentation = "https://docs.rs/rakka"
 readme = "README.md"
 
 [workspace.dependencies]
-axum = "0.7.9"
+axum = { version = "0.7.9", features = ["ws"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 prost = "0.13"

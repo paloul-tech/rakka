@@ -47,6 +47,18 @@ pub enum HttpError {
         /// Timeout that elapsed.
         timeout: Duration,
     },
+    /// A Rakka stream ended with an error while backing an HTTP stream.
+    Stream {
+        /// Stream failure detail.
+        message: String,
+    },
+    /// HTTP streaming stopped because the client disconnected.
+    ClientDisconnected,
+    /// WebSocket bridge failed.
+    WebSocket {
+        /// WebSocket failure detail.
+        message: String,
+    },
     /// Actor mailbox was full.
     ActorMailboxFull,
     /// Actor mailbox was closed.
@@ -139,6 +151,9 @@ impl HttpError {
             Self::JsonEncode { .. } => "json-encode",
             Self::Service { .. } => "service-error",
             Self::ServiceTimeout { .. } => "service-timeout",
+            Self::Stream { .. } => "stream-error",
+            Self::ClientDisconnected => "client-disconnected",
+            Self::WebSocket { .. } => "websocket-error",
             Self::ActorMailboxFull => "actor-mailbox-full",
             Self::ActorMailboxClosed => "actor-mailbox-closed",
             Self::ActorTimeout => "actor-timeout",
@@ -168,8 +183,10 @@ impl HttpError {
             Self::ActorTimeout | Self::EntityTimeout | Self::ServiceTimeout { .. } => {
                 StatusCode::GATEWAY_TIMEOUT
             }
+            Self::ClientDisconnected => StatusCode::BAD_REQUEST,
             Self::ActorMailboxFull
             | Self::ActorMailboxClosed
+            | Self::Stream { .. }
             | Self::EntityNoRoute { .. }
             | Self::EntityMailboxFull
             | Self::EntityMailboxClosed
@@ -179,6 +196,7 @@ impl HttpError {
             Self::EntityRejected { .. } => StatusCode::CONFLICT,
             Self::JsonEncode { .. }
             | Self::Service { .. }
+            | Self::WebSocket { .. }
             | Self::EntitySpawnFailed { .. }
             | Self::EntityRemoteEncode { .. }
             | Self::EntityRemoteSend { .. }
@@ -193,6 +211,12 @@ impl HttpError {
             AskError::MailboxClosed => Self::ActorMailboxClosed,
             AskError::Timeout => Self::ActorTimeout,
             AskError::ReplyDropped => Self::ActorReplyDropped,
+        }
+    }
+
+    pub(crate) fn from_stream_error(error: rakka_stream::StreamError) -> Self {
+        Self::Stream {
+            message: error.to_string(),
         }
     }
 
@@ -269,6 +293,9 @@ impl Display for HttpError {
             Self::ServiceTimeout { timeout } => {
                 write!(f, "service handler timed out after {timeout:?}")
             }
+            Self::Stream { message } => write!(f, "HTTP stream failed: {message}"),
+            Self::ClientDisconnected => f.write_str("HTTP client disconnected"),
+            Self::WebSocket { message } => write!(f, "WebSocket bridge failed: {message}"),
             Self::ActorMailboxFull => f.write_str("actor mailbox was full"),
             Self::ActorMailboxClosed => f.write_str("actor mailbox was closed"),
             Self::ActorTimeout => f.write_str("actor ask timed out"),

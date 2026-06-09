@@ -188,7 +188,7 @@ Implementation notes:
 
 ## Slice 5D: HTTP Streaming, SSE, and WebSocket Foundations
 
-Status: planned.
+Status: implemented.
 
 Goal: build public HTTP streaming adapters on top of `rakka-stream`.
 
@@ -215,6 +215,15 @@ Out of scope:
 
 - Full web framework routing DSL.
 - Browser-oriented session/state features.
+
+Implementation notes:
+
+- Added request body adapters that pump Axum bodies into bounded Rakka byte streams with payload limits and back-pressure.
+- Added byte-stream response adapters and route builders that stream `StreamSource<Bytes>` into HTTP responses and complete cleanly on graceful drain.
+- Added SSE response and route builders that map ordered `StreamSource<String>` items to SSE events and emit typed error events on stream failure.
+- Added WebSocket bridge foundations: per-connection bridge pairs, Axum upgrade route builder, generic bridge loop, inbound/outbound message forwarding, close-frame stream error mapping, and outbound source cancellation on client disconnect.
+- Covered request-body back-pressure, byte response streaming, stream body error propagation, SSE ordering/completion/error event mapping, WebSocket inbound/outbound bridging, and disconnect cancellation in HTTP streaming tests.
+- Continue with Slice 5E for gRPC unary adapter foundations.
 
 ## Slice 5E: gRPC Unary Adapter Foundations
 

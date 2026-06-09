@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod routes;
 mod server;
+mod streaming;
 
 pub use axum::Router;
 pub use config::{
@@ -21,6 +22,13 @@ pub use routes::{
     json_entity_ask_route, json_entity_tell_route, json_service_route, HttpAccepted, HttpRouter,
 };
 pub use server::serve_with_graceful_shutdown;
+pub use streaming::{
+    byte_stream_response, byte_stream_response_with_content_type, byte_stream_route,
+    request_body_stream_from_body, request_body_stream_from_request, request_body_stream_route,
+    run_websocket_bridge, run_websocket_bridge_io, sse_response_from_stream, sse_stream_route,
+    websocket_bridge_pair, websocket_stream_route, HttpRequestBodyPump, HttpRequestBodyStream,
+    WebSocketBridge, WebSocketBridgeSummary, WebSocketCloseFrame, WebSocketMessage,
+};
 
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-http";
