@@ -13,15 +13,17 @@ use rakka_cluster::{
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem,
-    InMemoryMetricsRecorder, METRIC_GRPC_REQUEST_LATENCY_MS, METRIC_HTTP_REQUEST_LATENCY_MS,
+    InMemoryMetricsRecorder, MetricAttribute, METRIC_GRPC_REQUEST_LATENCY_MS,
+    METRIC_HTTP_REQUEST_LATENCY_MS,
 };
 use rakka_grpc::{
     bidi_streaming_service_from_stream, record_grpc_request_metrics, unary_actor_ask,
     unary_entity_ask, GrpcStreamConfig, GrpcUnaryConfig,
 };
 use rakka_http::{
-    json_actor_ask_route, json_entity_ask_route, json_service_route, record_http_request_metrics,
-    HttpError, HttpRouteConfig,
+    json_actor_ask_route, json_entity_ask_route, json_service_route,
+    open_telemetry_metrics_json_route, operational_snapshots_route, prometheus_metrics_route,
+    record_http_request_metrics, HttpError, HttpRouteConfig, OperationalSnapshotRegistry,
 };
 use rakka_k8s::{KubernetesDrainController, KubernetesDrainOutcome, KubernetesNodeHealth};
 use rakka_process::{
@@ -34,7 +36,7 @@ use rakka_sharding::{
 use rakka_stream::{bounded_channel, StreamSink};
 use rakka_testkit::{
     assert_drain_complete, assert_http_status, assert_metric_attribute, assert_probe_passed,
-    collect_grpc_stream, expect_grpc_unary_ok, expect_metric_observation, http_post_json,
+    collect_grpc_stream, expect_grpc_unary_ok, expect_metric_observation, http_get, http_post_json,
 };
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Status};
@@ -139,6 +141,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (cart_region, cart_entity, cart_events) = cart_region()?;
     let legacy = spawn_legacy_actor(&system)?;
     let recorder = InMemoryMetricsRecorder::new();
+    let snapshots = OperationalSnapshotRegistry::new();
 
     let http_router = json_actor_ask_route(
         "/counter/add",
@@ -178,7 +181,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         },
-    ));
+    ))
+    .merge(prometheus_metrics_route("/metrics", {
+        let recorder = recorder.clone();
+        move || recorder.snapshot()
+    }))
+    .merge(open_telemetry_metrics_json_route(
+        "/otel/metrics",
+        vec![MetricAttribute::new("service.name", "rakka-edge-gateway")],
+        {
+            let recorder = recorder.clone();
+            move || recorder.snapshot()
+        },
+    ))
+    .merge(operational_snapshots_route("/snapshots", snapshots.clone()));
 
     let http_counter = record_http_request_metrics(&recorder, "POST", "/counter/add", async {
         Ok::<_, HttpError>(
@@ -206,7 +222,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let http_cart: CartReply = http_cart.json();
 
     let http_legacy = http_post_json(
-        http_router,
+        http_router.clone(),
         "/legacy/increment",
         &LegacyRequest {
             command: "increment".to_owned(),
@@ -292,6 +308,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     health.require_service("grpc");
     health.register_service("http");
     health.register_service("grpc");
+    snapshots.register_snapshot("actor_system", {
+        let system = system.clone();
+        move || system.record_metrics()
+    });
+    snapshots.register_snapshot("kubernetes_health", {
+        let health = health.clone();
+        move || health.snapshot()
+    });
     assert_probe_passed(&health.readiness_probe());
     let mut drain = KubernetesDrainController::new(health.clone());
     let (drain_sink, _drain_source) = bounded_channel::<String>(1)?;
@@ -313,6 +337,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rakka_core::MetricKind::Histogram,
     );
     assert_metric_attribute(&grpc_metric, "method", "Add");
+
+    let prometheus_response = http_get(http_router.clone(), "/metrics").await;
+    assert_http_status(&prometheus_response, axum::http::StatusCode::OK);
+    let prometheus_body = String::from_utf8(prometheus_response.body().to_vec())
+        .map_err(|error| example_error(error.to_string()))?;
+    assert!(prometheus_body.contains("rakka_http_request_latency_ms_count"));
+
+    let otel_response = http_get(http_router.clone(), "/otel/metrics").await;
+    assert_http_status(&otel_response, axum::http::StatusCode::OK);
+    let otel: serde_json::Value = otel_response.json();
+    assert_eq!(
+        otel["resource_attributes"][0]["value"],
+        "rakka-edge-gateway"
+    );
+
+    let snapshots_response = http_get(http_router, "/snapshots").await;
+    assert_http_status(&snapshots_response, axum::http::StatusCode::OK);
+    let snapshot_body: serde_json::Value = snapshots_response.json();
+    assert_eq!(
+        snapshot_body["snapshots"]["kubernetes_health"]["membership_state"],
+        "up"
+    );
 
     println!(
         "HTTP actor gateway returned counter value {}.",
@@ -347,6 +393,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         http_metric.attribute("route").unwrap_or("unknown"),
         grpc_metric.attribute("method").unwrap_or("unknown")
     );
+    println!("Observability routes exposed /metrics, /otel/metrics, and /snapshots.");
 
     legacy.stop()?;
     system.shutdown();

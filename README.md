@@ -10,6 +10,7 @@ See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kuberne
 See `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, allowed version skew, and compatibility test commands.
 See `docs/rakka-v1-api-review.md` for the current public API review notes, crate map, feature boundaries, and error-code policy.
 See `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrored HTTP routes, and the adapter boundary.
+See `docs/rakka-v1-observability-exporters.md` for Prometheus/OpenTelemetry exporter adapters, snapshot routes, and cardinality guidance.
 
 ## Crate Map
 
@@ -30,6 +31,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 cargo test -p rakka-example-generated-contracts --test generated_contracts -- --nocapture
+cargo test -p rakka-core --test observability_exporters
+cargo test -p rakka-http --test observability_routes
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
@@ -172,6 +175,7 @@ gRPC bidirectional stream routed 2 cart updates.
 Streaming ingestion transformed 2 items into entity commands.
 Kubernetes readiness passed before drain; drain outcome Complete.
 Metrics captured HTTP route /counter/add and gRPC method Add.
+Observability routes exposed /metrics, /otel/metrics, and /snapshots.
 ```
 
 ### Generated Contracts

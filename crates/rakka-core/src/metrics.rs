@@ -1,5 +1,7 @@
-//! Metrics traits, stable metric names, and test-friendly recorders.
+//! Metrics traits, stable metric names, test-friendly recorders, and exporter adapters.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -59,7 +61,7 @@ pub trait MetricsRecorder: Send + Sync {
 }
 
 /// Kind of metric observation captured by an in-memory recorder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MetricKind {
     /// Monotonically increasing counter.
@@ -83,7 +85,7 @@ impl MetricKind {
 }
 
 /// Owned key/value metric attribute.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MetricAttribute {
     key: String,
     value: String,
@@ -232,6 +234,321 @@ impl MetricsSnapshot {
     }
 }
 
+/// Configuration for rendering Rakka metrics in the Prometheus text exposition format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrometheusTextConfig {
+    include_help: bool,
+}
+
+impl Default for PrometheusTextConfig {
+    fn default() -> Self {
+        Self { include_help: true }
+    }
+}
+
+impl PrometheusTextConfig {
+    /// Creates a Prometheus text exporter configuration with defaults.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { include_help: true }
+    }
+
+    /// Sets whether `# HELP` comments should be emitted.
+    #[must_use]
+    pub const fn include_help(mut self, include_help: bool) -> Self {
+        self.include_help = include_help;
+        self
+    }
+
+    /// Returns true when `# HELP` comments should be emitted.
+    #[must_use]
+    pub const fn help_enabled(&self) -> bool {
+        self.include_help
+    }
+}
+
+/// Serializes a metrics snapshot to Prometheus text exposition format.
+///
+/// Rakka metric constants use dot-separated names such as
+/// `rakka.http.request.latency_ms`. Prometheus metric identifiers cannot
+/// contain dots, so this exporter deterministically maps them to underscores
+/// such as `rakka_http_request_latency_ms`.
+#[must_use]
+pub fn export_prometheus_text(snapshot: &MetricsSnapshot) -> String {
+    export_prometheus_text_with_config(snapshot, &PrometheusTextConfig::default())
+}
+
+/// Serializes a metrics snapshot to Prometheus text exposition format with a custom config.
+#[must_use]
+pub fn export_prometheus_text_with_config(
+    snapshot: &MetricsSnapshot,
+    config: &PrometheusTextConfig,
+) -> String {
+    let mut output = String::new();
+    for metric in aggregate_metrics(snapshot) {
+        let prometheus_name = prometheus_metric_name(&metric.name);
+        if config.help_enabled() {
+            let help = prometheus_help_text(&metric.name);
+            let _ = writeln!(output, "# HELP {prometheus_name} {help}");
+        }
+        let metric_type = match metric.kind {
+            MetricKind::Counter => "counter",
+            MetricKind::Gauge => "gauge",
+            MetricKind::Histogram => "summary",
+        };
+        let _ = writeln!(output, "# TYPE {prometheus_name} {metric_type}");
+
+        match metric.kind {
+            MetricKind::Counter => {
+                for (attributes, value) in metric.counters {
+                    write_prometheus_sample(&mut output, &prometheus_name, &attributes, value);
+                }
+            }
+            MetricKind::Gauge => {
+                for (attributes, value) in metric.gauges {
+                    write_prometheus_sample(&mut output, &prometheus_name, &attributes, value);
+                }
+            }
+            MetricKind::Histogram => {
+                for (attributes, summary) in metric.histograms {
+                    let count_name = format!("{prometheus_name}_count");
+                    let sum_name = format!("{prometheus_name}_sum");
+                    write_prometheus_sample(
+                        &mut output,
+                        &count_name,
+                        &attributes,
+                        summary.count as f64,
+                    );
+                    write_prometheus_sample(&mut output, &sum_name, &attributes, summary.sum);
+                }
+            }
+        }
+    }
+    output
+}
+
+/// Converts a Rakka metric name into a Prometheus-compatible metric identifier.
+#[must_use]
+pub fn prometheus_metric_name(name: &str) -> String {
+    sanitize_prometheus_identifier(name, true)
+}
+
+/// Converts a Rakka metric attribute key into a Prometheus-compatible label identifier.
+#[must_use]
+pub fn prometheus_label_name(name: &str) -> String {
+    sanitize_prometheus_identifier(name, false)
+}
+
+/// Serializable OpenTelemetry-oriented view of a Rakka metrics snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenTelemetryMetricsExport {
+    resource_attributes: Vec<MetricAttribute>,
+    metrics: Vec<OpenTelemetryMetric>,
+}
+
+impl OpenTelemetryMetricsExport {
+    /// Creates an OpenTelemetry metrics export view.
+    #[must_use]
+    pub fn new(
+        resource_attributes: Vec<MetricAttribute>,
+        metrics: Vec<OpenTelemetryMetric>,
+    ) -> Self {
+        Self {
+            resource_attributes,
+            metrics,
+        }
+    }
+
+    /// Resource attributes that should be attached to the emitted resource.
+    #[must_use]
+    pub fn resource_attributes(&self) -> &[MetricAttribute] {
+        &self.resource_attributes
+    }
+
+    /// Metrics grouped by canonical Rakka metric name and kind.
+    #[must_use]
+    pub fn metrics(&self) -> &[OpenTelemetryMetric] {
+        &self.metrics
+    }
+}
+
+/// OpenTelemetry instrument kind used by the bridge model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenTelemetryInstrumentKind {
+    /// Monotonic cumulative counter.
+    Counter,
+    /// Observable point-in-time gauge.
+    Gauge,
+    /// Histogram distribution point.
+    Histogram,
+}
+
+/// OpenTelemetry aggregation temporality used by the bridge model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenTelemetryTemporality {
+    /// Cumulative values since recorder start or last recorder reset.
+    Cumulative,
+}
+
+/// One OpenTelemetry-oriented metric group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenTelemetryMetric {
+    name: String,
+    kind: OpenTelemetryInstrumentKind,
+    temporality: OpenTelemetryTemporality,
+    data_points: Vec<OpenTelemetryDataPoint>,
+}
+
+impl OpenTelemetryMetric {
+    /// Creates an OpenTelemetry metric group.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        kind: OpenTelemetryInstrumentKind,
+        temporality: OpenTelemetryTemporality,
+        data_points: Vec<OpenTelemetryDataPoint>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            temporality,
+            data_points,
+        }
+    }
+
+    /// Canonical Rakka metric name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// OpenTelemetry instrument kind.
+    #[must_use]
+    pub const fn kind(&self) -> OpenTelemetryInstrumentKind {
+        self.kind
+    }
+
+    /// Aggregation temporality.
+    #[must_use]
+    pub const fn temporality(&self) -> OpenTelemetryTemporality {
+        self.temporality
+    }
+
+    /// Metric data points.
+    #[must_use]
+    pub fn data_points(&self) -> &[OpenTelemetryDataPoint] {
+        &self.data_points
+    }
+}
+
+/// One OpenTelemetry-oriented data point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenTelemetryDataPoint {
+    attributes: Vec<MetricAttribute>,
+    value: Option<f64>,
+    count: Option<u64>,
+    sum: Option<f64>,
+}
+
+impl OpenTelemetryDataPoint {
+    /// Creates a scalar counter or gauge data point.
+    #[must_use]
+    pub fn scalar(attributes: Vec<MetricAttribute>, value: f64) -> Self {
+        Self {
+            attributes,
+            value: Some(value),
+            count: None,
+            sum: None,
+        }
+    }
+
+    /// Creates a histogram data point with count and sum.
+    #[must_use]
+    pub fn histogram(attributes: Vec<MetricAttribute>, count: u64, sum: f64) -> Self {
+        Self {
+            attributes,
+            value: None,
+            count: Some(count),
+            sum: Some(sum),
+        }
+    }
+
+    /// Data point attributes.
+    #[must_use]
+    pub fn attributes(&self) -> &[MetricAttribute] {
+        &self.attributes
+    }
+
+    /// Scalar value for counter or gauge points.
+    #[must_use]
+    pub const fn value(&self) -> Option<f64> {
+        self.value
+    }
+
+    /// Histogram sample count.
+    #[must_use]
+    pub const fn count(&self) -> Option<u64> {
+        self.count
+    }
+
+    /// Histogram sample sum.
+    #[must_use]
+    pub const fn sum(&self) -> Option<f64> {
+        self.sum
+    }
+}
+
+/// Converts a Rakka metrics snapshot into a serializable OpenTelemetry-oriented bridge model.
+///
+/// This helper intentionally does not depend on a concrete OpenTelemetry SDK.
+/// Applications can map the returned resource attributes, instrument kinds,
+/// temporality, and data points into the SDK/exporter stack they already use.
+#[must_use]
+pub fn export_open_telemetry_metrics(
+    snapshot: &MetricsSnapshot,
+    resource_attributes: MetricAttributes<'_>,
+) -> OpenTelemetryMetricsExport {
+    let resource_attributes = owned_attributes(resource_attributes);
+    let metrics = aggregate_metrics(snapshot)
+        .into_iter()
+        .map(|metric| {
+            let kind = match metric.kind {
+                MetricKind::Counter => OpenTelemetryInstrumentKind::Counter,
+                MetricKind::Gauge => OpenTelemetryInstrumentKind::Gauge,
+                MetricKind::Histogram => OpenTelemetryInstrumentKind::Histogram,
+            };
+            let data_points = match metric.kind {
+                MetricKind::Counter => metric
+                    .counters
+                    .into_iter()
+                    .map(|(attributes, value)| OpenTelemetryDataPoint::scalar(attributes, value))
+                    .collect(),
+                MetricKind::Gauge => metric
+                    .gauges
+                    .into_iter()
+                    .map(|(attributes, value)| OpenTelemetryDataPoint::scalar(attributes, value))
+                    .collect(),
+                MetricKind::Histogram => metric
+                    .histograms
+                    .into_iter()
+                    .map(|(attributes, summary)| {
+                        OpenTelemetryDataPoint::histogram(attributes, summary.count, summary.sum)
+                    })
+                    .collect(),
+            };
+            OpenTelemetryMetric::new(
+                metric.name,
+                kind,
+                OpenTelemetryTemporality::Cumulative,
+                data_points,
+            )
+        })
+        .collect();
+    OpenTelemetryMetricsExport::new(resource_attributes, metrics)
+}
+
 /// Metrics recorder that keeps all observations in memory for tests.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryMetricsRecorder {
@@ -311,4 +628,140 @@ impl MetricsRecorder for NoopMetricsRecorder {
     fn record_gauge(&self, _name: &str, _value: f64, _attributes: MetricAttributes<'_>) {}
 
     fn record_histogram(&self, _name: &str, _value: f64, _attributes: MetricAttributes<'_>) {}
+}
+
+#[derive(Debug)]
+struct AggregatedMetric {
+    name: String,
+    kind: MetricKind,
+    counters: BTreeMap<Vec<MetricAttribute>, f64>,
+    gauges: BTreeMap<Vec<MetricAttribute>, f64>,
+    histograms: BTreeMap<Vec<MetricAttribute>, HistogramSummary>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct HistogramSummary {
+    count: u64,
+    sum: f64,
+}
+
+fn aggregate_metrics(snapshot: &MetricsSnapshot) -> Vec<AggregatedMetric> {
+    let mut metrics = BTreeMap::<(String, MetricKind), AggregatedMetric>::new();
+    for observation in snapshot.observations() {
+        let key = (observation.name().to_owned(), observation.kind());
+        let metric = metrics.entry(key).or_insert_with(|| AggregatedMetric {
+            name: observation.name().to_owned(),
+            kind: observation.kind(),
+            counters: BTreeMap::new(),
+            gauges: BTreeMap::new(),
+            histograms: BTreeMap::new(),
+        });
+        let attributes = sorted_owned_attributes(observation.attributes());
+        match observation.kind() {
+            MetricKind::Counter => {
+                *metric.counters.entry(attributes).or_default() += observation.value();
+            }
+            MetricKind::Gauge => {
+                metric.gauges.insert(attributes, observation.value());
+            }
+            MetricKind::Histogram => {
+                let summary = metric.histograms.entry(attributes).or_default();
+                summary.count = summary.count.saturating_add(1);
+                summary.sum += observation.value();
+            }
+        }
+    }
+    metrics.into_values().collect()
+}
+
+fn owned_attributes(attributes: MetricAttributes<'_>) -> Vec<MetricAttribute> {
+    sorted_owned_attributes(
+        &attributes
+            .iter()
+            .map(|(key, value)| MetricAttribute::new(*key, *value))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn sorted_owned_attributes(attributes: &[MetricAttribute]) -> Vec<MetricAttribute> {
+    let mut attributes = attributes.to_vec();
+    attributes.sort();
+    attributes
+}
+
+fn sanitize_prometheus_identifier(identifier: &str, allow_colon: bool) -> String {
+    let mut sanitized = String::with_capacity(identifier.len().max(1));
+    for (index, character) in identifier.chars().enumerate() {
+        let valid = character == '_'
+            || character.is_ascii_alphabetic()
+            || (allow_colon && character == ':')
+            || (index > 0 && character.is_ascii_digit());
+        if valid {
+            sanitized.push(character);
+        } else if index == 0 && character.is_ascii_digit() {
+            sanitized.push('_');
+            sanitized.push(character);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "_".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn prometheus_help_text(canonical_name: &str) -> String {
+    format!(
+        "Rakka metric {}.",
+        canonical_name.replace('\\', r"\\").replace('\n', r"\n")
+    )
+}
+
+fn write_prometheus_sample(
+    output: &mut String,
+    name: &str,
+    attributes: &[MetricAttribute],
+    value: f64,
+) {
+    let _ = write!(output, "{name}");
+    write_prometheus_labels(output, attributes);
+    let _ = writeln!(output, " {}", prometheus_number(value));
+}
+
+fn write_prometheus_labels(output: &mut String, attributes: &[MetricAttribute]) {
+    if attributes.is_empty() {
+        return;
+    }
+
+    output.push('{');
+    for (index, attribute) in attributes.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        let key = prometheus_label_name(attribute.key());
+        let value = prometheus_label_value(attribute.value());
+        let _ = write!(output, "{key}=\"{value}\"");
+    }
+    output.push('}');
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('"', r#"\""#)
+}
+
+fn prometheus_number(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "+Inf".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Inf".to_owned()
+    } else {
+        value.to_string()
+    }
 }

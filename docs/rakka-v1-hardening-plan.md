@@ -246,7 +246,7 @@ Implementation notes:
 
 ## Slice V1F: Production Observability Exporters
 
-Status: planned.
+Status: implemented.
 
 Goal: connect backend-neutral metrics and tracing to production-oriented observability without forcing a single backend.
 
@@ -270,6 +270,16 @@ Out of scope:
 
 - Hosted observability dashboards.
 - Vendor-specific agents beyond generic Prometheus/OpenTelemetry integration.
+
+Implementation notes:
+
+- Added Prometheus text exposition helpers in `rakka-core` that aggregate `MetricsSnapshot` counters, gauges, and histograms while deterministically mapping canonical Rakka metric names to Prometheus-safe identifiers.
+- Added an OpenTelemetry-oriented serializable bridge model in `rakka-core` with resource attributes, instrument kind, cumulative temporality, scalar data points, and histogram count/sum data points without forcing a concrete OpenTelemetry SDK dependency.
+- Added `rakka-http` observability routes for Prometheus metrics, OpenTelemetry bridge JSON, generic JSON snapshots, and a named `OperationalSnapshotRegistry`.
+- Added exporter tests covering stable label ordering, metric kind mapping, HTTP/gRPC latency, stream pressure, process exits, remote failures, membership counts, shard ownership, and actor mailbox depth.
+- Added HTTP route tests for `/metrics`, `/otel/metrics`, individual snapshots, and named snapshot registry output.
+- Updated the edge gateway example to expose `/metrics`, `/otel/metrics`, and `/snapshots` through the in-process router and assert those routes during the example run.
+- Added `docs/rakka-v1-observability-exporters.md` with exporter boundary, OpenTelemetry bridge, snapshot registry, trace integration, and label cardinality guidance.
 
 ## Slice V1G: Kubernetes Multi-Node End-to-End Scenario
 

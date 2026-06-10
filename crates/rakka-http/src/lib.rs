@@ -8,6 +8,7 @@ use rakka_core::Subsystem;
 mod config;
 mod error;
 mod metrics;
+mod observability;
 mod routes;
 mod server;
 mod streaming;
@@ -20,6 +21,10 @@ pub use config::{
 };
 pub use error::{HttpError, HttpErrorBody, HttpResult};
 pub use metrics::record_http_request_metrics;
+pub use observability::{
+    json_snapshot_route, open_telemetry_metrics_json_route, operational_snapshots_route,
+    prometheus_metrics_route, OperationalSnapshotRegistry, OperationalSnapshots,
+};
 pub use routes::{
     binary_service_route, into_response, json_actor_ask_route, json_actor_tell_route,
     json_entity_ask_route, json_entity_tell_route, json_service_route, HttpAccepted, HttpRouter,

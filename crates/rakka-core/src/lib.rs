@@ -23,8 +23,11 @@ pub use actor::{
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
 pub use metrics::{
-    InMemoryMetricsRecorder, MetricAttribute, MetricAttributes, MetricKind, MetricObservation,
-    MetricsRecorder, MetricsSnapshot, NoopMetricsRecorder, METRIC_ACTOR_COUNT,
+    export_open_telemetry_metrics, export_prometheus_text, export_prometheus_text_with_config,
+    prometheus_label_name, prometheus_metric_name, InMemoryMetricsRecorder, MetricAttribute,
+    MetricAttributes, MetricKind, MetricObservation, MetricsRecorder, MetricsSnapshot,
+    NoopMetricsRecorder, OpenTelemetryDataPoint, OpenTelemetryInstrumentKind, OpenTelemetryMetric,
+    OpenTelemetryMetricsExport, OpenTelemetryTemporality, PrometheusTextConfig, METRIC_ACTOR_COUNT,
     METRIC_ACTOR_MAILBOX_DEPTH, METRIC_CLUSTER_MEMBERS, METRIC_GRPC_REQUEST_LATENCY_MS,
     METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_K8S_COMPATIBILITY, METRIC_K8S_READINESS,
     METRIC_PERSISTENCE_LATENCY_MS, METRIC_PROCESS_EXITS, METRIC_REMOTE_FAILURES,
