@@ -31,6 +31,15 @@ node-b local entity count: 1
 
 The specific entity id may vary if the shard hashing configuration changes, but node A should not spawn the remote entity locally and node B should receive it.
 
+The same example also has V1 hardening modes that exercise real Tokio TCP remoting:
+
+```bash
+cargo run -p rakka-example-multi-node-sharding -- --networked-loopback
+cargo run -p rakka-example-multi-node-sharding -- --networked-processes
+```
+
+`--networked-loopback` runs two networked node runtimes in one process. `--networked-processes` launches two child Rakka node processes on loopback ports and routes a sharded entity message from node A to node B over TCP.
+
 ## Ownership Refresh
 
 `ClusterShardingRuntime` is the local runtime facade that connects discovery snapshots, membership transitions, coordinator reconciliation, and registered shard regions.
@@ -84,9 +93,10 @@ The following Phase 3 pieces are usable as production-oriented foundations:
 
 The following pieces are intentionally deterministic scaffolding or incomplete production surfaces:
 
-- `InMemoryRemoteTransport` is for tests and local examples, not pod-to-pod production networking.
-- The multi-node example runs multiple logical nodes in one process.
-- There is no TCP, HTTP/2, TLS, mTLS, or real backpressure-aware remote transport yet.
+- `InMemoryRemoteTransport` is for deterministic tests and local examples.
+- `TcpRemoteTransport` provides the current Tokio TCP remoting foundation for local multi-process and Kubernetes pod-to-pod hardening.
+- The default multi-node example still runs multiple logical nodes in one process; use `--networked-processes` for a local multi-process TCP demonstration.
+- There is no HTTP/2, TLS, mTLS, or QUIC transport yet.
 - There is no full distributed consensus, gossip, or split-brain resolution yet.
 - Kubernetes DNS discovery exists as a foundation, but the full production runtime loop still needs deployment hardening.
 - Graceful handoff is modeled locally and deterministically; distributed acknowledgement and retry behavior remain future work.

@@ -353,6 +353,13 @@ impl ClusterNode {
         self
     }
 
+    /// Sets the direct remoting address advertised by this node.
+    #[must_use]
+    pub fn with_address(mut self, address: NodeAddress) -> Self {
+        self.address = address;
+        self
+    }
+
     /// Sets the cluster protocol compatibility advertisement.
     #[must_use]
     pub const fn with_protocol(mut self, protocol: ClusterProtocol) -> Self {

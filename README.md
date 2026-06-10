@@ -68,7 +68,7 @@ Workflow revision after recovery dispatch: 6.
 
 ### Multi-Node Sharding
 
-This example runs two local `ActorSystem`s in one process and uses the deterministic in-memory remote transport. It does not require Kubernetes, multiple terminals, or real network services. The example builds a two-node membership view, assigns shards for the `Cart` entity type, sends a `CartCommand` from node A to an entity owned by node B, and verifies that delivery happens on node B.
+This example defaults to two local `ActorSystem`s in one process using the deterministic in-memory remote transport. It does not require Kubernetes, multiple terminals, or real network services. The example builds a two-node membership view, assigns shards for the `Cart` entity type, sends a `CartCommand` from node A to an entity owned by node B, and verifies that delivery happens on node B.
 
 ```sh
 cargo run -p rakka-example-multi-node-sharding
@@ -84,6 +84,35 @@ node-b local entity count: 1
 ```
 
 The exact `cart-N` value can vary because the example searches for an entity id owned by node B under the current shard allocation.
+
+Run the same shape over real Tokio TCP loopback remoting in one process:
+
+```sh
+cargo run -p rakka-example-multi-node-sharding -- --networked-loopback
+```
+
+Expected output:
+
+```text
+Rakka networked sharding routed add-apple to cart-N on rakka-1#uid-b over TCP loopback.
+Registered TCP peers: node-a 1, node-b 1; membership events: 3.
+node-a local entity count: 0
+node-b local entity count: 1
+```
+
+Run the local multi-process TCP example, which launches two child Rakka node processes on loopback ports:
+
+```sh
+cargo run -p rakka-example-multi-node-sharding -- --networked-processes
+```
+
+Expected output:
+
+```text
+rakka-1 received add-apple for cart-N.
+Rakka networked sharding launched two node processes on 127.0.0.1:PORT and 127.0.0.1:PORT.
+node-a: rakka-0 sent add-apple to cart-N on rakka-1#uid-b.
+```
 
 ### External Binary Wrapper
 

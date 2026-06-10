@@ -10,6 +10,11 @@ documentation.workspace = true
 readme.workspace = true
 publish = false
 
+[[bin]]
+name = "rakka-example-multi-node-sharding"
+path = "src/main.rs"
+doc = false
+
 [dependencies]
 prost.workspace = true
 rakka-cluster = { path = "../../crates/rakka-cluster" }

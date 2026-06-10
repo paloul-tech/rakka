@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Minimal multi-node sharding example using the deterministic in-memory remote transport.
+//! Multi-node sharding examples using deterministic and TCP remote transports.
 
+use std::env;
 use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::process::Stdio;
 use std::time::Duration;
 
 use rakka_cluster::{
@@ -10,10 +13,15 @@ use rakka_cluster::{
 };
 use rakka_core::{actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem};
 use rakka_remote::{InMemoryRemoteTransport, RemoteEndpoint, SerializationRegistry};
+use rakka_sharding::node_runtime::{
+    ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeUpdate,
+};
 use rakka_sharding::{
     EntityId, EntityRef, EntityType, LocalEntityContext, LocalEntityRoute, RemoteEntityInbound,
-    RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinator, ShardingConfig,
+    RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinator, ShardRegion,
+    ShardingConfig,
 };
+use tokio::process::Command;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct CartCommand {
@@ -46,8 +54,23 @@ impl Actor for CartEntity {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let node_a = example_node("rakka-0", "uid-a");
-    let node_b = example_node("rakka-1", "uid-b");
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    match args.as_slice() {
+        [] => run_in_memory_example().await,
+        [flag] if flag == "--networked-loopback" => run_networked_loopback_example().await,
+        [flag] if flag == "--networked-processes" => run_networked_process_driver().await,
+        [flag, logical_id, incarnation, local_port, peer_port, role]
+            if flag == "--networked-node" =>
+        {
+            run_networked_child_node(logical_id, incarnation, local_port, peer_port, role).await
+        }
+        _ => Err(example_error(usage()).into()),
+    }
+}
+
+async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
+    let node_a = dns_example_node("rakka-0", "uid-a");
+    let node_b = dns_example_node("rakka-1", "uid-b");
     let membership = membership_with_up_nodes([node_a.clone(), node_b.clone()])?;
 
     let entity_type = EntityType::new("Cart");
@@ -58,9 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let remote_entity_id = entity_owned_by(&coordinator, node_b.id().logical_id())?;
     let remote_entity_owner = coordinator.owner_for_entity(&remote_entity_id)?.clone();
 
-    let mut registry = SerializationRegistry::new();
-    registry.register_protobuf::<CartCommand>("rakka.example.CartCommand", 1)?;
-
+    let registry = cart_registry()?;
     let transport = InMemoryRemoteTransport::new();
     let node_a_system = ActorSystem::new("rakka-example-node-a");
     let node_b_system = ActorSystem::new("rakka-example-node-b");
@@ -78,7 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let outbound = RemoteTransportEntityOutbound::new(transport.clone());
     let remote_route_a = RemoteEntityRoute::new(local_route_a.clone(), registry.clone(), outbound)
         .with_source(node_a.id().to_string());
-    let region_a = rakka_sharding::ShardRegion::from_snapshot(
+    let region_a = ShardRegion::from_snapshot(
         entity_type.clone(),
         sharding_config.clone(),
         &ownership,
@@ -95,7 +116,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             delivered: node_b_delivered.clone(),
         },
     );
-    let region_b = rakka_sharding::ShardRegion::from_snapshot(
+    let region_b = ShardRegion::from_snapshot(
         entity_type.clone(),
         sharding_config,
         &ownership,
@@ -147,7 +168,291 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn example_node(logical_id: &str, incarnation: &str) -> ClusterNode {
+async fn run_networked_loopback_example() -> Result<(), Box<dyn Error>> {
+    let registry = cart_registry()?;
+    let mut node_a = build_networked_runtime(
+        loopback_example_node("rakka-0", "uid-a", 0),
+        registry.clone(),
+        true,
+    )
+    .await?;
+    let mut node_b =
+        build_networked_runtime(loopback_example_node("rakka-1", "uid-b", 0), registry, true)
+            .await?;
+    let entity_type = EntityType::new("Cart");
+    let sharding_config = ShardingConfig::new(8)?;
+    let node_a_system = ActorSystem::new("rakka-example-networked-node-a");
+    let node_b_system = ActorSystem::new("rakka-example-networked-node-b");
+    let (node_a_delivered, _node_a_received) =
+        tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    let (node_b_delivered, mut node_b_received) =
+        tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+
+    let local_route_a = LocalEntityRoute::new(
+        node_a.local_node().id().clone(),
+        node_a_system.clone(),
+        move |context: LocalEntityContext| CartEntity {
+            context,
+            delivered: node_a_delivered.clone(),
+        },
+    );
+    let region_a = ShardRegion::new(
+        entity_type.clone(),
+        sharding_config.clone(),
+        node_a.remote_route(local_route_a.clone()),
+    );
+    let local_route_b = LocalEntityRoute::new(
+        node_b.local_node().id().clone(),
+        node_b_system.clone(),
+        move |context: LocalEntityContext| CartEntity {
+            context,
+            delivered: node_b_delivered.clone(),
+        },
+    );
+    let region_b = ShardRegion::new(entity_type.clone(), sharding_config, local_route_b.clone());
+
+    node_a.register_entity_region(region_a.clone())?;
+    node_b.register_entity_region(region_b)?;
+    let update = apply_networked_discovery(&mut node_a, &mut node_b)?;
+    let coordinator = node_a
+        .sharding()
+        .coordinator(&entity_type)
+        .ok_or_else(|| example_error("missing coordinator after discovery"))?;
+    let remote_entity_id = entity_owned_by(coordinator, node_b.local_node().id().logical_id())?;
+    let remote_entity_owner = coordinator.owner_for_entity(&remote_entity_id)?.clone();
+    let remote_entity = EntityRef::<CartCommand>::new(entity_type, remote_entity_id.clone());
+
+    remote_entity
+        .tell(
+            &region_a,
+            CartCommand {
+                action: "add-apple".to_string(),
+            },
+        )
+        .map_err(|error| example_error(format!("networked entity tell failed: {error:?}")))?;
+    let delivered = tokio::time::timeout(Duration::from_secs(1), node_b_received.recv())
+        .await?
+        .ok_or_else(|| example_error("networked delivery channel closed"))?;
+    wait_for(|| node_b.transport_snapshot().inbound_envelopes() >= 1).await?;
+
+    println!(
+        "Rakka networked sharding routed {} to {} on {} over TCP loopback.",
+        delivered.1, delivered.0, remote_entity_owner
+    );
+    println!(
+        "Registered TCP peers: node-a {}, node-b {}; membership events: {}.",
+        node_a.registered_peer_count(),
+        node_b.registered_peer_count(),
+        update.sharding().membership_events().len()
+    );
+    println!(
+        "node-a local entity count: {}",
+        local_route_a.entity_count()
+    );
+    println!(
+        "node-b local entity count: {}",
+        local_route_b.entity_count()
+    );
+
+    node_a_system.shutdown();
+    node_b_system.shutdown();
+    Ok(())
+}
+
+async fn run_networked_process_driver() -> Result<(), Box<dyn Error>> {
+    let node_a_port = unused_port()?;
+    let node_b_port = unused_port()?;
+    let executable = env::current_exe()?;
+    let mut node_b = Command::new(&executable)
+        .args([
+            "--networked-node",
+            "rakka-1",
+            "uid-b",
+            &node_b_port.to_string(),
+            &node_a_port.to_string(),
+            "receive",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let node_a_output = Command::new(&executable)
+        .args([
+            "--networked-node",
+            "rakka-0",
+            "uid-a",
+            &node_a_port.to_string(),
+            &node_b_port.to_string(),
+            "send",
+        ])
+        .output()
+        .await?;
+    let node_b_status = match tokio::time::timeout(Duration::from_secs(5), node_b.wait()).await {
+        Ok(status) => status?,
+        Err(_elapsed) => {
+            let _ = node_b.kill().await;
+            return Err(
+                example_error("node-b child process timed out waiting for delivery").into(),
+            );
+        }
+    };
+
+    ensure_success("node-a", &node_a_output)?;
+    ensure_status("node-b", node_b_status)?;
+
+    println!(
+        "Rakka networked sharding launched two node processes on 127.0.0.1:{node_a_port} and 127.0.0.1:{node_b_port}."
+    );
+    print_child_output("node-a", &node_a_output.stdout)?;
+    Ok(())
+}
+
+async fn run_networked_child_node(
+    logical_id: &str,
+    incarnation: &str,
+    local_port: &str,
+    peer_port: &str,
+    role: &str,
+) -> Result<(), Box<dyn Error>> {
+    let local_port = local_port.parse::<u16>()?;
+    let peer_port = peer_port.parse::<u16>()?;
+    let peer_logical_id = if logical_id == "rakka-0" {
+        "rakka-1"
+    } else {
+        "rakka-0"
+    };
+    let peer_incarnation = if incarnation == "uid-a" {
+        "uid-b"
+    } else {
+        "uid-a"
+    };
+    let registry = cart_registry()?;
+    let mut runtime = build_networked_runtime(
+        loopback_example_node(logical_id, incarnation, local_port),
+        registry,
+        false,
+    )
+    .await?;
+    let peer = loopback_example_node(peer_logical_id, peer_incarnation, peer_port);
+    let entity_type = EntityType::new("Cart");
+    let sharding_config = ShardingConfig::new(8)?;
+    let system = ActorSystem::new(format!("rakka-example-networked-{logical_id}"));
+    let (delivered_tx, mut delivered_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    let local_route = LocalEntityRoute::new(
+        runtime.local_node().id().clone(),
+        system.clone(),
+        move |context: LocalEntityContext| CartEntity {
+            context,
+            delivered: delivered_tx.clone(),
+        },
+    );
+    let region = if role == "send" {
+        ShardRegion::new(
+            entity_type.clone(),
+            sharding_config,
+            runtime.remote_route(local_route.clone()),
+        )
+    } else {
+        ShardRegion::new(entity_type.clone(), sharding_config, local_route.clone())
+    };
+
+    runtime.register_entity_region(region.clone())?;
+    runtime.apply_discovery(DiscoverySnapshot::new(
+        "networked-process-example",
+        1,
+        [runtime.local_node().clone(), peer.clone()],
+    ))?;
+
+    match role {
+        "send" => {
+            let coordinator = runtime
+                .sharding()
+                .coordinator(&entity_type)
+                .ok_or_else(|| example_error("missing coordinator after discovery"))?;
+            let remote_entity_id = entity_owned_by(coordinator, peer.id().logical_id())?;
+            let entity = EntityRef::<CartCommand>::new(entity_type, remote_entity_id.clone());
+            entity
+                .tell(
+                    &region,
+                    CartCommand {
+                        action: "add-apple".to_string(),
+                    },
+                )
+                .map_err(|error| {
+                    example_error(format!("networked child tell failed: {error:?}"))
+                })?;
+            wait_for(|| {
+                runtime
+                    .transport()
+                    .peer_snapshot(peer.id())
+                    .is_some_and(|snapshot| snapshot.sent() >= 1)
+            })
+            .await?;
+            println!(
+                "{logical_id} sent add-apple to {} on {}.",
+                remote_entity_id,
+                peer.id()
+            );
+        }
+        "receive" => {
+            let delivered = tokio::time::timeout(Duration::from_secs(3), delivered_rx.recv())
+                .await?
+                .ok_or_else(|| example_error("networked child delivery channel closed"))?;
+            println!("{logical_id} received {} for {}.", delivered.1, delivered.0);
+        }
+        _ => return Err(example_error(format!("unknown networked node role {role}")).into()),
+    }
+
+    system.shutdown();
+    Ok(())
+}
+
+async fn build_networked_runtime(
+    local_node: ClusterNode,
+    registry: SerializationRegistry,
+    advertise_bound_addr: bool,
+) -> Result<ClusterNodeRuntime, Box<dyn Error>> {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_node.address().port());
+    ClusterNodeRuntimeBuilder::new(local_node)
+        .with_membership_config(membership_config())
+        .with_transport_config(
+            rakka_remote::TcpRemoteTransportConfig::new()
+                .bind_addr(bind_addr)
+                .connect_timeout(Duration::from_millis(250))
+                .reconnect_backoff(Duration::from_millis(20))
+                .idle_timeout(Duration::from_secs(10)),
+        )
+        .with_registry(registry)
+        .advertise_bound_addr(advertise_bound_addr)
+        .build()
+        .await
+        .map_err(|error| {
+            example_error(format!("networked runtime failed to start: {error}")).into()
+        })
+}
+
+fn apply_networked_discovery(
+    node_a: &mut ClusterNodeRuntime,
+    node_b: &mut ClusterNodeRuntime,
+) -> Result<ClusterNodeRuntimeUpdate, Box<dyn Error>> {
+    let nodes = [node_a.local_node().clone(), node_b.local_node().clone()];
+    let update = node_a.apply_discovery(DiscoverySnapshot::new(
+        "networked-loopback-example",
+        1,
+        nodes.clone(),
+    ))?;
+    node_b.apply_discovery(DiscoverySnapshot::new(
+        "networked-loopback-example",
+        1,
+        nodes,
+    ))?;
+    Ok(update)
+}
+
+fn dns_example_node(logical_id: &str, incarnation: &str) -> ClusterNode {
     ClusterNode::new(
         NodeId::new(logical_id, incarnation),
         NodeAddress::new(
@@ -158,6 +463,18 @@ fn example_node(logical_id: &str, incarnation: &str) -> ClusterNode {
     .with_role("sharded-entity")
 }
 
+fn loopback_example_node(logical_id: &str, incarnation: &str, port: u16) -> ClusterNode {
+    ClusterNode::new(
+        NodeId::new(logical_id, incarnation),
+        NodeAddress::new("127.0.0.1", port),
+    )
+    .with_role("sharded-entity")
+}
+
+fn membership_config() -> MembershipConfig {
+    MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100))
+}
+
 fn membership_with_up_nodes(
     nodes: impl IntoIterator<Item = ClusterNode>,
 ) -> Result<ClusterMembership, Box<dyn Error>> {
@@ -166,15 +483,18 @@ fn membership_with_up_nodes(
         .first()
         .cloned()
         .ok_or_else(|| example_error("example requires at least one node"))?;
-    let mut membership = ClusterMembership::new(
-        local,
-        MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100)),
-    );
+    let mut membership = ClusterMembership::new(local, membership_config());
     membership.record_discovery(DiscoverySnapshot::new("example", 1, nodes.clone()))?;
     for (offset, node) in nodes.iter().enumerate() {
         membership.mark_up(node.id(), 2 + u64::try_from(offset)?)?;
     }
     Ok(membership)
+}
+
+fn cart_registry() -> Result<SerializationRegistry, Box<dyn Error>> {
+    let mut registry = SerializationRegistry::new();
+    registry.register_protobuf::<CartCommand>("rakka.example.CartCommand", 1)?;
+    Ok(registry)
 }
 
 fn entity_owned_by(
@@ -196,6 +516,61 @@ fn entity_owned_by(
             ))
             .into()
         })
+}
+
+fn unused_port() -> Result<u16, Box<dyn Error>> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn ensure_success(name: &str, output: &std::process::Output) -> Result<(), Box<dyn Error>> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(example_error(format!(
+        "{name} exited with {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    ))
+    .into())
+}
+
+fn ensure_status(name: &str, status: std::process::ExitStatus) -> Result<(), Box<dyn Error>> {
+    if status.success() {
+        return Ok(());
+    }
+    Err(example_error(format!("{name} exited with {status}")).into())
+}
+
+fn print_child_output(name: &str, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let output = std::str::from_utf8(bytes)?;
+    for line in output.lines() {
+        println!("{name}: {line}");
+    }
+    Ok(())
+}
+
+async fn wait_for(mut condition: impl FnMut() -> bool) -> Result<(), Box<dyn Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if condition() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(example_error("timed out waiting for networked example condition").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn usage() -> String {
+    [
+        "usage:",
+        "  cargo run -p rakka-example-multi-node-sharding",
+        "  cargo run -p rakka-example-multi-node-sharding -- --networked-loopback",
+        "  cargo run -p rakka-example-multi-node-sharding -- --networked-processes",
+    ]
+    .join("\n")
 }
 
 fn example_error(message: impl Into<String>) -> std::io::Error {

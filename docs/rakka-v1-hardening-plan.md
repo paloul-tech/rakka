@@ -96,7 +96,7 @@ Implementation notes:
 
 ## Slice V1B: Cluster Runtime Networking Integration
 
-Status: planned.
+Status: implemented.
 
 Goal: wire network remoting into cluster membership and sharding so routed entities can move across real process boundaries.
 
@@ -121,6 +121,17 @@ Out of scope:
 
 - Kubernetes manifests beyond consuming this runtime in later slices.
 - Durable shard coordinator storage unless needed to satisfy V1 reliability criteria.
+
+Implementation notes:
+
+- Added `rakka_sharding::ClusterNodeRuntime` and `ClusterNodeRuntimeBuilder` as the V1 networked node facade over membership, discovery, TCP remoting, remote endpoint dispatch, ask reply correlation, and `ClusterShardingRuntime`.
+- The builder binds `TcpRemoteTransport`, registers a reply handler backed by `RemoteRequestRegistry`, supports shared `SerializationRegistry`, accepts a metrics recorder, and can advertise the actual bound loopback address for local port-0 tests and examples.
+- Runtime discovery application now refreshes cluster/sharding ownership and registers non-local discovered members as TCP peers before callers route traffic.
+- Added helpers for TCP-backed remote-aware entity routes, remote ask clients, default inbound tell handlers, custom inbound handlers, and inbound ask handlers.
+- Added networked sharding integration tests for node join/peer registration, remote tell over TCP, remote ask/reply over TCP, graceful leaving handoff after remote delivery, ownership refresh, and unreachable peer failure snapshots.
+- Kept the deterministic in-memory multi-node sharding example as the default path.
+- Extended `rakka-example-multi-node-sharding` with `--networked-loopback` for two TCP node runtimes in one process and `--networked-processes` for a parent process that launches two child Rakka node processes on loopback ports.
+- Updated README and Phase 3 remote-sharding docs with deterministic, TCP loopback, and multi-process example commands.
 
 ## Slice V1C: Compatibility Matrix and Rolling Update Hardening
 
@@ -341,4 +352,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice V1B: Cluster Runtime Networking Integration. Real network remoting is now in place; the next step is wiring it into cluster membership and sharding so routed entities can move across real process boundaries.
+Continue with Slice V1C: Compatibility Matrix and Rolling Update Hardening. Network remoting is now wired through the cluster/sharding runtime; the next step is making N/N+1 compatibility a cross-surface release property.

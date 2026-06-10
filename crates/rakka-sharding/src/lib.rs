@@ -8,6 +8,7 @@ pub mod error;
 pub mod handoff;
 pub mod identity;
 pub mod local;
+pub mod node_runtime;
 pub mod remote;
 pub mod routing;
 pub mod runtime;
@@ -22,6 +23,10 @@ pub use error::{ShardingError, ShardingResult};
 pub use handoff::{ShardHandoff, ShardHandoffState};
 pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingConfig};
 pub use local::{LocalEntityContext, LocalEntityRoute};
+pub use node_runtime::{
+    ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeError,
+    ClusterNodeRuntimeResult, ClusterNodeRuntimeUpdate,
+};
 pub use remote::{
     RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
     RemoteEntityAskInboundError, RemoteEntityInbound, RemoteEntityInboundError,
