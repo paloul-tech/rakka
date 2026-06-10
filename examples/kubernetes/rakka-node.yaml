@@ -5,6 +5,10 @@
 # - HTTP readiness at /ready on port 8080
 # - HTTP liveness at /live on port 8080
 # - HTTP drain at /drain on port 8080
+# - Prometheus metrics at /metrics on port 8080
+# - JSON operational snapshots at /snapshots on port 8080
+# - A scenario route at /scenario/sharding/route-remote that verifies remote
+#   sharded entity routing across the Rakka remoting port
 # - Rakka remoting on port 2552
 # - Public gRPC on port 50051
 ---
@@ -26,12 +30,25 @@ metadata:
 data:
   RAKKA_HEADLESS_SERVICE: rakka-internal
   RAKKA_CLUSTER_DOMAIN: cluster.local
+  RAKKA_DISCOVERY_PROVIDER: kubernetes-dns
+  RAKKA_STATEFULSET_NAME: rakka-node
+  RAKKA_EXPECTED_REPLICAS: "3"
   RAKKA_REMOTING_PORT: "2552"
+  RAKKA_REMOTING_BIND_ADDR: 0.0.0.0:2552
+  RAKKA_REMOTING_ADVERTISE_PORT: "2552"
   RAKKA_HTTP_PORT: "8080"
+  RAKKA_HTTP_BIND_ADDR: 0.0.0.0:8080
   RAKKA_GRPC_PORT: "50051"
+  RAKKA_GRPC_BIND_ADDR: 0.0.0.0:50051
   RAKKA_READINESS_PATH: /ready
   RAKKA_LIVENESS_PATH: /live
   RAKKA_DRAIN_PATH: /drain
+  RAKKA_METRICS_PATH: /metrics
+  RAKKA_OTEL_METRICS_PATH: /otel/metrics
+  RAKKA_SNAPSHOTS_PATH: /snapshots
+  RAKKA_SCENARIO_ROUTE_PATH: /scenario/sharding/route-remote
+  RAKKA_SCENARIO_ENTITY_ID: cart-v1g
+  RAKKA_SCENARIO_ITEM: apple
   RAKKA_REQUIRED_SERVICES: http,grpc
   RAKKA_PROTOCOL_VERSION: "1.0"
   RAKKA_COMPAT_MIN: "1.0"
@@ -154,10 +171,29 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: RAKKA_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: RAKKA_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: RAKKA_DISCOVERY_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_DISCOVERY_PROVIDER
+            - name: RAKKA_STATEFULSET_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_STATEFULSET_NAME
+            - name: RAKKA_EXPECTED_REPLICAS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_EXPECTED_REPLICAS
             - name: RAKKA_HEADLESS_SERVICE
               valueFrom:
                 configMapKeyRef:
@@ -173,16 +209,36 @@ spec:
                 configMapKeyRef:
                   name: rakka-node-config
                   key: RAKKA_REMOTING_PORT
+            - name: RAKKA_REMOTING_BIND_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTING_BIND_ADDR
+            - name: RAKKA_REMOTING_ADVERTISE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTING_ADVERTISE_PORT
             - name: RAKKA_HTTP_PORT
               valueFrom:
                 configMapKeyRef:
                   name: rakka-node-config
                   key: RAKKA_HTTP_PORT
+            - name: RAKKA_HTTP_BIND_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_HTTP_BIND_ADDR
             - name: RAKKA_GRPC_PORT
               valueFrom:
                 configMapKeyRef:
                   name: rakka-node-config
                   key: RAKKA_GRPC_PORT
+            - name: RAKKA_GRPC_BIND_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_GRPC_BIND_ADDR
             - name: RAKKA_READINESS_PATH
               valueFrom:
                 configMapKeyRef:
@@ -198,6 +254,36 @@ spec:
                 configMapKeyRef:
                   name: rakka-node-config
                   key: RAKKA_DRAIN_PATH
+            - name: RAKKA_METRICS_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_METRICS_PATH
+            - name: RAKKA_OTEL_METRICS_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_OTEL_METRICS_PATH
+            - name: RAKKA_SNAPSHOTS_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_SNAPSHOTS_PATH
+            - name: RAKKA_SCENARIO_ROUTE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_SCENARIO_ROUTE_PATH
+            - name: RAKKA_SCENARIO_ENTITY_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_SCENARIO_ENTITY_ID
+            - name: RAKKA_SCENARIO_ITEM
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_SCENARIO_ITEM
             - name: RAKKA_REQUIRED_SERVICES
               valueFrom:
                 configMapKeyRef:

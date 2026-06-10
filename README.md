@@ -198,7 +198,7 @@ Mirrored HTTP JSON returned counter 12, cart pencil, workflow revision 2, legacy
 
 ## Kubernetes Example
 
-The reviewable Kubernetes example is in `examples/kubernetes`. It includes a three-replica `StatefulSet`, a headless internal service for stable pod DNS, a public HTTP/gRPC service, readiness/liveness probes, a pre-stop drain hook, and a PodDisruptionBudget.
+The reviewable Kubernetes example is in `examples/kubernetes`. It includes a three-replica `StatefulSet`, a headless internal service for stable pod DNS and internal Rakka remoting, a public HTTP/gRPC service, observability routes, readiness/liveness probes, a pre-stop drain hook, and a PodDisruptionBudget.
 
 Inspect the manifest:
 
@@ -218,6 +218,12 @@ Preview the local-cluster scenario without touching a cluster:
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh
 ```
 
+Preview the optional N/N+1 rolling-update path:
+
+```sh
+RAKKA_K8S_SCENARIO_DRY_RUN=1 RAKKA_K8S_NEXT_IMAGE=your-registry/rakka-node:next examples/kubernetes/local-cluster-scenario.sh
+```
+
 Validate the manifest with `kubectl` against your active context:
 
 ```sh
@@ -230,7 +236,7 @@ Run the optional local-cluster scenario against your active kind/minikube contex
 RAKKA_K8S_IMAGE=your-registry/rakka-node:dev RAKKA_K8S_RUN_LOCAL_CLUSTER=1 cargo test -p rakka-k8s optional_local_cluster_scenario_is_gated -- --nocapture
 ```
 
-The local-cluster scenario is gated because it applies resources, calls `/drain`, deletes one pod, and optionally performs a rolling update when `RAKKA_K8S_NEXT_IMAGE` is set.
+The local-cluster scenario is gated because it applies resources, checks `/metrics`, `/snapshots`, and `/scenario/sharding/route-remote`, calls `/drain`, verifies readiness fails after drain, deletes one pod, validates replacement, and optionally performs a partitioned rolling update when `RAKKA_K8S_NEXT_IMAGE` is set.
 
 ## Optional PostgreSQL Test
 

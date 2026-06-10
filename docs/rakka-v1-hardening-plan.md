@@ -283,7 +283,7 @@ Implementation notes:
 
 ## Slice V1G: Kubernetes Multi-Node End-to-End Scenario
 
-Status: planned.
+Status: implemented.
 
 Goal: prove the Kubernetes manifests can run real network remoting, shard routing, readiness, drain, and rolling updates in a local cluster.
 
@@ -308,6 +308,16 @@ Out of scope:
 
 - Cloud-provider-specific ingress, load balancers, autoscaling, and managed identity.
 - Production Helm release automation unless handled in release packaging.
+
+Implementation notes:
+
+- Expanded the Kubernetes manifest ConfigMap and container environment with explicit Kubernetes DNS discovery, StatefulSet identity, expected replica count, pod IP, remoting bind/advertise address, HTTP/gRPC bind address, metrics route, OpenTelemetry bridge route, snapshot route, and scenario sharding route settings.
+- Clarified the manifest's application image contract: the image must expose readiness, liveness, drain, Prometheus metrics, operational snapshots, public HTTP/gRPC, internal remoting, and a remote-sharding scenario endpoint.
+- Upgraded `examples/kubernetes/local-cluster-scenario.sh` into a gated multi-node end-to-end runner that applies the manifest, waits for readiness, checks probes, checks Prometheus metrics, checks JSON snapshots, verifies remote sharded routing through the scenario endpoint, calls drain, verifies readiness fails after drain, deletes one pod, validates the replacement pod UID changed, and rechecks routing.
+- Added optional partitioned N/N+1 rolling-update validation when `RAKKA_K8S_NEXT_IMAGE` is set: update one highest-ordinal pod first, verify mixed-version routing/probes, then lower the partition to complete the rollout.
+- Kept the scenario safe by default through documented dry-run mode and env-gated integration tests.
+- Expanded Kubernetes manifest contract tests to verify the new remoting/discovery/observability/scenario settings, dry-run output, optional rolling-update commands, and README application-contract guidance.
+- Updated README and `examples/kubernetes/README.md` with local image expectations, internal remoting versus public HTTP/gRPC service boundaries, metrics/snapshot checks, remote-sharding scenario behavior, readiness-after-drain behavior, and rolling-update commands.
 
 ## Slice V1H: Security and Operational Defaults
 
