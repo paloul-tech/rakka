@@ -15,7 +15,8 @@ mod streaming;
 pub use axum::Router;
 pub use config::{
     HttpRouteConfig, HttpServerConfig, DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT, DEFAULT_HTTP_PORT,
-    DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_REQUEST_TIMEOUT, V1_HTTP_SERVER_PRIMITIVE,
+    DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_REQUEST_TIMEOUT, V1_HTTP_API_COMPATIBILITY,
+    V1_HTTP_API_VERSION, V1_HTTP_SERVER_PRIMITIVE,
 };
 pub use error::{HttpError, HttpErrorBody, HttpResult};
 pub use metrics::record_http_request_metrics;

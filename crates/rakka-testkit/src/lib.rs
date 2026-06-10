@@ -3,6 +3,8 @@
 
 //! Testkit utilities for local actor, integration adapter, and operational tests.
 
+pub mod compatibility;
+
 use std::fmt::Debug;
 use std::future::Future;
 use std::time::Duration;

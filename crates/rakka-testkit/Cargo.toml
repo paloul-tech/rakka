@@ -16,9 +16,11 @@ name = "rakka_testkit"
 axum.workspace = true
 futures-util.workspace = true
 rakka-core = { path = "../rakka-core" }
+rakka-cluster = { path = "../rakka-cluster" }
 rakka-grpc = { path = "../rakka-grpc" }
 rakka-http = { path = "../rakka-http" }
 rakka-k8s = { path = "../rakka-k8s" }
+rakka-remote = { path = "../rakka-remote" }
 rakka-stream = { path = "../rakka-stream" }
 serde.workspace = true
 serde_json.workspace = true
@@ -27,7 +29,8 @@ tonic.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
-rakka-cluster = { path = "../rakka-cluster" }
+prost.workspace = true
+rakka-sharding = { path = "../rakka-sharding" }
 
 [lints]
 workspace = true

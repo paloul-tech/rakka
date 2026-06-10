@@ -63,7 +63,11 @@ fn manifest_documents_ports_environment_and_rolling_compatibility() {
         "RAKKA_COMPAT_MIN",
         "RAKKA_COMPAT_MAX",
         "RAKKA_COMPAT_POLICY",
+        "RAKKA_MANIFEST_VERSION",
+        "RAKKA_GENERATED_API_VERSION",
         "n-to-n-plus-one",
+        "rakka.rs/manifest-version: \"1.0\"",
+        "rakka.rs/generated-api-version: \"1.0\"",
         "minAvailable: 2",
     ] {
         assert!(MANIFEST.contains(expected), "missing {expected}");

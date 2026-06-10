@@ -135,7 +135,7 @@ Implementation notes:
 
 ## Slice V1C: Compatibility Matrix and Rolling Update Hardening
 
-Status: planned.
+Status: implemented.
 
 Goal: make N/N+1 compatibility a tested release property rather than only a policy object.
 
@@ -159,6 +159,15 @@ Out of scope:
 
 - Supporting arbitrary multi-version clusters beyond N/N+1.
 - Silent best-effort delivery across unknown schema changes.
+
+Implementation notes:
+
+- Added `rakka_testkit::compatibility` fixtures for the six v1 dimensions: crate version, cluster protocol, remote envelope, message schema, Kubernetes manifest, and generated API.
+- Added standard cases for current N, next N+1, incompatible-old, incompatible-new, additive-schema, and exact-schema compatibility checks.
+- Added `crates/rakka-testkit/tests/compatibility_matrix.rs` covering protocol handshake/admission, additive and exact schema policy, mixed N/N+1 remote entity routing over `InMemoryRemoteTransport`, incompatible-node readiness/metrics/ownership rejection, and HTTP/gRPC/Kubernetes metadata alignment.
+- Added Kubernetes compatibility/readiness metrics (`rakka.k8s.compatibility` and `rakka.k8s.readiness`) through `KubernetesNodeHealth::record_metrics`.
+- Added public HTTP/gRPC API compatibility version constants and manifest/API metadata to the Kubernetes example.
+- Expanded `docs/rakka-compatibility.md` with allowed skew, rolling-update sequence, explicit non-promises, observability surfaces, and compatibility test commands.
 
 ## Slice V1D: Public API Review and Crate Boundary Hardening
 
@@ -352,4 +361,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice V1C: Compatibility Matrix and Rolling Update Hardening. Network remoting is now wired through the cluster/sharding runtime; the next step is making N/N+1 compatibility a cross-surface release property.
+Continue with Slice V1D: Public API Review and Crate Boundary Hardening. Compatibility is now represented as a tested cross-surface release property; the next step is tightening public exports, docs, feature boundaries, and error surfaces before a v1 draft review.

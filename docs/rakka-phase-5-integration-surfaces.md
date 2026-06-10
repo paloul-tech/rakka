@@ -47,7 +47,7 @@ cargo test -p rakka-testkit
 Run Kubernetes manifest contract checks:
 
 ```sh
-cargo test -p rakka-k8s kubernetes_manifests
+cargo test -p rakka-k8s --test kubernetes_manifests
 ```
 
 Preview the local Kubernetes scenario without applying resources:

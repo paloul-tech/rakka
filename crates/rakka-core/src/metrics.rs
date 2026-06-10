@@ -40,6 +40,12 @@ pub const METRIC_HTTP_REQUEST_LATENCY_MS: &str = "rakka.http.request.latency_ms"
 /// gRPC request latency histogram in milliseconds.
 pub const METRIC_GRPC_REQUEST_LATENCY_MS: &str = "rakka.grpc.request.latency_ms";
 
+/// Kubernetes readiness state gauge.
+pub const METRIC_K8S_READINESS: &str = "rakka.k8s.readiness";
+
+/// Kubernetes cluster compatibility state gauge.
+pub const METRIC_K8S_COMPATIBILITY: &str = "rakka.k8s.compatibility";
+
 /// Minimal metrics sink used across runtime crates.
 pub trait MetricsRecorder: Send + Sync {
     /// Increments a monotonically increasing counter.

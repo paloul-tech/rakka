@@ -7,6 +7,9 @@ use rakka_stream::DEFAULT_BUFFER_CAPACITY;
 /// Tonic is the gRPC runtime selected for Rakka v1.
 pub const V1_GRPC_RUNTIME_PRIMITIVE: &str = "tonic";
 
+/// Version of generated gRPC service contracts used by v1 examples.
+pub const V1_GRPC_GENERATED_API_VERSION: &str = "1.0";
+
 /// Protobuf compatibility rule for Rakka v1 rolling updates.
 pub const V1_GRPC_PROTOBUF_COMPATIBILITY: &str =
     "Rakka v1 gRPC APIs require N/N+1 Protobuf compatibility during rolling updates: \

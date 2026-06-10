@@ -14,7 +14,7 @@ mod unary;
 pub use config::{
     GrpcStreamConfig, GrpcUnaryConfig, DEFAULT_GRPC_REQUEST_TIMEOUT,
     DEFAULT_GRPC_STREAM_BUFFER_CAPACITY, DEFAULT_GRPC_STREAM_DRAIN_TIMEOUT,
-    V1_GRPC_PROTOBUF_COMPATIBILITY, V1_GRPC_RUNTIME_PRIMITIVE,
+    V1_GRPC_GENERATED_API_VERSION, V1_GRPC_PROTOBUF_COMPATIBILITY, V1_GRPC_RUNTIME_PRIMITIVE,
 };
 pub use error::{
     decode_status, service_status, stream_status, validation_status, GrpcError,

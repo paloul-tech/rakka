@@ -7,6 +7,7 @@ The current repository state includes Phase 5 foundations: local typed actors, d
 See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
 See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kubernetes, and metrics integration boundaries.
+See `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, allowed version skew, and compatibility test commands.
 
 ## Validation Commands
 
@@ -14,7 +15,14 @@ See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kuberne
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 cargo doc --workspace --all-features --no-deps
+```
+
+The optional multi-process compatibility check launches two loopback node processes and is gated:
+
+```sh
+RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
 ```
 
 ## Examples
@@ -163,7 +171,7 @@ less examples/kubernetes/rakka-node.yaml
 Run the manifest contract tests:
 
 ```sh
-cargo test -p rakka-k8s kubernetes_manifests
+cargo test -p rakka-k8s --test kubernetes_manifests
 ```
 
 Preview the local-cluster scenario without touching a cluster:

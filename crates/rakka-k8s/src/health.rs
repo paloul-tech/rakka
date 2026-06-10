@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use rakka_cluster::{ClusterMembership, MembershipState, NodeId};
+use rakka_core::metrics::{MetricsRecorder, METRIC_K8S_COMPATIBILITY, METRIC_K8S_READINESS};
 use serde::{Deserialize, Serialize};
 
 /// Shared probe hook that HTTP integrations can call.
@@ -239,6 +240,53 @@ impl KubernetesNodeHealth {
     #[must_use]
     pub fn snapshot(&self) -> KubernetesHealthSnapshot {
         self.lock().snapshot()
+    }
+
+    /// Records Kubernetes readiness and compatibility gauges for diagnostics.
+    pub fn record_metrics(&self, recorder: &dyn MetricsRecorder) -> KubernetesHealthSnapshot {
+        let snapshot = self.snapshot();
+        let readiness = self.readiness_probe();
+        let local_node = snapshot.local_node_id().to_string();
+        let readiness_value = if readiness.passed() { 1.0 } else { 0.0 };
+        let compatibility_value = if snapshot.cluster_compatible() {
+            1.0
+        } else {
+            0.0
+        };
+        let compatibility_error = snapshot.compatibility_error().unwrap_or("none");
+
+        recorder.record_gauge(
+            METRIC_K8S_READINESS,
+            readiness_value,
+            &[
+                ("local_node", local_node.as_str()),
+                (
+                    "outcome",
+                    if readiness.passed() {
+                        "ready"
+                    } else {
+                        "not-ready"
+                    },
+                ),
+            ],
+        );
+        recorder.record_gauge(
+            METRIC_K8S_COMPATIBILITY,
+            compatibility_value,
+            &[
+                ("local_node", local_node.as_str()),
+                (
+                    "state",
+                    if snapshot.cluster_compatible() {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                ),
+                ("error", compatibility_error),
+            ],
+        );
+        snapshot
     }
 
     /// Computes readiness for Kubernetes.

@@ -6,6 +6,14 @@ use std::time::Duration;
 /// HTTP server primitive selected for Rakka v1.
 pub const V1_HTTP_SERVER_PRIMITIVE: &str = "axum";
 
+/// Version of the public HTTP adapter contract used by v1 examples.
+pub const V1_HTTP_API_VERSION: &str = "1.0";
+
+/// HTTP compatibility rule for Rakka v1 rolling updates.
+pub const V1_HTTP_API_COMPATIBILITY: &str =
+    "Rakka v1 HTTP APIs require N/N+1 request and response compatibility during rolling updates: \
+     add JSON fields compatibly, keep binary payload meanings stable, and preserve response defaults.";
+
 /// Default maximum unary request payload size.
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
