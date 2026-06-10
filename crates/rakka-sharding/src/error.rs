@@ -65,7 +65,9 @@ impl ShardingError {
         RakkaError::new(Subsystem::Sharding, self.code(), self.to_string())
     }
 
-    fn code(&self) -> &'static str {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidShardCount => "invalid-shard-count",
             Self::UnknownShard { .. } => "unknown-shard",

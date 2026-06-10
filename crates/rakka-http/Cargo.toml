@@ -18,7 +18,7 @@ futures-util.workspace = true
 http-body-util.workspace = true
 rakka-core = { path = "../rakka-core" }
 rakka-sharding = { path = "../rakka-sharding" }
-rakka-stream = { path = "../rakka-stream" }
+rakka-stream = { path = "../rakka-stream", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

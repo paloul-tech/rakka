@@ -21,7 +21,7 @@ rakka-grpc = { path = "../rakka-grpc" }
 rakka-http = { path = "../rakka-http" }
 rakka-k8s = { path = "../rakka-k8s" }
 rakka-remote = { path = "../rakka-remote" }
-rakka-stream = { path = "../rakka-stream" }
+rakka-stream = { path = "../rakka-stream", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

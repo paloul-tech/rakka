@@ -56,7 +56,9 @@ impl WorkflowError {
         RakkaError::new(Subsystem::Workflow, self.code(), self.to_string())
     }
 
-    fn code(&self) -> &'static str {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::NotRecovered { .. } => "not-recovered",
             Self::RevisionConflict { .. } => "revision-conflict",

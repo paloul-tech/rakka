@@ -8,6 +8,18 @@ See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routin
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
 See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kubernetes, and metrics integration boundaries.
 See `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, allowed version skew, and compatibility test commands.
+See `docs/rakka-v1-api-review.md` for the current public API review notes, crate map, feature boundaries, and error-code policy.
+
+## Crate Map
+
+| Crate | Role |
+| --- | --- |
+| `rakka-core` | Typed actors, actor refs, supervision, paths, shared metrics, and framework errors. |
+| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs plus PostgreSQL storage plugin. |
+| `rakka-cluster`, `rakka-remote`, `rakka-sharding` | Membership, remoting, protocol compatibility, and sharded entity routing. |
+| `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
+| `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |
+| `rakka-testkit` | Cross-crate integration helpers and compatibility fixtures. |
 
 ## Validation Commands
 
@@ -16,6 +28,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
+cargo check -p rakka-stream --no-default-features
+cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
 ```
 

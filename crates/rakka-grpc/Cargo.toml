@@ -16,7 +16,7 @@ name = "rakka_grpc"
 futures-util.workspace = true
 rakka-core = { path = "../rakka-core" }
 rakka-sharding = { path = "../rakka-sharding" }
-rakka-stream = { path = "../rakka-stream" }
+rakka-stream = { path = "../rakka-stream", default-features = false }
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true

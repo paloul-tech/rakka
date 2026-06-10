@@ -53,7 +53,9 @@ impl ClusterError {
         RakkaError::new(Subsystem::Cluster, self.code(), self.to_string())
     }
 
-    fn code(&self) -> &'static str {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::UnknownNode { .. } => "unknown-node",
             Self::InvalidTransition { .. } => "invalid-transition",

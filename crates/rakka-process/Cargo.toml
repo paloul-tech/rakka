@@ -12,6 +12,10 @@ readme.workspace = true
 [lib]
 name = "rakka_process"
 
+[features]
+default = ["testkit"]
+testkit = []
+
 [dependencies]
 rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }

@@ -171,7 +171,7 @@ Implementation notes:
 
 ## Slice V1D: Public API Review and Crate Boundary Hardening
 
-Status: planned.
+Status: implemented.
 
 Goal: make the public crate surfaces understandable, stable enough for v1 draft review, and internally consistent.
 
@@ -197,6 +197,16 @@ Out of scope:
 
 - Promising final semver stability before the v1 release candidate review is complete.
 - Large rewrites of already working slices without a concrete API or safety issue.
+
+Implementation notes:
+
+- Added `docs/rakka-v1-api-review.md` with stability tiers, a crate map, feature-boundary notes, public error-code policy, crate-by-crate review notes, and remaining open review questions.
+- Added a concise README crate map and linked the API review document from the repository entry point.
+- Made stable `code()` accessors public on `ClusterError`, `DurableError`, `ShardingError`, and `WorkflowError`.
+- Added `ProcessError::code()` and `ProcessError::into_rakka_error()` so process actor failures follow the same `RakkaError` conversion convention as the rest of the runtime crates.
+- Split `rakka-stream` adapter dependencies behind default features: `adapters` for actor/entity helpers and `process-io` for process pipe adapters. Stream core now compiles with `--no-default-features`.
+- Set `rakka-http`, `rakka-grpc`, `rakka-k8s`, and `rakka-testkit` to depend on stream core with `default-features = false`.
+- Feature-gated `rakka-process::testkit` behind a default-enabled `testkit` feature so production/minimal builds can disable it while existing tests remain compatible.
 
 ## Slice V1E: Generated gRPC and HTTP Contract Examples
 
@@ -361,4 +371,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice V1D: Public API Review and Crate Boundary Hardening. Compatibility is now represented as a tested cross-surface release property; the next step is tightening public exports, docs, feature boundaries, and error surfaces before a v1 draft review.
+Continue with Slice V1E: Generated gRPC and HTTP Contract Examples. Public API boundaries now have review notes, minimal feature checks, and consistent error-code accessors; the next step is demonstrating generated service contracts over the adapter APIs.

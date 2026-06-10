@@ -19,15 +19,19 @@ use rakka_core::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+#[cfg(feature = "adapters")]
 mod adapters;
+#[cfg(feature = "process-io")]
 mod process_io;
 
+#[cfg(feature = "adapters")]
 pub use adapters::{
     broadcast_stream, fan_in_streams, pipe_stream, spawn_actor_source, ActorSink, ActorSinkError,
     ActorSinkResult, ActorSource, ActorSourceSpawnError, BroadcastError, BroadcastResult,
     EntitySink, EntitySinkError, EntitySinkResult, StreamPipeError, StreamPipeResult,
     StreamPipeSummary,
 };
+#[cfg(feature = "process-io")]
 pub use process_io::{
     managed_process_stderr_stream, managed_process_stdin_sink, managed_process_stdout_stream,
     process_input_sink_from_writer, process_output_stream_from_reader,

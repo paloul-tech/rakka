@@ -17,7 +17,7 @@ rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }
 rakka-process = { path = "../rakka-process" }
 rakka-sharding = { path = "../rakka-sharding" }
-rakka-stream = { path = "../rakka-stream" }
+rakka-stream = { path = "../rakka-stream", default-features = false }
 serde.workspace = true
 tokio.workspace = true
 

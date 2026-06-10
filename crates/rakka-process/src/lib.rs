@@ -17,6 +17,7 @@ mod oneshot;
 mod sharded;
 mod spec;
 mod stdio;
+#[cfg(feature = "testkit")]
 pub mod testkit;
 
 pub use actor::{

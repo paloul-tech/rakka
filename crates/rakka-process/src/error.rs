@@ -5,6 +5,8 @@ use std::fmt::{self, Display, Formatter};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use rakka_core::{RakkaError, Subsystem};
+
 /// Convenient result alias for process actor operations.
 pub type ProcessResult<T> = Result<T, ProcessError>;
 
@@ -198,6 +200,56 @@ pub enum ProcessError {
         /// Last connection error observed before timing out.
         last_error: Option<String>,
     },
+}
+
+impl ProcessError {
+    /// Converts this error to a framework error.
+    #[must_use]
+    pub fn into_rakka_error(self) -> RakkaError {
+        RakkaError::new(Subsystem::Process, self.code(), self.to_string())
+    }
+
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::EmptyProgram => "empty-program",
+            Self::RelativeProgram { .. } => "relative-program",
+            Self::ProgramNotAllowed { .. } => "program-not-allowed",
+            Self::InvalidEnvironmentName { .. } => "invalid-environment-name",
+            Self::RelativeWorkingDirectory { .. } => "relative-working-directory",
+            Self::Spawn { .. } => "spawn-error",
+            Self::Wait { .. } => "wait-error",
+            Self::Kill { .. } => "kill-error",
+            Self::AlreadyReaped { .. } => "already-reaped",
+            Self::ShutdownTimeout { .. } => "shutdown-timeout",
+            Self::AlreadyRunning { .. } => "already-running",
+            Self::NotRunning => "not-running",
+            Self::StartupTimeout { .. } => "startup-timeout",
+            Self::ExitedDuringStartup { .. } => "exited-during-startup",
+            Self::UnexpectedExit { .. } => "unexpected-exit",
+            Self::Unhealthy { .. } => "unhealthy",
+            Self::RestartBudgetExhausted { .. } => "restart-budget-exhausted",
+            Self::Terminal { .. } => "terminal",
+            Self::MissingPipe { .. } => "missing-pipe",
+            Self::StdinClosed => "stdin-closed",
+            Self::StdoutClosed => "stdout-closed",
+            Self::StdioRead { .. } => "stdio-read",
+            Self::StdioWrite { .. } => "stdio-write",
+            Self::OutputLimitExceeded { .. } => "output-limit-exceeded",
+            Self::PendingCapacity { .. } => "pending-capacity",
+            Self::RequestTimeout { .. } => "request-timeout",
+            Self::ProtocolEncode { .. } => "protocol-encode",
+            Self::MalformedStdout { .. } => "malformed-stdout",
+            Self::UnknownReply { .. } => "unknown-reply",
+            Self::DuplicateReply { .. } => "duplicate-reply",
+            Self::ProtocolClosed { .. } => "protocol-closed",
+            Self::InvalidSandboxDirectory { .. } => "invalid-sandbox-directory",
+            Self::SandboxPathEscape { .. } => "sandbox-path-escape",
+            Self::FileIo { .. } => "file-io",
+            Self::EndpointTimeout { .. } => "endpoint-timeout",
+        }
+    }
 }
 
 impl Display for ProcessError {

@@ -12,10 +12,15 @@ readme.workspace = true
 [lib]
 name = "rakka_stream"
 
+[features]
+default = ["adapters", "process-io"]
+adapters = ["dep:rakka-sharding"]
+process-io = ["dep:rakka-process"]
+
 [dependencies]
 rakka-core = { path = "../rakka-core" }
-rakka-process = { path = "../rakka-process" }
-rakka-sharding = { path = "../rakka-sharding" }
+rakka-process = { path = "../rakka-process", optional = true }
+rakka-sharding = { path = "../rakka-sharding", optional = true }
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
