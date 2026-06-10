@@ -21,6 +21,28 @@ pub(crate) struct ProtoRemoteEnvelope {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub(crate) struct ProtoRemoteHandshake {
+    #[prost(string, tag = "1")]
+    pub(crate) node_id: String,
+    #[prost(uint32, tag = "2")]
+    pub(crate) protocol_major: u32,
+    #[prost(uint32, tag = "3")]
+    pub(crate) protocol_minor: u32,
+    #[prost(uint32, tag = "4")]
+    pub(crate) compatible_min_major: u32,
+    #[prost(uint32, tag = "5")]
+    pub(crate) compatible_min_minor: u32,
+    #[prost(uint32, tag = "6")]
+    pub(crate) compatible_max_major: u32,
+    #[prost(uint32, tag = "7")]
+    pub(crate) compatible_max_minor: u32,
+    #[prost(uint32, tag = "8")]
+    pub(crate) envelope_version: u32,
+    #[prost(string, repeated, tag = "9")]
+    pub(crate) capabilities: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub(crate) struct ProtoRemoteDestination {
     #[prost(enumeration = "ProtoDestinationKind", tag = "1")]
     pub(crate) kind: i32,

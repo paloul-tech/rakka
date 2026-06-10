@@ -6,6 +6,7 @@
 pub mod endpoint;
 pub mod envelope;
 pub mod error;
+pub mod network;
 mod proto;
 pub mod registry;
 pub mod request;
@@ -21,6 +22,13 @@ pub use envelope::{
     RemoteEnvelopeMetadata,
 };
 pub use error::{RemoteError, RemoteResult};
+pub use network::{
+    TcpRemoteConnectionLifecycle, TcpRemoteHandshake, TcpRemotePeerSnapshot, TcpRemoteTransport,
+    TcpRemoteTransportConfig, TcpRemoteTransportError, TcpRemoteTransportResult,
+    TcpRemoteTransportSnapshot, DEFAULT_REMOTE_ENVELOPE_VERSION,
+    METRIC_TCP_REMOTE_CONNECTION_STATE, METRIC_TCP_REMOTE_RECEIVES, METRIC_TCP_REMOTE_RECONNECTS,
+    METRIC_TCP_REMOTE_SENDS,
+};
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SchemaCompatibilityPolicy,
     SerializationRegistry,

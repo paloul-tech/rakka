@@ -1063,6 +1063,7 @@ dependencies = [
  "rakka-core",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -50,7 +50,7 @@ Minimum completion criteria:
 
 ## Slice V1A: Network Remoting Transport Foundation
 
-Status: planned.
+Status: implemented.
 
 Goal: replace deterministic-only remoting with a real Tokio network transport suitable for local multi-process and Kubernetes scenarios.
 
@@ -79,6 +79,20 @@ Out of scope:
 - Public internet exposure of remoting.
 - TLS/mTLS certificate lifecycle.
 - QUIC or multi-transport negotiation.
+
+Implementation notes:
+
+- Added `rakka_remote::network` with `TcpRemoteTransport`, `TcpRemoteTransportConfig`, `TcpRemoteHandshake`, lifecycle snapshots, transport snapshots, and TCP-specific metric names.
+- Kept `InMemoryRemoteTransport` unchanged for deterministic single-process tests and examples.
+- Implemented length-delimited TCP frames with explicit frame kinds for handshake, envelope, and graceful close.
+- Added handshake metadata for node id, cluster protocol version, compatibility range, envelope wire version, and capabilities.
+- Enforced registered-peer checks, expected-peer checks, envelope-version checks, and mutual `ClusterProtocol` compatibility before accepting inbound delivery or completing outbound connection setup.
+- Implemented bounded outbound per-peer queues through the existing synchronous `RemoteTransport::send` API, returning typed queue-full, draining, closed, and unknown-node failures.
+- Added fail-fast validation for invalid TCP transport queue and frame-size settings.
+- Added outbound worker lifecycle states for connecting, ready, backoff, draining, closed, and failed; added reconnect-on-write-failure with backoff, idle close, graceful drain, and force close.
+- Added TCP remoting counters/gauges for connection state, sends, receives, reconnects, and failures, plus tracing events for state transitions and inbound failures.
+- Added unit coverage for loopback delivery, unknown inbound node rejection, incompatible protocol rejection, malformed inbound envelope decode failure, bounded queue back-pressure, graceful drain, force-close reconnect, idle timeout, and failure metrics.
+- TCP tests self-skip when the host denies local loopback bind; unsandboxed loopback execution was also verified.
 
 ## Slice V1B: Cluster Runtime Networking Integration
 
@@ -327,4 +341,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Start with Slice V1A: Network Remoting Transport Foundation. Real network remoting unlocks the rest of the hardening plan: multi-process sharding, real Kubernetes pod-to-pod routing, compatibility matrix tests, generated service examples, and production-oriented operational validation.
+Continue with Slice V1B: Cluster Runtime Networking Integration. Real network remoting is now in place; the next step is wiring it into cluster membership and sharding so routed entities can move across real process boundaries.

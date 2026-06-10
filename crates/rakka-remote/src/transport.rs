@@ -27,6 +27,23 @@ pub enum RemoteTransportError {
         /// Duplicate node id.
         node_id: NodeId,
     },
+    /// A bounded outbound transport queue was full.
+    QueueFull {
+        /// Destination node id.
+        node_id: NodeId,
+        /// Configured queue capacity.
+        capacity: usize,
+    },
+    /// A destination node is draining and rejects new sends.
+    Draining {
+        /// Destination node id.
+        node_id: NodeId,
+    },
+    /// A destination node connection or worker was closed.
+    Closed {
+        /// Destination node id.
+        node_id: NodeId,
+    },
     /// Envelope encoding failed before transport delivery.
     Encode {
         /// Destination node id.
@@ -54,6 +71,18 @@ impl Display for RemoteTransportError {
                     f,
                     "remote transport already has an endpoint for node {node_id}"
                 )
+            }
+            Self::QueueFull { node_id, capacity } => {
+                write!(
+                    f,
+                    "remote transport queue to node {node_id} is full at capacity {capacity}"
+                )
+            }
+            Self::Draining { node_id } => {
+                write!(f, "remote transport to node {node_id} is draining")
+            }
+            Self::Closed { node_id } => {
+                write!(f, "remote transport to node {node_id} is closed")
             }
             Self::Encode { node_id, error } => {
                 write!(

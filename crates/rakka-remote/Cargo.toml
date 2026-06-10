@@ -18,6 +18,7 @@ rakka-cluster = { path = "../rakka-cluster" }
 rakka-core = { path = "../rakka-core" }
 serde.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
