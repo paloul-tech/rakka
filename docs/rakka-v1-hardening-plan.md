@@ -358,7 +358,7 @@ Implementation notes:
 
 ## Slice V1I: CI, Release Packaging, and Repository Hygiene
 
-Status: planned.
+Status: implemented.
 
 Goal: make the repo releasable and keep the validation surface repeatable.
 
@@ -369,7 +369,7 @@ Scope:
 - Validate `cargo package` for publishable crates and `publish = false` examples.
 - Add release profile guidance and binary image build notes.
 - Add changelog/release-notes draft structure.
-- Audit licenses, README links, docs links, crate metadata, rust-toolchain, and `.gitignore`.
+- Audit README links, docs links, crate metadata, rust-toolchain, and `.gitignore`.
 
 Acceptance criteria:
 
@@ -382,6 +382,18 @@ Out of scope:
 
 - Actual crates.io publish.
 - Production image registry publishing.
+
+Implementation notes:
+
+- Added root workspace package description metadata and propagated `description.workspace = true` through publishable crates and example packages.
+- Added explicit `version = "0.1.0"` to internal path dependencies for publishable crates so `cargo package` can normalize dependency metadata.
+- Added `scripts/validate.sh` as the required local validation entry point for format, clippy, workspace tests, minimal feature checks, docs, and safe Kubernetes dry-run validation.
+- Added `scripts/package-check.sh` for offline publishable crate package lists, full `rakka-core` package verification, and example `publish = false` enforcement. Crates with unpublished internal Rakka dependencies are list-checked offline because full Cargo package generation would require registry dependency resolution.
+- Reworked CI into required validation, MSRV, offline package, and Kubernetes dry-run jobs, plus gated workflow-dispatch jobs for PostgreSQL and local Kubernetes cluster validation.
+- Added `docs/rakka-v1-release-packaging.md` with release-candidate validation, CI job boundaries, publishable crate list, release profile guidance, image build notes, and release checklist.
+- Added `CHANGELOG.md` with an unreleased section and v1 release-candidate checklist.
+- Expanded `.gitignore` for local env files, release artifacts, and coverage output while preserving `.idea/` ignores.
+- Added `crates/rakka-testkit/tests/repository_hygiene.rs` to assert CI/script/release metadata, example publish boundaries, docs, and ignore rules.
 
 ## Slice V1J: Final V1 Release Candidate Review
 
@@ -411,4 +423,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice V1I: CI, Release Packaging, and Repository Hygiene. Security and operational defaults are now explicit and test-covered; the next step is making the validation, packaging, and release-candidate workflow repeatable from a clean checkout.
+Continue with Slice V1J: Final V1 Release Candidate Review. CI, package checks, release notes, and repository hygiene are now explicit; the next step is a final pass over docs, validation output expectations, reliability boundaries, and remaining known limitations.

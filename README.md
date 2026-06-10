@@ -12,6 +12,7 @@ See `docs/rakka-v1-api-review.md` for the current public API review notes, crate
 See `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrored HTTP routes, and the adapter boundary.
 See `docs/rakka-v1-observability-exporters.md` for Prometheus/OpenTelemetry exporter adapters, snapshot routes, and cardinality guidance.
 See `docs/rakka-v1-security-operational-defaults.md` for trusted remoting boundaries, process execution defaults, timeout budgets, and Kubernetes security assumptions.
+See `docs/rakka-v1-release-packaging.md` for CI, release-candidate validation, packaging, and image build notes.
 
 ## Crate Map
 
@@ -25,6 +26,17 @@ See `docs/rakka-v1-security-operational-defaults.md` for trusted remoting bounda
 | `rakka-testkit` | Cross-crate integration helpers and compatibility fixtures. |
 
 ## Validation Commands
+
+The two primary local validation entry points are:
+
+```sh
+scripts/validate.sh
+scripts/package-check.sh
+```
+
+`scripts/validate.sh` runs the required format, clippy, workspace tests, minimal feature checks, docs, and safe Kubernetes dry-run checks. `scripts/package-check.sh` validates publishable crate package file lists in Cargo offline mode, fully packages crates without unpublished internal Rakka dependencies, and confirms examples remain excluded from publishing.
+
+The underlying commands are:
 
 ```sh
 cargo fmt --all -- --check
@@ -40,11 +52,40 @@ cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
 ```
 
-The optional multi-process compatibility check launches two loopback node processes and is gated:
+Optional checks are gated because they need external services, child processes, or a mutable cluster.
+
+The optional multi-process compatibility check launches two loopback node processes:
 
 ```sh
 RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
 ```
+
+The optional PostgreSQL persistence check expects a local PostgreSQL database:
+
+```sh
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres
+```
+
+The optional Kubernetes local-cluster scenario expects `kubectl`, a current context, and an application image that satisfies the manifest contract:
+
+```sh
+RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh
+```
+
+## Release Packaging
+
+Rakka workspace crates share release metadata from the root manifest, and internal crate dependencies include explicit versions for packaging. Example packages are review/test assets and remain `publish = false`.
+
+Strict publishing policy: do not publish any Rakka crate, container image, release artifact, or generated bundle to a public or private registry without explicit user approval for that exact action. `scripts/package-check.sh` and `cargo package` are validation-only commands, and the package-check script always runs `cargo package` with `--offline`.
+
+Before cutting a v1 release candidate, run:
+
+```sh
+scripts/validate.sh
+scripts/package-check.sh
+```
+
+Then review `CHANGELOG.md` and `docs/rakka-v1-release-packaging.md`.
 
 ## Examples
 

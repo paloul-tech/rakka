@@ -5,10 +5,23 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      run_postgres:
+        description: Run PostgreSQL integration tests.
+        type: boolean
+        default: false
+      run_local_cluster:
+        description: Run gated local Kubernetes cluster scenario.
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Rust
+  validation:
+    name: Required Validation
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,14 +35,104 @@ jobs:
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      - name: Validate workspace
+        run: scripts/validate.sh
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Test
-        run: cargo test --workspace --all-features
+      - name: Install MSRV Rust
+        uses: dtolnay/rust-toolchain@1.80.0
 
-      - name: Docs
-        run: cargo doc --workspace --all-features --no-deps
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace on MSRV
+        run: cargo check --workspace --all-targets
+
+  package:
+    name: Offline Package Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate crate packages
+        run: scripts/package-check.sh
+
+  postgres:
+    name: PostgreSQL Integration
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_postgres }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test PostgreSQL store
+        env:
+          RAKKA_POSTGRES_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres
+        run: cargo test -p rakka-persistence-postgres
+
+  kubernetes-dry-run:
+    name: Kubernetes Scenario Dry Run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate scenario script without cluster access
+        env:
+          RAKKA_K8S_SCENARIO_DRY_RUN: "1"
+          RAKKA_K8S_NEXT_IMAGE: example/rakka-node:next
+        run: examples/kubernetes/local-cluster-scenario.sh
+
+  local-cluster:
+    name: Local Kubernetes Cluster
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_local_cluster }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run gated local-cluster contract test
+        env:
+          RAKKA_K8S_RUN_LOCAL_CLUSTER: "1"
+          RAKKA_K8S_IMAGE: ${{ vars.RAKKA_K8S_IMAGE }}
+          RAKKA_K8S_NEXT_IMAGE: ${{ vars.RAKKA_K8S_NEXT_IMAGE }}
+        run: cargo test -p rakka-k8s optional_local_cluster_scenario_is_gated -- --nocapture

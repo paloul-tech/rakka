@@ -1,9 +1,9 @@
 [package]
 name = "rakka-grpc"
 version = "0.1.0"
+description.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
@@ -14,16 +14,16 @@ name = "rakka_grpc"
 
 [dependencies]
 futures-util.workspace = true
-rakka-core = { path = "../rakka-core" }
-rakka-sharding = { path = "../rakka-sharding" }
-rakka-stream = { path = "../rakka-stream", default-features = false }
+rakka-core = { path = "../rakka-core", version = "0.1.0" }
+rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
+rakka-stream = { path = "../rakka-stream", version = "0.1.0", default-features = false }
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 prost.workspace = true
-rakka-cluster = { path = "../rakka-cluster" }
+rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 
 [lints]
 workspace = true
