@@ -12,7 +12,8 @@ use rakka_core::{
 };
 use rakka_k8s::{
     KubernetesDrainController, KubernetesDrainOutcome, KubernetesDrainStepResult,
-    KubernetesDrainStepStatus, KubernetesNodeHealth,
+    KubernetesDrainStepStatus, KubernetesNodeHealth, DEFAULT_KUBERNETES_PRESTOP_TIMEOUT,
+    DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS,
 };
 use rakka_process::{ProcessActorCommand, ProcessActorState, ProcessActorStatus, ProcessHealth};
 use rakka_sharding::{
@@ -93,6 +94,16 @@ fn liveness_ignores_rebalance_and_drain_but_fails_when_runtime_is_stuck() {
     assert!(liveness
         .reasons()
         .contains(&"runtime-stuck:executor stalled".to_string()));
+}
+
+#[test]
+fn kubernetes_timeout_defaults_leave_room_for_prestop_cleanup() {
+    assert_eq!(DEFAULT_KUBERNETES_PRESTOP_TIMEOUT, Duration::from_secs(30));
+    assert_eq!(DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS, 45);
+    assert!(
+        DEFAULT_KUBERNETES_PRESTOP_TIMEOUT
+            < Duration::from_secs(DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS)
+    );
 }
 
 #[tokio::test]

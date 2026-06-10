@@ -321,7 +321,7 @@ Implementation notes:
 
 ## Slice V1H: Security and Operational Defaults
 
-Status: planned.
+Status: implemented.
 
 Goal: make trust boundaries, unsafe defaults, and operator responsibilities explicit and testable.
 
@@ -344,6 +344,17 @@ Out of scope:
 
 - Complete authN/authZ platform.
 - Certificate provisioning, rotation, or service-mesh integration.
+
+Implementation notes:
+
+- Added `rakka_core::SecurityDefaults`, `DeploymentProfile`, and `OperationalTimeoutDefaults` to make development, local-cluster, and production-like security/timeout profiles explicit and serializable.
+- Added shared default constants for actor ask, remote connect/idle, remote outbound queue capacity, stream drain, process startup/shutdown, Kubernetes pre-stop, and Kubernetes termination grace period.
+- Exposed process spec defaults from `rakka-process`: null stdio, no environment inheritance, close-stdin graceful shutdown, 5s startup, 5s shutdown, and explicit executable allowlist requirement.
+- Exposed TCP remoting defaults from `rakka-remote`: loopback bind by default, 2552 port, bounded peer queue, connect/reconnect/idle/frame defaults, and `TCP_REMOTE_REQUIRES_REGISTERED_PEERS`.
+- Added Kubernetes default constants for pre-stop timeout and termination grace period.
+- Expanded the Kubernetes manifest with V1H environment defaults for deployment profile, trusted-cluster remoting boundary, discovery-based peer allowlist, process allowlist requirement, process environment inheritance policy, and timeout budgets.
+- Added tests for security profiles, operational timeout defaults, process spec conservative defaults, TCP remote defaults, Kubernetes timeout/grace-period relationship, and manifest safety env vars.
+- Added `docs/rakka-v1-security-operational-defaults.md` and updated README/Kubernetes docs with trust boundaries, what Rakka protects, what Kubernetes/operators must protect, and development/local-cluster/production-like profile examples.
 
 ## Slice V1I: CI, Release Packaging, and Repository Hygiene
 
@@ -400,4 +411,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice V1F: Production Observability Exporters. Generated contract examples now exercise the adapter APIs from `.proto` service definitions through gRPC, HTTP, workflow, and process-backed paths; the next step is connecting the stable metrics/tracing surfaces to production-consumable exporters.
+Continue with Slice V1I: CI, Release Packaging, and Repository Hygiene. Security and operational defaults are now explicit and test-covered; the next step is making the validation, packaging, and release-candidate workflow repeatable from a clean checkout.

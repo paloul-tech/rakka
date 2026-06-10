@@ -25,6 +25,31 @@ use crate::{
 /// Default remote envelope wire version for TCP remoting.
 pub const DEFAULT_REMOTE_ENVELOPE_VERSION: u32 = 1;
 
+/// Default TCP remoting port.
+pub const DEFAULT_TCP_REMOTE_PORT: u16 = 2552;
+
+/// Default TCP remoting bind address.
+pub const DEFAULT_TCP_REMOTE_BIND_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_TCP_REMOTE_PORT);
+
+/// Default bounded outbound queue capacity per TCP peer.
+pub const DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY: usize = 1024;
+
+/// Default TCP connect timeout.
+pub const DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default TCP reconnect backoff.
+pub const DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Default TCP idle timeout.
+pub const DEFAULT_TCP_REMOTE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default maximum remote frame size.
+pub const DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// TCP remoting only accepts inbound handshakes from registered peers.
+pub const TCP_REMOTE_REQUIRES_REGISTERED_PEERS: bool = true;
+
 /// TCP remote connection state gauge.
 pub const METRIC_TCP_REMOTE_CONNECTION_STATE: &str = "rakka.remote.tcp.connection.state";
 
@@ -84,12 +109,12 @@ pub struct TcpRemoteTransportConfig {
 impl Default for TcpRemoteTransportConfig {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2552),
-            outbound_queue_capacity: 1024,
-            connect_timeout: Duration::from_secs(2),
-            reconnect_backoff: Duration::from_millis(100),
-            idle_timeout: Duration::from_secs(30),
-            max_frame_bytes: 16 * 1024 * 1024,
+            bind_addr: DEFAULT_TCP_REMOTE_BIND_ADDR,
+            outbound_queue_capacity: DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
+            connect_timeout: DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT,
+            reconnect_backoff: DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF,
+            idle_timeout: DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
+            max_frame_bytes: DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES,
             envelope_version: DEFAULT_REMOTE_ENVELOPE_VERSION,
         }
     }
@@ -149,6 +174,54 @@ impl TcpRemoteTransportConfig {
     pub const fn envelope_version(mut self, envelope_version: u32) -> Self {
         self.envelope_version = envelope_version;
         self
+    }
+
+    /// Address the TCP listener should bind.
+    #[must_use]
+    pub const fn bind_addr_value(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    /// Bounded outbound queue capacity per peer.
+    #[must_use]
+    pub const fn outbound_queue_capacity_value(&self) -> usize {
+        self.outbound_queue_capacity
+    }
+
+    /// TCP connect timeout.
+    #[must_use]
+    pub const fn connect_timeout_value(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Reconnect backoff after transient failures.
+    #[must_use]
+    pub const fn reconnect_backoff_value(&self) -> Duration {
+        self.reconnect_backoff
+    }
+
+    /// Idle timeout before an unused connection is closed.
+    #[must_use]
+    pub const fn idle_timeout_value(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Maximum accepted frame size.
+    #[must_use]
+    pub const fn max_frame_bytes_value(&self) -> usize {
+        self.max_frame_bytes
+    }
+
+    /// Advertised remote envelope wire version.
+    #[must_use]
+    pub const fn envelope_version_value(&self) -> u32 {
+        self.envelope_version
+    }
+
+    /// Returns true because TCP remoting requires peer registration before delivery.
+    #[must_use]
+    pub const fn requires_registered_peers(&self) -> bool {
+        TCP_REMOTE_REQUIRES_REGISTERED_PEERS
     }
 }
 

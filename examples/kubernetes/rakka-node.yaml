@@ -33,6 +33,9 @@ data:
   RAKKA_DISCOVERY_PROVIDER: kubernetes-dns
   RAKKA_STATEFULSET_NAME: rakka-node
   RAKKA_EXPECTED_REPLICAS: "3"
+  RAKKA_DEPLOYMENT_PROFILE: production-like
+  RAKKA_REMOTING_TRUST_BOUNDARY: trusted-cluster
+  RAKKA_REMOTING_ALLOWED_PEERS: discovery
   RAKKA_REMOTING_PORT: "2552"
   RAKKA_REMOTING_BIND_ADDR: 0.0.0.0:2552
   RAKKA_REMOTING_ADVERTISE_PORT: "2552"
@@ -49,6 +52,15 @@ data:
   RAKKA_SCENARIO_ROUTE_PATH: /scenario/sharding/route-remote
   RAKKA_SCENARIO_ENTITY_ID: cart-v1g
   RAKKA_SCENARIO_ITEM: apple
+  RAKKA_ACTOR_ASK_TIMEOUT_MS: "5000"
+  RAKKA_REMOTE_CONNECT_TIMEOUT_MS: "2000"
+  RAKKA_REMOTE_IDLE_TIMEOUT_MS: "30000"
+  RAKKA_STREAM_DRAIN_TIMEOUT_MS: "5000"
+  RAKKA_PROCESS_STARTUP_TIMEOUT_MS: "5000"
+  RAKKA_PROCESS_SHUTDOWN_TIMEOUT_MS: "5000"
+  RAKKA_PROCESS_ALLOWLIST_REQUIRED: "true"
+  RAKKA_PROCESS_INHERIT_ENVIRONMENT: "false"
+  RAKKA_K8S_PRESTOP_TIMEOUT_MS: "30000"
   RAKKA_REQUIRED_SERVICES: http,grpc
   RAKKA_PROTOCOL_VERSION: "1.0"
   RAKKA_COMPAT_MIN: "1.0"
@@ -194,6 +206,21 @@ spec:
                 configMapKeyRef:
                   name: rakka-node-config
                   key: RAKKA_EXPECTED_REPLICAS
+            - name: RAKKA_DEPLOYMENT_PROFILE
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_DEPLOYMENT_PROFILE
+            - name: RAKKA_REMOTING_TRUST_BOUNDARY
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTING_TRUST_BOUNDARY
+            - name: RAKKA_REMOTING_ALLOWED_PEERS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTING_ALLOWED_PEERS
             - name: RAKKA_HEADLESS_SERVICE
               valueFrom:
                 configMapKeyRef:
@@ -284,6 +311,51 @@ spec:
                 configMapKeyRef:
                   name: rakka-node-config
                   key: RAKKA_SCENARIO_ITEM
+            - name: RAKKA_ACTOR_ASK_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_ACTOR_ASK_TIMEOUT_MS
+            - name: RAKKA_REMOTE_CONNECT_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTE_CONNECT_TIMEOUT_MS
+            - name: RAKKA_REMOTE_IDLE_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_REMOTE_IDLE_TIMEOUT_MS
+            - name: RAKKA_STREAM_DRAIN_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_STREAM_DRAIN_TIMEOUT_MS
+            - name: RAKKA_PROCESS_STARTUP_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_PROCESS_STARTUP_TIMEOUT_MS
+            - name: RAKKA_PROCESS_SHUTDOWN_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_PROCESS_SHUTDOWN_TIMEOUT_MS
+            - name: RAKKA_PROCESS_ALLOWLIST_REQUIRED
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_PROCESS_ALLOWLIST_REQUIRED
+            - name: RAKKA_PROCESS_INHERIT_ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_PROCESS_INHERIT_ENVIRONMENT
+            - name: RAKKA_K8S_PRESTOP_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: rakka-node-config
+                  key: RAKKA_K8S_PRESTOP_TIMEOUT_MS
             - name: RAKKA_REQUIRED_SERVICES
               valueFrom:
                 configMapKeyRef:

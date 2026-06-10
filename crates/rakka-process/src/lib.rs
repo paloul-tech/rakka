@@ -46,7 +46,12 @@ pub use sharded::{
     ProcessBackedEntityBehavior, ProcessBackedEntityContext, ProcessBackedEntityFuture,
     ProcessBackedEntityProcess, ProcessBackedEntityState, ProcessBackedEntityStatus,
 };
-pub use spec::{ExecutableAllowlist, GracefulShutdown, ProcessSpec, ProcessStdio, ResourceHints};
+pub use spec::{
+    ExecutableAllowlist, GracefulShutdown, ProcessSpec, ProcessStdio, ResourceHints,
+    DEFAULT_PROCESS_GRACEFUL_SHUTDOWN, DEFAULT_PROCESS_INHERITS_ENVIRONMENT,
+    DEFAULT_PROCESS_SHUTDOWN_TIMEOUT, DEFAULT_PROCESS_STARTUP_TIMEOUT, DEFAULT_PROCESS_STDERR,
+    DEFAULT_PROCESS_STDIN, DEFAULT_PROCESS_STDOUT,
+};
 pub use stdio::{
     spawn_stdio_actor, LineJsonCodec, LineJsonFrame, RawLineStdioCodec, StdioActor, StdioCodec,
     StdioCommand, StdioProtocolConfig, StdioReply, StdioStatus,

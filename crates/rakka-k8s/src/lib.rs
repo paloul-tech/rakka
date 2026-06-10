@@ -9,6 +9,7 @@ use rakka_cluster::{
 };
 use rakka_core::Subsystem;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 mod drain;
 mod health;
@@ -34,6 +35,12 @@ pub const DEFAULT_LIVENESS_PATH: &str = "/live";
 
 /// Default Kubernetes pre-stop drain endpoint.
 pub const DEFAULT_DRAIN_PATH: &str = "/drain";
+
+/// Default Kubernetes pre-stop drain timeout budget.
+pub const DEFAULT_KUBERNETES_PRESTOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default Kubernetes pod termination grace period for examples.
+pub const DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS: u64 = 45;
 
 /// Subsystem associated with Kubernetes integration.
 #[must_use]

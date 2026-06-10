@@ -10,8 +10,14 @@ use tokio::process::Command;
 
 use crate::{ProcessError, ProcessResult};
 
-const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default child process startup timeout.
+pub const DEFAULT_PROCESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default child process graceful shutdown timeout.
+pub const DEFAULT_PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether child processes inherit the node environment by default.
+pub const DEFAULT_PROCESS_INHERITS_ENVIRONMENT: bool = false;
 
 /// Policy for wiring one child-process standard IO stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,6 +29,15 @@ pub enum ProcessStdio {
     /// Create a pipe owned by Rakka.
     Piped,
 }
+
+/// Default stdin policy for a child process.
+pub const DEFAULT_PROCESS_STDIN: ProcessStdio = ProcessStdio::Null;
+
+/// Default stdout policy for a child process.
+pub const DEFAULT_PROCESS_STDOUT: ProcessStdio = ProcessStdio::Null;
+
+/// Default stderr policy for a child process.
+pub const DEFAULT_PROCESS_STDERR: ProcessStdio = ProcessStdio::Null;
 
 impl ProcessStdio {
     pub(crate) fn to_stdio(self) -> Stdio {
@@ -42,6 +57,9 @@ pub enum GracefulShutdown {
     /// Drop the owned stdin pipe so cooperative children can observe EOF.
     CloseStdin,
 }
+
+/// Default graceful shutdown policy for a child process.
+pub const DEFAULT_PROCESS_GRACEFUL_SHUTDOWN: GracefulShutdown = GracefulShutdown::CloseStdin;
 
 /// Optional resource hints for a child process.
 ///
@@ -210,13 +228,13 @@ impl ProcessSpec {
             args: Vec::new(),
             env: BTreeMap::new(),
             cwd: None,
-            stdin: ProcessStdio::Null,
-            stdout: ProcessStdio::Null,
-            stderr: ProcessStdio::Null,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-            graceful_shutdown: GracefulShutdown::CloseStdin,
-            inherit_environment: false,
+            stdin: DEFAULT_PROCESS_STDIN,
+            stdout: DEFAULT_PROCESS_STDOUT,
+            stderr: DEFAULT_PROCESS_STDERR,
+            startup_timeout: DEFAULT_PROCESS_STARTUP_TIMEOUT,
+            shutdown_timeout: DEFAULT_PROCESS_SHUTDOWN_TIMEOUT,
+            graceful_shutdown: DEFAULT_PROCESS_GRACEFUL_SHUTDOWN,
+            inherit_environment: DEFAULT_PROCESS_INHERITS_ENVIRONMENT,
             resource_hints: ResourceHints::new(),
         }
     }

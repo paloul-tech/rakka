@@ -25,9 +25,12 @@ pub use error::{RemoteError, RemoteResult};
 pub use network::{
     TcpRemoteConnectionLifecycle, TcpRemoteHandshake, TcpRemotePeerSnapshot, TcpRemoteTransport,
     TcpRemoteTransportConfig, TcpRemoteTransportError, TcpRemoteTransportResult,
-    TcpRemoteTransportSnapshot, DEFAULT_REMOTE_ENVELOPE_VERSION,
+    TcpRemoteTransportSnapshot, DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
+    DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
+    DEFAULT_TCP_REMOTE_PORT, DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF,
     METRIC_TCP_REMOTE_CONNECTION_STATE, METRIC_TCP_REMOTE_RECEIVES, METRIC_TCP_REMOTE_RECONNECTS,
-    METRIC_TCP_REMOTE_SENDS,
+    METRIC_TCP_REMOTE_SENDS, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SchemaCompatibilityPolicy,

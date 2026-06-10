@@ -6,7 +6,11 @@ use rakka_remote::{
     EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteDestination,
     RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
     RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
-    SchemaCompatibilityPolicy, SerializationRegistry,
+    SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransportConfig,
+    DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
+    DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
+    DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +38,38 @@ struct CompatPingV2 {
     value: String,
     #[prost(string, tag = "2")]
     suffix: String,
+}
+
+#[test]
+fn tcp_remote_defaults_are_loopback_bounded_and_known_peer_only() {
+    let config = TcpRemoteTransportConfig::default();
+
+    assert_eq!(config.bind_addr_value(), DEFAULT_TCP_REMOTE_BIND_ADDR);
+    assert_eq!(
+        config.outbound_queue_capacity_value(),
+        DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY
+    );
+    assert_eq!(
+        config.connect_timeout_value(),
+        DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT
+    );
+    assert_eq!(
+        config.reconnect_backoff_value(),
+        DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF
+    );
+    assert_eq!(config.idle_timeout_value(), DEFAULT_TCP_REMOTE_IDLE_TIMEOUT);
+    assert_eq!(
+        config.max_frame_bytes_value(),
+        DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES
+    );
+    assert_eq!(
+        config.envelope_version_value(),
+        DEFAULT_REMOTE_ENVELOPE_VERSION
+    );
+    assert_eq!(
+        config.requires_registered_peers(),
+        TCP_REMOTE_REQUIRES_REGISTERED_PEERS
+    );
 }
 
 #[test]

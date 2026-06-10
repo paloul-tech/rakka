@@ -11,6 +11,7 @@ See `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, all
 See `docs/rakka-v1-api-review.md` for the current public API review notes, crate map, feature boundaries, and error-code policy.
 See `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrored HTTP routes, and the adapter boundary.
 See `docs/rakka-v1-observability-exporters.md` for Prometheus/OpenTelemetry exporter adapters, snapshot routes, and cardinality guidance.
+See `docs/rakka-v1-security-operational-defaults.md` for trusted remoting boundaries, process execution defaults, timeout budgets, and Kubernetes security assumptions.
 
 ## Crate Map
 
@@ -32,6 +33,7 @@ cargo test --workspace --all-features
 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 cargo test -p rakka-example-generated-contracts --test generated_contracts -- --nocapture
 cargo test -p rakka-core --test observability_exporters
+cargo test -p rakka-core --test security_operational_defaults
 cargo test -p rakka-http --test observability_routes
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features

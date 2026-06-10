@@ -18,7 +18,10 @@ use rakka_process::{
     ProcessBackedEntityContext, ProcessBackedEntityFuture, ProcessBackedEntityProcess,
     ProcessCheck, ProcessError, ProcessExit, ProcessHealth, ProcessRestartPolicy,
     ProcessShutdownOutcome, ProcessSpec, ProcessStdio, RawLineStdioCodec, SocketProcessConfig,
-    StdioCommand, StdioProtocolConfig, StdioStatus,
+    StdioCommand, StdioProtocolConfig, StdioStatus, DEFAULT_PROCESS_GRACEFUL_SHUTDOWN,
+    DEFAULT_PROCESS_INHERITS_ENVIRONMENT, DEFAULT_PROCESS_SHUTDOWN_TIMEOUT,
+    DEFAULT_PROCESS_STARTUP_TIMEOUT, DEFAULT_PROCESS_STDERR, DEFAULT_PROCESS_STDIN,
+    DEFAULT_PROCESS_STDOUT,
 };
 use rakka_sharding::{
     EntityId, EntityRef, EntityType, ShardCoordinator, ShardRegion, ShardingConfig,
@@ -49,6 +52,36 @@ fn process_spec_validation_rejects_unsafe_or_incomplete_specs() {
             .cwd("relative-cwd")
             .validate(&allowlist),
         Err(ProcessError::RelativeWorkingDirectory { .. })
+    ));
+}
+
+#[test]
+fn process_spec_defaults_are_conservative() {
+    let spec = ProcessSpec::new(fixture_executable());
+
+    assert_eq!(spec.stdin_policy(), DEFAULT_PROCESS_STDIN);
+    assert_eq!(spec.stdout_policy(), DEFAULT_PROCESS_STDOUT);
+    assert_eq!(spec.stderr_policy(), DEFAULT_PROCESS_STDERR);
+    assert_eq!(
+        spec.startup_timeout_duration(),
+        DEFAULT_PROCESS_STARTUP_TIMEOUT
+    );
+    assert_eq!(
+        spec.shutdown_timeout_duration(),
+        DEFAULT_PROCESS_SHUTDOWN_TIMEOUT
+    );
+    assert_eq!(
+        spec.graceful_shutdown_policy(),
+        DEFAULT_PROCESS_GRACEFUL_SHUTDOWN
+    );
+    assert_eq!(
+        spec.inherits_environment(),
+        DEFAULT_PROCESS_INHERITS_ENVIRONMENT
+    );
+    assert!(!spec.inherits_environment());
+    assert!(matches!(
+        spec.validate(&ExecutableAllowlist::empty()),
+        Err(ProcessError::ProgramNotAllowed { .. })
     ));
 }
 

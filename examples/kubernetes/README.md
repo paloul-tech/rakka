@@ -43,14 +43,37 @@ That shape matches `KubernetesDnsDiscoveryConfig::new("rakka-system", "rakka-int
 The ConfigMap sets:
 
 ```text
+RAKKA_DEPLOYMENT_PROFILE=production-like
 RAKKA_DISCOVERY_PROVIDER=kubernetes-dns
 RAKKA_HEADLESS_SERVICE=rakka-internal
 RAKKA_EXPECTED_REPLICAS=3
+RAKKA_REMOTING_TRUST_BOUNDARY=trusted-cluster
+RAKKA_REMOTING_ALLOWED_PEERS=discovery
 RAKKA_REMOTING_BIND_ADDR=0.0.0.0:2552
 RAKKA_REMOTING_ADVERTISE_PORT=2552
 ```
 
 The application should combine `RAKKA_POD_NAME`, `RAKKA_POD_UID`, `RAKKA_NAMESPACE`, `RAKKA_HEADLESS_SERVICE`, `RAKKA_CLUSTER_DOMAIN`, and `RAKKA_REMOTING_ADVERTISE_PORT` to derive the local node id and advertised pod DNS address.
+
+Internal Rakka remoting should only be reachable by trusted Rakka pods. Use NetworkPolicy, service mesh policy, or equivalent cluster controls so `rakka-internal` is not exposed as a public API.
+
+## Security And Operational Defaults
+
+The example surfaces the V1 hardening defaults as environment variables:
+
+```text
+RAKKA_PROCESS_ALLOWLIST_REQUIRED=true
+RAKKA_PROCESS_INHERIT_ENVIRONMENT=false
+RAKKA_ACTOR_ASK_TIMEOUT_MS=5000
+RAKKA_REMOTE_CONNECT_TIMEOUT_MS=2000
+RAKKA_REMOTE_IDLE_TIMEOUT_MS=30000
+RAKKA_STREAM_DRAIN_TIMEOUT_MS=5000
+RAKKA_PROCESS_STARTUP_TIMEOUT_MS=5000
+RAKKA_PROCESS_SHUTDOWN_TIMEOUT_MS=5000
+RAKKA_K8S_PRESTOP_TIMEOUT_MS=30000
+```
+
+The app image should parse these values into the matching Rakka config builders. The Kubernetes `terminationGracePeriodSeconds` is `45`, leaving room after the `30s` pre-stop drain budget for reports and final cleanup.
 
 ## Health And Drain
 
