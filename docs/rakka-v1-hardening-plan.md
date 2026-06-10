@@ -210,7 +210,7 @@ Implementation notes:
 
 ## Slice V1E: Generated gRPC and HTTP Contract Examples
 
-Status: planned.
+Status: implemented.
 
 Goal: show how real application contracts use Rakka adapters without relying only on hand-written test structs.
 
@@ -234,6 +234,15 @@ Out of scope:
 
 - Full application template generator.
 - OpenAPI generation unless needed for an example.
+
+Implementation notes:
+
+- Added `rakka-example-generated-contracts`, a workspace example package with a `.proto` contract, `tonic-build` build script, generated tonic clients/servers, and mirrored HTTP JSON/binary routes.
+- The generated contract demonstrates unary actor ask, unary entity ask, server streaming, client streaming, bidirectional streaming, durable workflow inbox acceptance, and a process-backed line-json legacy service.
+- Added a dedicated legacy child binary for deterministic process-backed tests.
+- Added `docs/rakka-v1-generated-contracts.md` explaining where generated service code ends and Rakka adapter glue begins.
+- Added an integration test that calls generated tonic clients over loopback and exercises mirrored in-process HTTP routes.
+- Updated README validation and example instructions with generated-contract commands and expected output.
 
 ## Slice V1F: Production Observability Exporters
 
@@ -371,4 +380,4 @@ Out of scope:
 
 ## Suggested Next Slice
 
-Continue with Slice V1E: Generated gRPC and HTTP Contract Examples. Public API boundaries now have review notes, minimal feature checks, and consistent error-code accessors; the next step is demonstrating generated service contracts over the adapter APIs.
+Continue with Slice V1F: Production Observability Exporters. Generated contract examples now exercise the adapter APIs from `.proto` service definitions through gRPC, HTTP, workflow, and process-backed paths; the next step is connecting the stable metrics/tracing surfaces to production-consumable exporters.

@@ -18,6 +18,7 @@ members = [
     "examples/durable-workflow",
     "examples/external-binary-wrapper",
     "examples/edge-gateway",
+    "examples/generated-contracts",
     "examples/minimal-system",
     "examples/multi-node-sharding",
 ]
@@ -49,7 +50,9 @@ tokio = { version = "1", features = [
     "time",
 ] }
 tokio-postgres = "0.7"
+tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
+tonic-build = "0.12"
 tower = "0.5"
 tracing = "0.1"
 

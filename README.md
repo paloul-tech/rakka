@@ -9,6 +9,7 @@ See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, securi
 See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kubernetes, and metrics integration boundaries.
 See `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, allowed version skew, and compatibility test commands.
 See `docs/rakka-v1-api-review.md` for the current public API review notes, crate map, feature boundaries, and error-code policy.
+See `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrored HTTP routes, and the adapter boundary.
 
 ## Crate Map
 
@@ -28,6 +29,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
+cargo test -p rakka-example-generated-contracts --test generated_contracts -- --nocapture
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
@@ -170,6 +172,24 @@ gRPC bidirectional stream routed 2 cart updates.
 Streaming ingestion transformed 2 items into entity commands.
 Kubernetes readiness passed before drain; drain outcome Complete.
 Metrics captured HTTP route /counter/add and gRPC method Add.
+```
+
+### Generated Contracts
+
+This V1 hardening example starts from a `.proto` service contract, generates tonic client/server code at build time, implements the generated services with Rakka adapters, mirrors the same messages through HTTP JSON and binary routes, accepts a durable workflow command, and wraps a line-json child process.
+
+```sh
+cargo run -p rakka-example-generated-contracts
+```
+
+Expected output:
+
+```text
+Generated gRPC CounterService returned value 7.
+Generated gRPC CartService accepted book and CatalogService returned ["book", "box"].
+Generated gRPC streaming accepted 2 upload item(s) and 2 bidi ack(s).
+Generated gRPC WorkflowService revision 1 and LegacyService result 42.
+Mirrored HTTP JSON returned counter 12, cart pencil, workflow revision 2, legacy 100; binary counter 23.
 ```
 
 ## Kubernetes Example

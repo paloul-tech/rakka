@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package rakka.examples.contracts.v1;
+
+message CounterDelta {
+  int64 amount = 1;
+}
+
+message CounterValue {
+  int64 value = 1;
+}
+
+message CartItem {
+  string cart_id = 1;
+  string sku = 2;
+}
+
+message CartAck {
+  bool accepted = 1;
+  string cart_id = 2;
+  string sku = 3;
+}
+
+message CatalogRequest {
+  string prefix = 1;
+}
+
+message CatalogItem {
+  string sku = 1;
+}
+
+message IngestSummary {
+  uint64 accepted = 1;
+}
+
+message WorkflowCommand {
+  string workflow_id = 1;
+  string command_id = 2;
+}
+
+message WorkflowAck {
+  string workflow_id = 1;
+  string message_id = 2;
+  uint64 revision = 3;
+  bool duplicate = 4;
+}
+
+message LegacyRequest {
+  string command = 1;
+  uint64 value = 2;
+}
+
+message LegacyReply {
+  string service = 1;
+  uint64 result = 2;
+}
+
+service CounterService {
+  rpc Add(CounterDelta) returns (CounterValue);
+}
+
+service CartService {
+  rpc AddItem(CartItem) returns (CartAck);
+}
+
+service CatalogService {
+  rpc List(CatalogRequest) returns (stream CatalogItem);
+}
+
+service IngestService {
+  rpc Upload(stream CartItem) returns (IngestSummary);
+}
+
+service CartLiveService {
+  rpc Watch(stream CartItem) returns (stream CartAck);
+}
+
+service WorkflowService {
+  rpc Submit(WorkflowCommand) returns (WorkflowAck);
+}
+
+service LegacyService {
+  rpc Increment(LegacyRequest) returns (LegacyReply);
+}
