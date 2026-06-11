@@ -16,10 +16,11 @@ use rakka_remote::{
     RemoteRequestRegistry, SerializationRegistry,
 };
 use rakka_sharding::{
-    ClusterShardingError, ClusterShardingRuntime, EntityAskError, EntityDeliveryFailure, EntityId,
-    EntityRef, EntityTellError, EntityType, LocalEntityContext, LocalEntityRoute,
-    RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound,
-    RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
+    ClusterSharding, ClusterShardingError, ClusterShardingRuntime, Entity, EntityAskError,
+    EntityContext, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
+    EntityTypeKey, LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient,
+    RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityInboundError,
+    RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
     RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision,
     ShardHandoffState, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig,
     ShardingError,
@@ -34,6 +35,11 @@ enum CartCommand {
 
 struct CartEntity {
     context: LocalEntityContext,
+    items: Vec<String>,
+}
+
+struct FacadeCartEntity {
+    context: EntityContext<CartCommand>,
     items: Vec<String>,
 }
 
@@ -88,6 +94,29 @@ impl Actor for CartEntity {
                 CartCommand::Add(value) => self.items.push(value),
                 CartCommand::Get(reply_to) => {
                     let value = format!("{}:{}", self.context.entity_id(), self.items.join(","));
+                    let _ = reply_to.reply(value);
+                }
+                CartCommand::Passivate => return Ok(ActorAction::Stop),
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+impl Actor for FacadeCartEntity {
+    type Msg = CartCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        actor_future(async move {
+            match msg {
+                CartCommand::Add(value) => self.items.push(value),
+                CartCommand::Get(reply_to) => {
+                    let value =
+                        format!("{}:{}", self.context.persistence_id(), self.items.join(","));
                     let _ = reply_to.reply(value);
                 }
                 CartCommand::Passivate => return Ok(ActorAction::Stop),
@@ -324,6 +353,95 @@ async fn wait_for_entity_count<A, F>(
     }
 
     assert_eq!(route.entity_count(), expected_count);
+}
+
+#[tokio::test]
+async fn cluster_sharding_facade_initializes_and_routes_local_entity() {
+    let system = ActorSystem::new("facade-local-test");
+    let sharding = ClusterSharding::get(&system);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_stop_message_factory(|| CartCommand::Passivate),
+        )
+        .unwrap();
+    let cart = registration.entity_ref_for("cart-1");
+
+    cart.tell(CartCommand::Add("apple".to_string())).unwrap();
+    cart.tell(CartCommand::Add("banana".to_string())).unwrap();
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(value, "FacadeCart|cart-1:apple,banana");
+    let state = sharding.registration_state(&key).unwrap();
+    assert_eq!(state.entity_type(), key.entity_type());
+    assert_eq!(state.number_of_shards(), 4);
+    assert_eq!(state.local_entity_count(), 1);
+    assert!(state.has_stop_message());
+    assert!(!state.proxy_only());
+    assert_eq!(sharding.state().entity_types().len(), 1);
+
+    assert!(sharding.passivate_entity(&key, "cart-1").unwrap());
+    assert_eq!(
+        sharding
+            .registration_state(&key)
+            .unwrap()
+            .local_entity_count(),
+        0
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let cart = sharding.entity_ref_for(&key, "cart-1").unwrap();
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(value, "FacadeCart|cart-1:");
+    system.shutdown();
+}
+
+#[test]
+fn cluster_sharding_facade_reports_proxy_and_message_mismatch_state() {
+    let system = ActorSystem::new("facade-proxy-test");
+    let sharding = ClusterSharding::get(&system);
+    let key = EntityTypeKey::<CartCommand>::new("ProxyCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let proxy = sharding.init_proxy(key.clone()).unwrap();
+
+    let state = sharding.registration_state(&key).unwrap();
+    assert!(state.proxy_only());
+    assert_eq!(state.local_entity_count(), 0);
+    let proxy_ref = proxy.entity_ref_for("cart-1");
+    let error = proxy_ref
+        .tell(CartCommand::Add("apple".to_string()))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EntityTellError::Delivery {
+            failure: EntityDeliveryFailure::NotLocal { .. },
+            ..
+        }
+    ));
+
+    let mismatched_key = EntityTypeKey::<RemoteCartCommand>::new("ProxyCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let error = sharding.region_for(&mismatched_key).unwrap_err();
+    assert!(matches!(
+        error,
+        ClusterShardingError::EntityTypeMessageMismatch { entity_type }
+            if entity_type == EntityType::new("ProxyCart")
+    ));
+    system.shutdown();
 }
 
 #[test]

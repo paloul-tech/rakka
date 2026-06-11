@@ -5,6 +5,7 @@
 
 pub mod coordinator;
 pub mod error;
+pub mod facade;
 pub mod handoff;
 pub mod identity;
 pub mod local;
@@ -20,6 +21,10 @@ pub use coordinator::{
     ShardOwnershipSnapshot, ShardRebalancePlan,
 };
 pub use error::{ShardingError, ShardingResult};
+pub use facade::{
+    ClusterSharding, ClusterShardingState, Entity, EntityContext, EntityTypeKey,
+    EntityTypeRegistration, EntityTypeRegistrationState, Passivate, ShardedEntityRef,
+};
 pub use handoff::{ShardHandoff, ShardHandoffState};
 pub use identity::{EntityId, EntityRef, EntityType, ShardId, ShardKey, ShardingConfig};
 pub use local::{LocalEntityContext, LocalEntityRoute};

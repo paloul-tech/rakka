@@ -17,9 +17,9 @@ use rakka_sharding::node_runtime::{
     ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeUpdate,
 };
 use rakka_sharding::{
-    EntityId, EntityRef, EntityType, LocalEntityContext, LocalEntityRoute, RemoteEntityInbound,
-    RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinator, ShardRegion,
-    ShardingConfig,
+    ClusterSharding, Entity, EntityContext, EntityId, EntityRef, EntityType, EntityTypeKey,
+    LocalEntityContext, LocalEntityRoute, RemoteEntityInbound, RemoteEntityRoute,
+    RemoteTransportEntityOutbound, ShardCoordinator, ShardRegion, ShardingConfig,
 };
 use tokio::process::Command;
 
@@ -34,7 +34,30 @@ struct CartEntity {
     delivered: tokio::sync::mpsc::UnboundedSender<(String, String)>,
 }
 
+struct FacadeCartEntity {
+    context: EntityContext<CartCommand>,
+    delivered: tokio::sync::mpsc::UnboundedSender<(String, String)>,
+}
+
 impl Actor for CartEntity {
+    type Msg = CartCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entity_id = self.context.entity_id().as_str().to_string();
+        let action = msg.action;
+        let delivered = self.delivered.clone();
+        actor_future(async move {
+            let _sent = delivered.send((entity_id, action));
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+impl Actor for FacadeCartEntity {
     type Msg = CartCommand;
 
     fn handle<'a>(
@@ -72,9 +95,12 @@ async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
     let node_a = dns_example_node("rakka-0", "uid-a");
     let node_b = dns_example_node("rakka-1", "uid-b");
     let membership = membership_with_up_nodes([node_a.clone(), node_b.clone()])?;
+    let node_b_membership = membership_with_up_nodes([node_b.clone(), node_a.clone()])?;
 
     let entity_type = EntityType::new("Cart");
     let sharding_config = ShardingConfig::new(8)?;
+    let entity_key = EntityTypeKey::<CartCommand>::new(entity_type.as_str())
+        .with_config(sharding_config.clone());
     let mut coordinator = ShardCoordinator::new(entity_type.clone(), sharding_config.clone());
     let rebalance = coordinator.reconcile(&membership);
     let ownership = coordinator.snapshot();
@@ -108,20 +134,16 @@ async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
 
     let (node_b_delivered, mut node_b_received) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
-    let local_route_b = LocalEntityRoute::new(
-        node_b.id().clone(),
-        node_b_system.clone(),
-        move |context: LocalEntityContext| CartEntity {
+    let node_b_sharding =
+        ClusterSharding::from_membership(&node_b_system, node_b.clone(), node_b_membership);
+    let node_b_registration = node_b_sharding.init(Entity::of(
+        entity_key,
+        move |context: EntityContext<CartCommand>| FacadeCartEntity {
             context,
             delivered: node_b_delivered.clone(),
         },
-    );
-    let region_b = ShardRegion::from_snapshot(
-        entity_type.clone(),
-        sharding_config,
-        &ownership,
-        local_route_b.clone(),
-    )?;
+    ))?;
+    let region_b = node_b_registration.region().clone();
 
     let endpoint_b = RemoteEndpoint::new(node_b.id().clone());
     endpoint_b.register_entity_handler(
@@ -159,8 +181,11 @@ async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
         local_route_a.entity_count()
     );
     println!(
-        "node-b local entity count: {}",
-        local_route_b.entity_count()
+        "node-b facade local entity count: {}",
+        node_b_sharding
+            .registration_state(node_b_registration.key())
+            .map(|state| state.local_entity_count())
+            .unwrap_or_default()
     );
 
     node_a_system.shutdown();

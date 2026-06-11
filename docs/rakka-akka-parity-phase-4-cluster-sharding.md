@@ -1,0 +1,77 @@
+# Rakka Akka Parity Phase 4: High-Level Cluster Sharding
+
+Phase 4 adds an Akka-style sharding facade on top of the existing
+`ShardCoordinator`, `ShardRegion`, `LocalEntityRoute`, and remote route
+foundation.
+
+## Facade Flow
+
+Application code should prefer the facade for local entity registration:
+
+```rust
+use rakka::prelude::*;
+
+let system = ActorSystem::new("shopping");
+let sharding = ClusterSharding::get(&system);
+let key = EntityTypeKey::<CartCommand>::new("Cart")
+    .with_number_of_shards(32)?;
+
+let registration = sharding.init(Entity::of(key.clone(), |context| CartEntity {
+    persistence_id: context.persistence_id(),
+    entity_id: context.entity_id().as_str().to_string(),
+}))?;
+
+let cart = registration.entity_ref_for("cart-42");
+cart.tell(CartCommand::Add("apple".to_string()))?;
+let total = cart
+    .ask(|reply_to| CartCommand::GetTotal { reply_to }, timeout)
+    .await?;
+```
+
+The high-level `ShardedEntityRef<M>` carries its initialized `ShardRegion`, so
+callers do not need to pass the region on every `tell` or `ask`. The existing
+logical `EntityRef<M>` remains available for serialization and lower-level
+routing.
+
+## Entity Context
+
+`EntityContext<M>` exposes:
+
+- `entity_type_key()`
+- `entity_type()`
+- `entity_id()`
+- `shard_id()`
+- `local_node_id()`
+- `actor_name()`
+- `persistence_id()`
+
+`persistence_id()` returns the same string format used by
+`rakka_persistence::PersistenceId::of(entity_type, entity_id)`. It intentionally
+does not return `PersistenceId` directly because a direct dependency from
+`rakka-sharding` to `rakka-persistence` currently creates a crate cycle.
+
+## Passivation And State
+
+`Entity::with_stop_message_factory` configures a message that is delivered
+before explicit facade passivation stops the local actor:
+
+```rust
+let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
+    .with_idle_passivation(Duration::from_secs(60))
+    .with_stop_message_factory(|| CartCommand::Stop);
+
+sharding.init(entity)?;
+sharding.passivate_entity(&key, "cart-42")?;
+```
+
+`ClusterSharding::state()` and `registration_state(&key)` expose registration
+mode, shard count, local entity count, passivation settings, and owner revision
+for diagnostics and tests.
+
+## Current Boundary
+
+The facade owns local registration and proxy-only registration. Automatic remote
+route, endpoint, serializer, and network-region wiring still lives in
+`ClusterNodeRuntime` and the lower-level remote sharding APIs. The next Phase 4
+slice should connect those pieces so `ClusterSharding::init` can perform the
+same automatic remote registration when a cluster runtime is present.

@@ -311,6 +311,45 @@ Validation:
   handoff buffering, rebalance, proxy-only routing, remote ask, and
   persistence recovery after movement.
 
+Implementation status on 2026-06-11:
+
+- Added `ClusterSharding::get(&system)` and explicit local-node construction
+  over the existing deterministic sharding runtime.
+- Added Akka-named `EntityTypeKey<M>`, `Entity<M, A, F>`, and
+  `EntityContext<M>` facade types.
+- Added `ClusterSharding::init(entity)`, `init_proxy`, `entity_ref_for`, and
+  `region_for`.
+- Added `ShardedEntityRef<M>` so facade callers can `tell` and `ask` without
+  carrying a `ShardRegion` at every call site while preserving the existing
+  serializable logical `EntityRef<M>`.
+- Added explicit passivation through the facade with configurable stop-message
+  factories and local entity-count state queries.
+- Added `ClusterShardingState` and `EntityTypeRegistrationState` query
+  snapshots for registration mode, shard count, local entity count, and
+  passivation settings.
+- Added dependency-free `EntityContext::persistence_id()` string generation
+  matching the `PersistenceId::of(entity_type, entity_id)` convention. A direct
+  sharding-to-persistence dependency would currently form a crate cycle through
+  stream/process/sharding.
+- Updated `examples/multi-node-sharding` so the receiving node hosts its entity
+  through the facade while the sending node continues to demonstrate explicit
+  remote-route wiring.
+- Added facade coverage for local sharding, proxy-only registration,
+  passivation, typed message mismatch reporting, state queries, and remote
+  inbound compatibility with facade-created regions.
+
+Phase 4 follow-ups:
+
+- Extend `ClusterNodeRuntime` or a future cluster extension so
+  `ClusterSharding::init` can automatically register remote routes, endpoint
+  handlers, serializers, and network regions.
+- Add handoff/passivation buffering semantics instead of immediate route
+  removal plus actor stop.
+- Add pluggable shard allocation strategy hooks to `ShardCoordinator`.
+- Add durable coordinator backend traits and persistent ownership snapshots.
+- Add persistence recovery-after-movement examples once remote facade wiring is
+  stable.
+
 ## Phase 5: Cluster Extension, Receptionist, and Routers
 
 Objectives:

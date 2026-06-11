@@ -89,6 +89,12 @@ pub mod prelude {
     };
 
     #[cfg(feature = "sharding")]
+    pub use rakka_sharding::facade::{
+        ClusterSharding, ClusterShardingState, Entity, EntityContext, EntityTypeKey,
+        EntityTypeRegistration, EntityTypeRegistrationState, Passivate, ShardedEntityRef,
+    };
+
+    #[cfg(feature = "sharding")]
     pub use rakka_sharding::{EntityId, EntityRef, EntityType, ShardingConfig};
 
     #[cfg(feature = "stream")]

@@ -42,6 +42,16 @@ pub enum ClusterShardingError {
         /// Requested number of shards.
         actual_shards: u32,
     },
+    /// Entity type has not been initialized in this sharding facade.
+    EntityTypeNotRegistered {
+        /// Entity type.
+        entity_type: EntityType,
+    },
+    /// Entity type was initialized for a different message protocol.
+    EntityTypeMessageMismatch {
+        /// Entity type.
+        entity_type: EntityType,
+    },
 }
 
 impl Display for ClusterShardingError {
@@ -56,6 +66,13 @@ impl Display for ClusterShardingError {
             } => write!(
                 f,
                 "entity type {entity_type} was registered with {actual_shards} shards; expected {expected_shards}"
+            ),
+            Self::EntityTypeNotRegistered { entity_type } => {
+                write!(f, "entity type {entity_type} has not been initialized")
+            }
+            Self::EntityTypeMessageMismatch { entity_type } => write!(
+                f,
+                "entity type {entity_type} was initialized for a different message protocol"
             ),
         }
     }
