@@ -17,12 +17,15 @@ See `docs/rakka-v1-reliability-boundaries.md` for v1 reliability guarantees, non
 See `docs/rakka-v1-rolling-update-upgrade.md` for the N/N+1 Kubernetes rolling-update sequence.
 See `docs/rakka-v1-known-limitations-roadmap.md` for known limitations and post-v1 roadmap items.
 See `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklist and example coverage matrix.
+See `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/test-support API boundary.
+See `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
 Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
 
 | Crate | Role |
 | --- | --- |
+| `rakka` | Top-level facade crate and curated prelude for application code. |
 | `rakka-core` | Typed actors, actor refs, supervision, paths, shared metrics, and framework errors. |
 | `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs plus PostgreSQL storage plugin. |
 | `rakka-cluster`, `rakka-remote`, `rakka-sharding` | Membership, remoting, protocol compatibility, and sharded entity routing. |

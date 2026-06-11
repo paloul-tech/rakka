@@ -47,6 +47,7 @@ Optional jobs are gated by `workflow_dispatch` inputs because they need external
 
 The publishable crate set is:
 
+- `rakka`
 - `rakka-core`
 - `rakka-persistence`
 - `rakka-persistence-postgres`

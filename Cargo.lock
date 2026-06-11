@@ -959,6 +959,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rakka"
+version = "0.1.0"
+dependencies = [
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-grpc",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-persistence",
+ "rakka-process",
+ "rakka-remote",
+ "rakka-sharding",
+ "rakka-stream",
+ "rakka-testkit",
+ "rakka-workflow",
+]
+
+[[package]]
 name = "rakka-cluster"
 version = "0.1.0"
 dependencies = [

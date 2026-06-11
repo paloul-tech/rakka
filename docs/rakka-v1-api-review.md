@@ -15,6 +15,7 @@ This note records the current public API boundary for the v1 hardening work. It 
 
 | Crate | Tier | Public Boundary |
 | --- | --- | --- |
+| `rakka` | V1 candidate | Top-level facade crate, curated `rakka::prelude`, and feature-gated module re-exports for application code. |
 | `rakka-core` | V1 candidate | Typed actor runtime, actor refs, supervision options, paths, dead letters, telemetry names, `RakkaError`, metrics recorder traits, and Tokio runtime marker. |
 | `rakka-persistence` | V1 candidate | Durable state store traits, in-memory store, durable actor helper, durable effects, revisions, and `DurableError`. |
 | `rakka-persistence-postgres` | Adapter candidate | PostgreSQL durable state store, migration SQL, backend constants, and binary-state codec. |
@@ -67,6 +68,7 @@ Internal/runtime errors:
 ## Current Boundary Decisions
 
 - Keep re-exporting the most common types at each crate root for v1 ergonomics.
+- Add `rakka` as the preferred application-facing facade crate while component crates remain directly usable.
 - Keep module namespaces public where they clarify ownership, for example `rakka_remote::registry` and `rakka_sharding::runtime`.
 - Keep examples as separate unpublished packages.
 - Keep `rakka-testkit` as the home for cross-crate compatibility fixtures instead of leaking those helpers into production crates.
@@ -74,6 +76,7 @@ Internal/runtime errors:
 
 ## Review Notes By Crate
 
+- `rakka`: facade crate added during Akka-parity Phase 0; `rakka::prelude` is intentionally curated and should not expose coordinator, route, transport, or adapter internals.
 - `rakka-core`: public actor and metrics primitives are cohesive; no integration dependencies.
 - `rakka-persistence`: durable store traits and in-memory implementation are narrow; PostgreSQL remains a separate plugin crate.
 - `rakka-cluster`: protocol compatibility and membership admission are public and documented by the compatibility matrix.

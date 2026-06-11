@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const PUBLISHABLE_CRATES: &[&str] = &[
+    "rakka",
     "rakka-core",
     "rakka-persistence",
     "rakka-persistence-postgres",
@@ -30,6 +31,17 @@ fn repo_root() -> PathBuf {
 fn read(relative: &str) -> String {
     fs::read_to_string(repo_root().join(relative))
         .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+}
+
+fn section_between<'a>(contents: &'a str, start: &str, end: &str) -> &'a str {
+    let start_index = contents
+        .find(start)
+        .unwrap_or_else(|| panic!("missing section start {start:?}"));
+    let remaining = &contents[start_index..];
+    let end_index = remaining
+        .find(end)
+        .unwrap_or_else(|| panic!("missing section end {end:?}"));
+    &remaining[..end_index]
 }
 
 #[test]
@@ -133,6 +145,46 @@ fn publishable_crates_have_release_metadata_and_versioned_internal_deps() {
 }
 
 #[test]
+fn facade_prelude_is_curated() {
+    let facade = read("crates/rakka/src/lib.rs");
+    let prelude = section_between(&facade, "pub mod prelude", "/// Actor runtime primitives.");
+
+    for expected in [
+        "pub use rakka_core::{",
+        "pub use rakka_persistence::{",
+        "pub use rakka_sharding::{EntityId, EntityRef, EntityType, ShardingConfig};",
+        "pub use rakka_stream::{BoundedStream, StreamError, StreamResult, StreamSink, StreamSource};",
+    ] {
+        assert!(prelude.contains(expected), "prelude missing {expected}");
+    }
+
+    for internal in [
+        "ShardCoordinator",
+        "LocalEntityRoute",
+        "RemoteEntityRoute",
+        "ClusterNodeRuntime",
+        "RemoteEnvelope",
+        "TcpRemoteTransport",
+        "KubernetesDrainReport",
+    ] {
+        assert!(
+            !prelude.contains(internal),
+            "prelude should not expose foundation/adapter internals: {internal}"
+        );
+    }
+
+    let api_inventory = read("docs/rakka-api-boundary-inventory.md");
+    assert!(api_inventory.contains("Facade"));
+    assert!(api_inventory.contains("Foundation"));
+    assert!(api_inventory.contains("Adapter"));
+    assert!(api_inventory.contains("Test/support"));
+
+    let migration = read("docs/rakka-akka-parity-migration-notes.md");
+    assert!(migration.contains("Phase 0"));
+    assert!(migration.contains("rakka::prelude"));
+}
+
+#[test]
 fn examples_are_workspace_only_packages() {
     let examples_dir = repo_root().join("examples");
     let entries = fs::read_dir(&examples_dir)
@@ -201,6 +253,7 @@ fn release_docs_and_ignore_rules_are_present() {
 #[test]
 fn implementation_plans_are_separated_from_product_docs() {
     for plan in [
+        "rakka-akka-parity-implementation-plan.md",
         "rakka-phase-3-continuation-plan.md",
         "rakka-phase-4-continuation-plan.md",
         "rakka-phase-5-continuation-plan.md",

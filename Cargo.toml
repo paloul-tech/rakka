@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rakka",
     "crates/rakka-core",
     "crates/rakka-persistence",
     "crates/rakka-persistence-postgres",
@@ -31,6 +32,7 @@ repository = "https://github.com/rakka-rs/rakka"
 homepage = "https://github.com/rakka-rs/rakka"
 documentation = "https://docs.rs/rakka"
 readme = "README.md"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 axum = { version = "0.7.9", features = ["ws"] }

@@ -78,6 +78,16 @@ Validation:
 - `cargo doc --workspace --all-features --no-deps`
 - A small documentation test showing the intended import surface.
 
+Implementation status on 2026-06-11:
+
+- Added `crates/rakka` as the top-level facade crate.
+- Added `rakka::prelude` with common actor, durable-state, sharding identity,
+  stream, error, supervision, timer, and metrics imports.
+- Added `docs/rakka-api-boundary-inventory.md`.
+- Added `docs/rakka-akka-parity-migration-notes.md`.
+- Added repository hygiene coverage that keeps coordinator, route, transport,
+  and adapter internals out of the prelude.
+
 ## Phase 1: Actor Identity, Paths, and System Lifecycle
 
 Objectives:
