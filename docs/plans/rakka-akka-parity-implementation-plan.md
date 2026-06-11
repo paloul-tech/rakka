@@ -115,6 +115,23 @@ Validation:
   graceful system termination.
 - Existing examples updated only where path formatting changes require it.
 
+Implementation status on 2026-06-11:
+
+- Split logical actor paths from actor incarnations with `ActorPath` and
+  `ActorUid`.
+- Added UID-bearing `ActorRef`, `ActorRuntimeSnapshot`, and `ActorTerminated`
+  surfaces.
+- Added live path registration with duplicate root and child-name rejection.
+- Added `SerializedActorRef` and `ActorRefResolver` for typed local ref
+  serialization and stale-ref rejection.
+- Added `ActorSystem::builder`, opaque serialization registry storage, runtime
+  settings, shutdown configuration, `terminate().await`, `when_terminated()`,
+  and `is_terminated()`.
+- Added `/system` namespace spawning helpers for framework-owned actors.
+- Added local actor runtime coverage for duplicate names, reincarnation,
+  resolver success and failures, DeathWatch UID preservation after
+  reincarnation, and graceful system termination.
+
 ## Phase 2: Actor Facade and Context Ergonomics
 
 Objectives:

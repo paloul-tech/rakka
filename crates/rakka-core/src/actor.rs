@@ -1,6 +1,6 @@
 //! Local typed actor runtime.
 
-use std::any::type_name;
+use std::any::{type_name, Any};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::dead_letter::{DeadLetter, DeadLetterReason};
-use crate::path::ActorPath;
+use crate::path::{ActorPath, ActorUid};
 use crate::supervision::{ActorOptions, SupervisionStrategy};
 use crate::system::ActorSystem;
 use crate::{RakkaError, RakkaResult};
@@ -124,14 +124,72 @@ pub enum TerminationReason {
 pub struct ActorTerminated {
     /// Path of the actor that terminated.
     pub path: ActorPath,
+    /// Incarnation uid of the actor that terminated.
+    pub uid: ActorUid,
     /// Termination reason.
     pub reason: TerminationReason,
+}
+
+/// Serializable descriptor for an actor reference.
+///
+/// The descriptor captures both the logical path and incarnation uid. Resolving
+/// it only succeeds while the same live actor cell is still registered in the
+/// target actor system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializedActorRef {
+    system_name: String,
+    path: ActorPath,
+    uid: ActorUid,
+    message_type: String,
+}
+
+impl SerializedActorRef {
+    /// Creates a serialized actor reference descriptor.
+    #[must_use]
+    pub fn new(
+        system_name: impl Into<String>,
+        path: ActorPath,
+        uid: ActorUid,
+        message_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            system_name: system_name.into(),
+            path,
+            uid,
+            message_type: message_type.into(),
+        }
+    }
+
+    /// Actor system name that produced the descriptor.
+    #[must_use]
+    pub fn system_name(&self) -> &str {
+        &self.system_name
+    }
+
+    /// Logical actor path.
+    #[must_use]
+    pub const fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    /// Incarnation uid.
+    #[must_use]
+    pub const fn uid(&self) -> ActorUid {
+        self.uid
+    }
+
+    /// Rust message type name recorded for typed local resolution.
+    #[must_use]
+    pub fn message_type(&self) -> &str {
+        &self.message_type
+    }
 }
 
 /// Serializable actor runtime snapshot used by operational diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorRuntimeSnapshot {
     path: ActorPath,
+    uid: ActorUid,
     mailbox_capacity: usize,
     mailbox_depth: usize,
     terminated: bool,
@@ -143,6 +201,7 @@ impl ActorRuntimeSnapshot {
     #[must_use]
     pub fn new(
         path: ActorPath,
+        uid: ActorUid,
         mailbox_capacity: usize,
         mailbox_depth: usize,
         terminated: bool,
@@ -150,6 +209,7 @@ impl ActorRuntimeSnapshot {
     ) -> Self {
         Self {
             path,
+            uid,
             mailbox_capacity,
             mailbox_depth,
             terminated,
@@ -161,6 +221,12 @@ impl ActorRuntimeSnapshot {
     #[must_use]
     pub fn path(&self) -> &ActorPath {
         &self.path
+    }
+
+    /// Incarnation uid.
+    #[must_use]
+    pub const fn uid(&self) -> ActorUid {
+        self.uid
     }
 
     /// Configured mailbox capacity.
@@ -280,6 +346,29 @@ where
         &self.cell.path
     }
 
+    /// Returns this actor's incarnation uid.
+    #[must_use]
+    pub fn uid(&self) -> ActorUid {
+        self.cell.uid
+    }
+
+    /// Returns a serializable descriptor for this actor reference.
+    #[must_use]
+    pub fn to_serialized_ref(&self) -> SerializedActorRef {
+        self.cell.to_serialized_ref()
+    }
+
+    /// Waits until this actor incarnation terminates.
+    pub async fn when_terminated(&self) -> ActorTerminated {
+        let (sender, receiver) = oneshot::channel();
+        self.watch(DeathRecipient::new(move |terminated| {
+            let _ = sender.send(terminated);
+        }));
+        receiver
+            .await
+            .expect("actor termination watcher should always send")
+    }
+
     /// Returns true after the actor has terminated.
     #[must_use]
     pub fn is_terminated(&self) -> bool {
@@ -349,6 +438,7 @@ where
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActorRef")
             .field("path", self.path())
+            .field("uid", &self.uid())
             .field("terminated", &self.is_terminated())
             .finish()
     }
@@ -546,10 +636,9 @@ where
             ));
         }
 
-        let path = self.system.child_path(self.path(), name.as_ref());
-        let actor_ref = spawn_actor_task(self.system.clone(), path, factory, options);
+        let (path, uid) = self.system.child_identity(self.path(), name.as_ref())?;
+        let actor_ref = spawn_actor_task(self.system.clone(), path, uid, factory, options)?;
         let stop_handle = actor_ref.stop_handle();
-        self.system.register_actor(stop_handle.clone());
         self.children.push(stop_handle);
         Ok(actor_ref)
     }
@@ -648,29 +737,36 @@ impl ActorStopHandle {
 pub(crate) fn spawn_actor_task<A, F>(
     system: ActorSystem,
     path: ActorPath,
+    uid: ActorUid,
     factory: F,
     options: ActorOptions,
-) -> ActorRef<A::Msg>
+) -> RakkaResult<ActorRef<A::Msg>>
 where
     A: Actor,
     F: Fn() -> A + Send + Sync + 'static,
 {
     let (sender, receiver) = mpsc::channel(options.mailbox_capacity);
     let cell = Arc::new(ActorCell::new(
+        system.name().to_string(),
         path,
+        uid,
+        type_name::<A::Msg>(),
+        Arc::new(sender.clone()),
         system.dead_letters(),
         options.mailbox_capacity,
     ));
+    system.register_actor_cell(cell.clone())?;
     let actor_ref = ActorRef {
         sender,
         cell: cell.clone(),
     };
+    system.register_actor(actor_ref.stop_handle());
     let factory = Arc::new(factory);
     let task_ref = actor_ref.clone();
     tokio::spawn(run_actor_task(
         system, task_ref, receiver, cell, factory, options,
     ));
-    actor_ref
+    Ok(actor_ref)
 }
 
 async fn run_actor_task<A, F>(
@@ -685,7 +781,7 @@ async fn run_actor_task<A, F>(
     F: Fn() -> A + Send + Sync + 'static,
 {
     let mut actor = factory();
-    let mut ctx = ActorContext::new(system, actor_ref);
+    let mut ctx = ActorContext::new(system.clone(), actor_ref);
     let mut restart_count = 0usize;
     let mut termination_reason = TerminationReason::Normal;
 
@@ -747,6 +843,7 @@ async fn run_actor_task<A, F>(
     let _ = catch_actor_result(actor.stopped(&mut ctx, &termination_reason)).await;
     ctx.stop_children();
     cell.mark_terminated(termination_reason);
+    system.unregister_actor_cell(&cell);
 }
 
 fn lifecycle_failure(outcome: Result<ActorResult, ActorFailure>) -> Option<TerminationReason> {
@@ -816,8 +913,12 @@ where
     Stop,
 }
 
-struct ActorCell {
+pub(crate) struct ActorCell {
+    system_name: String,
     path: ActorPath,
+    uid: ActorUid,
+    message_type: &'static str,
+    sender: Arc<dyn Any + Send + Sync>,
     dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
     mailbox_capacity: usize,
     mailbox_depth: AtomicUsize,
@@ -828,12 +929,20 @@ struct ActorCell {
 
 impl ActorCell {
     fn new(
+        system_name: String,
         path: ActorPath,
+        uid: ActorUid,
+        message_type: &'static str,
+        sender: Arc<dyn Any + Send + Sync>,
         dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
         mailbox_capacity: usize,
     ) -> Self {
         Self {
+            system_name,
             path,
+            uid,
+            message_type,
+            sender,
             dead_letters,
             mailbox_capacity,
             mailbox_depth: AtomicUsize::new(0),
@@ -849,6 +958,42 @@ impl ActorCell {
 
     fn mailbox_depth(&self) -> usize {
         self.mailbox_depth.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    pub(crate) const fn uid(&self) -> ActorUid {
+        self.uid
+    }
+
+    pub(crate) fn message_type(&self) -> &'static str {
+        self.message_type
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn to_serialized_ref(&self) -> SerializedActorRef {
+        SerializedActorRef::new(
+            self.system_name.clone(),
+            self.path.clone(),
+            self.uid,
+            self.message_type,
+        )
+    }
+
+    pub(crate) fn typed_ref<M>(cell: &Arc<Self>) -> Option<ActorRef<M>>
+    where
+        M: Message,
+    {
+        let sender = cell.sender.downcast_ref::<mpsc::Sender<Envelope<M>>>()?;
+        Some(ActorRef {
+            sender: sender.clone(),
+            cell: cell.clone(),
+        })
     }
 
     fn mark_enqueued(&self) {
@@ -874,6 +1019,7 @@ impl ActorCell {
 
         ActorRuntimeSnapshot::new(
             self.path.clone(),
+            self.uid,
             self.mailbox_capacity,
             self.mailbox_depth(),
             self.terminated.load(Ordering::Acquire),
@@ -891,6 +1037,7 @@ impl ActorCell {
                     .clone()
                     .map(|reason| ActorTerminated {
                         path: self.path.clone(),
+                        uid: self.uid,
                         reason,
                     })
             } else {
@@ -918,6 +1065,7 @@ impl ActorCell {
 
         let terminated = ActorTerminated {
             path: self.path.clone(),
+            uid: self.uid,
             reason,
         };
 

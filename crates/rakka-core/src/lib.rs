@@ -18,8 +18,9 @@ pub mod telemetry;
 
 pub use actor::{
     actor_future, Actor, ActorAction, ActorContext, ActorFailure, ActorFuture, ActorRef,
-    ActorResult, ActorRuntimeSnapshot, ActorTerminated, AskError, Message, ReplyTo, StopError,
-    TellError, TerminationReason, TimerHandle, DEFAULT_MAILBOX_CAPACITY,
+    ActorResult, ActorRuntimeSnapshot, ActorTerminated, AskError, Message, ReplyTo,
+    SerializedActorRef, StopError, TellError, TerminationReason, TimerHandle,
+    DEFAULT_MAILBOX_CAPACITY,
 };
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
@@ -41,9 +42,13 @@ pub use operational::{
     DEFAULT_REMOTE_CONNECT_TIMEOUT, DEFAULT_REMOTE_IDLE_TIMEOUT,
     DEFAULT_REMOTE_OUTBOUND_QUEUE_CAPACITY, DEFAULT_STREAM_DRAIN_TIMEOUT,
 };
-pub use path::ActorPath;
+pub use path::{validate_actor_path_segment, ActorPath, ActorUid};
 pub use supervision::{ActorOptions, SupervisionStrategy};
-pub use system::{ActorSystem, ActorSystemSnapshot};
+pub use system::{
+    ActorRefResolver, ActorSystem, ActorSystemBuilder, ActorSystemRuntimeSettings,
+    ActorSystemSerializationRegistry, ActorSystemShutdownConfig, ActorSystemSnapshot,
+    DEFAULT_SYSTEM_TERMINATION_TIMEOUT,
+};
 
 /// Framework name used in diagnostics and metric prefixes.
 pub const FRAMEWORK_NAME: &str = "rakka";

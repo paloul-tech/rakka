@@ -1,6 +1,6 @@
 # Rakka Akka Parity Migration Notes
 
-Status: Phase 0 draft
+Status: Phase 1 draft
 Date: 2026-06-11
 
 ## Phase 0
@@ -54,3 +54,35 @@ use rakka::sharding::ShardRegion;
 - Later phases may add Akka-like names such as `ClusterSharding`,
   `EntityTypeKey`, `EventSourcedBehavior`, `Source`, `Flow`, and `Sink`; until
   then, the existing foundation APIs remain the implementation path.
+
+## Phase 1
+
+Phase 1 separates logical actor paths from concrete actor incarnations. Code
+that previously treated `ActorPath` text as including a `#incarnation` suffix
+should now use `ActorRef::uid()` or `ActorRuntimeSnapshot::uid()` for concrete
+identity.
+
+Before:
+
+```rust
+let path = actor.path().to_string();
+```
+
+After:
+
+```rust
+let path = actor.path().to_string();
+let uid = actor.uid();
+```
+
+`ActorSystem::shutdown()` remains as a non-awaiting compatibility helper. New
+code that wants graceful lifecycle completion should prefer:
+
+```rust
+system.terminate().await?;
+system.when_terminated().await;
+```
+
+`ActorRefResolver` can serialize and resolve live local typed refs. Resolution
+intentionally fails when the path is empty, belongs to another system, has been
+reincarnated with a new uid, or is requested with the wrong message type.
