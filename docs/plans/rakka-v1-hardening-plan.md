@@ -397,7 +397,7 @@ Implementation notes:
 
 ## Slice V1J: Final V1 Release Candidate Review
 
-Status: planned.
+Status: implemented.
 
 Goal: assemble the hardening work into a final reviewable v1 release candidate.
 
@@ -405,6 +405,7 @@ Scope:
 
 - Run the full validation suite and record command output expectations.
 - Review all docs for stale phase language and inconsistent terminology.
+- Separate previous plan files, i.e., rakka-phase-[n]-continuation-plan.md, from actual documentation and into their own plan directory.
 - Confirm examples cover minimal actor usage, durable state, workflow reliability, process ownership, remote sharding, edge integration, observability, and Kubernetes operation.
 - Create a v1 reliability boundaries document.
 - Create a migration/upgrade note for N/N+1 rolling updates.
@@ -421,6 +422,17 @@ Out of scope:
 
 - Implementing new runtime features not already covered by the hardening slices.
 
-## Suggested Next Slice
+Implementation notes:
 
-Continue with Slice V1J: Final V1 Release Candidate Review. CI, package checks, release notes, and repository hygiene are now explicit; the next step is a final pass over docs, validation output expectations, reliability boundaries, and remaining known limitations.
+- Moved implementation plan files into `docs/plans/` and added `docs/plans/README.md` so working plans are separated from product/reference docs.
+- Added `docs/rakka-v1-release-candidate-review.md` with required validation expectations, optional gated checks, product-doc map, example coverage matrix, and a concise release-candidate checklist.
+- Added `docs/rakka-v1-reliability-boundaries.md` to document at-most-once core actor delivery, opt-in workflow reliability, remoting/sharding/process/Kubernetes boundaries, and non-guarantees.
+- Added `docs/rakka-v1-rolling-update-upgrade.md` with an N/N+1 rollout sequence, rollback sequence, incompatible-change guidance, and observable signals.
+- Added `docs/rakka-v1-known-limitations-roadmap.md` with explicit v1 limits, including no exactly-once external side effects, trusted-cluster remoting, no built-in TLS/mTLS, no durable distributed shard coordinator, no declared repository license, and no publishing from validation scripts.
+- Updated README from phase-foundation wording to v1 release-candidate wording and linked the final review docs.
+- Extended repository hygiene tests to assert the final review docs and plan/documentation split.
+- Ran required local validation for this slice: `cargo fmt --all -- --check`, `cargo test -p rakka-testkit --test repository_hygiene`, `scripts/package-check.sh`, and `scripts/validate.sh`.
+
+## Suggested Next Step
+
+V1 hardening is ready for user review. The next decision is whether to refine docs/API details, run optional gated PostgreSQL/Kubernetes checks, or decide repository license/contribution policy before any public release.

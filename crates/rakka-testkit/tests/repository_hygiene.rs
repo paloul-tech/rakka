@@ -168,6 +168,10 @@ fn release_docs_and_ignore_rules_are_present() {
     for required in [
         "CHANGELOG.md",
         "docs/rakka-v1-release-packaging.md",
+        "docs/rakka-v1-release-candidate-review.md",
+        "docs/rakka-v1-reliability-boundaries.md",
+        "docs/rakka-v1-rolling-update-upgrade.md",
+        "docs/rakka-v1-known-limitations-roadmap.md",
         "rust-toolchain.toml",
     ] {
         assert!(repo_root().join(required).exists(), "missing {required}");
@@ -181,8 +185,42 @@ fn release_docs_and_ignore_rules_are_present() {
     assert!(release_docs.contains("No Publishing Without Explicit Approval"));
     assert!(release_docs.contains("Release readiness is not permission to publish"));
 
+    let readme = read("README.md");
+    assert!(readme.contains("v1 release-candidate foundation"));
+    assert!(readme.contains("docs/rakka-v1-release-candidate-review.md"));
+    assert!(readme.contains("docs/rakka-v1-reliability-boundaries.md"));
+    assert!(readme.contains("docs/rakka-v1-rolling-update-upgrade.md"));
+    assert!(readme.contains("docs/rakka-v1-known-limitations-roadmap.md"));
+
     let gitignore = read(".gitignore");
     for ignored in ["/target/", ".idea/", "/.env", "/dist/", "*.crate"] {
         assert!(gitignore.contains(ignored), ".gitignore missing {ignored}");
     }
+}
+
+#[test]
+fn implementation_plans_are_separated_from_product_docs() {
+    for plan in [
+        "rakka-phase-3-continuation-plan.md",
+        "rakka-phase-4-continuation-plan.md",
+        "rakka-phase-5-continuation-plan.md",
+        "rakka-v1-implementation-plan.md",
+        "rakka-v1-hardening-plan.md",
+    ] {
+        assert!(
+            !repo_root().join("docs").join(plan).exists(),
+            "{plan} should live under docs/plans, not docs/"
+        );
+        assert!(
+            repo_root().join("docs/plans").join(plan).exists(),
+            "{plan} should exist under docs/plans"
+        );
+    }
+
+    let plan_index = read("docs/plans/README.md");
+    assert!(plan_index.contains("historical and active implementation plans"));
+    assert!(plan_index.contains("product docs in `docs/`"));
+
+    let review = read("docs/rakka-v1-release-candidate-review.md");
+    assert!(review.contains("Historical and active implementation plans live under `docs/plans/`"));
 }

@@ -1,8 +1,8 @@
 # Rakka
 
-Rakka is a Rust actor framework planned around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
+Rakka is a Rust actor framework built around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
 
-The current repository state includes Phase 5 foundations: local typed actors, durable state APIs, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, Protobuf remote envelopes, deterministic cluster sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, and reviewable Kubernetes manifests.
+The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
 
 See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
@@ -13,6 +13,11 @@ See `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrore
 See `docs/rakka-v1-observability-exporters.md` for Prometheus/OpenTelemetry exporter adapters, snapshot routes, and cardinality guidance.
 See `docs/rakka-v1-security-operational-defaults.md` for trusted remoting boundaries, process execution defaults, timeout budgets, and Kubernetes security assumptions.
 See `docs/rakka-v1-release-packaging.md` for CI, release-candidate validation, packaging, and image build notes.
+See `docs/rakka-v1-reliability-boundaries.md` for v1 reliability guarantees, non-guarantees, and operator/application responsibilities.
+See `docs/rakka-v1-rolling-update-upgrade.md` for the N/N+1 Kubernetes rolling-update sequence.
+See `docs/rakka-v1-known-limitations-roadmap.md` for known limitations and post-v1 roadmap items.
+See `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklist and example coverage matrix.
+Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
 
@@ -85,7 +90,7 @@ scripts/validate.sh
 scripts/package-check.sh
 ```
 
-Then review `CHANGELOG.md` and `docs/rakka-v1-release-packaging.md`.
+Then review `CHANGELOG.md`, `docs/rakka-v1-release-packaging.md`, and `docs/rakka-v1-release-candidate-review.md`.
 
 ## Examples
 
@@ -201,7 +206,7 @@ Captured child stderr: ["legacy child handled increment"]
 
 ### Edge Gateway
 
-This end-to-end Phase 5 example runs an in-process HTTP gateway, gRPC unary and bidirectional-streaming adapters, bounded stream ingestion, a process-backed legacy service, Kubernetes readiness/drain checks, and in-memory metrics. It does not bind public ports or require Kubernetes; it exercises the public adapter surfaces directly.
+This end-to-end edge integration example runs an in-process HTTP gateway, gRPC unary and bidirectional-streaming adapters, bounded stream ingestion, a process-backed legacy service, Kubernetes readiness/drain checks, and in-memory metrics. It does not bind public ports or require Kubernetes; it exercises the public adapter surfaces directly.
 
 ```sh
 cargo run -p rakka-example-edge-gateway

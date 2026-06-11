@@ -220,4 +220,4 @@ Acceptance criteria:
 
 ## Suggested Next Slice
 
-Phase 3 continuation is complete. The next major work should follow `docs/rakka-v1-implementation-plan.md` into productionization: real remote transport, Kubernetes runtime integration, distributed coordination hardening, and end-to-end examples that combine sharding with durable state.
+Phase 3 continuation is complete. The next major work should follow `docs/plans/rakka-v1-implementation-plan.md` into productionization: real remote transport, Kubernetes runtime integration, distributed coordination hardening, and end-to-end examples that combine sharding with durable state.

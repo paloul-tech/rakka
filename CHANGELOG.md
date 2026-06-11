@@ -11,11 +11,13 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - V1 hardening foundations for TCP remoting, cluster runtime integration, compatibility matrix tests, generated HTTP/gRPC contract examples, observability exporters, Kubernetes local-cluster scenarios, security defaults, and repository validation scripts.
 - `scripts/validate.sh` as the required local validation entry point.
 - `scripts/package-check.sh` as the offline package metadata and publishability check entry point.
+- V1 release-candidate review docs for reliability boundaries, N/N+1 rolling updates, known limitations, post-v1 roadmap, and final review checklist.
 
 ### Changed
 
 - Workspace crates now share release metadata and internal path dependencies include explicit versions for packaging.
 - CI separates required validation from optional PostgreSQL and local Kubernetes integration jobs.
+- Historical implementation plans now live under `docs/plans/` instead of the product-doc root.
 
 ### Security
 
@@ -26,6 +28,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 
 - Required validation: `scripts/validate.sh`.
 - Packaging validation: `scripts/package-check.sh` in Cargo offline mode.
+- Release-candidate review: `docs/rakka-v1-release-candidate-review.md`.
 - Optional PostgreSQL validation: `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres`.
 - Optional Kubernetes validation: `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`.
 
