@@ -9,11 +9,13 @@ use std::time::Duration;
 
 use rakka_cluster::{ClusterMembership, ClusterNode, MembershipConfig, NodeAddress, NodeId};
 use rakka_core::{Actor, ActorOptions, ActorSystem, Message, ReplyTo};
+use rakka_remote::{RemoteEnvelope, RemoteEnvelopeHandler, RemoteTransport};
 
 use crate::{
-    ClusterShardingError, ClusterShardingResult, ClusterShardingRuntime, EntityAskError, EntityId,
-    EntityRef, EntityTellError, EntityType, LocalEntityContext, LocalEntityRoute, ShardId,
-    ShardRegion, ShardingConfig,
+    ClusterNodeRuntime, ClusterNodeRuntimeResult, ClusterShardingError, ClusterShardingResult,
+    ClusterShardingRuntime, EntityAskError, EntityId, EntityRef, EntityTellError, EntityType,
+    LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient, RemoteEntityAskError,
+    RemoteEntityAskInbound, RemoteEntityInbound, ShardId, ShardRegion, ShardingConfig,
 };
 
 type RegionRegistry = Arc<Mutex<BTreeMap<EntityType, Box<dyn Any + Send + Sync>>>>;
@@ -339,6 +341,22 @@ impl ClusterSharding {
         Ok(Self::from_membership(system, local_node, membership))
     }
 
+    /// Creates a facade companion for a networked cluster node runtime.
+    ///
+    /// Remote entity initialization methods on this facade register regions and
+    /// endpoint handlers through the supplied [`ClusterNodeRuntime`]. The
+    /// facade stores typed references and diagnostics for the same local node.
+    pub fn for_node_runtime(
+        system: &ActorSystem,
+        runtime: &ClusterNodeRuntime,
+    ) -> ClusterShardingResult<Self> {
+        Self::for_local_node(
+            system,
+            runtime.local_node().clone(),
+            MembershipConfig::default(),
+        )
+    }
+
     /// Creates a facade from an existing membership table.
     #[must_use]
     pub fn from_membership(
@@ -421,6 +439,140 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
             },
         )?;
+
+        Ok(EntityTypeRegistration::new(key, region))
+    }
+
+    /// Initializes a remote-aware sharded entity type through a node runtime.
+    ///
+    /// This creates the local entity route, wraps it in a remote route, registers
+    /// the shard region with the node runtime, and installs the default inbound
+    /// remote tell handler for the entity type.
+    pub fn init_remote<M, A, F>(
+        &self,
+        runtime: &mut ClusterNodeRuntime,
+        entity: Entity<M, A, F>,
+    ) -> ClusterNodeRuntimeResult<EntityTypeRegistration<M>>
+    where
+        M: Message + Sync,
+        A: Actor<Msg = M>,
+        F: Fn(EntityContext<M>) -> A + Send + Sync + 'static,
+    {
+        let Entity {
+            key,
+            factory,
+            actor_options,
+            idle_passivation_timeout,
+            stop_message_factory,
+        } = entity;
+        let key_for_factory = key.clone();
+        let local_node_id = runtime.local_node().id().clone();
+        let system = self.system.clone();
+        let mut local_route = LocalEntityRoute::new(local_node_id, system, move |local_context| {
+            factory(EntityContext::new(key_for_factory.clone(), local_context))
+        })
+        .with_actor_options(actor_options);
+
+        if let Some(timeout) = idle_passivation_timeout {
+            local_route = local_route.with_idle_passivation(timeout);
+        }
+
+        let control = Arc::new(LocalRouteControl::new(
+            local_route.clone(),
+            stop_message_factory.clone(),
+        ));
+        let remote_route = runtime.remote_route(local_route.clone());
+        let region = ShardRegion::new(
+            key.entity_type().clone(),
+            key.config().clone(),
+            remote_route,
+        );
+        runtime.register_entity_region(region.clone())?;
+        self.store_typed_region(
+            key.clone(),
+            region.clone(),
+            RegistrationMode::Local {
+                control,
+                idle_passivation_timeout,
+                has_stop_message: stop_message_factory.is_some(),
+            },
+        );
+
+        Ok(EntityTypeRegistration::new(key, region))
+    }
+
+    /// Initializes a remote-aware entity type and installs remote ask handling.
+    ///
+    /// The endpoint handler accepts both tell envelopes and ask envelopes for
+    /// the same entity type. Ask envelopes are identified by request metadata
+    /// and converted into the entity command with `build`.
+    pub fn init_remote_with_ask<Q, M, R, A, F, B>(
+        &self,
+        runtime: &mut ClusterNodeRuntime,
+        entity: Entity<M, A, F>,
+        build: B,
+    ) -> ClusterNodeRuntimeResult<EntityTypeRegistration<M>>
+    where
+        Q: Message + Sync,
+        M: Message + Sync,
+        R: Send + Sync + 'static,
+        A: Actor<Msg = M>,
+        F: Fn(EntityContext<M>) -> A + Send + Sync + 'static,
+        B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+    {
+        let Entity {
+            key,
+            factory,
+            actor_options,
+            idle_passivation_timeout,
+            stop_message_factory,
+        } = entity;
+        let key_for_factory = key.clone();
+        let local_node_id = runtime.local_node().id().clone();
+        let system = self.system.clone();
+        let mut local_route = LocalEntityRoute::new(local_node_id, system, move |local_context| {
+            factory(EntityContext::new(key_for_factory.clone(), local_context))
+        })
+        .with_actor_options(actor_options);
+
+        if let Some(timeout) = idle_passivation_timeout {
+            local_route = local_route.with_idle_passivation(timeout);
+        }
+
+        let control = Arc::new(LocalRouteControl::new(
+            local_route.clone(),
+            stop_message_factory.clone(),
+        ));
+        let remote_route = runtime.remote_route(local_route.clone());
+        let region = ShardRegion::new(
+            key.entity_type().clone(),
+            key.config().clone(),
+            remote_route,
+        );
+        let tell_handler = RemoteEntityInbound::new(region.clone(), runtime.registry().clone());
+        let ask_handler = RemoteEntityAskInbound::new(
+            runtime.local_node().id().clone(),
+            region.clone(),
+            runtime.registry().clone(),
+            runtime.transport().clone(),
+            build,
+        );
+        runtime.register_entity_handler(region.clone(), move |envelope: RemoteEnvelope| {
+            if envelope.request_id.is_some() {
+                RemoteEnvelopeHandler::handle(&ask_handler, envelope)
+            } else {
+                RemoteEnvelopeHandler::handle(&tell_handler, envelope)
+            }
+        })?;
+        self.store_typed_region(
+            key.clone(),
+            region.clone(),
+            RegistrationMode::Local {
+                control,
+                idle_passivation_timeout,
+                has_stop_message: stop_message_factory.is_some(),
+            },
+        );
 
         Ok(EntityTypeRegistration::new(key, region))
     }
@@ -572,6 +724,18 @@ impl ClusterSharding {
             .lock()
             .expect("cluster sharding runtime mutex poisoned")
             .register_region(region.clone())?;
+        self.store_typed_region(key, region, mode);
+        Ok(())
+    }
+
+    fn store_typed_region<M>(
+        &self,
+        key: EntityTypeKey<M>,
+        region: ShardRegion<M>,
+        mode: RegistrationMode,
+    ) where
+        M: Message,
+    {
         self.regions
             .lock()
             .expect("cluster sharding region registry mutex poisoned")
@@ -606,8 +770,6 @@ impl ClusterSharding {
                     has_stop_message,
                 ),
             );
-
-        Ok(())
     }
 }
 
@@ -742,6 +904,23 @@ where
         R: Send + 'static,
     {
         self.entity_ref.ask(&self.region, build, timeout).await
+    }
+
+    /// Sends a request envelope through a remote ask client and waits for a reply.
+    pub async fn remote_ask<Q, R, T>(
+        &self,
+        client: &RemoteEntityAskClient<T>,
+        request: Q,
+        timeout: Duration,
+    ) -> Result<R, RemoteEntityAskError>
+    where
+        Q: Message + Sync,
+        R: Send + Sync + 'static,
+        T: RemoteTransport,
+    {
+        client
+            .ask(&self.region, &self.entity_ref, request, timeout)
+            .await
     }
 }
 

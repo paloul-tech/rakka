@@ -68,10 +68,58 @@ sharding.passivate_entity(&key, "cart-42")?;
 mode, shard count, local entity count, passivation settings, and owner revision
 for diagnostics and tests.
 
+## Remote Runtime Bridge
+
+Networked sharding should use a facade companion for `ClusterNodeRuntime`:
+
+```rust
+let system = ActorSystem::new("shopping-node-a");
+let mut runtime = ClusterNodeRuntime::builder(local_node)
+    .with_registry(registry)
+    .build()
+    .await?;
+let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
+
+let registration = sharding.init_remote(
+    &mut runtime,
+    Entity::of(key.clone(), |context| CartEntity::new(context)),
+)?;
+
+runtime.apply_discovery(discovery_snapshot)?;
+let cart = sharding.entity_ref_for(&key, "cart-42")?;
+cart.tell(CartCommand::Add("apple".to_string()))?;
+```
+
+`init_remote` creates the local entity route, wraps it in the runtime's remote
+route, registers the shard region with the networked sharding runtime, and
+installs the inbound remote tell handler for the entity type.
+
+Use `init_remote_with_ask` when remote request/reply should share the same
+entity type:
+
+```rust
+sharding.init_remote_with_ask(
+    &mut runtime,
+    Entity::of(key.clone(), |context| CartEntity::new(context)),
+    |request: CartGet, reply_to| CartCommand::Get {
+        id: request.id,
+        reply_to,
+    },
+)?;
+
+let reply: CartReply = cart
+    .remote_ask(&runtime.ask_client(), CartGet { id }, timeout)
+    .await?;
+```
+
+The combined remote handler accepts tell envelopes and ask envelopes for the
+same entity type. Ask envelopes are detected by request metadata and converted
+into the entity command with the supplied builder function.
+
 ## Current Boundary
 
-The facade owns local registration and proxy-only registration. Automatic remote
-route, endpoint, serializer, and network-region wiring still lives in
-`ClusterNodeRuntime` and the lower-level remote sharding APIs. The next Phase 4
-slice should connect those pieces so `ClusterSharding::init` can perform the
-same automatic remote registration when a cluster runtime is present.
+The facade now owns local, proxy-only, and networked entity registration.
+Serialization codecs still live in the `SerializationRegistry` supplied to
+`ClusterNodeRuntime`; missing codecs fail at send/decode time with typed remote
+delivery errors. Remaining Phase 4 work should focus on buffering semantics,
+allocation strategy hooks, and durable coordinator storage.

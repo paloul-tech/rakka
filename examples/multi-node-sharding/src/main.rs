@@ -206,38 +206,38 @@ async fn run_networked_loopback_example() -> Result<(), Box<dyn Error>> {
             .await?;
     let entity_type = EntityType::new("Cart");
     let sharding_config = ShardingConfig::new(8)?;
+    let entity_key =
+        EntityTypeKey::<CartCommand>::new(entity_type.as_str()).with_config(sharding_config);
     let node_a_system = ActorSystem::new("rakka-example-networked-node-a");
     let node_b_system = ActorSystem::new("rakka-example-networked-node-b");
     let (node_a_delivered, _node_a_received) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
     let (node_b_delivered, mut node_b_received) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    let sharding_a = ClusterSharding::for_node_runtime(&node_a_system, &node_a)?;
+    let sharding_b = ClusterSharding::for_node_runtime(&node_b_system, &node_b)?;
 
-    let local_route_a = LocalEntityRoute::new(
-        node_a.local_node().id().clone(),
-        node_a_system.clone(),
-        move |context: LocalEntityContext| CartEntity {
-            context,
-            delivered: node_a_delivered.clone(),
-        },
-    );
-    let region_a = ShardRegion::new(
-        entity_type.clone(),
-        sharding_config.clone(),
-        node_a.remote_route(local_route_a.clone()),
-    );
-    let local_route_b = LocalEntityRoute::new(
-        node_b.local_node().id().clone(),
-        node_b_system.clone(),
-        move |context: LocalEntityContext| CartEntity {
-            context,
-            delivered: node_b_delivered.clone(),
-        },
-    );
-    let region_b = ShardRegion::new(entity_type.clone(), sharding_config, local_route_b.clone());
+    let registration_a = sharding_a.init_remote(
+        &mut node_a,
+        Entity::of(
+            entity_key.clone(),
+            move |context: EntityContext<CartCommand>| FacadeCartEntity {
+                context,
+                delivered: node_a_delivered.clone(),
+            },
+        ),
+    )?;
+    let registration_b = sharding_b.init_remote(
+        &mut node_b,
+        Entity::of(
+            entity_key.clone(),
+            move |context: EntityContext<CartCommand>| FacadeCartEntity {
+                context,
+                delivered: node_b_delivered.clone(),
+            },
+        ),
+    )?;
 
-    node_a.register_entity_region(region_a.clone())?;
-    node_b.register_entity_region(region_b)?;
     let update = apply_networked_discovery(&mut node_a, &mut node_b)?;
     let coordinator = node_a
         .sharding()
@@ -245,15 +245,12 @@ async fn run_networked_loopback_example() -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| example_error("missing coordinator after discovery"))?;
     let remote_entity_id = entity_owned_by(coordinator, node_b.local_node().id().logical_id())?;
     let remote_entity_owner = coordinator.owner_for_entity(&remote_entity_id)?.clone();
-    let remote_entity = EntityRef::<CartCommand>::new(entity_type, remote_entity_id.clone());
+    let remote_entity = sharding_a.entity_ref_for(&entity_key, remote_entity_id.as_str())?;
 
     remote_entity
-        .tell(
-            &region_a,
-            CartCommand {
-                action: "add-apple".to_string(),
-            },
-        )
+        .tell(CartCommand {
+            action: "add-apple".to_string(),
+        })
         .map_err(|error| example_error(format!("networked entity tell failed: {error:?}")))?;
     let delivered = tokio::time::timeout(Duration::from_secs(1), node_b_received.recv())
         .await?
@@ -271,12 +268,18 @@ async fn run_networked_loopback_example() -> Result<(), Box<dyn Error>> {
         update.sharding().membership_events().len()
     );
     println!(
-        "node-a local entity count: {}",
-        local_route_a.entity_count()
+        "node-a facade local entity count: {}",
+        sharding_a
+            .registration_state(registration_a.key())
+            .map(|state| state.local_entity_count())
+            .unwrap_or_default()
     );
     println!(
-        "node-b local entity count: {}",
-        local_route_b.entity_count()
+        "node-b facade local entity count: {}",
+        sharding_b
+            .registration_state(registration_b.key())
+            .map(|state| state.local_entity_count())
+            .unwrap_or_default()
     );
 
     node_a_system.shutdown();
@@ -362,29 +365,23 @@ async fn run_networked_child_node(
     .await?;
     let peer = loopback_example_node(peer_logical_id, peer_incarnation, peer_port);
     let entity_type = EntityType::new("Cart");
-    let sharding_config = ShardingConfig::new(8)?;
+    let entity_key =
+        EntityTypeKey::<CartCommand>::new(entity_type.as_str()).with_number_of_shards(8)?;
     let system = ActorSystem::new(format!("rakka-example-networked-{logical_id}"));
+    let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
     let (delivered_tx, mut delivered_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
-    let local_route = LocalEntityRoute::new(
-        runtime.local_node().id().clone(),
-        system.clone(),
-        move |context: LocalEntityContext| CartEntity {
-            context,
-            delivered: delivered_tx.clone(),
-        },
-    );
-    let region = if role == "send" {
-        ShardRegion::new(
-            entity_type.clone(),
-            sharding_config,
-            runtime.remote_route(local_route.clone()),
-        )
-    } else {
-        ShardRegion::new(entity_type.clone(), sharding_config, local_route.clone())
-    };
+    let registration = sharding.init_remote(
+        &mut runtime,
+        Entity::of(
+            entity_key.clone(),
+            move |context: EntityContext<CartCommand>| FacadeCartEntity {
+                context,
+                delivered: delivered_tx.clone(),
+            },
+        ),
+    )?;
 
-    runtime.register_entity_region(region.clone())?;
     runtime.apply_discovery(DiscoverySnapshot::new(
         "networked-process-example",
         1,
@@ -398,14 +395,11 @@ async fn run_networked_child_node(
                 .coordinator(&entity_type)
                 .ok_or_else(|| example_error("missing coordinator after discovery"))?;
             let remote_entity_id = entity_owned_by(coordinator, peer.id().logical_id())?;
-            let entity = EntityRef::<CartCommand>::new(entity_type, remote_entity_id.clone());
+            let entity = sharding.entity_ref_for(&entity_key, remote_entity_id.as_str())?;
             entity
-                .tell(
-                    &region,
-                    CartCommand {
-                        action: "add-apple".to_string(),
-                    },
-                )
+                .tell(CartCommand {
+                    action: "add-apple".to_string(),
+                })
                 .map_err(|error| {
                     example_error(format!("networked child tell failed: {error:?}"))
                 })?;
@@ -427,6 +421,13 @@ async fn run_networked_child_node(
                 .await?
                 .ok_or_else(|| example_error("networked child delivery channel closed"))?;
             println!("{logical_id} received {} for {}.", delivered.1, delivered.0);
+            println!(
+                "{logical_id} facade local entity count: {}.",
+                sharding
+                    .registration_state(registration.key())
+                    .map(|state| state.local_entity_count())
+                    .unwrap_or_default()
+            );
         }
         _ => return Err(example_error(format!("unknown networked node role {role}")).into()),
     }

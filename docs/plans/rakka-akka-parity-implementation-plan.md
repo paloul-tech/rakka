@@ -337,18 +337,29 @@ Implementation status on 2026-06-11:
 - Added facade coverage for local sharding, proxy-only registration,
   passivation, typed message mismatch reporting, state queries, and remote
   inbound compatibility with facade-created regions.
+- Added Phase 4A remote facade integration with
+  `ClusterSharding::for_node_runtime`, `init_remote`,
+  `init_remote_with_ask`, and `ShardedEntityRef::remote_ask`.
+- `init_remote` now creates the local route, wraps it in the runtime remote
+  route, registers the networked shard region, and installs the inbound remote
+  tell handler through `ClusterNodeRuntime`.
+- `init_remote_with_ask` installs a combined tell/ask endpoint handler so one
+  entity type can support both at-most-once remote tells and request/reply
+  remote asks.
+- Rewrote the TCP loopback and multi-process paths in
+  `examples/multi-node-sharding` to use the facade for both sender and receiver
+  regions.
+- Added Phase 4A TCP coverage for facade remote tell, facade remote ask,
+  missing serializer failure, and ownership refresh after graceful-leave
+  handoff.
 
 Phase 4 follow-ups:
 
-- Extend `ClusterNodeRuntime` or a future cluster extension so
-  `ClusterSharding::init` can automatically register remote routes, endpoint
-  handlers, serializers, and network regions.
 - Add handoff/passivation buffering semantics instead of immediate route
   removal plus actor stop.
 - Add pluggable shard allocation strategy hooks to `ShardCoordinator`.
 - Add durable coordinator backend traits and persistent ownership snapshots.
-- Add persistence recovery-after-movement examples once remote facade wiring is
-  stable.
+- Add persistence recovery-after-movement examples on top of the remote facade.
 
 ## Phase 5: Cluster Extension, Receptionist, and Routers
 
