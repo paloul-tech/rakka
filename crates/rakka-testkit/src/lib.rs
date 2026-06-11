@@ -24,8 +24,9 @@ use rakka_k8s::{
     KubernetesProbeSnapshot,
 };
 use rakka_persistence::{
-    DurableState, InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore,
-    PersistenceEvent,
+    DurableEffect, DurableState, DurableStateBehavior, DurableStateChange, EventSourcedBehavior,
+    InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore, PersistenceEvent,
+    Revision, SequenceNr, StashDirective, TaggedEvent,
 };
 use rakka_stream::{StreamLifecycle, StreamSource};
 use serde::de::DeserializeOwned;
@@ -123,6 +124,205 @@ where
 
 /// Persistence testkit for event-sourced behavior tests without durable state.
 pub type EventSourcedPersistenceTestKit<E, S> = PersistenceTestKit<E, S, ()>;
+
+/// Result of running one command through an event-sourced behavior testkit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSourcedBehaviorTestOutcome<E, S>
+where
+    E: PersistenceEvent,
+    S: DurableState,
+{
+    /// Events selected by the command.
+    pub events: Vec<TaggedEvent<E>>,
+    /// State after applying selected events.
+    pub state: S,
+    /// Highest sequence number after the command.
+    pub sequence_nr: SequenceNr,
+    /// Whether the command requested a snapshot.
+    pub snapshot: bool,
+    /// Whether the command requested actor stop.
+    pub stop: bool,
+    /// Stash directive selected by the command.
+    pub stash: StashDirective,
+    /// Whether the command was unhandled.
+    pub unhandled: bool,
+}
+
+/// Reusable testkit for [`EventSourcedBehavior`].
+pub struct EventSourcedBehaviorTestKit<C, E, S>
+where
+    C: Message,
+    E: PersistenceEvent,
+    S: DurableState,
+{
+    behavior: EventSourcedBehavior<C, E, S>,
+    state: S,
+    sequence_nr: SequenceNr,
+    events: Vec<TaggedEvent<E>>,
+    snapshots: Vec<S>,
+}
+
+impl<C, E, S> EventSourcedBehaviorTestKit<C, E, S>
+where
+    C: Message,
+    E: PersistenceEvent,
+    S: DurableState,
+{
+    /// Creates a behavior testkit.
+    #[must_use]
+    pub fn new(behavior: EventSourcedBehavior<C, E, S>) -> Self {
+        let state = behavior.initial_state();
+        Self {
+            behavior,
+            state,
+            sequence_nr: SequenceNr::INITIAL,
+            events: Vec::new(),
+            snapshots: Vec::new(),
+        }
+    }
+
+    /// Returns the current testkit state.
+    #[must_use]
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    /// Returns the highest applied sequence number.
+    #[must_use]
+    pub const fn sequence_nr(&self) -> SequenceNr {
+        self.sequence_nr
+    }
+
+    /// Returns all persisted test events.
+    #[must_use]
+    pub fn events(&self) -> &[TaggedEvent<E>] {
+        &self.events
+    }
+
+    /// Returns all snapshots captured by explicit snapshot effects.
+    #[must_use]
+    pub fn snapshots(&self) -> &[S] {
+        &self.snapshots
+    }
+
+    /// Runs one command through the behavior.
+    pub fn run_command(
+        &mut self,
+        command: C,
+    ) -> rakka_persistence::DurableResult<EventSourcedBehaviorTestOutcome<E, S>> {
+        let effect = self.behavior.evaluate_command(&self.state, command)?;
+        let (events, snapshot, stop, stash, unhandled, side_effects) = effect.into_test_parts();
+
+        for tagged in &events {
+            self.sequence_nr = self.sequence_nr.next();
+            self.state = self.behavior.evaluate_event(&self.state, &tagged.event);
+        }
+        if snapshot {
+            self.snapshots.push(self.state.clone());
+        }
+        for side_effect in side_effects {
+            side_effect();
+        }
+        self.events.extend(events.clone());
+
+        Ok(EventSourcedBehaviorTestOutcome {
+            events,
+            state: self.state.clone(),
+            sequence_nr: self.sequence_nr,
+            snapshot,
+            stop,
+            stash,
+            unhandled,
+        })
+    }
+}
+
+/// Result of running one command through a durable-state behavior testkit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableStateBehaviorTestOutcome<S>
+where
+    S: DurableState,
+{
+    /// State after applying the durable effect.
+    pub state: S,
+    /// Revision after applying the durable effect.
+    pub revision: Revision,
+    /// State change selected by the command.
+    pub state_change: DurableStateChange<S>,
+    /// Whether the command requested actor stop.
+    pub stop: bool,
+}
+
+/// Reusable testkit for [`DurableStateBehavior`].
+pub struct DurableStateBehaviorTestKit<C, S>
+where
+    C: Message,
+    S: DurableState,
+{
+    behavior: DurableStateBehavior<C, S>,
+    state: S,
+    revision: Revision,
+}
+
+impl<C, S> DurableStateBehaviorTestKit<C, S>
+where
+    C: Message,
+    S: DurableState,
+{
+    /// Creates a durable-state behavior testkit.
+    #[must_use]
+    pub fn new(behavior: DurableStateBehavior<C, S>) -> Self {
+        let state = behavior.initial_state();
+        Self {
+            behavior,
+            state,
+            revision: Revision::INITIAL,
+        }
+    }
+
+    /// Returns the current testkit state.
+    #[must_use]
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    /// Returns the current testkit revision.
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    /// Runs one command through the behavior.
+    pub fn run_command(
+        &mut self,
+        command: C,
+    ) -> rakka_persistence::DurableResult<DurableStateBehaviorTestOutcome<S>> {
+        let effect: DurableEffect<S> = self.behavior.evaluate_command(&self.state, command)?;
+        let (state_change, stop, side_effects) = effect.into_test_parts();
+
+        match &state_change {
+            DurableStateChange::None | DurableStateChange::Unhandled => {}
+            DurableStateChange::Persist(state) => {
+                self.state = state.clone();
+                self.revision = self.revision.next();
+            }
+            DurableStateChange::Delete => {
+                self.state = self.behavior.initial_state();
+                self.revision = Revision::INITIAL;
+            }
+        }
+        for side_effect in side_effects {
+            side_effect();
+        }
+
+        Ok(DurableStateBehaviorTestOutcome {
+            state: self.state.clone(),
+            revision: self.revision,
+            state_change,
+            stop,
+        })
+    }
+}
 
 /// Captured HTTP response returned by in-process router helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]

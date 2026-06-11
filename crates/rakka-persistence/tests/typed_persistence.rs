@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use rakka_core::{ActorRef, ActorSystem, Message, ReplyTo};
 use rakka_persistence::{
-    event_sourced_actor_future, spawn_event_sourced_actor, DurableError, DurableStateStore,
-    EventJournal, EventSourcedActor, EventSourcedActorContext, EventSourcedActorFuture,
-    EventSourcedEffect, InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore,
-    PersistenceId, Revision, SequenceNr, SnapshotSelection, SnapshotStore, TaggedEvent,
+    current_events_by_tag, current_persistence_ids, event_sourced_actor_future,
+    spawn_event_sourced_actor, DurableEffect, DurableError, DurableStateBehavior,
+    DurableStateStore, EventJournal, EventSourcedActor, EventSourcedActorContext,
+    EventSourcedActorFuture, EventSourcedBehavior, EventSourcedEffect, InMemoryDurableStateStore,
+    InMemoryEventJournal, InMemorySnapshotStore, PersistenceId, RetentionCriteria, Revision,
+    SequenceNr, SnapshotSelection, SnapshotStore, TaggedEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +306,156 @@ async fn event_sourced_actor_recovers_from_snapshot_and_journal() {
         SequenceNr::FIRST
     );
     system.shutdown();
+}
+
+#[tokio::test]
+async fn event_sourced_behavior_builder_spawns_with_retention_and_recovery() {
+    let system = ActorSystem::new("event-sourced-behavior");
+    let journal = InMemoryEventJournal::<CounterEvent>::new();
+    let snapshots = InMemorySnapshotStore::<CounterState>::new();
+    let id = PersistenceId::of("counter", "behavior").expect("id should be valid");
+    let behavior = counter_event_sourced_behavior(id.clone()).with_retention_criteria(
+        RetentionCriteria::snapshot_every(2)
+            .keep_snapshots(1)
+            .delete_events_on_snapshot(),
+    );
+    let first = behavior
+        .clone()
+        .spawn(
+            &system,
+            "counter-behavior-a",
+            journal.clone(),
+            snapshots.clone(),
+        )
+        .expect("behavior should spawn");
+
+    assert_eq!(increment_event_sourced(&first, 1).await, 1);
+    assert_eq!(increment_event_sourced(&first, 2).await, 3);
+    assert_eq!(
+        snapshots
+            .load(&id, SnapshotSelection::latest())
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .sequence_nr,
+        SequenceNr::new(2)
+    );
+    assert!(
+        journal
+            .replay(&id, SequenceNr::FIRST, SequenceNr::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
+        "retention should delete events covered by the retained snapshot"
+    );
+
+    assert_eq!(increment_event_sourced(&first, 3).await, 6);
+    first.stop().expect("actor should stop");
+    wait_until_terminated(&first).await;
+
+    let second = behavior
+        .spawn(
+            &system,
+            "counter-behavior-b",
+            journal.clone(),
+            snapshots.clone(),
+        )
+        .expect("behavior should respawn");
+    assert_eq!(get_event_sourced(&second).await, 6);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn durable_state_behavior_facade_persists_state() {
+    let system = ActorSystem::new("durable-state-behavior");
+    let store = InMemoryDurableStateStore::<CounterState>::new();
+    let id = PersistenceId::of("counter", "durable-behavior").expect("id should be valid");
+    let behavior = DurableStateBehavior::builder(id.clone(), CounterState { value: 0 })
+        .on_command(|state, command: CounterCommand| match command {
+            CounterCommand::Increment { by, reply_to } => {
+                let next = CounterState {
+                    value: state.value + by,
+                };
+                DurableEffect::persist(next.clone()).then_reply(reply_to, next.value)
+            }
+            CounterCommand::Get { reply_to } => DurableEffect::reply(reply_to, state.value),
+            CounterCommand::Snapshot { reply_to } => DurableEffect::reply(reply_to, ()),
+        })
+        .build()
+        .expect("durable behavior should build");
+    let actor = behavior
+        .spawn(&system, "durable-behavior", store.clone())
+        .expect("durable behavior should spawn");
+
+    assert_eq!(increment_event_sourced(&actor, 4).await, 4);
+    assert_eq!(
+        store.load(&id).await.unwrap().unwrap().state,
+        CounterState { value: 4 }
+    );
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn persistence_query_helpers_return_bounded_streams() {
+    let journal = InMemoryEventJournal::<CounterEvent>::new();
+    let id = PersistenceId::of("counter", "query").expect("id should be valid");
+    journal
+        .append(
+            &id,
+            SequenceNr::INITIAL,
+            vec![TaggedEvent::with_tags(
+                CounterEvent::Incremented(5),
+                ["query"],
+            )],
+        )
+        .await
+        .expect("append should succeed");
+
+    let tagged = current_events_by_tag(journal.clone(), "query")
+        .await
+        .expect("query should build stream");
+    let events = collect_query_stream(tagged).await;
+    assert_eq!(events[0].event, CounterEvent::Incremented(5));
+
+    let ids = current_persistence_ids::<CounterEvent, _>(journal)
+        .await
+        .expect("id query should build stream");
+    assert_eq!(collect_query_stream(ids).await, vec![id]);
+}
+
+fn counter_event_sourced_behavior(
+    persistence_id: PersistenceId,
+) -> EventSourcedBehavior<CounterCommand, CounterEvent, CounterState> {
+    EventSourcedBehavior::builder(persistence_id, CounterState { value: 0 })
+        .on_command(|state, command| match command {
+            CounterCommand::Increment { by, reply_to } => EventSourcedEffect::persist_tagged(
+                TaggedEvent::with_tags(CounterEvent::Incremented(by), ["counter"]),
+            )
+            .then_reply(reply_to, state.value + by),
+            CounterCommand::Get { reply_to } => EventSourcedEffect::reply(reply_to, state.value),
+            CounterCommand::Snapshot { reply_to } => EventSourcedEffect::none()
+                .then_snapshot()
+                .then_reply(reply_to, ()),
+        })
+        .on_event(|state, event| match event {
+            CounterEvent::Incremented(by) => CounterState {
+                value: state.value + by,
+            },
+            CounterEvent::Decremented(by) => CounterState {
+                value: state.value - by,
+            },
+        })
+        .build()
+        .expect("event-sourced behavior should build")
+}
+
+async fn collect_query_stream<T>(source: rakka_stream::StreamSource<T>) -> Vec<T> {
+    let mut items = Vec::new();
+    while let Some(item) = source.next().await.expect("query stream should read") {
+        items.push(item);
+    }
+    items
 }
 
 async fn increment_event_sourced(counter: &ActorRef<CounterCommand>, by: i64) -> i64 {

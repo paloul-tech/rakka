@@ -3,6 +3,7 @@
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,18 @@ impl Revision {
     #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
+    }
+
+    /// Returns the previous sequence number, saturating at [`SequenceNr::INITIAL`].
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        Self(self.0.saturating_sub(1))
+    }
+
+    /// Returns this sequence number minus `amount`, saturating at [`SequenceNr::INITIAL`].
+    #[must_use]
+    pub const fn saturating_sub(self, amount: u64) -> Self {
+        Self(self.0.saturating_sub(amount))
     }
 }
 
@@ -470,6 +483,134 @@ impl Default for RecoveryOptions {
     }
 }
 
+/// Snapshot and event deletion policy for event-sourced actors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionCriteria {
+    snapshot_every: Option<u64>,
+    keep_snapshots: usize,
+    delete_events_on_snapshot: bool,
+}
+
+impl RetentionCriteria {
+    /// Disables automatic snapshot retention.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            snapshot_every: None,
+            keep_snapshots: usize::MAX,
+            delete_events_on_snapshot: false,
+        }
+    }
+
+    /// Takes a snapshot every `event_count` persisted events.
+    #[must_use]
+    pub const fn snapshot_every(event_count: u64) -> Self {
+        Self {
+            snapshot_every: Some(event_count),
+            keep_snapshots: usize::MAX,
+            delete_events_on_snapshot: false,
+        }
+    }
+
+    /// Returns a copy that keeps at most `keep_snapshots` matching snapshots.
+    #[must_use]
+    pub const fn keep_snapshots(mut self, keep_snapshots: usize) -> Self {
+        self.keep_snapshots = keep_snapshots;
+        self
+    }
+
+    /// Returns a copy that deletes events covered by older retained snapshots.
+    #[must_use]
+    pub const fn delete_events_on_snapshot(mut self) -> Self {
+        self.delete_events_on_snapshot = true;
+        self
+    }
+
+    /// Returns the automatic snapshot cadence, if enabled.
+    #[must_use]
+    pub const fn snapshot_every_events(self) -> Option<u64> {
+        self.snapshot_every
+    }
+
+    /// Returns the maximum number of snapshots retained.
+    #[must_use]
+    pub const fn keep_snapshots_count(self) -> usize {
+        self.keep_snapshots
+    }
+
+    /// Returns true when event deletion should run after snapshot retention.
+    #[must_use]
+    pub const fn should_delete_events_on_snapshot(self) -> bool {
+        self.delete_events_on_snapshot
+    }
+
+    /// Returns true when a newly persisted sequence number should trigger a snapshot.
+    #[must_use]
+    pub const fn should_snapshot(self, sequence_nr: SequenceNr) -> bool {
+        match self.snapshot_every {
+            Some(every) if every > 0 => sequence_nr.get() > 0 && sequence_nr.get() % every == 0,
+            _ => false,
+        }
+    }
+}
+
+impl Default for RetentionCriteria {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// Retry policy for failed persistence writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistFailureBackoff {
+    retry_delay_millis: u64,
+    max_retries: u32,
+}
+
+impl PersistFailureBackoff {
+    /// Disables persistence write retries.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            retry_delay_millis: 0,
+            max_retries: 0,
+        }
+    }
+
+    /// Creates a fixed-delay retry policy.
+    #[must_use]
+    pub fn fixed(retry_delay: Duration, max_retries: u32) -> Self {
+        Self {
+            retry_delay_millis: duration_millis(retry_delay),
+            max_retries,
+        }
+    }
+
+    /// Returns the retry delay.
+    #[must_use]
+    pub const fn retry_delay(self) -> Duration {
+        Duration::from_millis(self.retry_delay_millis)
+    }
+
+    /// Returns the maximum retry attempts after the first failed write.
+    #[must_use]
+    pub const fn max_retries(self) -> u32 {
+        self.max_retries
+    }
+
+    /// Returns true when retry attempts are configured.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        self.max_retries > 0
+    }
+}
+
+impl Default for PersistFailureBackoff {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// Codec used by byte-oriented durable state stores.
 pub trait StateCodec<S>: Clone + Send + Sync + 'static
 where
@@ -611,6 +752,10 @@ pub(crate) fn current_timestamp_millis() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn validate_persistence_id_part(name: &str, value: &str) -> DurableResult<()> {

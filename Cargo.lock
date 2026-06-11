@@ -1036,6 +1036,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-event-sourced-counter"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-external-binary-wrapper"
 version = "0.1.0"
 dependencies = [
@@ -1094,6 +1102,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-sharded-cart-persistence"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-grpc"
 version = "0.1.0"
 dependencies = [
@@ -1144,6 +1160,7 @@ name = "rakka-persistence"
 version = "0.1.0"
 dependencies = [
  "rakka-core",
+ "rakka-stream",
  "serde",
  "tokio",
 ]

@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use rakka_core::Subsystem;
 use rakka_persistence::{
-    DurableError, DurableResult, DurableState, DurableStateStore, PersistenceId, Revision,
-    StateCodec, StateRecord, StoreFuture,
+    DurableError, DurableResult, DurableState, DurableStateStore, EventJournal, EventMetadata,
+    EventRecord, PersistenceEvent, PersistenceId, Revision, SequenceNr, SnapshotMetadata,
+    SnapshotRecord, SnapshotSelection, SnapshotStore, StateCodec, StateRecord, StoreFuture,
+    TaggedEvent,
 };
 use tokio_postgres::{types::ToSql, Client, Row};
 
@@ -28,13 +30,41 @@ pub const BACKEND_NAME: &str = "postgres";
 /// Default durable state table name.
 pub const TABLE_NAME: &str = "rakka_durable_state";
 
-/// SQL migration for the default durable state table.
+/// Default event journal table name.
+pub const EVENT_JOURNAL_TABLE_NAME: &str = "rakka_events";
+
+/// Default snapshot table name.
+pub const SNAPSHOT_TABLE_NAME: &str = "rakka_snapshots";
+
+/// SQL migration for the default durable state, journal, and snapshot tables.
 pub const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS rakka_durable_state (
     persistence_id TEXT PRIMARY KEY,
     revision BIGINT NOT NULL CHECK (revision >= 0),
     state BYTEA NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS rakka_events (
+    persistence_id TEXT NOT NULL,
+    sequence_nr BIGINT NOT NULL CHECK (sequence_nr > 0),
+    event BYTEA NOT NULL,
+    tags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    slice INTEGER NULL,
+    timestamp_millis BIGINT NOT NULL CHECK (timestamp_millis >= 0),
+    deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (persistence_id, sequence_nr)
+);
+
+CREATE INDEX IF NOT EXISTS rakka_events_tag_idx
+    ON rakka_events USING GIN (tags);
+
+CREATE TABLE IF NOT EXISTS rakka_snapshots (
+    persistence_id TEXT NOT NULL,
+    sequence_nr BIGINT NOT NULL CHECK (sequence_nr >= 0),
+    snapshot BYTEA NOT NULL,
+    timestamp_millis BIGINT NOT NULL CHECK (timestamp_millis >= 0),
+    PRIMARY KEY (persistence_id, sequence_nr)
 );
 "#;
 
@@ -201,6 +231,403 @@ RETURNING revision, state
             }
         })
     }
+
+    fn persistence_ids<'a>(&'a self) -> StoreFuture<'a, Vec<PersistenceId>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let rows = client
+                .query(
+                    "SELECT persistence_id FROM rakka_durable_state ORDER BY persistence_id",
+                    &[],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| PersistenceId::new(row.get::<_, String>("persistence_id")))
+                .collect())
+        })
+    }
+}
+
+/// PostgreSQL event journal using a pluggable event codec.
+pub struct PostgresEventJournal<C> {
+    client: Arc<Client>,
+    codec: C,
+}
+
+impl<C> PostgresEventJournal<C>
+where
+    C: Clone,
+{
+    /// Creates a PostgreSQL event journal.
+    #[must_use]
+    pub fn new(client: Client, codec: C) -> Self {
+        Self {
+            client: Arc::new(client),
+            codec,
+        }
+    }
+
+    /// Applies the default table migration.
+    pub async fn migrate(&self) -> DurableResult<()> {
+        self.client
+            .batch_execute(MIGRATION_SQL)
+            .await
+            .map_err(map_postgres_error)?;
+        Ok(())
+    }
+}
+
+impl<C> Clone for PostgresEventJournal<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            codec: self.codec.clone(),
+        }
+    }
+}
+
+impl<E, C> EventJournal<E> for PostgresEventJournal<C>
+where
+    E: PersistenceEvent,
+    C: StateCodec<E>,
+{
+    fn backend_name(&self) -> &'static str {
+        BACKEND_NAME
+    }
+
+    fn append<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        expected_sequence_nr: SequenceNr,
+        events: Vec<TaggedEvent<E>>,
+    ) -> StoreFuture<'a, Vec<EventRecord<E>>> {
+        let client = self.client.clone();
+        let codec = self.codec.clone();
+        Box::pin(async move {
+            let actual = load_highest_sequence_nr(&client, persistence_id).await?;
+            if actual != expected_sequence_nr {
+                return Err(DurableError::sequence_conflict(
+                    persistence_id.clone(),
+                    expected_sequence_nr,
+                    actual,
+                ));
+            }
+
+            let mut sequence_nr = expected_sequence_nr;
+            let mut appended = Vec::with_capacity(events.len());
+            for tagged in events {
+                sequence_nr = sequence_nr.next();
+                let encoded = codec.encode(&tagged.event)?;
+                let timestamp_millis = current_timestamp_millis_i64()?;
+                let sequence = sequence_to_i64(sequence_nr)?;
+                let tags = tagged.tags;
+                let slice: Option<i32> = None;
+                client
+                    .execute(
+                        r#"
+INSERT INTO rakka_events
+    (persistence_id, sequence_nr, event, tags, slice, timestamp_millis)
+VALUES ($1, $2::bigint, $3::bytea, $4::text[], $5::integer, $6::bigint)
+"#,
+                        &[
+                            &persistence_id.as_str(),
+                            &sequence,
+                            &encoded.as_slice(),
+                            &tags,
+                            &slice,
+                            &timestamp_millis,
+                        ],
+                    )
+                    .await
+                    .map_err(map_postgres_error)?;
+                let metadata = EventMetadata {
+                    persistence_id: persistence_id.clone(),
+                    sequence_nr,
+                    timestamp_millis: u64::try_from(timestamp_millis).map_err(|_negative| {
+                        DurableError::store(BACKEND_NAME, "event timestamp was negative")
+                    })?,
+                    tags,
+                    slice: None,
+                };
+                appended.push(EventRecord::new(tagged.event, metadata));
+            }
+            Ok(appended)
+        })
+    }
+
+    fn replay<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        from: SequenceNr,
+        to: SequenceNr,
+    ) -> StoreFuture<'a, Vec<EventRecord<E>>> {
+        let client = self.client.clone();
+        let codec = self.codec.clone();
+        Box::pin(async move {
+            let from = sequence_to_i64(from)?;
+            let to = sequence_bound_to_i64(to);
+            let rows = client
+                .query(
+                    r#"
+SELECT sequence_nr, event, tags, slice, timestamp_millis
+FROM rakka_events
+WHERE persistence_id = $1
+  AND sequence_nr >= $2::bigint
+  AND sequence_nr <= $3::bigint
+  AND deleted = FALSE
+ORDER BY sequence_nr ASC
+"#,
+                    &[&persistence_id.as_str(), &from, &to],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(|row| decode_event_row(&codec, persistence_id.clone(), row))
+                .collect()
+        })
+    }
+
+    fn delete_to<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        to: SequenceNr,
+    ) -> StoreFuture<'a, ()> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let to = sequence_to_i64(to)?;
+            client
+                .execute(
+                    r#"
+UPDATE rakka_events
+SET deleted = TRUE
+WHERE persistence_id = $1
+  AND sequence_nr <= $2::bigint
+"#,
+                    &[&persistence_id.as_str(), &to],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            Ok(())
+        })
+    }
+
+    fn highest_sequence_nr<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+    ) -> StoreFuture<'a, SequenceNr> {
+        let client = self.client.clone();
+        Box::pin(async move { load_highest_sequence_nr(&client, persistence_id).await })
+    }
+
+    fn persistence_ids<'a>(&'a self) -> StoreFuture<'a, Vec<PersistenceId>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let rows = client
+                .query(
+                    "SELECT DISTINCT persistence_id FROM rakka_events ORDER BY persistence_id",
+                    &[],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| PersistenceId::new(row.get::<_, String>("persistence_id")))
+                .collect())
+        })
+    }
+
+    fn events_by_tag<'a>(&'a self, tag: &'a str) -> StoreFuture<'a, Vec<EventRecord<E>>> {
+        let client = self.client.clone();
+        let codec = self.codec.clone();
+        Box::pin(async move {
+            let rows = client
+                .query(
+                    r#"
+SELECT persistence_id, sequence_nr, event, tags, slice, timestamp_millis
+FROM rakka_events
+WHERE $1 = ANY(tags)
+  AND deleted = FALSE
+ORDER BY timestamp_millis ASC, persistence_id ASC, sequence_nr ASC
+"#,
+                    &[&tag],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            rows.into_iter()
+                .map(|row| {
+                    let persistence_id = PersistenceId::new(row.get::<_, String>("persistence_id"));
+                    decode_event_row(&codec, persistence_id, row)
+                })
+                .collect()
+        })
+    }
+}
+
+/// PostgreSQL snapshot store using a pluggable snapshot codec.
+pub struct PostgresSnapshotStore<C> {
+    client: Arc<Client>,
+    codec: C,
+}
+
+impl<C> PostgresSnapshotStore<C>
+where
+    C: Clone,
+{
+    /// Creates a PostgreSQL snapshot store.
+    #[must_use]
+    pub fn new(client: Client, codec: C) -> Self {
+        Self {
+            client: Arc::new(client),
+            codec,
+        }
+    }
+
+    /// Applies the default table migration.
+    pub async fn migrate(&self) -> DurableResult<()> {
+        self.client
+            .batch_execute(MIGRATION_SQL)
+            .await
+            .map_err(map_postgres_error)?;
+        Ok(())
+    }
+}
+
+impl<C> Clone for PostgresSnapshotStore<C>
+where
+    C: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            codec: self.codec.clone(),
+        }
+    }
+}
+
+impl<S, C> SnapshotStore<S> for PostgresSnapshotStore<C>
+where
+    S: DurableState,
+    C: StateCodec<S>,
+{
+    fn backend_name(&self) -> &'static str {
+        BACKEND_NAME
+    }
+
+    fn save<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        sequence_nr: SequenceNr,
+        snapshot: S,
+    ) -> StoreFuture<'a, SnapshotRecord<S>> {
+        let client = self.client.clone();
+        let codec = self.codec.clone();
+        Box::pin(async move {
+            let encoded = codec.encode(&snapshot)?;
+            let sequence = sequence_to_i64(sequence_nr)?;
+            let timestamp_millis = current_timestamp_millis_i64()?;
+            client
+                .execute(
+                    r#"
+INSERT INTO rakka_snapshots
+    (persistence_id, sequence_nr, snapshot, timestamp_millis)
+VALUES ($1, $2::bigint, $3::bytea, $4::bigint)
+ON CONFLICT (persistence_id, sequence_nr)
+DO UPDATE SET snapshot = EXCLUDED.snapshot,
+              timestamp_millis = EXCLUDED.timestamp_millis
+"#,
+                    &[
+                        &persistence_id.as_str(),
+                        &sequence,
+                        &encoded.as_slice(),
+                        &timestamp_millis,
+                    ],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            Ok(SnapshotRecord::new(
+                snapshot,
+                SnapshotMetadata::new(
+                    persistence_id.clone(),
+                    sequence_nr,
+                    u64::try_from(timestamp_millis).map_err(|_negative| {
+                        DurableError::store(BACKEND_NAME, "snapshot timestamp was negative")
+                    })?,
+                ),
+            ))
+        })
+    }
+
+    fn load<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        selection: SnapshotSelection,
+    ) -> StoreFuture<'a, Option<SnapshotRecord<S>>> {
+        let client = self.client.clone();
+        let codec = self.codec.clone();
+        Box::pin(async move {
+            let row = query_snapshot_rows(&client, persistence_id, selection, Some(1))
+                .await?
+                .into_iter()
+                .next();
+            row.map(|row| decode_snapshot_row(&codec, persistence_id.clone(), row))
+                .transpose()
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        selection: SnapshotSelection,
+    ) -> StoreFuture<'a, Vec<SnapshotMetadata>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let rows = query_snapshot_rows(&client, persistence_id, selection, None).await?;
+            rows.into_iter()
+                .map(|row| decode_snapshot_metadata(persistence_id.clone(), row))
+                .collect()
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        selection: SnapshotSelection,
+    ) -> StoreFuture<'a, usize> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let min_sequence = sequence_bound_to_i64(selection.min_sequence_nr);
+            let max_sequence = sequence_bound_to_i64(selection.max_sequence_nr);
+            let min_timestamp = timestamp_bound_to_i64(selection.min_timestamp_millis);
+            let max_timestamp = timestamp_bound_to_i64(selection.max_timestamp_millis);
+            let removed = client
+                .execute(
+                    r#"
+DELETE FROM rakka_snapshots
+WHERE persistence_id = $1
+  AND sequence_nr >= $2::bigint
+  AND sequence_nr <= $3::bigint
+  AND timestamp_millis >= $4::bigint
+  AND timestamp_millis <= $5::bigint
+"#,
+                    &[
+                        &persistence_id.as_str(),
+                        &min_sequence,
+                        &max_sequence,
+                        &min_timestamp,
+                        &max_timestamp,
+                    ],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            usize::try_from(removed)
+                .map_err(|_overflow| DurableError::store(BACKEND_NAME, "delete count overflow"))
+        })
+    }
 }
 
 /// Identity codec for byte-vector state.
@@ -258,6 +685,174 @@ fn revision_from_i64(revision: i64) -> DurableResult<Revision> {
     u64::try_from(revision)
         .map(Revision::new)
         .map_err(|_negative| DurableError::store(BACKEND_NAME, "stored revision was negative"))
+}
+
+fn sequence_to_i64(sequence_nr: SequenceNr) -> DurableResult<i64> {
+    i64::try_from(sequence_nr.get())
+        .map_err(|_overflow| DurableError::store(BACKEND_NAME, "sequence number exceeds i64 range"))
+}
+
+fn sequence_bound_to_i64(sequence_nr: SequenceNr) -> i64 {
+    i64::try_from(sequence_nr.get()).unwrap_or(i64::MAX)
+}
+
+fn sequence_from_i64(sequence_nr: i64) -> DurableResult<SequenceNr> {
+    u64::try_from(sequence_nr)
+        .map(SequenceNr::new)
+        .map_err(|_negative| {
+            DurableError::store(BACKEND_NAME, "stored sequence number was negative")
+        })
+}
+
+fn timestamp_bound_to_i64(timestamp_millis: u64) -> i64 {
+    i64::try_from(timestamp_millis).unwrap_or(i64::MAX)
+}
+
+fn current_timestamp_millis_i64() -> DurableResult<i64> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_overflow| DurableError::store(BACKEND_NAME, "timestamp exceeds i64 range"))
+}
+
+async fn load_highest_sequence_nr(
+    client: &Client,
+    persistence_id: &PersistenceId,
+) -> DurableResult<SequenceNr> {
+    let sequence_nr = client
+        .query_opt(
+            "SELECT MAX(sequence_nr) AS sequence_nr FROM rakka_events WHERE persistence_id = $1",
+            &[&persistence_id.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?
+        .and_then(|row| row.get::<_, Option<i64>>("sequence_nr"))
+        .map_or(Ok(SequenceNr::INITIAL), sequence_from_i64)?;
+    Ok(sequence_nr)
+}
+
+fn decode_event_row<E, C>(
+    codec: &C,
+    persistence_id: PersistenceId,
+    row: Row,
+) -> DurableResult<EventRecord<E>>
+where
+    E: PersistenceEvent,
+    C: StateCodec<E>,
+{
+    let sequence_nr = sequence_from_i64(row.get("sequence_nr"))?;
+    let event: Vec<u8> = row.get("event");
+    let timestamp_millis: i64 = row.get("timestamp_millis");
+    let tags: Vec<String> = row.get("tags");
+    let slice: Option<i32> = row.get("slice");
+    let slice = slice
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_negative| DurableError::store(BACKEND_NAME, "stored slice was negative"))?;
+    let timestamp_millis = u64::try_from(timestamp_millis)
+        .map_err(|_negative| DurableError::store(BACKEND_NAME, "event timestamp was negative"))?;
+    Ok(EventRecord::new(
+        codec.decode(&event)?,
+        EventMetadata {
+            persistence_id,
+            sequence_nr,
+            timestamp_millis,
+            tags,
+            slice,
+        },
+    ))
+}
+
+async fn query_snapshot_rows(
+    client: &Client,
+    persistence_id: &PersistenceId,
+    selection: SnapshotSelection,
+    limit: Option<i64>,
+) -> DurableResult<Vec<Row>> {
+    let min_sequence = sequence_bound_to_i64(selection.min_sequence_nr);
+    let max_sequence = sequence_bound_to_i64(selection.max_sequence_nr);
+    let min_timestamp = timestamp_bound_to_i64(selection.min_timestamp_millis);
+    let max_timestamp = timestamp_bound_to_i64(selection.max_timestamp_millis);
+    let rows = if let Some(limit) = limit {
+        client
+            .query(
+                r#"
+SELECT sequence_nr, snapshot, timestamp_millis
+FROM rakka_snapshots
+WHERE persistence_id = $1
+  AND sequence_nr >= $2::bigint
+  AND sequence_nr <= $3::bigint
+  AND timestamp_millis >= $4::bigint
+  AND timestamp_millis <= $5::bigint
+ORDER BY sequence_nr DESC, timestamp_millis DESC
+LIMIT $6::bigint
+"#,
+                &[
+                    &persistence_id.as_str(),
+                    &min_sequence,
+                    &max_sequence,
+                    &min_timestamp,
+                    &max_timestamp,
+                    &limit,
+                ],
+            )
+            .await
+    } else {
+        client
+            .query(
+                r#"
+SELECT sequence_nr, snapshot, timestamp_millis
+FROM rakka_snapshots
+WHERE persistence_id = $1
+  AND sequence_nr >= $2::bigint
+  AND sequence_nr <= $3::bigint
+  AND timestamp_millis >= $4::bigint
+  AND timestamp_millis <= $5::bigint
+ORDER BY sequence_nr DESC, timestamp_millis DESC
+"#,
+                &[
+                    &persistence_id.as_str(),
+                    &min_sequence,
+                    &max_sequence,
+                    &min_timestamp,
+                    &max_timestamp,
+                ],
+            )
+            .await
+    }
+    .map_err(map_postgres_error)?;
+    Ok(rows)
+}
+
+fn decode_snapshot_metadata(
+    persistence_id: PersistenceId,
+    row: Row,
+) -> DurableResult<SnapshotMetadata> {
+    let sequence_nr = sequence_from_i64(row.get("sequence_nr"))?;
+    let timestamp_millis: i64 = row.get("timestamp_millis");
+    Ok(SnapshotMetadata::new(
+        persistence_id,
+        sequence_nr,
+        u64::try_from(timestamp_millis).map_err(|_negative| {
+            DurableError::store(BACKEND_NAME, "snapshot timestamp was negative")
+        })?,
+    ))
+}
+
+fn decode_snapshot_row<S, C>(
+    codec: &C,
+    persistence_id: PersistenceId,
+    row: Row,
+) -> DurableResult<SnapshotRecord<S>>
+where
+    S: DurableState,
+    C: StateCodec<S>,
+{
+    let snapshot: Vec<u8> = row.get("snapshot");
+    let metadata = decode_snapshot_metadata(persistence_id, row)?;
+    Ok(SnapshotRecord::new(codec.decode(&snapshot)?, metadata))
 }
 
 fn map_postgres_error(error: tokio_postgres::Error) -> DurableError {
@@ -323,5 +918,96 @@ mod tests {
 
         store.delete(&id, second.revision).await.unwrap();
         assert_eq!(store.load(&id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn postgres_journal_and_snapshots_round_trip_when_dsn_is_set() {
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+
+        let (journal_client, journal_connection) =
+            tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(error) = journal_connection.await {
+                eprintln!("postgres journal connection error: {error}");
+            }
+        });
+        let journal = PostgresEventJournal::new(journal_client, BytesStateCodec);
+        journal.migrate().await.unwrap();
+        let journal_id = unique_id("postgres-journal");
+
+        let appended = journal
+            .append(
+                &journal_id,
+                SequenceNr::INITIAL,
+                vec![TaggedEvent::with_tags(b"one".to_vec(), ["tag-a"])],
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended[0].metadata.sequence_nr, SequenceNr::FIRST);
+        assert_eq!(
+            journal
+                .replay(&journal_id, SequenceNr::FIRST, SequenceNr::MAX)
+                .await
+                .unwrap()[0]
+                .event,
+            b"one".to_vec()
+        );
+        assert_eq!(journal.events_by_tag("tag-a").await.unwrap().len(), 1);
+        journal
+            .delete_to(&journal_id, SequenceNr::FIRST)
+            .await
+            .unwrap();
+        assert!(journal
+            .replay(&journal_id, SequenceNr::FIRST, SequenceNr::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            journal.highest_sequence_nr(&journal_id).await.unwrap(),
+            SequenceNr::FIRST
+        );
+
+        let (snapshot_client, snapshot_connection) =
+            tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(error) = snapshot_connection.await {
+                eprintln!("postgres snapshot connection error: {error}");
+            }
+        });
+        let snapshots = PostgresSnapshotStore::new(snapshot_client, BytesStateCodec);
+        snapshots.migrate().await.unwrap();
+        let snapshot_id = unique_id("postgres-snapshot");
+
+        snapshots
+            .save(&snapshot_id, SequenceNr::new(2), b"snapshot".to_vec())
+            .await
+            .unwrap();
+        let loaded = snapshots
+            .load(&snapshot_id, SnapshotSelection::latest())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.snapshot, b"snapshot".to_vec());
+        assert_eq!(loaded.metadata.sequence_nr, SequenceNr::new(2));
+        assert_eq!(
+            snapshots
+                .delete(&snapshot_id, SnapshotSelection::latest())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    fn unique_id(prefix: &str) -> PersistenceId {
+        PersistenceId::new(format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }

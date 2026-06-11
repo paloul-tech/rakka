@@ -13,9 +13,86 @@ use rakka_core::{
 use crate::effect::DurableSideEffect;
 use crate::error::DurableResult;
 use crate::store::{
-    DurableState, EventJournal, PersistenceEvent, PersistenceId, RecoveryOptions, SequenceNr,
-    SnapshotRecord, SnapshotStore, TaggedEvent,
+    DurableState, EventJournal, EventRecord, PersistFailureBackoff, PersistenceEvent,
+    PersistenceId, RecoveryOptions, RetentionCriteria, SequenceNr, SnapshotRecord,
+    SnapshotSelection, SnapshotStore, TaggedEvent,
 };
+
+/// Runtime signal emitted by an event-sourced actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistenceSignal {
+    /// Recovery is about to load snapshots and replay events.
+    RecoveryStarted {
+        /// Durable identity being recovered.
+        persistence_id: PersistenceId,
+    },
+    /// Recovery completed.
+    RecoveryCompleted {
+        /// Durable identity that recovered.
+        persistence_id: PersistenceId,
+        /// Highest recovered sequence number.
+        sequence_nr: SequenceNr,
+    },
+    /// Events were persisted.
+    EventsPersisted {
+        /// Durable identity that persisted events.
+        persistence_id: PersistenceId,
+        /// First persisted sequence number.
+        from: SequenceNr,
+        /// Last persisted sequence number.
+        to: SequenceNr,
+    },
+    /// Event persistence failed.
+    PersistFailed {
+        /// Durable identity being written.
+        persistence_id: PersistenceId,
+        /// Attempt number, starting at zero.
+        attempt: u32,
+        /// Stable error code.
+        error_code: &'static str,
+        /// Human-readable error detail.
+        message: String,
+    },
+    /// A snapshot was saved.
+    SnapshotSaved {
+        /// Durable identity that saved a snapshot.
+        persistence_id: PersistenceId,
+        /// Snapshot sequence number.
+        sequence_nr: SequenceNr,
+    },
+    /// A snapshot save failed.
+    SnapshotFailed {
+        /// Durable identity being snapshotted.
+        persistence_id: PersistenceId,
+        /// Attempt number, starting at zero.
+        attempt: u32,
+        /// Stable error code.
+        error_code: &'static str,
+        /// Human-readable error detail.
+        message: String,
+    },
+    /// The actor is about to recover after a restart.
+    PreRestart {
+        /// Durable identity being restarted.
+        persistence_id: PersistenceId,
+    },
+    /// The actor stopped.
+    PostStop {
+        /// Durable identity that stopped.
+        persistence_id: PersistenceId,
+    },
+}
+
+/// Explicit stash directive carried by an event-sourced effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StashDirective {
+    /// Do not modify the stash.
+    None,
+    /// Mark the current command for stashing.
+    Stash,
+    /// Request unstashing of previously stashed commands.
+    UnstashAll,
+}
 
 /// Boxed future returned by event-sourced actor command handlers.
 pub type EventSourcedActorFuture<'a, E> =
@@ -56,6 +133,21 @@ pub trait EventSourcedActor: Send + 'static {
 
     /// Applies one persisted event to a state value.
     fn apply_event(&mut self, state: &Self::State, event: &Self::Event) -> Self::State;
+
+    /// Returns the snapshot retention policy.
+    fn retention_criteria(&self) -> RetentionCriteria {
+        RetentionCriteria::disabled()
+    }
+
+    /// Returns the retry policy used for failed persistence writes.
+    fn persist_failure_backoff(&self) -> PersistFailureBackoff {
+        PersistFailureBackoff::disabled()
+    }
+
+    /// Handles event-sourced runtime signals.
+    fn on_signal(&mut self, _signal: PersistenceSignal) -> DurableResult<()> {
+        Ok(())
+    }
 }
 
 /// Event-sourced actor context.
@@ -143,6 +235,8 @@ where
     events: Vec<TaggedEvent<E>>,
     snapshot: bool,
     stop: bool,
+    stash: StashDirective,
+    unhandled: bool,
     side_effects: Vec<DurableSideEffect>,
 }
 
@@ -157,7 +251,18 @@ where
             events: Vec::new(),
             snapshot: false,
             stop: false,
+            stash: StashDirective::None,
+            unhandled: false,
             side_effects: Vec::new(),
+        }
+    }
+
+    /// Marks a command as unhandled without persisting an event.
+    #[must_use]
+    pub fn unhandled() -> Self {
+        Self {
+            unhandled: true,
+            ..Self::none()
         }
     }
 
@@ -174,6 +279,8 @@ where
             events: vec![event],
             snapshot: false,
             stop: false,
+            stash: StashDirective::None,
+            unhandled: false,
             side_effects: Vec::new(),
         }
     }
@@ -189,7 +296,27 @@ where
             events: events.into_iter().map(Into::into).collect(),
             snapshot: false,
             stop: false,
+            stash: StashDirective::None,
+            unhandled: false,
             side_effects: Vec::new(),
+        }
+    }
+
+    /// Marks the current command for stashing.
+    #[must_use]
+    pub fn stash() -> Self {
+        Self {
+            stash: StashDirective::Stash,
+            ..Self::none()
+        }
+    }
+
+    /// Requests unstashing of previously stashed commands.
+    #[must_use]
+    pub fn unstash_all() -> Self {
+        Self {
+            stash: StashDirective::UnstashAll,
+            ..Self::none()
         }
     }
 
@@ -200,6 +327,8 @@ where
             events: Vec::new(),
             snapshot: false,
             stop: true,
+            stash: StashDirective::None,
+            unhandled: false,
             side_effects: Vec::new(),
         }
     }
@@ -225,6 +354,32 @@ where
         self
     }
 
+    /// Replies after selected events and snapshot commit.
+    #[must_use]
+    pub fn then_reply<R>(self, reply_to: ReplyTo<R>, reply: R) -> Self
+    where
+        R: Send + 'static,
+    {
+        self.then_run(move || {
+            let _ = reply_to.reply(reply);
+        })
+    }
+
+    /// Replies without persisting an event.
+    #[must_use]
+    pub fn reply<R>(reply_to: ReplyTo<R>, reply: R) -> Self
+    where
+        R: Send + 'static,
+    {
+        Self::none().then_reply(reply_to, reply)
+    }
+
+    /// Persists no events and sends no reply.
+    #[must_use]
+    pub fn no_reply() -> Self {
+        Self::none()
+    }
+
     /// Returns the selected events.
     #[must_use]
     pub fn events(&self) -> &[TaggedEvent<E>] {
@@ -243,8 +398,33 @@ where
         self.stop
     }
 
-    fn into_parts(self) -> (Vec<TaggedEvent<E>>, bool, bool, Vec<DurableSideEffect>) {
-        (self.events, self.snapshot, self.stop, self.side_effects)
+    /// Returns the stash directive selected by this effect.
+    #[must_use]
+    pub const fn stash_directive(&self) -> StashDirective {
+        self.stash
+    }
+
+    /// Returns true when this effect marks a command as unhandled.
+    #[must_use]
+    pub const fn is_unhandled(&self) -> bool {
+        self.unhandled
+    }
+
+    fn into_parts(self) -> EventSourcedEffectParts<E> {
+        (
+            self.events,
+            self.snapshot,
+            self.stop,
+            self.stash,
+            self.unhandled,
+            self.side_effects,
+        )
+    }
+
+    /// Splits this effect into parts for behavior testkits.
+    #[must_use]
+    pub fn into_test_parts(self) -> EventSourcedEffectParts<E> {
+        self.into_parts()
     }
 }
 
@@ -257,10 +437,22 @@ where
             .field("events", &self.events)
             .field("snapshot", &self.snapshot)
             .field("stop", &self.stop)
+            .field("stash", &self.stash)
+            .field("unhandled", &self.unhandled)
             .field("side_effect_count", &self.side_effects.len())
             .finish()
     }
 }
+
+/// Parts returned by [`EventSourcedEffect::into_test_parts`].
+pub type EventSourcedEffectParts<E> = (
+    Vec<TaggedEvent<E>>,
+    bool,
+    bool,
+    StashDirective,
+    bool,
+    Vec<DurableSideEffect>,
+);
 
 /// Spawns an event-sourced actor with default local actor and recovery options.
 pub fn spawn_event_sourced_actor<A, Journal, Snapshots>(
@@ -421,6 +613,11 @@ where
     }
 
     async fn recover(&mut self) -> RakkaResult<()> {
+        self.actor
+            .on_signal(PersistenceSignal::RecoveryStarted {
+                persistence_id: self.persistence_id.clone(),
+            })
+            .map_err(|error| error.into_rakka_error())?;
         let snapshot = self
             .snapshots
             .load(
@@ -452,6 +649,12 @@ where
         }
 
         self.recovered = Some(RecoveredState { state, sequence_nr });
+        self.actor
+            .on_signal(PersistenceSignal::RecoveryCompleted {
+                persistence_id: self.persistence_id.clone(),
+                sequence_nr,
+            })
+            .map_err(|error| error.into_rakka_error())?;
         Ok(())
     }
 
@@ -459,7 +662,7 @@ where
         &mut self,
         effect: EventSourcedEffect<A::Event>,
     ) -> RakkaResult<ActorAction> {
-        let (events, snapshot, stop, side_effects) = effect.into_parts();
+        let (events, snapshot, stop, _stash, _unhandled, side_effects) = effect.into_parts();
         let recovered = self.recovered.as_ref().ok_or_else(|| {
             crate::DurableError::NotRecovered {
                 persistence_id: self.persistence_id.clone(),
@@ -468,24 +671,32 @@ where
         })?;
         let mut state = recovered.state.clone();
         let mut sequence_nr = recovered.sequence_nr;
+        let mut persisted_events = false;
 
         if !events.is_empty() {
-            let persisted = self
-                .journal
-                .append(&self.persistence_id, sequence_nr, events)
-                .await
-                .map_err(|error| error.into_rakka_error())?;
+            let persisted = self.append_with_backoff(sequence_nr, events).await?;
+            let first_sequence_nr = persisted
+                .first()
+                .map_or(sequence_nr.next(), |record| record.metadata.sequence_nr);
             for record in persisted {
                 sequence_nr = record.metadata.sequence_nr;
                 state = self.actor.apply_event(&state, &record.event);
             }
+            persisted_events = true;
+            self.actor
+                .on_signal(PersistenceSignal::EventsPersisted {
+                    persistence_id: self.persistence_id.clone(),
+                    from: first_sequence_nr,
+                    to: sequence_nr,
+                })
+                .map_err(|error| error.into_rakka_error())?;
         }
 
-        if snapshot {
-            self.snapshots
-                .save(&self.persistence_id, sequence_nr, state.clone())
-                .await
-                .map_err(|error| error.into_rakka_error())?;
+        let retention = self.actor.retention_criteria();
+        if snapshot || (persisted_events && retention.should_snapshot(sequence_nr)) {
+            self.save_snapshot_with_backoff(sequence_nr, state.clone())
+                .await?;
+            self.apply_retention(sequence_nr).await?;
         }
 
         self.recovered = Some(RecoveredState { state, sequence_nr });
@@ -499,6 +710,128 @@ where
         } else {
             Ok(ActorAction::Continue)
         }
+    }
+
+    async fn append_with_backoff(
+        &mut self,
+        expected_sequence_nr: SequenceNr,
+        events: Vec<TaggedEvent<A::Event>>,
+    ) -> RakkaResult<Vec<EventRecord<A::Event>>> {
+        let backoff = self.actor.persist_failure_backoff();
+        let mut attempt = 0;
+
+        loop {
+            match self
+                .journal
+                .append(&self.persistence_id, expected_sequence_nr, events.clone())
+                .await
+            {
+                Ok(records) => return Ok(records),
+                Err(error) => {
+                    self.actor
+                        .on_signal(PersistenceSignal::PersistFailed {
+                            persistence_id: self.persistence_id.clone(),
+                            attempt,
+                            error_code: error.code(),
+                            message: error.to_string(),
+                        })
+                        .map_err(|error| error.into_rakka_error())?;
+                    if attempt >= backoff.max_retries() {
+                        return Err(error.into_rakka_error());
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(backoff.retry_delay()).await;
+                }
+            }
+        }
+    }
+
+    async fn save_snapshot_with_backoff(
+        &mut self,
+        sequence_nr: SequenceNr,
+        state: A::State,
+    ) -> RakkaResult<()> {
+        let backoff = self.actor.persist_failure_backoff();
+        let mut attempt = 0;
+
+        loop {
+            match self
+                .snapshots
+                .save(&self.persistence_id, sequence_nr, state.clone())
+                .await
+            {
+                Ok(_record) => {
+                    self.actor
+                        .on_signal(PersistenceSignal::SnapshotSaved {
+                            persistence_id: self.persistence_id.clone(),
+                            sequence_nr,
+                        })
+                        .map_err(|error| error.into_rakka_error())?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.actor
+                        .on_signal(PersistenceSignal::SnapshotFailed {
+                            persistence_id: self.persistence_id.clone(),
+                            attempt,
+                            error_code: error.code(),
+                            message: error.to_string(),
+                        })
+                        .map_err(|error| error.into_rakka_error())?;
+                    if attempt >= backoff.max_retries() {
+                        return Err(error.into_rakka_error());
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(backoff.retry_delay()).await;
+                }
+            }
+        }
+    }
+
+    async fn apply_retention(
+        &mut self,
+        latest_snapshot_sequence_nr: SequenceNr,
+    ) -> RakkaResult<()> {
+        let retention = self.actor.retention_criteria();
+        let keep = retention.keep_snapshots_count();
+
+        if keep != usize::MAX {
+            let snapshots = self
+                .snapshots
+                .list(&self.persistence_id, SnapshotSelection::latest())
+                .await
+                .map_err(|error| error.into_rakka_error())?;
+            for metadata in snapshots.iter().skip(keep) {
+                self.snapshots
+                    .delete(
+                        &self.persistence_id,
+                        SnapshotSelection::between(metadata.sequence_nr, metadata.sequence_nr),
+                    )
+                    .await
+                    .map_err(|error| error.into_rakka_error())?;
+            }
+        }
+
+        if retention.should_delete_events_on_snapshot() {
+            let delete_to = if keep == 0 {
+                latest_snapshot_sequence_nr
+            } else {
+                let retained = self
+                    .snapshots
+                    .list(&self.persistence_id, SnapshotSelection::latest())
+                    .await
+                    .map_err(|error| error.into_rakka_error())?;
+                retained
+                    .last()
+                    .map_or(latest_snapshot_sequence_nr, |metadata| metadata.sequence_nr)
+            };
+            self.journal
+                .delete_to(&self.persistence_id, delete_to)
+                .await
+                .map_err(|error| error.into_rakka_error())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -523,6 +856,11 @@ where
         _failure: &'a rakka_core::ActorFailure,
     ) -> ActorFuture<'a> {
         actor_future(async move {
+            self.actor
+                .on_signal(PersistenceSignal::PreRestart {
+                    persistence_id: self.persistence_id.clone(),
+                })
+                .map_err(|error| error.into_rakka_error())?;
             self.recover().await?;
             Ok(ActorAction::Continue)
         })
@@ -551,6 +889,21 @@ where
                 .map_err(|error| error.into_rakka_error())?;
 
             self.apply_effect(effect).await
+        })
+    }
+
+    fn stopped<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        _reason: &'a rakka_core::TerminationReason,
+    ) -> ActorFuture<'a> {
+        actor_future(async move {
+            self.actor
+                .on_signal(PersistenceSignal::PostStop {
+                    persistence_id: self.persistence_id.clone(),
+                })
+                .map_err(|error| error.into_rakka_error())?;
+            Ok(ActorAction::Continue)
         })
     }
 }

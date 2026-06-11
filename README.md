@@ -2,7 +2,7 @@
 
 Rakka is a Rust actor framework built around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
 
-The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, typed persistence storage foundations, a local event-sourced actor adapter, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
+The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, typed persistence storage foundations, Akka-named event-sourced and durable-state behavior facades, in-memory and PostgreSQL persistence stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
 
 See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
@@ -28,7 +28,7 @@ Historical implementation plans live in `docs/plans/`.
 | --- | --- |
 | `rakka` | Top-level facade crate and curated prelude for application code. |
 | `rakka-core` | Typed actors, actor refs, supervision, paths, shared metrics, and framework errors. |
-| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs, typed event/snapshot store foundations, a local event-sourced actor adapter, in-memory stores, and PostgreSQL durable-state storage plugin. |
+| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs, typed event/snapshot stores, event-sourced and durable-state behavior facades, query helpers, in-memory stores, and PostgreSQL persistence plugins. |
 | `rakka-cluster`, `rakka-remote`, `rakka-sharding` | Membership, remoting, protocol compatibility, and sharded entity routing. |
 | `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
 | `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |
@@ -124,6 +124,34 @@ Expected output:
 
 ```text
 Rakka durable counter recovered value 2.
+```
+
+### Event-Sourced Counter
+
+This example uses `EventSourcedBehavior`, the in-memory event journal, snapshots, replies after persistence, and snapshot retention.
+
+```sh
+cargo run -p rakka-example-event-sourced-counter
+```
+
+Expected output:
+
+```text
+Rakka event-sourced counter values: 1, 2, recovered 2.
+```
+
+### Sharded Cart Persistence
+
+This example derives event-sourced persistence ids from sharding entity type and entity ids using `PersistenceId::of`.
+
+```sh
+cargo run -p rakka-example-sharded-cart-persistence
+```
+
+Expected output:
+
+```text
+Rakka sharded cart persistence wrote cart-a total 2 on shard N and cart-b total 1 on shard N.
 ```
 
 ### Durable Workflow

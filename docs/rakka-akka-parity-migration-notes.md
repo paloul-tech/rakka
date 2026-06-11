@@ -157,21 +157,38 @@ let snapshots = kit.snapshots();
 let durable_state = kit.durable_state();
 ```
 
-This first Phase 3 slice is storage and testkit infrastructure. The
-`EventSourcedActor` adapter can already persist tagged events, recover from the
-latest matching snapshot, replay later journal entries, and run post-commit side
-effects:
+New event-sourced application code should prefer `EventSourcedBehavior`:
 
 ```rust
-let actor = spawn_event_sourced_actor(
-    &system,
-    "cart",
-    CartActor::new(persistence_id),
-    kit.journal(),
-    kit.snapshots(),
-)?;
+let behavior = EventSourcedBehavior::builder(persistence_id, CartState::default())
+    .on_command(|state, command| match command {
+        CartCommand::Add { item, reply_to } => {
+            EventSourcedEffect::persist(CartEvent::Added(item))
+                .then_reply(reply_to, state.total + 1)
+        }
+    })
+    .on_event(|state, event| state.apply(event))
+    .build()?
+    .with_retention_criteria(RetentionCriteria::snapshot_every(100).keep_snapshots(2));
+
+let cart = behavior.spawn(&system, "cart", kit.journal(), kit.snapshots())?;
 ```
 
-The Akka-named `EventSourcedBehavior` and `DurableStateBehavior` builders,
-reply-effect/stash/signal polish, query streams, and PostgreSQL journal/snapshot
-plugins remain planned follow-up work.
+Durable state now has the same builder shape:
+
+```rust
+let behavior = DurableStateBehavior::builder(persistence_id, CartState::default())
+    .on_command(|state, command| DurableEffect::persist(state.handle(command)))
+    .build()?;
+```
+
+Use `EventSourcedBehaviorTestKit` and `DurableStateBehaviorTestKit` for
+command/effect assertions. Use `current_events_by_persistence_id`,
+`current_events_by_tag`, `current_persistence_ids`, and
+`current_durable_state_ids` when a query should be consumed as a
+`rakka-stream` source.
+
+`EventSourcedActor` and `DurableActor` remain available for advanced cases that
+need fully async command handlers. The behavior builders intentionally keep
+their command and event handlers synchronous so ordinary call sites stay small
+and avoid higher-ranked async closure complexity.

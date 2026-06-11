@@ -20,8 +20,10 @@ members = [
     "examples/external-binary-wrapper",
     "examples/edge-gateway",
     "examples/generated-contracts",
+    "examples/event-sourced-counter",
     "examples/minimal-system",
     "examples/multi-node-sharding",
+    "examples/sharded-cart-persistence",
 ]
 
 [workspace.package]

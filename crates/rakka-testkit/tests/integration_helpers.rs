@@ -8,8 +8,9 @@ use rakka_grpc::{server_streaming_response, unary_service, GrpcUnaryConfig};
 use rakka_http::{json_service_route, HttpRouteConfig};
 use rakka_k8s::{KubernetesDrainController, KubernetesDrainStepResult, KubernetesNodeHealth};
 use rakka_persistence::{
-    DurableStateStore, EventJournal, PersistenceId, Revision, SequenceNr, SnapshotSelection,
-    SnapshotStore, TaggedEvent,
+    DurableEffect, DurableStateBehavior, DurableStateStore, EventJournal, EventSourcedBehavior,
+    EventSourcedEffect, PersistenceId, Revision, SequenceNr, SnapshotSelection, SnapshotStore,
+    TaggedEvent,
 };
 use rakka_stream::{bounded_channel, StreamLifecycle};
 use rakka_testkit::{
@@ -17,8 +18,8 @@ use rakka_testkit::{
     assert_probe_failed_with_reason, assert_stream_lifecycle, expect_grpc_stream_items,
     expect_grpc_unary_ok, expect_metric_observation, expect_stream_source_items, expect_terminated,
     grpc_request, http_post_json, spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe,
-    ActorContextProbeCommand, ActorContextProbeEvent, PersistenceTestKit, StopProbeCommand,
-    TestProbe,
+    ActorContextProbeCommand, ActorContextProbeEvent, DurableStateBehaviorTestKit,
+    EventSourcedBehaviorTestKit, PersistenceTestKit, StopProbeCommand, TestProbe,
 };
 use serde::{Deserialize, Serialize};
 
@@ -252,6 +253,75 @@ async fn persistence_testkit_bundles_phase_3_in_memory_stores() {
     assert_eq!(durable_state.persistence_ids().await.unwrap(), vec![id]);
 }
 
+#[test]
+fn behavior_testkits_cover_phase_3_effects() {
+    let event_sourced = EventSourcedBehavior::builder(
+        PersistenceId::of("counter", "behavior-testkit").unwrap(),
+        CounterSnapshot { value: 0 },
+    )
+    .on_command(|_state, command| match command {
+        CounterTestCommand::Increment(by) => {
+            EventSourcedEffect::persist(CounterEvent::Incremented(by))
+        }
+        CounterTestCommand::Snapshot => EventSourcedEffect::none().then_snapshot(),
+        CounterTestCommand::Get => EventSourcedEffect::no_reply(),
+        CounterTestCommand::Stop => EventSourcedEffect::stop(),
+    })
+    .on_event(|state, event| match event {
+        CounterEvent::Incremented(by) => CounterSnapshot {
+            value: state.value + by,
+        },
+    })
+    .build()
+    .expect("event-sourced behavior should build");
+    let mut event_kit = EventSourcedBehaviorTestKit::new(event_sourced);
+
+    let outcome = event_kit
+        .run_command(CounterTestCommand::Increment(5))
+        .expect("event command should run");
+    assert_eq!(outcome.state.value, 5);
+    assert_eq!(outcome.sequence_nr, SequenceNr::FIRST);
+    let snapshot = event_kit
+        .run_command(CounterTestCommand::Snapshot)
+        .expect("snapshot command should run");
+    assert!(snapshot.snapshot);
+    assert_eq!(event_kit.snapshots()[0].value, 5);
+    assert!(
+        event_kit
+            .run_command(CounterTestCommand::Stop)
+            .expect("stop command should run")
+            .stop
+    );
+
+    let durable = DurableStateBehavior::builder(
+        PersistenceId::of("counter", "durable-testkit").unwrap(),
+        CounterSnapshot { value: 0 },
+    )
+    .on_command(|state, command| match command {
+        CounterTestCommand::Increment(by) => DurableEffect::persist(CounterSnapshot {
+            value: state.value + by,
+        }),
+        CounterTestCommand::Snapshot | CounterTestCommand::Get => DurableEffect::none(),
+        CounterTestCommand::Stop => DurableEffect::stop(),
+    })
+    .build()
+    .expect("durable behavior should build");
+    let mut durable_kit = DurableStateBehaviorTestKit::new(durable);
+
+    let outcome = durable_kit
+        .run_command(CounterTestCommand::Increment(2))
+        .expect("durable command should run");
+    assert_eq!(outcome.state.value, 2);
+    assert_eq!(outcome.revision, Revision::new(1));
+    assert_eq!(
+        durable_kit
+            .run_command(CounterTestCommand::Get)
+            .expect("get command should run")
+            .revision,
+        Revision::new(1)
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NumberRequest {
     value: i64,
@@ -265,6 +335,14 @@ struct NumberReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CounterEvent {
     Incremented(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CounterTestCommand {
+    Increment(i64),
+    Snapshot,
+    Get,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

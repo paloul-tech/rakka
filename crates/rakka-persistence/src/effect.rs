@@ -2,12 +2,15 @@
 
 use std::fmt::{self, Debug, Formatter};
 
+use rakka_core::ReplyTo;
+
 use crate::store::DurableState;
 
 /// Side effect executed after a durable state change commits.
 pub type DurableSideEffect = Box<dyn FnOnce() + Send + 'static>;
 
-type DurableEffectParts<S> = (DurableStateChange<S>, bool, Vec<DurableSideEffect>);
+/// Parts returned by [`DurableEffect::into_test_parts`].
+pub type DurableEffectParts<S> = (DurableStateChange<S>, bool, Vec<DurableSideEffect>);
 
 /// Durable state change selected by a command handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +20,8 @@ where
 {
     /// Leave durable state unchanged.
     None,
+    /// Mark a command as intentionally unhandled.
+    Unhandled,
     /// Persist a replacement state value.
     Persist(S),
     /// Delete durable state.
@@ -42,6 +47,16 @@ where
     pub fn none() -> Self {
         Self {
             state_change: DurableStateChange::None,
+            stop: false,
+            side_effects: Vec::new(),
+        }
+    }
+
+    /// Marks a command as unhandled without changing durable state.
+    #[must_use]
+    pub fn unhandled() -> Self {
+        Self {
+            state_change: DurableStateChange::Unhandled,
             stop: false,
             side_effects: Vec::new(),
         }
@@ -91,6 +106,32 @@ where
         self
     }
 
+    /// Replies after any selected durable state change commits.
+    #[must_use]
+    pub fn then_reply<R>(self, reply_to: ReplyTo<R>, reply: R) -> Self
+    where
+        R: Send + 'static,
+    {
+        self.then_run(move || {
+            let _ = reply_to.reply(reply);
+        })
+    }
+
+    /// Replies without changing durable state.
+    #[must_use]
+    pub fn reply<R>(reply_to: ReplyTo<R>, reply: R) -> Self
+    where
+        R: Send + 'static,
+    {
+        Self::none().then_reply(reply_to, reply)
+    }
+
+    /// Leaves durable state unchanged and sends no reply.
+    #[must_use]
+    pub fn no_reply() -> Self {
+        Self::none()
+    }
+
     /// Returns the selected state change.
     #[must_use]
     pub const fn state_change(&self) -> &DurableStateChange<S> {
@@ -105,6 +146,12 @@ where
 
     pub(crate) fn into_parts(self) -> DurableEffectParts<S> {
         (self.state_change, self.stop, self.side_effects)
+    }
+
+    /// Splits this effect into parts for behavior testkits.
+    #[must_use]
+    pub fn into_test_parts(self) -> DurableEffectParts<S> {
+        self.into_parts()
     }
 }
 
