@@ -73,9 +73,14 @@ pub mod prelude {
 
     #[cfg(feature = "persistence")]
     pub use rakka_persistence::{
-        durable_actor_future, spawn_durable_actor, spawn_durable_actor_factory, DurableActor,
-        DurableActorContext, DurableActorFuture, DurableEffect, DurableState, DurableStateStore,
-        InMemoryDurableStateStore, PersistenceId, Revision,
+        durable_actor_future, event_sourced_actor_future, spawn_durable_actor,
+        spawn_durable_actor_factory, spawn_event_sourced_actor, spawn_event_sourced_actor_factory,
+        DurableActor, DurableActorContext, DurableActorFuture, DurableEffect, DurableState,
+        DurableStateStore, EventJournal, EventMetadata, EventRecord, EventSourcedActor,
+        EventSourcedActorContext, EventSourcedActorFuture, EventSourcedEffect,
+        InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore, PersistenceEvent,
+        PersistenceId, RecoveryOptions, Revision, SequenceNr, SnapshotMetadata, SnapshotRecord,
+        SnapshotSelection, SnapshotStore, TaggedEvent,
     };
 
     #[cfg(feature = "sharding")]

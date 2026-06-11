@@ -6,6 +6,7 @@
 pub mod actor;
 pub mod effect;
 pub mod error;
+pub mod event_sourced;
 pub mod memory;
 pub mod store;
 
@@ -18,9 +19,17 @@ pub use actor::{
 };
 pub use effect::{DurableEffect, DurableStateChange};
 pub use error::{DurableError, DurableResult};
-pub use memory::InMemoryDurableStateStore;
+pub use event_sourced::{
+    event_sourced_actor_future, spawn_event_sourced_actor, spawn_event_sourced_actor_factory,
+    spawn_event_sourced_actor_factory_with_options, spawn_event_sourced_actor_with_options,
+    EventSourcedActor, EventSourcedActorContext, EventSourcedActorFuture, EventSourcedEffect,
+};
+pub use memory::{InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore};
 pub use store::{
-    DurableState, DurableStateStore, PersistenceId, Revision, StateCodec, StateRecord, StoreFuture,
+    DurableState, DurableStateStore, EventJournal, EventMetadata, EventRecord, PersistenceEvent,
+    PersistenceId, RecoveryOptions, Revision, SequenceNr, SnapshotMetadata, SnapshotRecord,
+    SnapshotSelection, SnapshotStore, StateCodec, StateRecord, StoreFuture, TaggedEvent,
+    PERSISTENCE_ID_SEPARATOR,
 };
 
 /// Crate name used in diagnostics.

@@ -2,7 +2,7 @@
 
 Rakka is a Rust actor framework built around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
 
-The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
+The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, typed persistence storage foundations, a local event-sourced actor adapter, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
 
 See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
@@ -28,7 +28,7 @@ Historical implementation plans live in `docs/plans/`.
 | --- | --- |
 | `rakka` | Top-level facade crate and curated prelude for application code. |
 | `rakka-core` | Typed actors, actor refs, supervision, paths, shared metrics, and framework errors. |
-| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs plus PostgreSQL storage plugin. |
+| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs, typed event/snapshot store foundations, a local event-sourced actor adapter, in-memory stores, and PostgreSQL durable-state storage plugin. |
 | `rakka-cluster`, `rakka-remote`, `rakka-sharding` | Membership, remoting, protocol compatibility, and sharded entity routing. |
 | `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
 | `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |

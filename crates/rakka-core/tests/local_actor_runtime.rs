@@ -687,9 +687,7 @@ impl Actor for ContextFacadeActor {
                 assert!(ctx.stop_child_named("child"));
                 ctx.stop(&unwatch_child).unwrap();
 
-                let adapter = ctx
-                    .message_adapter(|value| ContextFacadeMessage::Adapted(value))
-                    .unwrap();
+                let adapter = ctx.message_adapter(ContextFacadeMessage::Adapted).unwrap();
                 adapter.tell("adapted").unwrap();
 
                 ctx.start_timer_once(

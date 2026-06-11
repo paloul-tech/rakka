@@ -23,6 +23,10 @@ use rakka_k8s::{
     KubernetesDrainOutcome, KubernetesDrainReport, KubernetesDrainStepStatus,
     KubernetesProbeSnapshot,
 };
+use rakka_persistence::{
+    DurableState, InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore,
+    PersistenceEvent,
+};
 use rakka_stream::{StreamLifecycle, StreamSource};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -43,6 +47,82 @@ pub const fn subsystem() -> Subsystem {
 pub async fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     future.await
 }
+
+/// Reusable in-memory persistence stores for event-sourced and durable-state tests.
+#[derive(Debug, Clone)]
+pub struct PersistenceTestKit<E, S, D>
+where
+    E: PersistenceEvent,
+    S: DurableState,
+    D: DurableState,
+{
+    journal: InMemoryEventJournal<E>,
+    snapshots: InMemorySnapshotStore<S>,
+    durable_state: InMemoryDurableStateStore<D>,
+}
+
+impl<E, S, D> PersistenceTestKit<E, S, D>
+where
+    E: PersistenceEvent,
+    S: DurableState,
+    D: DurableState,
+{
+    /// Creates an empty persistence testkit.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            journal: InMemoryEventJournal::new(),
+            snapshots: InMemorySnapshotStore::new(),
+            durable_state: InMemoryDurableStateStore::new(),
+        }
+    }
+
+    /// Creates a persistence testkit from explicit stores.
+    #[must_use]
+    pub fn from_parts(
+        journal: InMemoryEventJournal<E>,
+        snapshots: InMemorySnapshotStore<S>,
+        durable_state: InMemoryDurableStateStore<D>,
+    ) -> Self {
+        Self {
+            journal,
+            snapshots,
+            durable_state,
+        }
+    }
+
+    /// Returns the in-memory event journal.
+    #[must_use]
+    pub fn journal(&self) -> InMemoryEventJournal<E> {
+        self.journal.clone()
+    }
+
+    /// Returns the in-memory snapshot store.
+    #[must_use]
+    pub fn snapshots(&self) -> InMemorySnapshotStore<S> {
+        self.snapshots.clone()
+    }
+
+    /// Returns the in-memory durable state store.
+    #[must_use]
+    pub fn durable_state(&self) -> InMemoryDurableStateStore<D> {
+        self.durable_state.clone()
+    }
+}
+
+impl<E, S, D> Default for PersistenceTestKit<E, S, D>
+where
+    E: PersistenceEvent,
+    S: DurableState,
+    D: DurableState,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Persistence testkit for event-sourced behavior tests without durable state.
+pub type EventSourcedPersistenceTestKit<E, S> = PersistenceTestKit<E, S, ()>;
 
 /// Captured HTTP response returned by in-process router helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]

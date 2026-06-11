@@ -1220,6 +1220,7 @@ dependencies = [
  "rakka-grpc",
  "rakka-http",
  "rakka-k8s",
+ "rakka-persistence",
  "rakka-remote",
  "rakka-sharding",
  "rakka-stream",

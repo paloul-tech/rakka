@@ -21,6 +21,7 @@ rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 rakka-grpc = { path = "../rakka-grpc", version = "0.1.0" }
 rakka-http = { path = "../rakka-http", version = "0.1.0" }
 rakka-k8s = { path = "../rakka-k8s", version = "0.1.0" }
+rakka-persistence = { path = "../rakka-persistence", version = "0.1.0" }
 rakka-remote = { path = "../rakka-remote", version = "0.1.0" }
 rakka-stream = { path = "../rakka-stream", version = "0.1.0", default-features = false }
 serde.workspace = true

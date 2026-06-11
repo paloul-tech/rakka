@@ -5,7 +5,7 @@ use std::fmt::{self, Display, Formatter};
 
 use rakka_core::{RakkaError, Subsystem};
 
-use crate::store::{PersistenceId, Revision};
+use crate::store::{PersistenceId, Revision, SequenceNr};
 
 /// Convenient result alias for durable state operations.
 pub type DurableResult<T> = Result<T, DurableError>;
@@ -21,6 +21,20 @@ pub enum DurableError {
         expected: Revision,
         /// Revision observed in the store.
         actual: Revision,
+    },
+    /// Journal sequence number differed from the caller's expected sequence number.
+    SequenceConflict {
+        /// Durable identity being written.
+        persistence_id: PersistenceId,
+        /// Sequence number expected by the caller.
+        expected: SequenceNr,
+        /// Sequence number observed in the journal.
+        actual: SequenceNr,
+    },
+    /// Persistence id construction failed validation.
+    InvalidPersistenceId {
+        /// Human-readable validation failure detail.
+        message: String,
     },
     /// Underlying store failed or was unavailable.
     Store {
@@ -56,6 +70,28 @@ impl DurableError {
         }
     }
 
+    /// Creates a journal sequence conflict error.
+    #[must_use]
+    pub fn sequence_conflict(
+        persistence_id: PersistenceId,
+        expected: SequenceNr,
+        actual: SequenceNr,
+    ) -> Self {
+        Self::SequenceConflict {
+            persistence_id,
+            expected,
+            actual,
+        }
+    }
+
+    /// Creates an invalid persistence id error.
+    #[must_use]
+    pub fn invalid_persistence_id(message: impl Into<String>) -> Self {
+        Self::InvalidPersistenceId {
+            message: message.into(),
+        }
+    }
+
     /// Creates a store error.
     #[must_use]
     pub fn store(backend: &'static str, message: impl Into<String>) -> Self {
@@ -84,6 +120,8 @@ impl DurableError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::RevisionConflict { .. } => "revision-conflict",
+            Self::SequenceConflict { .. } => "sequence-conflict",
+            Self::InvalidPersistenceId { .. } => "invalid-persistence-id",
             Self::Store { .. } => "store-error",
             Self::Codec { .. } => "codec-error",
             Self::NotRecovered { .. } => "not-recovered",
@@ -102,6 +140,17 @@ impl Display for DurableError {
                 f,
                 "revision conflict for {persistence_id}: expected {expected}, actual {actual}"
             ),
+            Self::SequenceConflict {
+                persistence_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "sequence conflict for {persistence_id}: expected {expected}, actual {actual}"
+            ),
+            Self::InvalidPersistenceId { message } => {
+                write!(f, "invalid persistence id: {message}")
+            }
             Self::Store { backend, message } => write!(f, "{backend} store error: {message}"),
             Self::Codec { message } => write!(f, "state codec error: {message}"),
             Self::NotRecovered { persistence_id } => {

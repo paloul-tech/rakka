@@ -251,6 +251,31 @@ Validation:
   - Durable-state counter migrated to the new behavior API.
   - Sharded event-sourced cart using `PersistenceId::of`.
 
+Implementation status on 2026-06-11:
+
+- Landed the first Phase 3 storage foundation:
+  - `PersistenceId::of(entity_type, entity_id)` with separator validation.
+  - `SequenceNr`, `SnapshotSelection`, `SnapshotMetadata`, `RecoveryOptions`,
+    `EventMetadata`, `EventRecord`, `TaggedEvent`, and optional slice metadata.
+  - `EventJournal<E>` and `SnapshotStore<S>` traits.
+  - `DurableStateStore<S>::persistence_ids` query hook.
+  - `InMemoryEventJournal`, `InMemorySnapshotStore`, and durable-state
+    persistence id queries.
+  - `EventSourcedActor`, `EventSourcedEffect`, spawn helpers, snapshot-first
+    recovery, journal replay, and post-commit side effects for the local actor
+    runtime.
+  - `PersistenceTestKit` bundling in-memory journal, snapshot, and durable-state
+    stores for reusable tests.
+- Remaining Phase 3 work:
+  - Akka-named `EventSourcedBehavior` builders over the current
+    `EventSourcedActor` runtime.
+  - `DurableStateBehavior` facade over the current durable actor runtime.
+  - Reply-effect, stash, retention, signal, and persist-failure backoff model.
+  - Query stream integration with `rakka-stream`.
+  - PostgreSQL journal and snapshot implementations.
+  - Event-sourced and durable-state behavior testkits.
+  - Event-sourced counter and sharded cart examples.
+
 ## Phase 4: High-Level Cluster Sharding
 
 Objectives:

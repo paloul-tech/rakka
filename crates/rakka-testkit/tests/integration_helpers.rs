@@ -7,13 +7,18 @@ use rakka_core::{InMemoryMetricsRecorder, MetricKind, MetricsRecorder};
 use rakka_grpc::{server_streaming_response, unary_service, GrpcUnaryConfig};
 use rakka_http::{json_service_route, HttpRouteConfig};
 use rakka_k8s::{KubernetesDrainController, KubernetesDrainStepResult, KubernetesNodeHealth};
+use rakka_persistence::{
+    DurableStateStore, EventJournal, PersistenceId, Revision, SequenceNr, SnapshotSelection,
+    SnapshotStore, TaggedEvent,
+};
 use rakka_stream::{bounded_channel, StreamLifecycle};
 use rakka_testkit::{
     assert_counter_total, assert_drain_complete, assert_http_status, assert_metric_attribute,
     assert_probe_failed_with_reason, assert_stream_lifecycle, expect_grpc_stream_items,
     expect_grpc_unary_ok, expect_metric_observation, expect_stream_source_items, expect_terminated,
     grpc_request, http_post_json, spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe,
-    ActorContextProbeCommand, ActorContextProbeEvent, StopProbeCommand, TestProbe,
+    ActorContextProbeCommand, ActorContextProbeEvent, PersistenceTestKit, StopProbeCommand,
+    TestProbe,
 };
 use serde::{Deserialize, Serialize};
 
@@ -204,6 +209,49 @@ async fn testkit_helpers_cover_phase_2_actor_context_surfaces() {
     system.terminate().await.expect("system should terminate");
 }
 
+#[tokio::test]
+async fn persistence_testkit_bundles_phase_3_in_memory_stores() {
+    let kit = PersistenceTestKit::<CounterEvent, CounterSnapshot, CounterSnapshot>::new();
+    let id = PersistenceId::of("counter", "testkit").expect("persistence id should be valid");
+
+    let journal = kit.journal();
+    journal
+        .append(
+            &id,
+            SequenceNr::INITIAL,
+            vec![TaggedEvent::with_tags(
+                CounterEvent::Incremented(3),
+                ["counter"],
+            )],
+        )
+        .await
+        .expect("journal append should succeed");
+    let tagged = journal
+        .events_by_tag("counter")
+        .await
+        .expect("tag query should succeed");
+    assert_eq!(tagged[0].event, CounterEvent::Incremented(3));
+
+    let snapshots = kit.snapshots();
+    snapshots
+        .save(&id, SequenceNr::FIRST, CounterSnapshot { value: 3 })
+        .await
+        .expect("snapshot save should succeed");
+    let snapshot = snapshots
+        .load(&id, SnapshotSelection::latest())
+        .await
+        .expect("snapshot load should succeed")
+        .expect("snapshot should exist");
+    assert_eq!(snapshot.snapshot.value, 3);
+
+    let durable_state = kit.durable_state();
+    durable_state
+        .compare_and_set(&id, Revision::INITIAL, CounterSnapshot { value: 4 })
+        .await
+        .expect("durable state write should succeed");
+    assert_eq!(durable_state.persistence_ids().await.unwrap(), vec![id]);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NumberRequest {
     value: i64,
@@ -211,5 +259,15 @@ struct NumberRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NumberReply {
+    value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CounterEvent {
+    Incremented(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CounterSnapshot {
     value: i64,
 }

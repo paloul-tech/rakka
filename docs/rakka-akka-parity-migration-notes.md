@@ -133,3 +133,45 @@ Tests that exercise these context APIs should prefer the reusable
 supported through manual `Actor` implementations, `Behavior`, `setup`,
 `ctx.ask`, and `ctx.pipe_to_self`. A future fully async closure helper should be
 additive so existing `actor_fn` call sites remain stable.
+
+## Phase 3
+
+Phase 3 starts the full typed persistence track. Existing durable actors and
+durable-state stores remain valid, and the storage vocabulary now has the
+Akka-like pieces needed for event sourcing.
+
+Prefer structured persistence ids for new entity-style code:
+
+```rust
+let persistence_id = PersistenceId::of("cart", cart_id)?;
+```
+
+Use `InMemoryEventJournal`, `InMemorySnapshotStore`, and
+`InMemoryDurableStateStore` directly for low-level store tests, or use
+`PersistenceTestKit` when a test needs all three stores:
+
+```rust
+let kit = PersistenceTestKit::<CartEvent, CartSnapshot, CartSnapshot>::new();
+let journal = kit.journal();
+let snapshots = kit.snapshots();
+let durable_state = kit.durable_state();
+```
+
+This first Phase 3 slice is storage and testkit infrastructure. The
+`EventSourcedActor` adapter can already persist tagged events, recover from the
+latest matching snapshot, replay later journal entries, and run post-commit side
+effects:
+
+```rust
+let actor = spawn_event_sourced_actor(
+    &system,
+    "cart",
+    CartActor::new(persistence_id),
+    kit.journal(),
+    kit.snapshots(),
+)?;
+```
+
+The Akka-named `EventSourcedBehavior` and `DurableStateBehavior` builders,
+reply-effect/stash/signal polish, query streams, and PostgreSQL journal/snapshot
+plugins remain planned follow-up work.
