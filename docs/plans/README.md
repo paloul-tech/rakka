@@ -11,5 +11,6 @@ Use the product docs in `docs/` for current behavior, validation, examples, comp
 - `rakka-phase-4-continuation-plan.md`: Phase 4 process actor and durable workflow continuation plan.
 - `rakka-phase-5-continuation-plan.md`: Phase 5 stream, HTTP/gRPC, Kubernetes, and metrics continuation plan.
 - `rakka-v1-hardening-plan.md`: V1 hardening slice plan.
+- `rakka-akka-parity-implementation-plan.md`: post-v1 Akka Core parity and API simplification plan.
 
 When a plan creates durable user-facing behavior, update the relevant product doc in `docs/` as the source of truth.
