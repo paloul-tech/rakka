@@ -86,3 +86,50 @@ system.when_terminated().await;
 `ActorRefResolver` can serialize and resolve live local typed refs. Resolution
 intentionally fails when the path is empty, belongs to another system, has been
 reincarnated with a new uid, or is requested with the wrong message type.
+
+## Phase 2
+
+Phase 2 adds high-level actor and context ergonomics while keeping existing
+`Actor` implementations valid.
+
+Manual actor structs remain supported:
+
+```rust
+let actor = system.spawn_actor("echo", EchoActor)?;
+```
+
+New examples should prefer the facade names:
+
+```rust
+let actor = system.spawn("echo", actor_fn(|_ctx, msg| {
+    match msg {
+        EchoMessage::Ping { reply_to } => {
+            let _ = reply_to.reply("pong");
+            Ok(ActorAction::Continue)
+        }
+    }
+}))?;
+```
+
+Use `setup` when initialization needs the actor context:
+
+```rust
+let actor = system.spawn("configured", setup(|ctx| {
+    let path = ctx.path().to_string();
+    Ok(MyBehavior { path })
+}))?;
+```
+
+Inside actors, prefer `ctx.spawn`, `ctx.spawn_anonymous`, `ctx.children`,
+`ctx.child`, `ctx.watch_with`, `ctx.start_timer_once`, `ctx.ask`, and
+`ctx.pipe_to_self` over ad hoc task or timer wiring.
+
+Tests that exercise these context APIs should prefer the reusable
+`rakka-testkit` probes: `spawn_actor_context_probe`, `spawn_stop_probe`,
+`spawn_echo_probe`, `expect_terminated`, `TestProbe::expect_message_eq`, and
+`TestProbe::expect_no_message`.
+
+`actor_fn` is intentionally synchronous today. Async actor work remains
+supported through manual `Actor` implementations, `Behavior`, `setup`,
+`ctx.ask`, and `ctx.pipe_to_self`. A future fully async closure helper should be
+additive so existing `actor_fn` call sites remain stable.

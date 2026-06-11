@@ -446,6 +446,89 @@ impl ActorSystem {
     }
 
     /// Spawns a local actor with default options.
+    pub fn spawn<A>(&self, name: impl AsRef<str>, actor: A) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+    {
+        self.spawn_actor(name, actor)
+    }
+
+    /// Spawns a local actor using a restartable factory and default options.
+    pub fn spawn_factory<A, F>(
+        &self,
+        name: impl AsRef<str>,
+        factory: F,
+    ) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_actor_factory(name, factory)
+    }
+
+    /// Spawns a local actor using a restartable factory and explicit options.
+    pub fn spawn_with_options<A, F>(
+        &self,
+        name: impl AsRef<str>,
+        factory: F,
+        options: ActorOptions,
+    ) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_actor_with_options(name, factory, options)
+    }
+
+    /// Spawns an anonymous user actor with default options.
+    pub fn spawn_anonymous<A>(&self, actor: A) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+    {
+        let actor = Mutex::new(Some(actor));
+        self.spawn_anonymous_with_options(
+            move || {
+                actor
+                    .lock()
+                    .expect("actor factory mutex poisoned")
+                    .take()
+                    .expect("single-use actor factory cannot restart")
+            },
+            ActorOptions::default(),
+        )
+    }
+
+    /// Spawns an anonymous user actor using a restartable factory and default options.
+    pub fn spawn_anonymous_factory<A, F>(&self, factory: F) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_anonymous_with_options(factory, ActorOptions::default())
+    }
+
+    /// Spawns an anonymous user actor using a restartable factory and explicit options.
+    pub fn spawn_anonymous_with_options<A, F>(
+        &self,
+        factory: F,
+        options: ActorOptions,
+    ) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        if options.mailbox_capacity == 0 {
+            return Err(RakkaError::core(
+                "invalid-mailbox-capacity",
+                "actor mailbox capacity must be greater than zero",
+            ));
+        }
+
+        let (path, uid) = self.next_anonymous_user_identity();
+        spawn_actor_task(self.clone(), path, uid, factory, options)
+    }
+
+    /// Spawns a local actor with default options.
     pub fn spawn_actor<A>(&self, name: impl AsRef<str>, actor: A) -> RakkaResult<ActorRef<A::Msg>>
     where
         A: Actor,
@@ -642,6 +725,16 @@ impl ActorSystem {
         Ok((parent.child(child_name), uid))
     }
 
+    pub(crate) fn anonymous_child_identity(
+        &self,
+        parent: &ActorPath,
+    ) -> (String, ActorPath, ActorUid) {
+        let uid = self.next_actor_uid();
+        let name = format!("$anon-{}", uid.value());
+        let path = parent.child(&name);
+        (name, path, uid)
+    }
+
     pub(crate) fn dead_letters(&self) -> broadcast::Sender<DeadLetter> {
         self.inner.dead_letters.clone()
     }
@@ -777,6 +870,12 @@ impl ActorSystem {
             ActorPath::user(self.name(), actor_name),
             self.next_actor_uid(),
         ))
+    }
+
+    fn next_anonymous_user_identity(&self) -> (ActorPath, ActorUid) {
+        let uid = self.next_actor_uid();
+        let name = format!("$anon-{}", uid.value());
+        (ActorPath::user(self.name(), &name), uid)
     }
 
     fn next_system_identity(&self, actor_name: &str) -> RakkaResult<(ActorPath, ActorUid)> {

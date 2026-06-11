@@ -17,10 +17,10 @@ pub mod system;
 pub mod telemetry;
 
 pub use actor::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFailure, ActorFuture, ActorRef,
-    ActorResult, ActorRuntimeSnapshot, ActorTerminated, AskError, Message, ReplyTo,
-    SerializedActorRef, StopError, TellError, TerminationReason, TimerHandle,
-    DEFAULT_MAILBOX_CAPACITY,
+    actor_fn, actor_future, setup, Actor, ActorAction, ActorContext, ActorFailure, ActorFn,
+    ActorFuture, ActorRef, ActorResult, ActorRuntimeSnapshot, ActorTerminated, ActorTraceContext,
+    AskError, Behavior, BehaviorActor, Message, ReplyTo, SerializedActorRef, SetupActor, StopError,
+    TellError, TerminationReason, TimerHandle, WatchHandle, DEFAULT_MAILBOX_CAPACITY,
 };
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
@@ -43,7 +43,9 @@ pub use operational::{
     DEFAULT_REMOTE_OUTBOUND_QUEUE_CAPACITY, DEFAULT_STREAM_DRAIN_TIMEOUT,
 };
 pub use path::{validate_actor_path_segment, ActorPath, ActorUid};
-pub use supervision::{ActorOptions, SupervisionStrategy};
+pub use supervision::{
+    ActorOptions, ActorProps, DispatcherHint, SpawnOptions, SupervisionStrategy,
+};
 pub use system::{
     ActorRefResolver, ActorSystem, ActorSystemBuilder, ActorSystemRuntimeSettings,
     ActorSystemSerializationRegistry, ActorSystemShutdownConfig, ActorSystemSnapshot,

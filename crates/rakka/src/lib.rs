@@ -61,12 +61,14 @@
 /// Common application imports for Rakka.
 pub mod prelude {
     pub use rakka_core::{
-        actor_future, Actor, ActorAction, ActorContext, ActorFailure, ActorFuture, ActorPath,
-        ActorRef, ActorRefResolver, ActorResult, ActorSystem, ActorSystemBuilder,
-        ActorSystemRuntimeSettings, ActorSystemSerializationRegistry, ActorSystemShutdownConfig,
-        ActorTerminated, ActorUid, AskError, InMemoryMetricsRecorder, Message, MetricsRecorder,
-        NoopMetricsRecorder, RakkaError, RakkaResult, ReplyTo, SerializedActorRef, StopError,
-        SupervisionStrategy, TellError, TerminationReason, TimerHandle,
+        actor_fn, actor_future, setup, Actor, ActorAction, ActorContext, ActorFailure, ActorFn,
+        ActorFuture, ActorPath, ActorProps, ActorRef, ActorRefResolver, ActorResult, ActorSystem,
+        ActorSystemBuilder, ActorSystemRuntimeSettings, ActorSystemSerializationRegistry,
+        ActorSystemShutdownConfig, ActorTerminated, ActorTraceContext, ActorUid, AskError,
+        Behavior, BehaviorActor, DispatcherHint, InMemoryMetricsRecorder, Message, MetricsRecorder,
+        NoopMetricsRecorder, RakkaError, RakkaResult, ReplyTo, SerializedActorRef, SetupActor,
+        SpawnOptions, StopError, SupervisionStrategy, TellError, TerminationReason, TimerHandle,
+        WatchHandle,
     };
 
     #[cfg(feature = "persistence")]

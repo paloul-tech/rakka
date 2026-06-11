@@ -159,6 +159,35 @@ Validation:
   pipe-to-self.
 - Minimal-system example rewritten to the high-level style.
 
+Implementation status on 2026-06-11:
+
+- Added `actor_fn` for synchronous function-style actors.
+- Added `Behavior`, `BehaviorActor`, `SetupActor`, and `setup` for context-aware
+  initialization.
+- Added `ActorSystem::spawn`, `spawn_factory`, `spawn_with_options`, and
+  anonymous spawn aliases while keeping the existing `spawn_actor` API.
+- Added `SpawnOptions` and `ActorProps` aliases over `ActorOptions`, plus
+  dispatcher, instrumentation, and blocking hints.
+- Added `ActorContext::spawn`, `spawn_anonymous`, `children`, `child`, `stop`,
+  `stop_child_named`, `watch`, `watch_with`, and `unwatch`.
+- Added keyed one-shot timers, receive timeout configuration, message adapters,
+  context ask, ask-with-status, and pipe-to-self helpers.
+- Added actor trace context helpers for actor-scoped logging and tracing fields.
+- Rewrote `examples/minimal-system` to use `rakka::prelude`,
+  `ActorSystem::spawn`, `actor_fn`, and `terminate().await`.
+- Added local actor runtime coverage for function actors, setup actors, context
+  spawn/child lookup, anonymous children, watch/unwatch, adapters, timers,
+  receive timeout, context ask, and pipe-to-self.
+- Added reusable `rakka-testkit` probes for timers, receive timeouts,
+  watch/unwatch, context ask, pipe-to-self, and termination assertions.
+- Added `docs/rakka-akka-parity-phase-2-actor-facade.md` with actor-shape guidance, context
+  idioms, testkit probe examples, and async closure facade tradeoffs.
+
+Remaining follow-up:
+
+- Prototype an additive async closure helper only if its call site avoids
+  boxed-future annotations and higher-ranked lifetime noise for users.
+
 ## Phase 3: Full Typed Persistence
 
 Objectives:

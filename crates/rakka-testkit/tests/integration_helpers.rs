@@ -11,8 +11,9 @@ use rakka_stream::{bounded_channel, StreamLifecycle};
 use rakka_testkit::{
     assert_counter_total, assert_drain_complete, assert_http_status, assert_metric_attribute,
     assert_probe_failed_with_reason, assert_stream_lifecycle, expect_grpc_stream_items,
-    expect_grpc_unary_ok, expect_metric_observation, expect_stream_source_items, grpc_request,
-    http_post_json,
+    expect_grpc_unary_ok, expect_metric_observation, expect_stream_source_items, expect_terminated,
+    grpc_request, http_post_json, spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe,
+    ActorContextProbeCommand, ActorContextProbeEvent, StopProbeCommand, TestProbe,
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,123 @@ async fn testkit_helpers_cover_phase_5_surfaces() {
         MetricKind::Counter,
     );
     assert_metric_attribute(&observation, "surface", "testkit");
+}
+
+#[tokio::test]
+async fn testkit_helpers_cover_phase_2_actor_context_surfaces() {
+    let system = rakka_core::ActorSystem::new("phase-2-testkit");
+    let mut events = TestProbe::<ActorContextProbeEvent>::spawn(&system, "events")
+        .expect("event probe should spawn");
+    let context = spawn_actor_context_probe(&system, "context", events.actor_ref())
+        .expect("context probe should spawn");
+
+    context
+        .tell(ActorContextProbeCommand::StartTimer {
+            key: "tick".to_owned(),
+            delay: Duration::from_millis(10),
+        })
+        .expect("timer command should send");
+    events
+        .expect_message_eq(
+            ActorContextProbeEvent::TimerFired("tick".to_owned()),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("timer should fire");
+
+    context
+        .tell(ActorContextProbeCommand::EnableReceiveTimeout {
+            delay: Duration::from_millis(10),
+        })
+        .expect("receive-timeout command should send");
+    events
+        .expect_message_eq(
+            ActorContextProbeEvent::ReceiveTimeout,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("receive timeout should fire");
+
+    let watched = spawn_stop_probe(&system, "watched").expect("watched actor should spawn");
+    context
+        .tell(ActorContextProbeCommand::WatchStopper {
+            target: watched.clone(),
+        })
+        .expect("watch command should send");
+    events
+        .expect_message_eq(
+            ActorContextProbeEvent::WatchRegistered,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("watch should register");
+    watched
+        .tell(StopProbeCommand::Stop)
+        .expect("stop command should send");
+    let observed = events
+        .expect_message(Duration::from_secs(1))
+        .await
+        .expect("watch should observe termination");
+    assert!(matches!(
+        observed,
+        ActorContextProbeEvent::WatchObserved(terminated)
+            if terminated.path == watched.path().clone() && terminated.uid == watched.uid()
+    ));
+
+    let unwatched = spawn_stop_probe(&system, "unwatched").expect("unwatched actor should spawn");
+    context
+        .tell(ActorContextProbeCommand::WatchAndUnwatchStopper {
+            target: unwatched.clone(),
+        })
+        .expect("watch/unwatch command should send");
+    events
+        .expect_message_eq(
+            ActorContextProbeEvent::WatchCancelled,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("watch should cancel");
+    unwatched
+        .tell(StopProbeCommand::Stop)
+        .expect("stop command should send");
+    let _terminated = expect_terminated(&unwatched, Duration::from_secs(1))
+        .await
+        .expect("unwatched actor should terminate");
+    events
+        .expect_no_message(Duration::from_millis(50))
+        .await
+        .expect("unwatched termination should not be observed");
+
+    let echo = spawn_echo_probe(&system, "echo").expect("echo probe should spawn");
+    context
+        .tell(ActorContextProbeCommand::AskEcho {
+            target: echo,
+            value: "pong".to_owned(),
+            timeout: Duration::from_secs(1),
+        })
+        .expect("ask command should send");
+    events
+        .expect_message_eq(
+            ActorContextProbeEvent::AskCompleted(Ok("pong".to_owned())),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("context ask should complete");
+
+    context
+        .tell(ActorContextProbeCommand::PipeValue {
+            value: "done".to_owned(),
+        })
+        .expect("pipe command should send");
+    events
+        .expect_message_eq(
+            ActorContextProbeEvent::PipeCompleted("done".to_owned()),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("pipe-to-self should complete");
+
+    system.terminate().await.expect("system should terminate");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

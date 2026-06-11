@@ -14,8 +14,8 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, Message, RakkaError,
-    RakkaResult, Subsystem,
+    actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, ActorTerminated,
+    AskError, Message, RakkaError, RakkaResult, ReplyTo, Subsystem,
 };
 use rakka_core::{MetricKind, MetricObservation, MetricsSnapshot};
 use rakka_grpc::{GrpcResponseStream, GrpcResult};
@@ -340,6 +340,308 @@ where
             )),
         }
     }
+
+    /// Waits for the next probe message and asserts exact equality.
+    pub async fn expect_message_eq(&mut self, expected: M, timeout: Duration) -> RakkaResult<()>
+    where
+        M: Debug + PartialEq,
+    {
+        let actual = self.expect_message(timeout).await?;
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    /// Asserts that no probe message arrives before the timeout elapses.
+    pub async fn expect_no_message(&mut self, timeout: Duration) -> RakkaResult<()> {
+        match tokio::time::timeout(timeout, self.receiver.recv()).await {
+            Ok(Some(_message)) => Err(RakkaError::new(
+                Subsystem::Testkit,
+                "unexpected-probe-message",
+                "test probe received an unexpected message",
+            )),
+            Ok(None) => Err(RakkaError::new(
+                Subsystem::Testkit,
+                "probe-closed",
+                "test probe channel closed",
+            )),
+            Err(_elapsed) => Ok(()),
+        }
+    }
+}
+
+/// Waits for an actor to terminate.
+pub async fn expect_terminated<M>(
+    actor: &ActorRef<M>,
+    timeout: Duration,
+) -> RakkaResult<ActorTerminated>
+where
+    M: Message,
+{
+    tokio::time::timeout(timeout, actor.when_terminated())
+        .await
+        .map_err(|_elapsed| {
+            RakkaError::new(
+                Subsystem::Testkit,
+                "expect-terminated-timeout",
+                "timed out waiting for actor termination",
+            )
+        })
+}
+
+/// Event emitted by [`ActorContextProbe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorContextProbeEvent {
+    /// A keyed timer fired.
+    TimerFired(String),
+    /// A configured receive timeout fired.
+    ReceiveTimeout,
+    /// A watch was registered.
+    WatchRegistered,
+    /// A watch was cancelled.
+    WatchCancelled,
+    /// A watched actor terminated.
+    WatchObserved(ActorTerminated),
+    /// A context ask completed.
+    AskCompleted(Result<String, AskError>),
+    /// A pipe-to-self future completed.
+    PipeCompleted(String),
+}
+
+/// Command protocol accepted by [`ActorContextProbe`].
+#[derive(Debug, Clone)]
+pub enum ActorContextProbeCommand {
+    /// Starts a keyed timer.
+    StartTimer {
+        /// Timer key.
+        key: String,
+        /// Timer delay.
+        delay: Duration,
+    },
+    /// Internal timer-fired message.
+    TimerElapsed {
+        /// Timer key.
+        key: String,
+    },
+    /// Enables one receive timeout.
+    EnableReceiveTimeout {
+        /// Timeout delay.
+        delay: Duration,
+    },
+    /// Internal receive-timeout message.
+    ReceiveTimeout,
+    /// Watches a stopper actor.
+    WatchStopper {
+        /// Actor to watch.
+        target: ActorRef<StopProbeCommand>,
+    },
+    /// Watches and immediately unwatches a stopper actor.
+    WatchAndUnwatchStopper {
+        /// Actor to watch and unwatch.
+        target: ActorRef<StopProbeCommand>,
+    },
+    /// Internal watch notification.
+    WatchObserved(ActorTerminated),
+    /// Asks an echo probe.
+    AskEcho {
+        /// Actor to ask.
+        target: ActorRef<EchoProbeCommand>,
+        /// Request value.
+        value: String,
+        /// Ask timeout.
+        timeout: Duration,
+    },
+    /// Internal ask completion message.
+    AskCompleted(Result<String, AskError>),
+    /// Starts a pipe-to-self operation.
+    PipeValue {
+        /// Value to pipe.
+        value: String,
+    },
+    /// Internal pipe completion message.
+    PipeCompleted(String),
+}
+
+impl From<ActorTerminated> for ActorContextProbeCommand {
+    fn from(terminated: ActorTerminated) -> Self {
+        Self::WatchObserved(terminated)
+    }
+}
+
+/// Probe actor for Phase 2 actor-context APIs.
+pub struct ActorContextProbe {
+    events: ActorRef<ActorContextProbeEvent>,
+}
+
+impl ActorContextProbe {
+    /// Creates an actor-context probe.
+    #[must_use]
+    pub fn new(events: ActorRef<ActorContextProbeEvent>) -> Self {
+        Self { events }
+    }
+}
+
+impl Actor for ActorContextProbe {
+    type Msg = ActorContextProbeCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        let events = self.events.clone();
+
+        match msg {
+            ActorContextProbeCommand::StartTimer { key, delay } => {
+                ctx.start_timer_once(
+                    key.clone(),
+                    delay,
+                    ActorContextProbeCommand::TimerElapsed { key },
+                );
+                actor_future(async { Ok(ActorAction::Continue) })
+            }
+            ActorContextProbeCommand::TimerElapsed { key } => actor_future(async move {
+                let _ = events.tell(ActorContextProbeEvent::TimerFired(key));
+                Ok(ActorAction::Continue)
+            }),
+            ActorContextProbeCommand::EnableReceiveTimeout { delay } => {
+                ctx.set_receive_timeout(delay, ActorContextProbeCommand::ReceiveTimeout);
+                actor_future(async { Ok(ActorAction::Continue) })
+            }
+            ActorContextProbeCommand::ReceiveTimeout => {
+                ctx.cancel_receive_timeout();
+                actor_future(async move {
+                    let _ = events.tell(ActorContextProbeEvent::ReceiveTimeout);
+                    Ok(ActorAction::Continue)
+                })
+            }
+            ActorContextProbeCommand::WatchStopper { target } => {
+                ctx.watch(&target);
+                actor_future(async move {
+                    let _ = events.tell(ActorContextProbeEvent::WatchRegistered);
+                    Ok(ActorAction::Continue)
+                })
+            }
+            ActorContextProbeCommand::WatchAndUnwatchStopper { target } => {
+                let handle = ctx.watch(&target);
+                ctx.unwatch(&handle);
+                actor_future(async move {
+                    let _ = events.tell(ActorContextProbeEvent::WatchCancelled);
+                    Ok(ActorAction::Continue)
+                })
+            }
+            ActorContextProbeCommand::WatchObserved(terminated) => actor_future(async move {
+                let _ = events.tell(ActorContextProbeEvent::WatchObserved(terminated));
+                Ok(ActorAction::Continue)
+            }),
+            ActorContextProbeCommand::AskEcho {
+                target,
+                value,
+                timeout,
+            } => {
+                ctx.ask(
+                    &target,
+                    |reply_to| EchoProbeCommand::Ask { value, reply_to },
+                    timeout,
+                    ActorContextProbeCommand::AskCompleted,
+                );
+                actor_future(async { Ok(ActorAction::Continue) })
+            }
+            ActorContextProbeCommand::AskCompleted(result) => actor_future(async move {
+                let _ = events.tell(ActorContextProbeEvent::AskCompleted(result));
+                Ok(ActorAction::Continue)
+            }),
+            ActorContextProbeCommand::PipeValue { value } => {
+                ctx.pipe_to_self(async move { Ok::<String, ()>(value) }, |result| {
+                    ActorContextProbeCommand::PipeCompleted(
+                        result.unwrap_or_else(|()| "pipe-error".to_owned()),
+                    )
+                });
+                actor_future(async { Ok(ActorAction::Continue) })
+            }
+            ActorContextProbeCommand::PipeCompleted(value) => actor_future(async move {
+                let _ = events.tell(ActorContextProbeEvent::PipeCompleted(value));
+                Ok(ActorAction::Continue)
+            }),
+        }
+    }
+}
+
+/// Spawns an actor-context probe.
+pub fn spawn_actor_context_probe(
+    system: &ActorSystem,
+    name: impl AsRef<str>,
+    events: ActorRef<ActorContextProbeEvent>,
+) -> RakkaResult<ActorRef<ActorContextProbeCommand>> {
+    system.spawn_actor(name, ActorContextProbe::new(events))
+}
+
+/// Command protocol for a stopper probe actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopProbeCommand {
+    /// Stop the actor.
+    Stop,
+}
+
+struct StopProbeActor;
+
+impl Actor for StopProbeActor {
+    type Msg = StopProbeCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        _msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        actor_future(async { Ok(ActorAction::Stop) })
+    }
+}
+
+/// Spawns a stopper probe actor.
+pub fn spawn_stop_probe(
+    system: &ActorSystem,
+    name: impl AsRef<str>,
+) -> RakkaResult<ActorRef<StopProbeCommand>> {
+    system.spawn_actor(name, StopProbeActor)
+}
+
+/// Command protocol for an echo probe actor.
+pub enum EchoProbeCommand {
+    /// Ask for a string echo.
+    Ask {
+        /// Echo value.
+        value: String,
+        /// Reply channel.
+        reply_to: ReplyTo<String>,
+    },
+}
+
+struct EchoProbeActor;
+
+impl Actor for EchoProbeActor {
+    type Msg = EchoProbeCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        actor_future(async move {
+            match msg {
+                EchoProbeCommand::Ask { value, reply_to } => {
+                    let _ = reply_to.reply(value);
+                }
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+/// Spawns an echo probe actor.
+pub fn spawn_echo_probe(
+    system: &ActorSystem,
+    name: impl AsRef<str>,
+) -> RakkaResult<ActorRef<EchoProbeCommand>> {
+    system.spawn_actor(name, EchoProbeActor)
 }
 
 struct ProbeActor<M>

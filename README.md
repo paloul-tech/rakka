@@ -19,6 +19,7 @@ See `docs/rakka-v1-known-limitations-roadmap.md` for known limitations and post-
 See `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklist and example coverage matrix.
 See `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/test-support API boundary.
 See `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
+See `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
 Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
@@ -108,7 +109,7 @@ cargo run -p rakka-example-minimal-system
 Expected output:
 
 ```text
-Rakka Phase 1 actor replied with pong on tokio.
+Rakka Phase 2 actor facade replied with pong on tokio.
 ```
 
 ### Durable Counter

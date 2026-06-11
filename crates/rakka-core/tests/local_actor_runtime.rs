@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorSystem,
-    ActorSystemRuntimeSettings, ActorSystemShutdownConfig, DeadLetterReason, RakkaError, ReplyTo,
-    SerializedActorRef, SupervisionStrategy, TellError,
+    actor_fn, actor_future, setup, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions,
+    ActorSystem, ActorSystemRuntimeSettings, ActorSystemShutdownConfig, Behavior, DeadLetterReason,
+    RakkaError, ReplyTo, SerializedActorRef, SupervisionStrategy, TellError,
 };
 use tokio::sync::{mpsc, Notify};
 
@@ -551,6 +551,233 @@ async fn actor_system_builder_and_terminate_complete_lifecycle() {
 
     let late_spawn = system.spawn_actor("late", StopActor).unwrap_err();
     assert_eq!(late_spawn.code(), "system-terminating");
+}
+
+#[derive(Debug)]
+enum FunctionActorMessage {
+    Increment(ReplyTo<usize>),
+}
+
+#[tokio::test]
+async fn function_actor_facade_handles_messages() {
+    let system = ActorSystem::new("function-actor");
+    let mut count = 0usize;
+    let counter = system
+        .spawn(
+            "counter",
+            actor_fn(
+                move |_ctx: &mut ActorContext<FunctionActorMessage>, msg: FunctionActorMessage| {
+                    match msg {
+                        FunctionActorMessage::Increment(reply_to) => {
+                            count += 1;
+                            let value = count;
+                            let _ = reply_to.reply(value);
+                            Ok(ActorAction::Continue)
+                        }
+                    }
+                },
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(
+        counter
+            .ask(FunctionActorMessage::Increment, Duration::from_secs(1))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        counter
+            .ask(FunctionActorMessage::Increment, Duration::from_secs(1))
+            .await
+            .unwrap(),
+        2
+    );
+    system.terminate().await.unwrap();
+}
+
+#[derive(Debug)]
+enum SetupMessage {
+    GetPath(ReplyTo<String>),
+}
+
+struct SetupBehavior {
+    path: String,
+}
+
+impl Behavior<SetupMessage> for SetupBehavior {
+    fn on_message<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<SetupMessage>,
+        msg: SetupMessage,
+    ) -> ActorFuture<'a> {
+        let path = self.path.clone();
+        actor_future(async move {
+            match msg {
+                SetupMessage::GetPath(reply_to) => {
+                    let _ = reply_to.reply(path);
+                }
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+#[tokio::test]
+async fn setup_actor_facade_initializes_with_context() {
+    let system = ActorSystem::new("setup");
+    let actor = system
+        .spawn(
+            "configured",
+            setup(|ctx: &mut ActorContext<SetupMessage>| {
+                Ok(SetupBehavior {
+                    path: ctx.path().to_string(),
+                })
+            }),
+        )
+        .unwrap();
+
+    let path = actor
+        .ask(SetupMessage::GetPath, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(path, actor.path().to_string());
+    system.terminate().await.unwrap();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextFacadeMessage {
+    Start,
+    Adapted(&'static str),
+    TimerFired,
+    Piped(u32),
+    Asked(Result<&'static str, rakka_core::AskError>),
+    WatchedGone,
+    UnwatchedGone,
+    Timeout,
+}
+
+struct ContextFacadeActor {
+    echo: rakka_core::ActorRef<EchoMessage>,
+    events: mpsc::Sender<&'static str>,
+}
+
+impl Actor for ContextFacadeActor {
+    type Msg = ContextFacadeMessage;
+
+    fn handle<'a>(
+        &'a mut self,
+        ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let events = self.events.clone();
+
+        match msg {
+            ContextFacadeMessage::Start => {
+                let child = ctx.spawn("child", ChildActor).unwrap();
+                let unwatch_child = ctx.spawn_anonymous(ChildActor).unwrap();
+                assert!(ctx.child("child").is_some());
+                assert!(ctx.children().len() >= 2);
+                assert!(ctx.trace_context().path().as_str().contains("/user/parent"));
+
+                ctx.watch_with(&child, ContextFacadeMessage::WatchedGone);
+                let handle = ctx.watch_with(&unwatch_child, ContextFacadeMessage::UnwatchedGone);
+                assert!(ctx.unwatch(&handle));
+                assert!(ctx.stop_child_named("child"));
+                ctx.stop(&unwatch_child).unwrap();
+
+                let adapter = ctx
+                    .message_adapter(|value| ContextFacadeMessage::Adapted(value))
+                    .unwrap();
+                adapter.tell("adapted").unwrap();
+
+                ctx.start_timer_once(
+                    "tick",
+                    Duration::from_millis(10),
+                    ContextFacadeMessage::TimerFired,
+                );
+                assert!(ctx.is_timer_active("tick"));
+
+                ctx.pipe_to_self(async { Ok::<u32, ()>(7) }, |result| {
+                    ContextFacadeMessage::Piped(result.unwrap())
+                });
+                ctx.ask(
+                    &self.echo,
+                    EchoMessage::Ping,
+                    Duration::from_secs(1),
+                    ContextFacadeMessage::Asked,
+                );
+                ctx.set_receive_timeout(Duration::from_millis(25), ContextFacadeMessage::Timeout);
+
+                actor_future(async move {
+                    events.send("started").await.unwrap();
+                    Ok(ActorAction::Continue)
+                })
+            }
+            ContextFacadeMessage::Adapted(value) => actor_future(async move {
+                events.send(value).await.unwrap();
+                Ok(ActorAction::Continue)
+            }),
+            ContextFacadeMessage::TimerFired => actor_future(async move {
+                events.send("timer").await.unwrap();
+                Ok(ActorAction::Continue)
+            }),
+            ContextFacadeMessage::Piped(value) => actor_future(async move {
+                assert_eq!(value, 7);
+                events.send("piped").await.unwrap();
+                Ok(ActorAction::Continue)
+            }),
+            ContextFacadeMessage::Asked(result) => actor_future(async move {
+                assert_eq!(result.unwrap(), "pong");
+                events.send("asked").await.unwrap();
+                Ok(ActorAction::Continue)
+            }),
+            ContextFacadeMessage::WatchedGone => actor_future(async move {
+                events.send("watched").await.unwrap();
+                Ok(ActorAction::Continue)
+            }),
+            ContextFacadeMessage::UnwatchedGone => actor_future(async move {
+                events.send("unwatched").await.unwrap();
+                Ok(ActorAction::Continue)
+            }),
+            ContextFacadeMessage::Timeout => actor_future(async move {
+                events.send("timeout").await.unwrap();
+                Ok(ActorAction::Stop)
+            }),
+        }
+    }
+}
+
+#[tokio::test]
+async fn context_facade_covers_spawn_watch_timers_ask_and_pipe_to_self() {
+    let system = ActorSystem::new("context-facade");
+    let echo = system.spawn("echo", EchoActor).unwrap();
+    let (events, mut observed) = mpsc::channel(16);
+    let parent = system
+        .spawn("parent", ContextFacadeActor { echo, events })
+        .unwrap();
+
+    parent.tell(ContextFacadeMessage::Start).unwrap();
+
+    let mut seen = Vec::new();
+    while seen.len() < 7 {
+        let event = tokio::time::timeout(Duration::from_secs(1), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        seen.push(event);
+    }
+
+    assert!(seen.contains(&"started"));
+    assert!(seen.contains(&"adapted"));
+    assert!(seen.contains(&"timer"));
+    assert!(seen.contains(&"piped"));
+    assert!(seen.contains(&"asked"));
+    assert!(seen.contains(&"watched"));
+    assert!(seen.contains(&"timeout"));
+    assert!(!seen.contains(&"unwatched"));
+    system.terminate().await.unwrap();
 }
 
 async fn wait_until_terminated<M>(actor: &rakka_core::ActorRef<M>)

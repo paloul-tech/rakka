@@ -1076,7 +1076,7 @@ dependencies = [
 name = "rakka-example-minimal-system"
 version = "0.1.0"
 dependencies = [
- "rakka-core",
+ "rakka",
  "tokio",
  "tracing",
 ]
