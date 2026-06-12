@@ -371,6 +371,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Goal: decide whether and how Rakka should support Akka-style remembered
 entities.
 
+Status: implemented.
+
+Decision: accepted for implementation as an opt-in, bounded Cluster Sharding
+feature. See
+`docs/rakka-akka-parity-phase-4-remembered-entities-decision.md`.
+
 Evaluation questions:
 
 - Should remembered entities be a parity target for v1-style high-level
@@ -433,6 +439,18 @@ Acceptance criteria for the evaluation slice:
   storage, region activation, passivation semantics, and tests.
 - If deferred, docs state the gap against Akka and the recommended workaround:
   demand-started persistent entities plus application-level activation indexes.
+
+Implementation status:
+
+- Added the remembered entities decision record.
+- Accepted remembered entities as opt-in and bounded.
+- Chose remember-after-successful-local-activation semantics.
+- Chose explicit forget APIs instead of forget-on-passivation.
+- Chose per-shard remembered identity storage outside coordinator snapshots and
+  outside entity persistence.
+- Added
+  `docs/plans/rakka-akka-parity-phase-4d5-remembered-entities-implementation-plan.md`
+  as the follow-on implementation plan.
 
 Review commands:
 

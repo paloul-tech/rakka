@@ -294,6 +294,15 @@ architectural reasoning and Akka comparison.
 The facade now owns local, proxy-only, and networked entity registration.
 Serialization codecs still live in the `SerializationRegistry` supplied to
 `ClusterNodeRuntime`; missing codecs fail at send/decode time with typed remote
-delivery errors. Remaining Phase 4 work should focus on persistent coordinator
-backends, coordinator leadership/lease semantics, remembered entities, and
-persistence recovery examples over movement.
+delivery errors.
+
+Remembered entities are accepted as an opt-in follow-on feature. The semantics
+are documented in
+`docs/rakka-akka-parity-phase-4-remembered-entities-decision.md`: remember only
+after successful local activation, forget only through explicit facade APIs,
+replay lazily in bounded batches on shard acquisition, and keep remembered
+identity storage separate from coordinator ownership snapshots and entity
+persistence.
+
+Remaining Phase 4 work should focus on implementing remembered entities and
+adding persistence recovery examples over movement.

@@ -401,6 +401,8 @@ Implementation status on 2026-06-11:
   `ShardCoordinatorLease`, `LeaseToken`, in-memory and PostgreSQL lease
   backends, async runtime/node renewal and release APIs, facade constructors for
   async store-plus-lease wiring, and stale-token publication guards.
+- Completed Phase 4D4 remembered entities evaluation with an accepted opt-in,
+  bounded semantics decision and a dedicated Phase 4D5 implementation plan.
 
 Phase 4 follow-ups:
 
