@@ -5,6 +5,8 @@ use std::fmt::{self, Display, Formatter};
 
 use rakka_core::{RakkaError, Subsystem};
 
+use rakka_cluster::NodeId;
+
 use crate::identity::{EntityId, EntityType, ShardId};
 
 /// Convenient result alias for sharding operations.
@@ -83,10 +85,50 @@ pub enum ShardingError {
         /// Failure detail.
         message: String,
     },
+    /// Coordinator leadership lease backend failed.
+    CoordinatorLease {
+        /// Lease backend name.
+        lease: String,
+        /// Failure detail.
+        message: String,
+    },
+    /// Coordinator leadership lease is currently held by another node.
+    CoordinatorLeaseRejected {
+        /// Lease backend name.
+        lease: String,
+        /// Entity type whose coordinator authority was requested.
+        entity_type: Box<EntityType>,
+        /// Node that attempted to acquire the lease.
+        holder_node: Box<NodeId>,
+        /// Current holder when known.
+        current_holder_node: Option<Box<NodeId>>,
+        /// Current expiry timestamp when known.
+        expires_at_millis: Option<u64>,
+    },
+    /// Previously acquired coordinator leadership lease is no longer valid.
+    CoordinatorLeaseLost {
+        /// Lease backend name.
+        lease: String,
+        /// Entity type whose coordinator authority was lost.
+        entity_type: Box<EntityType>,
+        /// Node that held the stale token.
+        holder_node: Box<NodeId>,
+        /// Stale fencing token.
+        fencing_token: u64,
+        /// Current holder when known.
+        actual_holder_node: Option<Box<NodeId>>,
+        /// Current fencing token when known.
+        actual_fencing_token: Option<u64>,
+    },
     /// An async-only coordinator store was used through a synchronous sharding API.
     AsyncCoordinatorStoreRequiresAsyncApi {
         /// Backend name.
         backend: String,
+    },
+    /// A coordinator lease was used through a synchronous sharding API.
+    AsyncCoordinatorLeaseRequiresAsyncApi {
+        /// Lease backend name.
+        lease: String,
     },
 }
 
@@ -112,8 +154,14 @@ impl ShardingError {
             }
             Self::CoordinatorRevisionConflict { .. } => "coordinator-revision-conflict",
             Self::CoordinatorStore { .. } => "coordinator-store",
+            Self::CoordinatorLease { .. } => "coordinator-lease",
+            Self::CoordinatorLeaseRejected { .. } => "coordinator-lease-rejected",
+            Self::CoordinatorLeaseLost { .. } => "coordinator-lease-lost",
             Self::AsyncCoordinatorStoreRequiresAsyncApi { .. } => {
                 "async-coordinator-store-requires-async-api"
+            }
+            Self::AsyncCoordinatorLeaseRequiresAsyncApi { .. } => {
+                "async-coordinator-lease-requires-async-api"
             }
         }
     }
@@ -175,9 +223,53 @@ impl Display for ShardingError {
             Self::CoordinatorStore { backend, message } => {
                 write!(f, "{backend} coordinator store failed: {message}")
             }
+            Self::CoordinatorLease { lease, message } => {
+                write!(f, "{lease} coordinator lease failed: {message}")
+            }
+            Self::CoordinatorLeaseRejected {
+                lease,
+                entity_type,
+                holder_node,
+                current_holder_node,
+                expires_at_millis,
+            } => match (current_holder_node, expires_at_millis) {
+                (Some(current_holder_node), Some(expires_at_millis)) => write!(
+                    f,
+                    "{lease} coordinator lease for {entity_type} rejected holder {holder_node}; current holder {current_holder_node} expires at {expires_at_millis}"
+                ),
+                (Some(current_holder_node), None) => write!(
+                    f,
+                    "{lease} coordinator lease for {entity_type} rejected holder {holder_node}; current holder {current_holder_node}"
+                ),
+                _ => write!(
+                    f,
+                    "{lease} coordinator lease for {entity_type} rejected holder {holder_node}"
+                ),
+            },
+            Self::CoordinatorLeaseLost {
+                lease,
+                entity_type,
+                holder_node,
+                fencing_token,
+                actual_holder_node,
+                actual_fencing_token,
+            } => match (actual_holder_node, actual_fencing_token) {
+                (Some(actual_holder_node), Some(actual_fencing_token)) => write!(
+                    f,
+                    "{lease} coordinator lease for {entity_type} held by {holder_node} with token {fencing_token} was lost; current holder {actual_holder_node} has token {actual_fencing_token}"
+                ),
+                _ => write!(
+                    f,
+                    "{lease} coordinator lease for {entity_type} held by {holder_node} with token {fencing_token} was lost"
+                ),
+            },
             Self::AsyncCoordinatorStoreRequiresAsyncApi { backend } => write!(
                 f,
                 "{backend} coordinator store requires an async sharding API"
+            ),
+            Self::AsyncCoordinatorLeaseRequiresAsyncApi { lease } => write!(
+                f,
+                "{lease} coordinator lease requires an async sharding API"
             ),
         }
     }

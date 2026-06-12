@@ -18,14 +18,14 @@ use rakka_remote::{
 use rakka_sharding::{
     AsyncShardCoordinatorStore, ClusterSharding, ClusterShardingError, ClusterShardingRuntime,
     CoordinatorStoreFuture, Entity, EntityAskError, EntityContext, EntityDeliveryFailure, EntityId,
-    EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryShardCoordinatorStore,
-    LeastShardAllocationStrategy, LocalEntityContext, LocalEntityRoute,
-    PersistedShardCoordinatorState, RemoteEntityAskClient, RemoteEntityAskError,
+    EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryShardCoordinatorLease,
+    InMemoryShardCoordinatorStore, LeastShardAllocationStrategy, LocalEntityContext,
+    LocalEntityRoute, PersistedShardCoordinatorState, RemoteEntityAskClient, RemoteEntityAskError,
     RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound,
     RemoteEntityRoute, RemoteEntitySendFailure, RemoteTransportEntityOutbound, RoutedEntityMessage,
     ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinator,
-    ShardCoordinatorStore, ShardDecision, ShardHandoffState, ShardId, ShardMoveReason,
-    ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
+    ShardCoordinatorLease, ShardCoordinatorStore, ShardDecision, ShardHandoffState, ShardId,
+    ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -580,6 +580,65 @@ fn in_memory_coordinator_store_rejects_stale_revision() {
     ));
 }
 
+#[tokio::test]
+async fn in_memory_coordinator_lease_acquires_renews_and_releases() {
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(50));
+    let entity_type = EntityType::new("LeaseCart");
+    let holder = NodeId::new("rakka-0", "uid-a");
+
+    let token = lease.acquire(&entity_type, &holder).await.unwrap();
+    assert_eq!(token.namespace(), "default");
+    assert_eq!(token.entity_type(), &entity_type);
+    assert_eq!(token.holder_node(), &holder);
+    assert_eq!(token.fencing_token(), 1);
+    assert!(lease.token(&entity_type).is_some());
+
+    lease.renew(&token).await.unwrap();
+    lease.release(token).await.unwrap();
+    assert!(lease.token(&entity_type).is_none());
+}
+
+#[tokio::test]
+async fn in_memory_coordinator_lease_rejects_active_holder_and_fences_stale_token() {
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(5));
+    let entity_type = EntityType::new("LeaseConflictCart");
+    let holder_a = NodeId::new("rakka-0", "uid-a");
+    let holder_b = NodeId::new("rakka-1", "uid-b");
+
+    let token_a = lease.acquire(&entity_type, &holder_a).await.unwrap();
+    let rejected = lease.acquire(&entity_type, &holder_b).await.unwrap_err();
+    assert!(matches!(
+        rejected,
+        ShardingError::CoordinatorLeaseRejected {
+            entity_type,
+            holder_node,
+            current_holder_node: Some(current_holder_node),
+            ..
+        } if *entity_type == EntityType::new("LeaseConflictCart")
+            && *holder_node == holder_b
+            && *current_holder_node == holder_a
+    ));
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let token_b = lease.acquire(&entity_type, &holder_b).await.unwrap();
+    assert_eq!(token_b.fencing_token(), 2);
+
+    let lost = lease.renew(&token_a).await.unwrap_err();
+    assert!(matches!(
+        lost,
+        ShardingError::CoordinatorLeaseLost {
+            entity_type,
+            holder_node,
+            fencing_token: 1,
+            actual_holder_node: Some(actual_holder_node),
+            actual_fencing_token: Some(2),
+            ..
+        } if *entity_type == EntityType::new("LeaseConflictCart")
+            && *holder_node == holder_a
+            && *actual_holder_node == holder_b
+    ));
+}
+
 #[test]
 fn cluster_sharding_runtime_persists_coordinator_snapshot_on_registration() {
     let local = node("rakka-0", "uid-a");
@@ -599,6 +658,106 @@ fn cluster_sharding_runtime_persists_coordinator_snapshot_on_registration() {
     assert_eq!(persisted.snapshot().revision(), 1);
     assert_eq!(persisted.snapshot().assignments().len(), 4);
     assert_eq!(region.owner_revision(), persisted.snapshot().revision());
+}
+
+#[tokio::test]
+async fn async_runtime_with_lease_allows_only_current_holder_to_coordinate() {
+    let local_a = node("rakka-0", "uid-a");
+    let local_b = node("rakka-1", "uid-b");
+    let entity_type = EntityType::new("LeasedRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(50));
+    let mut runtime_a = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_a.clone()]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease.clone());
+    let mut runtime_b = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_b]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease);
+
+    runtime_a
+        .register_region_async(runtime_region(entity_type.clone(), config.clone()))
+        .await
+        .unwrap();
+    assert_eq!(runtime_a.coordinator_lease_backend(), Some("in-memory"));
+    assert!(runtime_a.coordinator_lease_requires_async_api());
+    assert_eq!(
+        runtime_a
+            .coordinator_lease_token(&entity_type)
+            .unwrap()
+            .holder_node(),
+        local_a.id()
+    );
+
+    let error = runtime_b
+        .register_region_async(runtime_region(entity_type.clone(), config))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::CoordinatorLeaseRejected { entity_type: rejected, .. }
+        } if *rejected == entity_type
+    ));
+
+    assert_eq!(
+        store.load_sync(&entity_type).unwrap().snapshot().revision(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn lost_lease_prevents_stale_runtime_from_publishing_ownership() {
+    let local_a = node("rakka-0", "uid-a");
+    let local_b = node("rakka-1", "uid-b");
+    let remote = node("rakka-2", "uid-c");
+    let entity_type = EntityType::new("LostLeaseCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(5));
+    let region_a = runtime_region(entity_type.clone(), config.clone());
+    let region_b = runtime_region(entity_type.clone(), config.clone());
+    let mut runtime_a = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_a, remote.clone()]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease.clone());
+
+    runtime_a
+        .register_region_async(region_a.clone())
+        .await
+        .unwrap();
+    let initial_revision = region_a.owner_revision();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mut runtime_b = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_b, remote.clone()]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease);
+    runtime_b.register_region_async(region_b).await.unwrap();
+    let revision_after_takeover = store.load_sync(&entity_type).unwrap().snapshot().revision();
+
+    let error = runtime_a
+        .mark_down_async(remote.id(), 3)
+        .await
+        .expect_err("stale runtime should not regain leadership while another holder is active");
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::CoordinatorLeaseRejected { entity_type: rejected, .. }
+        } if *rejected == entity_type
+    ));
+    assert_eq!(region_a.owner_revision(), initial_revision);
+    assert_eq!(
+        store.load_sync(&entity_type).unwrap().snapshot().revision(),
+        revision_after_takeover
+    );
 }
 
 #[test]

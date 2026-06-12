@@ -14,13 +14,13 @@ license-file.workspace = true
 name = "rakka_sharding_postgres"
 
 [dependencies]
+rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
 rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 serde_json.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
-rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 tokio.workspace = true
 
 [lints]

@@ -162,6 +162,7 @@ fn facade_prelude_is_curated() {
         "EntityRef",
         "EntityType",
         "ShardingConfig",
+        "ShardCoordinatorLease",
         "ShardCoordinatorStore",
         "pub use rakka_stream::{BoundedStream, StreamError, StreamResult, StreamSink, StreamSource};",
     ] {

@@ -233,10 +233,52 @@ sharding
     .await?;
 ```
 
+Multi-coordinator deployments can pair the async store with a leadership lease.
+The store's revision compare-and-set protects each snapshot update from stale
+writers; the lease decides which node may make coordinator decisions at all.
+When a lease is rejected, lost, expired, or stolen by a higher fencing token,
+the runtime fails before publishing new owner caches.
+
+```rust
+use rakka_sharding_postgres::{
+    PostgresShardCoordinatorLease,
+    PostgresShardCoordinatorStore,
+};
+use tokio_postgres::NoTls;
+
+let (store_client, store_connection) = tokio_postgres::connect(dsn, NoTls).await?;
+tokio::spawn(async move {
+    let _ = store_connection.await;
+});
+let (lease_client, lease_connection) = tokio_postgres::connect(dsn, NoTls).await?;
+tokio::spawn(async move {
+    let _ = lease_connection.await;
+});
+
+let store = PostgresShardCoordinatorStore::builder(store_client)
+    .with_namespace("shopping-prod")
+    .migrate()
+    .await?;
+let lease = PostgresShardCoordinatorLease::builder(lease_client)
+    .with_namespace("shopping-prod")
+    .migrate()
+    .await?;
+
+let sharding = ClusterSharding::get_with_async_coordinator_store_and_lease(
+    &system,
+    store,
+    lease,
+);
+```
+
 Networked nodes can use
-`ClusterNodeRuntime::builder(local_node).with_async_shard_coordinator_store(store)`.
+`ClusterNodeRuntime::builder(local_node).with_async_shard_coordinator_store(store)`
+and `.with_shard_coordinator_lease(lease)`.
 Runtime users can call `register_region_async`, `apply_discovery_async`,
-`heartbeat_async`, `mark_leaving_async`, `mark_down_async`, and `tick_async`.
+`heartbeat_async`, `mark_leaving_async`, `mark_down_async`, `tick_async`,
+`renew_coordinator_leases_async`, and `release_coordinator_leases_async`.
+When a lease is configured, sync sharding APIs fail closed with
+`ShardingError::AsyncCoordinatorLeaseRequiresAsyncApi`.
 
 Coordinator writes use snapshot revision compare-and-set. A stale writer returns
 `ShardingError::CoordinatorRevisionConflict`; incompatible persisted state

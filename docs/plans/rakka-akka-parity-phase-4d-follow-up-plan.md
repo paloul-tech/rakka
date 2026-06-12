@@ -268,6 +268,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Goal: prevent multiple coordinators from making ownership decisions for the
 same entity type at the same time.
 
+Status: implemented.
+
 Scope:
 
 - Add a lease abstraction independent of the snapshot store:
@@ -296,6 +298,31 @@ pub trait ShardCoordinatorLease: Debug + Send + Sync + 'static {
 - Add `InMemoryShardCoordinatorLease` for deterministic tests.
 - Add `PostgresShardCoordinatorLease` using a PostgreSQL table and
   `expires_at`-based acquisition.
+
+Implementation status:
+
+- Added `ShardCoordinatorLease`, `CoordinatorLeaseFuture`, and `LeaseToken` to
+  the sharding foundation.
+- Added typed lease errors for rejected acquisition, lost/stale tokens, backend
+  failures, and sync API use with async leases.
+- Added `InMemoryShardCoordinatorLease` for deterministic tests and
+  single-process experiments.
+- Added runtime lease state so configured runtimes acquire or renew leadership
+  before coordinator creation, reconciliation, persistence, handoff, or
+  publication.
+- Added explicit async renewal and release APIs on `ClusterShardingRuntime` and
+  `ClusterNodeRuntime`.
+- Added `ClusterNodeRuntimeBuilder::with_shard_coordinator_lease` and shared
+  reference variants.
+- Added high-level `ClusterSharding` constructors for async coordinator stores
+  paired with leadership leases.
+- Added `PostgresShardCoordinatorLease` with the
+  `rakka_shard_coordinator_lease` table, namespace isolation,
+  `expires_at`-based acquisition, renewal, release, and monotonically
+  increasing fencing tokens.
+- Added tests for acquire, renew, release, active-holder rejection, expiry,
+  stolen lease/stale token rejection, runtime holder enforcement, and stale
+  runtime publication prevention.
 
 Suggested PostgreSQL lease schema:
 

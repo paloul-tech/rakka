@@ -22,7 +22,7 @@ This note records the current public API boundary for the v1 hardening work. It 
 | `rakka-cluster` | V1 candidate | Node identity, discovery snapshots/providers, membership state machine, protocol compatibility, and `ClusterError`. |
 | `rakka-remote` | V1 candidate | Remote envelopes, serialization registry, request/reply correlation, in-memory transport, TCP remoting foundation, and `RemoteError`. |
 | `rakka-sharding` | V1 candidate | Entity identity, shard coordinator, region routing, local and remote entity routes, cluster node runtime, and `ShardingError`/`ClusterShardingError`. |
-| `rakka-sharding-postgres` | Adapter candidate | PostgreSQL shard coordinator store, migration SQL, backend constants, and namespace-isolated coordinator snapshots. |
+| `rakka-sharding-postgres` | Adapter candidate | PostgreSQL shard coordinator store and lease, migration SQL, backend constants, namespace-isolated coordinator snapshots, and fencing tokens. |
 | `rakka-process` | Adapter candidate | Managed process ownership, process actor runtime, stdio/file/socket/local-gRPC modes, process-backed entities, and `ProcessError`. |
 | `rakka-workflow` | V1 candidate | Durable inbox/outbox model, workflow clocks, recovery, retry scheduling, and `WorkflowError`. |
 | `rakka-stream` | V1 candidate | Bounded stream source/sink primitives, lifecycle snapshots, stream errors, telemetry labels, and optional adapters. |
@@ -82,8 +82,8 @@ Internal/runtime errors:
 - `rakka-persistence`: durable store traits and in-memory implementation are narrow; PostgreSQL remains a separate plugin crate.
 - `rakka-cluster`: protocol compatibility and membership admission are public and documented by the compatibility matrix.
 - `rakka-remote`: both in-memory and TCP transports are public; TCP remains a v1 foundation but not a full production security story.
-- `rakka-sharding`: local/remote routes and node runtime are public; durable shard coordinator storage is opt-in through sync and async store traits.
-- `rakka-sharding-postgres`: PostgreSQL shard coordinator snapshots are adapter scope and should track the coordinator store contract without expanding the facade prelude.
+- `rakka-sharding`: local/remote routes and node runtime are public; durable shard coordinator storage and leadership are opt-in through store and lease traits.
+- `rakka-sharding-postgres`: PostgreSQL shard coordinator snapshots and leadership leases are adapter scope and should track the coordinator store/lease contracts without expanding the facade prelude.
 - `rakka-process`: `testkit` is feature-gated; process sandbox defaults and allowlists should stay conservative.
 - `rakka-workflow`: durable inbox/outbox is public; workflow engine orchestration beyond these primitives remains out of scope.
 - `rakka-stream`: stream core can compile without process/sharding adapters.

@@ -17,8 +17,8 @@ use crate::{
     ClusterShardingResult, ClusterShardingRuntime, EntityAskError, EntityId, EntityRef,
     EntityTellError, EntityType, LeastShardAllocationStrategy, LocalEntityContext,
     LocalEntityRoute, RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
-    RemoteEntityInbound, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinatorStore,
-    ShardId, ShardRegion, ShardingConfig,
+    RemoteEntityInbound, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinatorLease,
+    ShardCoordinatorStore, ShardId, ShardRegion, ShardingConfig,
 };
 
 type RegionRegistry = Arc<Mutex<BTreeMap<EntityType, Box<dyn Any + Send + Sync>>>>;
@@ -481,6 +481,38 @@ impl ClusterSharding {
         .expect("local cluster sharding facade should initialize")
     }
 
+    /// Creates a local-only sharding facade with async durable storage and a leadership lease.
+    #[must_use]
+    pub fn get_with_async_coordinator_store_and_lease(
+        system: &ActorSystem,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+        coordinator_lease: impl ShardCoordinatorLease,
+    ) -> Self {
+        Self::get_with_async_coordinator_store_and_lease_ref(
+            system,
+            Arc::new(coordinator_store),
+            Arc::new(coordinator_lease),
+        )
+    }
+
+    /// Creates a local-only sharding facade with shared async storage and leadership lease.
+    #[must_use]
+    pub fn get_with_async_coordinator_store_and_lease_ref(
+        system: &ActorSystem,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+        coordinator_lease: Arc<dyn ShardCoordinatorLease>,
+    ) -> Self {
+        let local_node = local_node_for_system(system);
+        Self::for_local_node_with_async_coordinator_store_and_lease_ref(
+            system,
+            local_node,
+            MembershipConfig::default(),
+            coordinator_store,
+            coordinator_lease,
+        )
+        .expect("local cluster sharding facade should initialize")
+    }
+
     /// Creates a sharding facade for an explicit local node descriptor.
     pub fn for_local_node(
         system: &ActorSystem,
@@ -557,6 +589,45 @@ impl ClusterSharding {
             membership,
             coordinator_store,
         ))
+    }
+
+    /// Creates a sharding facade with async durable storage and a leadership lease.
+    pub fn for_local_node_with_async_coordinator_store_and_lease(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        config: MembershipConfig,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+        coordinator_lease: impl ShardCoordinatorLease,
+    ) -> ClusterShardingResult<Self> {
+        Self::for_local_node_with_async_coordinator_store_and_lease_ref(
+            system,
+            local_node,
+            config,
+            Arc::new(coordinator_store),
+            Arc::new(coordinator_lease),
+        )
+    }
+
+    /// Creates a sharding facade with shared async durable storage and leadership lease.
+    pub fn for_local_node_with_async_coordinator_store_and_lease_ref(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        config: MembershipConfig,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+        coordinator_lease: Arc<dyn ShardCoordinatorLease>,
+    ) -> ClusterShardingResult<Self> {
+        let local_node_id = local_node.id().clone();
+        let mut membership = ClusterMembership::new(local_node.clone(), config);
+        membership.mark_up(&local_node_id, 0)?;
+        Ok(
+            Self::from_membership_with_async_coordinator_store_and_lease_ref(
+                system,
+                local_node,
+                membership,
+                coordinator_store,
+                coordinator_lease,
+            ),
+        )
     }
 
     /// Creates a facade companion for a networked cluster node runtime.
@@ -660,6 +731,49 @@ impl ClusterSharding {
                     membership,
                     coordinator_store,
                 ),
+            )),
+            regions: Arc::new(Mutex::new(BTreeMap::new())),
+            controls: Arc::new(Mutex::new(BTreeMap::new())),
+            states: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Creates a facade from membership with async storage and a leadership lease.
+    #[must_use]
+    pub fn from_membership_with_async_coordinator_store_and_lease(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        membership: ClusterMembership,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+        coordinator_lease: impl ShardCoordinatorLease,
+    ) -> Self {
+        Self::from_membership_with_async_coordinator_store_and_lease_ref(
+            system,
+            local_node,
+            membership,
+            Arc::new(coordinator_store),
+            Arc::new(coordinator_lease),
+        )
+    }
+
+    /// Creates a facade from membership with shared async storage and leadership lease.
+    #[must_use]
+    pub fn from_membership_with_async_coordinator_store_and_lease_ref(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        membership: ClusterMembership,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+        coordinator_lease: Arc<dyn ShardCoordinatorLease>,
+    ) -> Self {
+        Self {
+            system: system.clone(),
+            local_node,
+            runtime: Arc::new(AsyncMutex::new(
+                ClusterShardingRuntime::with_async_coordinator_store_ref(
+                    membership,
+                    coordinator_store,
+                )
+                .with_coordinator_lease_ref(coordinator_lease),
             )),
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             controls: Arc::new(Mutex::new(BTreeMap::new())),

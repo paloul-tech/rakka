@@ -20,8 +20,8 @@ use rakka_remote::{
 use crate::{
     AsyncShardCoordinatorStore, ClusterShardingError, ClusterShardingRuntime,
     ClusterShardingUpdate, EntityRoute, RemoteEntityAskClient, RemoteEntityAskInbound,
-    RemoteEntityInbound, RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinatorStore,
-    ShardRegion,
+    RemoteEntityInbound, RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinatorLease,
+    ShardCoordinatorStore, ShardRegion,
 };
 
 /// Convenient result alias for networked cluster node runtime operations.
@@ -98,6 +98,7 @@ pub struct ClusterNodeRuntimeBuilder {
     recorder: Arc<dyn MetricsRecorder>,
     advertise_bound_addr: bool,
     coordinator_store: Option<CoordinatorStoreBuilderMode>,
+    coordinator_lease: Option<Arc<dyn ShardCoordinatorLease>>,
 }
 
 enum CoordinatorStoreBuilderMode {
@@ -126,6 +127,7 @@ impl ClusterNodeRuntimeBuilder {
             recorder: Arc::new(NoopMetricsRecorder),
             advertise_bound_addr: false,
             coordinator_store: None,
+            coordinator_lease: None,
         }
     }
 
@@ -212,6 +214,26 @@ impl ClusterNodeRuntimeBuilder {
         self
     }
 
+    /// Sets an async leadership lease for shard coordinator decisions.
+    #[must_use]
+    pub fn with_shard_coordinator_lease(
+        mut self,
+        coordinator_lease: impl ShardCoordinatorLease,
+    ) -> Self {
+        self.coordinator_lease = Some(Arc::new(coordinator_lease));
+        self
+    }
+
+    /// Sets a shared async leadership lease for shard coordinator decisions.
+    #[must_use]
+    pub fn with_shard_coordinator_lease_ref(
+        mut self,
+        coordinator_lease: Arc<dyn ShardCoordinatorLease>,
+    ) -> Self {
+        self.coordinator_lease = Some(coordinator_lease);
+        self
+    }
+
     /// Binds TCP remoting and creates the cluster node runtime.
     pub async fn build(self) -> ClusterNodeRuntimeResult<ClusterNodeRuntime> {
         let endpoint = RemoteEndpoint::new(self.local_node.id().clone());
@@ -232,7 +254,7 @@ impl ClusterNodeRuntimeBuilder {
             self.advertise_bound_addr,
         );
         let membership = ClusterMembership::new(local_node.clone(), self.membership_config);
-        let sharding = match self.coordinator_store {
+        let mut sharding = match self.coordinator_store {
             Some(CoordinatorStoreBuilderMode::Sync(store)) => {
                 ClusterShardingRuntime::with_coordinator_store_ref(membership, store)
             }
@@ -241,6 +263,9 @@ impl ClusterNodeRuntimeBuilder {
             }
             None => ClusterShardingRuntime::new(membership),
         };
+        if let Some(coordinator_lease) = self.coordinator_lease {
+            sharding = sharding.with_coordinator_lease_ref(coordinator_lease);
+        }
 
         Ok(ClusterNodeRuntime {
             local_node,
@@ -267,6 +292,13 @@ impl Debug for ClusterNodeRuntimeBuilder {
                     .coordinator_store
                     .as_ref()
                     .map(CoordinatorStoreBuilderMode::backend_name),
+            )
+            .field(
+                "coordinator_lease",
+                &self
+                    .coordinator_lease
+                    .as_ref()
+                    .map(|lease| ShardCoordinatorLease::lease_name(lease.as_ref())),
             )
             .finish_non_exhaustive()
     }
@@ -685,6 +717,18 @@ impl ClusterNodeRuntime {
     ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
         let sharding = self.sharding.tick_async(now_millis).await?;
         Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
+    }
+
+    /// Renews all currently held shard coordinator leadership leases.
+    pub async fn renew_coordinator_leases_async(&mut self) -> ClusterNodeRuntimeResult<()> {
+        self.sharding.renew_coordinator_leases_async().await?;
+        Ok(())
+    }
+
+    /// Releases all currently held shard coordinator leadership leases.
+    pub async fn release_coordinator_leases_async(&mut self) -> ClusterNodeRuntimeResult<()> {
+        self.sharding.release_coordinator_leases_async().await?;
+        Ok(())
     }
 
     fn register_peers_from_membership(&mut self) -> ClusterNodeRuntimeResult<usize> {

@@ -96,12 +96,12 @@ pub mod prelude {
 
     #[cfg(feature = "sharding")]
     pub use rakka_sharding::{
-        AsyncShardCoordinatorStore, CoordinatorStoreFuture,
+        AsyncShardCoordinatorStore, CoordinatorLeaseFuture, CoordinatorStoreFuture,
         DeterministicModuloShardAllocationStrategy, EntityId, EntityRef, EntityType,
-        InMemoryShardCoordinatorStore, LeastShardAllocationStrategy,
-        PersistedShardCoordinatorState, ShardAllocationContext, ShardAllocationStrategy,
-        ShardBufferConfig, ShardBufferOverflow, ShardCoordinatorStore, ShardReassignment,
-        ShardRebalanceContext, ShardingConfig,
+        InMemoryShardCoordinatorLease, InMemoryShardCoordinatorStore, LeaseToken,
+        LeastShardAllocationStrategy, PersistedShardCoordinatorState, ShardAllocationContext,
+        ShardAllocationStrategy, ShardBufferConfig, ShardBufferOverflow, ShardCoordinatorLease,
+        ShardCoordinatorStore, ShardReassignment, ShardRebalanceContext, ShardingConfig,
     };
 
     #[cfg(feature = "stream")]

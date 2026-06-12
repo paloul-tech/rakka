@@ -4,12 +4,16 @@
 //! PostgreSQL cluster sharding coordinator store.
 
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use rakka_cluster::NodeId;
 use rakka_core::Subsystem;
 use rakka_sharding::{
-    AsyncShardCoordinatorStore, CoordinatorStoreFuture, EntityType, PersistedShardCoordinatorState,
-    ShardingError, ShardingResult,
+    AsyncShardCoordinatorStore, CoordinatorLeaseFuture, CoordinatorStoreFuture, EntityType,
+    LeaseToken, PersistedShardCoordinatorState, ShardCoordinatorLease, ShardingError,
+    ShardingResult,
 };
 use tokio_postgres::Client;
 
@@ -31,6 +35,9 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 /// Default shard coordinator state table name.
 pub const COORDINATOR_TABLE_NAME: &str = "rakka_shard_coordinator_state";
 
+/// Default shard coordinator lease table name.
+pub const COORDINATOR_LEASE_TABLE_NAME: &str = "rakka_shard_coordinator_lease";
+
 /// PostgreSQL advisory lock id used while applying coordinator migrations.
 pub const MIGRATION_LOCK_ID: i64 = 982_451_653;
 
@@ -42,8 +49,24 @@ CREATE TABLE IF NOT EXISTS rakka_shard_coordinator_state (
     revision BIGINT NOT NULL CHECK (revision >= 0),
     number_of_shards INTEGER NOT NULL CHECK (number_of_shards > 0),
     allocation_strategy TEXT NOT NULL,
+    fencing_token BIGINT NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
     state_json JSONB NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (namespace, entity_type)
+);
+ALTER TABLE rakka_shard_coordinator_state
+    ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 0;
+"#;
+
+/// SQL migration for the default shard coordinator lease table.
+pub const LEASE_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS rakka_shard_coordinator_lease (
+    namespace TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    holder_node TEXT NOT NULL,
+    fencing_token BIGINT NOT NULL CHECK (fencing_token > 0),
+    expires_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (namespace, entity_type)
 );
@@ -53,6 +76,46 @@ CREATE TABLE IF NOT EXISTS rakka_shard_coordinator_state (
 pub struct PostgresShardCoordinatorStoreBuilder {
     client: Client,
     namespace: String,
+}
+
+/// Builder for [`PostgresShardCoordinatorLease`].
+pub struct PostgresShardCoordinatorLeaseBuilder {
+    client: Client,
+    namespace: String,
+    lease_duration: Duration,
+}
+
+impl PostgresShardCoordinatorLeaseBuilder {
+    /// Sets the namespace used to isolate coordinator leases.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self
+    }
+
+    /// Sets the coordinator lease duration.
+    #[must_use]
+    pub const fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration;
+        self
+    }
+
+    /// Builds a PostgreSQL coordinator lease backend.
+    #[must_use]
+    pub fn build(self) -> PostgresShardCoordinatorLease {
+        PostgresShardCoordinatorLease {
+            client: Arc::new(self.client),
+            namespace: self.namespace.into(),
+            lease_duration: self.lease_duration,
+        }
+    }
+
+    /// Applies the default migration and returns the built lease backend.
+    pub async fn migrate(self) -> ShardingResult<PostgresShardCoordinatorLease> {
+        let lease = self.build();
+        lease.migrate().await?;
+        Ok(lease)
+    }
 }
 
 impl PostgresShardCoordinatorStoreBuilder {
@@ -179,78 +242,37 @@ WHERE namespace = $1
         let client = self.client.clone();
         let namespace = self.namespace.clone();
         Box::pin(async move {
-            validate_state_entity_type(entity_type, &state)?;
-            let revision = u64_to_i64(state.snapshot().revision(), "coordinator revision")?;
-            let expected = u64_to_i64(expected_revision, "expected coordinator revision")?;
-            let number_of_shards = u32_to_i32(state.snapshot().number_of_shards())?;
-            let allocation_strategy = state.allocation_strategy().to_string();
-            let state_json =
-                serde_json::to_string(&state).map_err(|error| ShardingError::CoordinatorStore {
-                    backend: BACKEND_NAME.to_string(),
-                    message: format!("failed to encode coordinator state: {error}"),
-                })?;
-
-            let row = if expected_revision == 0 {
-                client
-                    .query_opt(
-                        r#"
-INSERT INTO rakka_shard_coordinator_state
-    (namespace, entity_type, revision, number_of_shards, allocation_strategy, state_json, schema_version)
-VALUES ($1, $2, $3::bigint, $4::integer, $5, $6::text::jsonb, 1)
-ON CONFLICT (namespace, entity_type) DO NOTHING
-RETURNING revision
-"#,
-                        &[
-                            &namespace.as_ref(),
-                            &entity_type.as_str(),
-                            &revision,
-                            &number_of_shards,
-                            &allocation_strategy,
-                            &state_json,
-                        ],
-                    )
-                    .await
-            } else {
-                client
-                    .query_opt(
-                        r#"
-UPDATE rakka_shard_coordinator_state
-SET revision = $3::bigint,
-    number_of_shards = $4::integer,
-    allocation_strategy = $5,
-    state_json = $6::text::jsonb,
-    schema_version = 1,
-    updated_at = now()
-WHERE namespace = $1
-  AND entity_type = $2
-  AND revision = $7::bigint
-RETURNING revision
-"#,
-                        &[
-                            &namespace.as_ref(),
-                            &entity_type.as_str(),
-                            &revision,
-                            &number_of_shards,
-                            &allocation_strategy,
-                            &state_json,
-                            &expected,
-                        ],
-                    )
-                    .await
-            }
-            .map_err(map_postgres_error)?;
-
-            if row.is_some() {
-                return Ok(state);
-            }
-
-            let actual_revision =
-                load_actual_revision(&client, namespace.as_ref(), entity_type).await?;
-            Err(ShardingError::CoordinatorRevisionConflict {
-                entity_type: entity_type.clone(),
+            compare_and_set_state(
+                &client,
+                namespace.as_ref(),
+                entity_type,
                 expected_revision,
-                actual_revision,
-            })
+                state,
+                None,
+            )
+            .await
+        })
+    }
+
+    fn compare_and_set_with_lease<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+        lease_token: Option<&'a LeaseToken>,
+    ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        Box::pin(async move {
+            compare_and_set_state(
+                &client,
+                namespace.as_ref(),
+                entity_type,
+                expected_revision,
+                state,
+                lease_token,
+            )
+            .await
         })
     }
 
@@ -293,6 +315,356 @@ WHERE namespace = $1
             }
         })
     }
+}
+
+/// PostgreSQL coordinator leadership lease backend.
+#[derive(Clone)]
+pub struct PostgresShardCoordinatorLease {
+    client: Arc<Client>,
+    namespace: Arc<str>,
+    lease_duration: Duration,
+}
+
+impl PostgresShardCoordinatorLease {
+    /// Default PostgreSQL coordinator lease duration.
+    pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(15);
+
+    /// Creates a PostgreSQL coordinator lease backend in the default namespace.
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self::builder(client).build()
+    }
+
+    /// Creates a builder for a PostgreSQL coordinator lease backend.
+    #[must_use]
+    pub fn builder(client: Client) -> PostgresShardCoordinatorLeaseBuilder {
+        PostgresShardCoordinatorLeaseBuilder {
+            client,
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            lease_duration: Self::DEFAULT_LEASE_DURATION,
+        }
+    }
+
+    /// Creates a PostgreSQL coordinator lease backend in an explicit namespace.
+    #[must_use]
+    pub fn with_namespace(client: Client, namespace: impl Into<String>) -> Self {
+        Self::builder(client).with_namespace(namespace).build()
+    }
+
+    /// Namespace used to isolate coordinator leases.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Coordinator lease duration.
+    #[must_use]
+    pub const fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
+    /// Applies the default lease table migration.
+    pub async fn migrate(&self) -> ShardingResult<()> {
+        acquire_migration_lock(&self.client)
+            .await
+            .map_err(map_postgres_error)?;
+        let migration_result = self.client.batch_execute(LEASE_MIGRATION_SQL).await;
+        let unlock_result = release_migration_lock(&self.client).await;
+
+        match (migration_result, unlock_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(map_postgres_error(error)),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn lease_duration_millis(&self) -> ShardingResult<f64> {
+        let millis = self.lease_duration.as_secs_f64() * 1000.0;
+        if millis <= 0.0 {
+            return Err(ShardingError::CoordinatorLease {
+                lease: BACKEND_NAME.to_string(),
+                message: "lease duration must be greater than zero".to_string(),
+            });
+        }
+        if millis.is_finite() {
+            Ok(millis)
+        } else {
+            Err(ShardingError::CoordinatorLease {
+                lease: BACKEND_NAME.to_string(),
+                message: "lease duration is not finite".to_string(),
+            })
+        }
+    }
+}
+
+impl std::fmt::Debug for PostgresShardCoordinatorLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresShardCoordinatorLease")
+            .field("namespace", &self.namespace())
+            .field("lease_duration", &self.lease_duration)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShardCoordinatorLease for PostgresShardCoordinatorLease {
+    fn lease_name(&self) -> &'static str {
+        BACKEND_NAME
+    }
+
+    fn acquire<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        holder: &'a NodeId,
+    ) -> CoordinatorLeaseFuture<'a, LeaseToken> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        Box::pin(async move {
+            let lease_millis = self.lease_duration_millis()?;
+            let holder_node = holder.to_string();
+
+            if let Some(row) = client
+                .query_opt(
+                    r#"
+UPDATE rakka_shard_coordinator_lease
+SET holder_node = $3,
+    fencing_token = CASE
+        WHEN holder_node = $3 THEN fencing_token
+        ELSE fencing_token + 1
+    END,
+    expires_at = now() + ($4::double precision * INTERVAL '1 millisecond'),
+    updated_at = now()
+WHERE namespace = $1
+  AND entity_type = $2
+  AND (holder_node = $3 OR expires_at <= now())
+RETURNING holder_node,
+          fencing_token,
+          ((EXTRACT(EPOCH FROM expires_at) * 1000)::bigint) AS expires_at_millis
+"#,
+                    &[
+                        &namespace.as_ref(),
+                        &entity_type.as_str(),
+                        &holder_node,
+                        &lease_millis,
+                    ],
+                )
+                .await
+                .map_err(map_postgres_error)?
+            {
+                return decode_lease_row(namespace.as_ref(), entity_type, row);
+            }
+
+            if let Some(row) = client
+                .query_opt(
+                    r#"
+INSERT INTO rakka_shard_coordinator_lease
+    (namespace, entity_type, holder_node, fencing_token, expires_at)
+VALUES (
+    $1,
+    $2,
+    $3,
+    1,
+    now() + ($4::double precision * INTERVAL '1 millisecond')
+)
+ON CONFLICT (namespace, entity_type) DO NOTHING
+RETURNING holder_node,
+          fencing_token,
+          ((EXTRACT(EPOCH FROM expires_at) * 1000)::bigint) AS expires_at_millis
+"#,
+                    &[
+                        &namespace.as_ref(),
+                        &entity_type.as_str(),
+                        &holder_node,
+                        &lease_millis,
+                    ],
+                )
+                .await
+                .map_err(map_postgres_error)?
+            {
+                return decode_lease_row(namespace.as_ref(), entity_type, row);
+            }
+
+            let current = load_current_lease(&client, namespace.as_ref(), entity_type).await?;
+            Err(lease_rejected(BACKEND_NAME, entity_type, holder, current))
+        })
+    }
+
+    fn renew<'a>(&'a self, token: &'a LeaseToken) -> CoordinatorLeaseFuture<'a, ()> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let lease_millis = self.lease_duration_millis()?;
+            let fencing_token = u64_to_i64(token.fencing_token(), "lease fencing token")?;
+            let holder_node = token.holder_node().to_string();
+            let row = client
+                .query_opt(
+                    r#"
+UPDATE rakka_shard_coordinator_lease
+SET expires_at = now() + ($5::double precision * INTERVAL '1 millisecond'),
+    updated_at = now()
+WHERE namespace = $1
+  AND entity_type = $2
+  AND holder_node = $3
+  AND fencing_token = $4::bigint
+  AND expires_at > now()
+RETURNING fencing_token
+"#,
+                    &[
+                        &token.namespace(),
+                        &token.entity_type().as_str(),
+                        &holder_node,
+                        &fencing_token,
+                        &lease_millis,
+                    ],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+
+            if row.is_some() {
+                return Ok(());
+            }
+
+            let current =
+                load_current_lease(&client, token.namespace(), token.entity_type()).await?;
+            Err(lease_lost_from_current(BACKEND_NAME, token, current))
+        })
+    }
+
+    fn release<'a>(&'a self, token: LeaseToken) -> CoordinatorLeaseFuture<'a, ()> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let fencing_token = u64_to_i64(token.fencing_token(), "lease fencing token")?;
+            let holder_node = token.holder_node().to_string();
+            let deleted = client
+                .execute(
+                    r#"
+DELETE FROM rakka_shard_coordinator_lease
+WHERE namespace = $1
+  AND entity_type = $2
+  AND holder_node = $3
+  AND fencing_token = $4::bigint
+"#,
+                    &[
+                        &token.namespace(),
+                        &token.entity_type().as_str(),
+                        &holder_node,
+                        &fencing_token,
+                    ],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+
+            if deleted == 1 {
+                return Ok(());
+            }
+
+            let current =
+                load_current_lease(&client, token.namespace(), token.entity_type()).await?;
+            if current.is_none() {
+                Ok(())
+            } else {
+                Err(lease_lost_from_current(BACKEND_NAME, &token, current))
+            }
+        })
+    }
+}
+
+async fn compare_and_set_state(
+    client: &Client,
+    namespace: &str,
+    entity_type: &EntityType,
+    expected_revision: u64,
+    state: PersistedShardCoordinatorState,
+    lease_token: Option<&LeaseToken>,
+) -> ShardingResult<PersistedShardCoordinatorState> {
+    validate_state_entity_type(entity_type, &state)?;
+    let revision = u64_to_i64(state.snapshot().revision(), "coordinator revision")?;
+    let expected = u64_to_i64(expected_revision, "expected coordinator revision")?;
+    let number_of_shards = u32_to_i32(state.snapshot().number_of_shards())?;
+    let allocation_strategy = state.allocation_strategy().to_string();
+    let fencing_token = lease_token.map_or(Ok(0), |token| {
+        u64_to_i64(token.fencing_token(), "lease fencing token")
+    })?;
+    let state_json =
+        serde_json::to_string(&state).map_err(|error| ShardingError::CoordinatorStore {
+            backend: BACKEND_NAME.to_string(),
+            message: format!("failed to encode coordinator state: {error}"),
+        })?;
+
+    let row = if expected_revision == 0 {
+        client
+            .query_opt(
+                r#"
+INSERT INTO rakka_shard_coordinator_state
+    (namespace, entity_type, revision, number_of_shards, allocation_strategy, fencing_token, state_json, schema_version)
+VALUES ($1, $2, $3::bigint, $4::integer, $5, $6::bigint, $7::text::jsonb, 1)
+ON CONFLICT (namespace, entity_type) DO NOTHING
+RETURNING revision
+"#,
+                &[
+                    &namespace,
+                    &entity_type.as_str(),
+                    &revision,
+                    &number_of_shards,
+                    &allocation_strategy,
+                    &fencing_token,
+                    &state_json,
+                ],
+            )
+            .await
+    } else {
+        client
+            .query_opt(
+                r#"
+UPDATE rakka_shard_coordinator_state
+SET revision = $3::bigint,
+    number_of_shards = $4::integer,
+    allocation_strategy = $5,
+    fencing_token = $6::bigint,
+    state_json = $7::text::jsonb,
+    schema_version = 1,
+    updated_at = now()
+WHERE namespace = $1
+  AND entity_type = $2
+  AND revision = $8::bigint
+  AND fencing_token <= $6::bigint
+RETURNING revision
+"#,
+                &[
+                    &namespace,
+                    &entity_type.as_str(),
+                    &revision,
+                    &number_of_shards,
+                    &allocation_strategy,
+                    &fencing_token,
+                    &state_json,
+                    &expected,
+                ],
+            )
+            .await
+    }
+    .map_err(map_postgres_error)?;
+
+    if row.is_some() {
+        return Ok(state);
+    }
+
+    let actual = load_actual_revision_and_fencing(client, namespace, entity_type).await?;
+    if let (Some(token), Some((actual_revision, actual_fencing_token))) = (lease_token, actual) {
+        if actual_revision == expected_revision && actual_fencing_token > token.fencing_token() {
+            return Err(ShardingError::CoordinatorLeaseLost {
+                lease: BACKEND_NAME.to_string(),
+                entity_type: Box::new(entity_type.clone()),
+                holder_node: Box::new(token.holder_node().clone()),
+                fencing_token: token.fencing_token(),
+                actual_holder_node: None,
+                actual_fencing_token: Some(actual_fencing_token),
+            });
+        }
+    }
+
+    Err(ShardingError::CoordinatorRevisionConflict {
+        entity_type: entity_type.clone(),
+        expected_revision,
+        actual_revision: actual.map_or(0, |(revision, _fencing)| revision),
+    })
 }
 
 fn decode_state_row(row: tokio_postgres::Row) -> ShardingResult<PersistedShardCoordinatorState> {
@@ -357,6 +729,106 @@ fn validate_state_entity_type(
     }
 }
 
+#[derive(Debug, Clone)]
+struct CurrentLease {
+    holder_node: NodeId,
+    fencing_token: u64,
+    expires_at_millis: u64,
+}
+
+fn decode_lease_row(
+    namespace: &str,
+    entity_type: &EntityType,
+    row: tokio_postgres::Row,
+) -> ShardingResult<LeaseToken> {
+    let holder_node: String = row.get("holder_node");
+    let holder_node =
+        NodeId::from_str(&holder_node).map_err(|error| ShardingError::CoordinatorLease {
+            lease: BACKEND_NAME.to_string(),
+            message: format!("failed to decode lease holder node: {error}"),
+        })?;
+    let fencing_token = i64_to_u64(row.get("fencing_token"), "lease fencing token")?;
+    let expires_at_millis = i64_to_u64(row.get("expires_at_millis"), "lease expiry")?;
+
+    Ok(LeaseToken::new(
+        namespace.to_string(),
+        entity_type.clone(),
+        holder_node,
+        fencing_token,
+        expires_at_millis,
+    ))
+}
+
+async fn load_current_lease(
+    client: &Client,
+    namespace: &str,
+    entity_type: &EntityType,
+) -> ShardingResult<Option<CurrentLease>> {
+    let row = client
+        .query_opt(
+            r#"
+SELECT holder_node,
+       fencing_token,
+       ((EXTRACT(EPOCH FROM expires_at) * 1000)::bigint) AS expires_at_millis
+FROM rakka_shard_coordinator_lease
+WHERE namespace = $1
+  AND entity_type = $2
+"#,
+            &[&namespace, &entity_type.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.map(|row| {
+        let holder_node: String = row.get("holder_node");
+        let holder_node =
+            NodeId::from_str(&holder_node).map_err(|error| ShardingError::CoordinatorLease {
+                lease: BACKEND_NAME.to_string(),
+                message: format!("failed to decode lease holder node: {error}"),
+            })?;
+        Ok(CurrentLease {
+            holder_node,
+            fencing_token: i64_to_u64(row.get("fencing_token"), "lease fencing token")?,
+            expires_at_millis: i64_to_u64(row.get("expires_at_millis"), "lease expiry")?,
+        })
+    })
+    .transpose()
+}
+
+fn lease_rejected(
+    lease: &str,
+    entity_type: &EntityType,
+    holder: &NodeId,
+    current: Option<CurrentLease>,
+) -> ShardingError {
+    ShardingError::CoordinatorLeaseRejected {
+        lease: lease.to_string(),
+        entity_type: Box::new(entity_type.clone()),
+        holder_node: Box::new(holder.clone()),
+        current_holder_node: current
+            .as_ref()
+            .map(|lease| Box::new(lease.holder_node.clone())),
+        expires_at_millis: current.map(|lease| lease.expires_at_millis),
+    }
+}
+
+fn lease_lost_from_current(
+    lease: &str,
+    token: &LeaseToken,
+    current: Option<CurrentLease>,
+) -> ShardingError {
+    ShardingError::CoordinatorLeaseLost {
+        lease: lease.to_string(),
+        entity_type: Box::new(token.entity_type().clone()),
+        holder_node: Box::new(token.holder_node().clone()),
+        fencing_token: token.fencing_token(),
+        actual_holder_node: current
+            .as_ref()
+            .map(|lease| Box::new(lease.holder_node.clone())),
+        actual_fencing_token: current.map(|lease| lease.fencing_token),
+    }
+}
+
 async fn load_actual_revision(
     client: &Client,
     namespace: &str,
@@ -378,6 +850,34 @@ WHERE namespace = $1
     row.map(|row| i64_to_u64(row.get("revision"), "coordinator revision"))
         .transpose()
         .map(|revision| revision.unwrap_or(0))
+}
+
+async fn load_actual_revision_and_fencing(
+    client: &Client,
+    namespace: &str,
+    entity_type: &EntityType,
+) -> ShardingResult<Option<(u64, u64)>> {
+    let row = client
+        .query_opt(
+            r#"
+SELECT revision,
+       fencing_token
+FROM rakka_shard_coordinator_state
+WHERE namespace = $1
+  AND entity_type = $2
+"#,
+            &[&namespace, &entity_type.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.map(|row| {
+        Ok((
+            i64_to_u64(row.get("revision"), "coordinator revision")?,
+            i64_to_u64(row.get("fencing_token"), "lease fencing token")?,
+        ))
+    })
+    .transpose()
 }
 
 fn u64_to_i64(value: u64, label: &str) -> ShardingResult<i64> {
@@ -445,7 +945,7 @@ mod tests {
     };
     use rakka_sharding::{
         AsyncShardCoordinatorStore, ClusterShardingRuntime, EntityType, RoutedEntityMessage,
-        ShardCoordinator, ShardRegion, ShardingConfig, ShardingError,
+        ShardCoordinator, ShardCoordinatorLease, ShardRegion, ShardingConfig, ShardingError,
     };
     use tokio_postgres::NoTls;
 
@@ -523,6 +1023,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_store_rejects_stale_fencing_token_when_dsn_is_set() {
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+        let namespace = unique_namespace("store-fencing");
+        let store = connect_store(&dsn, namespace.clone()).await;
+        let entity_type = EntityType::new("FencedStoreCart");
+        let (first, second) = coordinator_states(entity_type.clone());
+        let holder_a = NodeId::new("rakka-0", "uid-a");
+        let holder_b = NodeId::new("rakka-1", "uid-b");
+        let stale_token = LeaseToken::new(namespace.clone(), entity_type.clone(), holder_a, 1, 1);
+        let current_token = LeaseToken::new(namespace, entity_type.clone(), holder_b, 2, 2);
+
+        store
+            .compare_and_set_with_lease(&entity_type, 0, first, Some(&current_token))
+            .await
+            .unwrap();
+
+        let lost = store
+            .compare_and_set_with_lease(
+                &entity_type,
+                second.snapshot().revision() - 1,
+                second,
+                Some(&stale_token),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            lost,
+            ShardingError::CoordinatorLeaseLost {
+                entity_type,
+                holder_node,
+                fencing_token: 1,
+                actual_fencing_token: Some(2),
+                ..
+            } if *entity_type == EntityType::new("FencedStoreCart")
+                && *holder_node == NodeId::new("rakka-0", "uid-a")
+        ));
+    }
+
+    #[tokio::test]
     async fn postgres_runtime_recovers_without_rewriting_when_dsn_is_set() {
         let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
             Ok(dsn) => dsn,
@@ -561,6 +1104,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn postgres_lease_acquires_renews_and_releases_when_dsn_is_set() {
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+        let lease = connect_lease(
+            &dsn,
+            unique_namespace("lease-round-trip"),
+            Duration::from_millis(100),
+        )
+        .await;
+        let entity_type = EntityType::new("PostgresLeaseCart");
+        let holder = NodeId::new("rakka-0", "uid-a");
+
+        let token = lease.acquire(&entity_type, &holder).await.unwrap();
+        assert_eq!(token.namespace(), lease.namespace());
+        assert_eq!(token.entity_type(), &entity_type);
+        assert_eq!(token.holder_node(), &holder);
+        assert_eq!(token.fencing_token(), 1);
+
+        lease.renew(&token).await.unwrap();
+        lease.release(token).await.unwrap();
+
+        let reacquired = lease.acquire(&entity_type, &holder).await.unwrap();
+        assert_eq!(reacquired.fencing_token(), 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_lease_rejects_active_holder_and_fences_stale_token_when_dsn_is_set() {
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+        let namespace = unique_namespace("lease-conflict");
+        let lease_a = connect_lease(&dsn, namespace.clone(), Duration::from_millis(10)).await;
+        let lease_b = connect_lease(&dsn, namespace, Duration::from_millis(100)).await;
+        let entity_type = EntityType::new("PostgresLeaseConflictCart");
+        let holder_a = NodeId::new("rakka-0", "uid-a");
+        let holder_b = NodeId::new("rakka-1", "uid-b");
+
+        let token_a = lease_a.acquire(&entity_type, &holder_a).await.unwrap();
+        let rejected = lease_b.acquire(&entity_type, &holder_b).await.unwrap_err();
+        assert!(matches!(
+            rejected,
+        ShardingError::CoordinatorLeaseRejected {
+            entity_type,
+            holder_node,
+            current_holder_node: Some(current_holder_node),
+            ..
+        } if *entity_type == EntityType::new("PostgresLeaseConflictCart")
+                && *holder_node == holder_b
+                && *current_holder_node == holder_a
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_b = lease_b.acquire(&entity_type, &holder_b).await.unwrap();
+        assert_eq!(token_b.fencing_token(), 2);
+
+        let lost = lease_a.renew(&token_a).await.unwrap_err();
+        assert!(matches!(
+            lost,
+        ShardingError::CoordinatorLeaseLost {
+            entity_type,
+            holder_node,
+            fencing_token: 1,
+            actual_holder_node: Some(actual_holder_node),
+            actual_fencing_token: Some(2),
+            ..
+        } if *entity_type == EntityType::new("PostgresLeaseConflictCart")
+                && *holder_node == holder_a
+                && *actual_holder_node == holder_b
+        ));
+    }
+
     async fn connect_store(dsn: &str, namespace: String) -> PostgresShardCoordinatorStore {
         let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.unwrap();
         tokio::spawn(async move {
@@ -570,6 +1188,25 @@ mod tests {
         });
         PostgresShardCoordinatorStore::builder(client)
             .with_namespace(namespace)
+            .migrate()
+            .await
+            .unwrap()
+    }
+
+    async fn connect_lease(
+        dsn: &str,
+        namespace: String,
+        lease_duration: Duration,
+    ) -> PostgresShardCoordinatorLease {
+        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("postgres sharding lease connection error: {error}");
+            }
+        });
+        PostgresShardCoordinatorLease::builder(client)
+            .with_namespace(namespace)
+            .with_lease_duration(lease_duration)
             .migrate()
             .await
             .unwrap()

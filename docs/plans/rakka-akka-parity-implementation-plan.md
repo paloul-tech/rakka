@@ -397,6 +397,10 @@ Implementation status on 2026-06-11:
   `rakka-sharding-postgres` adapter crate, namespace-isolated coordinator
   snapshots, migration SQL, compare-and-set revision fencing, and gated
   PostgreSQL recovery tests.
+- Implemented Phase 4D3 coordinator leadership leases with
+  `ShardCoordinatorLease`, `LeaseToken`, in-memory and PostgreSQL lease
+  backends, async runtime/node renewal and release APIs, facade constructors for
+  async store-plus-lease wiring, and stale-token publication guards.
 
 Phase 4 follow-ups:
 

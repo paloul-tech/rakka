@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator::ShardOwnershipSnapshot;
+use crate::coordinator_lease::LeaseToken;
 use crate::error::{ShardingError, ShardingResult};
 use crate::identity::EntityType;
 
@@ -84,6 +85,17 @@ pub trait ShardCoordinatorStore: Debug + Send + Sync + 'static {
         state: PersistedShardCoordinatorState,
     ) -> ShardingResult<PersistedShardCoordinatorState>;
 
+    /// Persists coordinator state with an optional lease fencing token.
+    fn compare_and_set_with_lease(
+        &self,
+        entity_type: &EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+        _lease_token: Option<&LeaseToken>,
+    ) -> ShardingResult<PersistedShardCoordinatorState> {
+        self.compare_and_set(entity_type, expected_revision, state)
+    }
+
     /// Deletes coordinator state if the stored revision matches `expected_revision`.
     fn delete(&self, entity_type: &EntityType, expected_revision: u64) -> ShardingResult<()>;
 }
@@ -109,6 +121,21 @@ pub trait AsyncShardCoordinatorStore: Debug + Send + Sync + 'static {
         expected_revision: u64,
         state: PersistedShardCoordinatorState,
     ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState>;
+
+    /// Persists coordinator state with an optional lease fencing token.
+    fn compare_and_set_with_lease<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+        lease_token: Option<&'a LeaseToken>,
+    ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState> {
+        Box::pin(async move {
+            let _lease_token = lease_token;
+            self.compare_and_set(entity_type, expected_revision, state)
+                .await
+        })
+    }
 
     /// Deletes coordinator state if the stored revision matches `expected_revision`.
     fn delete<'a>(
@@ -141,6 +168,24 @@ where
     ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState> {
         Box::pin(async move {
             ShardCoordinatorStore::compare_and_set(self, entity_type, expected_revision, state)
+        })
+    }
+
+    fn compare_and_set_with_lease<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+        lease_token: Option<&'a LeaseToken>,
+    ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState> {
+        Box::pin(async move {
+            ShardCoordinatorStore::compare_and_set_with_lease(
+                self,
+                entity_type,
+                expected_revision,
+                state,
+                lease_token,
+            )
         })
     }
 

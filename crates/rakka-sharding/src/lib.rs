@@ -5,6 +5,7 @@
 
 pub mod allocation;
 pub mod coordinator;
+pub mod coordinator_lease;
 pub mod coordinator_store;
 pub mod error;
 pub mod facade;
@@ -25,6 +26,9 @@ pub use allocation::{
 pub use coordinator::{
     ShardAssignment, ShardCoordinator, ShardDecision, ShardMoveReason, ShardOwnerCount,
     ShardOwnershipSnapshot, ShardRebalancePlan,
+};
+pub use coordinator_lease::{
+    CoordinatorLeaseFuture, InMemoryShardCoordinatorLease, LeaseToken, ShardCoordinatorLease,
 };
 pub use coordinator_store::{
     AsyncShardCoordinatorStore, CoordinatorStoreFuture, InMemoryShardCoordinatorStore,
