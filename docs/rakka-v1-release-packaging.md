@@ -40,7 +40,7 @@ Required CI jobs are safe for normal pull requests and pushes:
 
 Optional jobs are gated by `workflow_dispatch` inputs because they need external services or a mutable cluster:
 
-- `PostgreSQL Integration`: runs `cargo test -p rakka-persistence-postgres` with `RAKKA_POSTGRES_TEST_DSN`.
+- `PostgreSQL Integration`: runs `cargo test -p rakka-persistence-postgres` and `cargo test -p rakka-sharding-postgres` with `RAKKA_POSTGRES_TEST_DSN`.
 - `Local Kubernetes Cluster`: runs the gated local-cluster contract test with `RAKKA_K8S_RUN_LOCAL_CLUSTER=1` and image variables supplied by the repository or operator.
 
 ## Publishable Crates
@@ -54,6 +54,7 @@ The publishable crate set is:
 - `rakka-remote`
 - `rakka-cluster`
 - `rakka-sharding`
+- `rakka-sharding-postgres`
 - `rakka-workflow`
 - `rakka-stream`
 - `rakka-process`

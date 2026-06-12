@@ -8,6 +8,7 @@ members = [
     "crates/rakka-remote",
     "crates/rakka-cluster",
     "crates/rakka-sharding",
+    "crates/rakka-sharding-postgres",
     "crates/rakka-workflow",
     "crates/rakka-stream",
     "crates/rakka-process",

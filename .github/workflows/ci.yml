@@ -101,7 +101,9 @@ jobs:
       - name: Test PostgreSQL store
         env:
           RAKKA_POSTGRES_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres
-        run: cargo test -p rakka-persistence-postgres
+        run: |
+          cargo test -p rakka-persistence-postgres
+          cargo test -p rakka-sharding-postgres
 
   kubernetes-dry-run:
     name: Kubernetes Scenario Dry Run

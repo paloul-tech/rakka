@@ -181,6 +181,8 @@ Implementation status:
 
 Goal: add a production-shaped persistent coordinator snapshot backend.
 
+Status: implemented.
+
 Scope:
 
 - Add `rakka-sharding-postgres` as an adapter crate, or explicitly decide to
@@ -203,6 +205,25 @@ Scope:
   runtime recovery.
 - Add optional migration helper and docs consistent with existing
   `rakka-persistence-postgres` migration style.
+
+Implementation status:
+
+- Added `rakka-sharding-postgres` as a dedicated adapter crate.
+- Added `PostgresShardCoordinatorStore` and builder APIs over
+  `AsyncShardCoordinatorStore`.
+- Added `MIGRATION_SQL` for the `rakka_shard_coordinator_state` table with
+  namespace, entity type, revision, shard count, allocation strategy, JSONB
+  snapshot state, schema version, and update timestamp columns.
+- Added namespace isolation with a default namespace and explicit
+  `.with_namespace(...)` builder support.
+- Added compare-and-set insert/update/delete SQL that returns
+  `CoordinatorRevisionConflict` on stale revisions.
+- Added read-side validation that rejects rows whose persisted snapshot does
+  not match the row revision, shard count, or allocation strategy metadata.
+- Added gated PostgreSQL tests for migration and round-trip writes, namespace
+  isolation, conflict detection, deletes, and runtime recovery without
+  unnecessary rewrites.
+- Added CI/package/review documentation references for the new adapter crate.
 
 Suggested schema:
 

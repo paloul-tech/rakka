@@ -11,6 +11,7 @@ const PUBLISHABLE_CRATES: &[&str] = &[
     "rakka-remote",
     "rakka-cluster",
     "rakka-sharding",
+    "rakka-sharding-postgres",
     "rakka-workflow",
     "rakka-stream",
     "rakka-process",
@@ -152,14 +153,24 @@ fn facade_prelude_is_curated() {
     for expected in [
         "pub use rakka_core::{",
         "pub use rakka_persistence::{",
-        "pub use rakka_sharding::{EntityId, EntityRef, EntityType, ShardingConfig};",
+        "pub use rakka_sharding::facade::{",
+        "ClusterSharding",
+        "EntityTypeKey",
+        "ShardedEntityRef",
+        "pub use rakka_sharding::{",
+        "EntityId",
+        "EntityRef",
+        "EntityType",
+        "ShardingConfig",
+        "ShardCoordinatorStore",
         "pub use rakka_stream::{BoundedStream, StreamError, StreamResult, StreamSink, StreamSource};",
     ] {
         assert!(prelude.contains(expected), "prelude missing {expected}");
     }
 
     for internal in [
-        "ShardCoordinator",
+        "ShardCoordinator,",
+        "ShardRegion",
         "LocalEntityRoute",
         "RemoteEntityRoute",
         "ClusterNodeRuntime",

@@ -18,6 +18,7 @@ rakka-persistence-postgres
 rakka-remote
 rakka-cluster
 rakka-sharding
+rakka-sharding-postgres
 rakka-workflow
 rakka-stream
 rakka-process

@@ -1212,6 +1212,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-sharding-postgres"
+version = "0.1.0"
+dependencies = [
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-sharding",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "rakka-stream"
 version = "0.1.0"
 dependencies = [

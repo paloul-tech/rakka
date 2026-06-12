@@ -210,6 +210,22 @@ Persistent coordinator backends should use the async store path so database I/O
 does not block runtime threads:
 
 ```rust
+use rakka_sharding_postgres::PostgresShardCoordinatorStore;
+use tokio_postgres::NoTls;
+
+let (client, connection) = tokio_postgres::connect(
+    "postgres://postgres:postgres@localhost:5432/postgres",
+    NoTls,
+).await?;
+tokio::spawn(async move {
+    let _ = connection.await;
+});
+
+let store = PostgresShardCoordinatorStore::builder(client)
+    .with_namespace("shopping-prod")
+    .migrate()
+    .await?;
+
 let sharding = ClusterSharding::get_with_async_coordinator_store(&system, store);
 
 sharding

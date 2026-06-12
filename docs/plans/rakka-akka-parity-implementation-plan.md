@@ -393,6 +393,10 @@ Implementation status on 2026-06-11:
   `AsyncShardCoordinatorStore`, `CoordinatorStoreFuture`, async runtime
   registration/update APIs, async node-runtime APIs, async facade init/proxy
   APIs, and fail-closed sync behavior for async-only stores.
+- Implemented Phase 4D2 PostgreSQL coordinator store with the
+  `rakka-sharding-postgres` adapter crate, namespace-isolated coordinator
+  snapshots, migration SQL, compare-and-set revision fencing, and gated
+  PostgreSQL recovery tests.
 
 Phase 4 follow-ups:
 
