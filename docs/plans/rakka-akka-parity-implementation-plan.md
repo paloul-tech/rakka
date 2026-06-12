@@ -406,17 +406,23 @@ Implementation status on 2026-06-11:
 - Implemented Phase 4D5 remembered entities with facade opt-in, explicit async
   forget APIs, activation recording, bounded replay on ownership/acquire,
   in-memory and PostgreSQL remembered stores, tests, docs, and an example.
+- Implemented Phase 4D6 recovery-after-movement examples by upgrading
+  `examples/sharded-cart-persistence` to facade-created sharded cart entities
+  with in-memory and PostgreSQL coordinator/event/snapshot paths, tests that
+  assert state survives ownership movement, and docs that separate coordinator
+  recovery from entity persistence recovery.
 
 Phase 4 follow-ups:
 
-See `docs/plans/rakka-akka-parity-phase-4d-follow-up-plan.md` for the detailed
-slice plan.
+Completed. See `docs/plans/rakka-akka-parity-phase-4d-follow-up-plan.md` for
+the detailed slice plan and implementation notes.
 
-- Add persistent coordinator store implementations, starting with PostgreSQL or
-  a persistence-adapter bridge.
-- Add coordinator leadership/lease semantics for multi-coordinator deployments.
-- Evaluate remembered-entity semantics against Akka Cluster Sharding.
-- Add persistence recovery-after-movement examples on top of the remote facade.
+- Persistent coordinator store implementations, starting with PostgreSQL.
+- Coordinator leadership/lease semantics for multi-coordinator deployments.
+- Remembered-entity semantics evaluated against Akka Cluster Sharding and
+  implemented as opt-in bounded replay.
+- Persistence recovery-after-movement examples on top of facade-created
+  sharded entities.
 
 ## Phase 5: Cluster Extension, Receptionist, and Routers
 
