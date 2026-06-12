@@ -40,7 +40,7 @@ pub use remote::{
 };
 pub use routing::{
     EntityAskError, EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage,
-    ShardOwnerCache, ShardRegion,
+    ShardBufferConfig, ShardBufferOverflow, ShardOwnerCache, ShardRegion,
 };
 pub use runtime::{
     ClusterShardingError, ClusterShardingResult, ClusterShardingRuntime, ClusterShardingUpdate,

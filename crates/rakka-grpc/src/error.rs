@@ -108,6 +108,13 @@ pub enum GrpcError {
         /// Current handoff state.
         state: String,
     },
+    /// Entity shard movement buffer is full.
+    EntityShardBufferFull {
+        /// Shard id whose buffer was full.
+        shard_id: String,
+        /// Configured capacity per shard.
+        capacity: usize,
+    },
     /// Entity route rejected the request.
     EntityRejected {
         /// Rejection detail.
@@ -198,6 +205,7 @@ impl GrpcError {
             Self::EntityRemoteEncode { .. } => "entity-remote-encode",
             Self::EntityRemoteSend { .. } => "entity-remote-send",
             Self::EntityShardHandoff { .. } => "entity-shard-handoff",
+            Self::EntityShardBufferFull { .. } => "entity-shard-buffer-full",
             Self::EntityRejected { .. } => "entity-rejected",
             Self::EntityTimeout => "entity-timeout",
             Self::EntityReplyDropped => "entity-reply-dropped",
@@ -217,6 +225,7 @@ impl GrpcError {
             Self::ActorMailboxFull | Self::EntityMailboxFull | Self::StreamFull { .. } => {
                 Code::ResourceExhausted
             }
+            Self::EntityShardBufferFull { .. } => Code::ResourceExhausted,
             Self::ActorMailboxClosed
             | Self::ActorReplyDropped
             | Self::StreamDraining
@@ -273,6 +282,10 @@ impl GrpcError {
                 shard_id: shard_id.to_string(),
                 state: state.to_string(),
             },
+            EntityAskError::ShardBufferFull { shard_id, capacity } => Self::EntityShardBufferFull {
+                shard_id: shard_id.to_string(),
+                capacity,
+            },
             EntityAskError::Rejected(message) => Self::EntityRejected { message },
             EntityAskError::Timeout => Self::EntityTimeout,
             EntityAskError::ReplyDropped => Self::EntityReplyDropped,
@@ -320,6 +333,12 @@ impl GrpcError {
                 shard_id: shard_id.to_string(),
                 state: state.to_string(),
             },
+            EntityDeliveryFailure::ShardBufferFull { shard_id, capacity } => {
+                Self::EntityShardBufferFull {
+                    shard_id: shard_id.to_string(),
+                    capacity,
+                }
+            }
             EntityDeliveryFailure::Rejected(message) => Self::EntityRejected { message },
         }
     }
@@ -372,6 +391,9 @@ impl Display for GrpcError {
             }
             Self::EntityShardHandoff { shard_id, state } => {
                 write!(f, "shard {shard_id} is {state} during graceful handoff")
+            }
+            Self::EntityShardBufferFull { shard_id, capacity } => {
+                write!(f, "shard {shard_id} buffer is full at capacity {capacity}")
             }
             Self::EntityRejected { message } => {
                 write!(f, "entity route rejected request: {message}")

@@ -352,11 +352,22 @@ Implementation status on 2026-06-11:
 - Added Phase 4A TCP coverage for facade remote tell, facade remote ask,
   missing serializer failure, and ownership refresh after graceful-leave
   handoff.
+- Added Phase 4B handoff/passivation buffering with `ShardBufferConfig`,
+  bounded per-shard queues, overflow errors, TTL-based expiry, and explicit
+  low-level `ShardRegion::with_buffering` opt-in.
+- Facade-created `Entity` registrations now enable default buffering and expose
+  `with_buffering`, `with_handoff_buffer`, `without_buffering`, and
+  `with_passivation_buffer_duration`.
+- `ClusterSharding::passivate_entity` now opens a short buffering window before
+  stopping the local entity and flushes buffered messages once the window
+  closes.
+- HTTP and gRPC adapters now map full shard buffers to stable
+  `entity-shard-buffer-full` errors.
+- Added Phase 4B tests for facade passivation buffering, handoff flush on shard
+  acquire, and bounded-buffer overflow returning the original message.
 
 Phase 4 follow-ups:
 
-- Add handoff/passivation buffering semantics instead of immediate route
-  removal plus actor stop.
 - Add pluggable shard allocation strategy hooks to `ShardCoordinator`.
 - Add durable coordinator backend traits and persistent ownership snapshots.
 - Add persistence recovery-after-movement examples on top of the remote facade.

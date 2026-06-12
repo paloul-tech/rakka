@@ -103,6 +103,13 @@ pub enum HttpError {
         /// Current handoff state.
         state: String,
     },
+    /// Entity shard movement buffer is full.
+    EntityShardBufferFull {
+        /// Shard id whose buffer was full.
+        shard_id: String,
+        /// Configured capacity per shard.
+        capacity: usize,
+    },
     /// Entity route rejected the request.
     EntityRejected {
         /// Rejection detail.
@@ -166,6 +173,7 @@ impl HttpError {
             Self::EntityRemoteEncode { .. } => "entity-remote-encode",
             Self::EntityRemoteSend { .. } => "entity-remote-send",
             Self::EntityShardHandoff { .. } => "entity-shard-handoff",
+            Self::EntityShardBufferFull { .. } => "entity-shard-buffer-full",
             Self::EntityRejected { .. } => "entity-rejected",
             Self::EntityTimeout => "entity-timeout",
             Self::EntityReplyDropped => "entity-reply-dropped",
@@ -191,7 +199,8 @@ impl HttpError {
             | Self::EntityMailboxFull
             | Self::EntityMailboxClosed
             | Self::EntityNotLocal { .. }
-            | Self::EntityShardHandoff { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::EntityShardHandoff { .. }
+            | Self::EntityShardBufferFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ActorReplyDropped | Self::EntityReplyDropped => StatusCode::BAD_GATEWAY,
             Self::EntityRejected { .. } => StatusCode::CONFLICT,
             Self::JsonEncode { .. }
@@ -242,6 +251,10 @@ impl HttpError {
                 shard_id: shard_id.to_string(),
                 state: state.to_string(),
             },
+            EntityAskError::ShardBufferFull { shard_id, capacity } => Self::EntityShardBufferFull {
+                shard_id: shard_id.to_string(),
+                capacity,
+            },
             EntityAskError::Rejected(message) => Self::EntityRejected { message },
             EntityAskError::Timeout => Self::EntityTimeout,
             EntityAskError::ReplyDropped => Self::EntityReplyDropped,
@@ -275,6 +288,12 @@ impl HttpError {
                 shard_id: shard_id.to_string(),
                 state: state.to_string(),
             },
+            EntityDeliveryFailure::ShardBufferFull { shard_id, capacity } => {
+                Self::EntityShardBufferFull {
+                    shard_id: shard_id.to_string(),
+                    capacity,
+                }
+            }
             EntityDeliveryFailure::Rejected(message) => Self::EntityRejected { message },
         }
     }
@@ -311,6 +330,12 @@ impl Display for HttpError {
             Self::EntityRemoteSend { message } => write!(f, "remote entity send failed: {message}"),
             Self::EntityShardHandoff { shard_id, state } => {
                 write!(f, "entity shard {shard_id} is {state}")
+            }
+            Self::EntityShardBufferFull { shard_id, capacity } => {
+                write!(
+                    f,
+                    "entity shard {shard_id} buffer is full at capacity {capacity}"
+                )
             }
             Self::EntityRejected { message } => {
                 write!(f, "entity route rejected request: {message}")

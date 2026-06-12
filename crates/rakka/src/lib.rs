@@ -95,7 +95,9 @@ pub mod prelude {
     };
 
     #[cfg(feature = "sharding")]
-    pub use rakka_sharding::{EntityId, EntityRef, EntityType, ShardingConfig};
+    pub use rakka_sharding::{
+        EntityId, EntityRef, EntityType, ShardBufferConfig, ShardBufferOverflow, ShardingConfig,
+    };
 
     #[cfg(feature = "stream")]
     pub use rakka_stream::{BoundedStream, StreamError, StreamResult, StreamSink, StreamSource};

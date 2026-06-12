@@ -21,9 +21,9 @@ use rakka_sharding::{
     EntityTypeKey, LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient,
     RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityInboundError,
     RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
-    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision,
-    ShardHandoffState, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig,
-    ShardingError,
+    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardBufferConfig, ShardCoordinator,
+    ShardDecision, ShardHandoffState, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion,
+    ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -405,6 +405,48 @@ async fn cluster_sharding_facade_initializes_and_routes_local_entity() {
         .await
         .unwrap();
     assert_eq!(value, "FacadeCart|cart-1:");
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn cluster_sharding_facade_buffers_messages_during_explicit_passivation() {
+    let system = ActorSystem::new("facade-passivation-buffer-test");
+    let sharding = ClusterSharding::get(&system);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeBufferedCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_stop_message_factory(|| CartCommand::Passivate)
+            .with_passivation_buffer_duration(Duration::from_millis(50)),
+        )
+        .unwrap();
+    let cart = registration.entity_ref_for("cart-1");
+
+    cart.tell(CartCommand::Add("apple".to_string())).unwrap();
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(value, "FacadeBufferedCart|cart-1:apple");
+
+    assert!(sharding.passivate_entity(&key, "cart-1").unwrap());
+    cart.tell(CartCommand::Add("after-passivate".to_string()))
+        .unwrap();
+    assert_eq!(registration.region().buffered_message_count(), 1);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(value, "FacadeBufferedCart|cart-1:after-passivate");
+    assert_eq!(registration.region().buffered_message_count(), 0);
     system.shutdown();
 }
 
@@ -813,6 +855,97 @@ async fn cluster_sharding_runtime_runs_graceful_handoff_before_ownership_publish
         .tell(&region_a, CartCommand::Add("banana".to_string()))
         .unwrap();
     assert_eq!(route_a.entity_count(), 1);
+}
+
+#[tokio::test]
+async fn shard_region_buffers_messages_during_local_handoff_until_acquire() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("BufferedCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-handoff-buffer-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap()
+            .with_buffering(ShardBufferConfig::new(8, Duration::from_secs(1)));
+    let entity = region.entity_ref("cart-42");
+    let shard_id = entity.shard_id(region.config());
+
+    assert_eq!(region.begin_shard_handoff(shard_id).unwrap(), 0);
+    entity
+        .tell(&region, CartCommand::Add("buffered".to_string()))
+        .unwrap();
+
+    assert_eq!(region.buffered_message_count_for_shard(shard_id), 1);
+    assert_eq!(route.entity_count(), 0);
+
+    assert_eq!(region.acquire_shard(shard_id).unwrap(), 0);
+    let reply = entity
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "cart-42:buffered");
+    assert_eq!(region.buffered_message_count_for_shard(shard_id), 0);
+    assert_eq!(route.entity_count(), 1);
+}
+
+#[test]
+fn shard_region_reports_buffer_full_when_handoff_buffer_overflows() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("OverflowCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-handoff-buffer-overflow-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap()
+            .with_buffering(ShardBufferConfig::new(1, Duration::from_secs(1)));
+    let entity = region.entity_ref("cart-42");
+    let shard_id = entity.shard_id(region.config());
+
+    region.begin_shard_handoff(shard_id).unwrap();
+    entity
+        .tell(&region, CartCommand::Add("first".to_string()))
+        .unwrap();
+    let error = entity
+        .tell(&region, CartCommand::Add("second".to_string()))
+        .expect_err("second message should overflow the shard buffer");
+
+    assert_eq!(region.buffered_message_count_for_shard(shard_id), 1);
+    match error {
+        EntityTellError::Delivery {
+            message: CartCommand::Add(value),
+            failure:
+                EntityDeliveryFailure::ShardBufferFull {
+                    shard_id: failed_shard_id,
+                    capacity,
+                },
+        } => {
+            assert_eq!(value, "second");
+            assert_eq!(failed_shard_id, shard_id);
+            assert_eq!(capacity, 1);
+        }
+        other => panic!("unexpected buffer overflow error: {other:?}"),
+    }
 }
 
 #[test]

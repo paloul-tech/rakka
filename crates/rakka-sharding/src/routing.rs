@@ -1,10 +1,10 @@
 //! Shard owner cache and typed entity routing surface.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rakka_cluster::NodeId;
 use rakka_core::{Message, ReplyTo};
@@ -39,6 +39,13 @@ pub enum EntityDeliveryFailure {
         /// Current handoff state.
         state: ShardHandoffState,
     },
+    /// Bounded shard buffer was full.
+    ShardBufferFull {
+        /// Shard id whose buffer was full.
+        shard_id: ShardId,
+        /// Configured capacity per shard.
+        capacity: usize,
+    },
     /// Transport or route handler rejected the message.
     Rejected(String),
 }
@@ -54,6 +61,9 @@ impl Display for EntityDeliveryFailure {
             Self::RemoteSend(message) => write!(f, "remote entity send failed: {message}"),
             Self::ShardHandoff { shard_id, state } => {
                 write!(f, "shard {shard_id} is {state} during graceful handoff")
+            }
+            Self::ShardBufferFull { shard_id, capacity } => {
+                write!(f, "shard {shard_id} buffer is full at capacity {capacity}")
             }
             Self::Rejected(message) => write!(f, "entity route rejected message: {message}"),
         }
@@ -105,6 +115,9 @@ impl<M> EntityTellError<M> {
                 EntityDeliveryFailure::ShardHandoff { shard_id, state } => {
                     EntityAskError::ShardHandoff { shard_id, state }
                 }
+                EntityDeliveryFailure::ShardBufferFull { shard_id, capacity } => {
+                    EntityAskError::ShardBufferFull { shard_id, capacity }
+                }
                 EntityDeliveryFailure::Rejected(message) => EntityAskError::Rejected(message),
             },
         }
@@ -138,6 +151,13 @@ pub enum EntityAskError {
         /// Current handoff state.
         state: ShardHandoffState,
     },
+    /// Bounded shard buffer was full.
+    ShardBufferFull {
+        /// Shard id whose buffer was full.
+        shard_id: ShardId,
+        /// Configured capacity per shard.
+        capacity: usize,
+    },
     /// Route handler rejected delivery.
     Rejected(String),
     /// Timed out waiting for a reply.
@@ -158,6 +178,9 @@ impl Display for EntityAskError {
             Self::RemoteSend(message) => write!(f, "remote entity send failed: {message}"),
             Self::ShardHandoff { shard_id, state } => {
                 write!(f, "shard {shard_id} is {state} during graceful handoff")
+            }
+            Self::ShardBufferFull { shard_id, capacity } => {
+                write!(f, "shard {shard_id} buffer is full at capacity {capacity}")
             }
             Self::Rejected(message) => write!(f, "entity route rejected message: {message}"),
             Self::Timeout => f.write_str("entity ask timed out"),
@@ -278,6 +301,224 @@ where
     }
 }
 
+/// Overflow behavior for a bounded shard message buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardBufferOverflow {
+    /// Reject the new message and return it to the caller.
+    FailFast,
+    /// Drop the new message and keep already buffered messages.
+    DropNewest,
+    /// Drop the oldest buffered message and keep the new message.
+    DropOldest,
+}
+
+/// Bounded buffering policy for messages sent during shard movement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardBufferConfig {
+    capacity_per_shard: usize,
+    overflow: ShardBufferOverflow,
+    ttl: Duration,
+}
+
+impl ShardBufferConfig {
+    /// Creates a buffering policy.
+    #[must_use]
+    pub fn new(capacity_per_shard: usize, ttl: Duration) -> Self {
+        Self {
+            capacity_per_shard: capacity_per_shard.max(1),
+            overflow: ShardBufferOverflow::FailFast,
+            ttl,
+        }
+    }
+
+    /// Maximum queued messages per shard.
+    #[must_use]
+    pub const fn capacity_per_shard(&self) -> usize {
+        self.capacity_per_shard
+    }
+
+    /// Overflow behavior.
+    #[must_use]
+    pub const fn overflow(&self) -> ShardBufferOverflow {
+        self.overflow
+    }
+
+    /// Maximum time a buffered message remains eligible for delivery.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Sets the maximum queued messages per shard.
+    #[must_use]
+    pub fn with_capacity_per_shard(mut self, capacity_per_shard: usize) -> Self {
+        self.capacity_per_shard = capacity_per_shard.max(1);
+        self
+    }
+
+    /// Sets overflow behavior.
+    #[must_use]
+    pub const fn with_overflow(mut self, overflow: ShardBufferOverflow) -> Self {
+        self.overflow = overflow;
+        self
+    }
+
+    /// Sets maximum buffered-message lifetime.
+    #[must_use]
+    pub const fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+}
+
+impl Default for ShardBufferConfig {
+    fn default() -> Self {
+        Self::new(64, Duration::from_secs(5))
+    }
+}
+
+struct ShardMessageBuffer<M> {
+    config: ShardBufferConfig,
+    queues: BTreeMap<ShardId, VecDeque<BufferedEntityMessage<M>>>,
+    paused_entities: BTreeMap<EntityId, Instant>,
+}
+
+impl<M> ShardMessageBuffer<M> {
+    fn new(config: ShardBufferConfig) -> Self {
+        Self {
+            config,
+            queues: BTreeMap::new(),
+            paused_entities: BTreeMap::new(),
+        }
+    }
+
+    fn config(&self) -> &ShardBufferConfig {
+        &self.config
+    }
+
+    fn enqueue(
+        &mut self,
+        entity_type: EntityType,
+        entity_id: EntityId,
+        shard_id: ShardId,
+        message: M,
+        enqueued_at: Instant,
+    ) -> Result<(), EntityTellError<M>> {
+        let queue = self.queues.entry(shard_id).or_default();
+        if queue.len() < self.config.capacity_per_shard {
+            queue.push_back(BufferedEntityMessage::new(
+                entity_type,
+                entity_id,
+                shard_id,
+                message,
+                enqueued_at,
+            ));
+            return Ok(());
+        }
+
+        match self.config.overflow {
+            ShardBufferOverflow::FailFast => Err(EntityTellError::Delivery {
+                message,
+                failure: EntityDeliveryFailure::ShardBufferFull {
+                    shard_id,
+                    capacity: self.config.capacity_per_shard,
+                },
+            }),
+            ShardBufferOverflow::DropNewest => Ok(()),
+            ShardBufferOverflow::DropOldest => {
+                let _dropped = queue.pop_front();
+                queue.push_back(BufferedEntityMessage::new(
+                    entity_type,
+                    entity_id,
+                    shard_id,
+                    message,
+                    enqueued_at,
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    fn requeue(&mut self, message: BufferedEntityMessage<M>) {
+        let queue = self.queues.entry(message.shard_id).or_default();
+        if queue.len() < self.config.capacity_per_shard {
+            queue.push_back(message);
+        }
+    }
+
+    fn pause_entity(&mut self, entity_id: EntityId, until: Instant) {
+        self.paused_entities.insert(entity_id, until);
+    }
+
+    fn is_entity_paused(&mut self, entity_id: &EntityId, now: Instant) -> bool {
+        self.paused_entities
+            .retain(|_entity_id, paused_until| *paused_until > now);
+        self.paused_entities.contains_key(entity_id)
+    }
+
+    fn resume_entity(&mut self, entity_id: &EntityId) {
+        self.paused_entities.remove(entity_id);
+    }
+
+    fn drain_ready(&mut self, now: Instant) -> Vec<BufferedEntityMessage<M>> {
+        self.paused_entities
+            .retain(|_entity_id, paused_until| *paused_until > now);
+        let mut ready = Vec::new();
+        for queue in self.queues.values_mut() {
+            let len = queue.len();
+            for _ in 0..len {
+                let Some(message) = queue.pop_front() else {
+                    break;
+                };
+                if now.duration_since(message.enqueued_at) > self.config.ttl {
+                    continue;
+                }
+                if self.paused_entities.contains_key(&message.entity_id) {
+                    queue.push_back(message);
+                } else {
+                    ready.push(message);
+                }
+            }
+        }
+        self.queues.retain(|_shard_id, queue| !queue.is_empty());
+        ready
+    }
+
+    fn message_count(&self) -> usize {
+        self.queues.values().map(VecDeque::len).sum()
+    }
+
+    fn message_count_for_shard(&self, shard_id: ShardId) -> usize {
+        self.queues.get(&shard_id).map_or(0, VecDeque::len)
+    }
+}
+
+struct BufferedEntityMessage<M> {
+    entity_type: EntityType,
+    entity_id: EntityId,
+    shard_id: ShardId,
+    message: M,
+    enqueued_at: Instant,
+}
+
+impl<M> BufferedEntityMessage<M> {
+    fn new(
+        entity_type: EntityType,
+        entity_id: EntityId,
+        shard_id: ShardId,
+        message: M,
+        enqueued_at: Instant,
+    ) -> Self {
+        Self {
+            entity_type,
+            entity_id,
+            shard_id,
+            message,
+            enqueued_at,
+        }
+    }
+}
+
 /// Local cache of shard ownership for one entity type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardOwnerCache {
@@ -383,6 +624,7 @@ where
     config: ShardingConfig,
     owner_cache: Arc<Mutex<ShardOwnerCache>>,
     route: Arc<dyn EntityRoute<M>>,
+    buffer: Arc<Mutex<Option<ShardMessageBuffer<M>>>>,
 }
 
 impl<M> ShardRegion<M>
@@ -404,6 +646,7 @@ where
             entity_type,
             config,
             route: Arc::new(route),
+            buffer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -423,7 +666,18 @@ where
             entity_type,
             config,
             route: Arc::new(route),
+            buffer: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Enables bounded buffering for transient shard movement states.
+    #[must_use]
+    pub fn with_buffering(self, config: ShardBufferConfig) -> Self {
+        *self
+            .buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned") = Some(ShardMessageBuffer::new(config));
+        self
     }
 
     /// Entity type routed by this region.
@@ -458,7 +712,85 @@ where
         self.owner_cache
             .lock()
             .expect("shard owner cache mutex poisoned")
-            .refresh(snapshot)
+            .refresh(snapshot)?;
+        self.flush_buffered();
+        Ok(())
+    }
+
+    /// Returns configured buffering policy, when buffering is enabled.
+    #[must_use]
+    pub fn buffer_config(&self) -> Option<ShardBufferConfig> {
+        self.buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_ref()
+            .map(|buffer| buffer.config().clone())
+    }
+
+    /// Number of messages currently buffered across all shards.
+    #[must_use]
+    pub fn buffered_message_count(&self) -> usize {
+        self.buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_ref()
+            .map_or(0, ShardMessageBuffer::message_count)
+    }
+
+    /// Number of messages currently buffered for one shard.
+    #[must_use]
+    pub fn buffered_message_count_for_shard(&self, shard_id: ShardId) -> usize {
+        self.buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_ref()
+            .map_or(0, |buffer| buffer.message_count_for_shard(shard_id))
+    }
+
+    /// Marks an entity as temporarily passivating so incoming messages are buffered.
+    pub fn begin_entity_passivation(&self, entity_id: EntityId, duration: Duration) {
+        let Some(paused_until) = Instant::now().checked_add(duration) else {
+            return;
+        };
+        if let Some(buffer) = self
+            .buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_mut()
+        {
+            buffer.pause_entity(entity_id, paused_until);
+        }
+    }
+
+    /// Clears an entity passivation pause and attempts to flush buffered messages.
+    pub fn end_entity_passivation(&self, entity_id: &EntityId) {
+        if let Some(buffer) = self
+            .buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_mut()
+        {
+            buffer.resume_entity(entity_id);
+        }
+        self.flush_buffered();
+    }
+
+    /// Attempts to deliver buffered messages whose shard/entity is available.
+    pub fn flush_buffered(&self) {
+        let ready = {
+            let mut buffer = self
+                .buffer
+                .lock()
+                .expect("shard message buffer mutex poisoned");
+            let Some(buffer) = buffer.as_mut() else {
+                return;
+            };
+            buffer.drain_ready(Instant::now())
+        };
+
+        for message in ready {
+            self.flush_one_buffered(message);
+        }
     }
 
     /// Local node id for routes that host local entities.
@@ -479,7 +811,9 @@ where
 
     /// Marks a shard as acquired by this region's local route.
     pub fn acquire_shard(&self, shard_id: ShardId) -> ShardingResult<usize> {
-        self.route.acquire_shard(shard_id)
+        let stopped = self.route.acquire_shard(shard_id)?;
+        self.flush_buffered();
+        Ok(stopped)
     }
 
     /// Current known local handoff state for a shard, when tracked by this route.
@@ -500,8 +834,33 @@ where
 
     /// Sends a message without waiting for a reply.
     pub fn tell(&self, entity: &EntityRef<M>, message: M) -> Result<(), EntityTellError<M>> {
-        let (owner, shard_id) = match self.resolve(entity) {
-            Ok(resolved) => resolved,
+        if let Err(error) = self.ensure_entity_type(entity) {
+            return Err(EntityTellError::NoRoute { message, error });
+        }
+        let shard_id = entity.shard_id(&self.config);
+        if self.is_entity_buffered(entity.entity_id()) {
+            return self.enqueue_buffered(
+                entity.entity_type().clone(),
+                entity.entity_id().clone(),
+                shard_id,
+                message,
+            );
+        }
+        let owner = match self
+            .owner_cache
+            .lock()
+            .expect("shard owner cache mutex poisoned")
+            .owner_for_entity(entity.entity_id())
+        {
+            Ok((owner, _shard_id)) => owner.clone(),
+            Err(error) if self.can_buffer_no_route(&error) => {
+                return self.enqueue_buffered(
+                    entity.entity_type().clone(),
+                    entity.entity_id().clone(),
+                    shard_id,
+                    message,
+                );
+            }
             Err(error) => return Err(EntityTellError::NoRoute { message, error }),
         };
         let routed = RoutedEntityMessage::new(
@@ -511,7 +870,7 @@ where
             owner,
             message,
         );
-        self.route.deliver(routed)
+        self.deliver_or_buffer(routed)
     }
 
     /// Sends a request message and waits for its reply.
@@ -536,6 +895,117 @@ where
         }
     }
 
+    fn deliver_or_buffer(&self, routed: RoutedEntityMessage<M>) -> Result<(), EntityTellError<M>> {
+        let entity_type = routed.entity_type().clone();
+        let entity_id = routed.entity_id().clone();
+        match self.route.deliver(routed) {
+            Ok(()) => Ok(()),
+            Err(EntityTellError::Delivery {
+                message,
+                failure:
+                    failure @ EntityDeliveryFailure::ShardHandoff {
+                        shard_id: failure_shard_id,
+                        state: _,
+                    },
+            }) => {
+                if self.buffer_config().is_none() {
+                    return Err(EntityTellError::Delivery { message, failure });
+                }
+                self.enqueue_buffered(entity_type, entity_id, failure_shard_id, message)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn enqueue_buffered(
+        &self,
+        entity_type: EntityType,
+        entity_id: EntityId,
+        shard_id: ShardId,
+        message: M,
+    ) -> Result<(), EntityTellError<M>> {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned");
+        if let Some(buffer) = buffer.as_mut() {
+            buffer.enqueue(entity_type, entity_id, shard_id, message, Instant::now())
+        } else {
+            Err(EntityTellError::Delivery {
+                message,
+                failure: EntityDeliveryFailure::ShardHandoff {
+                    shard_id,
+                    state: self
+                        .shard_handoff_state(shard_id)
+                        .unwrap_or(ShardHandoffState::Transferring),
+                },
+            })
+        }
+    }
+
+    fn enqueue_existing_buffered(&self, message: BufferedEntityMessage<M>) {
+        if let Some(buffer) = self
+            .buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_mut()
+        {
+            buffer.requeue(message);
+        }
+    }
+
+    fn flush_one_buffered(&self, buffered: BufferedEntityMessage<M>) {
+        let entity = EntityRef::new(buffered.entity_type.clone(), buffered.entity_id.clone());
+        let Ok((owner, shard_id)) = self.resolve(&entity) else {
+            self.enqueue_existing_buffered(buffered);
+            return;
+        };
+        match self.route.deliver(RoutedEntityMessage::new(
+            buffered.entity_type.clone(),
+            buffered.entity_id.clone(),
+            shard_id,
+            owner,
+            buffered.message,
+        )) {
+            Ok(()) => {}
+            Err(EntityTellError::Delivery {
+                message,
+                failure: EntityDeliveryFailure::ShardHandoff { shard_id, .. },
+            }) => self.enqueue_existing_buffered(BufferedEntityMessage::new(
+                buffered.entity_type,
+                buffered.entity_id,
+                shard_id,
+                message,
+                buffered.enqueued_at,
+            )),
+            Err(EntityTellError::NoRoute { message, .. }) => {
+                self.enqueue_existing_buffered(BufferedEntityMessage::new(
+                    buffered.entity_type,
+                    buffered.entity_id,
+                    buffered.shard_id,
+                    message,
+                    buffered.enqueued_at,
+                ))
+            }
+            Err(EntityTellError::Delivery { .. }) => {}
+        }
+    }
+
+    fn is_entity_buffered(&self, entity_id: &EntityId) -> bool {
+        self.buffer
+            .lock()
+            .expect("shard message buffer mutex poisoned")
+            .as_mut()
+            .is_some_and(|buffer| buffer.is_entity_paused(entity_id, Instant::now()))
+    }
+
+    fn can_buffer_no_route(&self, error: &ShardingError) -> bool {
+        matches!(
+            error,
+            ShardingError::NoShardOwner { .. } | ShardingError::NoEntityOwner { .. }
+        ) && self.buffer_config().is_some()
+    }
+
     fn ensure_entity_type(&self, entity: &EntityRef<M>) -> ShardingResult<()> {
         if entity.entity_type() == self.entity_type() {
             Ok(())
@@ -558,6 +1028,7 @@ where
             config: self.config.clone(),
             owner_cache: self.owner_cache.clone(),
             route: self.route.clone(),
+            buffer: self.buffer.clone(),
         }
     }
 }

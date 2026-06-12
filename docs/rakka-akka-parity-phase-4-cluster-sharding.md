@@ -68,6 +68,38 @@ sharding.passivate_entity(&key, "cart-42")?;
 mode, shard count, local entity count, passivation settings, and owner revision
 for diagnostics and tests.
 
+## Handoff And Passivation Buffering
+
+Facade-created entity types enable bounded shard buffering by default. Messages
+sent during graceful shard handoff, temporary owner-cache gaps, or explicit
+facade passivation are accepted into the region buffer and flushed when the
+shard/entity becomes available again.
+
+```rust
+let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
+    .with_handoff_buffer(128)
+    .with_passivation_buffer_duration(Duration::from_millis(50));
+
+sharding.init(entity)?;
+```
+
+Use `Entity::with_buffering(ShardBufferConfig::default())` to set capacity,
+overflow behavior, and TTL together. Use `Entity::without_buffering()` for
+fail-fast behavior that mirrors the lower-level route errors.
+
+Lower-level `ShardRegion::new` and `ShardRegion::from_snapshot` remain
+unbuffered unless explicitly configured:
+
+```rust
+let region = ShardRegion::from_snapshot(entity_type, config, &snapshot, route)?
+    .with_buffering(ShardBufferConfig::new(64, Duration::from_secs(5)));
+```
+
+When the bounded buffer is full, `tell` returns the original message with
+`EntityDeliveryFailure::ShardBufferFull`; `ask` maps the same condition to
+`EntityAskError::ShardBufferFull`. HTTP and gRPC adapters expose the stable
+`entity-shard-buffer-full` code.
+
 ## Remote Runtime Bridge
 
 Networked sharding should use a facade companion for `ClusterNodeRuntime`:
@@ -121,5 +153,6 @@ into the entity command with the supplied builder function.
 The facade now owns local, proxy-only, and networked entity registration.
 Serialization codecs still live in the `SerializationRegistry` supplied to
 `ClusterNodeRuntime`; missing codecs fail at send/decode time with typed remote
-delivery errors. Remaining Phase 4 work should focus on buffering semantics,
-allocation strategy hooks, and durable coordinator storage.
+delivery errors. Remaining Phase 4 work should focus on allocation strategy
+hooks, durable coordinator storage, and persistence recovery examples over
+movement.

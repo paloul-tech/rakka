@@ -15,13 +15,15 @@ use crate::{
     ClusterNodeRuntime, ClusterNodeRuntimeResult, ClusterShardingError, ClusterShardingResult,
     ClusterShardingRuntime, EntityAskError, EntityId, EntityRef, EntityTellError, EntityType,
     LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient, RemoteEntityAskError,
-    RemoteEntityAskInbound, RemoteEntityInbound, ShardId, ShardRegion, ShardingConfig,
+    RemoteEntityAskInbound, RemoteEntityInbound, ShardBufferConfig, ShardId, ShardRegion,
+    ShardingConfig,
 };
 
 type RegionRegistry = Arc<Mutex<BTreeMap<EntityType, Box<dyn Any + Send + Sync>>>>;
 type LocalControlRegistry = Arc<Mutex<BTreeMap<EntityType, Arc<dyn LocalEntityControl>>>>;
 type StateRegistry = Arc<Mutex<BTreeMap<EntityType, EntityTypeRegistrationState>>>;
 type StopMessageFactory<M> = Arc<dyn Fn() -> M + Send + Sync>;
+const DEFAULT_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
 /// Akka-style typed key for one sharded entity protocol.
 #[derive(Debug, PartialEq, Eq)]
@@ -214,6 +216,8 @@ where
     actor_options: ActorOptions,
     idle_passivation_timeout: Option<Duration>,
     stop_message_factory: Option<StopMessageFactory<M>>,
+    buffer_config: Option<ShardBufferConfig>,
+    passivation_buffer_duration: Duration,
 }
 
 impl<M, A, F> Entity<M, A, F>
@@ -231,6 +235,8 @@ where
             actor_options: ActorOptions::default(),
             idle_passivation_timeout: None,
             stop_message_factory: None,
+            buffer_config: Some(ShardBufferConfig::default()),
+            passivation_buffer_duration: DEFAULT_PASSIVATION_BUFFER_DURATION,
         }
     }
 
@@ -245,6 +251,35 @@ where
     #[must_use]
     pub fn with_idle_passivation(mut self, timeout: Duration) -> Self {
         self.idle_passivation_timeout = Some(timeout);
+        self
+    }
+
+    /// Configures bounded buffering for shard handoff, owner refresh, and passivation windows.
+    #[must_use]
+    pub fn with_buffering(mut self, config: ShardBufferConfig) -> Self {
+        self.buffer_config = Some(config);
+        self
+    }
+
+    /// Configures buffering with the given capacity and default overflow/TTL.
+    #[must_use]
+    pub fn with_handoff_buffer(mut self, capacity_per_shard: usize) -> Self {
+        self.buffer_config =
+            Some(ShardBufferConfig::default().with_capacity_per_shard(capacity_per_shard));
+        self
+    }
+
+    /// Disables facade-level buffering for this entity type.
+    #[must_use]
+    pub fn without_buffering(mut self) -> Self {
+        self.buffer_config = None;
+        self
+    }
+
+    /// Sets how long explicit facade passivation should buffer incoming entity messages.
+    #[must_use]
+    pub const fn with_passivation_buffer_duration(mut self, duration: Duration) -> Self {
+        self.passivation_buffer_duration = duration;
         self
     }
 
@@ -291,6 +326,18 @@ where
     pub fn has_stop_message(&self) -> bool {
         self.stop_message_factory.is_some()
     }
+
+    /// Configured shard buffering policy, when enabled.
+    #[must_use]
+    pub const fn buffer_config(&self) -> Option<&ShardBufferConfig> {
+        self.buffer_config.as_ref()
+    }
+
+    /// Explicit passivation buffering window.
+    #[must_use]
+    pub const fn passivation_buffer_duration(&self) -> Duration {
+        self.passivation_buffer_duration
+    }
 }
 
 impl<M, A, F> Debug for Entity<M, A, F>
@@ -305,6 +352,11 @@ where
             .field("number_of_shards", &self.key.config().number_of_shards())
             .field("idle_passivation_timeout", &self.idle_passivation_timeout)
             .field("has_stop_message", &self.has_stop_message())
+            .field("buffer_config", &self.buffer_config)
+            .field(
+                "passivation_buffer_duration",
+                &self.passivation_buffer_duration,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -408,6 +460,8 @@ impl ClusterSharding {
             actor_options,
             idle_passivation_timeout,
             stop_message_factory,
+            buffer_config,
+            passivation_buffer_duration,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = self.local_node.id().clone();
@@ -425,10 +479,13 @@ impl ClusterSharding {
             local_route.clone(),
             stop_message_factory.clone(),
         ));
-        let region = ShardRegion::new(
-            key.entity_type().clone(),
-            key.config().clone(),
-            local_route.clone(),
+        let region = apply_buffering(
+            ShardRegion::new(
+                key.entity_type().clone(),
+                key.config().clone(),
+                local_route.clone(),
+            ),
+            buffer_config.clone(),
         );
         self.register_typed_region(
             key.clone(),
@@ -437,6 +494,8 @@ impl ClusterSharding {
                 control,
                 idle_passivation_timeout,
                 has_stop_message: stop_message_factory.is_some(),
+                buffer_config,
+                passivation_buffer_duration,
             },
         )?;
 
@@ -464,6 +523,8 @@ impl ClusterSharding {
             actor_options,
             idle_passivation_timeout,
             stop_message_factory,
+            buffer_config,
+            passivation_buffer_duration,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -482,10 +543,13 @@ impl ClusterSharding {
             stop_message_factory.clone(),
         ));
         let remote_route = runtime.remote_route(local_route.clone());
-        let region = ShardRegion::new(
-            key.entity_type().clone(),
-            key.config().clone(),
-            remote_route,
+        let region = apply_buffering(
+            ShardRegion::new(
+                key.entity_type().clone(),
+                key.config().clone(),
+                remote_route,
+            ),
+            buffer_config.clone(),
         );
         runtime.register_entity_region(region.clone())?;
         self.store_typed_region(
@@ -495,6 +559,8 @@ impl ClusterSharding {
                 control,
                 idle_passivation_timeout,
                 has_stop_message: stop_message_factory.is_some(),
+                buffer_config,
+                passivation_buffer_duration,
             },
         );
 
@@ -526,6 +592,8 @@ impl ClusterSharding {
             actor_options,
             idle_passivation_timeout,
             stop_message_factory,
+            buffer_config,
+            passivation_buffer_duration,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -544,10 +612,13 @@ impl ClusterSharding {
             stop_message_factory.clone(),
         ));
         let remote_route = runtime.remote_route(local_route.clone());
-        let region = ShardRegion::new(
-            key.entity_type().clone(),
-            key.config().clone(),
-            remote_route,
+        let region = apply_buffering(
+            ShardRegion::new(
+                key.entity_type().clone(),
+                key.config().clone(),
+                remote_route,
+            ),
+            buffer_config.clone(),
         );
         let tell_handler = RemoteEntityInbound::new(region.clone(), runtime.registry().clone());
         let ask_handler = RemoteEntityAskInbound::new(
@@ -571,6 +642,8 @@ impl ClusterSharding {
                 control,
                 idle_passivation_timeout,
                 has_stop_message: stop_message_factory.is_some(),
+                buffer_config,
+                passivation_buffer_duration,
             },
         );
 
@@ -657,16 +730,48 @@ impl ClusterSharding {
     where
         M: Message,
     {
-        let controls = self
+        let region = self.region_for(key)?;
+        let passivation_buffer_duration = self
+            .states
+            .lock()
+            .expect("cluster sharding state registry mutex poisoned")
+            .get(key.entity_type())
+            .map_or(Duration::ZERO, |state| state.passivation_buffer_duration);
+        let should_buffer =
+            region.buffer_config().is_some() && passivation_buffer_duration > Duration::ZERO;
+        if should_buffer {
+            region.begin_entity_passivation(entity_id.clone(), passivation_buffer_duration);
+        }
+
+        let control = self
             .controls
             .lock()
-            .expect("cluster sharding control registry mutex poisoned");
-        let control = controls.get(key.entity_type()).ok_or_else(|| {
-            ClusterShardingError::EntityTypeNotRegistered {
+            .expect("cluster sharding control registry mutex poisoned")
+            .get(key.entity_type())
+            .cloned()
+            .ok_or_else(|| ClusterShardingError::EntityTypeNotRegistered {
                 entity_type: key.entity_type().clone(),
+            })?;
+        let passivated = control.passivate_entity(entity_id);
+
+        if should_buffer {
+            let region = region.clone();
+            let entity_id = entity_id.clone();
+            if passivated {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        tokio::time::sleep(passivation_buffer_duration).await;
+                        region.end_entity_passivation(&entity_id);
+                    });
+                } else {
+                    region.end_entity_passivation(&entity_id);
+                }
+            } else {
+                region.end_entity_passivation(&entity_id);
             }
-        })?;
-        Ok(control.passivate_entity(entity_id))
+        }
+
+        Ok(passivated)
     }
 
     /// Returns the facade state for all registered entity types.
@@ -741,19 +846,33 @@ impl ClusterSharding {
             .expect("cluster sharding region registry mutex poisoned")
             .insert(key.entity_type().clone(), Box::new(region.clone()));
 
-        let (proxy_only, idle_passivation_timeout, has_stop_message) = match mode {
+        let (
+            proxy_only,
+            idle_passivation_timeout,
+            has_stop_message,
+            buffer_config,
+            passivation_buffer_duration,
+        ) = match mode {
             RegistrationMode::Local {
                 control,
                 idle_passivation_timeout,
                 has_stop_message,
+                buffer_config,
+                passivation_buffer_duration,
             } => {
                 self.controls
                     .lock()
                     .expect("cluster sharding control registry mutex poisoned")
                     .insert(key.entity_type().clone(), control);
-                (false, idle_passivation_timeout, has_stop_message)
+                (
+                    false,
+                    idle_passivation_timeout,
+                    has_stop_message,
+                    buffer_config,
+                    passivation_buffer_duration,
+                )
             }
-            RegistrationMode::ProxyOnly => (true, None, false),
+            RegistrationMode::ProxyOnly => (true, None, false, None, Duration::ZERO),
         };
 
         self.states
@@ -761,14 +880,18 @@ impl ClusterSharding {
             .expect("cluster sharding state registry mutex poisoned")
             .insert(
                 key.entity_type().clone(),
-                EntityTypeRegistrationState::new(
-                    key.entity_type().clone(),
-                    key.config().number_of_shards(),
-                    region.owner_revision(),
+                EntityTypeRegistrationState {
+                    entity_type: key.entity_type().clone(),
+                    number_of_shards: key.config().number_of_shards(),
+                    owner_revision: region.owner_revision(),
                     proxy_only,
+                    local_entity_count: 0,
                     idle_passivation_timeout,
                     has_stop_message,
-                ),
+                    buffer_config,
+                    passivation_buffer_duration,
+                    buffered_message_count: region.buffered_message_count(),
+                },
             );
     }
 }
@@ -972,30 +1095,12 @@ pub struct EntityTypeRegistrationState {
     local_entity_count: usize,
     idle_passivation_timeout: Option<Duration>,
     has_stop_message: bool,
+    buffer_config: Option<ShardBufferConfig>,
+    passivation_buffer_duration: Duration,
+    buffered_message_count: usize,
 }
 
 impl EntityTypeRegistrationState {
-    /// Creates entity-type registration state.
-    #[must_use]
-    pub fn new(
-        entity_type: EntityType,
-        number_of_shards: u32,
-        owner_revision: u64,
-        proxy_only: bool,
-        idle_passivation_timeout: Option<Duration>,
-        has_stop_message: bool,
-    ) -> Self {
-        Self {
-            entity_type,
-            number_of_shards,
-            owner_revision,
-            proxy_only,
-            local_entity_count: 0,
-            idle_passivation_timeout,
-            has_stop_message,
-        }
-    }
-
     /// Entity type.
     #[must_use]
     pub fn entity_type(&self) -> &EntityType {
@@ -1038,6 +1143,24 @@ impl EntityTypeRegistrationState {
         self.has_stop_message
     }
 
+    /// Configured shard buffering policy, when enabled.
+    #[must_use]
+    pub const fn buffer_config(&self) -> Option<&ShardBufferConfig> {
+        self.buffer_config.as_ref()
+    }
+
+    /// Explicit passivation buffering window.
+    #[must_use]
+    pub const fn passivation_buffer_duration(&self) -> Duration {
+        self.passivation_buffer_duration
+    }
+
+    /// Number of currently buffered messages observed by the facade.
+    #[must_use]
+    pub const fn buffered_message_count(&self) -> usize {
+        self.buffered_message_count
+    }
+
     fn with_control(mut self, control: Option<&Arc<dyn LocalEntityControl>>) -> Self {
         if let Some(control) = control {
             self.local_entity_count = control.entity_count();
@@ -1051,6 +1174,8 @@ enum RegistrationMode {
         control: Arc<dyn LocalEntityControl>,
         idle_passivation_timeout: Option<Duration>,
         has_stop_message: bool,
+        buffer_config: Option<ShardBufferConfig>,
+        passivation_buffer_duration: Duration,
     },
     ProxyOnly,
 }
@@ -1105,6 +1230,17 @@ where
             }
         }
         self.route.passivate_entity(entity_id)
+    }
+}
+
+fn apply_buffering<M>(region: ShardRegion<M>, config: Option<ShardBufferConfig>) -> ShardRegion<M>
+where
+    M: Message,
+{
+    if let Some(config) = config {
+        region.with_buffering(config)
+    } else {
+        region
     }
 }
 
