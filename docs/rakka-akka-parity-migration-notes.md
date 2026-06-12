@@ -192,3 +192,15 @@ command/effect assertions. Use `current_events_by_persistence_id`,
 need fully async command handlers. The behavior builders intentionally keep
 their command and event handlers synchronous so ordinary call sites stay small
 and avoid higher-ranked async closure complexity.
+
+The sharded cart persistence example now demonstrates persistence recovery
+after shard movement:
+
+```bash
+cargo run -p rakka-example-sharded-cart-persistence
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo run -p rakka-example-sharded-cart-persistence -- --postgres
+```
+
+See `docs/rakka-akka-parity-phase-4d6-recovery-after-movement.md` for the
+boundary between shard coordinator recovery and entity persistence recovery.

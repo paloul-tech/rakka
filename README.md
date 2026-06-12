@@ -142,7 +142,7 @@ Rakka event-sourced counter values: 1, 2, recovered 2.
 
 ### Sharded Cart Persistence
 
-This example derives event-sourced persistence ids from sharding entity type and entity ids using `PersistenceId::of`.
+This example derives event-sourced persistence ids from sharding entity type and entity ids using `PersistenceId::of`, writes cart state on a shard owned by node A, gracefully moves the shard to node B, and proves node B recovers the same cart state by replaying persistence.
 
 ```sh
 cargo run -p rakka-example-sharded-cart-persistence
@@ -151,7 +151,17 @@ cargo run -p rakka-example-sharded-cart-persistence
 Expected output:
 
 ```text
-Rakka sharded cart persistence wrote cart-a total 2 on shard N and cart-b total 1 on shard N.
+Rakka sharded cart movement (in-memory) used entity type CartMovement and persistence id CartMovement|cart-0.
+node A initially owned cart-0 on shard N and wrote cart total 2.
+ownership moved from rakka-0#uid-a to rakka-1#uid-b at coordinator revision N.
+node B recovered cart total 2 from persistence; persisted coordinator revision N was reloadable.
+```
+
+The same example can use PostgreSQL for both the shard coordinator snapshot and entity event/snapshot storage:
+
+```sh
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo run -p rakka-example-sharded-cart-persistence -- --postgres
 ```
 
 ### Durable Workflow

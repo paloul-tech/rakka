@@ -1106,7 +1106,13 @@ name = "rakka-example-sharded-cart-persistence"
 version = "0.1.0"
 dependencies = [
  "rakka",
+ "rakka-cluster",
+ "rakka-persistence",
+ "rakka-persistence-postgres",
+ "rakka-sharding",
+ "rakka-sharding-postgres",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

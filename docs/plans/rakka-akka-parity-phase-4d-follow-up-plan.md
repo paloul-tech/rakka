@@ -515,6 +515,8 @@ Implementation status:
 Goal: prove the durable coordinator and entity persistence story with examples
 that move ownership between nodes.
 
+Status: implemented.
+
 Scope:
 
 - Add or rewrite an example that combines:
@@ -552,6 +554,24 @@ Acceptance criteria:
   visible after movement.
 - Product docs link the example from the Phase 4 sharding page and the typed
   persistence docs.
+
+Implementation status:
+
+- Upgraded `examples/sharded-cart-persistence` from direct-spawned persistent
+  actors to facade-created sharded cart entities.
+- Added a deterministic in-memory movement path using `ClusterSharding`,
+  `InMemoryShardCoordinatorStore`, `InMemoryEventJournal`, and
+  `InMemorySnapshotStore`.
+- Added a gated PostgreSQL movement path using `PostgresShardCoordinatorStore`,
+  `PostgresEventJournal`, and `PostgresSnapshotStore`.
+- Added example tests that assert cart state written before movement is visible
+  after node B acquires the shard.
+- Added `docs/rakka-akka-parity-phase-4d6-recovery-after-movement.md` to explain
+  what is recovered by sharding versus typed persistence.
+- Linked the example from README, migration notes, and the remote sharding doc.
+- Boundary note: the movement example keeps `ReplyTo`-based cart asks local
+  before and after ownership changes; `examples/multi-node-sharding` remains the
+  transport and serialization proof for remote sharding.
 
 Review commands:
 
