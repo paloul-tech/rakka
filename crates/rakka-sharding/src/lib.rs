@@ -3,6 +3,7 @@
 
 //! Cluster sharding and entity routing foundation.
 
+pub mod allocation;
 pub mod coordinator;
 pub mod error;
 pub mod facade;
@@ -16,6 +17,10 @@ pub mod runtime;
 
 use rakka_core::Subsystem;
 
+pub use allocation::{
+    DeterministicModuloShardAllocationStrategy, LeastShardAllocationStrategy,
+    ShardAllocationContext, ShardAllocationStrategy, ShardReassignment, ShardRebalanceContext,
+};
 pub use coordinator::{
     ShardAssignment, ShardCoordinator, ShardDecision, ShardMoveReason, ShardOwnerCount,
     ShardOwnershipSnapshot, ShardRebalancePlan,

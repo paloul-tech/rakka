@@ -365,10 +365,20 @@ Implementation status on 2026-06-11:
   `entity-shard-buffer-full` errors.
 - Added Phase 4B tests for facade passivation buffering, handoff flush on shard
   acquire, and bounded-buffer overflow returning the original message.
+- Added Phase 4C `ShardAllocationStrategy` hooks with read-only allocation and
+  rebalance contexts, strategy-requested reassignments, and validation in
+  `ShardCoordinator`.
+- Preserved the original deterministic modulo ownership as
+  `DeterministicModuloShardAllocationStrategy` and added
+  `LeastShardAllocationStrategy` for bounded least-shard rebalancing.
+- `ShardRegion`, `Entity`, remote facade registration, and proxy-only
+  registration now carry allocation strategy metadata into
+  `ClusterShardingRuntime`.
+- Added Phase 4C tests for custom initial allocation, bounded least-shard
+  rebalance, and facade-to-runtime strategy propagation.
 
 Phase 4 follow-ups:
 
-- Add pluggable shard allocation strategy hooks to `ShardCoordinator`.
 - Add durable coordinator backend traits and persistent ownership snapshots.
 - Add persistence recovery-after-movement examples on top of the remote facade.
 

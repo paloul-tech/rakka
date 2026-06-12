@@ -18,12 +18,12 @@ use rakka_remote::{
 use rakka_sharding::{
     ClusterSharding, ClusterShardingError, ClusterShardingRuntime, Entity, EntityAskError,
     EntityContext, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
-    EntityTypeKey, LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient,
-    RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityInboundError,
-    RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
-    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardBufferConfig, ShardCoordinator,
-    ShardDecision, ShardHandoffState, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion,
-    ShardingConfig, ShardingError,
+    EntityTypeKey, LeastShardAllocationStrategy, LocalEntityContext, LocalEntityRoute,
+    RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound,
+    RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
+    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardAllocationContext,
+    ShardAllocationStrategy, ShardBufferConfig, ShardCoordinator, ShardDecision, ShardHandoffState,
+    ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -227,6 +227,19 @@ impl RemoteEntityOutbound for FailingRemoteOutbound {
         Err(RemoteEntitySendFailure::Rejected(
             "transport unavailable".to_string(),
         ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LastRoutableAllocationStrategy;
+
+impl ShardAllocationStrategy for LastRoutableAllocationStrategy {
+    fn allocate_shard(
+        &self,
+        context: &ShardAllocationContext<'_>,
+        _shard_id: ShardId,
+    ) -> Option<NodeId> {
+        context.routable_nodes().last().cloned()
     }
 }
 
@@ -451,6 +464,46 @@ async fn cluster_sharding_facade_buffers_messages_during_explicit_passivation() 
 }
 
 #[test]
+fn cluster_sharding_facade_passes_allocation_strategy_to_runtime() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local.clone(), remote.clone()]);
+    let system = ActorSystem::new("facade-allocation-strategy-test");
+    let sharding = ClusterSharding::from_membership(&system, local, membership);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeStrategyCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_allocation_strategy(LastRoutableAllocationStrategy),
+        )
+        .unwrap();
+    let state = sharding.registration_state(&key).unwrap();
+    let runtime = sharding.runtime();
+    let runtime = runtime.lock().expect("cluster sharding runtime poisoned");
+    let coordinator = runtime.coordinator(key.entity_type()).unwrap();
+
+    assert!(state
+        .allocation_strategy()
+        .contains("LastRoutableAllocationStrategy"));
+    assert!(registration
+        .region()
+        .allocation_strategy_name()
+        .contains("LastRoutableAllocationStrategy"));
+    assert!(coordinator
+        .snapshot()
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner() == remote.id()));
+    system.shutdown();
+}
+
+#[test]
 fn cluster_sharding_facade_reports_proxy_and_message_mismatch_state() {
     let system = ActorSystem::new("facade-proxy-test");
     let sharding = ClusterSharding::get(&system);
@@ -566,6 +619,39 @@ fn coordinator_allocates_all_shards_to_routable_members() {
 }
 
 #[test]
+fn coordinator_uses_custom_strategy_for_initial_allocation() {
+    let membership = membership_with_up_nodes(vec![
+        node("rakka-0", "uid-a"),
+        node("rakka-1", "uid-b"),
+        node("rakka-2", "uid-c"),
+    ]);
+    let mut coordinator = ShardCoordinator::with_allocation_strategy(
+        EntityType::new("Cart"),
+        ShardingConfig::new(6).unwrap(),
+        LastRoutableAllocationStrategy,
+    );
+
+    let plan = coordinator.reconcile(&membership);
+    let snapshot = coordinator.snapshot();
+
+    assert_eq!(plan.decisions().len(), 6);
+    assert!(plan.decisions().iter().all(|decision| {
+        matches!(
+            decision,
+            ShardDecision::Assign {
+                to,
+                reason: ShardMoveReason::InitialAllocation,
+                ..
+            } if to.logical_id() == "rakka-2"
+        )
+    }));
+    assert!(snapshot
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner().logical_id() == "rakka-2"));
+}
+
+#[test]
 fn reconciliation_is_empty_when_membership_does_not_change() {
     let membership =
         membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
@@ -615,6 +701,54 @@ fn joining_member_rebalances_existing_ownership() {
             .filter(|assignment| assignment.owner().logical_id() == "rakka-2")
             .count(),
         2
+    );
+}
+
+#[test]
+fn least_shard_strategy_rebalances_existing_ownership_with_limit() {
+    let one_node = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let three_nodes = membership_with_up_nodes(vec![
+        node("rakka-0", "uid-a"),
+        node("rakka-1", "uid-b"),
+        node("rakka-2", "uid-c"),
+    ]);
+    let mut coordinator = ShardCoordinator::with_allocation_strategy(
+        EntityType::new("Cart"),
+        ShardingConfig::new(6).unwrap(),
+        LeastShardAllocationStrategy::new(1, 2),
+    );
+
+    coordinator.reconcile(&one_node);
+    let plan = coordinator.reconcile(&three_nodes);
+    let snapshot = coordinator.snapshot();
+
+    let rebalance_moves = plan
+        .decisions()
+        .iter()
+        .filter(|decision| {
+            matches!(
+                decision,
+                ShardDecision::Move {
+                    from,
+                    reason: ShardMoveReason::Rebalance,
+                    ..
+                } if from.logical_id() == "rakka-0"
+            )
+        })
+        .count();
+
+    assert_eq!(rebalance_moves, 2);
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-0", "uid-a")),
+        4
+    );
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-1", "uid-b")),
+        1
+    );
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-2", "uid-c")),
+        1
     );
 }
 

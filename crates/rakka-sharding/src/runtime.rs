@@ -12,9 +12,9 @@ use rakka_cluster::{
 use rakka_core::Message;
 
 use crate::{
-    EntityType, ShardCoordinator, ShardDecision, ShardHandoff, ShardHandoffState, ShardMoveReason,
-    ShardOwnershipSnapshot, ShardRebalancePlan, ShardRegion, ShardingConfig, ShardingError,
-    ShardingResult,
+    EntityType, ShardAllocationStrategy, ShardCoordinator, ShardDecision, ShardHandoff,
+    ShardHandoffState, ShardMoveReason, ShardOwnershipSnapshot, ShardRebalancePlan, ShardRegion,
+    ShardingConfig, ShardingError, ShardingResult,
 };
 
 /// Convenient result alias for cluster/sharding runtime operations.
@@ -204,7 +204,8 @@ impl ClusterShardingRuntime {
     {
         let entity_type = region.entity_type().clone();
         let config = region.config().clone();
-        self.ensure_coordinator(entity_type.clone(), config)?;
+        let allocation_strategy = region.allocation_strategy();
+        self.ensure_coordinator(entity_type.clone(), config, allocation_strategy)?;
         let snapshot = self
             .coordinators
             .get(&entity_type)
@@ -293,6 +294,7 @@ impl ClusterShardingRuntime {
         &mut self,
         entity_type: EntityType,
         config: ShardingConfig,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
     ) -> ClusterShardingResult<()> {
         if let Some(coordinator) = self.coordinators.get(&entity_type) {
             if coordinator.config().number_of_shards() != config.number_of_shards() {
@@ -305,7 +307,11 @@ impl ClusterShardingRuntime {
             return Ok(());
         }
 
-        let mut coordinator = ShardCoordinator::new(entity_type.clone(), config);
+        let mut coordinator = ShardCoordinator::with_allocation_strategy_ref(
+            entity_type.clone(),
+            config,
+            allocation_strategy,
+        );
         coordinator.reconcile(&self.membership);
         self.coordinators.insert(entity_type, coordinator);
         Ok(())

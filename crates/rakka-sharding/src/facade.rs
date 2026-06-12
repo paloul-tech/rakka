@@ -14,9 +14,9 @@ use rakka_remote::{RemoteEnvelope, RemoteEnvelopeHandler, RemoteTransport};
 use crate::{
     ClusterNodeRuntime, ClusterNodeRuntimeResult, ClusterShardingError, ClusterShardingResult,
     ClusterShardingRuntime, EntityAskError, EntityId, EntityRef, EntityTellError, EntityType,
-    LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient, RemoteEntityAskError,
-    RemoteEntityAskInbound, RemoteEntityInbound, ShardBufferConfig, ShardId, ShardRegion,
-    ShardingConfig,
+    LeastShardAllocationStrategy, LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient,
+    RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound, ShardAllocationStrategy,
+    ShardBufferConfig, ShardId, ShardRegion, ShardingConfig,
 };
 
 type RegionRegistry = Arc<Mutex<BTreeMap<EntityType, Box<dyn Any + Send + Sync>>>>;
@@ -218,6 +218,7 @@ where
     stop_message_factory: Option<StopMessageFactory<M>>,
     buffer_config: Option<ShardBufferConfig>,
     passivation_buffer_duration: Duration,
+    allocation_strategy: Arc<dyn ShardAllocationStrategy>,
 }
 
 impl<M, A, F> Entity<M, A, F>
@@ -237,6 +238,7 @@ where
             stop_message_factory: None,
             buffer_config: Some(ShardBufferConfig::default()),
             passivation_buffer_duration: DEFAULT_PASSIVATION_BUFFER_DURATION,
+            allocation_strategy: Arc::new(crate::DeterministicModuloShardAllocationStrategy),
         }
     }
 
@@ -281,6 +283,39 @@ where
     pub const fn with_passivation_buffer_duration(mut self, duration: Duration) -> Self {
         self.passivation_buffer_duration = duration;
         self
+    }
+
+    /// Sets the shard allocation strategy for this entity type.
+    #[must_use]
+    pub fn with_allocation_strategy(
+        mut self,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> Self {
+        self.allocation_strategy = Arc::new(allocation_strategy);
+        self
+    }
+
+    /// Sets a shared shard allocation strategy for this entity type.
+    #[must_use]
+    pub fn with_allocation_strategy_ref(
+        mut self,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> Self {
+        self.allocation_strategy = allocation_strategy;
+        self
+    }
+
+    /// Uses the built-in least-shard allocation strategy for this entity type.
+    #[must_use]
+    pub fn with_least_shard_allocation(
+        self,
+        rebalance_threshold: usize,
+        max_simultaneous_rebalance: usize,
+    ) -> Self {
+        self.with_allocation_strategy(LeastShardAllocationStrategy::new(
+            rebalance_threshold,
+            max_simultaneous_rebalance,
+        ))
     }
 
     /// Configures a stop message delivered immediately before facade passivation stops an entity.
@@ -338,6 +373,18 @@ where
     pub const fn passivation_buffer_duration(&self) -> Duration {
         self.passivation_buffer_duration
     }
+
+    /// Configured shard allocation strategy.
+    #[must_use]
+    pub fn allocation_strategy(&self) -> Arc<dyn ShardAllocationStrategy> {
+        self.allocation_strategy.clone()
+    }
+
+    /// Stable shard allocation strategy name used for diagnostics.
+    #[must_use]
+    pub fn allocation_strategy_name(&self) -> &'static str {
+        self.allocation_strategy.strategy_name()
+    }
 }
 
 impl<M, A, F> Debug for Entity<M, A, F>
@@ -357,6 +404,7 @@ where
                 "passivation_buffer_duration",
                 &self.passivation_buffer_duration,
             )
+            .field("allocation_strategy", &self.allocation_strategy_name())
             .finish_non_exhaustive()
     }
 }
@@ -462,6 +510,7 @@ impl ClusterSharding {
             stop_message_factory,
             buffer_config,
             passivation_buffer_duration,
+            allocation_strategy,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = self.local_node.id().clone();
@@ -480,10 +529,13 @@ impl ClusterSharding {
             stop_message_factory.clone(),
         ));
         let region = apply_buffering(
-            ShardRegion::new(
-                key.entity_type().clone(),
-                key.config().clone(),
-                local_route.clone(),
+            apply_allocation_strategy(
+                ShardRegion::new(
+                    key.entity_type().clone(),
+                    key.config().clone(),
+                    local_route.clone(),
+                ),
+                allocation_strategy,
             ),
             buffer_config.clone(),
         );
@@ -525,6 +577,7 @@ impl ClusterSharding {
             stop_message_factory,
             buffer_config,
             passivation_buffer_duration,
+            allocation_strategy,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -544,10 +597,13 @@ impl ClusterSharding {
         ));
         let remote_route = runtime.remote_route(local_route.clone());
         let region = apply_buffering(
-            ShardRegion::new(
-                key.entity_type().clone(),
-                key.config().clone(),
-                remote_route,
+            apply_allocation_strategy(
+                ShardRegion::new(
+                    key.entity_type().clone(),
+                    key.config().clone(),
+                    remote_route,
+                ),
+                allocation_strategy,
             ),
             buffer_config.clone(),
         );
@@ -594,6 +650,7 @@ impl ClusterSharding {
             stop_message_factory,
             buffer_config,
             passivation_buffer_duration,
+            allocation_strategy,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -613,10 +670,13 @@ impl ClusterSharding {
         ));
         let remote_route = runtime.remote_route(local_route.clone());
         let region = apply_buffering(
-            ShardRegion::new(
-                key.entity_type().clone(),
-                key.config().clone(),
-                remote_route,
+            apply_allocation_strategy(
+                ShardRegion::new(
+                    key.entity_type().clone(),
+                    key.config().clone(),
+                    remote_route,
+                ),
+                allocation_strategy,
             ),
             buffer_config.clone(),
         );
@@ -658,17 +718,47 @@ impl ClusterSharding {
     where
         M: Message,
     {
+        self.init_proxy_with_allocation_strategy_ref(
+            key,
+            Arc::new(crate::DeterministicModuloShardAllocationStrategy),
+        )
+    }
+
+    /// Initializes a proxy-only entity type registration with an allocation strategy.
+    pub fn init_proxy_with_allocation_strategy<M>(
+        &self,
+        key: EntityTypeKey<M>,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> ClusterShardingResult<EntityTypeRegistration<M>>
+    where
+        M: Message,
+    {
+        self.init_proxy_with_allocation_strategy_ref(key, Arc::new(allocation_strategy))
+    }
+
+    /// Initializes a proxy-only entity type registration with a shared allocation strategy.
+    pub fn init_proxy_with_allocation_strategy_ref<M>(
+        &self,
+        key: EntityTypeKey<M>,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> ClusterShardingResult<EntityTypeRegistration<M>>
+    where
+        M: Message,
+    {
         let entity_type = key.entity_type().clone();
-        let region = ShardRegion::new(
-            entity_type.clone(),
-            key.config().clone(),
-            move |message: crate::RoutedEntityMessage<M>| {
-                let owner = message.owner().clone();
-                Err(EntityTellError::Delivery {
-                    message: message.into_message(),
-                    failure: crate::EntityDeliveryFailure::NotLocal { owner },
-                })
-            },
+        let region = apply_allocation_strategy(
+            ShardRegion::new(
+                entity_type.clone(),
+                key.config().clone(),
+                move |message: crate::RoutedEntityMessage<M>| {
+                    let owner = message.owner().clone();
+                    Err(EntityTellError::Delivery {
+                        message: message.into_message(),
+                        failure: crate::EntityDeliveryFailure::NotLocal { owner },
+                    })
+                },
+            ),
+            allocation_strategy,
         );
         self.register_typed_region(key.clone(), region.clone(), RegistrationMode::ProxyOnly)?;
         Ok(EntityTypeRegistration::new(key, region))
@@ -891,6 +981,7 @@ impl ClusterSharding {
                     buffer_config,
                     passivation_buffer_duration,
                     buffered_message_count: region.buffered_message_count(),
+                    allocation_strategy: region.allocation_strategy_name().to_string(),
                 },
             );
     }
@@ -1098,6 +1189,7 @@ pub struct EntityTypeRegistrationState {
     buffer_config: Option<ShardBufferConfig>,
     passivation_buffer_duration: Duration,
     buffered_message_count: usize,
+    allocation_strategy: String,
 }
 
 impl EntityTypeRegistrationState {
@@ -1159,6 +1251,12 @@ impl EntityTypeRegistrationState {
     #[must_use]
     pub const fn buffered_message_count(&self) -> usize {
         self.buffered_message_count
+    }
+
+    /// Stable shard allocation strategy name used for this registration.
+    #[must_use]
+    pub fn allocation_strategy(&self) -> &str {
+        &self.allocation_strategy
     }
 
     fn with_control(mut self, control: Option<&Arc<dyn LocalEntityControl>>) -> Self {
@@ -1242,6 +1340,16 @@ where
     } else {
         region
     }
+}
+
+fn apply_allocation_strategy<M>(
+    region: ShardRegion<M>,
+    allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+) -> ShardRegion<M>
+where
+    M: Message,
+{
+    region.with_allocation_strategy_ref(allocation_strategy)
 }
 
 fn local_node_for_system(system: &ActorSystem) -> ClusterNode {

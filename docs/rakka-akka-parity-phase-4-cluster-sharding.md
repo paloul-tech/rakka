@@ -100,6 +100,40 @@ When the bounded buffer is full, `tell` returns the original message with
 `EntityAskError::ShardBufferFull`. HTTP and gRPC adapters expose the stable
 `entity-shard-buffer-full` code.
 
+## Allocation Strategies
+
+Shard ownership is pluggable through `ShardAllocationStrategy`. The default is
+`DeterministicModuloShardAllocationStrategy`, which preserves the original
+stable modulo ownership model.
+
+```rust
+let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
+    .with_least_shard_allocation(1, 10);
+
+sharding.init(entity)?;
+```
+
+Use `LeastShardAllocationStrategy` when a newly joined node should receive a
+bounded number of shards per rebalance pass based on current owner counts:
+
+```rust
+let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
+    .with_allocation_strategy(LeastShardAllocationStrategy::new(1, 4));
+```
+
+Custom strategies implement `ShardAllocationStrategy` and receive read-only
+`ShardAllocationContext` / `ShardRebalanceContext` values. The coordinator
+keeps responsibility for validating target owners and assigning move reasons,
+so graceful-leave handoff and owner-unavailable failover continue to use the
+same `ShardDecision` model.
+
+Low-level users can attach a strategy directly to a region:
+
+```rust
+let region = ShardRegion::new(entity_type, config, route)
+    .with_allocation_strategy(LeastShardAllocationStrategy::default());
+```
+
 ## Remote Runtime Bridge
 
 Networked sharding should use a facade companion for `ClusterNodeRuntime`:
@@ -153,6 +187,5 @@ into the entity command with the supplied builder function.
 The facade now owns local, proxy-only, and networked entity registration.
 Serialization codecs still live in the `SerializationRegistry` supplied to
 `ClusterNodeRuntime`; missing codecs fail at send/decode time with typed remote
-delivery errors. Remaining Phase 4 work should focus on allocation strategy
-hooks, durable coordinator storage, and persistence recovery examples over
-movement.
+delivery errors. Remaining Phase 4 work should focus on durable coordinator
+storage and persistence recovery examples over movement.

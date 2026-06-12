@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rakka_cluster::NodeId;
 use rakka_core::{Message, ReplyTo};
 
+use crate::allocation::{DeterministicModuloShardAllocationStrategy, ShardAllocationStrategy};
 use crate::coordinator::ShardOwnershipSnapshot;
 use crate::error::{ShardingError, ShardingResult};
 use crate::handoff::ShardHandoffState;
@@ -625,6 +626,7 @@ where
     owner_cache: Arc<Mutex<ShardOwnerCache>>,
     route: Arc<dyn EntityRoute<M>>,
     buffer: Arc<Mutex<Option<ShardMessageBuffer<M>>>>,
+    allocation_strategy: Arc<dyn ShardAllocationStrategy>,
 }
 
 impl<M> ShardRegion<M>
@@ -647,6 +649,7 @@ where
             config,
             route: Arc::new(route),
             buffer: Arc::new(Mutex::new(None)),
+            allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy),
         }
     }
 
@@ -667,6 +670,7 @@ where
             config,
             route: Arc::new(route),
             buffer: Arc::new(Mutex::new(None)),
+            allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy),
         })
     }
 
@@ -680,6 +684,26 @@ where
         self
     }
 
+    /// Sets the allocation strategy used when this region registers with a runtime.
+    #[must_use]
+    pub fn with_allocation_strategy(
+        mut self,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> Self {
+        self.allocation_strategy = Arc::new(allocation_strategy);
+        self
+    }
+
+    /// Sets a shared allocation strategy used when this region registers with a runtime.
+    #[must_use]
+    pub fn with_allocation_strategy_ref(
+        mut self,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> Self {
+        self.allocation_strategy = allocation_strategy;
+        self
+    }
+
     /// Entity type routed by this region.
     #[must_use]
     pub fn entity_type(&self) -> &EntityType {
@@ -690,6 +714,18 @@ where
     #[must_use]
     pub const fn config(&self) -> &ShardingConfig {
         &self.config
+    }
+
+    /// Allocation strategy used when this region registers with a runtime.
+    #[must_use]
+    pub fn allocation_strategy(&self) -> Arc<dyn ShardAllocationStrategy> {
+        self.allocation_strategy.clone()
+    }
+
+    /// Stable allocation strategy name used for diagnostics.
+    #[must_use]
+    pub fn allocation_strategy_name(&self) -> &'static str {
+        self.allocation_strategy.strategy_name()
     }
 
     /// Current owner cache revision.
@@ -1029,6 +1065,7 @@ where
             owner_cache: self.owner_cache.clone(),
             route: self.route.clone(),
             buffer: self.buffer.clone(),
+            allocation_strategy: self.allocation_strategy.clone(),
         }
     }
 }
@@ -1042,6 +1079,7 @@ where
             .field("entity_type", self.entity_type())
             .field("number_of_shards", &self.config().number_of_shards())
             .field("owner_revision", &self.owner_revision())
+            .field("allocation_strategy", &self.allocation_strategy_name())
             .finish_non_exhaustive()
     }
 }
