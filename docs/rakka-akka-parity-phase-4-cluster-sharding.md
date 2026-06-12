@@ -289,6 +289,60 @@ sharding API with an async-only store returns
 See `docs/rakka-akka-parity-phase-4-durable-coordinator-rationale.md` for the
 architectural reasoning and Akka comparison.
 
+## Remembered Entities
+
+Entity types can opt into Akka-style remembered entities. Rakka records an
+entity id after the local actor is successfully activated, replays remembered
+ids in bounded batches when a shard is owned or acquired locally, and keeps the
+remembered identity store separate from coordinator ownership snapshots and
+entity persistence.
+
+```rust
+let remembered = InMemoryRememberedEntityStore::new();
+let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
+    .with_remembered_entities(
+        RememberedEntities::enabled()
+            .with_start_batch_size(64)
+            .with_store(remembered.clone()),
+    );
+
+let registration = sharding.init(entity)?;
+let cart = registration.entity_ref_for("cart-42");
+cart.tell(CartCommand::Add("apple".to_string()))?;
+```
+
+Passivation remains a local resource-management mechanism. Idle passivation and
+ordinary explicit passivation stop local actors but leave the remembered id in
+place. To remove the identity from the remembered set, call the explicit async
+forget API:
+
+```rust
+sharding.forget_entity(&key, "cart-42").await?;
+```
+
+Persistent remembered identity can use `PostgresRememberedEntityStore` from
+`rakka-sharding-postgres`:
+
+```rust
+let remembered = PostgresRememberedEntityStore::builder(client)
+    .with_namespace("shopping-prod")
+    .migrate()
+    .await?;
+
+let entity = Entity::of(key.clone(), |context| CartEntity::new(context))
+    .with_remembered_entities(
+        RememberedEntities::enabled().with_store(remembered),
+    );
+
+sharding.init_async(entity).await?;
+```
+
+Remembered entities are not persistence. They decide which entity ids should be
+started again; event-sourced or durable-state recovery still belongs to
+`rakka-persistence`. High-cardinality remembered sets can slow shard acquisition,
+so production configurations should choose batch sizing and store namespaces
+deliberately.
+
 ## Current Boundary
 
 The facade now owns local, proxy-only, and networked entity registration.
@@ -296,13 +350,6 @@ Serialization codecs still live in the `SerializationRegistry` supplied to
 `ClusterNodeRuntime`; missing codecs fail at send/decode time with typed remote
 delivery errors.
 
-Remembered entities are accepted as an opt-in follow-on feature. The semantics
-are documented in
-`docs/rakka-akka-parity-phase-4-remembered-entities-decision.md`: remember only
-after successful local activation, forget only through explicit facade APIs,
-replay lazily in bounded batches on shard acquisition, and keep remembered
-identity storage separate from coordinator ownership snapshots and entity
-persistence.
-
-Remaining Phase 4 work should focus on implementing remembered entities and
-adding persistence recovery examples over movement.
+Remaining Phase 4 work should focus on persistence recovery examples over
+movement and any operational polish found while exercising remembered entities
+with durable stores.

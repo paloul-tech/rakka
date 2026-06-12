@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 4D5 Remembered Entities Implementation Plan
 
-Status: ready for implementation
+Status: implemented
 Date: 2026-06-12
 
 ## Purpose
@@ -10,6 +10,25 @@ as an opt-in Cluster Sharding parity target.
 
 Decision record:
 `docs/rakka-akka-parity-phase-4-remembered-entities-decision.md`.
+
+Implementation status:
+
+- Added `RememberedEntities`, `RememberedEntityStore`,
+  `RememberedStoreFuture`, `InMemoryRememberedEntityStore`,
+  `RememberedEntityReplay`, and `RememberedEntityReplaySettings` in
+  `rakka-sharding`.
+- Added `Entity::with_remembered_entities` and registration-state diagnostics
+  for replay batch size, delay, enabled state, and store backend.
+- Recorded remembered ids from successful local activation/reuse through local
+  route activation observers.
+- Added async `ClusterSharding::forget_entity` and `forget_entity_id` APIs that
+  remove remembered identity and passivate any active local actor.
+- Replayed remembered ids when owned shards are refreshed or acquired after
+  graceful handoff.
+- Added `PostgresRememberedEntityStore` and the
+  `rakka_shard_remembered_entities` migration.
+- Updated the multi-node sharding example with an in-memory remembered entity
+  registration.
 
 ## Target Semantics
 
@@ -58,7 +77,7 @@ pub trait RememberedEntityStore: Debug + Send + Sync + 'static {
         &'a self,
         shard: &'a ShardKey,
         entity_id: &'a EntityId,
-    ) -> RememberedStoreFuture<'a, ()>;
+    ) -> RememberedStoreFuture<'a, bool>;
 
     fn remembered_for_shard<'a>(
         &'a self,
@@ -98,16 +117,15 @@ Registration state should expose:
 - `remembered_start_batch_size()`,
 - `remembered_start_batch_delay()`.
 
-Repository hygiene should keep store internals out of `rakka::prelude`, but the
-high-level `RememberedEntities` settings type may be prelude-worthy once the API
-settles.
+Repository hygiene keeps adapter internals out of `rakka::prelude`; the
+high-level `RememberedEntities` settings type and in-memory test/example store
+are now prelude exports.
 
 Tests:
 
 - settings propagate from `Entity` to `EntityTypeRegistrationState`,
-- proxy-only registration rejects remembered entities unless a concrete local
-  activation path exists,
-- async init is required when the remembered store is async-only.
+- proxy-only registration has no remembered-entity opt-in surface,
+- persistent remembered stores should be paired with async initialization paths.
 
 ## Slice 3: Remember On Activation
 
@@ -266,5 +284,5 @@ RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
 - Should replay expose per-shard progress snapshots?
 - Should the first implementation include a hard maximum remembered ids per
   shard, or only batch controls and documentation?
-- Should `RememberedEntities` enter `rakka::prelude` immediately, or wait until
-  after the API is validated by examples?
+- Should replay expose per-shard progress snapshots beyond the current
+  `RememberedEntityReplay` summary type?

@@ -42,8 +42,8 @@ Component crates continue to own implementation-specific concepts:
 | `rakka-persistence-postgres` | Adapter | PostgreSQL durable-state backend and future journal/snapshot backend. |
 | `rakka-cluster` | Foundation | Membership, node identity, discovery snapshots, and compatibility primitives. |
 | `rakka-remote` | Foundation | Remote envelopes, serialization registry, request correlation, and transport traits. |
-| `rakka-sharding` | Foundation | Entity identity, shard ownership, regions, local/remote routes, and node runtime. |
-| `rakka-sharding-postgres` | Adapter | PostgreSQL durable shard coordinator store, leadership lease, and migration helpers. |
+| `rakka-sharding` | Foundation | Entity identity, shard ownership, regions, local/remote routes, remembered entity settings/stores, and node runtime. |
+| `rakka-sharding-postgres` | Adapter | PostgreSQL durable shard coordinator store, leadership lease, remembered entity store, and migration helpers. |
 | `rakka-workflow` | Foundation | Durable inbox/outbox reliability primitives. |
 | `rakka-stream` | Foundation | Bounded stream primitives and stream lifecycle semantics. |
 | `rakka-process` | Adapter | Supervised child-process ownership and process-backed actors/entities. |
@@ -67,7 +67,8 @@ Component crates continue to own implementation-specific concepts:
 - Sharding facade and common configuration when the `sharding` feature is
   enabled: `ClusterSharding`, `Entity`, `EntityTypeKey`, `ShardedEntityRef`,
   `EntityType`, `EntityId`, `EntityRef`, `ShardingConfig`, shard allocation
-  strategies, and durable coordinator store/lease hooks.
+  strategies, remembered entity settings, and durable coordinator store/lease
+  hooks.
 - Stream basics when the `stream` feature is enabled:
   `BoundedStream`, `StreamSink`, `StreamSource`, `StreamError`, and
   `StreamResult`.

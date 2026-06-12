@@ -13,6 +13,7 @@ pub mod handoff;
 pub mod identity;
 pub mod local;
 pub mod node_runtime;
+pub mod remembered_entities;
 pub mod remote;
 pub mod routing;
 pub mod runtime;
@@ -45,6 +46,10 @@ pub use local::{LocalEntityContext, LocalEntityRoute};
 pub use node_runtime::{
     ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeError,
     ClusterNodeRuntimeResult, ClusterNodeRuntimeUpdate,
+};
+pub use remembered_entities::{
+    InMemoryRememberedEntityStore, RememberedEntities, RememberedEntityReplay,
+    RememberedEntityReplaySettings, RememberedEntityStore, RememberedStoreFuture,
 };
 pub use remote::{
     RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,

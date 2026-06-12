@@ -403,6 +403,9 @@ Implementation status on 2026-06-11:
   async store-plus-lease wiring, and stale-token publication guards.
 - Completed Phase 4D4 remembered entities evaluation with an accepted opt-in,
   bounded semantics decision and a dedicated Phase 4D5 implementation plan.
+- Implemented Phase 4D5 remembered entities with facade opt-in, explicit async
+  forget APIs, activation recording, bounded replay on ownership/acquire,
+  in-memory and PostgreSQL remembered stores, tests, docs, and an example.
 
 Phase 4 follow-ups:
 

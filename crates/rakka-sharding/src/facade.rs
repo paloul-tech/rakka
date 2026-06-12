@@ -16,14 +16,15 @@ use crate::{
     AsyncShardCoordinatorStore, ClusterNodeRuntime, ClusterNodeRuntimeResult, ClusterShardingError,
     ClusterShardingResult, ClusterShardingRuntime, EntityAskError, EntityId, EntityRef,
     EntityTellError, EntityType, LeastShardAllocationStrategy, LocalEntityContext,
-    LocalEntityRoute, RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
-    RemoteEntityInbound, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinatorLease,
-    ShardCoordinatorStore, ShardId, ShardRegion, ShardingConfig,
+    LocalEntityRoute, RememberedEntities, RemoteEntityAskClient, RemoteEntityAskError,
+    RemoteEntityAskInbound, RemoteEntityInbound, ShardAllocationStrategy, ShardBufferConfig,
+    ShardCoordinatorLease, ShardCoordinatorStore, ShardId, ShardKey, ShardRegion, ShardingConfig,
 };
 
 type RegionRegistry = Arc<Mutex<BTreeMap<EntityType, Box<dyn Any + Send + Sync>>>>;
 type LocalControlRegistry = Arc<Mutex<BTreeMap<EntityType, Arc<dyn LocalEntityControl>>>>;
 type StateRegistry = Arc<Mutex<BTreeMap<EntityType, EntityTypeRegistrationState>>>;
+type RememberedRegistry = Arc<Mutex<BTreeMap<EntityType, RememberedEntities>>>;
 type StopMessageFactory<M> = Arc<dyn Fn() -> M + Send + Sync>;
 const DEFAULT_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
@@ -221,6 +222,7 @@ where
     buffer_config: Option<ShardBufferConfig>,
     passivation_buffer_duration: Duration,
     allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    remembered_entities: Option<RememberedEntities>,
 }
 
 impl<M, A, F> Entity<M, A, F>
@@ -241,6 +243,7 @@ where
             buffer_config: Some(ShardBufferConfig::default()),
             passivation_buffer_duration: DEFAULT_PASSIVATION_BUFFER_DURATION,
             allocation_strategy: Arc::new(crate::DeterministicModuloShardAllocationStrategy),
+            remembered_entities: None,
         }
     }
 
@@ -320,6 +323,13 @@ where
         ))
     }
 
+    /// Enables remembered entities for this entity type.
+    #[must_use]
+    pub fn with_remembered_entities(mut self, remembered_entities: RememberedEntities) -> Self {
+        self.remembered_entities = Some(remembered_entities);
+        self
+    }
+
     /// Configures a stop message delivered immediately before facade passivation stops an entity.
     #[must_use]
     pub fn with_stop_message(mut self, stop_message: M) -> Self
@@ -387,6 +397,12 @@ where
     pub fn allocation_strategy_name(&self) -> &'static str {
         self.allocation_strategy.strategy_name()
     }
+
+    /// Remembered entity settings, when enabled.
+    #[must_use]
+    pub const fn remembered_entities(&self) -> Option<&RememberedEntities> {
+        self.remembered_entities.as_ref()
+    }
 }
 
 impl<M, A, F> Debug for Entity<M, A, F>
@@ -407,6 +423,7 @@ where
                 &self.passivation_buffer_duration,
             )
             .field("allocation_strategy", &self.allocation_strategy_name())
+            .field("remembered_entities", &self.remembered_entities)
             .finish_non_exhaustive()
     }
 }
@@ -420,6 +437,7 @@ pub struct ClusterSharding {
     regions: RegionRegistry,
     controls: LocalControlRegistry,
     states: StateRegistry,
+    remembered: RememberedRegistry,
 }
 
 impl ClusterSharding {
@@ -660,6 +678,7 @@ impl ClusterSharding {
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             controls: Arc::new(Mutex::new(BTreeMap::new())),
             states: Arc::new(Mutex::new(BTreeMap::new())),
+            remembered: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -696,6 +715,7 @@ impl ClusterSharding {
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             controls: Arc::new(Mutex::new(BTreeMap::new())),
             states: Arc::new(Mutex::new(BTreeMap::new())),
+            remembered: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -735,6 +755,7 @@ impl ClusterSharding {
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             controls: Arc::new(Mutex::new(BTreeMap::new())),
             states: Arc::new(Mutex::new(BTreeMap::new())),
+            remembered: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -778,6 +799,7 @@ impl ClusterSharding {
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             controls: Arc::new(Mutex::new(BTreeMap::new())),
             states: Arc::new(Mutex::new(BTreeMap::new())),
+            remembered: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -818,6 +840,7 @@ impl ClusterSharding {
             buffer_config,
             passivation_buffer_duration,
             allocation_strategy,
+            remembered_entities,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = self.local_node.id().clone();
@@ -830,21 +853,25 @@ impl ClusterSharding {
         if let Some(timeout) = idle_passivation_timeout {
             local_route = local_route.with_idle_passivation(timeout);
         }
+        local_route = apply_remembered_activation(local_route, remembered_entities.clone());
 
         let control = Arc::new(LocalRouteControl::new(
             local_route.clone(),
             stop_message_factory.clone(),
         ));
-        let region = apply_buffering(
-            apply_allocation_strategy(
-                ShardRegion::new(
-                    key.entity_type().clone(),
-                    key.config().clone(),
-                    local_route.clone(),
+        let region = apply_remembered_entities(
+            apply_buffering(
+                apply_allocation_strategy(
+                    ShardRegion::new(
+                        key.entity_type().clone(),
+                        key.config().clone(),
+                        local_route.clone(),
+                    ),
+                    allocation_strategy,
                 ),
-                allocation_strategy,
+                buffer_config.clone(),
             ),
-            buffer_config.clone(),
+            remembered_entities.clone(),
         );
         self.register_typed_region(
             key.clone(),
@@ -855,6 +882,7 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             },
         )?;
 
@@ -880,6 +908,7 @@ impl ClusterSharding {
             buffer_config,
             passivation_buffer_duration,
             allocation_strategy,
+            remembered_entities,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = self.local_node.id().clone();
@@ -892,21 +921,25 @@ impl ClusterSharding {
         if let Some(timeout) = idle_passivation_timeout {
             local_route = local_route.with_idle_passivation(timeout);
         }
+        local_route = apply_remembered_activation(local_route, remembered_entities.clone());
 
         let control = Arc::new(LocalRouteControl::new(
             local_route.clone(),
             stop_message_factory.clone(),
         ));
-        let region = apply_buffering(
-            apply_allocation_strategy(
-                ShardRegion::new(
-                    key.entity_type().clone(),
-                    key.config().clone(),
-                    local_route.clone(),
+        let region = apply_remembered_entities(
+            apply_buffering(
+                apply_allocation_strategy(
+                    ShardRegion::new(
+                        key.entity_type().clone(),
+                        key.config().clone(),
+                        local_route.clone(),
+                    ),
+                    allocation_strategy,
                 ),
-                allocation_strategy,
+                buffer_config.clone(),
             ),
-            buffer_config.clone(),
+            remembered_entities.clone(),
         );
         self.register_typed_region_async(
             key.clone(),
@@ -917,6 +950,7 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             },
         )
         .await?;
@@ -948,6 +982,7 @@ impl ClusterSharding {
             buffer_config,
             passivation_buffer_duration,
             allocation_strategy,
+            remembered_entities,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -960,22 +995,26 @@ impl ClusterSharding {
         if let Some(timeout) = idle_passivation_timeout {
             local_route = local_route.with_idle_passivation(timeout);
         }
+        local_route = apply_remembered_activation(local_route, remembered_entities.clone());
 
         let control = Arc::new(LocalRouteControl::new(
             local_route.clone(),
             stop_message_factory.clone(),
         ));
         let remote_route = runtime.remote_route(local_route.clone());
-        let region = apply_buffering(
-            apply_allocation_strategy(
-                ShardRegion::new(
-                    key.entity_type().clone(),
-                    key.config().clone(),
-                    remote_route,
+        let region = apply_remembered_entities(
+            apply_buffering(
+                apply_allocation_strategy(
+                    ShardRegion::new(
+                        key.entity_type().clone(),
+                        key.config().clone(),
+                        remote_route,
+                    ),
+                    allocation_strategy,
                 ),
-                allocation_strategy,
+                buffer_config.clone(),
             ),
-            buffer_config.clone(),
+            remembered_entities.clone(),
         );
         runtime.register_entity_region(region.clone())?;
         self.store_typed_region(
@@ -987,6 +1026,7 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             },
         );
 
@@ -1013,6 +1053,7 @@ impl ClusterSharding {
             buffer_config,
             passivation_buffer_duration,
             allocation_strategy,
+            remembered_entities,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -1025,22 +1066,26 @@ impl ClusterSharding {
         if let Some(timeout) = idle_passivation_timeout {
             local_route = local_route.with_idle_passivation(timeout);
         }
+        local_route = apply_remembered_activation(local_route, remembered_entities.clone());
 
         let control = Arc::new(LocalRouteControl::new(
             local_route.clone(),
             stop_message_factory.clone(),
         ));
         let remote_route = runtime.remote_route(local_route.clone());
-        let region = apply_buffering(
-            apply_allocation_strategy(
-                ShardRegion::new(
-                    key.entity_type().clone(),
-                    key.config().clone(),
-                    remote_route,
+        let region = apply_remembered_entities(
+            apply_buffering(
+                apply_allocation_strategy(
+                    ShardRegion::new(
+                        key.entity_type().clone(),
+                        key.config().clone(),
+                        remote_route,
+                    ),
+                    allocation_strategy,
                 ),
-                allocation_strategy,
+                buffer_config.clone(),
             ),
-            buffer_config.clone(),
+            remembered_entities.clone(),
         );
         runtime.register_entity_region_async(region.clone()).await?;
         self.store_typed_region(
@@ -1052,6 +1097,7 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             },
         );
 
@@ -1086,6 +1132,7 @@ impl ClusterSharding {
             buffer_config,
             passivation_buffer_duration,
             allocation_strategy,
+            remembered_entities,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -1098,22 +1145,26 @@ impl ClusterSharding {
         if let Some(timeout) = idle_passivation_timeout {
             local_route = local_route.with_idle_passivation(timeout);
         }
+        local_route = apply_remembered_activation(local_route, remembered_entities.clone());
 
         let control = Arc::new(LocalRouteControl::new(
             local_route.clone(),
             stop_message_factory.clone(),
         ));
         let remote_route = runtime.remote_route(local_route.clone());
-        let region = apply_buffering(
-            apply_allocation_strategy(
-                ShardRegion::new(
-                    key.entity_type().clone(),
-                    key.config().clone(),
-                    remote_route,
+        let region = apply_remembered_entities(
+            apply_buffering(
+                apply_allocation_strategy(
+                    ShardRegion::new(
+                        key.entity_type().clone(),
+                        key.config().clone(),
+                        remote_route,
+                    ),
+                    allocation_strategy,
                 ),
-                allocation_strategy,
+                buffer_config.clone(),
             ),
-            buffer_config.clone(),
+            remembered_entities.clone(),
         );
         let tell_handler = RemoteEntityInbound::new(region.clone(), runtime.registry().clone());
         let ask_handler = RemoteEntityAskInbound::new(
@@ -1139,6 +1190,7 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             },
         );
 
@@ -1169,6 +1221,7 @@ impl ClusterSharding {
             buffer_config,
             passivation_buffer_duration,
             allocation_strategy,
+            remembered_entities,
         } = entity;
         let key_for_factory = key.clone();
         let local_node_id = runtime.local_node().id().clone();
@@ -1181,22 +1234,26 @@ impl ClusterSharding {
         if let Some(timeout) = idle_passivation_timeout {
             local_route = local_route.with_idle_passivation(timeout);
         }
+        local_route = apply_remembered_activation(local_route, remembered_entities.clone());
 
         let control = Arc::new(LocalRouteControl::new(
             local_route.clone(),
             stop_message_factory.clone(),
         ));
         let remote_route = runtime.remote_route(local_route.clone());
-        let region = apply_buffering(
-            apply_allocation_strategy(
-                ShardRegion::new(
-                    key.entity_type().clone(),
-                    key.config().clone(),
-                    remote_route,
+        let region = apply_remembered_entities(
+            apply_buffering(
+                apply_allocation_strategy(
+                    ShardRegion::new(
+                        key.entity_type().clone(),
+                        key.config().clone(),
+                        remote_route,
+                    ),
+                    allocation_strategy,
                 ),
-                allocation_strategy,
+                buffer_config.clone(),
             ),
-            buffer_config.clone(),
+            remembered_entities.clone(),
         );
         let tell_handler = RemoteEntityInbound::new(region.clone(), runtime.registry().clone());
         let ask_handler = RemoteEntityAskInbound::new(
@@ -1224,6 +1281,7 @@ impl ClusterSharding {
                 has_stop_message: stop_message_factory.is_some(),
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             },
         );
 
@@ -1441,6 +1499,49 @@ impl ClusterSharding {
         Ok(passivated)
     }
 
+    /// Forgets one remembered entity id and passivates the local entity when active.
+    pub async fn forget_entity<M>(
+        &self,
+        key: &EntityTypeKey<M>,
+        entity_id: impl Into<String>,
+    ) -> ClusterShardingResult<bool>
+    where
+        M: Message,
+    {
+        self.forget_entity_id(key, &EntityId::new(entity_id)).await
+    }
+
+    /// Forgets one remembered entity id and passivates the local entity when active.
+    pub async fn forget_entity_id<M>(
+        &self,
+        key: &EntityTypeKey<M>,
+        entity_id: &EntityId,
+    ) -> ClusterShardingResult<bool>
+    where
+        M: Message,
+    {
+        let remembered_entities = self
+            .remembered
+            .lock()
+            .expect("cluster sharding remembered registry mutex poisoned")
+            .get(key.entity_type())
+            .cloned();
+        let Some(remembered_entities) = remembered_entities else {
+            return Ok(false);
+        };
+        let shard = ShardKey::new(
+            key.entity_type().clone(),
+            ShardId::for_entity(key.entity_type(), entity_id, key.config()),
+        );
+        let removed = remembered_entities
+            .store()
+            .forget(&shard, entity_id)
+            .await
+            .map_err(ClusterShardingError::from)?;
+        let passivated = self.passivate_entity_id(key, entity_id)?;
+        Ok(removed || passivated)
+    }
+
     /// Returns the facade state for all registered entity types.
     #[must_use]
     pub fn state(&self) -> ClusterShardingState {
@@ -1537,6 +1638,7 @@ impl ClusterSharding {
             has_stop_message,
             buffer_config,
             passivation_buffer_duration,
+            remembered_entities,
         ) = match mode {
             RegistrationMode::Local {
                 control,
@@ -1544,20 +1646,39 @@ impl ClusterSharding {
                 has_stop_message,
                 buffer_config,
                 passivation_buffer_duration,
+                remembered_entities,
             } => {
                 self.controls
                     .lock()
                     .expect("cluster sharding control registry mutex poisoned")
                     .insert(key.entity_type().clone(), control);
+                if let Some(remembered_entities) = remembered_entities.clone() {
+                    self.remembered
+                        .lock()
+                        .expect("cluster sharding remembered registry mutex poisoned")
+                        .insert(key.entity_type().clone(), remembered_entities);
+                } else {
+                    self.remembered
+                        .lock()
+                        .expect("cluster sharding remembered registry mutex poisoned")
+                        .remove(key.entity_type());
+                }
                 (
                     false,
                     idle_passivation_timeout,
                     has_stop_message,
                     buffer_config,
                     passivation_buffer_duration,
+                    remembered_entities,
                 )
             }
-            RegistrationMode::ProxyOnly => (true, None, false, None, Duration::ZERO),
+            RegistrationMode::ProxyOnly => {
+                self.remembered
+                    .lock()
+                    .expect("cluster sharding remembered registry mutex poisoned")
+                    .remove(key.entity_type());
+                (true, None, false, None, Duration::ZERO, None)
+            }
         };
 
         self.states
@@ -1577,6 +1698,16 @@ impl ClusterSharding {
                     passivation_buffer_duration,
                     buffered_message_count: region.buffered_message_count(),
                     allocation_strategy: region.allocation_strategy_name().to_string(),
+                    remembered_entities_enabled: remembered_entities.is_some(),
+                    remembered_start_batch_size: remembered_entities
+                        .as_ref()
+                        .map_or(0, RememberedEntities::start_batch_size),
+                    remembered_start_batch_delay: remembered_entities
+                        .as_ref()
+                        .map_or(Duration::ZERO, RememberedEntities::start_batch_delay),
+                    remembered_store_backend: remembered_entities
+                        .as_ref()
+                        .map(|remembered_entities| remembered_entities.store_backend().to_string()),
                 },
             );
     }
@@ -1785,6 +1916,10 @@ pub struct EntityTypeRegistrationState {
     passivation_buffer_duration: Duration,
     buffered_message_count: usize,
     allocation_strategy: String,
+    remembered_entities_enabled: bool,
+    remembered_start_batch_size: usize,
+    remembered_start_batch_delay: Duration,
+    remembered_store_backend: Option<String>,
 }
 
 impl EntityTypeRegistrationState {
@@ -1854,6 +1989,30 @@ impl EntityTypeRegistrationState {
         &self.allocation_strategy
     }
 
+    /// Returns true when remembered entities are enabled for this registration.
+    #[must_use]
+    pub const fn remembered_entities_enabled(&self) -> bool {
+        self.remembered_entities_enabled
+    }
+
+    /// Remembered replay batch size.
+    #[must_use]
+    pub const fn remembered_start_batch_size(&self) -> usize {
+        self.remembered_start_batch_size
+    }
+
+    /// Delay inserted between remembered replay batches.
+    #[must_use]
+    pub const fn remembered_start_batch_delay(&self) -> Duration {
+        self.remembered_start_batch_delay
+    }
+
+    /// Remembered entity store backend name.
+    #[must_use]
+    pub fn remembered_store_backend(&self) -> Option<&str> {
+        self.remembered_store_backend.as_deref()
+    }
+
     fn with_control(mut self, control: Option<&Arc<dyn LocalEntityControl>>) -> Self {
         if let Some(control) = control {
             self.local_entity_count = control.entity_count();
@@ -1869,6 +2028,7 @@ enum RegistrationMode {
         has_stop_message: bool,
         buffer_config: Option<ShardBufferConfig>,
         passivation_buffer_duration: Duration,
+        remembered_entities: Option<RememberedEntities>,
     },
     ProxyOnly,
 }
@@ -1937,6 +2097,20 @@ where
     }
 }
 
+fn apply_remembered_entities<M>(
+    region: ShardRegion<M>,
+    remembered_entities: Option<RememberedEntities>,
+) -> ShardRegion<M>
+where
+    M: Message,
+{
+    if let Some(remembered_entities) = remembered_entities {
+        region.with_remembered_entities(remembered_entities)
+    } else {
+        region
+    }
+}
+
 fn apply_allocation_strategy<M>(
     region: ShardRegion<M>,
     allocation_strategy: Arc<dyn ShardAllocationStrategy>,
@@ -1945,6 +2119,32 @@ where
     M: Message,
 {
     region.with_allocation_strategy_ref(allocation_strategy)
+}
+
+fn apply_remembered_activation<M, A, F>(
+    route: LocalEntityRoute<M, A, F>,
+    remembered_entities: Option<RememberedEntities>,
+) -> LocalEntityRoute<M, A, F>
+where
+    M: Message,
+    A: Actor<Msg = M>,
+    F: Fn(LocalEntityContext) -> A + Send + Sync + 'static,
+{
+    let Some(remembered_entities) = remembered_entities else {
+        return route;
+    };
+    let store = remembered_entities.store();
+    route.with_activation_observer(move |context| {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = store.clone();
+        let shard = ShardKey::new(context.entity_type().clone(), context.shard_id());
+        let entity_id = context.entity_id().clone();
+        handle.spawn(async move {
+            let _remembered = store.remember(&shard, &entity_id).await;
+        });
+    })
 }
 
 fn local_node_for_system(system: &ActorSystem) -> ClusterNode {

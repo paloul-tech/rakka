@@ -286,6 +286,16 @@ where
         Ok(0)
     }
 
+    /// Starts or confirms a local entity without delivering a user message.
+    fn activate_entity(
+        &self,
+        _entity_type: &EntityType,
+        _entity_id: &EntityId,
+        _shard_id: ShardId,
+    ) -> ShardingResult<bool> {
+        Ok(false)
+    }
+
     /// Current known local handoff state for a shard, when tracked by this route.
     fn shard_handoff_state(&self, _shard_id: ShardId) -> Option<ShardHandoffState> {
         None
@@ -627,6 +637,7 @@ where
     route: Arc<dyn EntityRoute<M>>,
     buffer: Arc<Mutex<Option<ShardMessageBuffer<M>>>>,
     allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    remembered_entities: Option<crate::RememberedEntities>,
 }
 
 impl<M> ShardRegion<M>
@@ -650,6 +661,7 @@ where
             route: Arc::new(route),
             buffer: Arc::new(Mutex::new(None)),
             allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy),
+            remembered_entities: None,
         }
     }
 
@@ -671,6 +683,7 @@ where
             route: Arc::new(route),
             buffer: Arc::new(Mutex::new(None)),
             allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy),
+            remembered_entities: None,
         })
     }
 
@@ -704,6 +717,16 @@ where
         self
     }
 
+    /// Enables remembered entity replay for this region.
+    #[must_use]
+    pub fn with_remembered_entities(
+        mut self,
+        remembered_entities: crate::RememberedEntities,
+    ) -> Self {
+        self.remembered_entities = Some(remembered_entities);
+        self
+    }
+
     /// Entity type routed by this region.
     #[must_use]
     pub fn entity_type(&self) -> &EntityType {
@@ -728,6 +751,12 @@ where
         self.allocation_strategy.strategy_name()
     }
 
+    /// Remembered entity settings, when enabled.
+    #[must_use]
+    pub const fn remembered_entities(&self) -> Option<&crate::RememberedEntities> {
+        self.remembered_entities.as_ref()
+    }
+
     /// Current owner cache revision.
     #[must_use]
     pub fn owner_revision(&self) -> u64 {
@@ -750,6 +779,7 @@ where
             .expect("shard owner cache mutex poisoned")
             .refresh(snapshot)?;
         self.flush_buffered();
+        self.replay_remembered_for_owned_shards(snapshot);
         Ok(())
     }
 
@@ -848,8 +878,28 @@ where
     /// Marks a shard as acquired by this region's local route.
     pub fn acquire_shard(&self, shard_id: ShardId) -> ShardingResult<usize> {
         let stopped = self.route.acquire_shard(shard_id)?;
+        self.replay_remembered_for_shard(shard_id);
         self.flush_buffered();
         Ok(stopped)
+    }
+
+    /// Starts or confirms a local entity without delivering a user message.
+    pub fn activate_entity(&self, entity_id: &EntityId) -> ShardingResult<bool> {
+        let shard_id = ShardId::for_entity(&self.entity_type, entity_id, &self.config);
+        let owner = self
+            .owner_cache
+            .lock()
+            .expect("shard owner cache mutex poisoned")
+            .owner_for_shard(shard_id)?
+            .clone();
+        let Some(local_node_id) = self.local_node_id() else {
+            return Ok(false);
+        };
+        if &owner != local_node_id {
+            return Ok(false);
+        }
+        self.route
+            .activate_entity(&self.entity_type, entity_id, shard_id)
     }
 
     /// Current known local handoff state for a shard, when tracked by this route.
@@ -1052,6 +1102,45 @@ where
             })
         }
     }
+
+    fn replay_remembered_for_owned_shards(&self, snapshot: &ShardOwnershipSnapshot) {
+        let Some(local_node_id) = self.local_node_id().cloned() else {
+            return;
+        };
+        for assignment in snapshot.assignments() {
+            if assignment.owner() == &local_node_id {
+                self.replay_remembered_for_shard(assignment.shard().shard_id());
+            }
+        }
+    }
+
+    fn replay_remembered_for_shard(&self, shard_id: ShardId) {
+        let Some(remembered_entities) = self.remembered_entities.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let region = self.clone();
+        let shard = crate::ShardKey::new(self.entity_type.clone(), shard_id);
+        handle.spawn(async move {
+            let Ok(entity_ids) = remembered_entities
+                .store()
+                .remembered_for_shard(&shard)
+                .await
+            else {
+                return;
+            };
+            for chunk in entity_ids.chunks(remembered_entities.start_batch_size()) {
+                for entity_id in chunk {
+                    let _ = region.activate_entity(entity_id);
+                }
+                if !remembered_entities.start_batch_delay().is_zero() {
+                    tokio::time::sleep(remembered_entities.start_batch_delay()).await;
+                }
+            }
+        });
+    }
 }
 
 impl<M> Clone for ShardRegion<M>
@@ -1066,6 +1155,7 @@ where
             route: self.route.clone(),
             buffer: self.buffer.clone(),
             allocation_strategy: self.allocation_strategy.clone(),
+            remembered_entities: self.remembered_entities.clone(),
         }
     }
 }

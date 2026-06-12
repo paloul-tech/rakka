@@ -14,6 +14,8 @@ use crate::handoff::ShardHandoffState;
 use crate::identity::{EntityId, EntityType, ShardId};
 use crate::routing::{EntityDeliveryFailure, EntityRoute, EntityTellError, RoutedEntityMessage};
 
+type ActivationObserver = Arc<dyn Fn(LocalEntityContext) + Send + Sync>;
+
 /// Context supplied when a local sharded entity actor is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEntityContext {
@@ -89,6 +91,7 @@ where
     shard_states: Arc<Mutex<BTreeMap<ShardId, ShardHandoffState>>>,
     next_idle_token: Arc<AtomicU64>,
     idle_passivation_timeout: Option<Duration>,
+    activation_observer: Option<ActivationObserver>,
     _actor: PhantomData<fn() -> A>,
 }
 
@@ -132,6 +135,7 @@ where
             shard_states: Arc::new(Mutex::new(BTreeMap::new())),
             next_idle_token: Arc::new(AtomicU64::new(1)),
             idle_passivation_timeout: None,
+            activation_observer: None,
             _actor: PhantomData,
         }
     }
@@ -147,6 +151,16 @@ where
     #[must_use]
     pub fn with_idle_passivation(mut self, timeout: Duration) -> Self {
         self.idle_passivation_timeout = Some(timeout);
+        self
+    }
+
+    /// Observes successful local entity activation or reuse.
+    #[must_use]
+    pub fn with_activation_observer(
+        mut self,
+        observer: impl Fn(LocalEntityContext) + Send + Sync + 'static,
+    ) -> Self {
+        self.activation_observer = Some(Arc::new(observer));
         self
     }
 
@@ -257,11 +271,19 @@ where
             .lock()
             .expect("local entity registry mutex poisoned");
 
-        if let Some(handle) = actors
+        if let Some(actor_ref) = actors
             .get(entity_id)
             .filter(|handle| !handle.actor_ref.is_terminated())
+            .map(|handle| handle.actor_ref.clone())
         {
-            return Ok(handle.actor_ref.clone());
+            drop(actors);
+            self.observe_activation(LocalEntityContext::new(
+                self.local_node_id.clone(),
+                entity_type.clone(),
+                entity_id.clone(),
+                shard_id,
+            ));
+            return Ok(actor_ref);
         }
 
         let context = LocalEntityContext::new(
@@ -290,7 +312,25 @@ where
                 idle_token: self.next_idle_token(),
             },
         );
+        drop(actors);
+        self.observe_activation(context);
         Ok(actor_ref)
+    }
+
+    fn activate_existing_or_spawn(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &EntityId,
+        shard_id: ShardId,
+    ) -> crate::ShardingResult<bool> {
+        self.actor_for(entity_type, entity_id, shard_id)
+            .map(|_actor_ref| true)
+            .map_err(|failure| crate::ShardingError::RememberedEntityReplay {
+                entity_type: entity_type.clone(),
+                entity_id: entity_id.clone(),
+                shard_id,
+                message: failure.to_string(),
+            })
     }
 
     fn set_shard_state(&self, shard_id: ShardId, state: ShardHandoffState) {
@@ -358,6 +398,12 @@ where
     fn next_idle_token(&self) -> u64 {
         self.next_idle_token.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn observe_activation(&self, context: LocalEntityContext) {
+        if let Some(observer) = &self.activation_observer {
+            observer(context);
+        }
+    }
 }
 
 impl<M, A, F> Clone for LocalEntityRoute<M, A, F>
@@ -376,6 +422,7 @@ where
             shard_states: self.shard_states.clone(),
             next_idle_token: self.next_idle_token.clone(),
             idle_passivation_timeout: self.idle_passivation_timeout,
+            activation_observer: self.activation_observer.clone(),
             _actor: PhantomData,
         }
     }
@@ -456,6 +503,15 @@ where
 
     fn acquire_shard(&self, shard_id: ShardId) -> crate::ShardingResult<usize> {
         Ok(self.mark_shard_acquired(shard_id))
+    }
+
+    fn activate_entity(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &EntityId,
+        shard_id: ShardId,
+    ) -> crate::ShardingResult<bool> {
+        self.activate_existing_or_spawn(entity_type, entity_id, shard_id)
     }
 
     fn shard_handoff_state(&self, shard_id: ShardId) -> Option<ShardHandoffState> {

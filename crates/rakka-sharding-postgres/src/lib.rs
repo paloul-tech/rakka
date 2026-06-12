@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! PostgreSQL cluster sharding coordinator store.
+//! PostgreSQL cluster sharding coordinator, lease, and remembered entity stores.
 
 use std::error::Error;
 use std::str::FromStr;
@@ -11,9 +11,9 @@ use std::time::Duration;
 use rakka_cluster::NodeId;
 use rakka_core::Subsystem;
 use rakka_sharding::{
-    AsyncShardCoordinatorStore, CoordinatorLeaseFuture, CoordinatorStoreFuture, EntityType,
-    LeaseToken, PersistedShardCoordinatorState, ShardCoordinatorLease, ShardingError,
-    ShardingResult,
+    AsyncShardCoordinatorStore, CoordinatorLeaseFuture, CoordinatorStoreFuture, EntityId,
+    EntityType, LeaseToken, PersistedShardCoordinatorState, RememberedEntityStore,
+    RememberedStoreFuture, ShardCoordinatorLease, ShardKey, ShardingError, ShardingResult,
 };
 use tokio_postgres::Client;
 
@@ -37,6 +37,9 @@ pub const COORDINATOR_TABLE_NAME: &str = "rakka_shard_coordinator_state";
 
 /// Default shard coordinator lease table name.
 pub const COORDINATOR_LEASE_TABLE_NAME: &str = "rakka_shard_coordinator_lease";
+
+/// Default remembered entity table name.
+pub const REMEMBERED_ENTITIES_TABLE_NAME: &str = "rakka_shard_remembered_entities";
 
 /// PostgreSQL advisory lock id used while applying coordinator migrations.
 pub const MIGRATION_LOCK_ID: i64 = 982_451_653;
@@ -72,6 +75,18 @@ CREATE TABLE IF NOT EXISTS rakka_shard_coordinator_lease (
 );
 "#;
 
+/// SQL migration for the default remembered entity table.
+pub const REMEMBERED_ENTITIES_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS rakka_shard_remembered_entities (
+    namespace TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    shard_id INTEGER NOT NULL CHECK (shard_id >= 0),
+    entity_id TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (namespace, entity_type, shard_id, entity_id)
+);
+"#;
+
 /// Builder for [`PostgresShardCoordinatorStore`].
 pub struct PostgresShardCoordinatorStoreBuilder {
     client: Client,
@@ -83,6 +98,12 @@ pub struct PostgresShardCoordinatorLeaseBuilder {
     client: Client,
     namespace: String,
     lease_duration: Duration,
+}
+
+/// Builder for [`PostgresRememberedEntityStore`].
+pub struct PostgresRememberedEntityStoreBuilder {
+    client: Client,
+    namespace: String,
 }
 
 impl PostgresShardCoordinatorLeaseBuilder {
@@ -115,6 +136,31 @@ impl PostgresShardCoordinatorLeaseBuilder {
         let lease = self.build();
         lease.migrate().await?;
         Ok(lease)
+    }
+}
+
+impl PostgresRememberedEntityStoreBuilder {
+    /// Sets the namespace used to isolate remembered entity ids.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = namespace.into();
+        self
+    }
+
+    /// Builds a PostgreSQL remembered entity store.
+    #[must_use]
+    pub fn build(self) -> PostgresRememberedEntityStore {
+        PostgresRememberedEntityStore {
+            client: Arc::new(self.client),
+            namespace: self.namespace.into(),
+        }
+    }
+
+    /// Applies the default migration and returns the built store.
+    pub async fn migrate(self) -> ShardingResult<PostgresRememberedEntityStore> {
+        let store = self.build();
+        store.migrate().await?;
+        Ok(store)
     }
 }
 
@@ -566,6 +612,168 @@ WHERE namespace = $1
     }
 }
 
+/// PostgreSQL remembered entity store.
+#[derive(Clone)]
+pub struct PostgresRememberedEntityStore {
+    client: Arc<Client>,
+    namespace: Arc<str>,
+}
+
+impl PostgresRememberedEntityStore {
+    /// Creates a PostgreSQL remembered entity store in the default namespace.
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self::builder(client).build()
+    }
+
+    /// Creates a builder for a PostgreSQL remembered entity store.
+    #[must_use]
+    pub fn builder(client: Client) -> PostgresRememberedEntityStoreBuilder {
+        PostgresRememberedEntityStoreBuilder {
+            client,
+            namespace: DEFAULT_NAMESPACE.to_string(),
+        }
+    }
+
+    /// Creates a PostgreSQL remembered entity store in an explicit namespace.
+    #[must_use]
+    pub fn with_namespace(client: Client, namespace: impl Into<String>) -> Self {
+        Self::builder(client).with_namespace(namespace).build()
+    }
+
+    /// Namespace used to isolate remembered entity ids.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Applies the default remembered entity table migration.
+    pub async fn migrate(&self) -> ShardingResult<()> {
+        acquire_migration_lock(&self.client)
+            .await
+            .map_err(map_remembered_postgres_error)?;
+        let migration_result = self
+            .client
+            .batch_execute(REMEMBERED_ENTITIES_MIGRATION_SQL)
+            .await;
+        let unlock_result = release_migration_lock(&self.client).await;
+
+        match (migration_result, unlock_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(map_remembered_postgres_error(error)),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for PostgresRememberedEntityStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresRememberedEntityStore")
+            .field("namespace", &self.namespace())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RememberedEntityStore for PostgresRememberedEntityStore {
+    fn backend_name(&self) -> &'static str {
+        BACKEND_NAME
+    }
+
+    fn remember<'a>(
+        &'a self,
+        shard: &'a ShardKey,
+        entity_id: &'a EntityId,
+    ) -> RememberedStoreFuture<'a, ()> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        Box::pin(async move {
+            let shard_id = shard_id_to_i32(shard)?;
+            client
+                .execute(
+                    r#"
+INSERT INTO rakka_shard_remembered_entities
+    (namespace, entity_type, shard_id, entity_id)
+VALUES ($1, $2, $3::integer, $4)
+ON CONFLICT (namespace, entity_type, shard_id, entity_id)
+DO UPDATE SET updated_at = now()
+"#,
+                    &[
+                        &namespace.as_ref(),
+                        &shard.entity_type().as_str(),
+                        &shard_id,
+                        &entity_id.as_str(),
+                    ],
+                )
+                .await
+                .map_err(map_remembered_postgres_error)?;
+            Ok(())
+        })
+    }
+
+    fn forget<'a>(
+        &'a self,
+        shard: &'a ShardKey,
+        entity_id: &'a EntityId,
+    ) -> RememberedStoreFuture<'a, bool> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        Box::pin(async move {
+            let shard_id = shard_id_to_i32(shard)?;
+            let deleted = client
+                .execute(
+                    r#"
+DELETE FROM rakka_shard_remembered_entities
+WHERE namespace = $1
+  AND entity_type = $2
+  AND shard_id = $3::integer
+  AND entity_id = $4
+"#,
+                    &[
+                        &namespace.as_ref(),
+                        &shard.entity_type().as_str(),
+                        &shard_id,
+                        &entity_id.as_str(),
+                    ],
+                )
+                .await
+                .map_err(map_remembered_postgres_error)?;
+            Ok(deleted > 0)
+        })
+    }
+
+    fn remembered_for_shard<'a>(
+        &'a self,
+        shard: &'a ShardKey,
+    ) -> RememberedStoreFuture<'a, Vec<EntityId>> {
+        let client = self.client.clone();
+        let namespace = self.namespace.clone();
+        Box::pin(async move {
+            let shard_id = shard_id_to_i32(shard)?;
+            let rows = client
+                .query(
+                    r#"
+SELECT entity_id
+FROM rakka_shard_remembered_entities
+WHERE namespace = $1
+  AND entity_type = $2
+  AND shard_id = $3::integer
+ORDER BY entity_id ASC
+"#,
+                    &[
+                        &namespace.as_ref(),
+                        &shard.entity_type().as_str(),
+                        &shard_id,
+                    ],
+                )
+                .await
+                .map_err(map_remembered_postgres_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| EntityId::new(row.get::<_, String>("entity_id")))
+                .collect())
+        })
+    }
+}
+
 async fn compare_and_set_state(
     client: &Client,
     namespace: &str,
@@ -908,6 +1116,18 @@ fn i32_to_u32(value: i32) -> ShardingResult<u32> {
     })
 }
 
+fn shard_id_to_i32(shard: &ShardKey) -> ShardingResult<i32> {
+    i32::try_from(shard.shard_id().as_u32()).map_err(|_overflow| {
+        ShardingError::RememberedEntityStore {
+            backend: BACKEND_NAME.to_string(),
+            message: format!(
+                "shard id {} exceeds PostgreSQL integer range",
+                shard.shard_id()
+            ),
+        }
+    })
+}
+
 async fn acquire_migration_lock(client: &Client) -> Result<(), tokio_postgres::Error> {
     let _row = client
         .query_one("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
@@ -936,6 +1156,20 @@ fn map_postgres_error(error: tokio_postgres::Error) -> ShardingError {
     }
 }
 
+fn map_remembered_postgres_error(error: tokio_postgres::Error) -> ShardingError {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    ShardingError::RememberedEntityStore {
+        backend: BACKEND_NAME.to_string(),
+        message,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -945,7 +1179,8 @@ mod tests {
     };
     use rakka_sharding::{
         AsyncShardCoordinatorStore, ClusterShardingRuntime, EntityType, RoutedEntityMessage,
-        ShardCoordinator, ShardCoordinatorLease, ShardRegion, ShardingConfig, ShardingError,
+        ShardCoordinator, ShardCoordinatorLease, ShardId, ShardRegion, ShardingConfig,
+        ShardingError,
     };
     use tokio_postgres::NoTls;
 
@@ -1179,6 +1414,37 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn postgres_remembered_entity_store_round_trips_when_dsn_is_set() {
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+        let namespace_a = unique_namespace("remembered-a");
+        let namespace_b = unique_namespace("remembered-b");
+        let store_a = connect_remembered_store(&dsn, namespace_a).await;
+        let store_b = connect_remembered_store(&dsn, namespace_b).await;
+        let shard = ShardKey::new(EntityType::new("PostgresRememberedCart"), ShardId::new(2));
+        let cart_a = EntityId::new("cart-a");
+        let cart_b = EntityId::new("cart-b");
+
+        store_a.remember(&shard, &cart_b).await.unwrap();
+        store_a.remember(&shard, &cart_a).await.unwrap();
+        store_a.remember(&shard, &cart_a).await.unwrap();
+
+        assert_eq!(
+            store_a.remembered_for_shard(&shard).await.unwrap(),
+            vec![cart_a.clone(), cart_b]
+        );
+        assert_eq!(store_b.remembered_for_shard(&shard).await.unwrap(), vec![]);
+        assert!(store_a.forget(&shard, &cart_a).await.unwrap());
+        assert!(!store_a.forget(&shard, &cart_a).await.unwrap());
+        assert_eq!(
+            store_a.remembered_for_shard(&shard).await.unwrap(),
+            vec![EntityId::new("cart-b")]
+        );
+    }
+
     async fn connect_store(dsn: &str, namespace: String) -> PostgresShardCoordinatorStore {
         let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.unwrap();
         tokio::spawn(async move {
@@ -1207,6 +1473,23 @@ mod tests {
         PostgresShardCoordinatorLease::builder(client)
             .with_namespace(namespace)
             .with_lease_duration(lease_duration)
+            .migrate()
+            .await
+            .unwrap()
+    }
+
+    async fn connect_remembered_store(
+        dsn: &str,
+        namespace: String,
+    ) -> PostgresRememberedEntityStore {
+        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("postgres remembered entity connection error: {error}");
+            }
+        });
+        PostgresRememberedEntityStore::builder(client)
+            .with_namespace(namespace)
             .migrate()
             .await
             .unwrap()

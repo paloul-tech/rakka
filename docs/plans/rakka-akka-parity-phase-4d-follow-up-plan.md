@@ -424,7 +424,7 @@ pub trait RememberedEntityStore: Debug + Send + Sync + 'static {
         &'a self,
         shard: &'a ShardKey,
         entity_id: &'a EntityId,
-    ) -> RememberedStoreFuture<'a, ()>;
+    ) -> RememberedStoreFuture<'a, bool>;
     fn remembered_for_shard<'a>(
         &'a self,
         shard: &'a ShardKey,
@@ -463,6 +463,8 @@ cargo test -p rakka-sharding
 
 Goal: implement remembered entities if Slice 4D4 accepts the feature.
 
+Status: implemented.
+
 Scope:
 
 - Add `RememberedEntities` settings to `Entity`.
@@ -497,6 +499,16 @@ Acceptance criteria:
   reacquire after handoff, idle passivation restart, and bounded activation.
 - Remembered entity recovery does not bypass entity persistence recovery.
 - Docs warn about high-cardinality remembered sets and describe batching.
+
+Implementation status:
+
+- Added remembered entity settings, async store trait, in-memory store, replay
+  settings, and replay summaries to `rakka-sharding`.
+- Added facade opt-in and explicit async forget APIs.
+- Added activation recording after successful local activation/reuse.
+- Added lazy replay on ownership refresh and shard acquisition.
+- Added PostgreSQL remembered entity store and gated integration tests.
+- Updated the cluster sharding doc and multi-node sharding example.
 
 ## Slice 4D6: Recovery-after-Movement Examples
 

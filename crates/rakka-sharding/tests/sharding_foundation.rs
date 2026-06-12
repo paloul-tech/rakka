@@ -18,14 +18,15 @@ use rakka_remote::{
 use rakka_sharding::{
     AsyncShardCoordinatorStore, ClusterSharding, ClusterShardingError, ClusterShardingRuntime,
     CoordinatorStoreFuture, Entity, EntityAskError, EntityContext, EntityDeliveryFailure, EntityId,
-    EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryShardCoordinatorLease,
-    InMemoryShardCoordinatorStore, LeastShardAllocationStrategy, LocalEntityContext,
-    LocalEntityRoute, PersistedShardCoordinatorState, RemoteEntityAskClient, RemoteEntityAskError,
-    RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound,
-    RemoteEntityRoute, RemoteEntitySendFailure, RemoteTransportEntityOutbound, RoutedEntityMessage,
+    EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryRememberedEntityStore,
+    InMemoryShardCoordinatorLease, InMemoryShardCoordinatorStore, LeastShardAllocationStrategy,
+    LocalEntityContext, LocalEntityRoute, PersistedShardCoordinatorState, RememberedEntities,
+    RememberedEntityStore, RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
+    RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute,
+    RemoteEntitySendFailure, RemoteTransportEntityOutbound, RoutedEntityMessage,
     ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinator,
     ShardCoordinatorLease, ShardCoordinatorStore, ShardDecision, ShardHandoffState, ShardId,
-    ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
+    ShardKey, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -420,6 +421,47 @@ async fn wait_for_entity_count<A, F>(
     assert_eq!(route.entity_count(), expected_count);
 }
 
+async fn wait_for_remembered_count(
+    store: &InMemoryRememberedEntityStore,
+    shard: &ShardKey,
+    expected_count: usize,
+) {
+    for _attempt in 0..20 {
+        if store.len_for_shard(shard) == expected_count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(store.len_for_shard(shard), expected_count);
+}
+
+async fn wait_for_entity_count_from_facade<M>(
+    sharding: &ClusterSharding,
+    key: &EntityTypeKey<M>,
+    expected_count: usize,
+) where
+    M: rakka_core::Message,
+{
+    for _attempt in 0..20 {
+        if sharding
+            .registration_state(key)
+            .is_some_and(|state| state.local_entity_count() == expected_count)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        sharding
+            .registration_state(key)
+            .map(|state| state.local_entity_count())
+            .unwrap_or_default(),
+        expected_count
+    );
+}
+
 #[tokio::test]
 async fn cluster_sharding_facade_initializes_and_routes_local_entity() {
     let system = ActorSystem::new("facade-local-test");
@@ -512,6 +554,135 @@ async fn cluster_sharding_facade_buffers_messages_during_explicit_passivation() 
 
     assert_eq!(value, "FacadeBufferedCart|cart-1:after-passivate");
     assert_eq!(registration.region().buffered_message_count(), 0);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn in_memory_remembered_entity_store_remembers_forgets_and_lists_by_shard() {
+    let store = InMemoryRememberedEntityStore::new();
+    let cart_shard = ShardKey::new(EntityType::new("RememberedCart"), ShardId::new(1));
+    let other_shard = ShardKey::new(EntityType::new("RememberedCart"), ShardId::new(2));
+    let cart_a = EntityId::new("cart-a");
+    let cart_b = EntityId::new("cart-b");
+
+    store.remember(&cart_shard, &cart_b).await.unwrap();
+    store.remember(&cart_shard, &cart_a).await.unwrap();
+    store.remember(&cart_shard, &cart_a).await.unwrap();
+    store.remember(&other_shard, &cart_a).await.unwrap();
+
+    assert_eq!(store.len(), 3);
+    assert_eq!(
+        store.remembered_for_shard(&cart_shard).await.unwrap(),
+        vec![cart_a.clone(), cart_b]
+    );
+    assert!(store.forget(&cart_shard, &cart_a).await.unwrap());
+    assert!(!store.forget(&cart_shard, &cart_a).await.unwrap());
+    assert_eq!(store.len_for_shard(&cart_shard), 1);
+    assert_eq!(store.len_for_shard(&other_shard), 1);
+}
+
+#[tokio::test]
+async fn remembered_entity_settings_propagate_to_facade_state() {
+    let system = ActorSystem::new("remembered-settings-test");
+    let sharding = ClusterSharding::get(&system);
+    let store = InMemoryRememberedEntityStore::new();
+    let key = EntityTypeKey::<CartCommand>::new("RememberedSettingsCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_remembered_entities(
+                RememberedEntities::enabled()
+                    .with_start_batch_size(3)
+                    .with_start_batch_delay(Duration::from_millis(5))
+                    .with_store(store),
+            ),
+        )
+        .unwrap();
+
+    let state = sharding.registration_state(&key).unwrap();
+    assert!(state.remembered_entities_enabled());
+    assert_eq!(state.remembered_start_batch_size(), 3);
+    assert_eq!(
+        state.remembered_start_batch_delay(),
+        Duration::from_millis(5)
+    );
+    assert_eq!(state.remembered_store_backend(), Some("in-memory"));
+    assert!(registration.region().remembered_entities().is_some());
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn remembered_entities_record_activation_survive_passivation_and_forget_explicitly() {
+    let system = ActorSystem::new("remembered-activation-test");
+    let sharding = ClusterSharding::get(&system);
+    let store = InMemoryRememberedEntityStore::new();
+    let key = EntityTypeKey::<CartCommand>::new("RememberedActivationCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_stop_message_factory(|| CartCommand::Passivate)
+            .with_remembered_entities(
+                RememberedEntities::enabled().with_store_ref(Arc::new(store.clone())),
+            ),
+        )
+        .unwrap();
+    let entity_id = EntityId::new("cart-1");
+    let shard = ShardKey::new(
+        key.entity_type().clone(),
+        ShardId::for_entity(key.entity_type(), &entity_id, key.config()),
+    );
+    let cart = registration.entity_ref_for(entity_id.as_str());
+
+    cart.tell(CartCommand::Add("apple".to_string())).unwrap();
+    wait_for_remembered_count(&store, &shard, 1).await;
+
+    assert!(sharding.passivate_entity_id(&key, &entity_id).unwrap());
+    wait_for_entity_count_from_facade(&sharding, &key, 0).await;
+    assert_eq!(store.len_for_shard(&shard), 1);
+
+    assert!(sharding.forget_entity_id(&key, &entity_id).await.unwrap());
+    assert_eq!(store.len_for_shard(&shard), 0);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn remembered_entities_replay_on_local_registration() {
+    let system = ActorSystem::new("remembered-registration-replay-test");
+    let sharding = ClusterSharding::get(&system);
+    let store = InMemoryRememberedEntityStore::new();
+    let key = EntityTypeKey::<CartCommand>::new("RememberedReplayCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let entity_id = EntityId::new("cart-1");
+    let shard = ShardKey::new(
+        key.entity_type().clone(),
+        ShardId::for_entity(key.entity_type(), &entity_id, key.config()),
+    );
+    store.remember(&shard, &entity_id).await.unwrap();
+
+    sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_remembered_entities(
+                RememberedEntities::enabled().with_store_ref(Arc::new(store.clone())),
+            ),
+        )
+        .unwrap();
+
+    wait_for_entity_count_from_facade(&sharding, &key, 1).await;
     system.shutdown();
 }
 
@@ -1511,6 +1682,63 @@ async fn cluster_sharding_runtime_runs_graceful_handoff_before_ownership_publish
         .tell(&region_a, CartCommand::Add("banana".to_string()))
         .unwrap();
     assert_eq!(route_a.entity_count(), 1);
+}
+
+#[tokio::test]
+async fn remembered_entities_replay_after_graceful_handoff_acquire() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let leaving = node("rakka-1", "uid-b");
+    let leaving_id = leaving.id().clone();
+    let entity_type = EntityType::new("RememberedHandoffCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = InMemoryRememberedEntityStore::new();
+    let remembered = RememberedEntities::enabled().with_store_ref(Arc::new(store.clone()));
+    let route_a = LocalEntityRoute::new(
+        local_id.clone(),
+        ActorSystem::new("remembered-handoff-node-a-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let route_b = LocalEntityRoute::new(
+        leaving_id.clone(),
+        ActorSystem::new("remembered-handoff-node-b-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region_a = ShardRegion::new(entity_type.clone(), config.clone(), route_a.clone())
+        .with_remembered_entities(remembered.clone());
+    let region_b = ShardRegion::new(entity_type.clone(), config.clone(), route_b.clone())
+        .with_remembered_entities(remembered);
+    let mut runtime = runtime_with_local(local.clone());
+
+    runtime.register_region(region_a.clone()).unwrap();
+    runtime.register_region(region_b.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, leaving]))
+        .unwrap();
+
+    let entity_id = entity_owned_by(runtime.coordinator(&entity_type).unwrap(), "rakka-1");
+    let entity = EntityRef::<CartCommand>::new(entity_type.clone(), entity_id.clone());
+    let shard = entity.shard_key(&config);
+    store.remember(&shard, &entity_id).await.unwrap();
+    entity
+        .tell(&region_b, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    assert_eq!(route_b.entity_count(), 1);
+
+    let _leave_update = runtime.mark_leaving(&leaving_id, 2).unwrap();
+
+    assert_eq!(
+        route_a.shard_handoff_state(shard.shard_id()),
+        ShardHandoffState::Acquired
+    );
+    assert_eq!(route_b.entity_count(), 0);
+    wait_for_entity_count(&route_a, 1).await;
 }
 
 #[tokio::test]

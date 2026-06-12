@@ -79,7 +79,7 @@ pub trait RememberedEntityStore: Debug + Send + Sync + 'static {
         &'a self,
         shard: &'a ShardKey,
         entity_id: &'a EntityId,
-    ) -> RememberedStoreFuture<'a, ()>;
+    ) -> RememberedStoreFuture<'a, bool>;
 
     fn remembered_for_shard<'a>(
         &'a self,

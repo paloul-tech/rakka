@@ -18,8 +18,9 @@ use rakka_sharding::node_runtime::{
 };
 use rakka_sharding::{
     ClusterSharding, Entity, EntityContext, EntityId, EntityRef, EntityType, EntityTypeKey,
-    LocalEntityContext, LocalEntityRoute, RemoteEntityInbound, RemoteEntityRoute,
-    RemoteTransportEntityOutbound, ShardCoordinator, ShardRegion, ShardingConfig,
+    InMemoryRememberedEntityStore, LocalEntityContext, LocalEntityRoute, RememberedEntities,
+    RemoteEntityInbound, RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinator,
+    ShardRegion, ShardingConfig,
 };
 use tokio::process::Command;
 
@@ -134,15 +135,20 @@ async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
 
     let (node_b_delivered, mut node_b_received) =
         tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    let remembered_entities = InMemoryRememberedEntityStore::new();
     let node_b_sharding =
         ClusterSharding::from_membership(&node_b_system, node_b.clone(), node_b_membership);
-    let node_b_registration = node_b_sharding.init(Entity::of(
-        entity_key,
-        move |context: EntityContext<CartCommand>| FacadeCartEntity {
-            context,
-            delivered: node_b_delivered.clone(),
-        },
-    ))?;
+    let node_b_registration = node_b_sharding.init(
+        Entity::of(entity_key, move |context: EntityContext<CartCommand>| {
+            FacadeCartEntity {
+                context,
+                delivered: node_b_delivered.clone(),
+            }
+        })
+        .with_remembered_entities(
+            RememberedEntities::enabled().with_store(remembered_entities.clone()),
+        ),
+    )?;
     let region_b = node_b_registration.region().clone();
 
     let endpoint_b = RemoteEndpoint::new(node_b.id().clone());
@@ -165,6 +171,7 @@ async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
     let delivered = tokio::time::timeout(Duration::from_secs(1), node_b_received.recv())
         .await?
         .ok_or_else(|| example_error("remote entity delivery channel closed"))?;
+    wait_for(|| remembered_entities.len() == 1).await?;
 
     println!(
         "Rakka multi-node sharding routed {} to {} on {}.",
@@ -186,6 +193,10 @@ async fn run_in_memory_example() -> Result<(), Box<dyn Error>> {
             .registration_state(node_b_registration.key())
             .map(|state| state.local_entity_count())
             .unwrap_or_default()
+    );
+    println!(
+        "node-b remembered entity count: {}",
+        remembered_entities.len()
     );
 
     node_a_system.shutdown();

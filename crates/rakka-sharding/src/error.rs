@@ -92,6 +92,24 @@ pub enum ShardingError {
         /// Failure detail.
         message: String,
     },
+    /// Remembered entity store backend failed.
+    RememberedEntityStore {
+        /// Backend name.
+        backend: String,
+        /// Failure detail.
+        message: String,
+    },
+    /// Remembered entity replay could not activate an entity locally.
+    RememberedEntityReplay {
+        /// Entity type being replayed.
+        entity_type: EntityType,
+        /// Entity id being replayed.
+        entity_id: EntityId,
+        /// Shard being replayed.
+        shard_id: ShardId,
+        /// Failure detail.
+        message: String,
+    },
     /// Coordinator leadership lease is currently held by another node.
     CoordinatorLeaseRejected {
         /// Lease backend name.
@@ -155,6 +173,8 @@ impl ShardingError {
             Self::CoordinatorRevisionConflict { .. } => "coordinator-revision-conflict",
             Self::CoordinatorStore { .. } => "coordinator-store",
             Self::CoordinatorLease { .. } => "coordinator-lease",
+            Self::RememberedEntityStore { .. } => "remembered-entity-store",
+            Self::RememberedEntityReplay { .. } => "remembered-entity-replay",
             Self::CoordinatorLeaseRejected { .. } => "coordinator-lease-rejected",
             Self::CoordinatorLeaseLost { .. } => "coordinator-lease-lost",
             Self::AsyncCoordinatorStoreRequiresAsyncApi { .. } => {
@@ -226,6 +246,18 @@ impl Display for ShardingError {
             Self::CoordinatorLease { lease, message } => {
                 write!(f, "{lease} coordinator lease failed: {message}")
             }
+            Self::RememberedEntityStore { backend, message } => {
+                write!(f, "{backend} remembered entity store failed: {message}")
+            }
+            Self::RememberedEntityReplay {
+                entity_type,
+                entity_id,
+                shard_id,
+                message,
+            } => write!(
+                f,
+                "remembered entity replay for {entity_type}/{entity_id} in shard {shard_id} failed: {message}"
+            ),
             Self::CoordinatorLeaseRejected {
                 lease,
                 entity_type,
