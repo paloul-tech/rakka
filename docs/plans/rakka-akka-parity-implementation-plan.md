@@ -376,10 +376,33 @@ Implementation status on 2026-06-11:
   `ClusterShardingRuntime`.
 - Added Phase 4C tests for custom initial allocation, bounded least-shard
   rebalance, and facade-to-runtime strategy propagation.
+- Began Phase 4D durable coordinator work with
+  `ShardCoordinatorStore`, `PersistedShardCoordinatorState`, and
+  `InMemoryShardCoordinatorStore`.
+- `ShardCoordinator` can now recover from a persisted `ShardOwnershipSnapshot`
+  while preserving revision and validating entity type, shard count, and shard
+  ids.
+- `ClusterShardingRuntime`, `ClusterNodeRuntimeBuilder`, and
+  `ClusterSharding` facade constructors can opt in to durable coordinator
+  storage without changing the default ephemeral behavior.
+- Added durable coordinator tests for revision fencing, initial snapshot
+  persistence, runtime recovery, persisted config mismatch, and facade wiring.
+- Added `docs/rakka-akka-parity-phase-4-durable-coordinator-rationale.md`
+  capturing the control-plane reasoning and Akka comparison.
+- Implemented Phase 4D1 async coordinator store boundaries with
+  `AsyncShardCoordinatorStore`, `CoordinatorStoreFuture`, async runtime
+  registration/update APIs, async node-runtime APIs, async facade init/proxy
+  APIs, and fail-closed sync behavior for async-only stores.
 
 Phase 4 follow-ups:
 
-- Add durable coordinator backend traits and persistent ownership snapshots.
+See `docs/plans/rakka-akka-parity-phase-4d-follow-up-plan.md` for the detailed
+slice plan.
+
+- Add persistent coordinator store implementations, starting with PostgreSQL or
+  a persistence-adapter bridge.
+- Add coordinator leadership/lease semantics for multi-coordinator deployments.
+- Evaluate remembered-entity semantics against Akka Cluster Sharding.
 - Add persistence recovery-after-movement examples on top of the remote facade.
 
 ## Phase 5: Cluster Extension, Receptionist, and Routers

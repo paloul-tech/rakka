@@ -299,6 +299,85 @@ impl ShardCoordinator {
         }
     }
 
+    /// Restores a coordinator from a stable ownership snapshot.
+    pub fn from_snapshot(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        snapshot: &ShardOwnershipSnapshot,
+    ) -> ShardingResult<Self> {
+        Self::from_snapshot_with_allocation_strategy(
+            entity_type,
+            config,
+            snapshot,
+            DeterministicModuloShardAllocationStrategy,
+        )
+    }
+
+    /// Restores a coordinator from a stable ownership snapshot with a custom allocation strategy.
+    pub fn from_snapshot_with_allocation_strategy(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        snapshot: &ShardOwnershipSnapshot,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> ShardingResult<Self> {
+        Self::from_snapshot_with_allocation_strategy_ref(
+            entity_type,
+            config,
+            snapshot,
+            Arc::new(allocation_strategy),
+        )
+    }
+
+    /// Restores a coordinator from a stable ownership snapshot with a shared allocation strategy.
+    pub fn from_snapshot_with_allocation_strategy_ref(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        snapshot: &ShardOwnershipSnapshot,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> ShardingResult<Self> {
+        if snapshot.entity_type() != &entity_type
+            || snapshot.number_of_shards() != config.number_of_shards()
+        {
+            return Err(ShardingError::PersistedCoordinatorSnapshotMismatch {
+                expected_entity_type: entity_type,
+                actual_entity_type: snapshot.entity_type().clone(),
+                expected_shards: config.number_of_shards(),
+                actual_shards: snapshot.number_of_shards(),
+            });
+        }
+
+        let mut assignments = BTreeMap::new();
+        for assignment in snapshot.assignments() {
+            let shard = assignment.shard();
+            if shard.entity_type() != &entity_type {
+                return Err(ShardingError::PersistedCoordinatorSnapshotMismatch {
+                    expected_entity_type: entity_type,
+                    actual_entity_type: shard.entity_type().clone(),
+                    expected_shards: config.number_of_shards(),
+                    actual_shards: snapshot.number_of_shards(),
+                });
+            }
+
+            let shard_id = shard.shard_id();
+            if !config.contains_shard(shard_id) {
+                return Err(ShardingError::UnknownShard {
+                    shard_id,
+                    number_of_shards: config.number_of_shards(),
+                });
+            }
+
+            assignments.insert(shard_id, assignment.owner().clone());
+        }
+
+        Ok(Self {
+            entity_type,
+            config,
+            assignments,
+            revision: snapshot.revision(),
+            allocation_strategy,
+        })
+    }
+
     /// Entity type coordinated by this instance.
     #[must_use]
     pub fn entity_type(&self) -> &EntityType {

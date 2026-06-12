@@ -10,13 +10,15 @@ use std::time::Duration;
 use rakka_cluster::{ClusterMembership, ClusterNode, MembershipConfig, NodeAddress, NodeId};
 use rakka_core::{Actor, ActorOptions, ActorSystem, Message, ReplyTo};
 use rakka_remote::{RemoteEnvelope, RemoteEnvelopeHandler, RemoteTransport};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
-    ClusterNodeRuntime, ClusterNodeRuntimeResult, ClusterShardingError, ClusterShardingResult,
-    ClusterShardingRuntime, EntityAskError, EntityId, EntityRef, EntityTellError, EntityType,
-    LeastShardAllocationStrategy, LocalEntityContext, LocalEntityRoute, RemoteEntityAskClient,
-    RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound, ShardAllocationStrategy,
-    ShardBufferConfig, ShardId, ShardRegion, ShardingConfig,
+    AsyncShardCoordinatorStore, ClusterNodeRuntime, ClusterNodeRuntimeResult, ClusterShardingError,
+    ClusterShardingResult, ClusterShardingRuntime, EntityAskError, EntityId, EntityRef,
+    EntityTellError, EntityType, LeastShardAllocationStrategy, LocalEntityContext,
+    LocalEntityRoute, RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
+    RemoteEntityInbound, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinatorStore,
+    ShardId, ShardRegion, ShardingConfig,
 };
 
 type RegionRegistry = Arc<Mutex<BTreeMap<EntityType, Box<dyn Any + Send + Sync>>>>;
@@ -414,7 +416,7 @@ where
 pub struct ClusterSharding {
     system: ActorSystem,
     local_node: ClusterNode,
-    runtime: Arc<Mutex<ClusterShardingRuntime>>,
+    runtime: Arc<AsyncMutex<ClusterShardingRuntime>>,
     regions: RegionRegistry,
     controls: LocalControlRegistry,
     states: StateRegistry,
@@ -429,6 +431,56 @@ impl ClusterSharding {
             .expect("local cluster sharding facade should initialize")
     }
 
+    /// Creates a local-only sharding facade with a durable shard coordinator store.
+    #[must_use]
+    pub fn get_with_coordinator_store(
+        system: &ActorSystem,
+        coordinator_store: impl ShardCoordinatorStore,
+    ) -> Self {
+        Self::get_with_coordinator_store_ref(system, Arc::new(coordinator_store))
+    }
+
+    /// Creates a local-only sharding facade with a shared durable shard coordinator store.
+    #[must_use]
+    pub fn get_with_coordinator_store_ref(
+        system: &ActorSystem,
+        coordinator_store: Arc<dyn ShardCoordinatorStore>,
+    ) -> Self {
+        let local_node = local_node_for_system(system);
+        Self::for_local_node_with_coordinator_store_ref(
+            system,
+            local_node,
+            MembershipConfig::default(),
+            coordinator_store,
+        )
+        .expect("local cluster sharding facade should initialize")
+    }
+
+    /// Creates a local-only sharding facade with an async durable coordinator store.
+    #[must_use]
+    pub fn get_with_async_coordinator_store(
+        system: &ActorSystem,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+    ) -> Self {
+        Self::get_with_async_coordinator_store_ref(system, Arc::new(coordinator_store))
+    }
+
+    /// Creates a local-only sharding facade with a shared async durable coordinator store.
+    #[must_use]
+    pub fn get_with_async_coordinator_store_ref(
+        system: &ActorSystem,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+    ) -> Self {
+        let local_node = local_node_for_system(system);
+        Self::for_local_node_with_async_coordinator_store_ref(
+            system,
+            local_node,
+            MembershipConfig::default(),
+            coordinator_store,
+        )
+        .expect("local cluster sharding facade should initialize")
+    }
+
     /// Creates a sharding facade for an explicit local node descriptor.
     pub fn for_local_node(
         system: &ActorSystem,
@@ -439,6 +491,72 @@ impl ClusterSharding {
         let mut membership = ClusterMembership::new(local_node.clone(), config);
         membership.mark_up(&local_node_id, 0)?;
         Ok(Self::from_membership(system, local_node, membership))
+    }
+
+    /// Creates a sharding facade with a durable shard coordinator store.
+    pub fn for_local_node_with_coordinator_store(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        config: MembershipConfig,
+        coordinator_store: impl ShardCoordinatorStore,
+    ) -> ClusterShardingResult<Self> {
+        Self::for_local_node_with_coordinator_store_ref(
+            system,
+            local_node,
+            config,
+            Arc::new(coordinator_store),
+        )
+    }
+
+    /// Creates a sharding facade with a shared durable shard coordinator store.
+    pub fn for_local_node_with_coordinator_store_ref(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        config: MembershipConfig,
+        coordinator_store: Arc<dyn ShardCoordinatorStore>,
+    ) -> ClusterShardingResult<Self> {
+        let local_node_id = local_node.id().clone();
+        let mut membership = ClusterMembership::new(local_node.clone(), config);
+        membership.mark_up(&local_node_id, 0)?;
+        Ok(Self::from_membership_with_coordinator_store_ref(
+            system,
+            local_node,
+            membership,
+            coordinator_store,
+        ))
+    }
+
+    /// Creates a sharding facade with an async durable shard coordinator store.
+    pub fn for_local_node_with_async_coordinator_store(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        config: MembershipConfig,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+    ) -> ClusterShardingResult<Self> {
+        Self::for_local_node_with_async_coordinator_store_ref(
+            system,
+            local_node,
+            config,
+            Arc::new(coordinator_store),
+        )
+    }
+
+    /// Creates a sharding facade with a shared async durable shard coordinator store.
+    pub fn for_local_node_with_async_coordinator_store_ref(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        config: MembershipConfig,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+    ) -> ClusterShardingResult<Self> {
+        let local_node_id = local_node.id().clone();
+        let mut membership = ClusterMembership::new(local_node.clone(), config);
+        membership.mark_up(&local_node_id, 0)?;
+        Ok(Self::from_membership_with_async_coordinator_store_ref(
+            system,
+            local_node,
+            membership,
+            coordinator_store,
+        ))
     }
 
     /// Creates a facade companion for a networked cluster node runtime.
@@ -467,7 +585,82 @@ impl ClusterSharding {
         Self {
             system: system.clone(),
             local_node,
-            runtime: Arc::new(Mutex::new(ClusterShardingRuntime::new(membership))),
+            runtime: Arc::new(AsyncMutex::new(ClusterShardingRuntime::new(membership))),
+            regions: Arc::new(Mutex::new(BTreeMap::new())),
+            controls: Arc::new(Mutex::new(BTreeMap::new())),
+            states: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Creates a facade from an existing membership table with a durable coordinator store.
+    #[must_use]
+    pub fn from_membership_with_coordinator_store(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        membership: ClusterMembership,
+        coordinator_store: impl ShardCoordinatorStore,
+    ) -> Self {
+        Self::from_membership_with_coordinator_store_ref(
+            system,
+            local_node,
+            membership,
+            Arc::new(coordinator_store),
+        )
+    }
+
+    /// Creates a facade from an existing membership table with a shared durable coordinator store.
+    #[must_use]
+    pub fn from_membership_with_coordinator_store_ref(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        membership: ClusterMembership,
+        coordinator_store: Arc<dyn ShardCoordinatorStore>,
+    ) -> Self {
+        Self {
+            system: system.clone(),
+            local_node,
+            runtime: Arc::new(AsyncMutex::new(
+                ClusterShardingRuntime::with_coordinator_store_ref(membership, coordinator_store),
+            )),
+            regions: Arc::new(Mutex::new(BTreeMap::new())),
+            controls: Arc::new(Mutex::new(BTreeMap::new())),
+            states: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Creates a facade from an existing membership table with an async coordinator store.
+    #[must_use]
+    pub fn from_membership_with_async_coordinator_store(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        membership: ClusterMembership,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+    ) -> Self {
+        Self::from_membership_with_async_coordinator_store_ref(
+            system,
+            local_node,
+            membership,
+            Arc::new(coordinator_store),
+        )
+    }
+
+    /// Creates a facade from an existing membership table with a shared async coordinator store.
+    #[must_use]
+    pub fn from_membership_with_async_coordinator_store_ref(
+        system: &ActorSystem,
+        local_node: ClusterNode,
+        membership: ClusterMembership,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+    ) -> Self {
+        Self {
+            system: system.clone(),
+            local_node,
+            runtime: Arc::new(AsyncMutex::new(
+                ClusterShardingRuntime::with_async_coordinator_store_ref(
+                    membership,
+                    coordinator_store,
+                ),
+            )),
             regions: Arc::new(Mutex::new(BTreeMap::new())),
             controls: Arc::new(Mutex::new(BTreeMap::new())),
             states: Arc::new(Mutex::new(BTreeMap::new())),
@@ -488,7 +681,7 @@ impl ClusterSharding {
 
     /// Shared low-level sharding runtime.
     #[must_use]
-    pub fn runtime(&self) -> Arc<Mutex<ClusterShardingRuntime>> {
+    pub fn runtime(&self) -> Arc<AsyncMutex<ClusterShardingRuntime>> {
         self.runtime.clone()
     }
 
@@ -554,6 +747,69 @@ impl ClusterSharding {
         Ok(EntityTypeRegistration::new(key, region))
     }
 
+    /// Initializes a sharded entity type on this node through async coordinator storage.
+    pub async fn init_async<M, A, F>(
+        &self,
+        entity: Entity<M, A, F>,
+    ) -> ClusterShardingResult<EntityTypeRegistration<M>>
+    where
+        M: Message,
+        A: Actor<Msg = M>,
+        F: Fn(EntityContext<M>) -> A + Send + Sync + 'static,
+    {
+        let Entity {
+            key,
+            factory,
+            actor_options,
+            idle_passivation_timeout,
+            stop_message_factory,
+            buffer_config,
+            passivation_buffer_duration,
+            allocation_strategy,
+        } = entity;
+        let key_for_factory = key.clone();
+        let local_node_id = self.local_node.id().clone();
+        let system = self.system.clone();
+        let mut local_route = LocalEntityRoute::new(local_node_id, system, move |local_context| {
+            factory(EntityContext::new(key_for_factory.clone(), local_context))
+        })
+        .with_actor_options(actor_options);
+
+        if let Some(timeout) = idle_passivation_timeout {
+            local_route = local_route.with_idle_passivation(timeout);
+        }
+
+        let control = Arc::new(LocalRouteControl::new(
+            local_route.clone(),
+            stop_message_factory.clone(),
+        ));
+        let region = apply_buffering(
+            apply_allocation_strategy(
+                ShardRegion::new(
+                    key.entity_type().clone(),
+                    key.config().clone(),
+                    local_route.clone(),
+                ),
+                allocation_strategy,
+            ),
+            buffer_config.clone(),
+        );
+        self.register_typed_region_async(
+            key.clone(),
+            region.clone(),
+            RegistrationMode::Local {
+                control,
+                idle_passivation_timeout,
+                has_stop_message: stop_message_factory.is_some(),
+                buffer_config,
+                passivation_buffer_duration,
+            },
+        )
+        .await?;
+
+        Ok(EntityTypeRegistration::new(key, region))
+    }
+
     /// Initializes a remote-aware sharded entity type through a node runtime.
     ///
     /// This creates the local entity route, wraps it in a remote route, registers
@@ -608,6 +864,71 @@ impl ClusterSharding {
             buffer_config.clone(),
         );
         runtime.register_entity_region(region.clone())?;
+        self.store_typed_region(
+            key.clone(),
+            region.clone(),
+            RegistrationMode::Local {
+                control,
+                idle_passivation_timeout,
+                has_stop_message: stop_message_factory.is_some(),
+                buffer_config,
+                passivation_buffer_duration,
+            },
+        );
+
+        Ok(EntityTypeRegistration::new(key, region))
+    }
+
+    /// Initializes a remote-aware sharded entity type through async coordinator storage.
+    pub async fn init_remote_async<M, A, F>(
+        &self,
+        runtime: &mut ClusterNodeRuntime,
+        entity: Entity<M, A, F>,
+    ) -> ClusterNodeRuntimeResult<EntityTypeRegistration<M>>
+    where
+        M: Message + Sync,
+        A: Actor<Msg = M>,
+        F: Fn(EntityContext<M>) -> A + Send + Sync + 'static,
+    {
+        let Entity {
+            key,
+            factory,
+            actor_options,
+            idle_passivation_timeout,
+            stop_message_factory,
+            buffer_config,
+            passivation_buffer_duration,
+            allocation_strategy,
+        } = entity;
+        let key_for_factory = key.clone();
+        let local_node_id = runtime.local_node().id().clone();
+        let system = self.system.clone();
+        let mut local_route = LocalEntityRoute::new(local_node_id, system, move |local_context| {
+            factory(EntityContext::new(key_for_factory.clone(), local_context))
+        })
+        .with_actor_options(actor_options);
+
+        if let Some(timeout) = idle_passivation_timeout {
+            local_route = local_route.with_idle_passivation(timeout);
+        }
+
+        let control = Arc::new(LocalRouteControl::new(
+            local_route.clone(),
+            stop_message_factory.clone(),
+        ));
+        let remote_route = runtime.remote_route(local_route.clone());
+        let region = apply_buffering(
+            apply_allocation_strategy(
+                ShardRegion::new(
+                    key.entity_type().clone(),
+                    key.config().clone(),
+                    remote_route,
+                ),
+                allocation_strategy,
+            ),
+            buffer_config.clone(),
+        );
+        runtime.register_entity_region_async(region.clone()).await?;
         self.store_typed_region(
             key.clone(),
             region.clone(),
@@ -710,6 +1031,91 @@ impl ClusterSharding {
         Ok(EntityTypeRegistration::new(key, region))
     }
 
+    /// Initializes a remote-aware entity type with ask handling through async storage.
+    pub async fn init_remote_with_ask_async<Q, M, R, A, F, B>(
+        &self,
+        runtime: &mut ClusterNodeRuntime,
+        entity: Entity<M, A, F>,
+        build: B,
+    ) -> ClusterNodeRuntimeResult<EntityTypeRegistration<M>>
+    where
+        Q: Message + Sync,
+        M: Message + Sync,
+        R: Send + Sync + 'static,
+        A: Actor<Msg = M>,
+        F: Fn(EntityContext<M>) -> A + Send + Sync + 'static,
+        B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+    {
+        let Entity {
+            key,
+            factory,
+            actor_options,
+            idle_passivation_timeout,
+            stop_message_factory,
+            buffer_config,
+            passivation_buffer_duration,
+            allocation_strategy,
+        } = entity;
+        let key_for_factory = key.clone();
+        let local_node_id = runtime.local_node().id().clone();
+        let system = self.system.clone();
+        let mut local_route = LocalEntityRoute::new(local_node_id, system, move |local_context| {
+            factory(EntityContext::new(key_for_factory.clone(), local_context))
+        })
+        .with_actor_options(actor_options);
+
+        if let Some(timeout) = idle_passivation_timeout {
+            local_route = local_route.with_idle_passivation(timeout);
+        }
+
+        let control = Arc::new(LocalRouteControl::new(
+            local_route.clone(),
+            stop_message_factory.clone(),
+        ));
+        let remote_route = runtime.remote_route(local_route.clone());
+        let region = apply_buffering(
+            apply_allocation_strategy(
+                ShardRegion::new(
+                    key.entity_type().clone(),
+                    key.config().clone(),
+                    remote_route,
+                ),
+                allocation_strategy,
+            ),
+            buffer_config.clone(),
+        );
+        let tell_handler = RemoteEntityInbound::new(region.clone(), runtime.registry().clone());
+        let ask_handler = RemoteEntityAskInbound::new(
+            runtime.local_node().id().clone(),
+            region.clone(),
+            runtime.registry().clone(),
+            runtime.transport().clone(),
+            build,
+        );
+        runtime
+            .register_entity_handler_async(region.clone(), move |envelope: RemoteEnvelope| {
+                if envelope.request_id.is_some() {
+                    RemoteEnvelopeHandler::handle(&ask_handler, envelope)
+                } else {
+                    RemoteEnvelopeHandler::handle(&tell_handler, envelope)
+                }
+            })
+            .await?;
+        self.store_typed_region(
+            key.clone(),
+            region.clone(),
+            RegistrationMode::Local {
+                control,
+                idle_passivation_timeout,
+                has_stop_message: stop_message_factory.is_some(),
+                buffer_config,
+                passivation_buffer_duration,
+            },
+        );
+
+        Ok(EntityTypeRegistration::new(key, region))
+    }
+
     /// Initializes a proxy-only entity type registration.
     pub fn init_proxy<M>(
         &self,
@@ -724,6 +1130,21 @@ impl ClusterSharding {
         )
     }
 
+    /// Initializes a proxy-only entity type registration through async storage.
+    pub async fn init_proxy_async<M>(
+        &self,
+        key: EntityTypeKey<M>,
+    ) -> ClusterShardingResult<EntityTypeRegistration<M>>
+    where
+        M: Message,
+    {
+        self.init_proxy_with_allocation_strategy_ref_async(
+            key,
+            Arc::new(crate::DeterministicModuloShardAllocationStrategy),
+        )
+        .await
+    }
+
     /// Initializes a proxy-only entity type registration with an allocation strategy.
     pub fn init_proxy_with_allocation_strategy<M>(
         &self,
@@ -734,6 +1155,19 @@ impl ClusterSharding {
         M: Message,
     {
         self.init_proxy_with_allocation_strategy_ref(key, Arc::new(allocation_strategy))
+    }
+
+    /// Initializes a proxy-only registration with an allocation strategy through async storage.
+    pub async fn init_proxy_with_allocation_strategy_async<M>(
+        &self,
+        key: EntityTypeKey<M>,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> ClusterShardingResult<EntityTypeRegistration<M>>
+    where
+        M: Message,
+    {
+        self.init_proxy_with_allocation_strategy_ref_async(key, Arc::new(allocation_strategy))
+            .await
     }
 
     /// Initializes a proxy-only entity type registration with a shared allocation strategy.
@@ -761,6 +1195,35 @@ impl ClusterSharding {
             allocation_strategy,
         );
         self.register_typed_region(key.clone(), region.clone(), RegistrationMode::ProxyOnly)?;
+        Ok(EntityTypeRegistration::new(key, region))
+    }
+
+    /// Initializes a proxy-only registration with a shared allocation strategy through async storage.
+    pub async fn init_proxy_with_allocation_strategy_ref_async<M>(
+        &self,
+        key: EntityTypeKey<M>,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> ClusterShardingResult<EntityTypeRegistration<M>>
+    where
+        M: Message,
+    {
+        let entity_type = key.entity_type().clone();
+        let region = apply_allocation_strategy(
+            ShardRegion::new(
+                entity_type.clone(),
+                key.config().clone(),
+                move |message: crate::RoutedEntityMessage<M>| {
+                    let owner = message.owner().clone();
+                    Err(EntityTellError::Delivery {
+                        message: message.into_message(),
+                        failure: crate::EntityDeliveryFailure::NotLocal { owner },
+                    })
+                },
+            ),
+            allocation_strategy,
+        );
+        self.register_typed_region_async(key.clone(), region.clone(), RegistrationMode::ProxyOnly)
+            .await?;
         Ok(EntityTypeRegistration::new(key, region))
     }
 
@@ -916,9 +1379,27 @@ impl ClusterSharding {
         M: Message,
     {
         self.runtime
-            .lock()
-            .expect("cluster sharding runtime mutex poisoned")
+            .try_lock()
+            .map_err(|_error| ClusterShardingError::RuntimeBusy)?
             .register_region(region.clone())?;
+        self.store_typed_region(key, region, mode);
+        Ok(())
+    }
+
+    async fn register_typed_region_async<M>(
+        &self,
+        key: EntityTypeKey<M>,
+        region: ShardRegion<M>,
+        mode: RegistrationMode,
+    ) -> ClusterShardingResult<()>
+    where
+        M: Message,
+    {
+        self.runtime
+            .lock()
+            .await
+            .register_region_async(region.clone())
+            .await?;
         self.store_typed_region(key, region, mode);
         Ok(())
     }

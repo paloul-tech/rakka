@@ -56,6 +56,38 @@ pub enum ShardingError {
         /// Shard count carried by the ownership snapshot.
         actual_shards: u32,
     },
+    /// Persisted coordinator snapshot did not match the requested coordinator configuration.
+    PersistedCoordinatorSnapshotMismatch {
+        /// Entity type expected by the coordinator.
+        expected_entity_type: EntityType,
+        /// Entity type carried by persisted coordinator state.
+        actual_entity_type: EntityType,
+        /// Shard count expected by the coordinator.
+        expected_shards: u32,
+        /// Shard count carried by persisted coordinator state.
+        actual_shards: u32,
+    },
+    /// Durable coordinator write used a stale revision.
+    CoordinatorRevisionConflict {
+        /// Entity type whose coordinator state conflicted.
+        entity_type: EntityType,
+        /// Expected stored revision.
+        expected_revision: u64,
+        /// Actual stored revision.
+        actual_revision: u64,
+    },
+    /// Durable coordinator backend failed.
+    CoordinatorStore {
+        /// Backend name.
+        backend: String,
+        /// Failure detail.
+        message: String,
+    },
+    /// An async-only coordinator store was used through a synchronous sharding API.
+    AsyncCoordinatorStoreRequiresAsyncApi {
+        /// Backend name.
+        backend: String,
+    },
 }
 
 impl ShardingError {
@@ -75,6 +107,14 @@ impl ShardingError {
             Self::NoEntityOwner { .. } => "no-entity-owner",
             Self::EntityTypeMismatch { .. } => "entity-type-mismatch",
             Self::OwnershipSnapshotMismatch { .. } => "ownership-snapshot-mismatch",
+            Self::PersistedCoordinatorSnapshotMismatch { .. } => {
+                "persisted-coordinator-snapshot-mismatch"
+            }
+            Self::CoordinatorRevisionConflict { .. } => "coordinator-revision-conflict",
+            Self::CoordinatorStore { .. } => "coordinator-store",
+            Self::AsyncCoordinatorStoreRequiresAsyncApi { .. } => {
+                "async-coordinator-store-requires-async-api"
+            }
         }
     }
 }
@@ -114,6 +154,30 @@ impl Display for ShardingError {
             } => write!(
                 f,
                 "ownership snapshot {actual_entity_type}/{actual_shards} does not match region {expected_entity_type}/{expected_shards}"
+            ),
+            Self::PersistedCoordinatorSnapshotMismatch {
+                expected_entity_type,
+                actual_entity_type,
+                expected_shards,
+                actual_shards,
+            } => write!(
+                f,
+                "persisted coordinator snapshot {actual_entity_type}/{actual_shards} does not match coordinator {expected_entity_type}/{expected_shards}"
+            ),
+            Self::CoordinatorRevisionConflict {
+                entity_type,
+                expected_revision,
+                actual_revision,
+            } => write!(
+                f,
+                "coordinator state for {entity_type} expected revision {expected_revision}, found {actual_revision}"
+            ),
+            Self::CoordinatorStore { backend, message } => {
+                write!(f, "{backend} coordinator store failed: {message}")
+            }
+            Self::AsyncCoordinatorStoreRequiresAsyncApi { backend } => write!(
+                f,
+                "{backend} coordinator store requires an async sharding API"
             ),
         }
     }

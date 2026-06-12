@@ -182,10 +182,60 @@ The combined remote handler accepts tell envelopes and ask envelopes for the
 same entity type. Ask envelopes are detected by request metadata and converted
 into the entity command with the supplied builder function.
 
+## Durable Coordinator Store
+
+Cluster sharding can opt in to durable shard coordinator snapshots. The store is
+control-plane state only: it keeps entity type, shard count, owner assignments,
+allocation strategy name, revision, and update time. Entity event/state
+persistence remains owned by `rakka-persistence`.
+
+```rust
+use rakka::prelude::*;
+
+let system = ActorSystem::new("shopping");
+let store = InMemoryShardCoordinatorStore::new();
+let sharding = ClusterSharding::get_with_coordinator_store(&system, store.clone());
+
+let key = EntityTypeKey::<CartCommand>::new("Cart")
+    .with_number_of_shards(32)?;
+sharding.init(Entity::of(key.clone(), |context| CartEntity::new(context)))?;
+```
+
+Networked nodes can configure the same store through
+`ClusterNodeRuntime::builder(local_node).with_shard_coordinator_store(store)`.
+Low-level runtime users can use
+`ClusterShardingRuntime::with_coordinator_store(membership, store)`.
+
+Persistent coordinator backends should use the async store path so database I/O
+does not block runtime threads:
+
+```rust
+let sharding = ClusterSharding::get_with_async_coordinator_store(&system, store);
+
+sharding
+    .init_async(Entity::of(key.clone(), |context| CartEntity::new(context)))
+    .await?;
+```
+
+Networked nodes can use
+`ClusterNodeRuntime::builder(local_node).with_async_shard_coordinator_store(store)`.
+Runtime users can call `register_region_async`, `apply_discovery_async`,
+`heartbeat_async`, `mark_leaving_async`, `mark_down_async`, and `tick_async`.
+
+Coordinator writes use snapshot revision compare-and-set. A stale writer returns
+`ShardingError::CoordinatorRevisionConflict`; incompatible persisted state
+returns `ShardingError::PersistedCoordinatorSnapshotMismatch`. Calling a sync
+sharding API with an async-only store returns
+`ShardingError::AsyncCoordinatorStoreRequiresAsyncApi`.
+
+See `docs/rakka-akka-parity-phase-4-durable-coordinator-rationale.md` for the
+architectural reasoning and Akka comparison.
+
 ## Current Boundary
 
 The facade now owns local, proxy-only, and networked entity registration.
 Serialization codecs still live in the `SerializationRegistry` supplied to
 `ClusterNodeRuntime`; missing codecs fail at send/decode time with typed remote
-delivery errors. Remaining Phase 4 work should focus on durable coordinator
-storage and persistence recovery examples over movement.
+delivery errors. Remaining Phase 4 work should focus on persistent coordinator
+backends, coordinator leadership/lease semantics, remembered entities, and
+persistence recovery examples over movement.

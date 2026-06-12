@@ -16,14 +16,16 @@ use rakka_remote::{
     RemoteRequestRegistry, SerializationRegistry,
 };
 use rakka_sharding::{
-    ClusterSharding, ClusterShardingError, ClusterShardingRuntime, Entity, EntityAskError,
-    EntityContext, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
-    EntityTypeKey, LeastShardAllocationStrategy, LocalEntityContext, LocalEntityRoute,
-    RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound,
-    RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
-    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardAllocationContext,
-    ShardAllocationStrategy, ShardBufferConfig, ShardCoordinator, ShardDecision, ShardHandoffState,
-    ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
+    AsyncShardCoordinatorStore, ClusterSharding, ClusterShardingError, ClusterShardingRuntime,
+    CoordinatorStoreFuture, Entity, EntityAskError, EntityContext, EntityDeliveryFailure, EntityId,
+    EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryShardCoordinatorStore,
+    LeastShardAllocationStrategy, LocalEntityContext, LocalEntityRoute,
+    PersistedShardCoordinatorState, RemoteEntityAskClient, RemoteEntityAskError,
+    RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound,
+    RemoteEntityRoute, RemoteEntitySendFailure, RemoteTransportEntityOutbound, RoutedEntityMessage,
+    ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinator,
+    ShardCoordinatorStore, ShardDecision, ShardHandoffState, ShardId, ShardMoveReason,
+    ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -240,6 +242,56 @@ impl ShardAllocationStrategy for LastRoutableAllocationStrategy {
         _shard_id: ShardId,
     ) -> Option<NodeId> {
         context.routable_nodes().last().cloned()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AsyncOnlyCoordinatorStore {
+    inner: InMemoryShardCoordinatorStore,
+}
+
+impl AsyncOnlyCoordinatorStore {
+    fn load_sync(&self, entity_type: &EntityType) -> Option<PersistedShardCoordinatorState> {
+        ShardCoordinatorStore::load(&self.inner, entity_type).unwrap()
+    }
+}
+
+impl AsyncShardCoordinatorStore for AsyncOnlyCoordinatorStore {
+    fn backend_name(&self) -> &'static str {
+        "async-only-test"
+    }
+
+    fn load<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+    ) -> CoordinatorStoreFuture<'a, Option<PersistedShardCoordinatorState>> {
+        Box::pin(async move { ShardCoordinatorStore::load(&self.inner, entity_type) })
+    }
+
+    fn compare_and_set<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+    ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState> {
+        Box::pin(async move {
+            ShardCoordinatorStore::compare_and_set(
+                &self.inner,
+                entity_type,
+                expected_revision,
+                state,
+            )
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+    ) -> CoordinatorStoreFuture<'a, ()> {
+        Box::pin(async move {
+            ShardCoordinatorStore::delete(&self.inner, entity_type, expected_revision)
+        })
     }
 }
 
@@ -485,7 +537,7 @@ fn cluster_sharding_facade_passes_allocation_strategy_to_runtime() {
         .unwrap();
     let state = sharding.registration_state(&key).unwrap();
     let runtime = sharding.runtime();
-    let runtime = runtime.lock().expect("cluster sharding runtime poisoned");
+    let runtime = runtime.try_lock().expect("cluster sharding runtime busy");
     let coordinator = runtime.coordinator(key.entity_type()).unwrap();
 
     assert!(state
@@ -500,6 +552,317 @@ fn cluster_sharding_facade_passes_allocation_strategy_to_runtime() {
         .assignments()
         .iter()
         .all(|assignment| assignment.owner() == remote.id()));
+    system.shutdown();
+}
+
+#[test]
+fn in_memory_coordinator_store_rejects_stale_revision() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("StoredCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config);
+    coordinator.reconcile(&membership);
+
+    let store = InMemoryShardCoordinatorStore::new();
+    let state = PersistedShardCoordinatorState::now(coordinator.snapshot(), "test");
+    ShardCoordinatorStore::compare_and_set(&store, &entity_type, 0, state.clone()).unwrap();
+
+    let error = ShardCoordinatorStore::compare_and_set(&store, &entity_type, 0, state).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ShardingError::CoordinatorRevisionConflict {
+            entity_type,
+            expected_revision: 0,
+            actual_revision: 1,
+        } if entity_type == EntityType::new("StoredCart")
+    ));
+}
+
+#[test]
+fn cluster_sharding_runtime_persists_coordinator_snapshot_on_registration() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("DurableRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = InMemoryShardCoordinatorStore::new();
+    let mut runtime = ClusterShardingRuntime::with_coordinator_store(membership, store.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region(region.clone()).unwrap();
+
+    let persisted = ShardCoordinatorStore::load(&store, &entity_type)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.coordinator_store_backend(), Some("in-memory"));
+    assert_eq!(persisted.snapshot().revision(), 1);
+    assert_eq!(persisted.snapshot().assignments().len(), 4);
+    assert_eq!(region.owner_revision(), persisted.snapshot().revision());
+}
+
+#[test]
+fn sync_runtime_rejects_async_only_coordinator_store() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("AsyncOnlySyncCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let mut runtime = ClusterShardingRuntime::with_async_coordinator_store(membership, store);
+
+    let error = runtime
+        .register_region(runtime_region(entity_type, config))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::AsyncCoordinatorStoreRequiresAsyncApi { backend }
+        } if backend == "async-only-test"
+    ));
+}
+
+#[tokio::test]
+async fn async_runtime_persists_coordinator_snapshot_on_registration() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("AsyncDurableRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let mut runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership, store.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region_async(region.clone()).await.unwrap();
+
+    let persisted = store.load_sync(&entity_type).unwrap();
+    assert_eq!(runtime.coordinator_store_backend(), Some("async-only-test"));
+    assert!(runtime.coordinator_store_requires_async_api());
+    assert_eq!(persisted.snapshot().revision(), 1);
+    assert_eq!(persisted.snapshot().assignments().len(), 4);
+    assert_eq!(region.owner_revision(), persisted.snapshot().revision());
+}
+
+#[tokio::test]
+async fn async_runtime_recovers_persisted_coordinator_snapshot() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local, remote]);
+    let entity_type = EntityType::new("AsyncRecoveredRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+
+    let mut first_runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership.clone(), store.clone());
+    first_runtime
+        .register_region_async(runtime_region(entity_type.clone(), config.clone()))
+        .await
+        .unwrap();
+    let first_state = store.load_sync(&entity_type).unwrap();
+
+    let mut recovered_runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership, store.clone());
+    let recovered_region = runtime_region(entity_type.clone(), config);
+    recovered_runtime
+        .register_region_async(recovered_region.clone())
+        .await
+        .unwrap();
+    let recovered = recovered_runtime.coordinator(&entity_type).unwrap();
+
+    assert_eq!(recovered.revision(), first_state.snapshot().revision());
+    assert_eq!(
+        recovered.snapshot().assignments(),
+        first_state.snapshot().assignments()
+    );
+    assert_eq!(
+        recovered_region.owner_revision(),
+        first_state.snapshot().revision()
+    );
+}
+
+#[tokio::test]
+async fn async_runtime_persists_rebalance_after_membership_update() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let remote_id = remote.id().clone();
+    let membership = membership_with_up_nodes(vec![local, remote]);
+    let entity_type = EntityType::new("AsyncRebalancedRuntimeCart");
+    let config = ShardingConfig::new(8).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let mut runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership, store.clone());
+
+    runtime
+        .register_region_async(runtime_region(entity_type.clone(), config))
+        .await
+        .unwrap();
+    let initial = store.load_sync(&entity_type).unwrap();
+
+    let update = runtime.mark_down_async(&remote_id, 3).await.unwrap();
+    let persisted = store.load_sync(&entity_type).unwrap();
+
+    assert!(!update.rebalances().is_empty());
+    assert_eq!(
+        initial.snapshot().revision() + 1,
+        persisted.snapshot().revision()
+    );
+    assert!(persisted
+        .snapshot()
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner() != &remote_id));
+}
+
+#[test]
+fn cluster_sharding_runtime_recovers_persisted_coordinator_snapshot() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local, remote]);
+    let entity_type = EntityType::new("RecoveredRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = InMemoryShardCoordinatorStore::new();
+
+    let mut first_runtime =
+        ClusterShardingRuntime::with_coordinator_store(membership.clone(), store.clone());
+    first_runtime
+        .register_region(runtime_region(entity_type.clone(), config.clone()))
+        .unwrap();
+    let first_state = ShardCoordinatorStore::load(&store, &entity_type)
+        .unwrap()
+        .unwrap();
+
+    let mut recovered_runtime =
+        ClusterShardingRuntime::with_coordinator_store(membership, store.clone());
+    let recovered_region = runtime_region(entity_type.clone(), config);
+    recovered_runtime
+        .register_region(recovered_region.clone())
+        .unwrap();
+    let recovered = recovered_runtime.coordinator(&entity_type).unwrap();
+
+    assert_eq!(recovered.revision(), first_state.snapshot().revision());
+    assert_eq!(
+        recovered.snapshot().assignments(),
+        first_state.snapshot().assignments()
+    );
+    assert_eq!(
+        recovered_region.owner_revision(),
+        first_state.snapshot().revision()
+    );
+}
+
+#[test]
+fn cluster_sharding_runtime_rejects_mismatched_persisted_coordinator_snapshot() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("MismatchedDurableCart");
+    let store = InMemoryShardCoordinatorStore::new();
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config);
+    coordinator.reconcile(&membership);
+    ShardCoordinatorStore::compare_and_set(
+        &store,
+        &entity_type,
+        0,
+        PersistedShardCoordinatorState::now(coordinator.snapshot(), "test"),
+    )
+    .unwrap();
+
+    let mut runtime = ClusterShardingRuntime::with_coordinator_store(membership, store);
+    let error = runtime
+        .register_region(runtime_region(
+            entity_type.clone(),
+            ShardingConfig::new(8).unwrap(),
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::PersistedCoordinatorSnapshotMismatch {
+                expected_entity_type,
+                actual_entity_type,
+                expected_shards: 8,
+                actual_shards: 4,
+            }
+        } if expected_entity_type == entity_type && actual_entity_type == entity_type
+    ));
+}
+
+#[test]
+fn cluster_sharding_facade_can_use_durable_coordinator_store() {
+    let system = ActorSystem::new("facade-durable-coordinator-test");
+    let store = InMemoryShardCoordinatorStore::new();
+    let sharding = ClusterSharding::get_with_coordinator_store(&system, store.clone());
+    let key = EntityTypeKey::<CartCommand>::new("FacadeDurableCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    sharding
+        .init(Entity::of(key.clone(), |context| FacadeCartEntity {
+            context,
+            items: Vec::new(),
+        }))
+        .unwrap();
+
+    let persisted = ShardCoordinatorStore::load(&store, key.entity_type())
+        .unwrap()
+        .unwrap();
+    let runtime = sharding.runtime();
+    let runtime = runtime.try_lock().expect("cluster sharding runtime busy");
+    assert_eq!(runtime.coordinator_store_backend(), Some("in-memory"));
+    assert_eq!(persisted.snapshot().entity_type(), key.entity_type());
+    assert_eq!(persisted.snapshot().number_of_shards(), 4);
+    system.shutdown();
+}
+
+#[test]
+fn sync_facade_rejects_async_only_coordinator_store() {
+    let system = ActorSystem::new("facade-sync-async-store-test");
+    let store = AsyncOnlyCoordinatorStore::default();
+    let sharding = ClusterSharding::get_with_async_coordinator_store(&system, store);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeSyncAsyncStoreCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    let error = sharding
+        .init(Entity::of(key, |context| FacadeCartEntity {
+            context,
+            items: Vec::new(),
+        }))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::AsyncCoordinatorStoreRequiresAsyncApi { backend }
+        } if backend == "async-only-test"
+    ));
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn async_facade_init_uses_async_only_coordinator_store() {
+    let system = ActorSystem::new("facade-async-coordinator-test");
+    let store = AsyncOnlyCoordinatorStore::default();
+    let sharding = ClusterSharding::get_with_async_coordinator_store(&system, store.clone());
+    let key = EntityTypeKey::<CartCommand>::new("FacadeAsyncDurableCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    sharding
+        .init_async(Entity::of(key.clone(), |context| FacadeCartEntity {
+            context,
+            items: Vec::new(),
+        }))
+        .await
+        .unwrap();
+
+    let persisted = store.load_sync(key.entity_type()).unwrap();
+    let runtime = sharding.runtime();
+    let runtime = runtime.try_lock().expect("cluster sharding runtime busy");
+    assert_eq!(runtime.coordinator_store_backend(), Some("async-only-test"));
+    assert_eq!(persisted.snapshot().entity_type(), key.entity_type());
+    assert_eq!(persisted.snapshot().number_of_shards(), 4);
     system.shutdown();
 }
 
