@@ -1,11 +1,13 @@
 //! Remote endpoint routing for inbound envelopes.
 
+use std::any::type_name;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 use rakka_cluster::NodeId;
+use rakka_core::Message;
 
 use crate::{ProtobufEnvelopeCodec, RemoteDestination, RemoteEnvelope, RemoteError};
 
@@ -30,6 +32,11 @@ pub enum RemoteEndpointError {
         /// Entity type carried by the remote envelope.
         entity_type: String,
     },
+    /// No handler is registered for the requested actor-ref message type.
+    UnregisteredActorRefHandler {
+        /// Rust message type carried by the actor-ref descriptor.
+        message_type: String,
+    },
     /// No handler is registered for remote replies.
     UnregisteredReplyHandler {
         /// Request id carried by the reply destination.
@@ -39,6 +46,11 @@ pub enum RemoteEndpointError {
     DuplicateEntityHandler {
         /// Entity type that already has a handler.
         entity_type: String,
+    },
+    /// An actor-ref handler is already registered for this message type.
+    DuplicateActorRefHandler {
+        /// Rust message type that already has a handler.
+        message_type: String,
     },
     /// A registered handler rejected the envelope.
     HandlerRejected {
@@ -62,6 +74,12 @@ impl Display for RemoteEndpointError {
             Self::UnregisteredEntityType { entity_type } => {
                 write!(f, "remote endpoint has no entity handler for {entity_type}")
             }
+            Self::UnregisteredActorRefHandler { message_type } => {
+                write!(
+                    f,
+                    "remote endpoint has no actor-ref handler for {message_type}"
+                )
+            }
             Self::UnregisteredReplyHandler { request_id } => {
                 write!(
                     f,
@@ -72,6 +90,12 @@ impl Display for RemoteEndpointError {
                 write!(
                     f,
                     "remote endpoint already has an entity handler for {entity_type}"
+                )
+            }
+            Self::DuplicateActorRefHandler { message_type } => {
+                write!(
+                    f,
+                    "remote endpoint already has an actor-ref handler for {message_type}"
                 )
             }
             Self::HandlerRejected {
@@ -144,6 +168,27 @@ impl RemoteEndpoint {
         Ok(())
     }
 
+    /// Registers a handler for concrete actor-ref envelopes with message type `M`.
+    pub fn register_actor_ref_handler<M>(
+        &self,
+        handler: impl RemoteEnvelopeHandler,
+    ) -> RemoteEndpointResult<()>
+    where
+        M: Message,
+    {
+        let message_type = type_name::<M>().to_string();
+        let mut handlers = self
+            .handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned");
+        if handlers.actor_refs.contains_key(&message_type) {
+            return Err(RemoteEndpointError::DuplicateActorRefHandler { message_type });
+        }
+
+        handlers.actor_refs.insert(message_type, Arc::new(handler));
+        Ok(())
+    }
+
     /// Registers the handler for reply envelopes.
     pub fn register_reply_handler(&self, handler: impl RemoteEnvelopeHandler) {
         self.handlers
@@ -164,6 +209,10 @@ impl RemoteEndpoint {
         match &envelope.destination {
             RemoteDestination::Entity { entity_type, .. } => {
                 let handler = self.entity_handler(entity_type)?;
+                handler.handle(envelope)
+            }
+            RemoteDestination::ActorRef { actor_ref } => {
+                let handler = self.actor_ref_handler(actor_ref.message_type())?;
                 handler.handle(envelope)
             }
             RemoteDestination::Reply { request_id } => {
@@ -188,6 +237,21 @@ impl RemoteEndpoint {
             .cloned()
             .ok_or_else(|| RemoteEndpointError::UnregisteredEntityType {
                 entity_type: entity_type.to_string(),
+            })
+    }
+
+    fn actor_ref_handler(
+        &self,
+        message_type: &str,
+    ) -> RemoteEndpointResult<Arc<dyn RemoteEnvelopeHandler>> {
+        self.handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .actor_refs
+            .get(message_type)
+            .cloned()
+            .ok_or_else(|| RemoteEndpointError::UnregisteredActorRefHandler {
+                message_type: message_type.to_string(),
             })
     }
 
@@ -220,9 +284,16 @@ impl Debug for RemoteEndpoint {
             .expect("remote endpoint handler mutex poisoned")
             .reply
             .is_some();
+        let actor_ref_handler_count = self
+            .handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .actor_refs
+            .len();
         f.debug_struct("RemoteEndpoint")
             .field("node_id", &self.node_id)
             .field("entity_handler_count", &entity_handler_count)
+            .field("actor_ref_handler_count", &actor_ref_handler_count)
             .field("has_reply_handler", &has_reply_handler)
             .finish_non_exhaustive()
     }
@@ -231,5 +302,6 @@ impl Debug for RemoteEndpoint {
 #[derive(Default)]
 struct RemoteEndpointHandlers {
     entities: BTreeMap<String, Arc<dyn RemoteEnvelopeHandler>>,
+    actor_refs: BTreeMap<String, Arc<dyn RemoteEnvelopeHandler>>,
     reply: Option<Arc<dyn RemoteEnvelopeHandler>>,
 }

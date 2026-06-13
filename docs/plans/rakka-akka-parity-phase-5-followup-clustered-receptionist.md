@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slice 5R-A implemented; Slice 5R-B pending
+Status: Slices 5R-A and 5R-B implemented; Slice 5R-C pending
 Date: 2026-06-13
 
 ## Purpose
@@ -81,6 +81,8 @@ cargo test -p rakka-remote --test remote_boundary
 
 Goal: deliver remote envelopes to local concrete actor refs safely.
 
+Status: implemented.
+
 Scope:
 
 - Add a typed inbound handler, for example `RemoteActorRefInbound<M>`.
@@ -97,6 +99,17 @@ Acceptance criteria:
 - A stale uid at the same path is rejected.
 - Wrong message type and missing codec fail closed before delivery.
 - Mailbox full and closed actor errors are observable.
+
+Implementation status:
+
+- Added `RemoteActorRefInbound<M>` as the typed inbound actor-ref handler.
+- Added `RemoteActorRefInboundError` for destination mismatch, node mismatch,
+  actor-ref resolution, decode, full mailbox, and closed mailbox failures.
+- Added `RemoteEndpoint::register_actor_ref_handler::<M>` and actor-ref
+  dispatch keyed by the Rust message type carried in `RemoteActorRef`.
+- Added remote boundary coverage for successful in-memory delivery, missing
+  handler, stale uid, wrong message type, missing codec, node mismatch, and
+  full mailbox failures.
 
 Review commands:
 

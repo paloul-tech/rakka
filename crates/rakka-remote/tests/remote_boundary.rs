@@ -2,18 +2,24 @@
 
 use prost::Message;
 use rakka_cluster::NodeId;
-use rakka_core::{ActorPath, ActorUid, SerializedActorRef};
+use rakka_core::{
+    actor_fn, actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorPath,
+    ActorUid, SerializedActorRef,
+};
 use rakka_remote::{
     EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef,
-    RemoteDestination, RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata,
-    RemoteError, RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
-    SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransportConfig,
-    DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    RemoteActorRefInbound, RemoteDestination, RemoteEndpoint, RemoteEndpointError, RemoteEnvelope,
+    RemoteEnvelopeMetadata, RemoteError, RemoteRequestError, RemoteRequestRegistry,
+    RemoteTransport, RemoteTransportError, SchemaCompatibilityPolicy, SerializationRegistry,
+    TcpRemoteTransportConfig, DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
     DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
     DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
     DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
+use std::any::type_name;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Clone, PartialEq, Message)]
 struct Ping {
@@ -439,6 +445,256 @@ fn endpoint_dispatches_entity_envelope_received_over_in_memory_transport() {
     );
 }
 
+#[tokio::test]
+async fn endpoint_dispatches_actor_ref_envelope_received_over_in_memory_transport() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-actor-ref-delivery");
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Ping>("rakka.test.Ping", 1)
+        .unwrap();
+    let (delivered, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let actor = system
+        .spawn(
+            "worker",
+            actor_fn(move |_ctx: &mut ActorContext<Ping>, msg: Ping| {
+                let _sent = delivered.send(msg.value);
+                Ok(ActorAction::Continue)
+            }),
+        )
+        .unwrap();
+    let actor_ref =
+        RemoteActorRef::from_serialized(node_id.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = RemoteEndpoint::new(node_id.clone());
+    endpoint
+        .register_actor_ref_handler::<Ping>(RemoteActorRefInbound::<Ping>::new(
+            node_id.clone(),
+            system.clone(),
+            registry.clone(),
+        ))
+        .unwrap();
+    let transport = InMemoryRemoteTransport::new();
+    transport.register_endpoint(endpoint).unwrap();
+    let envelope = RemoteEnvelope::new(
+        RemoteDestination::actor_ref(actor_ref),
+        registry
+            .encode(&Ping {
+                value: "hello actor".to_string(),
+            })
+            .unwrap(),
+    );
+
+    transport.send(&node_id, envelope).unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap(),
+        Some("hello actor".to_string())
+    );
+    system.terminate().await.unwrap();
+}
+
+#[test]
+fn endpoint_fails_closed_when_actor_ref_handler_is_missing() {
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-0", "uid-a"));
+    let error = endpoint
+        .receive_envelope(RemoteEnvelope::new(
+            RemoteDestination::actor_ref(test_remote_actor_ref()),
+            EncodedPayload::new(
+                RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+                Vec::new(),
+            ),
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::UnregisteredActorRefHandler { message_type }
+            if message_type == type_name::<Ping>()
+    ));
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_stale_uid_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-stale-uid");
+    let registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref = RemoteActorRef::new(
+        node_id.clone(),
+        actor.to_serialized_ref().system_name(),
+        actor.path().clone(),
+        ActorUid::new(actor.uid().value() + 1000),
+        type_name::<Ping>(),
+    )
+    .unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "stale"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("remote actor-ref resolve failed")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_wrong_message_type_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-wrong-type");
+    let registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref = RemoteActorRef::new(
+        node_id.clone(),
+        actor.to_serialized_ref().system_name(),
+        actor.path().clone(),
+        actor.uid(),
+        type_name::<Pong>(),
+    )
+    .unwrap();
+    let endpoint = RemoteEndpoint::new(node_id.clone());
+    endpoint
+        .register_actor_ref_handler::<Pong>(RemoteActorRefInbound::<Pong>::new(
+            node_id.clone(),
+            system.clone(),
+            registry.clone(),
+        ))
+        .unwrap();
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "wrong-type"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("remote actor-ref resolve failed")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_missing_codec_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-missing-codec");
+    let empty_registry = SerializationRegistry::new();
+    let encode_registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref =
+        RemoteActorRef::from_serialized(node_id.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &empty_registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(
+            actor_ref,
+            &encode_registry,
+            "missing-codec",
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("remote actor-ref decode failed")
+                && message.contains("unknown codec")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_node_mismatch_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let wrong_node = NodeId::new("rakka-1", "uid-b");
+    let system = rakka_core::ActorSystem::new("remote-node-mismatch");
+    let registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref =
+        RemoteActorRef::from_serialized(wrong_node.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "wrong-node"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("cannot be handled by local node")
+                && message.contains(&wrong_node.to_string())
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_reports_full_mailbox() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-mailbox-full");
+    let registry = ping_registry();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let entered_for_actor = entered.clone();
+    let release_for_actor = release.clone();
+    let actor = system
+        .spawn_actor_with_options(
+            "worker",
+            move || BlockingPingActor {
+                entered: entered_for_actor.clone(),
+                release: release_for_actor.clone(),
+            },
+            ActorOptions::default().with_mailbox_capacity(1),
+        )
+        .unwrap();
+    actor
+        .tell(Ping {
+            value: "block".to_string(),
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    actor
+        .tell(Ping {
+            value: "queued".to_string(),
+        })
+        .unwrap();
+    let actor_ref =
+        RemoteActorRef::from_serialized(node_id.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "full"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("mailbox was full")
+    ));
+    release.notify_waiters();
+    wait_for_mailbox_depth(&actor, 0).await;
+    system.terminate().await.unwrap();
+}
+
 #[test]
 fn in_memory_transport_reports_unknown_destination_node() {
     let transport = InMemoryRemoteTransport::new();
@@ -641,7 +897,113 @@ fn test_remote_actor_ref() -> RemoteActorRef {
         "orders",
         ActorPath::new("rakka://local/orders/user/worker"),
         ActorUid::new(42),
-        "rakka.test.Ping",
+        type_name::<Ping>(),
     )
     .expect("remote actor ref should be valid")
+}
+
+fn ping_registry() -> SerializationRegistry {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Ping>("rakka.test.Ping", 1)
+        .unwrap();
+    registry
+}
+
+fn actor_ref_endpoint(
+    node_id: &NodeId,
+    system: &rakka_core::ActorSystem,
+    registry: &SerializationRegistry,
+) -> RemoteEndpoint {
+    let endpoint = RemoteEndpoint::new(node_id.clone());
+    endpoint
+        .register_actor_ref_handler::<Ping>(RemoteActorRefInbound::<Ping>::new(
+            node_id.clone(),
+            system.clone(),
+            registry.clone(),
+        ))
+        .unwrap();
+    endpoint
+}
+
+fn ping_actor_ref_envelope(
+    actor_ref: RemoteActorRef,
+    registry: &SerializationRegistry,
+    value: &str,
+) -> RemoteEnvelope {
+    RemoteEnvelope::new(
+        RemoteDestination::actor_ref(actor_ref),
+        registry
+            .encode(&Ping {
+                value: value.to_string(),
+            })
+            .unwrap(),
+    )
+}
+
+fn spawn_recording_ping_actor(
+    system: &rakka_core::ActorSystem,
+    name: &str,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<String>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    rakka_core::ActorRef<Ping>,
+) {
+    let (delivered, received) = tokio::sync::mpsc::unbounded_channel();
+    let actor = system
+        .spawn(
+            name,
+            actor_fn({
+                let delivered = delivered.clone();
+                move |_ctx: &mut ActorContext<Ping>, msg: Ping| {
+                    let _sent = delivered.send(msg.value);
+                    Ok(ActorAction::Continue)
+                }
+            }),
+        )
+        .unwrap();
+    (delivered, received, actor)
+}
+
+struct BlockingPingActor {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Actor for BlockingPingActor {
+    type Msg = Ping;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        actor_future(async move {
+            if msg.value == "block" {
+                entered.notify_waiters();
+                release.notified().await;
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+async fn wait_for_mailbox_depth<M>(actor: &rakka_core::ActorRef<M>, expected: usize)
+where
+    M: rakka_core::Message,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if actor.mailbox_depth() == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mailbox depth stayed at {}, expected {expected}",
+            actor.mailbox_depth()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
