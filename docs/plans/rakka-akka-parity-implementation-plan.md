@@ -451,6 +451,14 @@ Validation:
   lifecycle cleanup, routee removal, pool fairness, group route refresh, and
   clustered service lookup.
 
+Implementation status on 2026-06-12:
+
+- Implemented Phase 5A cluster extension facade with `Cluster::get`,
+  configured local-node construction, `ClusterManager` commands for
+  `join_self`, `join`, `join_seed_nodes`, `leave`, and `down`,
+  replayable cluster subscriptions, `ClusterState`, `SelfMember`,
+  `ClusterUpdate`, and `ClusterEvent`.
+
 ## Phase 6: Streams Facade and Stream Testkit
 
 Objectives:

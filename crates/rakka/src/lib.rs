@@ -71,6 +71,13 @@ pub mod prelude {
         WatchHandle,
     };
 
+    #[cfg(feature = "cluster")]
+    pub use rakka_cluster::{
+        Cluster, ClusterEvent, ClusterManager, ClusterState, ClusterSubscription,
+        ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions, ClusterUpdate,
+        SelfMember,
+    };
+
     #[cfg(feature = "persistence")]
     pub use rakka_persistence::{
         current_durable_state_by_id, current_durable_state_ids, current_events_by_persistence_id,

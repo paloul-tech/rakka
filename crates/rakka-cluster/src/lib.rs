@@ -5,6 +5,7 @@
 
 pub mod discovery;
 pub mod error;
+pub mod facade;
 pub mod membership;
 pub mod node;
 
@@ -12,6 +13,11 @@ use rakka_core::Subsystem;
 
 pub use discovery::{DiscoveryProvider, DiscoverySnapshot, LocalDiscovery, StaticDiscovery};
 pub use error::{ClusterError, ClusterResult};
+pub use facade::{
+    Cluster, ClusterEvent, ClusterManager, ClusterState, ClusterSubscription,
+    ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions, ClusterUpdate,
+    SelfMember,
+};
 pub use membership::{
     ClusterMembership, ClusterMembershipOperationalSnapshot, MemberRecord, MembershipConfig,
     MembershipEvent, MembershipSnapshot, MembershipState, MembershipStateCount,
