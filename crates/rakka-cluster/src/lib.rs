@@ -14,9 +14,10 @@ use rakka_core::Subsystem;
 pub use discovery::{DiscoveryProvider, DiscoverySnapshot, LocalDiscovery, StaticDiscovery};
 pub use error::{ClusterError, ClusterResult};
 pub use facade::{
-    Cluster, ClusterEvent, ClusterManager, ClusterState, ClusterSubscription,
-    ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions, ClusterUpdate,
-    SelfMember,
+    Cluster, ClusterEvent, ClusterManager, ClusterRuntime, ClusterSettings, ClusterState,
+    ClusterSubscription, ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions,
+    ClusterUpdate, DowningStrategy, FailureDetector, NoDowningStrategy, SelfMember,
+    TimeoutDowningStrategy, TimeoutFailureDetector,
 };
 pub use membership::{
     ClusterMembership, ClusterMembershipOperationalSnapshot, MemberRecord, MembershipConfig,

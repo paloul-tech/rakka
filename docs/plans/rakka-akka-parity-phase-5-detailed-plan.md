@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: Draft for review
+Status: In progress; Slices 5A and 5B implemented
 Date: 2026-06-12
 
 ## Purpose
@@ -173,6 +173,8 @@ cargo doc -p rakka-cluster --no-deps
 Goal: make the cluster extension useful in running systems, not only direct
 unit tests.
 
+Status: implemented.
+
 Scope:
 
 - Add `ClusterSettings` covering:
@@ -204,10 +206,34 @@ Acceptance criteria:
 - `ClusterNodeRuntime` and `Cluster` facade state remain consistent after
   discovery updates.
 
+Implementation status:
+
+- Added `ClusterSettings` with local node, seed nodes, membership config,
+  discovery poll interval, failure tick interval, and convenience builders for
+  minimum contact points, failure timeout, and down-after-unreachable timeout.
+- Added `ClusterRuntime` as an explicit, deterministic facade runtime with
+  `join_seed_nodes`, `poll_discovery`, and `tick` operations.
+- Added `FailureDetector` and `DowningStrategy` hooks, with default timeout
+  implementations and a `NoDowningStrategy` for callers that disable automatic
+  downing.
+- Added `ClusterManager::apply_discovery` for direct snapshot application when
+  callers already own discovery scheduling.
+- Kept discovery provider integration in `rakka-cluster`, so
+  `rakka-k8s::KubernetesDnsDiscovery` can plug in through `DiscoveryProvider`
+  without a crate dependency cycle.
+- Kept discovery disappearance conservative: missing nodes are not immediately
+  removed by discovery polling; they become unreachable/down through the
+  configured failure detector and downing strategy.
+- Added `ClusterNodeRuntime::apply_cluster_state` and
+  `apply_cluster_state_async` bridge APIs so sharding/remoting runtimes can
+  mirror the high-level cluster facade state.
+- Exported the new runtime, settings, and policy hook types from
+  `rakka-cluster` and the top-level `rakka::prelude`.
+
 Tests:
 
 - Static discovery joins nodes deterministically.
-- Local discovery add/remove events update state and subscriptions.
+- Local discovery additions update state and subscriptions.
 - Unreachable/down transitions fire at configured times.
 - Custom downing strategy can prevent automatic downing.
 - Node runtime and cluster facade do not diverge after shared discovery updates.

@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use rakka_cluster::{
-    Cluster, ClusterError, ClusterEvent, ClusterNode, ClusterSubscriptionReplay, MembershipConfig,
-    MembershipState, NodeAddress, NodeId,
+    Cluster, ClusterError, ClusterEvent, ClusterNode, ClusterRuntime, ClusterSettings,
+    ClusterSubscriptionReplay, LocalDiscovery, MembershipConfig, MembershipState,
+    NoDowningStrategy, NodeAddress, NodeId, StaticDiscovery,
 };
 use rakka_core::ActorSystem;
 
@@ -205,6 +206,140 @@ fn invalid_transition_fails_closed() {
             ..
         }
     ));
+}
+
+#[test]
+fn runtime_static_discovery_forms_cluster() {
+    let node_a = node("rakka-0", "uid-a", 25520);
+    let node_b = node("rakka-1", "uid-b", 25521);
+    let settings = ClusterSettings::new(node_a.clone()).with_min_contact_points(2);
+    let runtime = ClusterRuntime::from_settings(settings);
+    let discovery = StaticDiscovery::new([node_a.clone(), node_b.clone()]);
+
+    let update = runtime
+        .poll_discovery(&discovery, 1)
+        .expect("static discovery should form cluster");
+
+    assert_eq!(update.state().members().len(), 2);
+    assert_eq!(
+        update.state().member(node_a.id()).expect("node a").state(),
+        MembershipState::Up
+    );
+    assert_eq!(
+        update.state().member(node_b.id()).expect("node b").state(),
+        MembershipState::Up
+    );
+    assert!(matches!(
+        update.events(),
+        [
+            ClusterEvent::MemberDiscovered { .. },
+            ClusterEvent::MemberUp { .. },
+            ClusterEvent::MemberUp { .. }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn runtime_local_discovery_changes_emit_cluster_events() {
+    let node_a = node("rakka-0", "uid-a", 25520);
+    let node_b = node("rakka-1", "uid-b", 25521);
+    let node_c = node("rakka-2", "uid-c", 25522);
+    let settings = ClusterSettings::new(node_a.clone()).with_min_contact_points(2);
+    let runtime = ClusterRuntime::from_settings(settings);
+    let discovery = LocalDiscovery::new();
+    discovery.register(node_a).expect("node a registers");
+    discovery
+        .register(node_b.clone())
+        .expect("node b registers");
+    runtime
+        .poll_discovery(&discovery, 1)
+        .expect("initial discovery should apply");
+
+    let mut subscription = runtime
+        .cluster()
+        .subscriptions()
+        .subscribe(ClusterSubscriptionReplay::LiveOnly);
+    discovery
+        .register(node_c.clone())
+        .expect("node c registers");
+    let update = runtime
+        .poll_discovery(&discovery, 2)
+        .expect("new local discovery should apply");
+
+    assert_eq!(
+        update.state().member(node_c.id()).expect("node c").state(),
+        MembershipState::Up
+    );
+    assert!(matches!(
+        subscription.recv().await.expect("discovered event"),
+        ClusterEvent::MemberDiscovered { .. }
+    ));
+    assert!(matches!(
+        subscription.recv().await.expect("up event"),
+        ClusterEvent::MemberUp { .. }
+    ));
+}
+
+#[test]
+fn runtime_tick_marks_unreachable_then_down_with_defaults() {
+    let node_a = node("rakka-0", "uid-a", 25520);
+    let node_b = node("rakka-1", "uid-b", 25521);
+    let settings = ClusterSettings::new(node_a.clone())
+        .with_min_contact_points(2)
+        .with_failure_timeout(Duration::from_millis(10))
+        .with_down_after_unreachable(Duration::from_millis(10));
+    let runtime = ClusterRuntime::from_settings(settings);
+    let discovery = StaticDiscovery::new([node_a, node_b.clone()]);
+    runtime
+        .poll_discovery(&discovery, 1)
+        .expect("discovery should form cluster");
+
+    let unreachable = runtime.tick(11).expect("failure tick should apply");
+    assert!(matches!(
+        unreachable.events(),
+        [ClusterEvent::MemberUnreachable { .. }]
+    ));
+    assert_eq!(
+        unreachable
+            .state()
+            .member(node_b.id())
+            .expect("node b")
+            .state(),
+        MembershipState::Unreachable
+    );
+
+    let down = runtime.tick(21).expect("downing tick should apply");
+    assert!(matches!(down.events(), [ClusterEvent::MemberDown { .. }]));
+    assert_eq!(
+        down.state().member(node_b.id()).expect("node b").state(),
+        MembershipState::Down
+    );
+}
+
+#[test]
+fn runtime_no_downing_strategy_keeps_unreachable_member() {
+    let node_a = node("rakka-0", "uid-a", 25520);
+    let node_b = node("rakka-1", "uid-b", 25521);
+    let settings = ClusterSettings::new(node_a.clone())
+        .with_min_contact_points(2)
+        .with_failure_timeout(Duration::from_millis(10))
+        .with_down_after_unreachable(Duration::from_millis(10));
+    let runtime = ClusterRuntime::from_settings(settings).with_downing_strategy(NoDowningStrategy);
+    let discovery = StaticDiscovery::new([node_a, node_b.clone()]);
+    runtime
+        .poll_discovery(&discovery, 1)
+        .expect("discovery should form cluster");
+
+    runtime
+        .tick(11)
+        .expect("failure tick should mark unreachable");
+    let update = runtime.tick(100).expect("downing tick should be disabled");
+
+    assert!(update.events().is_empty());
+    assert_eq!(
+        update.state().member(node_b.id()).expect("node b").state(),
+        MembershipState::Unreachable
+    );
 }
 
 fn node(logical_id: &str, incarnation: &str, port: u16) -> ClusterNode {

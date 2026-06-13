@@ -3,7 +3,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use rakka_cluster::{ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId};
+use rakka_cluster::{
+    ClusterNode, ClusterRuntime, ClusterSettings, DiscoverySnapshot, MembershipConfig,
+    MembershipState, NodeAddress, NodeId, StaticDiscovery,
+};
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
 };
@@ -741,6 +744,79 @@ async fn networked_runtime_records_unreachable_remote_delivery_failure() {
     .await;
 
     system_a.shutdown();
+}
+
+#[tokio::test]
+async fn networked_runtime_can_mirror_cluster_facade_state() {
+    let registry = cart_registry();
+    let Some(mut runtime) = build_runtime("rakka-0", "uid-a", registry).await else {
+        return;
+    };
+    let Some(remote_port) = unused_port() else {
+        return;
+    };
+    let remote = node("rakka-1", "uid-b", remote_port);
+    let cluster_runtime = ClusterRuntime::from_settings(
+        ClusterSettings::new(runtime.local_node().clone()).with_min_contact_points(2),
+    );
+    let discovery = StaticDiscovery::new([runtime.local_node().clone(), remote.clone()]);
+    cluster_runtime
+        .poll_discovery(&discovery, 1)
+        .expect("facade discovery should form cluster");
+
+    let state = cluster_runtime.cluster().state();
+    let updates = runtime
+        .apply_cluster_state(&state)
+        .expect("node runtime should mirror facade state");
+    assert!(!updates.is_empty());
+    assert_eq!(
+        runtime
+            .sharding()
+            .membership()
+            .member(remote.id())
+            .expect("remote member")
+            .state(),
+        MembershipState::Up
+    );
+    assert_eq!(runtime.registered_peer_count(), 1);
+
+    cluster_runtime
+        .cluster()
+        .manager()
+        .leave(remote.id())
+        .expect("remote should leave through facade");
+    let state = cluster_runtime.cluster().state();
+    runtime
+        .apply_cluster_state(&state)
+        .expect("leaving state should mirror");
+    assert_eq!(
+        runtime
+            .sharding()
+            .membership()
+            .member(remote.id())
+            .expect("remote member")
+            .state(),
+        MembershipState::Leaving
+    );
+
+    cluster_runtime
+        .cluster()
+        .manager()
+        .down(remote.id())
+        .expect("remote should down through facade");
+    let state = cluster_runtime.cluster().state();
+    runtime
+        .apply_cluster_state(&state)
+        .expect("down state should mirror");
+    assert_eq!(
+        runtime
+            .sharding()
+            .membership()
+            .member(remote.id())
+            .expect("remote member")
+            .state(),
+        MembershipState::Down
+    );
 }
 
 async fn build_runtime_pair(

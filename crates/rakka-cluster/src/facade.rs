@@ -5,13 +5,15 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rakka_core::ActorSystem;
 use tokio::sync::broadcast;
 
 use crate::{
-    ClusterMembership, ClusterNode, ClusterResult, DiscoverySnapshot, MemberRecord,
-    MembershipConfig, MembershipEvent, MembershipSnapshot, MembershipState, NodeAddress, NodeId,
+    ClusterMembership, ClusterNode, ClusterResult, DiscoveryProvider, DiscoverySnapshot,
+    MemberRecord, MembershipConfig, MembershipEvent, MembershipSnapshot, MembershipState,
+    NodeAddress, NodeId,
 };
 
 const CLUSTER_EVENT_CAPACITY: usize = 1024;
@@ -127,6 +129,14 @@ impl Cluster {
         mutate: impl FnOnce(&mut ClusterMembership, u64) -> ClusterResult<Vec<MembershipEvent>>,
     ) -> ClusterResult<ClusterUpdate> {
         let observed_at_millis = self.next_observed_at_millis();
+        self.update_at(observed_at_millis, mutate)
+    }
+
+    fn update_at(
+        &self,
+        observed_at_millis: u64,
+        mutate: impl FnOnce(&mut ClusterMembership, u64) -> ClusterResult<Vec<MembershipEvent>>,
+    ) -> ClusterResult<ClusterUpdate> {
         let (state, events) = {
             let mut data = self
                 .inner
@@ -210,6 +220,15 @@ impl ClusterManager {
         })
     }
 
+    /// Applies a discovery snapshot without automatically promoting members.
+    pub fn apply_discovery(&self, snapshot: DiscoverySnapshot) -> ClusterResult<ClusterUpdate> {
+        let observed_at_millis = snapshot.observed_at_millis();
+        self.cluster
+            .update_at(observed_at_millis, |membership, _observed_at_millis| {
+                membership.record_discovery(snapshot)
+            })
+    }
+
     /// Begins graceful leave for a member.
     pub fn leave(&self, node_id: &NodeId) -> ClusterResult<ClusterUpdate> {
         self.cluster.update(|membership, observed_at_millis| {
@@ -228,6 +247,319 @@ impl ClusterManager {
                 .into_iter()
                 .collect())
         })
+    }
+}
+
+/// Cluster extension runtime settings.
+#[derive(Debug, Clone)]
+pub struct ClusterSettings {
+    local_node: ClusterNode,
+    seed_nodes: Vec<ClusterNode>,
+    membership_config: MembershipConfig,
+    discovery_poll_interval: Duration,
+    failure_tick_interval: Duration,
+}
+
+impl ClusterSettings {
+    /// Creates settings for one local cluster node.
+    #[must_use]
+    pub fn new(local_node: ClusterNode) -> Self {
+        Self {
+            local_node,
+            seed_nodes: Vec::new(),
+            membership_config: MembershipConfig::default(),
+            discovery_poll_interval: Duration::from_secs(3),
+            failure_tick_interval: Duration::from_secs(1),
+        }
+    }
+
+    /// Local node descriptor.
+    #[must_use]
+    pub const fn local_node(&self) -> &ClusterNode {
+        &self.local_node
+    }
+
+    /// Seed nodes joined by [`ClusterRuntime::join_seed_nodes`].
+    #[must_use]
+    pub fn seed_nodes(&self) -> &[ClusterNode] {
+        &self.seed_nodes
+    }
+
+    /// Membership settings.
+    #[must_use]
+    pub const fn membership_config(&self) -> &MembershipConfig {
+        &self.membership_config
+    }
+
+    /// Discovery polling interval for application-driven runtime loops.
+    #[must_use]
+    pub const fn discovery_poll_interval(&self) -> Duration {
+        self.discovery_poll_interval
+    }
+
+    /// Failure-detection tick interval for application-driven runtime loops.
+    #[must_use]
+    pub const fn failure_tick_interval(&self) -> Duration {
+        self.failure_tick_interval
+    }
+
+    /// Sets seed nodes.
+    #[must_use]
+    pub fn with_seed_nodes(mut self, seed_nodes: impl IntoIterator<Item = ClusterNode>) -> Self {
+        self.seed_nodes = seed_nodes.into_iter().collect();
+        self
+    }
+
+    /// Sets membership configuration.
+    #[must_use]
+    pub fn with_membership_config(mut self, membership_config: MembershipConfig) -> Self {
+        self.membership_config = membership_config;
+        self
+    }
+
+    /// Sets the minimum discovered contact points required before joining
+    /// members are promoted to `Up`.
+    #[must_use]
+    pub fn with_min_contact_points(mut self, min_contact_points: usize) -> Self {
+        self.membership_config = MembershipConfig::new(
+            min_contact_points,
+            self.membership_config.failure_timeout(),
+            self.membership_config.down_after_unreachable(),
+        );
+        self
+    }
+
+    /// Sets the failure-detection timeout used by the default detector.
+    #[must_use]
+    pub fn with_failure_timeout(mut self, timeout: Duration) -> Self {
+        self.membership_config = MembershipConfig::new(
+            self.membership_config.min_contact_points(),
+            timeout,
+            self.membership_config.down_after_unreachable(),
+        );
+        self
+    }
+
+    /// Sets the down-after-unreachable timeout used by the default downing
+    /// strategy.
+    #[must_use]
+    pub fn with_down_after_unreachable(mut self, timeout: Duration) -> Self {
+        self.membership_config = MembershipConfig::new(
+            self.membership_config.min_contact_points(),
+            self.membership_config.failure_timeout(),
+            timeout,
+        );
+        self
+    }
+
+    /// Sets discovery polling interval metadata.
+    #[must_use]
+    pub const fn with_discovery_poll_interval(mut self, interval: Duration) -> Self {
+        self.discovery_poll_interval = interval;
+        self
+    }
+
+    /// Sets failure tick interval metadata.
+    #[must_use]
+    pub const fn with_failure_tick_interval(mut self, interval: Duration) -> Self {
+        self.failure_tick_interval = interval;
+        self
+    }
+
+    /// Creates a cluster facade from these settings.
+    #[must_use]
+    pub fn cluster(&self) -> Cluster {
+        Cluster::for_local_node(self.local_node.clone(), self.membership_config.clone())
+    }
+}
+
+/// Failure-detector hook used by [`ClusterRuntime`].
+pub trait FailureDetector: fmt::Debug + Send + Sync + 'static {
+    /// Returns members that should become unreachable at `now_millis`.
+    fn unreachable_members(&self, membership: &ClusterMembership, now_millis: u64) -> Vec<NodeId>;
+}
+
+/// Timeout-based failure detector using [`MembershipConfig::failure_timeout`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimeoutFailureDetector;
+
+impl FailureDetector for TimeoutFailureDetector {
+    fn unreachable_members(&self, membership: &ClusterMembership, now_millis: u64) -> Vec<NodeId> {
+        let failure_timeout_millis = duration_millis(membership.config().failure_timeout());
+        membership
+            .members()
+            .filter(|member| member.node().id() != membership.local_node_id())
+            .filter(|member| {
+                matches!(
+                    member.state(),
+                    MembershipState::Joining | MembershipState::Up
+                )
+            })
+            .filter(|member| {
+                now_millis.saturating_sub(member.last_seen_millis()) >= failure_timeout_millis
+            })
+            .map(|member| member.node().id().clone())
+            .collect()
+    }
+}
+
+/// Downing policy hook used by [`ClusterRuntime`].
+pub trait DowningStrategy: fmt::Debug + Send + Sync + 'static {
+    /// Returns unreachable members that should be downed at `now_millis`.
+    fn down_members(&self, membership: &ClusterMembership, now_millis: u64) -> Vec<NodeId>;
+}
+
+/// Conservative timeout downing strategy using
+/// [`MembershipConfig::down_after_unreachable`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimeoutDowningStrategy;
+
+impl DowningStrategy for TimeoutDowningStrategy {
+    fn down_members(&self, membership: &ClusterMembership, now_millis: u64) -> Vec<NodeId> {
+        let down_after_millis = duration_millis(membership.config().down_after_unreachable());
+        membership
+            .members()
+            .filter(|member| member.node().id() != membership.local_node_id())
+            .filter(|member| member.state() == MembershipState::Unreachable)
+            .filter(|member| {
+                now_millis.saturating_sub(member.last_seen_millis()) >= down_after_millis
+            })
+            .map(|member| member.node().id().clone())
+            .collect()
+    }
+}
+
+/// Downing strategy that never marks members down automatically.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDowningStrategy;
+
+impl DowningStrategy for NoDowningStrategy {
+    fn down_members(&self, _membership: &ClusterMembership, _now_millis: u64) -> Vec<NodeId> {
+        Vec::new()
+    }
+}
+
+/// Cluster facade runtime that applies discovery and failure policies.
+#[derive(Clone)]
+pub struct ClusterRuntime {
+    cluster: Cluster,
+    settings: ClusterSettings,
+    failure_detector: Arc<dyn FailureDetector>,
+    downing_strategy: Arc<dyn DowningStrategy>,
+}
+
+impl ClusterRuntime {
+    /// Creates a runtime from settings.
+    #[must_use]
+    pub fn from_settings(settings: ClusterSettings) -> Self {
+        let cluster = settings.cluster();
+        Self::new(cluster, settings)
+    }
+
+    /// Creates a runtime for an existing cluster facade.
+    #[must_use]
+    pub fn new(cluster: Cluster, settings: ClusterSettings) -> Self {
+        Self {
+            cluster,
+            settings,
+            failure_detector: Arc::new(TimeoutFailureDetector),
+            downing_strategy: Arc::new(TimeoutDowningStrategy),
+        }
+    }
+
+    /// Cluster facade driven by this runtime.
+    #[must_use]
+    pub const fn cluster(&self) -> &Cluster {
+        &self.cluster
+    }
+
+    /// Runtime settings.
+    #[must_use]
+    pub const fn settings(&self) -> &ClusterSettings {
+        &self.settings
+    }
+
+    /// Sets a failure detector.
+    #[must_use]
+    pub fn with_failure_detector(mut self, failure_detector: impl FailureDetector) -> Self {
+        self.failure_detector = Arc::new(failure_detector);
+        self
+    }
+
+    /// Sets a shared failure detector.
+    #[must_use]
+    pub fn with_failure_detector_ref(mut self, failure_detector: Arc<dyn FailureDetector>) -> Self {
+        self.failure_detector = failure_detector;
+        self
+    }
+
+    /// Sets a downing strategy.
+    #[must_use]
+    pub fn with_downing_strategy(mut self, downing_strategy: impl DowningStrategy) -> Self {
+        self.downing_strategy = Arc::new(downing_strategy);
+        self
+    }
+
+    /// Sets a shared downing strategy.
+    #[must_use]
+    pub fn with_downing_strategy_ref(mut self, downing_strategy: Arc<dyn DowningStrategy>) -> Self {
+        self.downing_strategy = downing_strategy;
+        self
+    }
+
+    /// Joins configured seed nodes.
+    pub fn join_seed_nodes(&self) -> ClusterResult<ClusterUpdate> {
+        self.cluster
+            .manager()
+            .join_seed_nodes(self.settings.seed_nodes.clone())
+    }
+
+    /// Polls a discovery provider once and promotes discovered joining members
+    /// when the membership has enough contact points.
+    pub fn poll_discovery(
+        &self,
+        provider: &(impl DiscoveryProvider + ?Sized),
+        observed_at_millis: u64,
+    ) -> ClusterResult<ClusterUpdate> {
+        let snapshot = provider.discover(observed_at_millis)?;
+        self.cluster
+            .update_at(observed_at_millis, |membership, observed_at_millis| {
+                let mut events = membership.record_discovery(snapshot)?;
+                events.extend(promote_joining_members(membership, observed_at_millis)?);
+                Ok(events)
+            })
+    }
+
+    /// Advances failure detection and downing policies once.
+    pub fn tick(&self, now_millis: u64) -> ClusterResult<ClusterUpdate> {
+        let failure_detector = self.failure_detector.clone();
+        let downing_strategy = self.downing_strategy.clone();
+        self.cluster
+            .update_at(now_millis, |membership, now_millis| {
+                let mut events = Vec::new();
+                for node_id in failure_detector.unreachable_members(membership, now_millis) {
+                    if let Some(event) = membership.mark_unreachable(&node_id, now_millis)? {
+                        events.push(event);
+                    }
+                }
+                for node_id in downing_strategy.down_members(membership, now_millis) {
+                    if let Some(event) = membership.mark_down(&node_id, now_millis)? {
+                        events.push(event);
+                    }
+                }
+                Ok(events)
+            })
+    }
+}
+
+impl fmt::Debug for ClusterRuntime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterRuntime")
+            .field("cluster", &self.cluster)
+            .field("settings", &self.settings)
+            .field("failure_detector", &self.failure_detector)
+            .field("downing_strategy", &self.downing_strategy)
+            .finish_non_exhaustive()
     }
 }
 
@@ -544,4 +876,30 @@ fn local_node_for_system(system: &ActorSystem) -> ClusterNode {
         NodeId::new(system.name(), "local"),
         NodeAddress::new("127.0.0.1", 0),
     )
+}
+
+fn promote_joining_members(
+    membership: &mut ClusterMembership,
+    observed_at_millis: u64,
+) -> ClusterResult<Vec<MembershipEvent>> {
+    if !membership.has_min_contact_points() {
+        return Ok(Vec::new());
+    }
+
+    let joining = membership
+        .members()
+        .filter(|member| member.state() == MembershipState::Joining)
+        .map(|member| member.node().id().clone())
+        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    for node_id in joining {
+        if let Some(event) = membership.mark_up(&node_id, observed_at_millis)? {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }

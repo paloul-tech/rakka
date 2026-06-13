@@ -458,6 +458,11 @@ Implementation status on 2026-06-12:
   `join_self`, `join`, `join_seed_nodes`, `leave`, and `down`,
   replayable cluster subscriptions, `ClusterState`, `SelfMember`,
   `ClusterUpdate`, and `ClusterEvent`.
+- Implemented Phase 5B cluster runtime hooks with `ClusterSettings`,
+  `ClusterRuntime`, explicit discovery polling, timeout failure detection,
+  timeout and no-op downing strategies, direct discovery snapshot application,
+  and `ClusterNodeRuntime` bridge APIs for mirroring high-level cluster state
+  into the sharding/remoting runtime.
 
 ## Phase 6: Streams Facade and Stream Testkit
 

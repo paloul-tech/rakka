@@ -7,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use rakka_cluster::{
-    ClusterMembership, ClusterNode, DiscoveryProvider, DiscoverySnapshot, MemberRecord,
-    MembershipConfig, MembershipState, NodeAddress, NodeId,
+    ClusterMembership, ClusterNode, ClusterState, DiscoveryProvider, DiscoverySnapshot,
+    MemberRecord, MembershipConfig, MembershipState, NodeAddress, NodeId,
 };
 use rakka_core::{Message, MetricsRecorder, NoopMetricsRecorder, ReplyTo};
 use rakka_remote::{
@@ -615,6 +615,88 @@ impl ClusterNodeRuntime {
             .discover(observed_at_millis)
             .map_err(ClusterShardingError::from)?;
         self.apply_discovery_async(snapshot).await
+    }
+
+    /// Mirrors a high-level cluster facade state into this node runtime.
+    ///
+    /// This bridge applies member descriptors through discovery, then applies
+    /// leaving and down states that affect shard ownership. It intentionally
+    /// keeps the cluster facade as the membership decision source for callers
+    /// that opt into both surfaces.
+    pub fn apply_cluster_state(
+        &mut self,
+        state: &ClusterState,
+    ) -> ClusterNodeRuntimeResult<Vec<ClusterNodeRuntimeUpdate>> {
+        let mut updates = Vec::new();
+        let snapshot = DiscoverySnapshot::new(
+            "cluster-facade",
+            state.revision(),
+            state
+                .members()
+                .iter()
+                .filter(|member| member.state() != MembershipState::Removed)
+                .map(|member| member.node().clone()),
+        );
+        updates.push(self.apply_discovery(snapshot)?);
+
+        for member in state.members() {
+            match member.state() {
+                MembershipState::Leaving => {
+                    updates.push(self.mark_leaving(member.node().id(), state.revision())?);
+                }
+                MembershipState::Down => {
+                    updates.push(self.mark_down(member.node().id(), state.revision())?);
+                }
+                MembershipState::Joining
+                | MembershipState::Up
+                | MembershipState::Unreachable
+                | MembershipState::Removed => {}
+            }
+        }
+
+        Ok(updates)
+    }
+
+    /// Mirrors a high-level cluster facade state through async durable sharding
+    /// APIs when configured.
+    pub async fn apply_cluster_state_async(
+        &mut self,
+        state: &ClusterState,
+    ) -> ClusterNodeRuntimeResult<Vec<ClusterNodeRuntimeUpdate>> {
+        let mut updates = Vec::new();
+        let snapshot = DiscoverySnapshot::new(
+            "cluster-facade",
+            state.revision(),
+            state
+                .members()
+                .iter()
+                .filter(|member| member.state() != MembershipState::Removed)
+                .map(|member| member.node().clone()),
+        );
+        updates.push(self.apply_discovery_async(snapshot).await?);
+
+        for member in state.members() {
+            match member.state() {
+                MembershipState::Leaving => {
+                    updates.push(
+                        self.mark_leaving_async(member.node().id(), state.revision())
+                            .await?,
+                    );
+                }
+                MembershipState::Down => {
+                    updates.push(
+                        self.mark_down_async(member.node().id(), state.revision())
+                            .await?,
+                    );
+                }
+                MembershipState::Joining
+                | MembershipState::Up
+                | MembershipState::Unreachable
+                | MembershipState::Removed => {}
+            }
+        }
+
+        Ok(updates)
     }
 
     /// Records a heartbeat and refreshes ownership if membership changed.

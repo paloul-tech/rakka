@@ -73,9 +73,10 @@ pub mod prelude {
 
     #[cfg(feature = "cluster")]
     pub use rakka_cluster::{
-        Cluster, ClusterEvent, ClusterManager, ClusterState, ClusterSubscription,
-        ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions, ClusterUpdate,
-        SelfMember,
+        Cluster, ClusterEvent, ClusterManager, ClusterRuntime, ClusterSettings, ClusterState,
+        ClusterSubscription, ClusterSubscriptionError, ClusterSubscriptionReplay,
+        ClusterSubscriptions, ClusterUpdate, DowningStrategy, FailureDetector, NoDowningStrategy,
+        SelfMember, TimeoutDowningStrategy, TimeoutFailureDetector,
     };
 
     #[cfg(feature = "persistence")]
