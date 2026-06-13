@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: draft for review
+Status: Slice 5R-A implemented; Slice 5R-B pending
 Date: 2026-06-13
 
 ## Purpose
@@ -38,6 +38,8 @@ That lets `Routers::group(ServiceKey<M>)` continue to route over normal typed
 
 Goal: make remote envelopes able to address one concrete actor incarnation.
 
+Status: implemented.
+
 Scope:
 
 - Add a transport-facing actor-reference destination or descriptor that carries:
@@ -57,6 +59,17 @@ Acceptance criteria:
 - Wire identity round-trips through `ProtobufEnvelopeCodec`.
 - Missing path, uid, system name, or message type fails closed.
 - Existing remote envelope tests continue to pass.
+
+Implementation status:
+
+- Added `RemoteActorRef` as the transport-serializable descriptor for a
+  concrete actor incarnation.
+- Added `RemoteDestination::ActorRef` while preserving the existing
+  path-only, entity, service, route-key, and reply destination variants.
+- Extended the Protobuf destination shape with actor node id, actor system
+  name, actor uid, and actor message type fields.
+- Added codec round-trip coverage and malformed private-proto tests for
+  missing actor-ref identity fields.
 
 Review commands:
 

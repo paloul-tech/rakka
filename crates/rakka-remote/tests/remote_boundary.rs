@@ -2,10 +2,11 @@
 
 use prost::Message;
 use rakka_cluster::NodeId;
+use rakka_core::{ActorPath, ActorUid, SerializedActorRef};
 use rakka_remote::{
-    EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteDestination,
-    RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
-    RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
+    EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef,
+    RemoteDestination, RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata,
+    RemoteError, RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
     SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransportConfig,
     DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
     DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
@@ -128,6 +129,7 @@ fn all_destination_variants_round_trip_through_envelope_codec() {
         RemoteDestination::ActorPath {
             path: "/user/worker".to_string(),
         },
+        RemoteDestination::actor_ref(test_remote_actor_ref()),
         RemoteDestination::Entity {
             entity_type: "cart".to_string(),
             entity_id: "cart-42".to_string(),
@@ -157,6 +159,32 @@ fn all_destination_variants_round_trip_through_envelope_codec() {
 
         assert_eq!(decoded, envelope);
     }
+}
+
+#[test]
+fn remote_actor_ref_destination_round_trips_serialized_identity() {
+    let serialized = SerializedActorRef::new(
+        "orders",
+        ActorPath::new("rakka://local/orders/user/worker"),
+        ActorUid::new(42),
+        "rakka.test.Ping",
+    );
+    let actor_ref =
+        RemoteActorRef::from_serialized(NodeId::new("rakka-0", "uid-a"), &serialized).unwrap();
+    let envelope = RemoteEnvelope::new(
+        RemoteDestination::actor_ref(actor_ref.clone()),
+        EncodedPayload::new(
+            RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+            vec![1, 2, 3],
+        ),
+    );
+
+    let wire = ProtobufEnvelopeCodec::encode(&envelope).unwrap();
+    let decoded = ProtobufEnvelopeCodec::decode(&wire).unwrap();
+
+    assert_eq!(decoded, envelope);
+    assert_eq!(actor_ref.node_id(), &NodeId::new("rakka-0", "uid-a"));
+    assert_eq!(actor_ref.to_serialized_ref(), serialized);
 }
 
 #[test]
@@ -605,4 +633,15 @@ fn endpoint_fails_closed_when_reply_handler_is_missing() {
         RemoteEndpointError::UnregisteredReplyHandler { request_id }
             if request_id == "request-1"
     ));
+}
+
+fn test_remote_actor_ref() -> RemoteActorRef {
+    RemoteActorRef::new(
+        NodeId::new("rakka-0", "uid-a"),
+        "orders",
+        ActorPath::new("rakka://local/orders/user/worker"),
+        ActorUid::new(42),
+        "rakka.test.Ping",
+    )
+    .expect("remote actor ref should be valid")
 }

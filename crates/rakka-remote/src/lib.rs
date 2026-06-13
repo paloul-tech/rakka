@@ -18,7 +18,7 @@ pub use endpoint::{
     RemoteEndpoint, RemoteEndpointError, RemoteEndpointResult, RemoteEnvelopeHandler,
 };
 pub use envelope::{
-    EncodedPayload, ProtobufEnvelopeCodec, RemoteDestination, RemoteEnvelope,
+    EncodedPayload, ProtobufEnvelopeCodec, RemoteActorRef, RemoteDestination, RemoteEnvelope,
     RemoteEnvelopeMetadata,
 };
 pub use error::{RemoteError, RemoteResult};
