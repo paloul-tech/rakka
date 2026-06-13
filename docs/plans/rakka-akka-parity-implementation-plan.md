@@ -502,6 +502,9 @@ Phase 5 follow-ups:
   routees have a transport-serializable reference model rather than
   deterministic in-process `ActorRef<M>` propagation.
 
+Detailed follow-up plan:
+`docs/plans/rakka-akka-parity-phase-5-followup-clustered-receptionist.md`.
+
 Recommended breakdown for TCP clustered receptionist propagation:
 
 - Ownership boundary:
