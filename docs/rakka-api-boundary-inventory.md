@@ -61,6 +61,9 @@ Component crates continue to own implementation-specific concepts:
   common actor errors.
 - Core runtime support: `RakkaError`, `RakkaResult`, supervision, termination,
   timers, and metrics recorder traits.
+- Local service discovery: `Receptionist`, `ServiceKey`, `Listing`,
+  receptionist subscriptions, registration handles, and typed receptionist
+  errors.
 - Persistence basics when the `persistence` feature is enabled:
   `DurableActor`, `DurableActorContext`, `DurableEffect`, durable actor spawn
   helpers, durable state traits, `PersistenceId`, and `Revision`.

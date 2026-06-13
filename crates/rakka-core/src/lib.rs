@@ -12,6 +12,7 @@ pub mod error;
 pub mod metrics;
 pub mod operational;
 pub mod path;
+pub mod receptionist;
 pub mod supervision;
 pub mod system;
 pub mod telemetry;
@@ -43,6 +44,10 @@ pub use operational::{
     DEFAULT_REMOTE_OUTBOUND_QUEUE_CAPACITY, DEFAULT_STREAM_DRAIN_TIMEOUT,
 };
 pub use path::{validate_actor_path_segment, ActorPath, ActorUid};
+pub use receptionist::{
+    Listing, Receptionist, ReceptionistError, ReceptionistRegistration, ReceptionistResult,
+    ReceptionistSubscription, ServiceKey,
+};
 pub use supervision::{
     ActorOptions, ActorProps, DispatcherHint, SpawnOptions, SupervisionStrategy,
 };

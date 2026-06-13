@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: In progress; Slices 5A and 5B implemented
+Status: In progress; Slices 5A, 5B, and 5C implemented
 Date: 2026-06-12
 
 ## Purpose
@@ -251,15 +251,17 @@ cargo clippy -p rakka-cluster -p rakka-sharding --all-targets -- -D warnings
 
 Goal: implement Akka-style typed service discovery for local actor refs.
 
+Status: implemented.
+
 Proposed API:
 
 ```rust
 let receptionist = Receptionist::get(&system);
 let key = ServiceKey::<WorkerCommand>::new("workers");
 
-let registration = receptionist.register(&key, worker_ref.clone()).await?;
-let listing = receptionist.find(&key).await?;
-let subscription = receptionist.subscribe(&key).await?;
+let registration = receptionist.register(&key, worker_ref.clone())?;
+let listing = receptionist.find(&key)?;
+let subscription = receptionist.subscribe(&key)?;
 ```
 
 Scope:
@@ -285,6 +287,25 @@ Acceptance criteria:
 - Actor termination removes routees without manual cleanup.
 - Subscribers receive initial listing and subsequent changes.
 - Duplicate registration is idempotent.
+
+Implementation status:
+
+- Added `ServiceKey<M>`, `Receptionist`, `Listing<M>`,
+  `ReceptionistRegistration<M>`, `ReceptionistSubscription<M>`,
+  `ReceptionistError`, and `ReceptionistResult` in `rakka-core`.
+- Added `Receptionist::get(&ActorSystem)` backed by a per-system local
+  registry.
+- Added synchronous local `register`, `deregister`, `find`, and `subscribe`
+  operations; local calls remain deterministic and do not need async scheduling.
+- Added registration leases that deregister on drop and can be explicitly
+  released with `ReceptionistRegistration::deregister`.
+- Added duplicate-registration lease counting so repeated registration of the
+  same actor/key produces one listing entry until all leases are released.
+- Added actor-termination cleanup through DeathWatch-backed registration tasks,
+  with subscriber notification after cleanup.
+- Added typed service-id protection: once a service id is associated with a
+  message protocol, using that id through another `ServiceKey<M>` fails closed.
+- Added `rakka::prelude` exports for the stable local receptionist facade.
 
 Tests:
 

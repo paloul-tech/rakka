@@ -463,6 +463,11 @@ Implementation status on 2026-06-12:
   timeout and no-op downing strategies, direct discovery snapshot application,
   and `ClusterNodeRuntime` bridge APIs for mirroring high-level cluster state
   into the sharding/remoting runtime.
+- Implemented Phase 5C local receptionist with `ServiceKey<M>`,
+  `Receptionist::get`, typed local `register`, `deregister`, `find`, and
+  `subscribe`, `Listing<M>`, drop-safe registration leases, actor termination
+  cleanup, subscription updates, duplicate-registration idempotence, and
+  service-key type mismatch protection.
 
 ## Phase 6: Streams Facade and Stream Testkit
 

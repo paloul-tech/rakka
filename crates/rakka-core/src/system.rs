@@ -19,6 +19,7 @@ use crate::metrics::{
     MetricsRecorder, NoopMetricsRecorder, METRIC_ACTOR_COUNT, METRIC_ACTOR_MAILBOX_DEPTH,
 };
 use crate::path::{validate_actor_path_segment, ActorPath, ActorUid};
+use crate::receptionist::ReceptionistRegistry;
 use crate::supervision::ActorOptions;
 use crate::Message;
 use crate::{RakkaError, RakkaResult};
@@ -40,6 +41,7 @@ pub(crate) struct ActorSystemInner {
     serialization_registry: Option<ActorSystemSerializationRegistry>,
     runtime_settings: ActorSystemRuntimeSettings,
     shutdown_config: ActorSystemShutdownConfig,
+    receptionist: Arc<ReceptionistRegistry>,
     actors: Mutex<Vec<ActorStopHandle>>,
     live_actors: Mutex<HashMap<ActorPath, Arc<ActorCell>>>,
     terminating: std::sync::atomic::AtomicBool,
@@ -347,6 +349,7 @@ impl ActorSystem {
                 serialization_registry: builder.serialization_registry,
                 runtime_settings: builder.runtime_settings,
                 shutdown_config: builder.shutdown_config,
+                receptionist: Arc::new(ReceptionistRegistry::new()),
                 actors: Mutex::new(Vec::new()),
                 live_actors: Mutex::new(HashMap::new()),
                 terminating: std::sync::atomic::AtomicBool::new(false),
@@ -396,6 +399,10 @@ impl ActorSystem {
     #[must_use]
     pub fn actor_ref_resolver(&self) -> ActorRefResolver {
         ActorRefResolver::new(self.clone())
+    }
+
+    pub(crate) fn receptionist_registry(&self) -> Arc<ReceptionistRegistry> {
+        self.inner.receptionist.clone()
     }
 
     /// Returns a serializable actor-system snapshot.
