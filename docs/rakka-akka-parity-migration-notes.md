@@ -1,7 +1,7 @@
 # Rakka Akka Parity Migration Notes
 
-Status: Phase 1 draft
-Date: 2026-06-11
+Status: updated through Phase 5
+Date: 2026-06-13
 
 ## Phase 0
 
@@ -204,3 +204,53 @@ RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
 
 See `docs/rakka-akka-parity-phase-4d6-recovery-after-movement.md` for the
 boundary between shard coordinator recovery and entity persistence recovery.
+
+## Phase 5
+
+Phase 5 adds the Akka-style cluster extension, typed receptionist, and local
+router facades. New service-discovery code should prefer `ServiceKey<M>`,
+`Receptionist::get(&system)`, and `Routers::group(key)` over hand-maintained
+actor-ref sets.
+
+Before:
+
+```rust
+let workers = vec![worker_a, worker_b];
+workers[index % workers.len()].tell(command)?;
+```
+
+After:
+
+```rust
+let key = ServiceKey::<WorkerCommand>::new("workers");
+let receptionist = Receptionist::get(&system);
+let _registration = receptionist.register(&key, worker)?;
+let router = Routers::group(key).with_round_robin().spawn(&system, "workers")?;
+router.tell(command)?;
+```
+
+Use `Routers::pool("worker", size, factory)` when the router should own local
+routee actors. Use `with_consistent_hash(|message| key)` for stateless
+key-sticky work. Use `ClusterSharding` instead when the key is durable entity
+identity or when ownership movement, passivation, remembered entities, and
+recovery are correctness requirements.
+
+Cluster membership now has a compact facade:
+
+```rust
+let cluster = Cluster::get(&system);
+cluster.manager().join_self()?;
+let mut events = cluster
+    .subscriptions()
+    .subscribe(ClusterSubscriptionReplay::InitialState);
+```
+
+Tests should prefer the Phase 5 `rakka-testkit` helpers:
+`expect_receptionist_listing_count`, `assert_receptionist_listing_contains`,
+`assert_pool_routee_count`, `assert_group_routee_count`,
+`expect_cluster_member_up`, and `assert_cluster_event_node`.
+
+Clustered receptionist propagation is deterministic and in-process today:
+`ClusteredReceptionist::propagate_to` proves the listing model and group-router
+integration, while TCP propagation remains a follow-up until remote service refs
+have a transport-serializable representation.

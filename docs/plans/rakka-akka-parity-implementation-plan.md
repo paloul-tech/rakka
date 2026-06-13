@@ -451,7 +451,7 @@ Validation:
   lifecycle cleanup, routee removal, pool fairness, group route refresh, and
   clustered service lookup.
 
-Implementation status on 2026-06-12:
+Implementation status on 2026-06-13:
 
 - Implemented Phase 5A cluster extension facade with `Cluster::get`,
   configured local-node construction, `ClusterManager` commands for
@@ -490,6 +490,83 @@ Implementation status on 2026-06-12:
   virtual nodes, routee-incarnation-aware ring points, stable same-key routing,
   routee-removal remapping, group refresh after receptionist changes, and
   fail-closed validation for missing mappers or zero virtual nodes.
+- Implemented Phase 5H docs, examples, and testkit support with the Phase 5
+  guide, README and migration-note updates, local receptionist/group router,
+  pool router, and deterministic clustered receptionist examples, plus reusable
+  testkit helpers for receptionist listings, router routee counts, and cluster
+  subscription assertions.
+
+Phase 5 follow-ups:
+
+- TCP clustered receptionist propagation remains pending until remote service
+  routees have a transport-serializable reference model rather than
+  deterministic in-process `ActorRef<M>` propagation.
+
+Recommended breakdown for TCP clustered receptionist propagation:
+
+- Ownership boundary:
+  - Implement transport integration in `rakka-remote`, not `rakka-cluster`.
+    `rakka-cluster` should remain transport-agnostic, while `rakka-remote`
+    already owns envelopes, TCP transport, endpoints, and serialization.
+  - Keep the public user path unchanged: applications should continue using
+    `Receptionist`, `ServiceKey<M>`, and `Routers::group(ServiceKey<M>)`.
+  - Preserve the deterministic in-process `ClusteredReceptionist` APIs as the
+    pure model and test scaffold.
+- Remote service-reference model:
+  - Do not serialize `ActorRef<M>` directly.
+  - Publish routee descriptors containing source `NodeId`, service id,
+    serialized actor identity, actor path, actor uid, message type, listing
+    version, and observation timestamp.
+  - Use concrete actor incarnation identity rather than service-key-only
+    routing so stale reincarnations and wrong message types fail closed.
+- Remote envelope and endpoint support:
+  - Extend `RemoteDestination` and Protobuf envelope fields as needed to carry
+    actor-ref identity with uid and message type, not just an actor path.
+  - Add `RemoteEndpoint` dispatch for concrete actor-ref destinations.
+  - Add a typed inbound handler that decodes with `SerializationRegistry`,
+    resolves the `SerializedActorRef` against the local `ActorSystem`, and
+    tells the decoded message to the local actor.
+  - Fail closed for stale uid, wrong message type, missing codec, full mailbox,
+    closed actor, or unknown destination node.
+- Wire-listing propagation:
+  - Add `RemoteReceptionistListing` and `RemoteServiceRoutee` wire types in
+    `rakka-remote`.
+  - Convert local-only `Listing<M>` snapshots into wire descriptors using
+    `ActorRefResolver`.
+  - Send listing updates to `Up` peers using the configured remote transport
+    and `ClusteredReceptionistSettings::publish_interval`.
+  - Preserve source-revision stale update rejection, same-version TTL refresh,
+    listing-size limits, source-node pruning, and remote listing expiry.
+- Proxy materialization on receiving nodes:
+  - Materialize one local typed proxy actor per remote routee descriptor.
+  - The proxy actor should accept `M`, encode it with `SerializationRegistry`,
+    and send a remote envelope to the source node.
+  - Register materialized proxies into the existing local receptionist using
+    the current remote-listing installation path so group routers keep working
+    unchanged.
+  - Maintain a proxy registry keyed by source node, service id, actor path, uid,
+    and message type so proxies are reused across equal-version TTL refreshes
+    and stopped when listings expire or nodes leave/down.
+- Runtime integration:
+  - Add a runtime helper such as `RemoteClusteredReceptionist` that wires
+    `ActorSystem`, `Cluster`, `RemoteEndpoint`, `RemoteTransport`, and
+    `SerializationRegistry`.
+  - Expose explicit `publish_once`, `apply_wire_listing`, and optional
+    interval-driven task helpers before adding any hidden background loop.
+  - Bridge this helper into `ClusterRuntime` or `ClusterNodeRuntime` only after
+    the explicit helper is covered by tests.
+- Validation:
+  - In-memory remote transport propagates a listing and routes through a group
+    router on the receiving node.
+  - TCP loopback propagation routes from node B to a service actor on node A.
+  - Routee deregistration, actor termination, TTL expiry, and node down remove
+    materialized proxy routees.
+  - Reincarnating an actor at the same path with a new uid rejects stale remote
+    descriptors.
+  - Missing codec, wrong message type, full mailbox, closed mailbox, and
+    unknown node errors are surfaced without losing the original message where
+    the public API can preserve it.
+  - Existing deterministic `ClusteredReceptionist` tests continue to pass.
 
 ## Phase 6: Streams Facade and Stream Testkit
 

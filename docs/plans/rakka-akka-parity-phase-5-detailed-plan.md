@@ -1,7 +1,7 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: In progress; Slices 5A through 5G implemented, with 5F TCP propagation follow-up pending
-Date: 2026-06-12
+Status: implemented through Slice 5H, with 5F TCP propagation follow-up pending
+Date: 2026-06-13
 
 ## Purpose
 
@@ -616,6 +616,8 @@ cargo clippy -p rakka-core -p rakka-testkit --all-targets -- -D warnings
 
 Goal: make Phase 5 behavior reviewable by humans and reusable in tests.
 
+Status: implemented.
+
 Scope:
 
 - Add `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md`.
@@ -637,6 +639,26 @@ Acceptance criteria:
 - Docs explain when to choose receptionist, router, or sharding.
 - Testkit helpers remove repeated subscription/listing boilerplate.
 - Phase 5 completion status is clear.
+
+Implementation status:
+
+- Added `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md`
+  covering the cluster extension, local receptionist, pool routers, group
+  routers, clustered receptionist propagation, testkit helpers, examples, and
+  when to choose receptionist, router, or sharding.
+- Updated `README.md` with Phase 5 documentation links, validation commands,
+  and runnable example sections.
+- Updated `docs/rakka-akka-parity-migration-notes.md` with Phase 5 migration
+  guidance from hand-maintained actor-ref sets to receptionist and router
+  facades.
+- Added runnable example packages:
+  `rakka-example-local-receptionist-router`, `rakka-example-pool-router`, and
+  `rakka-example-clustered-receptionist`.
+- Added `rakka-testkit` helpers for receptionist listing assertions, router
+  routee-count assertions, and cluster subscription/event assertions.
+- Added `rakka-testkit` integration coverage that exercises the new Phase 5
+  helpers against the real cluster, receptionist, pool-router, and group-router
+  facades.
 
 Review commands:
 
@@ -663,7 +685,7 @@ cargo doc --workspace --all-features --no-deps
 | Group routers | listing refresh, no-routee policy, deregistration cleanup |
 | Clustered receptionist | propagation, stale listing expiry, down-node filtering |
 | Consistent hash | stable key routing, routee change remapping |
-| Docs/API | examples compile, rustdoc builds, migration notes updated |
+| Docs/API | examples compile, testkit helpers cover Phase 5, rustdoc builds, migration notes updated |
 
 ## Validation Gate
 

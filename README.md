@@ -20,6 +20,7 @@ See `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklis
 See `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/test-support API boundary.
 See `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
 See `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
+See `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
 Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
@@ -56,6 +57,9 @@ cargo test -p rakka-example-generated-contracts --test generated_contracts -- --
 cargo test -p rakka-core --test observability_exporters
 cargo test -p rakka-core --test security_operational_defaults
 cargo test -p rakka-http --test observability_routes
+cargo run -p rakka-example-local-receptionist-router
+cargo run -p rakka-example-pool-router
+cargo run -p rakka-example-clustered-receptionist
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
@@ -162,6 +166,48 @@ The same example can use PostgreSQL for both the shard coordinator snapshot and 
 ```sh
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
   cargo run -p rakka-example-sharded-cart-persistence -- --postgres
+```
+
+### Local Receptionist And Group Router
+
+This example registers two typed service actors with the local receptionist and routes work through a receptionist-backed group router.
+
+```sh
+cargo run -p rakka-example-local-receptionist-router
+```
+
+Expected output:
+
+```text
+Rakka local receptionist group router delivered [worker-a:1, worker-b:2] across 2 routees.
+```
+
+### Pool Router
+
+This example spawns a local worker pool and routes six jobs in deterministic round-robin order.
+
+```sh
+cargo run -p rakka-example-pool-router
+```
+
+Expected output:
+
+```text
+Rakka pool router sent 6 jobs through 3 routees: [(0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2)].
+```
+
+### Clustered Receptionist
+
+This example creates two logical cluster nodes in one process, propagates a local receptionist listing from node A to node B, and routes from node B through the propagated listing.
+
+```sh
+cargo run -p rakka-example-clustered-receptionist
+```
+
+Expected output:
+
+```text
+Rakka clustered receptionist propagated true and routed rakka-0:7 through 1 remote routee.
 ```
 
 ### Durable Workflow

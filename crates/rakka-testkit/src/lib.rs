@@ -13,9 +13,11 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{Request, StatusCode};
 use futures_util::StreamExt;
+use rakka_cluster::{ClusterEvent, ClusterSubscription, ClusterSubscriptionError, NodeId};
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, ActorTerminated,
-    AskError, Message, RakkaError, RakkaResult, ReplyTo, Subsystem,
+    AskError, GroupRouter, GroupRouterSnapshot, Listing, Message, PoolRouter, RakkaError,
+    RakkaResult, ReceptionistSubscription, ReplyTo, Subsystem,
 };
 use rakka_core::{MetricKind, MetricObservation, MetricsSnapshot};
 use rakka_grpc::{GrpcResponseStream, GrpcResult};
@@ -515,6 +517,168 @@ pub fn assert_stream_lifecycle<T>(source: &StreamSource<T>, expected: StreamLife
     assert_eq!(source.status().lifecycle(), expected);
 }
 
+/// Asserts that a receptionist listing has the expected routee count.
+pub fn assert_receptionist_listing_count<M>(listing: &Listing<M>, expected: usize)
+where
+    M: Message,
+{
+    assert_eq!(
+        listing.len(),
+        expected,
+        "unexpected receptionist listing size for service {:?}",
+        listing.key()
+    );
+}
+
+/// Asserts that a receptionist listing contains a specific actor incarnation.
+pub fn assert_receptionist_listing_contains<M>(listing: &Listing<M>, actor_ref: &ActorRef<M>)
+where
+    M: Message,
+{
+    assert!(
+        listing.contains(actor_ref),
+        "expected receptionist listing for service {:?} to contain {}#{}",
+        listing.key(),
+        actor_ref.path(),
+        actor_ref.uid()
+    );
+}
+
+/// Waits for a receptionist subscription update with the expected routee count.
+pub async fn expect_receptionist_listing_count<M>(
+    subscription: &mut ReceptionistSubscription<M>,
+    expected: usize,
+    timeout: Duration,
+) -> RakkaResult<Listing<M>>
+where
+    M: Message,
+{
+    let listing = tokio::time::timeout(timeout, subscription.recv())
+        .await
+        .map_err(|_elapsed| {
+            RakkaError::new(
+                Subsystem::Testkit,
+                "receptionist-listing-timeout",
+                format!("timed out waiting for receptionist listing with {expected} routees"),
+            )
+        })?
+        .map_err(RakkaError::from)?;
+    assert_receptionist_listing_count(&listing, expected);
+    Ok(listing)
+}
+
+/// Asserts that a local pool router has the expected live routee count.
+pub fn assert_pool_routee_count<M>(router: &PoolRouter<M>, expected: usize)
+where
+    M: Message,
+{
+    assert_eq!(
+        router.routee_count(),
+        expected,
+        "unexpected pool router routee count for {:?}",
+        router
+    );
+}
+
+/// Asserts that a receptionist-backed group router has the expected live routee count.
+pub fn assert_group_routee_count<M>(router: &GroupRouter<M>, expected: usize)
+where
+    M: Message,
+{
+    assert_eq!(
+        router.routee_count(),
+        expected,
+        "unexpected group router routee count for {:?}",
+        router
+    );
+}
+
+/// Asserts that an observable group-router snapshot has the expected routee count.
+pub fn assert_group_router_snapshot_routee_count(snapshot: &GroupRouterSnapshot, expected: usize) {
+    assert_eq!(
+        snapshot.routee_count(),
+        expected,
+        "unexpected group router snapshot routee count for {:?}",
+        snapshot
+    );
+}
+
+/// Waits for the next cluster subscription event.
+pub async fn expect_cluster_event(
+    subscription: &mut ClusterSubscription,
+    timeout: Duration,
+) -> RakkaResult<ClusterEvent> {
+    tokio::time::timeout(timeout, subscription.recv())
+        .await
+        .map_err(|_elapsed| {
+            RakkaError::new(
+                Subsystem::Testkit,
+                "cluster-event-timeout",
+                "timed out waiting for cluster event",
+            )
+        })?
+        .map_err(cluster_subscription_error)
+}
+
+/// Waits until a cluster subscription emits an event matching `predicate`.
+pub async fn expect_cluster_event_matching(
+    subscription: &mut ClusterSubscription,
+    timeout: Duration,
+    description: impl Into<String>,
+    predicate: impl Fn(&ClusterEvent) -> bool,
+) -> RakkaResult<ClusterEvent> {
+    let description = description.into();
+    tokio::time::timeout(timeout, async {
+        loop {
+            let event = subscription
+                .recv()
+                .await
+                .map_err(cluster_subscription_error)?;
+            if predicate(&event) {
+                return Ok(event);
+            }
+        }
+    })
+    .await
+    .map_err(|_elapsed| {
+        RakkaError::new(
+            Subsystem::Testkit,
+            "cluster-event-timeout",
+            format!("timed out waiting for cluster event: {description}"),
+        )
+    })?
+}
+
+/// Waits for a `MemberUp` event for the expected node id.
+pub async fn expect_cluster_member_up(
+    subscription: &mut ClusterSubscription,
+    expected_node: &NodeId,
+    timeout: Duration,
+) -> RakkaResult<ClusterEvent> {
+    expect_cluster_event_matching(
+        subscription,
+        timeout,
+        format!("member up for {expected_node}"),
+        |event| {
+            matches!(
+                event,
+                ClusterEvent::MemberUp { member } if member.node().id() == expected_node
+            )
+        },
+    )
+    .await
+}
+
+/// Asserts that a cluster event belongs to the expected member node.
+pub fn assert_cluster_event_node(event: &ClusterEvent, expected_node: &NodeId) {
+    assert_eq!(
+        event.node_id(),
+        Some(expected_node),
+        "unexpected cluster event node for {:?}",
+        event
+    );
+}
+
 /// Asserts that a Kubernetes probe passed.
 pub fn assert_probe_passed(probe: &KubernetesProbeSnapshot) {
     assert!(
@@ -573,6 +737,14 @@ pub fn assert_metric_attribute(observation: &MetricObservation, key: &str, expec
 /// Asserts the accumulated counter total for a metric name.
 pub fn assert_counter_total(snapshot: &MetricsSnapshot, name: &str, expected: f64) {
     assert_eq!(snapshot.counter_total(name), expected);
+}
+
+fn cluster_subscription_error(error: ClusterSubscriptionError) -> RakkaError {
+    RakkaError::new(
+        Subsystem::Testkit,
+        "cluster-subscription-error",
+        error.to_string(),
+    )
 }
 
 /// Probe actor that records every message it receives.

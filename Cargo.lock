@@ -997,6 +997,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-clustered-receptionist"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-durable-counter"
 version = "0.1.0"
 dependencies = [
@@ -1082,6 +1090,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-local-receptionist-router"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-minimal-system"
 version = "0.1.0"
 dependencies = [
@@ -1099,6 +1115,14 @@ dependencies = [
  "rakka-core",
  "rakka-remote",
  "rakka-sharding",
+ "tokio",
+]
+
+[[package]]
+name = "rakka-example-pool-router"
+version = "0.1.0"
+dependencies = [
+ "rakka",
  "tokio",
 ]
 

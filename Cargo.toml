@@ -22,7 +22,10 @@ members = [
     "examples/edge-gateway",
     "examples/generated-contracts",
     "examples/event-sourced-counter",
+    "examples/local-receptionist-router",
     "examples/minimal-system",
+    "examples/pool-router",
+    "examples/clustered-receptionist",
     "examples/multi-node-sharding",
     "examples/sharded-cart-persistence",
 ]

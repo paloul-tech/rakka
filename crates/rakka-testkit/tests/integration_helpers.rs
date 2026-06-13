@@ -3,7 +3,13 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use rakka_core::{InMemoryMetricsRecorder, MetricKind, MetricsRecorder};
+use rakka_cluster::{
+    Cluster, ClusterNode, ClusterSubscriptionReplay, MembershipConfig, NodeAddress, NodeId,
+};
+use rakka_core::{
+    actor_fn, ActorAction, ActorContext, ActorSystem, InMemoryMetricsRecorder, MetricKind,
+    MetricsRecorder, Receptionist, Routers, ServiceKey,
+};
 use rakka_grpc::{server_streaming_response, unary_service, GrpcUnaryConfig};
 use rakka_http::{json_service_route, HttpRouteConfig};
 use rakka_k8s::{KubernetesDrainController, KubernetesDrainStepResult, KubernetesNodeHealth};
@@ -14,10 +20,13 @@ use rakka_persistence::{
 };
 use rakka_stream::{bounded_channel, StreamLifecycle};
 use rakka_testkit::{
-    assert_counter_total, assert_drain_complete, assert_http_status, assert_metric_attribute,
-    assert_probe_failed_with_reason, assert_stream_lifecycle, expect_grpc_stream_items,
-    expect_grpc_unary_ok, expect_metric_observation, expect_stream_source_items, expect_terminated,
-    grpc_request, http_post_json, spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe,
+    assert_cluster_event_node, assert_counter_total, assert_drain_complete,
+    assert_group_routee_count, assert_group_router_snapshot_routee_count, assert_http_status,
+    assert_metric_attribute, assert_pool_routee_count, assert_probe_failed_with_reason,
+    assert_receptionist_listing_contains, assert_stream_lifecycle, expect_cluster_member_up,
+    expect_grpc_stream_items, expect_grpc_unary_ok, expect_metric_observation,
+    expect_receptionist_listing_count, expect_stream_source_items, expect_terminated, grpc_request,
+    http_post_json, spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe,
     ActorContextProbeCommand, ActorContextProbeEvent, DurableStateBehaviorTestKit,
     EventSourcedBehaviorTestKit, PersistenceTestKit, StopProbeCommand, TestProbe,
 };
@@ -91,6 +100,71 @@ async fn testkit_helpers_cover_phase_5_surfaces() {
         MetricKind::Counter,
     );
     assert_metric_attribute(&observation, "surface", "testkit");
+}
+
+#[tokio::test]
+async fn testkit_helpers_cover_phase_5_cluster_receptionist_and_router_surfaces() {
+    let system = ActorSystem::new("phase-5-testkit");
+    let key = ServiceKey::<Phase5Command>::new("phase-5-workers");
+    let receptionist = Receptionist::get(&system);
+    let mut listings = receptionist
+        .subscribe(&key)
+        .expect("receptionist subscription should start");
+
+    let initial = expect_receptionist_listing_count(&mut listings, 0, Duration::from_secs(1))
+        .await
+        .expect("initial listing should be empty");
+    assert_eq!(initial.revision(), 0);
+
+    let worker = system
+        .spawn(
+            "phase-5-worker",
+            actor_fn(
+                |_ctx: &mut ActorContext<Phase5Command>, _msg: Phase5Command| {
+                    Ok(ActorAction::Continue)
+                },
+            ),
+        )
+        .expect("worker should spawn");
+    let _registration = receptionist
+        .register(&key, worker.clone())
+        .expect("worker should register");
+    let listing = expect_receptionist_listing_count(&mut listings, 1, Duration::from_secs(1))
+        .await
+        .expect("registration listing should arrive");
+    assert_receptionist_listing_contains(&listing, &worker);
+
+    let group = Routers::group(key)
+        .spawn(&system, "phase-5-group")
+        .expect("group router should spawn");
+    assert_group_routee_count(&group, 1);
+    assert_group_router_snapshot_routee_count(&group.snapshot(), 1);
+
+    let pool = Routers::pool("phase-5-pool", 2, || {
+        actor_fn(
+            |_ctx: &mut ActorContext<Phase5Command>, _msg: Phase5Command| Ok(ActorAction::Continue),
+        )
+    })
+    .spawn(&system)
+    .expect("pool router should spawn");
+    assert_pool_routee_count(&pool, 2);
+
+    let node = cluster_node("rakka-testkit", "uid-a", 25520);
+    let cluster = Cluster::for_local_node(node.clone(), MembershipConfig::default());
+    let mut cluster_events = cluster
+        .subscriptions()
+        .subscribe(ClusterSubscriptionReplay::LiveOnly);
+    cluster
+        .manager()
+        .join_self()
+        .expect("local cluster node should join");
+    let member_up =
+        expect_cluster_member_up(&mut cluster_events, node.id(), Duration::from_secs(1))
+            .await
+            .expect("member-up event should arrive");
+    assert_cluster_event_node(&member_up, node.id());
+
+    system.terminate().await.expect("system should terminate");
 }
 
 #[tokio::test]
@@ -332,6 +406,9 @@ struct NumberReply {
     value: i64,
 }
 
+#[derive(Debug)]
+struct Phase5Command;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CounterEvent {
     Incremented(i64),
@@ -348,4 +425,11 @@ enum CounterTestCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CounterSnapshot {
     value: i64,
+}
+
+fn cluster_node(logical_id: &str, incarnation: &str, port: u16) -> ClusterNode {
+    ClusterNode::new(
+        NodeId::new(logical_id, incarnation),
+        NodeAddress::new("127.0.0.1", port),
+    )
 }
