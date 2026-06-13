@@ -9,6 +9,7 @@ pub mod envelope;
 pub mod error;
 pub mod network;
 mod proto;
+pub mod receptionist;
 pub mod registry;
 pub mod request;
 pub mod transport;
@@ -34,6 +35,7 @@ pub use network::{
     METRIC_TCP_REMOTE_CONNECTION_STATE, METRIC_TCP_REMOTE_RECEIVES, METRIC_TCP_REMOTE_RECONNECTS,
     METRIC_TCP_REMOTE_SENDS, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
+pub use receptionist::{RemoteReceptionistListing, RemoteServiceRoutee};
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SchemaCompatibilityPolicy,
     SerializationRegistry,

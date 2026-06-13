@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slices 5R-A and 5R-B implemented; Slice 5R-C pending
+Status: Slices 5R-A through 5R-C implemented; Slice 5R-D pending
 Date: 2026-06-13
 
 ## Purpose
@@ -122,6 +122,8 @@ cargo test -p rakka-remote
 
 Goal: represent receptionist listings without in-memory `ActorRef<M>` values.
 
+Status: implemented.
+
 Scope:
 
 - Add remote wire-listing types in `rakka-remote`, for example:
@@ -141,6 +143,21 @@ Acceptance criteria:
 - Empty listings propagate deregistration.
 - Invalid or oversized wire listings fail closed.
 - Deterministic `ClusteredReceptionistListing<M>` remains available for tests.
+
+Implementation status:
+
+- Added `RemoteReceptionistListing` and `RemoteServiceRoutee` as
+  transport-facing descriptors for one source-node service snapshot.
+- Included source node, service id, service message type, routee descriptors,
+  source listing version, and observation timestamp.
+- Added conversion from local `Listing<M>` snapshots through
+  `ActorRefResolver`, preserving empty listings for deregistration.
+- Added fail-closed validation for source node identity, service id, service
+  message type, routee source node, routee message type, and optional maximum
+  routee count.
+- Added remote boundary coverage for non-empty local listing conversion, empty
+  deregistration listings, invalid input rejection, and oversized listing
+  rejection.
 
 Review commands:
 

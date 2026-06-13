@@ -4,14 +4,15 @@ use prost::Message;
 use rakka_cluster::NodeId;
 use rakka_core::{
     actor_fn, actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorPath,
-    ActorUid, SerializedActorRef,
+    ActorUid, Receptionist, SerializedActorRef, ServiceKey,
 };
 use rakka_remote::{
     EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef,
     RemoteActorRefInbound, RemoteDestination, RemoteEndpoint, RemoteEndpointError, RemoteEnvelope,
-    RemoteEnvelopeMetadata, RemoteError, RemoteRequestError, RemoteRequestRegistry,
-    RemoteTransport, RemoteTransportError, SchemaCompatibilityPolicy, SerializationRegistry,
-    TcpRemoteTransportConfig, DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    RemoteEnvelopeMetadata, RemoteError, RemoteReceptionistListing, RemoteRequestError,
+    RemoteRequestRegistry, RemoteServiceRoutee, RemoteTransport, RemoteTransportError,
+    SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransportConfig,
+    DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
     DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
     DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
     DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
@@ -191,6 +192,188 @@ fn remote_actor_ref_destination_round_trips_serialized_identity() {
     assert_eq!(decoded, envelope);
     assert_eq!(actor_ref.node_id(), &NodeId::new("rakka-0", "uid-a"));
     assert_eq!(actor_ref.to_serialized_ref(), serialized);
+}
+
+#[tokio::test]
+async fn remote_receptionist_listing_from_local_listing_converts_routees() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-listing-converts-routees");
+    let key = ServiceKey::<Ping>::new("workers");
+    let receptionist = Receptionist::get(&system);
+    let (_delivered_a, _received_a, actor_a) = spawn_recording_ping_actor(&system, "worker-a");
+    let (_delivered_b, _received_b, actor_b) = spawn_recording_ping_actor(&system, "worker-b");
+    let _registration_a = receptionist.register(&key, actor_a.clone()).unwrap();
+    let _registration_b = receptionist.register(&key, actor_b.clone()).unwrap();
+    let listing = receptionist.find_local(&key).unwrap();
+
+    let remote = RemoteReceptionistListing::from_listing(
+        node_id.clone(),
+        &system.actor_ref_resolver(),
+        &listing,
+        99,
+    )
+    .unwrap();
+
+    assert_eq!(remote.source_node(), &node_id);
+    assert_eq!(remote.service_id(), "workers");
+    assert_eq!(remote.service_message_type(), type_name::<Ping>());
+    assert_eq!(remote.version(), listing.revision());
+    assert_eq!(remote.observed_at_millis(), 99);
+    assert_eq!(remote.len(), 2);
+    assert!(!remote.is_empty());
+    assert!(remote.routees().iter().all(|routee| {
+        routee.actor_ref().node_id() == &node_id && routee.message_type() == type_name::<Ping>()
+    }));
+
+    let mut remote_paths = remote
+        .routees()
+        .iter()
+        .map(|routee| routee.actor_ref().path().to_string())
+        .collect::<Vec<_>>();
+    let mut local_paths = vec![actor_a.path().to_string(), actor_b.path().to_string()];
+    remote_paths.sort();
+    local_paths.sort();
+    assert_eq!(remote_paths, local_paths);
+
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_receptionist_listing_allows_empty_listing_for_deregistration() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-listing-empty");
+    let key = ServiceKey::<Ping>::new("workers");
+    let receptionist = Receptionist::get(&system);
+    let listing = receptionist.find_local(&key).unwrap();
+
+    let remote = RemoteReceptionistListing::from_listing(
+        node_id.clone(),
+        &system.actor_ref_resolver(),
+        &listing,
+        100,
+    )
+    .unwrap();
+
+    assert_eq!(remote.source_node(), &node_id);
+    assert_eq!(remote.service_id(), "workers");
+    assert_eq!(remote.service_message_type(), type_name::<Ping>());
+    assert_eq!(remote.version(), listing.revision());
+    assert_eq!(remote.observed_at_millis(), 100);
+    assert!(remote.is_empty());
+
+    system.terminate().await.unwrap();
+}
+
+#[test]
+fn remote_receptionist_listing_rejects_invalid_inputs() {
+    let source_node = NodeId::new("rakka-0", "uid-a");
+    let routee = RemoteServiceRoutee::new(test_remote_actor_ref());
+
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            NodeId::new("", "uid-a"),
+            "workers",
+            type_name::<Ping>(),
+            Vec::new(),
+            0,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            source_node.clone(),
+            "",
+            type_name::<Ping>(),
+            Vec::new(),
+            0,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+    assert!(matches!(
+        RemoteReceptionistListing::new(source_node.clone(), "workers", "", Vec::new(), 0, 1,),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+
+    let wrong_node_routee = RemoteServiceRoutee::new(
+        RemoteActorRef::new(
+            NodeId::new("rakka-1", "uid-b"),
+            "orders",
+            ActorPath::new("rakka://local/orders/user/worker"),
+            ActorUid::new(42),
+            type_name::<Ping>(),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            source_node.clone(),
+            "workers",
+            type_name::<Ping>(),
+            vec![wrong_node_routee],
+            1,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+
+    let wrong_type_routee = RemoteServiceRoutee::new(
+        RemoteActorRef::new(
+            source_node.clone(),
+            "orders",
+            ActorPath::new("rakka://local/orders/user/worker"),
+            ActorUid::new(42),
+            type_name::<Pong>(),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            source_node.clone(),
+            "workers",
+            type_name::<Ping>(),
+            vec![wrong_type_routee],
+            1,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+    assert!(matches!(
+        RemoteReceptionistListing::new_with_max_routees(
+            source_node,
+            "workers",
+            type_name::<Ping>(),
+            vec![routee],
+            1,
+            1,
+            Some(0),
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+}
+
+#[tokio::test]
+async fn remote_receptionist_listing_from_local_listing_enforces_max_routees() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-listing-max-routees");
+    let key = ServiceKey::<Ping>::new("workers");
+    let receptionist = Receptionist::get(&system);
+    let (_delivered, _received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let _registration = receptionist.register(&key, actor).unwrap();
+    let listing = receptionist.find_local(&key).unwrap();
+
+    let error = RemoteReceptionistListing::from_listing_with_max_routees(
+        node_id,
+        &system.actor_ref_resolver(),
+        &listing,
+        101,
+        Some(0),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, RemoteError::InvalidEnvelope { .. }));
+    system.terminate().await.unwrap();
 }
 
 #[test]
