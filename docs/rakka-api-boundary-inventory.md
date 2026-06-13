@@ -64,6 +64,8 @@ Component crates continue to own implementation-specific concepts:
 - Local service discovery: `Receptionist`, `ServiceKey`, `Listing`,
   receptionist subscriptions, registration handles, and typed receptionist
   errors.
+- Local routing: `Routers`, `PoolRouter`, pool router builders, routing
+  strategies, and message-preserving router tell errors.
 - Persistence basics when the `persistence` feature is enabled:
   `DurableActor`, `DurableActorContext`, `DurableEffect`, durable actor spawn
   helpers, durable state traits, `PersistenceId`, and `Revision`.

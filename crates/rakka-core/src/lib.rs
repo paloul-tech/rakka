@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod operational;
 pub mod path;
 pub mod receptionist;
+pub mod routers;
 pub mod supervision;
 pub mod system;
 pub mod telemetry;
@@ -47,6 +48,9 @@ pub use path::{validate_actor_path_segment, ActorPath, ActorUid};
 pub use receptionist::{
     Listing, Receptionist, ReceptionistError, ReceptionistRegistration, ReceptionistResult,
     ReceptionistSubscription, ServiceKey,
+};
+pub use routers::{
+    PoolRouter, PoolRouterBuilder, PoolRouterTellError, PoolRoutingStrategy, Routers,
 };
 pub use supervision::{
     ActorOptions, ActorProps, DispatcherHint, SpawnOptions, SupervisionStrategy,

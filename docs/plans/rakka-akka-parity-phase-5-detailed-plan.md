@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: In progress; Slices 5A, 5B, and 5C implemented
+Status: In progress; Slices 5A, 5B, 5C, and 5D implemented
 Date: 2026-06-12
 
 ## Purpose
@@ -329,6 +329,8 @@ cargo doc -p rakka-core --no-deps
 
 Goal: support local worker pools without forcing users into sharding.
 
+Status: implemented.
+
 Proposed API:
 
 ```rust
@@ -360,6 +362,23 @@ Acceptance criteria:
 - Random routing never selects terminated routees.
 - Routee termination behavior is explicit.
 - Failures preserve message ownership where possible.
+
+Implementation status:
+
+- Added the `Routers` facade namespace in `rakka-core`.
+- Added `Routers::pool(name, size, factory)` with routee actors spawned as
+  named local actors using the supplied factory.
+- Added `PoolRouterBuilder` with `with_round_robin`, `with_random`,
+  `with_strategy`, `with_options`, and `with_spawn_options`.
+- Added `PoolRouter<M>` with `tell`, `routees`, `routee_count`, `is_empty`,
+  `strategy`, and `stop_routees`.
+- Added `PoolRoutingStrategy` with round-robin and pseudo-random routing.
+- Added `PoolRouterTellError<M>` with message-preserving `NoRoutees`, `Full`,
+  and `Closed` failures.
+- Chose explicit routee termination semantics for this slice: terminated
+  routees are removed from the pool on the next router observation or send;
+  they are not automatically replaced yet.
+- Added `rakka::prelude` exports for the stable local pool-router facade.
 
 Tests:
 

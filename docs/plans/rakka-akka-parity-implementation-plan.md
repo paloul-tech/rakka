@@ -468,6 +468,10 @@ Implementation status on 2026-06-12:
   `subscribe`, `Listing<M>`, drop-safe registration leases, actor termination
   cleanup, subscription updates, duplicate-registration idempotence, and
   service-key type mismatch protection.
+- Implemented Phase 5D local pool routers with `Routers::pool`,
+  `PoolRouterBuilder`, round-robin and pseudo-random routing strategies,
+  routee spawn options, explicit terminated-routee removal, and
+  message-preserving no-routee/full/closed tell errors.
 
 ## Phase 6: Streams Facade and Stream Testkit
 

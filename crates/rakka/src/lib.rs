@@ -66,10 +66,11 @@ pub mod prelude {
         ActorSystemBuilder, ActorSystemRuntimeSettings, ActorSystemSerializationRegistry,
         ActorSystemShutdownConfig, ActorTerminated, ActorTraceContext, ActorUid, AskError,
         Behavior, BehaviorActor, DispatcherHint, InMemoryMetricsRecorder, Listing, Message,
-        MetricsRecorder, NoopMetricsRecorder, RakkaError, RakkaResult, Receptionist,
-        ReceptionistError, ReceptionistRegistration, ReceptionistResult, ReceptionistSubscription,
-        ReplyTo, SerializedActorRef, ServiceKey, SetupActor, SpawnOptions, StopError,
-        SupervisionStrategy, TellError, TerminationReason, TimerHandle, WatchHandle,
+        MetricsRecorder, NoopMetricsRecorder, PoolRouter, PoolRouterBuilder, PoolRouterTellError,
+        PoolRoutingStrategy, RakkaError, RakkaResult, Receptionist, ReceptionistError,
+        ReceptionistRegistration, ReceptionistResult, ReceptionistSubscription, ReplyTo, Routers,
+        SerializedActorRef, ServiceKey, SetupActor, SpawnOptions, StopError, SupervisionStrategy,
+        TellError, TerminationReason, TimerHandle, WatchHandle,
     };
 
     #[cfg(feature = "cluster")]
