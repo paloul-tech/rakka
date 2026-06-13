@@ -1,5 +1,6 @@
 //! Local typed receptionist and service discovery.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -167,16 +168,18 @@ where
 {
     key: ServiceKey<M>,
     service_instances: Vec<ActorRef<M>>,
+    revision: u64,
 }
 
 impl<M> Listing<M>
 where
     M: Message,
 {
-    fn new(key: ServiceKey<M>, service_instances: Vec<ActorRef<M>>) -> Self {
+    fn new(key: ServiceKey<M>, service_instances: Vec<ActorRef<M>>, revision: u64) -> Self {
         Self {
             key,
             service_instances,
+            revision,
         }
     }
 
@@ -190,6 +193,12 @@ where
     #[must_use]
     pub fn service_instances(&self) -> &[ActorRef<M>] {
         &self.service_instances
+    }
+
+    /// Monotonic receptionist revision for this service id.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Alias for [`Listing::service_instances`].
@@ -227,6 +236,7 @@ where
         f.debug_struct("Listing")
             .field("key", &self.key)
             .field("service_instances", &self.service_instances)
+            .field("revision", &self.revision)
             .finish()
     }
 }
@@ -259,7 +269,7 @@ impl Receptionist {
     {
         let identity = ActorIdentity::from_actor_ref(&actor_ref);
         self.registry
-            .register(key, identity.clone(), actor_ref.to_serialized_ref())?;
+            .register(key, identity.clone(), actor_ref.clone())?;
 
         let registry = self.registry.clone();
         let key_id = key.id().to_string();
@@ -298,8 +308,55 @@ impl Receptionist {
     where
         M: Message,
     {
-        let entries = self.registry.entries_for(key)?;
-        self.listing_from_entries(key, entries)
+        let (revision, entries) = self.registry.entries_for(key)?;
+        self.listing_from_entries(key, entries, revision)
+    }
+
+    /// Finds only service actors registered directly with this local
+    /// receptionist, excluding propagated clustered listings.
+    pub fn find_local<M>(&self, key: &ServiceKey<M>) -> ReceptionistResult<Listing<M>>
+    where
+        M: Message,
+    {
+        let (revision, entries) = self.registry.local_entries_for(key)?;
+        self.listing_from_entries(key, entries, revision)
+    }
+
+    /// Installs or replaces a propagated listing from another cluster node.
+    ///
+    /// Lower or equal versions are ignored so stale remote updates cannot
+    /// overwrite a newer listing already applied for the same source node and
+    /// service key.
+    pub fn install_remote_listing<M>(
+        &self,
+        node_id: impl Into<String>,
+        key: &ServiceKey<M>,
+        routees: Vec<ActorRef<M>>,
+        version: u64,
+        observed_at_millis: u64,
+    ) -> ReceptionistResult<bool>
+    where
+        M: Message,
+    {
+        self.registry.install_remote_listing(
+            node_id.into(),
+            key,
+            routees,
+            version,
+            observed_at_millis,
+        )
+    }
+
+    /// Removes all propagated listings for a remote cluster node.
+    pub fn remove_remote_node(&self, node_id: &str) -> bool {
+        self.registry.remove_remote_node(node_id)
+    }
+
+    /// Removes propagated listings last observed before `older_than_millis`.
+    ///
+    /// Returns the number of remote service listings removed.
+    pub fn expire_remote_listings(&self, older_than_millis: u64) -> usize {
+        self.registry.expire_remote_listings(older_than_millis)
     }
 
     /// Subscribes to current and future listings for a service key.
@@ -323,7 +380,8 @@ impl Receptionist {
     fn listing_from_entries<M>(
         &self,
         key: &ServiceKey<M>,
-        entries: Vec<(ActorIdentity, SerializedActorRef)>,
+        entries: Vec<ServiceEntry>,
+        revision: u64,
     ) -> ReceptionistResult<Listing<M>>
     where
         M: Message,
@@ -331,18 +389,31 @@ impl Receptionist {
         let resolver = self.system.actor_ref_resolver();
         let mut stale = Vec::new();
         let mut service_instances = Vec::new();
-        for (identity, serialized) in entries {
-            match resolver.resolve::<M>(&serialized) {
+        for entry in entries {
+            if let Some(actor_ref) = entry
+                .typed_ref
+                .as_ref()
+                .and_then(|typed_ref| typed_ref.as_ref().downcast_ref::<ActorRef<M>>())
+            {
+                if actor_ref.is_terminated() {
+                    stale.push(entry.key());
+                } else {
+                    service_instances.push(actor_ref.clone());
+                }
+                continue;
+            }
+
+            match resolver.resolve::<M>(&entry.serialized) {
                 Ok(actor_ref) if !actor_ref.is_terminated() => service_instances.push(actor_ref),
-                Ok(_) | Err(_) => stale.push(identity),
+                Ok(_) | Err(_) => stale.push(entry.key()),
             }
         }
 
         if !stale.is_empty() {
-            self.registry.remove_identities(key.id(), &stale);
+            self.registry.remove_entries(key.id(), &stale);
         }
 
-        Ok(Listing::new(key.clone(), service_instances))
+        Ok(Listing::new(key.clone(), service_instances, revision))
     }
 }
 
@@ -516,7 +587,7 @@ impl ReceptionistRegistry {
         &self,
         key: &ServiceKey<M>,
         identity: ActorIdentity,
-        serialized: SerializedActorRef,
+        actor_ref: ActorRef<M>,
     ) -> ReceptionistResult<()>
     where
         M: Message,
@@ -526,7 +597,7 @@ impl ReceptionistRegistry {
             .entry(key.id().to_string())
             .or_insert_with(|| ServiceRegistry::new(key.message_type()));
         service.verify_type(key)?;
-        let is_new = service.register(identity, serialized);
+        let is_new = service.register(identity, actor_ref);
         if is_new {
             service.publish_change();
         }
@@ -569,19 +640,31 @@ impl ReceptionistRegistry {
         Ok(removed)
     }
 
-    fn entries_for<M>(
-        &self,
-        key: &ServiceKey<M>,
-    ) -> ReceptionistResult<Vec<(ActorIdentity, SerializedActorRef)>>
+    fn entries_for<M>(&self, key: &ServiceKey<M>) -> ReceptionistResult<(u64, Vec<ServiceEntry>)>
     where
         M: Message,
     {
         let services = self.services.lock().expect("receptionist mutex poisoned");
         let Some(service) = services.get(key.id()) else {
-            return Ok(Vec::new());
+            return Ok((0, Vec::new()));
         };
         service.verify_type(key)?;
-        Ok(service.entries())
+        Ok((service.revision, service.entries()))
+    }
+
+    fn local_entries_for<M>(
+        &self,
+        key: &ServiceKey<M>,
+    ) -> ReceptionistResult<(u64, Vec<ServiceEntry>)>
+    where
+        M: Message,
+    {
+        let services = self.services.lock().expect("receptionist mutex poisoned");
+        let Some(service) = services.get(key.id()) else {
+            return Ok((0, Vec::new()));
+        };
+        service.verify_type(key)?;
+        Ok((service.revision, service.local_entries()))
     }
 
     fn subscribe<M>(&self, key: &ServiceKey<M>) -> ReceptionistResult<broadcast::Receiver<u64>>
@@ -608,26 +691,79 @@ impl ReceptionistRegistry {
         removed
     }
 
-    fn remove_identities(&self, key_id: &str, identities: &[ActorIdentity]) -> bool {
+    fn remove_entries(&self, key_id: &str, entries: &[ServiceEntryKey]) -> bool {
         let mut services = self.services.lock().expect("receptionist mutex poisoned");
         let Some(service) = services.get_mut(key_id) else {
             return false;
         };
         let mut removed_any = false;
-        for identity in identities {
-            removed_any |= service.remove(identity);
+        for entry in entries {
+            removed_any |= service.remove_entry(entry);
         }
         if removed_any {
             service.publish_change();
         }
         removed_any
     }
+
+    fn install_remote_listing<M>(
+        &self,
+        node_id: String,
+        key: &ServiceKey<M>,
+        routees: Vec<ActorRef<M>>,
+        version: u64,
+        observed_at_millis: u64,
+    ) -> ReceptionistResult<bool>
+    where
+        M: Message,
+    {
+        let mut services = self.services.lock().expect("receptionist mutex poisoned");
+        let service = services
+            .entry(key.id().to_string())
+            .or_insert_with(|| ServiceRegistry::new(key.message_type()));
+        service.verify_type(key)?;
+        let changed = service.install_remote_listing(node_id, routees, version, observed_at_millis);
+        if changed {
+            service.publish_change();
+        }
+        Ok(changed)
+    }
+
+    fn remove_remote_node(&self, node_id: &str) -> bool {
+        let mut services = self.services.lock().expect("receptionist mutex poisoned");
+        let mut removed_any = false;
+        for service in services.values_mut() {
+            if service.remote_listings.remove(node_id).is_some() {
+                service.publish_change();
+                removed_any = true;
+            }
+        }
+        removed_any
+    }
+
+    fn expire_remote_listings(&self, older_than_millis: u64) -> usize {
+        let mut services = self.services.lock().expect("receptionist mutex poisoned");
+        let mut removed = 0;
+        for service in services.values_mut() {
+            let before = service.remote_listings.len();
+            service
+                .remote_listings
+                .retain(|_node_id, listing| listing.observed_at_millis >= older_than_millis);
+            let service_removed = before.saturating_sub(service.remote_listings.len());
+            if service_removed > 0 {
+                removed += service_removed;
+                service.publish_change();
+            }
+        }
+        removed
+    }
 }
 
 #[derive(Debug)]
 struct ServiceRegistry {
     message_type: String,
-    records: BTreeMap<ActorIdentity, ServiceRecord>,
+    local_records: BTreeMap<ActorIdentity, ServiceRecord>,
+    remote_listings: BTreeMap<String, RemoteListing>,
     revision: u64,
     sender: broadcast::Sender<u64>,
 }
@@ -637,7 +773,8 @@ impl ServiceRegistry {
         let (sender, _) = broadcast::channel(RECEPTIONIST_EVENT_CAPACITY);
         Self {
             message_type: message_type.to_string(),
-            records: BTreeMap::new(),
+            local_records: BTreeMap::new(),
+            remote_listings: BTreeMap::new(),
             revision: 0,
             sender,
         }
@@ -658,16 +795,21 @@ impl ServiceRegistry {
         }
     }
 
-    fn register(&mut self, identity: ActorIdentity, serialized: SerializedActorRef) -> bool {
-        if let Some(record) = self.records.get_mut(&identity) {
+    fn register<M>(&mut self, identity: ActorIdentity, actor_ref: ActorRef<M>) -> bool
+    where
+        M: Message,
+    {
+        if let Some(record) = self.local_records.get_mut(&identity) {
             record.leases = record.leases.saturating_add(1);
-            record.serialized = serialized;
+            record.serialized = actor_ref.to_serialized_ref();
+            record.typed_ref = Some(Arc::new(actor_ref));
             false
         } else {
-            self.records.insert(
+            self.local_records.insert(
                 identity,
                 ServiceRecord {
-                    serialized,
+                    serialized: actor_ref.to_serialized_ref(),
+                    typed_ref: Some(Arc::new(actor_ref)),
                     leases: 1,
                 },
             );
@@ -676,12 +818,12 @@ impl ServiceRegistry {
     }
 
     fn release(&mut self, identity: &ActorIdentity) -> bool {
-        let Some(record) = self.records.get_mut(identity) else {
+        let Some(record) = self.local_records.get_mut(identity) else {
             return false;
         };
         record.leases = record.leases.saturating_sub(1);
         if record.leases == 0 {
-            self.records.remove(identity);
+            self.local_records.remove(identity);
             true
         } else {
             false
@@ -689,14 +831,101 @@ impl ServiceRegistry {
     }
 
     fn remove(&mut self, identity: &ActorIdentity) -> bool {
-        self.records.remove(identity).is_some()
+        self.local_records.remove(identity).is_some()
     }
 
-    fn entries(&self) -> Vec<(ActorIdentity, SerializedActorRef)> {
-        self.records
+    fn entries(&self) -> Vec<ServiceEntry> {
+        let mut entries = self.local_entries();
+        entries.extend(self.remote_listings.iter().flat_map(|(node_id, listing)| {
+            listing
+                .records
+                .iter()
+                .map(|(identity, record)| ServiceEntry {
+                    source: ServiceEntrySource::Remote {
+                        node_id: node_id.clone(),
+                    },
+                    identity: identity.clone(),
+                    serialized: record.serialized.clone(),
+                    typed_ref: Some(record.typed_ref.clone()),
+                })
+        }));
+        entries
+    }
+
+    fn local_entries(&self) -> Vec<ServiceEntry> {
+        self.local_records
             .iter()
-            .map(|(identity, record)| (identity.clone(), record.serialized.clone()))
+            .map(|(identity, record)| ServiceEntry {
+                source: ServiceEntrySource::Local,
+                identity: identity.clone(),
+                serialized: record.serialized.clone(),
+                typed_ref: record.typed_ref.clone(),
+            })
             .collect()
+    }
+
+    fn install_remote_listing<M>(
+        &mut self,
+        node_id: String,
+        routees: Vec<ActorRef<M>>,
+        version: u64,
+        observed_at_millis: u64,
+    ) -> bool
+    where
+        M: Message,
+    {
+        if let Some(existing) = self.remote_listings.get(&node_id) {
+            if version < existing.version {
+                return false;
+            }
+        }
+        if let Some(existing) = self.remote_listings.get_mut(&node_id) {
+            if version == existing.version {
+                existing.observed_at_millis = existing.observed_at_millis.max(observed_at_millis);
+                return false;
+            }
+        } else if version == 0 && routees.is_empty() {
+            return false;
+        }
+
+        let records = routees
+            .into_iter()
+            .filter(|routee| !routee.is_terminated())
+            .map(|routee| {
+                (
+                    ActorIdentity::from_actor_ref(&routee),
+                    RemoteServiceRecord {
+                        serialized: routee.to_serialized_ref(),
+                        typed_ref: Arc::new(routee),
+                    },
+                )
+            })
+            .collect();
+        self.remote_listings.insert(
+            node_id,
+            RemoteListing {
+                version,
+                observed_at_millis,
+                records,
+            },
+        );
+        true
+    }
+
+    fn remove_entry(&mut self, entry: &ServiceEntryKey) -> bool {
+        match entry {
+            ServiceEntryKey::Local { identity } => self.local_records.remove(identity).is_some(),
+            ServiceEntryKey::Remote { node_id, identity } => {
+                let Some(listing) = self.remote_listings.get_mut(node_id) else {
+                    return false;
+                };
+                let removed = listing.records.remove(identity).is_some();
+                if listing.records.is_empty() {
+                    self.remote_listings.remove(node_id);
+                }
+                removed
+            }
+        }
     }
 
     fn publish_change(&mut self) {
@@ -705,8 +934,87 @@ impl ServiceRegistry {
     }
 }
 
-#[derive(Debug)]
+type ErasedActorRef = Arc<dyn Any + Send + Sync>;
+
+#[derive(Clone)]
+struct ServiceEntry {
+    source: ServiceEntrySource,
+    identity: ActorIdentity,
+    serialized: SerializedActorRef,
+    typed_ref: Option<ErasedActorRef>,
+}
+
+impl ServiceEntry {
+    fn key(&self) -> ServiceEntryKey {
+        match &self.source {
+            ServiceEntrySource::Local => ServiceEntryKey::Local {
+                identity: self.identity.clone(),
+            },
+            ServiceEntrySource::Remote { node_id } => ServiceEntryKey::Remote {
+                node_id: node_id.clone(),
+                identity: self.identity.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ServiceEntrySource {
+    Local,
+    Remote { node_id: String },
+}
+
+#[derive(Clone)]
+enum ServiceEntryKey {
+    Local {
+        identity: ActorIdentity,
+    },
+    Remote {
+        node_id: String,
+        identity: ActorIdentity,
+    },
+}
+
+struct RemoteListing {
+    version: u64,
+    observed_at_millis: u64,
+    records: BTreeMap<ActorIdentity, RemoteServiceRecord>,
+}
+
+impl Debug for RemoteListing {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteListing")
+            .field("version", &self.version)
+            .field("observed_at_millis", &self.observed_at_millis)
+            .field("records", &self.records)
+            .finish()
+    }
+}
+
+struct RemoteServiceRecord {
+    serialized: SerializedActorRef,
+    typed_ref: ErasedActorRef,
+}
+
+impl Debug for RemoteServiceRecord {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteServiceRecord")
+            .field("serialized", &self.serialized)
+            .finish_non_exhaustive()
+    }
+}
+
 struct ServiceRecord {
     serialized: SerializedActorRef,
+    typed_ref: Option<ErasedActorRef>,
     leases: usize,
+}
+
+impl Debug for ServiceRecord {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceRecord")
+            .field("serialized", &self.serialized)
+            .field("leases", &self.leases)
+            .finish_non_exhaustive()
+    }
 }

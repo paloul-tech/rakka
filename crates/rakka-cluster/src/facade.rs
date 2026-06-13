@@ -11,9 +11,9 @@ use rakka_core::ActorSystem;
 use tokio::sync::broadcast;
 
 use crate::{
-    ClusterMembership, ClusterNode, ClusterResult, DiscoveryProvider, DiscoverySnapshot,
-    MemberRecord, MembershipConfig, MembershipEvent, MembershipSnapshot, MembershipState,
-    NodeAddress, NodeId,
+    ClusterMembership, ClusterNode, ClusterResult, ClusteredReceptionistSettings,
+    DiscoveryProvider, DiscoverySnapshot, MemberRecord, MembershipConfig, MembershipEvent,
+    MembershipSnapshot, MembershipState, NodeAddress, NodeId,
 };
 
 const CLUSTER_EVENT_CAPACITY: usize = 1024;
@@ -258,6 +258,7 @@ pub struct ClusterSettings {
     membership_config: MembershipConfig,
     discovery_poll_interval: Duration,
     failure_tick_interval: Duration,
+    clustered_receptionist: ClusteredReceptionistSettings,
 }
 
 impl ClusterSettings {
@@ -270,6 +271,7 @@ impl ClusterSettings {
             membership_config: MembershipConfig::default(),
             discovery_poll_interval: Duration::from_secs(3),
             failure_tick_interval: Duration::from_secs(1),
+            clustered_receptionist: ClusteredReceptionistSettings::default(),
         }
     }
 
@@ -301,6 +303,12 @@ impl ClusterSettings {
     #[must_use]
     pub const fn failure_tick_interval(&self) -> Duration {
         self.failure_tick_interval
+    }
+
+    /// Clustered receptionist propagation settings.
+    #[must_use]
+    pub const fn clustered_receptionist(&self) -> &ClusteredReceptionistSettings {
+        &self.clustered_receptionist
     }
 
     /// Sets seed nodes.
@@ -363,6 +371,13 @@ impl ClusterSettings {
     #[must_use]
     pub const fn with_failure_tick_interval(mut self, interval: Duration) -> Self {
         self.failure_tick_interval = interval;
+        self
+    }
+
+    /// Sets clustered receptionist propagation settings.
+    #[must_use]
+    pub fn with_clustered_receptionist(mut self, settings: ClusteredReceptionistSettings) -> Self {
+        self.clustered_receptionist = settings;
         self
     }
 

@@ -79,7 +79,8 @@ pub mod prelude {
     pub use rakka_cluster::{
         Cluster, ClusterEvent, ClusterManager, ClusterRuntime, ClusterSettings, ClusterState,
         ClusterSubscription, ClusterSubscriptionError, ClusterSubscriptionReplay,
-        ClusterSubscriptions, ClusterUpdate, DowningStrategy, FailureDetector, NoDowningStrategy,
+        ClusterSubscriptions, ClusterUpdate, ClusteredReceptionist, ClusteredReceptionistListing,
+        ClusteredReceptionistSettings, DowningStrategy, FailureDetector, NoDowningStrategy,
         SelfMember, TimeoutDowningStrategy, TimeoutFailureDetector,
     };
 

@@ -8,6 +8,7 @@ pub mod error;
 pub mod facade;
 pub mod membership;
 pub mod node;
+pub mod receptionist;
 
 use rakka_core::Subsystem;
 
@@ -26,6 +27,9 @@ pub use membership::{
 pub use node::{
     ClusterNode, ClusterProtocol, CompatibilityRange, NodeAddress, NodeId, NodeRole,
     ProtocolVersion,
+};
+pub use receptionist::{
+    ClusteredReceptionist, ClusteredReceptionistListing, ClusteredReceptionistSettings,
 };
 
 /// Crate name used in diagnostics.

@@ -477,6 +477,14 @@ Implementation status on 2026-06-12:
   pseudo-random routing over local receptionist listings, synchronous and
   subscription-driven routee refresh, deregistration/termination cleanup,
   observable snapshots, and explicit fail-fast or drop no-routee behavior.
+- Implemented Phase 5F deterministic clustered receptionist propagation with
+  `ClusteredReceptionistSettings`, `ClusteredReceptionistListing<M>`,
+  `ClusteredReceptionist`, local-only publish snapshots, remote listing
+  installation, source-revision stale update rejection, same-version TTL
+  refresh, TTL expiry, non-`Up` member pruning, listing-size limits, and
+  group-router discovery over propagated listings. TCP loopback propagation
+  remains pending until remote service references have a transport-serializable
+  representation.
 
 ## Phase 6: Streams Facade and Stream Testkit
 

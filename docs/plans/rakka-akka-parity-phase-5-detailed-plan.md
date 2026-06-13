@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: In progress; Slices 5A, 5B, 5C, 5D, and 5E implemented
+Status: In progress; Slices 5A, 5B, 5C, 5D, and 5E implemented; 5F deterministic propagation implemented
 Date: 2026-06-12
 
 ## Purpose
@@ -498,6 +498,38 @@ Acceptance criteria:
 - Down or removed node clears remote routees.
 - Stale remote listings expire.
 - Clustered group router refreshes from propagated listings.
+
+Implementation status:
+
+- Added additive core receptionist support for propagated listings:
+  `Listing::revision`, `Receptionist::find_local`,
+  `Receptionist::install_remote_listing`,
+  `Receptionist::remove_remote_node`, and
+  `Receptionist::expire_remote_listings`.
+- Local receptionist registrations and propagated remote node snapshots are
+  stored separately, then merged by normal `Receptionist::find` so existing
+  group routers can discover propagated routees without a new router API.
+- Added `ClusteredReceptionistSettings` with enabled/disabled propagation,
+  publish interval metadata, remote listing TTL, and optional maximum routees
+  per propagated listing.
+- Added `ClusteredReceptionistListing<M>` as the versioned publication envelope
+  and `ClusteredReceptionist` as the propagation facade.
+- Added explicit deterministic propagation APIs:
+  `publish_local`, `apply_remote`, and `propagate_to`.
+- Remote listings are keyed by source node and service id, reject lower source
+  revisions, refresh TTL on equal-version publications, expire by TTL, and are
+  pruned when the source member is no longer `Up`.
+- Added `ClusterSettings::clustered_receptionist` and
+  `with_clustered_receptionist` so runtime wiring can use the same settings.
+- Added `rakka-cluster` and `rakka::prelude` exports for the clustered
+  receptionist facade.
+- Added deterministic in-memory tests for registration propagation,
+  deregistration propagation, down-node pruning, TTL expiry, same-version TTL
+  refresh, stale-version rejection, listing-size limits, and group-router
+  routing over propagated listings.
+- TCP loopback propagation remains a follow-up inside 5F/5H because transport
+  propagation needs a serializable remote service-reference representation
+  rather than in-memory `ActorRef<M>` clones.
 
 Tests:
 

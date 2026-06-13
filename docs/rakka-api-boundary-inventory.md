@@ -61,9 +61,9 @@ Component crates continue to own implementation-specific concepts:
   common actor errors.
 - Core runtime support: `RakkaError`, `RakkaResult`, supervision, termination,
   timers, and metrics recorder traits.
-- Local service discovery: `Receptionist`, `ServiceKey`, `Listing`,
-  receptionist subscriptions, registration handles, and typed receptionist
-  errors.
+- Service discovery: `Receptionist`, `ServiceKey`, `Listing`, receptionist
+  subscriptions, registration handles, local-only listing snapshots, propagated
+  remote listing hooks, and typed receptionist errors.
 - Local routing: `Routers`, `PoolRouter`, `GroupRouter`, pool and group router
   builders, round-robin and random routing strategies, receptionist-backed
   group routing snapshots, explicit no-routee behavior, and
@@ -71,6 +71,10 @@ Component crates continue to own implementation-specific concepts:
 - Persistence basics when the `persistence` feature is enabled:
   `DurableActor`, `DurableActorContext`, `DurableEffect`, durable actor spawn
   helpers, durable state traits, `PersistenceId`, and `Revision`.
+- Cluster facade and common configuration when the `cluster` feature is enabled:
+  `Cluster`, `ClusterRuntime`, `ClusterSettings`, cluster manager and
+  subscription types, failure/downing hooks, and clustered receptionist
+  propagation facades.
 - Sharding facade and common configuration when the `sharding` feature is
   enabled: `ClusterSharding`, `Entity`, `EntityTypeKey`, `ShardedEntityRef`,
   `EntityType`, `EntityId`, `EntityRef`, `ShardingConfig`, shard allocation
