@@ -485,6 +485,11 @@ Implementation status on 2026-06-12:
   group-router discovery over propagated listings. TCP loopback propagation
   remains pending until remote service references have a transport-serializable
   representation.
+- Implemented Phase 5G consistent-hash routing for local pool and
+  receptionist-backed group routers with `with_consistent_hash`, configurable
+  virtual nodes, routee-incarnation-aware ring points, stable same-key routing,
+  routee-removal remapping, group refresh after receptionist changes, and
+  fail-closed validation for missing mappers or zero virtual nodes.
 
 ## Phase 6: Streams Facade and Stream Testkit
 

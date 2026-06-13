@@ -65,8 +65,8 @@ Component crates continue to own implementation-specific concepts:
   subscriptions, registration handles, local-only listing snapshots, propagated
   remote listing hooks, and typed receptionist errors.
 - Local routing: `Routers`, `PoolRouter`, `GroupRouter`, pool and group router
-  builders, round-robin and random routing strategies, receptionist-backed
-  group routing snapshots, explicit no-routee behavior, and
+  builders, round-robin, random, and consistent-hash routing strategies,
+  receptionist-backed group routing snapshots, explicit no-routee behavior, and
   message-preserving router tell errors.
 - Persistence basics when the `persistence` feature is enabled:
   `DurableActor`, `DurableActorContext`, `DurableEffect`, durable actor spawn

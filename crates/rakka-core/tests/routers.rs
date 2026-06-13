@@ -1,5 +1,6 @@
 //! Local router integration tests.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +8,7 @@ use std::time::Duration;
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorSystem,
     GroupNoRouteeBehavior, GroupRouterTellError, GroupRoutingStrategy, PoolRouterTellError,
-    Receptionist, Routers, ServiceKey,
+    PoolRoutingStrategy, Receptionist, Routers, ServiceKey,
 };
 use tokio::sync::{mpsc, Notify};
 
@@ -15,6 +16,13 @@ use tokio::sync::{mpsc, Notify};
 enum RecordCommand {
     Record { sequence: usize },
     Stop,
+}
+
+fn record_key(message: &RecordCommand) -> usize {
+    match message {
+        RecordCommand::Record { sequence } => *sequence,
+        RecordCommand::Stop => usize::MAX,
+    }
 }
 
 struct RecordingWorker {
@@ -172,6 +180,159 @@ async fn random_pool_does_not_select_terminated_routees() {
         .iter()
         .all(|(_sequence, routee_id)| *routee_id != 0));
     assert_eq!(router.routee_count(), 2);
+
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn consistent_hash_pool_routes_same_key_to_same_routee() {
+    let system = ActorSystem::new("pool-consistent-same-key");
+    let (delivered, mut received) = mpsc::unbounded_channel();
+    let next_id = Arc::new(AtomicUsize::new(0));
+
+    let router = Routers::pool("workers", 4, {
+        let next_id = next_id.clone();
+        move || RecordingWorker {
+            id: next_id.fetch_add(1, Ordering::SeqCst),
+            delivered: delivered.clone(),
+        }
+    })
+    .with_consistent_hash(record_key)
+    .with_consistent_hash_virtual_nodes(64)
+    .spawn(&system)
+    .expect("pool router should spawn");
+
+    assert_eq!(router.strategy(), PoolRoutingStrategy::ConsistentHash);
+    for _ in 0..8 {
+        router
+            .tell(RecordCommand::Record { sequence: 42 })
+            .expect("message should route");
+    }
+
+    let observed = receive_records(&mut received, 8).await;
+    let routee_ids = observed
+        .iter()
+        .map(|(_sequence, routee_id)| *routee_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(routee_ids.len(), 1);
+
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn consistent_hash_pool_spreads_different_keys() {
+    let system = ActorSystem::new("pool-consistent-spread");
+    let (delivered, mut received) = mpsc::unbounded_channel();
+    let next_id = Arc::new(AtomicUsize::new(0));
+
+    let router = Routers::pool("workers", 4, {
+        let next_id = next_id.clone();
+        move || RecordingWorker {
+            id: next_id.fetch_add(1, Ordering::SeqCst),
+            delivered: delivered.clone(),
+        }
+    })
+    .with_consistent_hash(record_key)
+    .with_consistent_hash_virtual_nodes(128)
+    .spawn(&system)
+    .expect("pool router should spawn");
+
+    for sequence in 0..256 {
+        router
+            .tell(RecordCommand::Record { sequence })
+            .expect("message should route");
+    }
+
+    let observed = receive_records(&mut received, 256).await;
+    let routee_ids = observed
+        .iter()
+        .map(|(_sequence, routee_id)| *routee_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(routee_ids, BTreeSet::from([0, 1, 2, 3]));
+
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn consistent_hash_pool_remaps_removed_routee_keys() {
+    let system = ActorSystem::new("pool-consistent-removal");
+    let (delivered, mut received) = mpsc::unbounded_channel();
+    let next_id = Arc::new(AtomicUsize::new(0));
+
+    let router = Routers::pool("workers", 4, {
+        let next_id = next_id.clone();
+        move || RecordingWorker {
+            id: next_id.fetch_add(1, Ordering::SeqCst),
+            delivered: delivered.clone(),
+        }
+    })
+    .with_consistent_hash_virtual_nodes(128)
+    .with_consistent_hash(record_key)
+    .spawn(&system)
+    .expect("pool router should spawn");
+
+    for sequence in 0..512 {
+        router
+            .tell(RecordCommand::Record { sequence })
+            .expect("message should route");
+    }
+    let observed = receive_records(&mut received, 512).await;
+    let removed_key = observed
+        .iter()
+        .find_map(|(sequence, routee_id)| (*routee_id == 0).then_some(*sequence))
+        .expect("some key should route to routee 0");
+
+    let removed_routee = router
+        .routees()
+        .into_iter()
+        .next()
+        .expect("routee should exist");
+    removed_routee
+        .tell(RecordCommand::Stop)
+        .expect("routee should stop");
+    let _terminated = removed_routee.when_terminated().await;
+
+    router
+        .tell(RecordCommand::Record {
+            sequence: removed_key,
+        })
+        .expect("message should remap to live routee");
+    let remapped = receive_records(&mut received, 1).await;
+    assert_ne!(remapped[0].1, 0);
+    assert_eq!(router.routee_count(), 3);
+
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn consistent_hash_pool_requires_mapper_and_virtual_nodes() {
+    let system = ActorSystem::new("pool-consistent-validation");
+    let (delivered, _received) = mpsc::unbounded_channel();
+
+    let missing_mapper = Routers::pool("workers", 1, {
+        let delivered = delivered.clone();
+        move || RecordingWorker {
+            id: 0,
+            delivered: delivered.clone(),
+        }
+    })
+    .with_strategy(PoolRoutingStrategy::ConsistentHash)
+    .spawn(&system)
+    .expect_err("consistent hash strategy should require mapper");
+    assert_eq!(missing_mapper.code(), "missing-consistent-hash-mapper");
+
+    let invalid_virtual_nodes = Routers::pool("other-workers", 1, move || RecordingWorker {
+        id: 0,
+        delivered: delivered.clone(),
+    })
+    .with_consistent_hash(record_key)
+    .with_consistent_hash_virtual_nodes(0)
+    .spawn(&system)
+    .expect_err("zero virtual nodes should fail");
+    assert_eq!(
+        invalid_virtual_nodes.code(),
+        "invalid-consistent-hash-virtual-nodes"
+    );
 
     system.shutdown();
 }
@@ -524,6 +685,143 @@ async fn random_group_router_does_not_select_terminated_routees() {
         .iter()
         .all(|(_sequence, routee_id)| *routee_id != 0));
     assert_eq!(router.routee_count(), 2);
+
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn consistent_hash_group_refreshes_after_receptionist_change() {
+    let system = ActorSystem::new("group-consistent-refresh");
+    let receptionist = Receptionist::get(&system);
+    let key = ServiceKey::<RecordCommand>::new("workers");
+    let (delivered, mut received) = mpsc::unbounded_channel();
+    let worker_a = system
+        .spawn_actor(
+            "worker-a",
+            RecordingWorker {
+                id: 0,
+                delivered: delivered.clone(),
+            },
+        )
+        .unwrap();
+    let worker_b = system
+        .spawn_actor(
+            "worker-b",
+            RecordingWorker {
+                id: 1,
+                delivered: delivered.clone(),
+            },
+        )
+        .unwrap();
+    let _registration_a = receptionist
+        .register(&key, worker_a.clone())
+        .expect("worker a should register");
+    let _registration_b = receptionist
+        .register(&key, worker_b)
+        .expect("worker b should register");
+    let router = Routers::group(key.clone())
+        .with_consistent_hash(record_key)
+        .with_consistent_hash_virtual_nodes(128)
+        .spawn(&system, "workers-group")
+        .expect("group router should spawn");
+
+    assert_eq!(router.strategy(), GroupRoutingStrategy::ConsistentHash);
+    for sequence in 0..512 {
+        router
+            .tell(RecordCommand::Record { sequence })
+            .expect("message should route");
+    }
+    let observed = receive_records(&mut received, 512).await;
+    let removed_key = observed
+        .iter()
+        .find_map(|(sequence, routee_id)| (*routee_id == 0).then_some(*sequence))
+        .expect("some key should route to routee 0");
+
+    assert!(receptionist
+        .deregister(&key, &worker_a)
+        .expect("worker a should deregister"));
+    router
+        .tell(RecordCommand::Record {
+            sequence: removed_key,
+        })
+        .expect("message should remap after receptionist change");
+
+    let remapped = receive_records(&mut received, 1).await;
+    assert_ne!(remapped[0].1, 0);
+    assert_eq!(router.routee_count(), 1);
+
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn consistent_hash_group_refreshes_after_added_routee() {
+    let system = ActorSystem::new("group-consistent-add");
+    let receptionist = Receptionist::get(&system);
+    let key = ServiceKey::<RecordCommand>::new("workers");
+    let (delivered, mut received) = mpsc::unbounded_channel();
+    let worker_a = system
+        .spawn_actor(
+            "worker-a",
+            RecordingWorker {
+                id: 0,
+                delivered: delivered.clone(),
+            },
+        )
+        .unwrap();
+    let worker_b = system
+        .spawn_actor(
+            "worker-b",
+            RecordingWorker {
+                id: 1,
+                delivered: delivered.clone(),
+            },
+        )
+        .unwrap();
+    let _registration_a = receptionist
+        .register(&key, worker_a)
+        .expect("worker a should register");
+    let _registration_b = receptionist
+        .register(&key, worker_b)
+        .expect("worker b should register");
+    let router = Routers::group(key.clone())
+        .with_consistent_hash(record_key)
+        .with_consistent_hash_virtual_nodes(128)
+        .spawn(&system, "workers-group")
+        .expect("group router should spawn");
+
+    for sequence in 0..128 {
+        router
+            .tell(RecordCommand::Record { sequence })
+            .expect("message should route before adding routee");
+    }
+    let before_add = receive_records(&mut received, 128).await;
+    assert!(!before_add
+        .iter()
+        .any(|(_sequence, routee_id)| *routee_id == 2));
+
+    let worker_c = system
+        .spawn_actor(
+            "worker-c",
+            RecordingWorker {
+                id: 2,
+                delivered: delivered.clone(),
+            },
+        )
+        .unwrap();
+    let _registration_c = receptionist
+        .register(&key, worker_c)
+        .expect("worker c should register");
+
+    for sequence in 0..512 {
+        router
+            .tell(RecordCommand::Record { sequence })
+            .expect("message should route after adding routee");
+    }
+    let after_add = receive_records(&mut received, 512).await;
+    assert!(after_add
+        .iter()
+        .any(|(_sequence, routee_id)| *routee_id == 2));
+    assert_eq!(router.routee_count(), 3);
 
     system.shutdown();
 }

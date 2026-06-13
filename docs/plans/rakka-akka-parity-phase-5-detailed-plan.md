@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: In progress; Slices 5A, 5B, 5C, 5D, and 5E implemented; 5F deterministic propagation implemented
+Status: In progress; Slices 5A through 5G implemented, with 5F TCP propagation follow-up pending
 Date: 2026-06-12
 
 ## Purpose
@@ -572,6 +572,29 @@ Acceptance criteria:
 - Different keys spread across routees.
 - Removed routee remaps affected keys.
 - Added routee changes distribution predictably.
+
+Implementation status:
+
+- Added `ConsistentHash` variants to `PoolRoutingStrategy` and
+  `GroupRoutingStrategy`.
+- Added `with_consistent_hash(|message| key)` and
+  `with_consistent_hash_virtual_nodes(count)` to pool and group router
+  builders.
+- The hash mapper accepts any key type implementing `Hash`; the router stores a
+  normalized `u64` mapper internally.
+- Consistent-hash routing uses routee path, incarnation uid, and configurable
+  virtual-node indexes as ring points.
+- Existing `tell` behavior remains message-preserving for no-routee, full, and
+  closed failures.
+- Consistent-hash configuration fails closed if the strategy is selected without
+  a mapper or if virtual-node count is zero.
+- Pool tests cover same-key stickiness, distribution across routees,
+  remapping after routee termination, and validation errors.
+- Group tests cover receptionist refresh after a routee is deregistered and a
+  formerly owned key must remap, plus later registration adding a routee to the
+  hash ring.
+- Documented guidance remains: consistent hash routing is for stateless
+  key-sticky workers; durable entity identity should use sharding.
 
 Tests:
 

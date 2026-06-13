@@ -15,6 +15,46 @@ use crate::{
     ServiceKey, TellError,
 };
 
+const DEFAULT_CONSISTENT_HASH_VIRTUAL_NODES: usize = 32;
+
+type HashMapper<M> = Arc<dyn Fn(&M) -> u64 + Send + Sync + 'static>;
+
+struct ConsistentHashConfig<M>
+where
+    M: Message,
+{
+    mapper: HashMapper<M>,
+    virtual_nodes: usize,
+}
+
+impl<M> ConsistentHashConfig<M>
+where
+    M: Message,
+{
+    fn new<K, H>(key_mapper: K) -> Self
+    where
+        K: Fn(&M) -> H + Send + Sync + 'static,
+        H: Hash + 'static,
+    {
+        Self {
+            mapper: Arc::new(move |message| hash_value(&key_mapper(message))),
+            virtual_nodes: DEFAULT_CONSISTENT_HASH_VIRTUAL_NODES,
+        }
+    }
+}
+
+impl<M> Clone for ConsistentHashConfig<M>
+where
+    M: Message,
+{
+    fn clone(&self) -> Self {
+        Self {
+            mapper: self.mapper.clone(),
+            virtual_nodes: self.virtual_nodes,
+        }
+    }
+}
+
 /// Facade namespace for local and clustered router builders.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Routers;
@@ -36,6 +76,8 @@ impl Routers {
             pool_size,
             factory,
             strategy: PoolRoutingStrategy::RoundRobin,
+            consistent_hash: None,
+            consistent_hash_virtual_nodes: DEFAULT_CONSISTENT_HASH_VIRTUAL_NODES,
             options: ActorOptions::default(),
         }
     }
@@ -49,6 +91,8 @@ impl Routers {
         GroupRouterBuilder {
             service_key,
             strategy: GroupRoutingStrategy::RoundRobin,
+            consistent_hash: None,
+            consistent_hash_virtual_nodes: DEFAULT_CONSISTENT_HASH_VIRTUAL_NODES,
             no_routee_behavior: GroupNoRouteeBehavior::FailFast,
         }
     }
@@ -61,6 +105,9 @@ pub enum PoolRoutingStrategy {
     RoundRobin,
     /// Route to a pseudo-random live routee.
     Random,
+    /// Route messages with equal hash keys to the same live routee when the
+    /// routee set is unchanged.
+    ConsistentHash,
 }
 
 /// Builder for a local pool router.
@@ -73,6 +120,8 @@ where
     pool_size: usize,
     factory: F,
     strategy: PoolRoutingStrategy,
+    consistent_hash: Option<ConsistentHashConfig<A::Msg>>,
+    consistent_hash_virtual_nodes: usize,
     options: ActorOptions,
 }
 
@@ -92,6 +141,37 @@ where
     #[must_use]
     pub const fn with_random(mut self) -> Self {
         self.strategy = PoolRoutingStrategy::Random;
+        self
+    }
+
+    /// Uses consistent-hash routing over live routees.
+    ///
+    /// Messages that map to the same key are routed to the same live routee
+    /// while the routee set is unchanged. Routee changes remap only the keys
+    /// whose ring segment moved.
+    #[must_use]
+    pub fn with_consistent_hash<K, H>(mut self, key_mapper: K) -> Self
+    where
+        K: Fn(&A::Msg) -> H + Send + Sync + 'static,
+        H: Hash + 'static,
+    {
+        self.strategy = PoolRoutingStrategy::ConsistentHash;
+        self.consistent_hash = Some(ConsistentHashConfig::new(key_mapper));
+        if let Some(config) = &mut self.consistent_hash {
+            config.virtual_nodes = self.consistent_hash_virtual_nodes;
+        }
+        self
+    }
+
+    /// Sets the number of virtual nodes used by consistent-hash routing.
+    ///
+    /// This only affects [`PoolRoutingStrategy::ConsistentHash`].
+    #[must_use]
+    pub fn with_consistent_hash_virtual_nodes(mut self, virtual_nodes: usize) -> Self {
+        self.consistent_hash_virtual_nodes = virtual_nodes;
+        if let Some(config) = &mut self.consistent_hash {
+            config.virtual_nodes = virtual_nodes;
+        }
         self
     }
 
@@ -123,6 +203,7 @@ where
                 "pool router size must be greater than zero",
             ));
         }
+        validate_pool_consistent_hash_config(self.strategy, self.consistent_hash.as_ref())?;
         validate_actor_path_segment(&self.name)?;
 
         let factory = Arc::new(self.factory);
@@ -148,6 +229,7 @@ where
         Ok(PoolRouter {
             name: Arc::from(self.name),
             strategy: self.strategy,
+            consistent_hash: self.consistent_hash,
             state: Arc::new(Mutex::new(PoolRouterState {
                 routees,
                 next_round_robin: 0,
@@ -167,6 +249,13 @@ where
             .field("name", &self.name)
             .field("pool_size", &self.pool_size)
             .field("strategy", &self.strategy)
+            .field(
+                "consistent_hash_virtual_nodes",
+                &self
+                    .consistent_hash
+                    .as_ref()
+                    .map(|config| config.virtual_nodes),
+            )
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
@@ -179,6 +268,7 @@ where
 {
     name: Arc<str>,
     strategy: PoolRoutingStrategy,
+    consistent_hash: Option<ConsistentHashConfig<M>>,
     state: Arc<Mutex<PoolRouterState<M>>>,
 }
 
@@ -224,7 +314,7 @@ where
     pub fn tell(&self, message: M) -> Result<(), PoolRouterTellError<M>> {
         let mut state = self.state.lock().expect("pool router mutex poisoned");
         state.cleanup_terminated();
-        let Some(index) = state.select(self.strategy) else {
+        let Some(index) = self.select_routee_index(&mut state, &message) else {
             return Err(PoolRouterTellError::NoRoutees { message });
         };
         let routee = state.routees[index].clone();
@@ -245,6 +335,21 @@ where
             let _ = routee.stop();
         }
     }
+
+    fn select_routee_index(&self, state: &mut PoolRouterState<M>, message: &M) -> Option<usize> {
+        match self.strategy {
+            PoolRoutingStrategy::RoundRobin | PoolRoutingStrategy::Random => {
+                state.select(self.strategy)
+            }
+            PoolRoutingStrategy::ConsistentHash => {
+                let config = self
+                    .consistent_hash
+                    .as_ref()
+                    .expect("consistent hash strategy requires a mapper");
+                state.select_consistent_hash((config.mapper)(message), config.virtual_nodes)
+            }
+        }
+    }
 }
 
 impl<M> Clone for PoolRouter<M>
@@ -255,6 +360,7 @@ where
         Self {
             name: self.name.clone(),
             strategy: self.strategy,
+            consistent_hash: self.consistent_hash.clone(),
             state: self.state.clone(),
         }
     }
@@ -268,6 +374,13 @@ where
         f.debug_struct("PoolRouter")
             .field("name", &self.name)
             .field("strategy", &self.strategy)
+            .field(
+                "consistent_hash_virtual_nodes",
+                &self
+                    .consistent_hash
+                    .as_ref()
+                    .map(|config| config.virtual_nodes),
+            )
             .field("routee_count", &self.routee_count())
             .finish()
     }
@@ -333,6 +446,9 @@ pub enum GroupRoutingStrategy {
     RoundRobin,
     /// Route to a pseudo-random live receptionist routee.
     Random,
+    /// Route messages with equal hash keys to the same live receptionist routee
+    /// when the routee set is unchanged.
+    ConsistentHash,
 }
 
 /// Behavior used when a group router has no live routees.
@@ -351,6 +467,8 @@ where
 {
     service_key: ServiceKey<M>,
     strategy: GroupRoutingStrategy,
+    consistent_hash: Option<ConsistentHashConfig<M>>,
+    consistent_hash_virtual_nodes: usize,
     no_routee_behavior: GroupNoRouteeBehavior,
 }
 
@@ -369,6 +487,36 @@ where
     #[must_use]
     pub const fn with_random(mut self) -> Self {
         self.strategy = GroupRoutingStrategy::Random;
+        self
+    }
+
+    /// Uses consistent-hash routing over live receptionist routees.
+    ///
+    /// Messages that map to the same key are routed to the same live routee
+    /// while the receptionist listing is unchanged.
+    #[must_use]
+    pub fn with_consistent_hash<K, H>(mut self, key_mapper: K) -> Self
+    where
+        K: Fn(&M) -> H + Send + Sync + 'static,
+        H: Hash + 'static,
+    {
+        self.strategy = GroupRoutingStrategy::ConsistentHash;
+        self.consistent_hash = Some(ConsistentHashConfig::new(key_mapper));
+        if let Some(config) = &mut self.consistent_hash {
+            config.virtual_nodes = self.consistent_hash_virtual_nodes;
+        }
+        self
+    }
+
+    /// Sets the number of virtual nodes used by consistent-hash routing.
+    ///
+    /// This only affects [`GroupRoutingStrategy::ConsistentHash`].
+    #[must_use]
+    pub fn with_consistent_hash_virtual_nodes(mut self, virtual_nodes: usize) -> Self {
+        self.consistent_hash_virtual_nodes = virtual_nodes;
+        if let Some(config) = &mut self.consistent_hash {
+            config.virtual_nodes = virtual_nodes;
+        }
         self
     }
 
@@ -409,6 +557,7 @@ where
     ) -> RakkaResult<GroupRouter<M>> {
         let name = name.into();
         validate_actor_path_segment(&name)?;
+        validate_group_consistent_hash_config(self.strategy, self.consistent_hash.as_ref())?;
         let receptionist = Receptionist::get(system);
         let subscription = receptionist.subscribe(&self.service_key)?;
         let initial = receptionist.find(&self.service_key)?;
@@ -417,6 +566,7 @@ where
             service_key: self.service_key.clone(),
             receptionist,
             strategy: self.strategy,
+            consistent_hash: self.consistent_hash,
             no_routee_behavior: self.no_routee_behavior,
             state: Mutex::new(GroupRouterRoutees {
                 routees: initial.service_instances().to_vec(),
@@ -444,6 +594,13 @@ where
         f.debug_struct("GroupRouterBuilder")
             .field("service_key", &self.service_key)
             .field("strategy", &self.strategy)
+            .field(
+                "consistent_hash_virtual_nodes",
+                &self
+                    .consistent_hash
+                    .as_ref()
+                    .map(|config| config.virtual_nodes),
+            )
             .field("no_routee_behavior", &self.no_routee_behavior)
             .finish()
     }
@@ -546,7 +703,7 @@ where
             .lock()
             .expect("group router mutex poisoned");
         state.cleanup_terminated();
-        let Some(index) = state.select(self.inner.strategy) else {
+        let Some(index) = self.select_routee_index(&mut state, &message) else {
             return match self.inner.no_routee_behavior {
                 GroupNoRouteeBehavior::FailFast => Err(GroupRouterTellError::NoRoutees { message }),
                 GroupNoRouteeBehavior::Drop => Ok(()),
@@ -560,6 +717,22 @@ where
             Err(TellError::Closed(message)) => {
                 state.remove_routee_at(index, &routee);
                 Err(GroupRouterTellError::Closed { message })
+            }
+        }
+    }
+
+    fn select_routee_index(&self, state: &mut GroupRouterRoutees<M>, message: &M) -> Option<usize> {
+        match self.inner.strategy {
+            GroupRoutingStrategy::RoundRobin | GroupRoutingStrategy::Random => {
+                state.select(self.inner.strategy)
+            }
+            GroupRoutingStrategy::ConsistentHash => {
+                let config = self
+                    .inner
+                    .consistent_hash
+                    .as_ref()
+                    .expect("consistent hash strategy requires a mapper");
+                state.select_consistent_hash((config.mapper)(message), config.virtual_nodes)
             }
         }
     }
@@ -719,6 +892,7 @@ where
     service_key: ServiceKey<M>,
     receptionist: Receptionist,
     strategy: GroupRoutingStrategy,
+    consistent_hash: Option<ConsistentHashConfig<M>>,
     no_routee_behavior: GroupNoRouteeBehavior,
     state: Mutex<GroupRouterRoutees<M>>,
     update_task: Mutex<Option<JoinHandle<()>>>,
@@ -793,7 +967,14 @@ where
                 self.random_state = next_random(self.random_state);
                 usize::try_from(self.random_state).unwrap_or(usize::MAX) % self.routees.len()
             }
+            GroupRoutingStrategy::ConsistentHash => {
+                unreachable!("consistent hash selection uses select_consistent_hash")
+            }
         })
+    }
+
+    fn select_consistent_hash(&self, key_hash: u64, virtual_nodes: usize) -> Option<usize> {
+        select_consistent_hash_routee(&self.routees, key_hash, virtual_nodes)
     }
 
     fn remove_routee_at(&mut self, index: usize, routee: &ActorRef<M>) {
@@ -886,7 +1067,14 @@ where
                 self.random_state = next_random(self.random_state);
                 usize::try_from(self.random_state).unwrap_or(usize::MAX) % self.routees.len()
             }
+            PoolRoutingStrategy::ConsistentHash => {
+                unreachable!("consistent hash selection uses select_consistent_hash")
+            }
         })
+    }
+
+    fn select_consistent_hash(&self, key_hash: u64, virtual_nodes: usize) -> Option<usize> {
+        select_consistent_hash_routee(&self.routees, key_hash, virtual_nodes)
     }
 
     fn remove_routee_at(&mut self, index: usize, routee: &ActorRef<M>) {
@@ -907,6 +1095,107 @@ where
             self.next_round_robin = 0;
         }
     }
+}
+
+fn validate_pool_consistent_hash_config<M>(
+    strategy: PoolRoutingStrategy,
+    config: Option<&ConsistentHashConfig<M>>,
+) -> RakkaResult<()>
+where
+    M: Message,
+{
+    validate_consistent_hash_config(
+        matches!(strategy, PoolRoutingStrategy::ConsistentHash),
+        config,
+    )
+}
+
+fn validate_group_consistent_hash_config<M>(
+    strategy: GroupRoutingStrategy,
+    config: Option<&ConsistentHashConfig<M>>,
+) -> RakkaResult<()>
+where
+    M: Message,
+{
+    validate_consistent_hash_config(
+        matches!(strategy, GroupRoutingStrategy::ConsistentHash),
+        config,
+    )
+}
+
+fn validate_consistent_hash_config<M>(
+    consistent_hash: bool,
+    config: Option<&ConsistentHashConfig<M>>,
+) -> RakkaResult<()>
+where
+    M: Message,
+{
+    if !consistent_hash {
+        return Ok(());
+    }
+
+    let Some(config) = config else {
+        return Err(RakkaError::core(
+            "missing-consistent-hash-mapper",
+            "consistent hash routing requires a key mapper",
+        ));
+    };
+
+    if config.virtual_nodes == 0 {
+        return Err(RakkaError::core(
+            "invalid-consistent-hash-virtual-nodes",
+            "consistent hash virtual nodes must be greater than zero",
+        ));
+    }
+
+    Ok(())
+}
+
+fn select_consistent_hash_routee<M>(
+    routees: &[ActorRef<M>],
+    key_hash: u64,
+    virtual_nodes: usize,
+) -> Option<usize>
+where
+    M: Message,
+{
+    if routees.is_empty() {
+        return None;
+    }
+
+    let mut selected: Option<(u64, usize)> = None;
+    let mut first: Option<(u64, usize)> = None;
+    for (index, routee) in routees.iter().enumerate() {
+        for virtual_node in 0..virtual_nodes {
+            let point = routee_hash(routee, virtual_node);
+            if first.map_or(true, |(first_point, _)| point < first_point) {
+                first = Some((point, index));
+            }
+            if point >= key_hash
+                && selected.map_or(true, |(selected_point, _)| point < selected_point)
+            {
+                selected = Some((point, index));
+            }
+        }
+    }
+
+    selected.or(first).map(|(_point, index)| index)
+}
+
+fn routee_hash<M>(routee: &ActorRef<M>, virtual_node: usize) -> u64
+where
+    M: Message,
+{
+    hash_value(&(routee.path().as_str(), routee.uid().value(), virtual_node))
+}
+
+fn hash_value<T>(value: &T) -> u64
+where
+    T: Hash + ?Sized,
+{
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn same_actor<M>(left: &ActorRef<M>, right: &ActorRef<M>) -> bool
