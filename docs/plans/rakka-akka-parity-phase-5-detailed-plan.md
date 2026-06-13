@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Detailed Plan
 
-Status: In progress; Slices 5A, 5B, 5C, and 5D implemented
+Status: In progress; Slices 5A, 5B, 5C, 5D, and 5E implemented
 Date: 2026-06-12
 
 ## Purpose
@@ -427,6 +427,33 @@ Acceptance criteria:
 - Registering a service updates routing without restarting the router.
 - Deregistering or terminating a service removes it from routing.
 - No-routee behavior is explicit and tested.
+
+Implementation status:
+
+- Added `Routers::group(ServiceKey<M>)` as the local
+  receptionist-backed group-router entry point.
+- Added `GroupRouterBuilder<M>` with `with_round_robin`, `with_random`,
+  `with_strategy`, `with_fail_fast_no_routees`,
+  `with_drop_when_no_routees`, and `with_no_routee_behavior`.
+- Added `GroupRouter<M>` with `tell`, `refresh`, `routees`,
+  `routee_count`, `is_empty`, `snapshot`, `strategy`,
+  `service_key`, and `no_routee_behavior`.
+- Added `GroupRoutingStrategy`, `GroupNoRouteeBehavior`,
+  `GroupRouterSnapshot`, and message-preserving
+  `GroupRouterTellError<M>`.
+- Group routers subscribe to local receptionist listing updates and also
+  refresh synchronously before sends so newly registered routees can be used
+  without restarting the router.
+- Round-robin and pseudo-random routing are supported over current local
+  receptionist routees.
+- Deregistered routees and terminated actors are removed from routing on
+  listing refresh, router observation, or send.
+- No-routee behavior is explicit: fail-fast is the default and preserves the
+  message; drop is opt-in and reports success after consuming the message.
+- Bounded no-routee buffering is intentionally deferred until it can reuse or
+  align with the existing sharding buffer model rather than adding a separate
+  router-only queue policy.
+- Added `rakka::prelude` exports for the stable local group-router facade.
 
 Tests:
 

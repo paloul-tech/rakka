@@ -50,7 +50,9 @@ pub use receptionist::{
     ReceptionistSubscription, ServiceKey,
 };
 pub use routers::{
-    PoolRouter, PoolRouterBuilder, PoolRouterTellError, PoolRoutingStrategy, Routers,
+    GroupNoRouteeBehavior, GroupRouter, GroupRouterBuilder, GroupRouterSnapshot,
+    GroupRouterTellError, GroupRoutingStrategy, PoolRouter, PoolRouterBuilder, PoolRouterTellError,
+    PoolRoutingStrategy, Routers,
 };
 pub use supervision::{
     ActorOptions, ActorProps, DispatcherHint, SpawnOptions, SupervisionStrategy,

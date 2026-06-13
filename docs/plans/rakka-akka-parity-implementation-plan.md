@@ -472,6 +472,11 @@ Implementation status on 2026-06-12:
   `PoolRouterBuilder`, round-robin and pseudo-random routing strategies,
   routee spawn options, explicit terminated-routee removal, and
   message-preserving no-routee/full/closed tell errors.
+- Implemented Phase 5E local group routers with
+  `Routers::group(ServiceKey<M>)`, `GroupRouterBuilder`, round-robin and
+  pseudo-random routing over local receptionist listings, synchronous and
+  subscription-driven routee refresh, deregistration/termination cleanup,
+  observable snapshots, and explicit fail-fast or drop no-routee behavior.
 
 ## Phase 6: Streams Facade and Stream Testkit
 
