@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6E fan-in and fan-out operators
+Status: implemented through Slice 6F actor source and sink boundaries
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -207,7 +207,59 @@ the upstream broadcast, matching the safer Akka-style default. If a branch is
 cancelled or dropped, it is removed from the broadcast so the remaining live
 branches can continue.
 
-Actor/entity boundaries and test probes arrive in later slices.
+## Actor Boundaries
+
+Slice 6F adds actor source and sink facade boundaries.
+
+For fire-and-fail-fast delivery, `Sink::actor_ref` forwards stream items
+directly into an actor mailbox:
+
+```rust
+let delivered = Source::from_iter(commands)
+    .run_with(Sink::actor_ref(worker))
+    .await?;
+```
+
+For explicit back-pressure, use `Sink::actor_ref_with_ack`. The target actor
+receives `ActorSinkMessage<T, Ack>` and must reply with the configured ack value
+before the stream pulls the next item:
+
+```rust
+let sink = Sink::actor_ref_with_ack(
+    worker,
+    AckProtocol::new("ack").with_timeout(Duration::from_secs(1)),
+);
+
+let delivered = Source::from_iter(commands)
+    .run_with(sink)
+    .await?;
+```
+
+Failures before delivery, such as a full or closed actor mailbox, surface as
+`StreamRunError::Actor` with `ActorStreamError<T>` so the undelivered item can
+be inspected or recovered.
+
+Actor-backed sources expose a typed actor ref plus a bounded source:
+
+```rust
+let (actor_ref, source) = Source::actor_ref(&system, "commands", 32)?;
+actor_ref.tell(Command::Start)?;
+let first = source.take(1).run_collect().await?;
+```
+
+The acked source variant accepts `ActorSourceMessage<T, Ack>` and replies only
+after the bounded source accepts the element:
+
+```rust
+let (actor_ref, source) = Source::actor_ref_with_ack(
+    &system,
+    "acked-commands",
+    32,
+    AckProtocol::new("ack"),
+)?;
+```
+
+Entity boundaries and test probes arrive in later slices.
 
 ## Design Rules
 

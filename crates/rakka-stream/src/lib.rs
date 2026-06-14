@@ -33,7 +33,8 @@ pub use adapters::{
     StreamPipeSummary,
 };
 pub use facade::{
-    Flow, RunnableStream, Sink, Source, StreamRunError, StreamRunResult, StreamRunSettings,
+    AckProtocol, ActorSinkMessage, ActorSourceError, ActorSourceMessage, ActorStreamError, Flow,
+    RunnableStream, Sink, Source, StreamRunError, StreamRunResult, StreamRunSettings,
 };
 #[cfg(feature = "process-io")]
 pub use process_io::{

@@ -6,10 +6,14 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use rakka_stream::{
-    bounded_channel, Flow, Sink, Source, StreamError, StreamRunError, StreamRunSettings,
-    DEFAULT_BUFFER_CAPACITY,
+use rakka_core::{
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorSystem,
 };
+use rakka_stream::{
+    bounded_channel, AckProtocol, ActorSinkMessage, ActorSourceMessage, ActorStreamError, Flow,
+    Sink, Source, StreamError, StreamRunError, StreamRunSettings, DEFAULT_BUFFER_CAPACITY,
+};
+use tokio::sync::{mpsc, Notify};
 
 #[test]
 fn stream_run_settings_defaults_are_bounded_and_named_later() {
@@ -515,4 +519,300 @@ async fn stream_facade_fanout_broadcast_cancelled_branch_drops_out() {
     cancelled.cancel("branch no longer needed");
 
     assert_eq!(live.run_collect().await.unwrap(), vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn actor_ack_sink_delivers_items_in_order_when_acks_arrive() {
+    let system = ActorSystem::new("actor-ack-sink-delivery");
+    let (events, mut receiver) = mpsc::channel(8);
+    let actor = system
+        .spawn_actor(
+            "sink",
+            AckingSinkActor {
+                events,
+                ack_init: true,
+                ack_elements: true,
+            },
+        )
+        .unwrap();
+
+    let delivered = Source::from_iter([1_u64, 2])
+        .run_with(Sink::actor_ref_with_ack(
+            actor,
+            AckProtocol::new("ack").with_timeout(Duration::from_secs(1)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(delivered, 2);
+    assert_eq!(recv_event(&mut receiver).await, AckSinkEvent::Init);
+    assert_eq!(recv_event(&mut receiver).await, AckSinkEvent::Element(1));
+    assert_eq!(recv_event(&mut receiver).await, AckSinkEvent::Element(2));
+    assert_eq!(recv_event(&mut receiver).await, AckSinkEvent::Complete);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn actor_ack_sink_does_not_overrun_missing_ack() {
+    let system = ActorSystem::new("actor-ack-sink-timeout");
+    let (events, mut receiver) = mpsc::channel(8);
+    let actor = system
+        .spawn_actor(
+            "sink",
+            AckingSinkActor {
+                events,
+                ack_init: true,
+                ack_elements: false,
+            },
+        )
+        .unwrap();
+
+    let error = Source::from_iter([1_u64, 2])
+        .run_with(Sink::actor_ref_with_ack(
+            actor,
+            AckProtocol::new("ack").with_timeout(Duration::from_millis(25)),
+        ))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.actor_error(),
+        Some(ActorStreamError::AckTimeout { .. } | ActorStreamError::AckDropped)
+    ));
+    assert_eq!(recv_event(&mut receiver).await, AckSinkEvent::Init);
+    assert_eq!(recv_event(&mut receiver).await, AckSinkEvent::Element(1));
+    if let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), receiver.recv()).await
+    {
+        assert!(matches!(event, AckSinkEvent::Cancelled(_)));
+    }
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn actor_ack_sink_preserves_item_when_actor_mailbox_is_full() {
+    let system = ActorSystem::new("actor-sink-mailbox-full");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let entered_wait = entered.notified();
+    let actor = system
+        .spawn_actor_with_options(
+            "blocking",
+            {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || BlockingSinkActor {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }
+            },
+            ActorOptions::default().with_mailbox_capacity(1),
+        )
+        .unwrap();
+
+    actor.tell(BlockingSinkMessage::Block).unwrap();
+    entered_wait.await;
+
+    let error = Source::from_iter([BlockingSinkMessage::Queued, BlockingSinkMessage::Extra])
+        .run_with(Sink::actor_ref(actor))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.actor_error(),
+        Some(ActorStreamError::MailboxFull {
+            item: BlockingSinkMessage::Extra
+        })
+    ));
+
+    release.notify_waiters();
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn actor_ack_source_exposes_actor_ref_and_bounded_source() {
+    let system = ActorSystem::new("actor-source-facade");
+    let (actor, source) = Source::actor_ref(&system, "source", 2).unwrap();
+
+    actor.tell(1_u64).unwrap();
+    actor.tell(2_u64).unwrap();
+
+    assert_eq!(source.take(2).run_collect().await.unwrap(), vec![1, 2]);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn actor_ack_source_replies_after_bounded_capacity_accepts_item() {
+    let system = ActorSystem::new("actor-source-ack");
+    let (actor, source) =
+        Source::actor_ref_with_ack(&system, "source", 1, AckProtocol::new("ack")).unwrap();
+
+    let first = actor
+        .ask(
+            |reply_to| ActorSourceMessage::Element {
+                item: 1_u64,
+                reply_to,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, "ack");
+
+    let second = tokio::spawn({
+        let actor = actor.clone();
+        async move {
+            actor
+                .ask(
+                    |reply_to| ActorSourceMessage::Element {
+                        item: 2_u64,
+                        reply_to,
+                    },
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !second.is_finished(),
+        "second ack should wait while source buffer is full"
+    );
+
+    let collected = source.take(2).run_collect().await.unwrap();
+    assert_eq!(second.await.unwrap(), "ack");
+    assert_eq!(collected, vec![1, 2]);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn actor_ack_sink_receives_failure_signal_when_upstream_fails() {
+    let system = ActorSystem::new("actor-ack-sink-failure-signal");
+    let (events, mut receiver) = mpsc::channel(8);
+    let actor = system
+        .spawn_actor(
+            "sink",
+            AckingSinkActor {
+                events,
+                ack_init: true,
+                ack_elements: true,
+            },
+        )
+        .unwrap();
+    let (sink, source) = bounded_channel::<u64>(1).unwrap();
+    sink.cancel("upstream cancelled");
+
+    let error = Source::from_stream_source(source)
+        .run_with(Sink::actor_ref_with_ack(actor, AckProtocol::new("ack")))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.source_error(),
+        Some(StreamError::Cancelled {
+            reason: Some(reason)
+        }) if reason == "upstream cancelled"
+    ));
+    assert_eq!(
+        recv_event(&mut receiver).await,
+        AckSinkEvent::Failure("cancelled".to_owned())
+    );
+    system.shutdown();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AckSinkEvent {
+    Init,
+    Element(u64),
+    Complete,
+    Failure(String),
+    Cancelled(String),
+}
+
+struct AckingSinkActor {
+    events: mpsc::Sender<AckSinkEvent>,
+    ack_init: bool,
+    ack_elements: bool,
+}
+
+impl Actor for AckingSinkActor {
+    type Msg = ActorSinkMessage<u64, &'static str>;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let events = self.events.clone();
+        let ack_init = self.ack_init;
+        let ack_elements = self.ack_elements;
+        actor_future(async move {
+            match msg {
+                ActorSinkMessage::Init { reply_to } => {
+                    events.send(AckSinkEvent::Init).await.unwrap();
+                    if ack_init {
+                        let _ignored = reply_to.reply("ack");
+                    }
+                }
+                ActorSinkMessage::Element { item, reply_to } => {
+                    events.send(AckSinkEvent::Element(item)).await.unwrap();
+                    if ack_elements {
+                        let _ignored = reply_to.reply("ack");
+                    }
+                }
+                ActorSinkMessage::Complete => {
+                    events.send(AckSinkEvent::Complete).await.unwrap();
+                }
+                ActorSinkMessage::Failure { error } => {
+                    events
+                        .send(AckSinkEvent::Failure(error.code().to_owned()))
+                        .await
+                        .unwrap();
+                }
+                ActorSinkMessage::Cancelled { reason } => {
+                    events.send(AckSinkEvent::Cancelled(reason)).await.unwrap();
+                }
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockingSinkMessage {
+    Block,
+    Queued,
+    Extra,
+}
+
+struct BlockingSinkActor {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Actor for BlockingSinkActor {
+    type Msg = BlockingSinkMessage;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        actor_future(async move {
+            if matches!(msg, BlockingSinkMessage::Block) {
+                entered.notify_one();
+                release.notified().await;
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+async fn recv_event(receiver: &mut mpsc::Receiver<AckSinkEvent>) -> AckSinkEvent {
+    tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        .await
+        .expect("event should arrive")
+        .expect("event sender should stay open")
 }

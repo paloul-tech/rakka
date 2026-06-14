@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6E
+Status: implemented through Slice 6F
 Date: 2026-06-14
 
 ## Purpose
@@ -76,7 +76,7 @@ Actor and entity integrations should be explicit about back-pressure:
 
 ```rust
 Source::from_iter(commands)
-    .run_with(Sink::actor_ref_with_ack(worker, AckProtocol::default()))
+    .run_with(Sink::actor_ref_with_ack(worker, AckProtocol::new("ack")))
     .await?;
 
 Source::from_iter(entity_commands)
@@ -411,6 +411,8 @@ cargo test -p rakka-stream stream_facade_fanout
 Goal: add Akka-style actor stream boundaries with a Rakka-native acknowledgement
 protocol.
 
+Status: implemented.
+
 Scope:
 
 - Keep existing `ActorSink` and `spawn_actor_source` simple adapters.
@@ -439,6 +441,31 @@ Acceptance criteria:
 - Failure before delivery returns or records the undelivered item.
 - Actor source exposes a typed `ActorRef<M>` and bounded `Source<M>`.
 - Cancellation sends the configured cancel/failure signal when provided.
+
+Implementation status:
+
+- Added `AckProtocol<Ack>` with an expected ack value and configurable timeout.
+- Added explicit actor boundary message protocols:
+  - `ActorSinkMessage<T, Ack>` for acked actor sinks;
+  - `ActorSourceMessage<T, Ack>` for acked actor sources.
+- Added `Sink::actor_ref(actor_ref)` for unacked actor delivery with typed
+  mailbox-full and mailbox-closed failures.
+- Added `Sink::actor_ref_with_ack(actor_ref, protocol)` for one-at-a-time
+  actor delivery that waits for init and per-element acknowledgements before
+  pulling the next stream item.
+- Added `Source::actor_ref(system, name, capacity)` for actor-backed bounded
+  sources.
+- Added `Source::actor_ref_with_ack(system, name, capacity, protocol)` for
+  actor-backed bounded sources that reply only after bounded capacity accepts
+  each element.
+- Added `ActorStreamError<T>` and an actor variant on `StreamRunError<T>` so
+  failures before delivery preserve the undelivered stream item.
+- Propagated source failure into acked actor sinks as
+  `ActorSinkMessage::Failure`, and sink drop/cancellation as
+  `ActorSinkMessage::Cancelled`.
+- Added focused `actor_ack` facade tests for ordered acked delivery, missing
+  ack behavior, mailbox-full item ownership, actor-backed sources, acked
+  source back-pressure, and upstream failure signalling.
 
 Review commands:
 

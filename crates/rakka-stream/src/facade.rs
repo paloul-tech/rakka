@@ -7,8 +7,14 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use rakka_core::{
+    actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, Message, RakkaError,
+    ReplyTo, TellError,
+};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -32,6 +38,11 @@ pub enum StreamRunError<T> {
         /// Sink send failure, including the rejected item.
         error: StreamSendError<T>,
     },
+    /// The actor sink boundary failed while delivering an item or lifecycle signal.
+    Actor {
+        /// Actor boundary failure.
+        error: ActorStreamError<T>,
+    },
 }
 
 impl<T> StreamRunError<T> {
@@ -41,6 +52,7 @@ impl<T> StreamRunError<T> {
         match self {
             Self::Source { .. } => "source-error",
             Self::Sink { .. } => "sink-error",
+            Self::Actor { .. } => "actor-error",
         }
     }
 
@@ -49,7 +61,7 @@ impl<T> StreamRunError<T> {
     pub const fn source_error(&self) -> Option<&StreamError> {
         match self {
             Self::Source { error } => Some(error),
-            Self::Sink { .. } => None,
+            Self::Sink { .. } | Self::Actor { .. } => None,
         }
     }
 
@@ -57,8 +69,17 @@ impl<T> StreamRunError<T> {
     #[must_use]
     pub const fn sink_error(&self) -> Option<&StreamSendError<T>> {
         match self {
-            Self::Source { .. } => None,
+            Self::Source { .. } | Self::Actor { .. } => None,
             Self::Sink { error } => Some(error),
+        }
+    }
+
+    /// Returns the actor boundary error when this is an actor sink failure.
+    #[must_use]
+    pub const fn actor_error(&self) -> Option<&ActorStreamError<T>> {
+        match self {
+            Self::Source { .. } | Self::Sink { .. } => None,
+            Self::Actor { error } => Some(error),
         }
     }
 }
@@ -68,11 +89,329 @@ impl<T> Display for StreamRunError<T> {
         match self {
             Self::Source { error } => write!(f, "stream source failed: {error}"),
             Self::Sink { error } => write!(f, "stream sink failed: {error}"),
+            Self::Actor { error } => write!(f, "stream actor boundary failed: {error}"),
         }
     }
 }
 
 impl<T> Error for StreamRunError<T> where T: Debug {}
+
+/// Explicit acknowledgement settings for actor stream boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckProtocol<Ack> {
+    ack: Ack,
+    timeout: Duration,
+}
+
+impl<Ack> AckProtocol<Ack> {
+    /// Creates an acknowledgement protocol with a one-second timeout.
+    #[must_use]
+    pub fn new(ack: Ack) -> Self {
+        Self {
+            ack,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// Expected acknowledgement value.
+    #[must_use]
+    pub const fn ack(&self) -> &Ack {
+        &self.ack
+    }
+
+    /// Maximum time to wait for an acknowledgement.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Returns this protocol with an updated acknowledgement timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+/// Message protocol accepted by `Sink::actor_ref_with_ack`.
+pub enum ActorSinkMessage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    /// Initializes an acked actor sink boundary.
+    Init {
+        /// Reply capability used by the target actor to acknowledge readiness.
+        reply_to: ReplyTo<Ack>,
+    },
+    /// One stream element plus an acknowledgement reply capability.
+    Element {
+        /// Stream element being delivered.
+        item: T,
+        /// Reply capability used by the target actor to acknowledge delivery.
+        reply_to: ReplyTo<Ack>,
+    },
+    /// The upstream source completed normally.
+    Complete,
+    /// The upstream source failed before completion.
+    Failure {
+        /// Source-side stream failure.
+        error: StreamError,
+    },
+    /// The actor sink boundary was cancelled or dropped before completion.
+    Cancelled {
+        /// Human-readable cancellation reason.
+        reason: String,
+    },
+}
+
+impl<T, Ack> Debug for ActorSinkMessage<T, Ack>
+where
+    T: Debug + Send + 'static,
+    Ack: Send + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Init { .. } => f.debug_struct("Init").finish_non_exhaustive(),
+            Self::Element { item, .. } => f
+                .debug_struct("Element")
+                .field("item", item)
+                .finish_non_exhaustive(),
+            Self::Complete => f.write_str("Complete"),
+            Self::Failure { error } => f.debug_struct("Failure").field("error", error).finish(),
+            Self::Cancelled { reason } => {
+                f.debug_struct("Cancelled").field("reason", reason).finish()
+            }
+        }
+    }
+}
+
+impl<T, Ack> ActorSinkMessage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    fn into_item(self) -> Option<T> {
+        match self {
+            Self::Element { item, .. } => Some(item),
+            Self::Init { .. } | Self::Complete | Self::Failure { .. } | Self::Cancelled { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// Message protocol accepted by `Source::actor_ref_with_ack`.
+pub enum ActorSourceMessage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    /// Enqueues one stream element and replies after bounded capacity accepts it.
+    Element {
+        /// Stream element to enqueue.
+        item: T,
+        /// Reply capability used after the element is accepted.
+        reply_to: ReplyTo<Ack>,
+    },
+    /// Completes the source normally after buffered items drain.
+    Complete,
+    /// Fails the source and wakes waiting stream consumers.
+    Failure {
+        /// Source-side stream failure.
+        error: StreamError,
+    },
+    /// Cancels the source with a reason.
+    Cancelled {
+        /// Human-readable cancellation reason.
+        reason: String,
+    },
+}
+
+impl<T, Ack> Debug for ActorSourceMessage<T, Ack>
+where
+    T: Debug + Send + 'static,
+    Ack: Send + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Element { item, .. } => f
+                .debug_struct("Element")
+                .field("item", item)
+                .finish_non_exhaustive(),
+            Self::Complete => f.write_str("Complete"),
+            Self::Failure { error } => f.debug_struct("Failure").field("error", error).finish(),
+            Self::Cancelled { reason } => {
+                f.debug_struct("Cancelled").field("reason", reason).finish()
+            }
+        }
+    }
+}
+
+/// Error returned while creating an actor-backed facade source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorSourceError {
+    /// Source stream could not be created.
+    Stream {
+        /// Stream construction failure.
+        error: StreamError,
+    },
+    /// Actor source relay could not be spawned.
+    Actor {
+        /// Actor spawn failure.
+        error: RakkaError,
+    },
+}
+
+impl Display for ActorSourceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stream { error } => Display::fmt(error, f),
+            Self::Actor { error } => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for ActorSourceError {}
+
+/// Failure returned by actor sink facade boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorStreamError<T> {
+    /// Initial acknowledgement could not be sent because the mailbox was full.
+    InitMailboxFull {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Initial acknowledgement could not be sent because the actor was closed.
+    InitMailboxClosed {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Actor mailbox was full before the item could be delivered.
+    MailboxFull {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Actor mailbox was closed before the item could be delivered.
+    MailboxClosed {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// The actor did not acknowledge before the configured timeout.
+    AckTimeout {
+        /// Timeout that elapsed.
+        timeout: Duration,
+    },
+    /// Initial acknowledgement timed out before the stream item was delivered.
+    InitAckTimeout {
+        /// Stream item that was not delivered.
+        item: T,
+        /// Timeout that elapsed.
+        timeout: Duration,
+    },
+    /// The actor dropped the acknowledgement reply channel.
+    AckDropped,
+    /// Initial acknowledgement was dropped before the stream item was delivered.
+    InitAckDropped {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// The actor replied with a value that did not match the expected ack.
+    UnexpectedAck,
+    /// Initial acknowledgement did not match before the stream item was delivered.
+    InitUnexpectedAck {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Completion signal could not be sent because the mailbox was full.
+    CompleteMailboxFull,
+    /// Completion signal could not be sent because the actor was closed.
+    CompleteMailboxClosed,
+    /// Failure or cancellation signal could not be sent because the mailbox was full.
+    SignalMailboxFull,
+    /// Failure or cancellation signal could not be sent because the actor was closed.
+    SignalMailboxClosed,
+}
+
+impl<T> ActorStreamError<T> {
+    /// Returns the undelivered stream item when the failure happened before delivery.
+    #[must_use]
+    pub const fn item(&self) -> Option<&T> {
+        match self {
+            Self::InitMailboxFull { item }
+            | Self::InitMailboxClosed { item }
+            | Self::MailboxFull { item }
+            | Self::MailboxClosed { item }
+            | Self::InitAckTimeout { item, .. }
+            | Self::InitAckDropped { item }
+            | Self::InitUnexpectedAck { item } => Some(item),
+            Self::AckTimeout { .. }
+            | Self::AckDropped
+            | Self::UnexpectedAck
+            | Self::CompleteMailboxFull
+            | Self::CompleteMailboxClosed
+            | Self::SignalMailboxFull
+            | Self::SignalMailboxClosed => None,
+        }
+    }
+
+    /// Consumes this error and returns the undelivered stream item, if any.
+    #[must_use]
+    pub fn into_item(self) -> Option<T> {
+        match self {
+            Self::InitMailboxFull { item }
+            | Self::InitMailboxClosed { item }
+            | Self::MailboxFull { item }
+            | Self::MailboxClosed { item }
+            | Self::InitAckTimeout { item, .. }
+            | Self::InitAckDropped { item }
+            | Self::InitUnexpectedAck { item } => Some(item),
+            Self::AckTimeout { .. }
+            | Self::AckDropped
+            | Self::UnexpectedAck
+            | Self::CompleteMailboxFull
+            | Self::CompleteMailboxClosed
+            | Self::SignalMailboxFull
+            | Self::SignalMailboxClosed => None,
+        }
+    }
+}
+
+impl<T> Display for ActorStreamError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InitMailboxFull { .. } => {
+                f.write_str("actor sink init mailbox was full before item delivery")
+            }
+            Self::InitMailboxClosed { .. } => {
+                f.write_str("actor sink init mailbox was closed before item delivery")
+            }
+            Self::MailboxFull { .. } => f.write_str("actor sink mailbox was full"),
+            Self::MailboxClosed { .. } => f.write_str("actor sink mailbox was closed"),
+            Self::AckTimeout { timeout } => {
+                write!(f, "actor sink acknowledgement timed out after {timeout:?}")
+            }
+            Self::InitAckTimeout { timeout, .. } => write!(
+                f,
+                "actor sink init acknowledgement timed out after {timeout:?} before item delivery"
+            ),
+            Self::AckDropped => f.write_str("actor sink acknowledgement channel was dropped"),
+            Self::InitAckDropped { .. } => f.write_str(
+                "actor sink init acknowledgement channel was dropped before item delivery",
+            ),
+            Self::UnexpectedAck => f.write_str("actor sink acknowledgement did not match"),
+            Self::InitUnexpectedAck { .. } => {
+                f.write_str("actor sink init acknowledgement did not match before item delivery")
+            }
+            Self::CompleteMailboxFull => f.write_str("actor sink completion mailbox was full"),
+            Self::CompleteMailboxClosed => f.write_str("actor sink completion mailbox was closed"),
+            Self::SignalMailboxFull => f.write_str("actor sink signal mailbox was full"),
+            Self::SignalMailboxClosed => f.write_str("actor sink signal mailbox was closed"),
+        }
+    }
+}
+
+impl<T> Error for ActorStreamError<T> where T: Debug {}
 
 /// Materialization settings shared by stream facade sources, flows, and sinks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +578,42 @@ impl<T> Source<T> {
         T: Send + 'static,
     {
         Self::queue(capacity)
+    }
+
+    /// Spawns an actor reference that forwards received messages into a bounded source.
+    pub fn actor_ref(
+        system: &ActorSystem,
+        name: impl AsRef<str>,
+        capacity: usize,
+    ) -> Result<(ActorRef<T>, Self), ActorSourceError>
+    where
+        T: Message,
+    {
+        let (sink, source) =
+            bounded_channel(capacity).map_err(|error| ActorSourceError::Stream { error })?;
+        let actor = system
+            .spawn_actor(name, FacadeActorSourceActor::new(sink))
+            .map_err(|error| ActorSourceError::Actor { error })?;
+        Ok((actor, Self::from_stream_source(source)))
+    }
+
+    /// Spawns an acked actor reference that forwards accepted messages into a bounded source.
+    pub fn actor_ref_with_ack<Ack>(
+        system: &ActorSystem,
+        name: impl AsRef<str>,
+        capacity: usize,
+        protocol: AckProtocol<Ack>,
+    ) -> Result<(ActorRef<ActorSourceMessage<T, Ack>>, Self), ActorSourceError>
+    where
+        T: Send + 'static,
+        Ack: Clone + Send + 'static,
+    {
+        let (sink, source) =
+            bounded_channel(capacity).map_err(|error| ActorSourceError::Stream { error })?;
+        let actor = system
+            .spawn_actor(name, FacadeAckedActorSourceActor::new(sink, protocol))
+            .map_err(|error| ActorSourceError::Actor { error })?;
+        Ok((actor, Self::from_stream_source(source)))
     }
 
     /// Returns true when this source is the empty source vocabulary shape.
@@ -471,14 +846,16 @@ impl<T> Source<T> {
         T: Send + 'static,
         M: Send + 'static,
     {
-        while let Some(item) = self
-            .next_item()
-            .await
-            .map_err(|error| StreamRunError::Source { error })?
-        {
-            sink.consume(item).await?;
+        loop {
+            match self.next_item().await {
+                Ok(Some(item)) => sink.consume(item).await?,
+                Ok(None) => return Ok(sink.finish()),
+                Err(error) => {
+                    sink.source_failed(error.clone());
+                    return Err(StreamRunError::Source { error });
+                }
+            }
         }
-        Ok(sink.finish())
     }
 
     /// Collects this source into a vector.
@@ -700,6 +1077,41 @@ where
             settings: StreamRunSettings::default(),
         }
     }
+
+    /// Creates a sink facade that forwards each item to an actor without acknowledgements.
+    #[must_use]
+    pub fn actor_ref(actor: ActorRef<T>) -> Self
+    where
+        T: Message,
+    {
+        Self {
+            stage: Box::new(ActorRefSinkStage { actor, count: 0 }),
+            kind: SinkKind::ActorRef,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates an acked actor sink facade using `ActorSinkMessage<T, Ack>`.
+    #[must_use]
+    pub fn actor_ref_with_ack<Ack>(
+        actor: ActorRef<ActorSinkMessage<T, Ack>>,
+        protocol: AckProtocol<Ack>,
+    ) -> Self
+    where
+        Ack: Clone + PartialEq + Send + 'static,
+    {
+        Self {
+            stage: Box::new(ActorRefWithAckSinkStage {
+                actor,
+                protocol,
+                initialized: false,
+                completed: false,
+                count: 0,
+            }),
+            kind: SinkKind::ActorRefWithAck,
+            settings: StreamRunSettings::default(),
+        }
+    }
 }
 
 impl<T, M> Sink<T, M>
@@ -753,6 +1165,10 @@ where
 {
     async fn consume(&mut self, item: T) -> StreamRunResult<T, ()> {
         self.stage.consume(item).await
+    }
+
+    fn source_failed(&mut self, error: StreamError) {
+        self.stage.source_failed(error);
     }
 
     fn finish(self) -> M {
@@ -1354,6 +1770,8 @@ enum SinkKind {
     Foreach,
     Fold,
     StreamSink,
+    ActorRef,
+    ActorRefWithAck,
 }
 
 trait SinkStage<T, M> {
@@ -1361,6 +1779,8 @@ trait SinkStage<T, M> {
         &'a mut self,
         item: T,
     ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>>;
+
+    fn source_failed(&mut self, _error: StreamError) {}
 
     fn finish(self: Box<Self>) -> M;
 }
@@ -1485,6 +1905,373 @@ where
 
     fn finish(self: Box<Self>) -> usize {
         self.count
+    }
+}
+
+struct ActorRefSinkStage<T>
+where
+    T: Message,
+{
+    actor: ActorRef<T>,
+    count: usize,
+}
+
+impl<T> SinkStage<T, usize> for ActorRefSinkStage<T>
+where
+    T: Message,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        let result = self
+            .actor
+            .tell(item)
+            .map_err(|error| StreamRunError::Actor {
+                error: actor_stream_error_from_tell(error),
+            });
+        if result.is_ok() {
+            self.count = self.count.saturating_add(1);
+        }
+        Box::pin(async move { result })
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        self.count
+    }
+}
+
+struct ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    actor: ActorRef<ActorSinkMessage<T, Ack>>,
+    protocol: AckProtocol<Ack>,
+    initialized: bool,
+    completed: bool,
+    count: usize,
+}
+
+impl<T, Ack> ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    async fn ensure_initialized(&mut self, item: T) -> Result<T, StreamRunError<T>> {
+        if self.initialized {
+            return Ok(item);
+        }
+
+        match self.ask_init().await {
+            Ok(()) => {
+                self.initialized = true;
+                Ok(item)
+            }
+            Err(ActorControlAckError::MailboxFull) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitMailboxFull { item },
+            }),
+            Err(ActorControlAckError::MailboxClosed) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitMailboxClosed { item },
+            }),
+            Err(ActorControlAckError::Timeout) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitAckTimeout {
+                    item,
+                    timeout: self.protocol.timeout(),
+                },
+            }),
+            Err(ActorControlAckError::Dropped) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitAckDropped { item },
+            }),
+            Err(ActorControlAckError::UnexpectedAck) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitUnexpectedAck { item },
+            }),
+        }
+    }
+
+    async fn ask_init(&mut self) -> Result<(), ActorControlAckError> {
+        let (sender, receiver) = oneshot::channel();
+        let message = ActorSinkMessage::Init {
+            reply_to: ReplyTo::new(sender),
+        };
+        self.actor
+            .tell(message)
+            .map_err(control_error_from_sink_tell)?;
+        Self::await_ack(
+            self.protocol.timeout(),
+            self.protocol.ack().clone(),
+            receiver,
+        )
+        .await
+    }
+
+    async fn ask_item(&mut self, item: T) -> StreamRunResult<T, ()> {
+        let (sender, receiver) = oneshot::channel();
+        let message = ActorSinkMessage::Element {
+            item,
+            reply_to: ReplyTo::new(sender),
+        };
+
+        self.actor.tell(message).map_err(|error| {
+            let error = match error {
+                TellError::Full(message) => {
+                    let item = message
+                        .into_item()
+                        .expect("element tell error should preserve stream item");
+                    ActorStreamError::MailboxFull { item }
+                }
+                TellError::Closed(message) => {
+                    let item = message
+                        .into_item()
+                        .expect("element tell error should preserve stream item");
+                    ActorStreamError::MailboxClosed { item }
+                }
+            };
+            StreamRunError::Actor { error }
+        })?;
+
+        Self::await_ack(
+            self.protocol.timeout(),
+            self.protocol.ack().clone(),
+            receiver,
+        )
+        .await
+        .map_err(|error| {
+            let error = match error {
+                ActorControlAckError::MailboxFull | ActorControlAckError::MailboxClosed => {
+                    unreachable!("mailbox failures are handled before awaiting item ack")
+                }
+                ActorControlAckError::Timeout => ActorStreamError::AckTimeout {
+                    timeout: self.protocol.timeout(),
+                },
+                ActorControlAckError::Dropped => ActorStreamError::AckDropped,
+                ActorControlAckError::UnexpectedAck => ActorStreamError::UnexpectedAck,
+            };
+            StreamRunError::Actor { error }
+        })?;
+
+        self.count = self.count.saturating_add(1);
+        Ok(())
+    }
+
+    async fn await_ack(
+        timeout: Duration,
+        expected_ack: Ack,
+        receiver: oneshot::Receiver<Ack>,
+    ) -> Result<(), ActorControlAckError> {
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(ack)) if ack == expected_ack => Ok(()),
+            Ok(Ok(_unexpected)) => Err(ActorControlAckError::UnexpectedAck),
+            Ok(Err(_dropped)) => Err(ActorControlAckError::Dropped),
+            Err(_elapsed) => Err(ActorControlAckError::Timeout),
+        }
+    }
+
+    fn send_complete(&mut self) -> Result<(), ActorControlDeliveryError> {
+        self.actor
+            .tell(ActorSinkMessage::Complete)
+            .map_err(delivery_error_from_sink_tell)
+    }
+
+    fn send_signal(
+        &mut self,
+        message: ActorSinkMessage<T, Ack>,
+    ) -> Result<(), ActorControlDeliveryError> {
+        self.actor
+            .tell(message)
+            .map_err(delivery_error_from_sink_tell)
+    }
+}
+
+impl<T, Ack> SinkStage<T, usize> for ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        Box::pin(async move {
+            let item = self.ensure_initialized(item).await?;
+            self.ask_item(item).await
+        })
+    }
+
+    fn source_failed(&mut self, error: StreamError) {
+        if !self.completed {
+            let _ignored = self.send_signal(ActorSinkMessage::Failure { error });
+            self.completed = true;
+        }
+    }
+
+    fn finish(mut self: Box<Self>) -> usize {
+        if !self.completed {
+            let _ignored = self.send_complete();
+            self.completed = true;
+        }
+        self.count
+    }
+}
+
+impl<T, Ack> Drop for ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ignored = self.send_signal(ActorSinkMessage::Cancelled {
+                reason: "actor sink dropped".to_string(),
+            });
+            self.completed = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorControlAckError {
+    MailboxFull,
+    MailboxClosed,
+    Timeout,
+    Dropped,
+    UnexpectedAck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorControlDeliveryError {
+    MailboxFull,
+    MailboxClosed,
+}
+
+fn actor_stream_error_from_tell<T>(error: TellError<T>) -> ActorStreamError<T>
+where
+    T: Message,
+{
+    match error {
+        TellError::Full(item) => ActorStreamError::MailboxFull { item },
+        TellError::Closed(item) => ActorStreamError::MailboxClosed { item },
+    }
+}
+
+fn control_error_from_sink_tell<T, Ack>(
+    error: TellError<ActorSinkMessage<T, Ack>>,
+) -> ActorControlAckError
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    match error {
+        TellError::Full(_message) => ActorControlAckError::MailboxFull,
+        TellError::Closed(_message) => ActorControlAckError::MailboxClosed,
+    }
+}
+
+fn delivery_error_from_sink_tell<T, Ack>(
+    error: TellError<ActorSinkMessage<T, Ack>>,
+) -> ActorControlDeliveryError
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    match error {
+        TellError::Full(_message) => ActorControlDeliveryError::MailboxFull,
+        TellError::Closed(_message) => ActorControlDeliveryError::MailboxClosed,
+    }
+}
+
+struct FacadeActorSourceActor<T>
+where
+    T: Send + 'static,
+{
+    sink: StreamSink<T>,
+}
+
+impl<T> FacadeActorSourceActor<T>
+where
+    T: Send + 'static,
+{
+    fn new(sink: StreamSink<T>) -> Self {
+        Self { sink }
+    }
+}
+
+impl<T> Actor for FacadeActorSourceActor<T>
+where
+    T: Send + 'static,
+{
+    type Msg = T;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        actor_future(async move {
+            match self.sink.send(msg).await {
+                Ok(()) => Ok(ActorAction::Continue),
+                Err(_closed) => Ok(ActorAction::Stop),
+            }
+        })
+    }
+}
+
+struct FacadeAckedActorSourceActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    sink: StreamSink<T>,
+    protocol: AckProtocol<Ack>,
+}
+
+impl<T, Ack> FacadeAckedActorSourceActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    fn new(sink: StreamSink<T>, protocol: AckProtocol<Ack>) -> Self {
+        Self { sink, protocol }
+    }
+}
+
+impl<T, Ack> Actor for FacadeAckedActorSourceActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    type Msg = ActorSourceMessage<T, Ack>;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        actor_future(async move {
+            match msg {
+                ActorSourceMessage::Element { item, reply_to } => {
+                    match self.sink.send(item).await {
+                        Ok(()) => {
+                            let _ignored = reply_to.reply(self.protocol.ack().clone());
+                            Ok(ActorAction::Continue)
+                        }
+                        Err(_closed) => Ok(ActorAction::Stop),
+                    }
+                }
+                ActorSourceMessage::Complete => {
+                    let _ignored = self.sink.drain();
+                    Ok(ActorAction::Stop)
+                }
+                ActorSourceMessage::Failure { error } => {
+                    let _dropped = self.sink.cancel(error.to_string());
+                    Ok(ActorAction::Stop)
+                }
+                ActorSourceMessage::Cancelled { reason } => {
+                    let _dropped = self.sink.cancel(reason);
+                    Ok(ActorAction::Stop)
+                }
+            }
+        })
     }
 }
 
