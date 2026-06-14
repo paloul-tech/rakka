@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6A
+Status: implemented through Slice 6B
 Date: 2026-06-14
 
 ## Purpose
@@ -179,6 +179,8 @@ cargo doc -p rakka-stream --no-deps
 
 Goal: make simple streams runnable through the facade.
 
+Status: implemented.
+
 Scope:
 
 - Add source constructors:
@@ -209,6 +211,21 @@ Acceptance criteria:
 - `Sink::fold` returns the expected accumulator.
 - `Source::from_stream_source` preserves closed and cancelled errors.
 - Default capacities are bounded and observable.
+
+Implementation status:
+
+- Added source constructors for empty, single-item, iterator-backed, low-level
+  `StreamSource<T>`-backed, and bounded queue sources.
+- Added sink constructors for ignore, collect, foreach, fold, and low-level
+  `StreamSink<T>` forwarding.
+- Added `Source::run_with`, `Source::run_collect`, `Source::run_foreach`, and
+  `RunnableStream::run`.
+- Added `StreamRunError<T>` and `StreamRunResult<T, M>` so source lifecycle
+  errors and sink send errors remain typed during materialization.
+- Added facade tests covering finite source collection, foreach, fold,
+  `source.to(sink).run()`, low-level source/sink wrapping, and source/sink
+  lifecycle errors.
+- Updated the Phase 6 streams guide with runnable materialization examples.
 
 Review commands:
 

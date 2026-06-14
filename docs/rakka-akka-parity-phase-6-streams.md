@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6A facade vocabulary
+Status: implemented through Slice 6B materialization basics
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -52,9 +52,9 @@ That runtime owns the precise lifecycle semantics:
 - cancellation with a reason;
 - typed stream errors.
 
-## Slice 6A Vocabulary
+## Facade Vocabulary
 
-Slice 6A adds the public facade names without changing runtime behavior:
+Slice 6A added the public facade names:
 
 ```rust
 use rakka_stream::{Flow, Sink, Source, StreamRunSettings};
@@ -72,9 +72,35 @@ assert!(flow.is_identity());
 assert_eq!(runnable.source_settings().stream_name(), Some("orders"));
 ```
 
-The facade descriptors are intentionally inert in Slice 6A. Actual
-materialization, operators, actor/entity boundaries, and test probes arrive in
-later slices.
+## Materialization Basics
+
+Slice 6B makes finite and low-level bounded sources runnable through terminal
+sinks:
+
+```rust
+let collected = Source::from_iter([1, 2, 3])
+    .run_collect()
+    .await?;
+assert_eq!(collected, vec![1, 2, 3]);
+
+let sum = Source::from_iter([1, 2, 3])
+    .run_with(Sink::fold(0, |sum, item| sum + item))
+    .await?;
+assert_eq!(sum, 6);
+```
+
+The facade can also bridge existing low-level bounded primitives:
+
+```rust
+let (sink, source) = rakka_stream::bounded_channel(8)?;
+sink.send("work").await?;
+sink.drain()?;
+
+let items = Source::from_stream_source(source).run_collect().await?;
+assert_eq!(items, vec!["work"]);
+```
+
+Operators, actor/entity boundaries, and test probes arrive in later slices.
 
 ## Design Rules
 
@@ -85,4 +111,3 @@ later slices.
   wherever the public API can return the message.
 - Testkit probes should replace sleeps in stream tests once demand and
   materialization APIs exist.
-

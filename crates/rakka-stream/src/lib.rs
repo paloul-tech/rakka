@@ -32,7 +32,9 @@ pub use adapters::{
     EntitySink, EntitySinkError, EntitySinkResult, StreamPipeError, StreamPipeResult,
     StreamPipeSummary,
 };
-pub use facade::{Flow, RunnableStream, Sink, Source, StreamRunSettings};
+pub use facade::{
+    Flow, RunnableStream, Sink, Source, StreamRunError, StreamRunResult, StreamRunSettings,
+};
 #[cfg(feature = "process-io")]
 pub use process_io::{
     managed_process_stderr_stream, managed_process_stdin_sink, managed_process_stdout_stream,

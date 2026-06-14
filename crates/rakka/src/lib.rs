@@ -123,7 +123,7 @@ pub mod prelude {
     #[cfg(feature = "stream")]
     pub use rakka_stream::{
         BoundedStream, Flow, RunnableStream, Sink, Source, StreamError, StreamResult,
-        StreamRunSettings, StreamSink, StreamSource,
+        StreamRunError, StreamRunResult, StreamRunSettings, StreamSink, StreamSource,
     };
 }
 
