@@ -75,6 +75,11 @@ pub enum StreamError {
         /// Optional human-readable cancellation reason.
         reason: Option<String>,
     },
+    /// A facade operator failed while processing the stream.
+    Operator {
+        /// Human-readable operator failure message.
+        message: String,
+    },
 }
 
 impl StreamError {
@@ -93,6 +98,7 @@ impl StreamError {
             Self::Draining => "draining",
             Self::Closed => "closed",
             Self::Cancelled { .. } => "cancelled",
+            Self::Operator { .. } => "operator-error",
         }
     }
 
@@ -101,7 +107,10 @@ impl StreamError {
     pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::InvalidCapacity { .. } | Self::Closed | Self::Cancelled { .. }
+            Self::InvalidCapacity { .. }
+                | Self::Closed
+                | Self::Cancelled { .. }
+                | Self::Operator { .. }
         )
     }
 }
@@ -119,6 +128,7 @@ impl Display for StreamError {
                 Some(reason) => write!(f, "stream was cancelled: {reason}"),
                 None => f.write_str("stream was cancelled"),
             },
+            Self::Operator { message } => write!(f, "stream operator failed: {message}"),
         }
     }
 }

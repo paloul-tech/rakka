@@ -62,6 +62,11 @@ pub enum GrpcError {
     StreamClosed,
     /// Stream was cancelled.
     StreamCancelled,
+    /// Stream facade operator failed while processing an item.
+    StreamOperator {
+        /// Operator failure detail.
+        message: String,
+    },
     /// RPC was cancelled by the caller.
     Cancelled,
     /// Actor mailbox was full.
@@ -192,6 +197,7 @@ impl GrpcError {
             Self::StreamDraining => "stream-draining",
             Self::StreamClosed => "stream-closed",
             Self::StreamCancelled => "stream-cancelled",
+            Self::StreamOperator { .. } => "stream-operator-error",
             Self::Cancelled => "cancelled",
             Self::ActorMailboxFull => "actor-mailbox-full",
             Self::ActorMailboxClosed => "actor-mailbox-closed",
@@ -240,6 +246,7 @@ impl GrpcError {
             Self::Service { .. }
             | Self::StreamPump { .. }
             | Self::StreamInvalidCapacity { .. }
+            | Self::StreamOperator { .. }
             | Self::EntitySpawnFailed { .. }
             | Self::EntityRemoteEncode { .. } => Code::Internal,
         }
@@ -310,6 +317,7 @@ impl GrpcError {
             StreamError::Draining => Self::StreamDraining,
             StreamError::Closed => Self::StreamClosed,
             StreamError::Cancelled { .. } => Self::StreamCancelled,
+            StreamError::Operator { message } => Self::StreamOperator { message },
         }
     }
 
@@ -369,6 +377,9 @@ impl Display for GrpcError {
             Self::StreamDraining => f.write_str("gRPC stream is draining"),
             Self::StreamClosed => f.write_str("gRPC stream is closed"),
             Self::StreamCancelled => f.write_str("gRPC stream was cancelled"),
+            Self::StreamOperator { message } => {
+                write!(f, "gRPC stream operator failed: {message}")
+            }
             Self::Cancelled => f.write_str("gRPC request was cancelled"),
             Self::ActorMailboxFull => f.write_str("actor mailbox was full"),
             Self::ActorMailboxClosed => f.write_str("actor mailbox was closed"),

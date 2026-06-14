@@ -1,6 +1,10 @@
 //! Stream facade vocabulary tests.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 
 use rakka_stream::{
     bounded_channel, Flow, Sink, Source, StreamError, StreamRunError, StreamRunSettings,
@@ -249,4 +253,160 @@ async fn take_zero_completes_without_waiting_and_cancels_upstream_queue() {
     ));
     assert_eq!(send_error.item(), "blocked");
     assert_eq!(sink.status().dropped_items(), 1);
+}
+
+#[tokio::test]
+async fn stream_facade_async_map_async_one_behaves_like_sequential_map() {
+    let values = Source::from_iter([1, 2, 3])
+        .map_async(1, |item| async move { item * 2 })
+        .unwrap()
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(values, vec![2, 4, 6]);
+}
+
+#[tokio::test]
+async fn stream_facade_async_map_async_preserves_order_when_futures_complete_out_of_order() {
+    let values = Source::from_iter([1_u64, 2, 3])
+        .map_async(3, |item| async move {
+            tokio::time::sleep(Duration::from_millis((4 - item) * 10)).await;
+            item
+        })
+        .unwrap()
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(values, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn stream_facade_async_map_async_rejects_zero_parallelism() {
+    let error = Source::from_iter([1])
+        .map_async(0, |item| async move { item })
+        .unwrap_err();
+
+    assert_eq!(error.code(), "operator-error");
+    assert!(matches!(
+        error,
+        StreamError::Operator { message }
+            if message == "map_async parallelism must be greater than zero"
+    ));
+}
+
+#[tokio::test]
+async fn stream_facade_async_map_async_limits_in_flight_work_to_parallelism() {
+    let current = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+
+    let values = Source::from_iter([1, 2, 3, 4])
+        .map_async(2, {
+            let current = Arc::clone(&current);
+            let max = Arc::clone(&max);
+            move |item| {
+                let current = Arc::clone(&current);
+                let max = Arc::clone(&max);
+                async move {
+                    let in_flight = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(in_flight, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    item
+                }
+            }
+        })
+        .unwrap()
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(values, vec![1, 2, 3, 4]);
+    assert_eq!(max.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn stream_facade_async_flow_from_async_fn_applies_through_via() {
+    let flow = Flow::from_async_fn(2, |item| async move { format!("item-{item}") }).unwrap();
+    let values = Source::from_iter([1, 2, 3])
+        .via(flow)
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        values,
+        vec![
+            "item-1".to_owned(),
+            "item-2".to_owned(),
+            "item-3".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stream_facade_async_map_async_task_failure_surfaces_operator_error() {
+    let error = Source::from_iter([1_u64])
+        .map_async(1, |item| async move {
+            if item == 1 {
+                panic!("boom");
+            }
+            item
+        })
+        .unwrap()
+        .run_collect()
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "source-error");
+    assert!(matches!(
+        error.source_error(),
+        Some(StreamError::Operator { message }) if message.contains("map_async task failed")
+    ));
+}
+
+#[tokio::test]
+async fn stream_facade_async_take_cancels_in_flight_map_async_tasks() {
+    struct DropGuard(Arc<AtomicUsize>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let never_release = Arc::new(tokio::sync::Notify::new());
+
+    let values = Source::from_iter([1, 2])
+        .map_async(2, {
+            let dropped = Arc::clone(&dropped);
+            let never_release = Arc::clone(&never_release);
+            move |item| {
+                let dropped = Arc::clone(&dropped);
+                let never_release = Arc::clone(&never_release);
+                async move {
+                    if item == 2 {
+                        let _guard = DropGuard(dropped);
+                        never_release.notified().await;
+                    }
+                    item
+                }
+            }
+        })
+        .unwrap()
+        .take(1)
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(values, vec![1]);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while dropped.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }

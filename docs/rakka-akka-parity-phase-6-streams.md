@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6C linear operators
+Status: implemented through Slice 6D async operators and back-pressure
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -127,8 +127,47 @@ let values = Source::from_iter([1, 2, 3])
 `take(n)` completes as soon as `n` elements are emitted. When it stops early it
 cancels its upstream source boundary, which wakes blocked bounded producers.
 
-Async operators, actor/entity boundaries, fan-in/fan-out, and test probes
-arrive in later slices.
+## Async Operators
+
+Slice 6D adds ordered `map_async`, matching Akka's default `mapAsync`
+behavior:
+
+```rust
+let values = Source::from_iter([1, 2, 3])
+    .map_async(2, |item| async move {
+        enrich(item).await
+    })?
+    .run_collect()
+    .await?;
+```
+
+At most `parallelism` mapper futures are in flight at once, and outputs are
+emitted in source order even when later futures complete first. A parallelism
+of zero is rejected with `StreamError::Operator`.
+
+The same behavior is available as a flow:
+
+```rust
+let flow = Flow::from_async_fn(4, |item| async move {
+    format!("item-{item}")
+})?;
+
+let values = Source::from_iter([1, 2, 3])
+    .via(flow)
+    .run_collect()
+    .await?;
+```
+
+When downstream cancels early, for example through `take(n)`, in-flight async
+mapper tasks are aborted where the Tokio runtime permits it. Mapper task
+failures surface as source-side `StreamRunError::Source` values containing
+`StreamError::Operator`.
+
+`map_async_unordered` is intentionally left as a follow-up so the first-path
+API remains ordered and easy to reason about.
+
+Actor/entity boundaries, fan-in/fan-out, and test probes arrive in later
+slices.
 
 ## Design Rules
 

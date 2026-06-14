@@ -7,6 +7,8 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 
+use tokio::task::JoinHandle;
+
 use crate::{
     bounded_channel, StreamError, StreamResult, StreamSendError, StreamSink, StreamSource,
     DEFAULT_BUFFER_CAPACITY,
@@ -275,6 +277,43 @@ impl<T> Source<T> {
         }
     }
 
+    /// Transforms each source element with an ordered asynchronous mapper.
+    ///
+    /// At most `parallelism` mapper futures are in flight at once. Outputs are
+    /// emitted in source order, matching Akka's ordered `mapAsync` behavior.
+    pub fn map_async<O, F, Fut>(self, parallelism: usize, mapper: F) -> StreamResult<Source<O>>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        validate_parallelism("map_async", parallelism)?;
+        Ok(self.map_async_validated(parallelism, mapper))
+    }
+
+    fn map_async_validated<O, F, Fut>(self, parallelism: usize, mapper: F) -> Source<O>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let settings = self.settings.clone();
+        Source {
+            stage: Box::new(MapAsyncStage {
+                upstream: self,
+                mapper,
+                parallelism,
+                in_flight: VecDeque::new(),
+                upstream_done: false,
+                _output: PhantomData,
+                _future: PhantomData,
+            }),
+            settings,
+        }
+    }
+
     /// Keeps source elements that satisfy `predicate`.
     #[must_use]
     pub fn filter<F>(self, predicate: F) -> Self
@@ -440,6 +479,20 @@ where
             settings: StreamRunSettings::default(),
             transform: Box::new(move |source| source.map(mapper)),
         }
+    }
+
+    /// Creates a flow that maps each input with an ordered asynchronous mapper.
+    pub fn from_async_fn<F, Fut>(parallelism: usize, mapper: F) -> StreamResult<Self>
+    where
+        F: FnMut(I) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        validate_parallelism("map_async", parallelism)?;
+        Ok(Self {
+            kind: FlowKind::MapAsync,
+            settings: StreamRunSettings::default(),
+            transform: Box::new(move |source| source.map_async_validated(parallelism, mapper)),
+        })
     }
 
     /// Run settings associated with this flow.
@@ -768,6 +821,100 @@ where
     }
 }
 
+struct MapAsyncStage<I, O, F, Fut>
+where
+    F: FnMut(I) -> Fut,
+{
+    upstream: Source<I>,
+    mapper: F,
+    parallelism: usize,
+    in_flight: VecDeque<JoinHandle<O>>,
+    upstream_done: bool,
+    _output: PhantomData<fn() -> O>,
+    _future: PhantomData<fn() -> Fut>,
+}
+
+impl<I, O, F, Fut> MapAsyncStage<I, O, F, Fut>
+where
+    F: FnMut(I) -> Fut,
+{
+    async fn fill_in_flight(&mut self) -> StreamResult<()>
+    where
+        I: Send + 'static,
+        O: Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        while !self.upstream_done && self.in_flight.len() < self.parallelism {
+            match self.upstream.next_item().await? {
+                Some(item) => {
+                    let future = (self.mapper)(item);
+                    self.in_flight.push_back(tokio::spawn(future));
+                }
+                None => self.upstream_done = true,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn abort_in_flight(&mut self) {
+        for handle in self.in_flight.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl<I, O, F, Fut> Drop for MapAsyncStage<I, O, F, Fut>
+where
+    F: FnMut(I) -> Fut,
+{
+    fn drop(&mut self) {
+        self.abort_in_flight();
+    }
+}
+
+impl<I, O, F, Fut> SourceStage<O> for MapAsyncStage<I, O, F, Fut>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: FnMut(I) -> Fut + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<O>>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Err(error) = self.fill_in_flight().await {
+                self.abort_in_flight();
+                return Err(error);
+            }
+
+            let Some(handle) = self.in_flight.pop_front() else {
+                return Ok(None);
+            };
+
+            match handle.await {
+                Ok(output) => Ok(Some(output)),
+                Err(error) => {
+                    self.abort_in_flight();
+                    Err(StreamError::Operator {
+                        message: format!("map_async task failed: {error}"),
+                    })
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.abort_in_flight();
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::MapAsync
+    }
+}
+
 struct FilterStage<T, F>
 where
     F: FnMut(&T) -> bool,
@@ -858,6 +1005,7 @@ enum SourceKind {
     Items,
     StreamSource,
     Map,
+    MapAsync,
     Filter,
     Take,
 }
@@ -866,6 +1014,7 @@ enum SourceKind {
 enum FlowKind {
     Identity,
     Map,
+    MapAsync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1012,6 +1161,16 @@ where
 fn validate_capacity(capacity: usize) -> StreamResult<()> {
     if capacity == 0 {
         Err(StreamError::InvalidCapacity { capacity })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_parallelism(operator: &str, parallelism: usize) -> StreamResult<()> {
+    if parallelism == 0 {
+        Err(StreamError::Operator {
+            message: format!("{operator} parallelism must be greater than zero"),
+        })
     } else {
         Ok(())
     }

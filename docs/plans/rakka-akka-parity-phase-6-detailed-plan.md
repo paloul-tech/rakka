@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6C
+Status: implemented through Slice 6D
 Date: 2026-06-14
 
 ## Purpose
@@ -295,6 +295,8 @@ cargo clippy -p rakka-stream --all-targets -- -D warnings
 Goal: add `map_async` while proving bounded back-pressure, cancellation, and
 error propagation.
 
+Status: implemented.
+
 Scope:
 
 - Add `map_async(parallelism, fn)`.
@@ -318,6 +320,27 @@ Acceptance criteria:
 - Cancelling a run stops in-flight operator tasks where possible and marks the
   stream cancelled.
 - Operator errors surface to the materialized result.
+
+Implementation status:
+
+- Added ordered `Source::map_async(parallelism, fn)` returning a typed
+  `StreamResult<Source<_>>`.
+- Added `Flow::from_async_fn(parallelism, fn)` for the same ordered async
+  behavior through `via(flow)`.
+- Added `StreamError::Operator` with stable `operator-error` code for invalid
+  async operator configuration and task join failures.
+- Rejected zero parallelism at construction time with a typed operator error.
+- Kept `map_async_unordered` out of this slice so ordered Akka-like
+  `mapAsync` remains the default first-path API.
+- Implemented bounded in-flight work: the stage pulls and spawns at most
+  `parallelism` mapper futures ahead of downstream demand.
+- Propagated cancellation through `take` and dropped materialized source
+  stages by aborting in-flight async mapper tasks where Tokio permits it.
+- Added focused tests for sequential parity, ordered out-of-order completion,
+  zero parallelism, bounded in-flight work, flow usage, task failure surfacing,
+  and cancellation of in-flight async tasks.
+- Updated the Phase 6 streams guide with async operator examples and the
+  ordered/unordered decision.
 
 Review commands:
 
