@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6F actor source and sink boundaries
+Status: implemented through Slice 6G entity sink integration
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -259,7 +259,40 @@ let (actor_ref, source) = Source::actor_ref_with_ack(
 )?;
 ```
 
-Entity boundaries and test probes arrive in later slices.
+## Entity Boundaries
+
+Slice 6G adds sharded entity sink integration behind the existing
+`rakka-stream` `adapters` feature.
+
+Use `Sink::entity_ref` when the caller already has a `ShardRegion<M>` and
+logical `EntityRef<M>`:
+
+```rust
+let delivered = Source::from_iter(commands)
+    .run_with(Sink::entity_ref(region, entity_ref))
+    .await?;
+```
+
+Use `Sink::sharded_entity_ref` with the higher-level sharding facade reference:
+
+```rust
+let delivered = Source::from_iter(commands)
+    .run_with(Sink::sharded_entity_ref(cart))
+    .await?;
+```
+
+No-route and delivery failures surface as `StreamRunError::Entity` and reuse
+`EntitySinkError<M>`, preserving the undelivered stream item. Region semantics
+remain owned by sharding: owner refresh, passivation buffering, shard handoff
+buffering, and routing failure behavior are whatever the provided `ShardRegion`
+would normally do for `tell`.
+
+Entity sources are intentionally not implicit. When an entity needs to emit a
+stream, use the actor-backed source boundary from Slice 6F or send to an
+explicit `Source::actor_ref`/`Source::actor_ref_with_ack` boundary. This keeps
+streams from pretending arbitrary entities are queryable sources.
+
+Test probes arrive in later slices.
 
 ## Design Rules
 

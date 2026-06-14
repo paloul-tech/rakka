@@ -13,6 +13,8 @@ use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, Message, RakkaError,
     ReplyTo, TellError,
 };
+#[cfg(feature = "adapters")]
+use rakka_sharding::{EntityRef, EntityTellError, ShardRegion, ShardedEntityRef};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -43,6 +45,12 @@ pub enum StreamRunError<T> {
         /// Actor boundary failure.
         error: ActorStreamError<T>,
     },
+    /// The sharded entity sink boundary failed while routing an item.
+    #[cfg(feature = "adapters")]
+    Entity {
+        /// Entity boundary failure.
+        error: crate::EntitySinkError<T>,
+    },
 }
 
 impl<T> StreamRunError<T> {
@@ -53,6 +61,8 @@ impl<T> StreamRunError<T> {
             Self::Source { .. } => "source-error",
             Self::Sink { .. } => "sink-error",
             Self::Actor { .. } => "actor-error",
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => "entity-error",
         }
     }
 
@@ -62,6 +72,8 @@ impl<T> StreamRunError<T> {
         match self {
             Self::Source { error } => Some(error),
             Self::Sink { .. } | Self::Actor { .. } => None,
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => None,
         }
     }
 
@@ -70,6 +82,8 @@ impl<T> StreamRunError<T> {
     pub const fn sink_error(&self) -> Option<&StreamSendError<T>> {
         match self {
             Self::Source { .. } | Self::Actor { .. } => None,
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => None,
             Self::Sink { error } => Some(error),
         }
     }
@@ -79,7 +93,19 @@ impl<T> StreamRunError<T> {
     pub const fn actor_error(&self) -> Option<&ActorStreamError<T>> {
         match self {
             Self::Source { .. } | Self::Sink { .. } => None,
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => None,
             Self::Actor { error } => Some(error),
+        }
+    }
+
+    /// Returns the entity boundary error when this is a sharded entity sink failure.
+    #[cfg(feature = "adapters")]
+    #[must_use]
+    pub const fn entity_error(&self) -> Option<&crate::EntitySinkError<T>> {
+        match self {
+            Self::Source { .. } | Self::Sink { .. } | Self::Actor { .. } => None,
+            Self::Entity { error } => Some(error),
         }
     }
 }
@@ -90,6 +116,8 @@ impl<T> Display for StreamRunError<T> {
             Self::Source { error } => write!(f, "stream source failed: {error}"),
             Self::Sink { error } => write!(f, "stream sink failed: {error}"),
             Self::Actor { error } => write!(f, "stream actor boundary failed: {error}"),
+            #[cfg(feature = "adapters")]
+            Self::Entity { error } => write!(f, "stream entity boundary failed: {error}"),
         }
     }
 }
@@ -1112,6 +1140,34 @@ where
             settings: StreamRunSettings::default(),
         }
     }
+
+    /// Creates a sink facade that forwards each item to one sharded entity.
+    #[cfg(feature = "adapters")]
+    #[must_use]
+    pub fn entity_ref(region: ShardRegion<T>, entity: EntityRef<T>) -> Self
+    where
+        T: Message,
+    {
+        Self {
+            stage: Box::new(EntityRefSinkStage {
+                region,
+                entity,
+                count: 0,
+            }),
+            kind: SinkKind::EntityRef,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a sink facade from a high-level sharded entity reference.
+    #[cfg(feature = "adapters")]
+    #[must_use]
+    pub fn sharded_entity_ref(entity: ShardedEntityRef<T>) -> Self
+    where
+        T: Message,
+    {
+        Self::entity_ref(entity.region().clone(), entity.entity_ref().clone())
+    }
 }
 
 impl<T, M> Sink<T, M>
@@ -1772,6 +1828,8 @@ enum SinkKind {
     StreamSink,
     ActorRef,
     ActorRefWithAck,
+    #[cfg(feature = "adapters")]
+    EntityRef,
 }
 
 trait SinkStage<T, M> {
@@ -1929,6 +1987,42 @@ where
             .tell(item)
             .map_err(|error| StreamRunError::Actor {
                 error: actor_stream_error_from_tell(error),
+            });
+        if result.is_ok() {
+            self.count = self.count.saturating_add(1);
+        }
+        Box::pin(async move { result })
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        self.count
+    }
+}
+
+#[cfg(feature = "adapters")]
+struct EntityRefSinkStage<T>
+where
+    T: Message,
+{
+    region: ShardRegion<T>,
+    entity: EntityRef<T>,
+    count: usize,
+}
+
+#[cfg(feature = "adapters")]
+impl<T> SinkStage<T, usize> for EntityRefSinkStage<T>
+where
+    T: Message,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        let result = self
+            .region
+            .tell(&self.entity, item)
+            .map_err(|error| StreamRunError::Entity {
+                error: entity_sink_error_from_tell(error),
             });
         if result.is_ok() {
             self.count = self.count.saturating_add(1);
@@ -2151,6 +2245,21 @@ where
     match error {
         TellError::Full(item) => ActorStreamError::MailboxFull { item },
         TellError::Closed(item) => ActorStreamError::MailboxClosed { item },
+    }
+}
+
+#[cfg(feature = "adapters")]
+fn entity_sink_error_from_tell<T>(error: EntityTellError<T>) -> crate::EntitySinkError<T>
+where
+    T: Message,
+{
+    match error {
+        EntityTellError::NoRoute { message, error } => {
+            crate::EntitySinkError::NoRoute { message, error }
+        }
+        EntityTellError::Delivery { message, failure } => {
+            crate::EntitySinkError::Delivery { message, failure }
+        }
     }
 }
 

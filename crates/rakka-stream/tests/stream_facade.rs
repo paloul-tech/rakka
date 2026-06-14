@@ -6,8 +6,15 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use rakka_cluster::{
+    ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
+};
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorSystem,
+};
+use rakka_sharding::{
+    EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType, RoutedEntityMessage,
+    ShardBufferConfig, ShardCoordinator, ShardRegion, ShardedEntityRef, ShardingConfig,
 };
 use rakka_stream::{
     bounded_channel, AckProtocol, ActorSinkMessage, ActorSourceMessage, ActorStreamError, Flow,
@@ -522,6 +529,187 @@ async fn stream_facade_fanout_broadcast_cancelled_branch_drops_out() {
 }
 
 #[tokio::test]
+async fn entity_facade_sink_routes_items_to_entity_in_order() {
+    let entity_type = EntityType::new("FacadeCart");
+    let config = ShardingConfig::new(4).expect("valid shard config");
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership_with_up_nodes(vec![node("rakka-0", "uid-a")]));
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let delivered_for_route = Arc::clone(&delivered);
+    let region = ShardRegion::from_snapshot(
+        entity_type,
+        config,
+        &coordinator.snapshot(),
+        move |message: RoutedEntityMessage<String>| {
+            delivered_for_route
+                .lock()
+                .expect("delivered mutex should not poison")
+                .push((message.entity_id().clone(), message.into_message()));
+            Ok(())
+        },
+    )
+    .expect("region should accept ownership snapshot");
+    let entity = region.entity_ref("cart-1");
+
+    let count = Source::from_iter(["add-1".to_owned(), "add-2".to_owned()])
+        .run_with(Sink::entity_ref(region, entity))
+        .await
+        .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(
+        *delivered.lock().expect("delivered mutex should not poison"),
+        vec![
+            (EntityId::new("cart-1"), "add-1".to_owned()),
+            (EntityId::new("cart-1"), "add-2".to_owned())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn entity_facade_sink_surfaces_no_route_without_losing_item() {
+    let entity_type = EntityType::new("FacadeNoRouteCart");
+    let config = ShardingConfig::new(4).expect("valid shard config");
+    let region = ShardRegion::new(
+        entity_type.clone(),
+        config,
+        |_message: RoutedEntityMessage<String>| unreachable!("route should not run without owner"),
+    );
+    let entity = EntityRef::new(entity_type, EntityId::new("cart-1"));
+
+    let error = Source::single("add-item".to_owned())
+        .run_with(Sink::entity_ref(region, entity))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "entity-error");
+    assert!(matches!(
+        error.entity_error(),
+        Some(rakka_stream::EntitySinkError::NoRoute { message, .. })
+            if message == "add-item"
+    ));
+}
+
+#[tokio::test]
+async fn entity_facade_sink_surfaces_delivery_failure_without_losing_item() {
+    let entity_type = EntityType::new("FacadeFailingCart");
+    let config = ShardingConfig::new(4).expect("valid shard config");
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership_with_up_nodes(vec![node("rakka-0", "uid-a")]));
+    let region = ShardRegion::from_snapshot(
+        entity_type,
+        config,
+        &coordinator.snapshot(),
+        |message: RoutedEntityMessage<String>| {
+            Err(EntityTellError::Delivery {
+                message: message.into_message(),
+                failure: EntityDeliveryFailure::MailboxFull,
+            })
+        },
+    )
+    .expect("region should accept ownership snapshot");
+    let entity = region.entity_ref("cart-1");
+
+    let error = Source::single("full".to_owned())
+        .run_with(Sink::entity_ref(region, entity))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.entity_error(),
+        Some(rakka_stream::EntitySinkError::Delivery {
+            message,
+            failure: EntityDeliveryFailure::MailboxFull
+        }) if message == "full"
+    ));
+}
+
+#[tokio::test]
+async fn entity_facade_sink_accepts_sharded_entity_ref_convenience() {
+    let entity_type = EntityType::new("FacadeShardedRefCart");
+    let config = ShardingConfig::new(4).expect("valid shard config");
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership_with_up_nodes(vec![node("rakka-0", "uid-a")]));
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let delivered_for_route = Arc::clone(&delivered);
+    let region = ShardRegion::from_snapshot(
+        entity_type,
+        config,
+        &coordinator.snapshot(),
+        move |message: RoutedEntityMessage<String>| {
+            delivered_for_route
+                .lock()
+                .expect("delivered mutex should not poison")
+                .push(message.into_message());
+            Ok(())
+        },
+    )
+    .expect("region should accept ownership snapshot");
+    let entity = ShardedEntityRef::new(region.entity_ref("cart-1"), region);
+
+    let count = Source::single("via-ref".to_owned())
+        .run_with(Sink::sharded_entity_ref(entity))
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(
+        *delivered.lock().expect("delivered mutex should not poison"),
+        vec!["via-ref".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn entity_facade_sink_respects_passivation_buffering() {
+    let entity_type = EntityType::new("FacadePassivatingCart");
+    let config = ShardingConfig::new(4).expect("valid shard config");
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership_with_up_nodes(vec![node("rakka-0", "uid-a")]));
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let delivered_for_route = Arc::clone(&delivered);
+    let region = ShardRegion::from_snapshot(
+        entity_type,
+        config,
+        &coordinator.snapshot(),
+        move |message: RoutedEntityMessage<String>| {
+            delivered_for_route
+                .lock()
+                .expect("delivered mutex should not poison")
+                .push(message.into_message());
+            Ok(())
+        },
+    )
+    .expect("region should accept ownership snapshot")
+    .with_buffering(ShardBufferConfig::new(8, Duration::from_secs(1)));
+    let entity = region.entity_ref("cart-1");
+
+    region.begin_entity_passivation(entity.entity_id().clone(), Duration::from_secs(1));
+    let count = Source::single("after-passivate".to_owned())
+        .run_with(Sink::entity_ref(region.clone(), entity.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(
+        region.buffered_message_count_for_shard(entity.shard_id(region.config())),
+        1
+    );
+    assert!(delivered
+        .lock()
+        .expect("delivered mutex should not poison")
+        .is_empty());
+
+    region.end_entity_passivation(entity.entity_id());
+    assert_eq!(
+        *delivered.lock().expect("delivered mutex should not poison"),
+        vec!["after-passivate".to_owned()]
+    );
+}
+
+#[tokio::test]
 async fn actor_ack_sink_delivers_items_in_order_when_acks_arrive() {
     let system = ActorSystem::new("actor-ack-sink-delivery");
     let (events, mut receiver) = mpsc::channel(8);
@@ -815,4 +1003,35 @@ async fn recv_event(receiver: &mut mpsc::Receiver<AckSinkEvent>) -> AckSinkEvent
         .await
         .expect("event should arrive")
         .expect("event sender should stay open")
+}
+
+fn node(logical_id: &str, incarnation: &str) -> ClusterNode {
+    ClusterNode::new(
+        NodeId::new(logical_id, incarnation),
+        NodeAddress::new(format!("{logical_id}.rakka.default.svc"), 2552),
+    )
+}
+
+fn membership_with_up_nodes(nodes: Vec<ClusterNode>) -> ClusterMembership {
+    let local = nodes[0].clone();
+    let mut membership = ClusterMembership::new(
+        local,
+        MembershipConfig::new(1, Duration::from_millis(50), Duration::from_millis(100)),
+    );
+
+    membership
+        .record_discovery(DiscoverySnapshot::new("test", 1, nodes))
+        .expect("discovery should be accepted");
+
+    for member in membership
+        .members()
+        .map(|member| member.node().id().clone())
+        .collect::<Vec<_>>()
+    {
+        membership
+            .mark_up(&member, 2)
+            .expect("member should transition up");
+    }
+
+    membership
 }

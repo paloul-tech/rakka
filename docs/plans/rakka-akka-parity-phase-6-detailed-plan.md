@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6F
+Status: implemented through Slice 6G
 Date: 2026-06-14
 
 ## Purpose
@@ -479,6 +479,8 @@ cargo test -p rakka-core --test local_actor_runtime
 Goal: integrate the stream facade with sharded entity references without making
 `rakka-stream` own sharding semantics.
 
+Status: implemented.
+
 Scope:
 
 - Keep `rakka-stream`'s optional `adapters` feature for sharding integration.
@@ -499,6 +501,22 @@ Acceptance criteria:
 - Missing owner and delivery failures preserve the undelivered message.
 - Entity sink behavior remains deterministic over `ShardRegion` snapshots.
 - The API does not introduce a dependency cycle between stream and sharding.
+
+Implementation status:
+
+- Added `Sink::entity_ref(region, entity_ref)` behind the existing
+  `rakka-stream` `adapters` feature.
+- Added `Sink::sharded_entity_ref(sharded_entity_ref)` as a convenience for the
+  high-level `rakka-sharding` facade reference.
+- Reused the existing ownership-preserving `EntitySinkError<M>` rather than
+  introducing a parallel stream-only entity error type.
+- Added a gated `StreamRunError::Entity` variant and `entity_error()` accessor
+  so no-route and delivery failures preserve the undelivered stream item.
+- Kept entity source support explicit through actor/source boundaries from
+  Slice 6F; arbitrary entities are not exposed as queryable sources.
+- Added focused facade tests for successful delivery, no-route ownership,
+  delivery failure ownership, `ShardedEntityRef` convenience, and passivation
+  buffering.
 
 Review commands:
 
