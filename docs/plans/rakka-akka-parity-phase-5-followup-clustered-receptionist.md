@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slices 5R-A through 5R-D implemented; Slice 5R-E pending
+Status: Slices 5R-A through 5R-E implemented; Slice 5R-F pending
 Date: 2026-06-13
 
 ## Purpose
@@ -222,6 +222,8 @@ cargo test -p rakka-remote
 
 Goal: provide a reviewable integration surface before adding background loops.
 
+Status: implemented.
+
 Scope:
 
 - Add a helper such as `RemoteClusteredReceptionist` in `rakka-remote`.
@@ -246,6 +248,25 @@ Acceptance criteria:
 - Users can drive one publish/apply cycle explicitly in tests.
 - Runtime helper does not hide IO or create unbounded background work.
 - Settings match `ClusteredReceptionistSettings`.
+
+Implementation status:
+
+- Added `RemoteClusteredReceptionist` as an explicit helper that wires
+  `ActorSystem`, `Cluster`, `RemoteEndpoint`, `RemoteTransport`,
+  `SerializationRegistry`, `Receptionist`, `RemoteServiceProxyRegistry`, and
+  `ClusteredReceptionistSettings`.
+- Added `register_actor_ref_handler::<M>` for reviewable inbound actor-ref
+  registration on the owned endpoint.
+- Added `publish_once` to convert local-only `ServiceKey<M>` listings into
+  remote wire listings without sending them implicitly.
+- Added `apply_wire_listing::<M>` to validate source membership, enforce routee
+  limits, and materialize remote service proxies through the proxy registry.
+- Added explicit `prune_unreachable_members` and `expire_stale_listings`
+  lifecycle methods using the same `Up` membership and TTL semantics as the
+  deterministic clustered receptionist facade.
+- Added remote boundary coverage for an explicit publish/apply cycle, disabled
+  propagation, routee-limit errors, pruning, and TTL expiry. No background loop
+  helper was added in this slice.
 
 Review commands:
 

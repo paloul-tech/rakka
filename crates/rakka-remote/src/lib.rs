@@ -4,6 +4,7 @@
 //! Remote envelopes, typed transport errors, and payload serialization registry.
 
 pub mod actor_ref;
+pub mod clustered_receptionist;
 pub mod endpoint;
 pub mod envelope;
 pub mod error;
@@ -17,6 +18,10 @@ pub mod transport;
 use rakka_core::Subsystem;
 
 pub use actor_ref::{RemoteActorRefInbound, RemoteActorRefInboundError};
+pub use clustered_receptionist::{
+    RemoteClusteredReceptionist, RemoteClusteredReceptionistError,
+    RemoteClusteredReceptionistResult,
+};
 pub use endpoint::{
     RemoteEndpoint, RemoteEndpointError, RemoteEndpointResult, RemoteEnvelopeHandler,
 };
