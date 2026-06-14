@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: draft for review
+Status: implemented through Slice 6A
 Date: 2026-06-14
 
 ## Purpose
@@ -126,6 +126,8 @@ assert_eq!(run.await?, vec![expected]);
 Goal: define the Phase 6 stream parity boundary and introduce stable facade
 names without changing runtime behavior.
 
+Status: implemented.
+
 Scope:
 
 - Add a stream facade module in `rakka-stream`.
@@ -151,6 +153,19 @@ Acceptance criteria:
 - Users can construct empty facade values without running a stream.
 - The guide clearly states that Phase 6 is Akka-shaped bounded-stream parity,
   not full Akka Streams graph parity.
+
+Implementation status:
+
+- Added the `rakka-stream` facade vocabulary module with `Source<T>`,
+  `Flow<I, O>`, `Sink<T, M>`, `RunnableStream<M>`, and
+  `StreamRunSettings`.
+- Added bounded-capacity validation and diagnostic stream naming/cancellation
+  labels through `StreamRunSettings`.
+- Re-exported the facade vocabulary from `rakka-stream`, `rakka::stream`, and
+  the curated `rakka::prelude`.
+- Added a Phase 6 streams guide documenting the bounded-subset parity boundary.
+- Added stream facade tests proving the vocabulary can be constructed without
+  materializing runtime behavior.
 
 Review commands:
 
@@ -537,4 +552,3 @@ cargo doc --workspace --all-features --no-deps
   no-ack actor sink available for simple fire-and-fail-fast use.
 - Dependency cycles: keep optional sharding/process integrations behind
   existing feature gates and avoid moving sharding types into `rakka-core`.
-

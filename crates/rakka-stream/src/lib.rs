@@ -3,10 +3,10 @@
 
 //! Bounded stream primitives shared by Rakka integration adapters.
 //!
-//! Phase 5 starts with a small core vocabulary: typed stream errors, bounded
-//! source/sink handles, explicit back-pressure, graceful drain, forced close,
-//! and cancellation. HTTP, gRPC, process IO, actor, and entity adapters build
-//! on this crate instead of inventing separate lifecycle semantics.
+//! Rakka streams start with a small core vocabulary: typed stream errors,
+//! bounded source/sink handles, explicit back-pressure, graceful drain, forced
+//! close, and cancellation. Phase 6 adds Akka-shaped facade names such as
+//! `Source`, `Flow`, and `Sink` while keeping the bounded runtime explicit.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 
 #[cfg(feature = "adapters")]
 mod adapters;
+mod facade;
 #[cfg(feature = "process-io")]
 mod process_io;
 
@@ -31,6 +32,7 @@ pub use adapters::{
     EntitySink, EntitySinkError, EntitySinkResult, StreamPipeError, StreamPipeResult,
     StreamPipeSummary,
 };
+pub use facade::{Flow, RunnableStream, Sink, Source, StreamRunSettings};
 #[cfg(feature = "process-io")]
 pub use process_io::{
     managed_process_stderr_stream, managed_process_stdin_sink, managed_process_stdout_stream,

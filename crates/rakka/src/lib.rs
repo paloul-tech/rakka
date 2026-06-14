@@ -121,7 +121,10 @@ pub mod prelude {
     };
 
     #[cfg(feature = "stream")]
-    pub use rakka_stream::{BoundedStream, StreamError, StreamResult, StreamSink, StreamSource};
+    pub use rakka_stream::{
+        BoundedStream, Flow, RunnableStream, Sink, Source, StreamError, StreamResult,
+        StreamRunSettings, StreamSink, StreamSource,
+    };
 }
 
 /// Actor runtime primitives.
