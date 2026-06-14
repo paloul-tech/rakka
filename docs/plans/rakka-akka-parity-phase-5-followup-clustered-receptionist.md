@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slices 5R-A through 5R-E implemented; Slice 5R-F pending
+Status: Slices 5R-A through 5R-F implemented; Slice 5R-G pending
 Date: 2026-06-13
 
 ## Purpose
@@ -279,6 +279,8 @@ cargo test -p rakka-cluster
 
 Goal: prove the transport-facing model without TCP timing noise.
 
+Status: implemented.
+
 Scope:
 
 - Build a two-node in-memory remote transport test fixture.
@@ -295,6 +297,21 @@ Acceptance criteria:
 - Stale or invalid routee descriptors never deliver.
 - Listing lifecycle cleanup removes proxy routees.
 - The deterministic Phase 5F tests remain green.
+
+Implementation status:
+
+- Added explicit two-node in-memory remote clustered receptionist validation
+  through `RemoteClusteredReceptionist` and `InMemoryRemoteTransport`.
+- Covered node B group-router delivery to a node A service actor through a
+  materialized proxy routee.
+- Covered deregistration and actor-termination publication of empty listings,
+  verifying proxy cleanup on node B.
+- Covered stale-uid remote routees by restarting the source actor at the same
+  path and asserting the stale proxy does not deliver.
+- Covered missing outbound codec on the proxying node, asserting the routee
+  never delivers while the source node remains valid.
+- Reused the 5R-E node-down pruning coverage and kept deterministic clustered
+  receptionist tests green.
 
 Review commands:
 

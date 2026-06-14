@@ -707,6 +707,185 @@ async fn remote_clustered_receptionist_prunes_and_expires_proxy_listings() {
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_deregistration_removes_proxy_routees() {
+    let fixture = RemoteRuntimeFixture::new(
+        "in-memory-deregister",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    assert!(registration.deregister().unwrap());
+    let empty_listing = fixture
+        .runtime_a
+        .publish_once(&key, 2)
+        .unwrap()
+        .expect("source should publish empty listing");
+    assert!(empty_listing.is_empty());
+
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(empty_listing)
+        .unwrap());
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 0);
+    assert!(fixture
+        .runtime_b
+        .receptionist()
+        .find(&key)
+        .unwrap()
+        .is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_actor_termination_publishes_empty_listing() {
+    let fixture = RemoteRuntimeFixture::new(
+        "in-memory-terminated",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker.clone())
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    worker.stop().unwrap();
+    worker.when_terminated().await;
+    wait_for_empty_local_listing(fixture.runtime_a.receptionist(), &key).await;
+    let empty_listing = fixture
+        .runtime_a
+        .publish_once(&key, 2)
+        .unwrap()
+        .expect("source should publish empty listing");
+
+    assert!(empty_listing.is_empty());
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(empty_listing)
+        .unwrap());
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 0);
+    assert!(fixture
+        .runtime_b
+        .receptionist()
+        .find(&key)
+        .unwrap()
+        .is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_stale_uid_routee_never_delivers() {
+    let fixture = RemoteRuntimeFixture::new(
+        "in-memory-stale-uid",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_old_delivered, mut old_received, old_worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, old_worker.clone())
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    old_worker.stop().unwrap();
+    old_worker.when_terminated().await;
+    let (_new_delivered, mut new_received, _new_worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "stale-uid-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "stale-uid".to_string(),
+        })
+        .unwrap();
+
+    assert_no_ping(&mut old_received).await;
+    assert_no_ping(&mut new_received).await;
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 1);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_missing_proxy_codec_never_delivers() {
+    let fixture = RemoteRuntimeFixture::with_registries(
+        "in-memory-missing-codec",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+        ping_registry(),
+        SerializationRegistry::new(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, mut received, worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "missing-codec-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "missing-codec".to_string(),
+        })
+        .unwrap();
+
+    assert_no_ping(&mut received).await;
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 1);
+    fixture.shutdown().await;
+}
+
 #[test]
 fn duplicate_codec_registration_fails_closed() {
     let mut registry = SerializationRegistry::new();
@@ -1482,6 +1661,22 @@ impl RemoteRuntimeFixture {
         settings_a: ClusteredReceptionistSettings,
         settings_b: ClusteredReceptionistSettings,
     ) -> Self {
+        Self::with_registries(
+            name,
+            settings_a,
+            settings_b,
+            ping_registry(),
+            ping_registry(),
+        )
+    }
+
+    fn with_registries(
+        name: &str,
+        settings_a: ClusteredReceptionistSettings,
+        settings_b: ClusteredReceptionistSettings,
+        registry_a: SerializationRegistry,
+        registry_b: SerializationRegistry,
+    ) -> Self {
         let system_a = rakka_core::ActorSystem::new(format!("{name}-a"));
         let system_b = rakka_core::ActorSystem::new(format!("{name}-b"));
         let node_a = remote_cluster_node(format!("{name}-a"), "uid-a", 26_520);
@@ -1493,13 +1688,12 @@ impl RemoteRuntimeFixture {
         let transport = InMemoryRemoteTransport::new();
         transport.register_endpoint(endpoint_a.clone()).unwrap();
         transport.register_endpoint(endpoint_b.clone()).unwrap();
-        let registry = ping_registry();
         let runtime_a = RemoteClusteredReceptionist::with_transport(
             system_a.clone(),
             cluster_a,
             endpoint_a,
             transport.clone(),
-            registry.clone(),
+            registry_a,
             settings_a,
         );
         let runtime_b = RemoteClusteredReceptionist::with_transport(
@@ -1507,7 +1701,7 @@ impl RemoteRuntimeFixture {
             cluster_b,
             endpoint_b,
             transport,
-            registry,
+            registry_b,
             settings_b,
         );
         runtime_a.register_actor_ref_handler::<Ping>().unwrap();
@@ -1659,4 +1853,31 @@ where
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+async fn wait_for_empty_local_listing<M>(receptionist: &Receptionist, key: &ServiceKey<M>)
+where
+    M: rakka_core::Message,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if receptionist.find_local(key).unwrap().is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "local receptionist listing for {} did not become empty",
+            key.id()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn assert_no_ping(received: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), received.recv())
+            .await
+            .is_err(),
+        "remote routee unexpectedly delivered a ping"
+    );
 }
