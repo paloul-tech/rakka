@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6B
+Status: implemented through Slice 6C
 Date: 2026-06-14
 
 ## Purpose
@@ -239,6 +239,8 @@ cargo test -p rakka-stream stream_facade
 Goal: add the core single-input single-output operators from the Phase 6
 deliverables.
 
+Status: implemented.
+
 Scope:
 
 - Add `Source` and `Flow` operators:
@@ -266,6 +268,20 @@ Acceptance criteria:
 - `take` completes after the requested count and does not wait for upstream
   completion.
 - Cancellation from downstream wakes blocked upstream producers.
+
+Implementation status:
+
+- Refactored `Source<T>` onto an internal source-stage trait so operators can
+  change item types without changing the public facade shape.
+- Added `Source::map`, `Source::filter`, `Source::take`, and `Source::via`.
+- Added `Flow::from_fn` alongside `Flow::identity`.
+- Kept operator closures infallible in this slice; fallible variants remain a
+  later extension if needed.
+- Made `take(n)` cancel upstream when the requested count is reached so bounded
+  queue producers are woken instead of waiting behind a completed consumer.
+- Added tests for operator composition, order preservation, identity flow,
+  mapped flow, and `take(0)` upstream cancellation.
+- Updated the Phase 6 streams guide with linear operator examples.
 
 Review commands:
 

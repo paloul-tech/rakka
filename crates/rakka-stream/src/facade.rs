@@ -168,61 +168,79 @@ impl Default for StreamRunSettings {
 
 /// Finite or live source of stream elements.
 pub struct Source<T> {
-    shape: SourceShape<T>,
+    stage: Box<dyn SourceStage<T> + Send>,
     settings: StreamRunSettings,
 }
 
 impl<T> Source<T> {
     /// Creates an empty source facade.
     #[must_use]
-    pub fn empty() -> Self {
+    pub fn empty() -> Self
+    where
+        T: Send + 'static,
+    {
         Self::empty_with_settings(StreamRunSettings::default())
     }
 
     /// Creates an empty source facade with explicit run settings.
     #[must_use]
-    pub fn empty_with_settings(settings: StreamRunSettings) -> Self {
+    pub fn empty_with_settings(settings: StreamRunSettings) -> Self
+    where
+        T: Send + 'static,
+    {
         Self {
-            shape: SourceShape::Empty,
+            stage: Box::new(EmptyStage),
             settings,
         }
     }
 
     /// Creates a source with one element.
     #[must_use]
-    pub fn single(item: T) -> Self {
+    pub fn single(item: T) -> Self
+    where
+        T: Send + 'static,
+    {
         let mut items = VecDeque::with_capacity(1);
         items.push_back(item);
         Self {
-            shape: SourceShape::Items(items),
+            stage: Box::new(ItemsStage { items }),
             settings: StreamRunSettings::default(),
         }
     }
 
     /// Creates a facade source from a low-level bounded stream source.
     #[must_use]
-    pub fn from_stream_source(source: StreamSource<T>) -> Self {
+    pub fn from_stream_source(source: StreamSource<T>) -> Self
+    where
+        T: Send + 'static,
+    {
         Self {
-            shape: SourceShape::StreamSource(source),
+            stage: Box::new(StreamSourceStage { source }),
             settings: StreamRunSettings::default(),
         }
     }
 
     /// Creates a bounded queue source and returns its producer sink.
-    pub fn queue(capacity: usize) -> StreamResult<(StreamSink<T>, Self)> {
+    pub fn queue(capacity: usize) -> StreamResult<(StreamSink<T>, Self)>
+    where
+        T: Send + 'static,
+    {
         let (sink, source) = bounded_channel(capacity)?;
         Ok((sink, Self::from_stream_source(source)))
     }
 
     /// Alias for `queue`, emphasizing that the source boundary is bounded.
-    pub fn bounded(capacity: usize) -> StreamResult<(StreamSink<T>, Self)> {
+    pub fn bounded(capacity: usize) -> StreamResult<(StreamSink<T>, Self)>
+    where
+        T: Send + 'static,
+    {
         Self::queue(capacity)
     }
 
     /// Returns true when this source is the empty source vocabulary shape.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        matches!(self.shape, SourceShape::Empty)
+    pub fn is_empty(&self) -> bool {
+        self.stage.kind() == SourceKind::Empty
     }
 
     /// Run settings associated with this source.
@@ -238,6 +256,71 @@ impl<T> Source<T> {
         self
     }
 
+    /// Transforms each source element.
+    #[must_use]
+    pub fn map<O, F>(self, mapper: F) -> Source<O>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+        F: FnMut(T) -> O + Send + 'static,
+    {
+        let settings = self.settings.clone();
+        Source {
+            stage: Box::new(MapStage {
+                upstream: self,
+                mapper,
+                _output: PhantomData,
+            }),
+            settings,
+        }
+    }
+
+    /// Keeps source elements that satisfy `predicate`.
+    #[must_use]
+    pub fn filter<F>(self, predicate: F) -> Self
+    where
+        T: Send + 'static,
+        F: FnMut(&T) -> bool + Send + 'static,
+    {
+        let settings = self.settings.clone();
+        Self {
+            stage: Box::new(FilterStage {
+                upstream: self,
+                predicate,
+            }),
+            settings,
+        }
+    }
+
+    /// Emits at most `count` elements and then cancels upstream.
+    #[must_use]
+    pub fn take(self, count: usize) -> Self
+    where
+        T: Send + 'static,
+    {
+        let settings = self.settings.clone();
+        let cancellation_reason = format!("take({count}) completed");
+        Self {
+            stage: Box::new(TakeStage {
+                upstream: self,
+                remaining: count,
+                upstream_cancelled: false,
+                cancellation_reason,
+            }),
+            settings,
+        }
+    }
+
+    /// Applies a flow to this source.
+    #[must_use]
+    pub fn via<O>(self, flow: Flow<T, O>) -> Source<O>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+    {
+        flow.apply(self)
+    }
+
     /// Connects this source to a sink, producing a runnable stream descriptor.
     #[must_use]
     pub fn to<M>(self, sink: Sink<T, M>) -> RunnableStream<T, M> {
@@ -250,7 +333,11 @@ impl<T> Source<T> {
         T: Send + 'static,
         M: Send + 'static,
     {
-        while let Some(item) = self.next_item().await? {
+        while let Some(item) = self
+            .next_item()
+            .await
+            .map_err(|error| StreamRunError::Source { error })?
+        {
             sink.consume(item).await?;
         }
         Ok(sink.finish())
@@ -273,25 +360,28 @@ impl<T> Source<T> {
         self.run_with(Sink::foreach(callback)).await
     }
 
-    async fn next_item(&mut self) -> StreamRunResult<T, Option<T>> {
-        match &mut self.shape {
-            SourceShape::Empty => Ok(None),
-            SourceShape::Items(items) => Ok(items.pop_front()),
-            SourceShape::StreamSource(source) => source
-                .next()
-                .await
-                .map_err(|error| StreamRunError::Source { error }),
-        }
+    /// Cancels this source boundary.
+    pub fn cancel(&mut self, reason: impl Into<String>) -> usize {
+        self.stage.cancel(reason.into())
+    }
+
+    async fn next_item(&mut self) -> StreamResult<Option<T>> {
+        self.stage.next().await
     }
 }
 
-impl<T> FromIterator<T> for Source<T> {
+impl<T> FromIterator<T> for Source<T>
+where
+    T: Send + 'static,
+{
     fn from_iter<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = T>,
     {
         Self {
-            shape: SourceShape::Items(iter.into_iter().collect()),
+            stage: Box::new(ItemsStage {
+                items: iter.into_iter().collect(),
+            }),
             settings: StreamRunSettings::default(),
         }
     }
@@ -300,22 +390,23 @@ impl<T> FromIterator<T> for Source<T> {
 impl<T> Debug for Source<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Source")
-            .field("shape", &self.shape)
+            .field("kind", &self.stage.kind())
             .field("settings", &self.settings)
             .finish_non_exhaustive()
     }
 }
 
 /// Single-input single-output stream transformation.
-#[derive(Clone)]
 pub struct Flow<I, O> {
-    shape: FlowShape,
+    kind: FlowKind,
     settings: StreamRunSettings,
-    _input: PhantomData<fn() -> I>,
-    _output: PhantomData<fn() -> O>,
+    transform: Box<dyn FnOnce(Source<I>) -> Source<O> + Send>,
 }
 
-impl<T> Flow<T, T> {
+impl<T> Flow<T, T>
+where
+    T: Send + 'static,
+{
     /// Creates an identity flow facade.
     #[must_use]
     pub fn identity() -> Self {
@@ -324,24 +415,40 @@ impl<T> Flow<T, T> {
 
     /// Creates an identity flow facade with explicit run settings.
     #[must_use]
-    pub const fn identity_with_settings(settings: StreamRunSettings) -> Self {
+    pub fn identity_with_settings(settings: StreamRunSettings) -> Self {
         Self {
-            shape: FlowShape::Identity,
+            kind: FlowKind::Identity,
             settings,
-            _input: PhantomData,
-            _output: PhantomData,
+            transform: Box::new(|source| source),
         }
     }
 }
 
-impl<I, O> Flow<I, O> {
+impl<I, O> Flow<I, O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    /// Creates a flow that maps each input into one output.
+    #[must_use]
+    pub fn from_fn<F>(mapper: F) -> Self
+    where
+        F: FnMut(I) -> O + Send + 'static,
+    {
+        Self {
+            kind: FlowKind::Map,
+            settings: StreamRunSettings::default(),
+            transform: Box::new(move |source| source.map(mapper)),
+        }
+    }
+
     /// Run settings associated with this flow.
     #[must_use]
     pub const fn settings(&self) -> &StreamRunSettings {
         &self.settings
     }
 
-    /// Returns a copy of this flow with updated run settings.
+    /// Returns this flow with updated run settings.
     #[must_use]
     pub fn with_settings(mut self, settings: StreamRunSettings) -> Self {
         self.settings = settings;
@@ -351,14 +458,19 @@ impl<I, O> Flow<I, O> {
     /// Returns true when this flow is the identity vocabulary shape.
     #[must_use]
     pub const fn is_identity(&self) -> bool {
-        matches!(self.shape, FlowShape::Identity)
+        matches!(self.kind, FlowKind::Identity)
+    }
+
+    fn apply(self, source: Source<I>) -> Source<O> {
+        let settings = self.settings.clone();
+        (self.transform)(source).with_settings(settings)
     }
 }
 
 impl<I, O> Debug for Flow<I, O> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Flow")
-            .field("shape", &self.shape)
+            .field("kind", &self.kind)
             .field("settings", &self.settings)
             .finish_non_exhaustive()
     }
@@ -543,28 +655,217 @@ impl<T, M> Debug for RunnableStream<T, M> {
     }
 }
 
-enum SourceShape<T> {
-    Empty,
-    Items(VecDeque<T>),
-    StreamSource(StreamSource<T>),
+trait SourceStage<T> {
+    fn next<'a>(&'a mut self)
+        -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>>;
+
+    fn cancel(&mut self, reason: String) -> usize;
+
+    fn kind(&self) -> SourceKind;
 }
 
-impl<T> Debug for SourceShape<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("Empty"),
-            Self::Items(items) => f.debug_struct("Items").field("len", &items.len()).finish(),
-            Self::StreamSource(source) => f
-                .debug_struct("StreamSource")
-                .field("status", &source.status())
-                .finish(),
+struct EmptyStage;
+
+impl<T> SourceStage<T> for EmptyStage
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn cancel(&mut self, _reason: String) -> usize {
+        0
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Empty
+    }
+}
+
+struct ItemsStage<T> {
+    items: VecDeque<T>,
+}
+
+impl<T> SourceStage<T> for ItemsStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async { Ok(self.items.pop_front()) })
+    }
+
+    fn cancel(&mut self, _reason: String) -> usize {
+        let dropped = self.items.len();
+        self.items.clear();
+        dropped
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Items
+    }
+}
+
+struct StreamSourceStage<T> {
+    source: StreamSource<T>,
+}
+
+impl<T> SourceStage<T> for StreamSourceStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async { self.source.next().await })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.source.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::StreamSource
+    }
+}
+
+struct MapStage<I, O, F>
+where
+    F: FnMut(I) -> O,
+{
+    upstream: Source<I>,
+    mapper: F,
+    _output: PhantomData<fn() -> O>,
+}
+
+impl<I, O, F> SourceStage<O> for MapStage<I, O, F>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: FnMut(I) -> O + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<O>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.upstream
+                .next_item()
+                .await
+                .map(|next| next.map(&mut self.mapper))
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Map
+    }
+}
+
+struct FilterStage<T, F>
+where
+    F: FnMut(&T) -> bool,
+{
+    upstream: Source<T>,
+    predicate: F,
+}
+
+impl<T, F> SourceStage<T> for FilterStage<T, F>
+where
+    T: Send + 'static,
+    F: FnMut(&T) -> bool + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            while let Some(item) = self.upstream.next_item().await? {
+                if (self.predicate)(&item) {
+                    return Ok(Some(item));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Filter
+    }
+}
+
+struct TakeStage<T> {
+    upstream: Source<T>,
+    remaining: usize,
+    upstream_cancelled: bool,
+    cancellation_reason: String,
+}
+
+impl<T> TakeStage<T> {
+    fn cancel_upstream_once(&mut self) {
+        if !self.upstream_cancelled {
+            self.upstream_cancelled = true;
+            let _dropped = self.upstream.cancel(self.cancellation_reason.clone());
         }
     }
 }
 
+impl<T> SourceStage<T> for TakeStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.remaining == 0 {
+                self.cancel_upstream_once();
+                return Ok(None);
+            }
+
+            match self.upstream.next_item().await? {
+                Some(item) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    Ok(Some(item))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.upstream_cancelled = true;
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Take
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlowShape {
+enum SourceKind {
+    Empty,
+    Items,
+    StreamSource,
+    Map,
+    Filter,
+    Take,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowKind {
     Identity,
+    Map,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

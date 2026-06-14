@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6B materialization basics
+Status: implemented through Slice 6C linear operators
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -100,7 +100,35 @@ let items = Source::from_stream_source(source).run_collect().await?;
 assert_eq!(items, vec!["work"]);
 ```
 
-Operators, actor/entity boundaries, and test probes arrive in later slices.
+## Linear Operators
+
+Slice 6C adds first-pass linear operators:
+
+```rust
+let values = Source::from_iter([1, 2, 3, 4])
+    .map(|item| item * 2)
+    .filter(|item| *item > 4)
+    .take(2)
+    .run_collect()
+    .await?;
+
+assert_eq!(values, vec![6, 8]);
+```
+
+`Flow::identity()` and `Flow::from_fn(...)` can be applied with `via`:
+
+```rust
+let values = Source::from_iter([1, 2, 3])
+    .via(Flow::from_fn(|item| format!("item-{item}")))
+    .run_collect()
+    .await?;
+```
+
+`take(n)` completes as soon as `n` elements are emitted. When it stops early it
+cancels its upstream source boundary, which wakes blocked bounded producers.
+
+Async operators, actor/entity boundaries, fan-in/fan-out, and test probes
+arrive in later slices.
 
 ## Design Rules
 

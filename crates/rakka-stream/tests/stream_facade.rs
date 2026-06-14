@@ -178,3 +178,75 @@ async fn facade_run_errors_preserve_source_and_sink_lifecycle() {
         Some(StreamError::Closed)
     ));
 }
+
+#[tokio::test]
+async fn linear_operators_compose_and_preserve_order() {
+    let result = Source::from_iter([1, 2, 3, 4])
+        .map(|item| item * 2)
+        .filter(|item| *item > 4)
+        .take(2)
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(result, vec![6, 8]);
+}
+
+#[tokio::test]
+async fn flow_identity_and_from_fn_apply_through_via() {
+    let identity = Source::from_iter([1, 2, 3])
+        .via(Flow::identity())
+        .run_collect()
+        .await
+        .unwrap();
+    assert_eq!(identity, vec![1, 2, 3]);
+
+    let mapped = Source::from_iter([1, 2, 3])
+        .via(Flow::from_fn(|item| format!("item-{item}")))
+        .run_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        mapped,
+        vec![
+            "item-1".to_owned(),
+            "item-2".to_owned(),
+            "item-3".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn take_zero_completes_without_waiting_and_cancels_upstream_queue() {
+    let (sink, source) = bounded_channel(1).unwrap();
+    sink.try_send("buffered".to_owned()).unwrap();
+    let pending_send = tokio::spawn({
+        let sink = sink.clone();
+        async move { sink.send("blocked".to_owned()).await }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        !pending_send.is_finished(),
+        "sender should wait while the source buffer is full"
+    );
+
+    let collected = Source::from_stream_source(source)
+        .take(0)
+        .run_collect()
+        .await
+        .unwrap();
+    assert!(collected.is_empty());
+
+    let send_error = pending_send
+        .await
+        .expect("pending send task should finish")
+        .expect_err("take(0) should cancel the upstream source");
+    assert!(matches!(
+        send_error.error(),
+        StreamError::Cancelled { reason: Some(reason) }
+            if reason == "take(0) completed"
+    ));
+    assert_eq!(send_error.item(), "blocked");
+    assert_eq!(sink.status().dropped_items(), 1);
+}
