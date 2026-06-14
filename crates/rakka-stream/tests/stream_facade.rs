@@ -410,3 +410,109 @@ async fn stream_facade_async_take_cancels_in_flight_map_async_tasks() {
 
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn stream_facade_fanout_merge_forwards_all_items_from_both_sources() {
+    let mut values = Source::from_iter([1, 2])
+        .merge(Source::from_iter([3, 4]))
+        .run_collect()
+        .await
+        .unwrap();
+
+    values.sort_unstable();
+    assert_eq!(values, vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
+async fn stream_facade_fanout_merge_all_empty_completes() {
+    let values = Source::<u64>::merge_all(Vec::new())
+        .run_collect()
+        .await
+        .unwrap();
+
+    assert!(values.is_empty());
+}
+
+#[tokio::test]
+async fn stream_facade_fanout_merge_surfaces_source_failure() {
+    let (sink, failed_source) = bounded_channel::<u64>(1).unwrap();
+    sink.cancel("merge input cancelled");
+
+    let error = Source::from_iter([1])
+        .merge(Source::from_stream_source(failed_source))
+        .run_collect()
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error.source_error(),
+        Some(StreamError::Cancelled {
+            reason: Some(reason)
+        }) if reason == "merge input cancelled"
+    ));
+}
+
+#[tokio::test]
+async fn stream_facade_fanout_broadcast_rejects_zero_branches() {
+    let error = Source::from_iter([1])
+        .broadcast(0)
+        .expect_err("zero broadcast branches should be rejected");
+
+    assert_eq!(error.code(), "operator-error");
+    assert!(matches!(
+        error,
+        StreamError::Operator { message }
+            if message == "broadcast branch count must be greater than zero"
+    ));
+}
+
+#[tokio::test]
+async fn stream_facade_fanout_broadcast_forwards_each_item_to_each_branch() {
+    let mut branches = Source::from_iter([1, 2, 3]).broadcast(2).unwrap();
+    let right = branches.pop().expect("right branch");
+    let left = branches.pop().expect("left branch");
+
+    let (left, right) = tokio::join!(left.run_collect(), right.run_collect());
+
+    assert_eq!(left.unwrap(), vec![1, 2, 3]);
+    assert_eq!(right.unwrap(), vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn stream_facade_fanout_broadcast_backpressures_on_full_live_branch() {
+    let settings = StreamRunSettings::new(8, 1).expect("valid stream settings");
+    let mut branches = Source::from_iter([1, 2])
+        .with_settings(settings)
+        .broadcast(2)
+        .unwrap();
+    let slow = branches.pop().expect("slow branch");
+    let fast = branches.pop().expect("fast branch");
+
+    let fast_run = tokio::spawn(async move { fast.run_collect().await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !fast_run.is_finished(),
+        "fast branch should wait for slow live branch capacity"
+    );
+
+    let slow_run = tokio::spawn(async move { slow.run_collect().await.unwrap() });
+    let (fast_values, slow_values) = tokio::join!(fast_run, slow_run);
+
+    assert_eq!(fast_values.expect("fast task should finish"), vec![1, 2]);
+    assert_eq!(slow_values.expect("slow task should finish"), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn stream_facade_fanout_broadcast_cancelled_branch_drops_out() {
+    let settings = StreamRunSettings::new(8, 1).expect("valid stream settings");
+    let mut branches = Source::from_iter([1, 2, 3])
+        .with_settings(settings)
+        .broadcast(2)
+        .unwrap();
+    let mut cancelled = branches.pop().expect("cancelled branch");
+    let live = branches.pop().expect("live branch");
+
+    cancelled.cancel("branch no longer needed");
+
+    assert_eq!(live.run_collect().await.unwrap(), vec![1, 2, 3]);
+}

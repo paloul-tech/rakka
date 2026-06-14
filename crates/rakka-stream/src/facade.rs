@@ -6,7 +6,9 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -312,6 +314,103 @@ impl<T> Source<T> {
             }),
             settings,
         }
+    }
+
+    /// Merges this source with another source.
+    ///
+    /// Each input preserves its own element order. Interleaving between inputs
+    /// depends on which source has an item available first.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self::merge_all_with_settings(self.settings.clone(), [self, other])
+    }
+
+    /// Merges many sources into one source.
+    ///
+    /// Empty input produces an empty source. When at least one source is
+    /// supplied, the first source's settings define the bounded operator
+    /// capacity for the merge output.
+    #[must_use]
+    pub fn merge_all<I>(sources: I) -> Self
+    where
+        T: Send + 'static,
+        I: IntoIterator<Item = Self>,
+    {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let settings = sources
+            .first()
+            .map_or_else(StreamRunSettings::default, |source| source.settings.clone());
+        Self::merge_all_with_settings(settings, sources)
+    }
+
+    /// Merges many sources using explicit run settings for the merge output.
+    #[must_use]
+    pub fn merge_all_with_settings<I>(settings: StreamRunSettings, sources: I) -> Self
+    where
+        T: Send + 'static,
+        I: IntoIterator<Item = Self>,
+    {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        if sources.is_empty() {
+            return Self::empty_with_settings(settings);
+        }
+
+        let (sender, receiver) = mpsc::channel(settings.operator_buffer_capacity());
+        Self {
+            stage: Box::new(MergeStage {
+                sources: Some(sources),
+                sender,
+                receiver,
+                handles: Vec::new(),
+                source_count: 0,
+                completed_sources: 0,
+                terminal: false,
+            }),
+            settings,
+        }
+    }
+
+    /// Broadcasts every source element to `branches` bounded branch sources.
+    ///
+    /// A live branch that stops consuming applies back-pressure to the
+    /// upstream. A cancelled or dropped branch is removed from the broadcast.
+    pub fn broadcast(self, branches: usize) -> StreamResult<Vec<Self>>
+    where
+        T: Clone + Send + 'static,
+    {
+        validate_positive("broadcast", "branch count", branches)?;
+
+        let settings = self.settings.clone();
+        let mut branch_sinks = Vec::with_capacity(branches);
+        let mut branch_sources = Vec::with_capacity(branches);
+        for _branch in 0..branches {
+            let (sink, source) = bounded_channel(settings.operator_buffer_capacity())?;
+            branch_sinks.push(Some(sink));
+            branch_sources.push(source);
+        }
+
+        let shared = Arc::new(Mutex::new(BroadcastShared {
+            source: Some(self),
+            branch_sinks,
+            started: false,
+            handle: None,
+        }));
+
+        Ok(branch_sources
+            .into_iter()
+            .enumerate()
+            .map(|(branch_index, branch_source)| Self {
+                stage: Box::new(BroadcastBranchStage {
+                    branch_index,
+                    branch_source,
+                    shared: Arc::clone(&shared),
+                }),
+                settings: settings.clone(),
+            })
+            .collect())
     }
 
     /// Keeps source elements that satisfy `predicate`.
@@ -999,6 +1098,235 @@ where
     }
 }
 
+enum MergeMessage<T> {
+    Item(T),
+    SourceCompleted,
+    SourceFailed(StreamError),
+}
+
+struct MergeStage<T> {
+    sources: Option<Vec<Source<T>>>,
+    sender: mpsc::Sender<MergeMessage<T>>,
+    receiver: mpsc::Receiver<MergeMessage<T>>,
+    handles: Vec<JoinHandle<()>>,
+    source_count: usize,
+    completed_sources: usize,
+    terminal: bool,
+}
+
+impl<T> MergeStage<T> {
+    fn abort_pumps(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> MergeStage<T>
+where
+    T: Send + 'static,
+{
+    fn ensure_started(&mut self) {
+        let Some(sources) = self.sources.take() else {
+            return;
+        };
+
+        self.source_count = sources.len();
+        for source in sources {
+            let sender = self.sender.clone();
+            self.handles.push(tokio::spawn(
+                async move { merge_pump(source, sender).await },
+            ));
+        }
+    }
+}
+
+impl<T> Drop for MergeStage<T> {
+    fn drop(&mut self) {
+        self.abort_pumps();
+    }
+}
+
+impl<T> SourceStage<T> for MergeStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.ensure_started();
+
+            if self.terminal {
+                return Ok(None);
+            }
+
+            while let Some(message) = self.receiver.recv().await {
+                match message {
+                    MergeMessage::Item(item) => return Ok(Some(item)),
+                    MergeMessage::SourceCompleted => {
+                        self.completed_sources = self.completed_sources.saturating_add(1);
+                        if self.completed_sources >= self.source_count {
+                            self.terminal = true;
+                            return Ok(None);
+                        }
+                    }
+                    MergeMessage::SourceFailed(error) => {
+                        self.terminal = true;
+                        self.receiver.close();
+                        self.abort_pumps();
+                        return Err(error);
+                    }
+                }
+            }
+
+            self.terminal = true;
+            Ok(None)
+        })
+    }
+
+    fn cancel(&mut self, _reason: String) -> usize {
+        self.terminal = true;
+        self.receiver.close();
+        self.abort_pumps();
+        0
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Merge
+    }
+}
+
+async fn merge_pump<T>(mut source: Source<T>, sender: mpsc::Sender<MergeMessage<T>>)
+where
+    T: Send + 'static,
+{
+    loop {
+        match source.next_item().await {
+            Ok(Some(item)) => {
+                if sender.send(MergeMessage::Item(item)).await.is_err() {
+                    let _dropped = source.cancel("merge downstream closed");
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ignored = sender.send(MergeMessage::SourceCompleted).await;
+                return;
+            }
+            Err(error) => {
+                let _ignored = sender.send(MergeMessage::SourceFailed(error)).await;
+                return;
+            }
+        }
+    }
+}
+
+struct BroadcastShared<T> {
+    source: Option<Source<T>>,
+    branch_sinks: Vec<Option<StreamSink<T>>>,
+    started: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct BroadcastBranchStage<T> {
+    branch_index: usize,
+    branch_source: StreamSource<T>,
+    shared: Arc<Mutex<BroadcastShared<T>>>,
+}
+
+impl<T> BroadcastBranchStage<T>
+where
+    T: Clone + Send + 'static,
+{
+    fn start_once(&self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shared.started {
+            return;
+        }
+
+        shared.started = true;
+        let Some(source) = shared.source.take() else {
+            return;
+        };
+        let branch_sinks = shared.branch_sinks.clone();
+        shared.handle = Some(tokio::spawn(async move {
+            broadcast_pump(source, branch_sinks).await;
+        }));
+    }
+}
+
+impl<T> Drop for BroadcastBranchStage<T> {
+    fn drop(&mut self) {
+        let _dropped = self
+            .branch_source
+            .cancel(format!("broadcast branch {} dropped", self.branch_index));
+    }
+}
+
+impl<T> SourceStage<T> for BroadcastBranchStage<T>
+where
+    T: Clone + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.start_once();
+            self.branch_source.next().await
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.branch_source.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Broadcast
+    }
+}
+
+async fn broadcast_pump<T>(mut source: Source<T>, mut branch_sinks: Vec<Option<StreamSink<T>>>)
+where
+    T: Clone + Send + 'static,
+{
+    loop {
+        match source.next_item().await {
+            Ok(Some(item)) => {
+                for sink in &mut branch_sinks {
+                    let Some(branch_sink) = sink else {
+                        continue;
+                    };
+
+                    if branch_sink.send(item.clone()).await.is_err() {
+                        *sink = None;
+                    }
+                }
+
+                if branch_sinks.iter().all(Option::is_none) {
+                    let _dropped = source.cancel("broadcast has no live branches");
+                    return;
+                }
+            }
+            Ok(None) => {
+                for branch_sink in branch_sinks.iter().flatten() {
+                    let _ignored = branch_sink.drain();
+                }
+                return;
+            }
+            Err(error) => {
+                let reason = format!("broadcast upstream failed: {error}");
+                for branch_sink in branch_sinks.iter().flatten() {
+                    let _dropped = branch_sink.cancel(reason.clone());
+                }
+                return;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
     Empty,
@@ -1008,6 +1336,8 @@ enum SourceKind {
     MapAsync,
     Filter,
     Take,
+    Merge,
+    Broadcast,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1170,6 +1500,16 @@ fn validate_parallelism(operator: &str, parallelism: usize) -> StreamResult<()> 
     if parallelism == 0 {
         Err(StreamError::Operator {
             message: format!("{operator} parallelism must be greater than zero"),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive(operator: &str, parameter: &str, value: usize) -> StreamResult<()> {
+    if value == 0 {
+        Err(StreamError::Operator {
+            message: format!("{operator} {parameter} must be greater than zero"),
         })
     } else {
         Ok(())

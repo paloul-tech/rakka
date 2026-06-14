@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6D
+Status: implemented through Slice 6E
 Date: 2026-06-14
 
 ## Purpose
@@ -354,6 +354,8 @@ cargo test -p rakka-testkit stream_probe
 Goal: expose Akka-recognizable `merge` and `broadcast` facade operators over
 the existing bounded stream adapter foundations.
 
+Status: implemented.
+
 Scope:
 
 - Add `Source::merge(left, right)` or `source.merge(other)`.
@@ -376,6 +378,26 @@ Acceptance criteria:
 - A full branch applies back-pressure to the broadcast source.
 - Cancellation and source failure are observable and deterministic.
 - Existing low-level `fan_in_streams` and `broadcast_stream` tests still pass.
+
+Implementation status:
+
+- Added `Source::merge(other)` for two-source fan-in.
+- Added `Source::merge_all(sources)` and
+  `Source::merge_all_with_settings(settings, sources)` for multi-source
+  fan-in and explicit operator capacity.
+- Implemented merge with bounded internal output capacity from
+  `StreamRunSettings::operator_buffer_capacity`.
+- Added `Source::broadcast(branches)` returning bounded branch `Source<T>`
+  values for `T: Clone`.
+- Rejected zero broadcast branches with typed `StreamError::Operator`.
+- Implemented broadcast so every item is sent to every live branch, a full
+  live branch backpressures upstream, and a cancelled or dropped branch is
+  removed from the fan-out.
+- Added focused facade tests for merge completion, empty merge, merge source
+  failure, broadcast duplication, invalid branch counts, full-branch
+  back-pressure, and cancelled branch dropout.
+- Updated the Phase 6 stream guide with fan-in/fan-out examples and
+  cancellation/back-pressure notes.
 
 Review commands:
 

@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6D async operators and back-pressure
+Status: implemented through Slice 6E fan-in and fan-out operators
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -166,8 +166,48 @@ failures surface as source-side `StreamRunError::Source` values containing
 `map_async_unordered` is intentionally left as a follow-up so the first-path
 API remains ordered and easy to reason about.
 
-Actor/entity boundaries, fan-in/fan-out, and test probes arrive in later
-slices.
+## Fan-in And Fan-out
+
+Slice 6E adds bounded `merge` and `broadcast` facade operators.
+
+`merge` combines two sources, preserving order within each input while allowing
+interleaving between inputs:
+
+```rust
+let values = Source::from_iter([1, 2])
+    .merge(Source::from_iter([3, 4]))
+    .run_collect()
+    .await?;
+```
+
+For more inputs, use `merge_all` or `merge_all_with_settings`:
+
+```rust
+let values = Source::merge_all([
+    Source::from_iter(["a"]),
+    Source::from_iter(["b", "c"]),
+])
+.run_collect()
+.await?;
+```
+
+`broadcast` returns one bounded branch source per requested branch:
+
+```rust
+let mut branches = Source::from_iter([1, 2, 3])
+    .broadcast(2)?;
+
+let right = branches.pop().expect("right branch");
+let left = branches.pop().expect("left branch");
+let (left, right) = tokio::join!(left.run_collect(), right.run_collect());
+```
+
+Every item is forwarded to every live branch. A full live branch backpressures
+the upstream broadcast, matching the safer Akka-style default. If a branch is
+cancelled or dropped, it is removed from the broadcast so the remaining live
+branches can continue.
+
+Actor/entity boundaries and test probes arrive in later slices.
 
 ## Design Rules
 
