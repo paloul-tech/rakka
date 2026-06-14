@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slices 5R-A through 5R-G implemented; Slice 5R-H pending
+Status: complete; Slices 5R-A through 5R-H implemented
 Date: 2026-06-13
 
 ## Purpose
@@ -370,6 +370,8 @@ cargo test -p rakka-sharding --test network_runtime
 
 Goal: make the TCP receptionist behavior reviewable and reusable.
 
+Status: implemented.
+
 Scope:
 
 - Update `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md`.
@@ -385,6 +387,22 @@ Acceptance criteria:
 - Docs explain deterministic propagation versus TCP propagation.
 - Example runs locally without external services.
 - Testkit helper additions are covered by `rakka-testkit` tests.
+
+Implementation status:
+
+- Updated the Phase 5 cluster, receptionist, and routers guide to explain the
+  deterministic in-process propagation model separately from TCP propagation
+  through `rakka-remote`.
+- Extended `rakka-example-clustered-receptionist` with `--tcp-loopback`, which
+  binds two loopback `TcpRemoteTransport` instances, registers service command
+  and listing codecs, publishes a remote listing over TCP, materializes the
+  proxy routee, and routes through a normal group router.
+- Added reusable `rakka-testkit` helpers for remote receptionist wire-listing
+  assertions, remote proxy/listing snapshot counts, and waiting for proxy
+  registry convergence.
+- Covered the new testkit helpers in `rakka-testkit` integration tests.
+- Updated the main Akka parity plan and migration notes to remove the stale
+  "TCP propagation pending" wording.
 
 Review commands:
 

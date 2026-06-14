@@ -1,5 +1,6 @@
 //! Integration tests for reusable Phase 5 testkit helpers.
 
+use std::any::type_name;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -7,8 +8,8 @@ use rakka_cluster::{
     Cluster, ClusterNode, ClusterSubscriptionReplay, MembershipConfig, NodeAddress, NodeId,
 };
 use rakka_core::{
-    actor_fn, ActorAction, ActorContext, ActorSystem, InMemoryMetricsRecorder, MetricKind,
-    MetricsRecorder, Receptionist, Routers, ServiceKey,
+    actor_fn, ActorAction, ActorContext, ActorPath, ActorSystem, ActorUid, InMemoryMetricsRecorder,
+    MetricKind, MetricsRecorder, Receptionist, Routers, ServiceKey,
 };
 use rakka_grpc::{server_streaming_response, unary_service, GrpcUnaryConfig};
 use rakka_http::{json_service_route, HttpRouteConfig};
@@ -18,17 +19,24 @@ use rakka_persistence::{
     EventSourcedEffect, PersistenceId, Revision, SequenceNr, SnapshotSelection, SnapshotStore,
     TaggedEvent,
 };
+use rakka_remote::{
+    RemoteActorRef, RemoteReceptionistListing, RemoteServiceProxyRegistrySnapshot,
+    RemoteServiceRoutee,
+};
 use rakka_stream::{bounded_channel, StreamLifecycle};
 use rakka_testkit::{
     assert_cluster_event_node, assert_counter_total, assert_drain_complete,
     assert_group_routee_count, assert_group_router_snapshot_routee_count, assert_http_status,
     assert_metric_attribute, assert_pool_routee_count, assert_probe_failed_with_reason,
-    assert_receptionist_listing_contains, assert_stream_lifecycle, expect_cluster_member_up,
+    assert_receptionist_listing_contains, assert_remote_receptionist_listing_count,
+    assert_remote_receptionist_listing_service, assert_remote_service_listing_count,
+    assert_remote_service_proxy_count, assert_stream_lifecycle, expect_cluster_member_up,
     expect_grpc_stream_items, expect_grpc_unary_ok, expect_metric_observation,
-    expect_receptionist_listing_count, expect_stream_source_items, expect_terminated, grpc_request,
-    http_post_json, spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe,
-    ActorContextProbeCommand, ActorContextProbeEvent, DurableStateBehaviorTestKit,
-    EventSourcedBehaviorTestKit, PersistenceTestKit, StopProbeCommand, TestProbe,
+    expect_receptionist_listing_count, expect_remote_proxy_registry_snapshot,
+    expect_stream_source_items, expect_terminated, grpc_request, http_post_json,
+    spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe, ActorContextProbeCommand,
+    ActorContextProbeEvent, DurableStateBehaviorTestKit, EventSourcedBehaviorTestKit,
+    PersistenceTestKit, StopProbeCommand, TestProbe,
 };
 use serde::{Deserialize, Serialize};
 
@@ -165,6 +173,58 @@ async fn testkit_helpers_cover_phase_5_cluster_receptionist_and_router_surfaces(
     assert_cluster_event_node(&member_up, node.id());
 
     system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn testkit_helpers_cover_remote_receptionist_surfaces() {
+    let routee = RemoteServiceRoutee::new(
+        RemoteActorRef::new(
+            NodeId::new("remote-testkit-a", "uid-a"),
+            "remote-testkit",
+            ActorPath::new("rakka://remote-testkit/user/worker"),
+            ActorUid::new(1),
+            type_name::<Phase5Command>(),
+        )
+        .expect("remote actor ref should be valid"),
+    );
+    let listing = RemoteReceptionistListing::new(
+        NodeId::new("remote-testkit-a", "uid-a"),
+        "phase-5-workers",
+        type_name::<Phase5Command>(),
+        vec![routee],
+        3,
+        99,
+    )
+    .expect("remote listing should be valid");
+    assert_remote_receptionist_listing_count(&listing, 1);
+    assert_remote_receptionist_listing_service(
+        &listing,
+        "phase-5-workers",
+        type_name::<Phase5Command>(),
+    );
+
+    let snapshot = RemoteServiceProxyRegistrySnapshot::new(1, 1);
+    assert_remote_service_proxy_count(&snapshot, 1);
+    assert_remote_service_listing_count(&snapshot, 1);
+
+    let mut polls = 0usize;
+    let eventual = expect_remote_proxy_registry_snapshot(
+        || {
+            polls += 1;
+            if polls > 2 {
+                RemoteServiceProxyRegistrySnapshot::new(2, 1)
+            } else {
+                RemoteServiceProxyRegistrySnapshot::new(0, 0)
+            }
+        },
+        2,
+        1,
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("remote proxy snapshot should converge");
+    assert_remote_service_proxy_count(&eventual, 2);
+    assert_remote_service_listing_count(&eventual, 1);
 }
 
 #[tokio::test]

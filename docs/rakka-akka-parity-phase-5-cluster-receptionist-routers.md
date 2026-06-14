@@ -1,7 +1,6 @@
 # Rakka Akka Parity Phase 5: Cluster, Receptionist, And Routers
 
-Status: implemented, with TCP clustered receptionist propagation still tracked
-as a follow-up.
+Status: implemented, including TCP loopback clustered receptionist propagation.
 Date: 2026-06-13
 
 Phase 5 adds the Akka-style cluster extension, typed receptionist, local
@@ -126,10 +125,35 @@ The propagated listing model includes:
 - stale source-revision rejection;
 - non-`Up` source pruning.
 
-Today, clustered receptionist propagation is production-shaped but
-deterministic and in-process. TCP propagation remains pending because remote
-service routees need a transport-serializable service-reference representation
-instead of cloned in-memory `ActorRef<M>` values.
+The deterministic API is the pure cluster model and remains useful for tests,
+simulation, and deployments that own their own propagation loop. It moves
+typed `ActorRef<M>` values in-process and avoids TCP timing.
+
+TCP clustered receptionist propagation lives in `rakka-remote`. It publishes
+transport-serializable `RemoteReceptionistListing` snapshots, materializes
+local proxy actors for remote routees, installs those proxies into the local
+`Receptionist`, and lets the normal `Routers::group(ServiceKey<M>)` path route
+messages over TCP without a new router API. The explicit helper keeps IO
+visible:
+
+```rust
+let runtime_a = RemoteClusteredReceptionist::with_transport(
+    system_a,
+    cluster_a,
+    endpoint_a,
+    transport_a,
+    serialization_a,
+    ClusteredReceptionistSettings::default(),
+);
+
+runtime_b.register_receptionist_listing_handler::<WorkerCommand>(&key)?;
+runtime_a.publish_once_to(&node_b, &key, observed_at_millis)?;
+```
+
+The remote path requires registering payload codecs for both the service
+command type and `RemoteReceptionistListing`. It fails closed for missing
+peers, unknown service handlers, stale actor uid, wrong message type, missing
+payload codecs, and transport backpressure.
 
 ## Testkit Helpers
 
@@ -138,6 +162,11 @@ instead of cloned in-memory `ActorRef<M>` values.
 - `assert_receptionist_listing_count`
 - `assert_receptionist_listing_contains`
 - `expect_receptionist_listing_count`
+- `assert_remote_receptionist_listing_count`
+- `assert_remote_receptionist_listing_service`
+- `assert_remote_service_proxy_count`
+- `assert_remote_service_listing_count`
+- `expect_remote_proxy_registry_snapshot`
 - `assert_pool_routee_count`
 - `assert_group_routee_count`
 - `assert_group_router_snapshot_routee_count`
@@ -157,9 +186,13 @@ Run the Phase 5 examples from the workspace root:
 cargo run -p rakka-example-local-receptionist-router
 cargo run -p rakka-example-pool-router
 cargo run -p rakka-example-clustered-receptionist
+cargo run -p rakka-example-clustered-receptionist -- --tcp-loopback
 ```
 
 Use `local-receptionist-router` to review service registration and
 receptionist-backed group routing. Use `pool-router` to review local worker
 farm routing. Use `clustered-receptionist` to review deterministic two-node
-listing propagation and routing over a propagated remote listing.
+listing propagation and routing over a propagated remote listing. Add
+`--tcp-loopback` to review the remote-backed path with two loopback
+`TcpRemoteTransport` instances, explicit listing publication, proxy
+materialization, and group-router delivery to the remote service actor.

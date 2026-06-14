@@ -30,6 +30,7 @@ use rakka_persistence::{
     InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore, PersistenceEvent,
     Revision, SequenceNr, StashDirective, TaggedEvent,
 };
+use rakka_remote::{RemoteReceptionistListing, RemoteServiceProxyRegistrySnapshot};
 use rakka_stream::{StreamLifecycle, StreamSource};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -565,6 +566,88 @@ where
         .map_err(RakkaError::from)?;
     assert_receptionist_listing_count(&listing, expected);
     Ok(listing)
+}
+
+/// Asserts that a remote receptionist wire listing has the expected routee count.
+pub fn assert_remote_receptionist_listing_count(
+    listing: &RemoteReceptionistListing,
+    expected: usize,
+) {
+    assert_eq!(
+        listing.len(),
+        expected,
+        "unexpected remote receptionist listing size for service {:?}",
+        listing.service_id()
+    );
+}
+
+/// Asserts that a remote receptionist wire listing targets the expected service.
+pub fn assert_remote_receptionist_listing_service(
+    listing: &RemoteReceptionistListing,
+    service_id: &str,
+    service_message_type: &str,
+) {
+    assert_eq!(
+        listing.service_id(),
+        service_id,
+        "unexpected remote receptionist service id"
+    );
+    assert_eq!(
+        listing.service_message_type(),
+        service_message_type,
+        "unexpected remote receptionist service message type"
+    );
+}
+
+/// Asserts the number of materialized remote service proxy routees.
+pub fn assert_remote_service_proxy_count(
+    snapshot: &RemoteServiceProxyRegistrySnapshot,
+    expected: usize,
+) {
+    assert_eq!(
+        snapshot.proxy_count(),
+        expected,
+        "unexpected remote service proxy count for {:?}",
+        snapshot
+    );
+}
+
+/// Asserts the number of tracked remote service listings.
+pub fn assert_remote_service_listing_count(
+    snapshot: &RemoteServiceProxyRegistrySnapshot,
+    expected: usize,
+) {
+    assert_eq!(
+        snapshot.listing_count(),
+        expected,
+        "unexpected remote service listing count for {:?}",
+        snapshot
+    );
+}
+
+/// Waits for a remote proxy-registry snapshot with the expected counts.
+pub async fn expect_remote_proxy_registry_snapshot(
+    mut snapshot: impl FnMut() -> RemoteServiceProxyRegistrySnapshot,
+    expected_proxies: usize,
+    expected_listings: usize,
+    timeout: Duration,
+) -> RakkaResult<RemoteServiceProxyRegistrySnapshot> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let current = snapshot();
+        if current.proxy_count() == expected_proxies && current.listing_count() == expected_listings
+        {
+            return Ok(current);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            assert_remote_service_proxy_count(&current, expected_proxies);
+            assert_remote_service_listing_count(&current, expected_listings);
+            return Ok(current);
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Asserts that a local pool router has the expected live routee count.

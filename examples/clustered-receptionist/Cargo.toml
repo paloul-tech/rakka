@@ -17,7 +17,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-rakka = { path = "../../crates/rakka", default-features = false, features = ["cluster"] }
+rakka = { path = "../../crates/rakka", default-features = false, features = ["cluster", "remote"] }
 tokio.workspace = true
 
 [lints]

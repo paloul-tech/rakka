@@ -493,17 +493,19 @@ Implementation status on 2026-06-13:
   fail-closed validation for missing mappers or zero virtual nodes.
 - Implemented Phase 5H docs, examples, and testkit support with the Phase 5
   guide, README and migration-note updates, local receptionist/group router,
-  pool router, and deterministic clustered receptionist examples, plus reusable
-  testkit helpers for receptionist listings, router routee counts, and cluster
-  subscription assertions.
+  pool router, deterministic clustered receptionist, and TCP loopback
+  clustered receptionist examples, plus reusable testkit helpers for local and
+  remote receptionist listings, router routee counts, proxy-registry snapshots,
+  and cluster subscription assertions.
 
 Phase 5 follow-ups:
 
-- TCP clustered receptionist propagation is implemented through Slice 5R-G:
+- TCP clustered receptionist propagation is complete through Slices 5R-A
+  through 5R-H:
   remote actor-ref wire identity, typed inbound actor-ref delivery, remote
   receptionist listings, proxy materialization, explicit runtime helper,
-  in-memory validation, and TCP loopback validation. Remaining work is Slice
-  5R-H docs, example, and reusable testkit polish.
+  in-memory validation, TCP loopback validation, docs, runnable example, and
+  reusable testkit polish.
 
 Detailed follow-up plan:
 `docs/plans/rakka-akka-parity-phase-5-followup-clustered-receptionist.md`.

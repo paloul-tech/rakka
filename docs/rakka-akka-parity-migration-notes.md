@@ -250,7 +250,8 @@ Tests should prefer the Phase 5 `rakka-testkit` helpers:
 `assert_pool_routee_count`, `assert_group_routee_count`,
 `expect_cluster_member_up`, and `assert_cluster_event_node`.
 
-Clustered receptionist propagation is deterministic and in-process today:
-`ClusteredReceptionist::propagate_to` proves the listing model and group-router
-integration, while TCP propagation remains a follow-up until remote service refs
-have a transport-serializable representation.
+Clustered receptionist propagation now has two reviewable paths:
+`ClusteredReceptionist::propagate_to` proves the deterministic in-process
+listing model and group-router integration, while `rakka-remote` provides TCP
+loopback propagation with transport-serializable remote service routees,
+materialized local proxies, and normal group-router delivery.
