@@ -35,7 +35,11 @@ pub use network::{
     METRIC_TCP_REMOTE_CONNECTION_STATE, METRIC_TCP_REMOTE_RECEIVES, METRIC_TCP_REMOTE_RECONNECTS,
     METRIC_TCP_REMOTE_SENDS, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
-pub use receptionist::{RemoteReceptionistListing, RemoteServiceRoutee};
+pub use receptionist::{
+    RemoteReceptionistListing, RemoteServiceProxy, RemoteServiceProxyError,
+    RemoteServiceProxyRegistry, RemoteServiceProxyRegistrySnapshot, RemoteServiceProxyResult,
+    RemoteServiceRoutee, RemoteServiceRouteeKey,
+};
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SchemaCompatibilityPolicy,
     SerializationRegistry,

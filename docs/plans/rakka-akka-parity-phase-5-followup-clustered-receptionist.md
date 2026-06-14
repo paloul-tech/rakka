@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slices 5R-A through 5R-C implemented; Slice 5R-D pending
+Status: Slices 5R-A through 5R-D implemented; Slice 5R-E pending
 Date: 2026-06-13
 
 ## Purpose
@@ -170,6 +170,8 @@ cargo test -p rakka-remote
 
 Goal: turn remote service routee descriptors into local typed proxy actors.
 
+Status: implemented.
+
 Scope:
 
 - Add a proxy actor, for example `RemoteServiceProxy<M>`.
@@ -190,6 +192,23 @@ Acceptance criteria:
   without new router APIs.
 - Equal-version refreshes do not create duplicate proxies.
 - Deregistration, TTL expiry, and node down remove proxy routees.
+
+Implementation status:
+
+- Added `RemoteServiceProxy<M>` as a local actor that encodes `M`, wraps it in
+  `RemoteDestination::ActorRef`, and sends it through `RemoteTransport`.
+- Added `RemoteServiceProxyRegistry` to materialize `RemoteReceptionistListing`
+  routees into local anonymous proxy actors and install them through
+  `Receptionist::install_remote_listing`.
+- Added stable `RemoteServiceRouteeKey` tracking by source node, service id,
+  actor path, actor uid, and message type.
+- Reused existing proxies for same-version listing refreshes while refreshing
+  the core receptionist timestamp.
+- Added lifecycle cleanup for empty listings, stale-listing expiry, and source
+  node removal, stopping proxy actors as their routees leave the remote
+  listing.
+- Added remote boundary coverage proving group routers discover local proxies
+  and deliver over the in-memory remote transport to the source node actor.
 
 Review commands:
 
