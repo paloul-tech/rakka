@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 5 Follow-up: TCP Clustered Receptionist
 
-Status: Slices 5R-A through 5R-F implemented; Slice 5R-G pending
+Status: Slices 5R-A through 5R-G implemented; Slice 5R-H pending
 Date: 2026-06-13
 
 ## Purpose
@@ -324,6 +324,8 @@ cargo test -p rakka-cluster --test clustered_receptionist
 
 Goal: complete the production-shaped TCP propagation story.
 
+Status: implemented.
+
 Scope:
 
 - Add TCP loopback tests for remote clustered receptionist propagation.
@@ -339,6 +341,23 @@ Acceptance criteria:
 - A group router on node B delivers to node A's service actor over TCP.
 - Missing peer or unknown destination node fails closed.
 - Existing sharding TCP tests remain unaffected.
+
+Implementation status:
+
+- Added `RemoteEndpoint::register_service_handler` and fail-closed service-key
+  dispatch so remote receptionist listings can arrive as service-addressed
+  envelopes over TCP.
+- Added `RemoteReceptionistListingCodec` for registering typed listing payloads
+  with `SerializationRegistry`.
+- Added `RemoteClusteredReceptionist::register_receptionist_listing_handler`
+  and `publish_once_to` so callers can explicitly receive and send wire
+  listings through the configured `RemoteTransport`.
+- Added TCP loopback coverage that publishes node A's service listing to node
+  B, materializes a node B proxy routee, routes a node B group-router message
+  back to node A's service actor over TCP, and asserts transport snapshots for
+  inbound and outbound envelope flow.
+- Added missing-peer fail-closed coverage for listing publication through the
+  TCP-backed helper.
 
 Review commands:
 

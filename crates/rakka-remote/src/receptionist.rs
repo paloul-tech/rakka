@@ -17,9 +17,18 @@ use rakka_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    RemoteActorRef, RemoteDestination, RemoteEnvelope, RemoteError, RemoteResult, RemoteTransport,
-    SerializationRegistry,
+    PayloadCodec, RemoteActorRef, RemoteDestination, RemoteEnvelope, RemoteError, RemoteResult,
+    RemoteTransport, SerializationRegistry,
 };
+
+/// Codec id used for remote receptionist listing payloads.
+pub const REMOTE_RECEPTIONIST_LISTING_CODEC_ID: &str = "json";
+
+/// Stable message type id used for remote receptionist listing payloads.
+pub const REMOTE_RECEPTIONIST_LISTING_MESSAGE_TYPE_ID: &str = "rakka.remote.ReceptionistListing";
+
+/// Schema version used for remote receptionist listing payloads.
+pub const REMOTE_RECEPTIONIST_LISTING_SCHEMA_VERSION: u32 = 1;
 
 /// Transport-facing descriptor for one service routee in a remote receptionist listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +263,43 @@ impl RemoteReceptionistListing {
         }
 
         Ok(())
+    }
+}
+
+/// JSON payload codec for `RemoteReceptionistListing`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoteReceptionistListingCodec;
+
+impl PayloadCodec<RemoteReceptionistListing> for RemoteReceptionistListingCodec {
+    fn codec_id(&self) -> &str {
+        REMOTE_RECEPTIONIST_LISTING_CODEC_ID
+    }
+
+    fn message_type_id(&self) -> &str {
+        REMOTE_RECEPTIONIST_LISTING_MESSAGE_TYPE_ID
+    }
+
+    fn schema_version(&self) -> u32 {
+        REMOTE_RECEPTIONIST_LISTING_SCHEMA_VERSION
+    }
+
+    fn encode(&self, message: &RemoteReceptionistListing) -> RemoteResult<Vec<u8>> {
+        serde_json::to_vec(message).map_err(|error| RemoteError::Encode {
+            codec_id: REMOTE_RECEPTIONIST_LISTING_CODEC_ID.to_string(),
+            message: error.to_string(),
+        })
+    }
+
+    fn decode(&self, payload: &[u8]) -> RemoteResult<RemoteReceptionistListing> {
+        let listing =
+            serde_json::from_slice::<RemoteReceptionistListing>(payload).map_err(|error| {
+                RemoteError::Decode {
+                    codec_id: REMOTE_RECEPTIONIST_LISTING_CODEC_ID.to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+        listing.validate()?;
+        Ok(listing)
     }
 }
 

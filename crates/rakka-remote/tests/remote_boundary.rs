@@ -2,7 +2,8 @@
 
 use prost::Message;
 use rakka_cluster::{
-    Cluster, ClusterNode, ClusteredReceptionistSettings, MembershipConfig, NodeAddress, NodeId,
+    Cluster, ClusterNode, ClusterProtocol, ClusteredReceptionistSettings, MembershipConfig,
+    NodeAddress, NodeId,
 };
 use rakka_core::{
     actor_fn, actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorPath,
@@ -12,16 +13,17 @@ use rakka_remote::{
     EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef,
     RemoteActorRefInbound, RemoteClusteredReceptionist, RemoteClusteredReceptionistError,
     RemoteDestination, RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata,
-    RemoteError, RemoteReceptionistListing, RemoteRequestError, RemoteRequestRegistry,
-    RemoteServiceProxyError, RemoteServiceProxyRegistry, RemoteServiceRoutee,
-    RemoteServiceRouteeKey, RemoteTransport, RemoteTransportError, SchemaCompatibilityPolicy,
-    SerializationRegistry, TcpRemoteTransportConfig, DEFAULT_REMOTE_ENVELOPE_VERSION,
-    DEFAULT_TCP_REMOTE_BIND_ADDR, DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT,
-    DEFAULT_TCP_REMOTE_IDLE_TIMEOUT, DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES,
-    DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY, DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF,
-    TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
+    RemoteError, RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteRequestError,
+    RemoteRequestRegistry, RemoteServiceProxyError, RemoteServiceProxyRegistry,
+    RemoteServiceRoutee, RemoteServiceRouteeKey, RemoteTransport, RemoteTransportError,
+    SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransport, TcpRemoteTransportConfig,
+    DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
+    DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
+    DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
 use std::any::type_name;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -378,6 +380,34 @@ async fn remote_receptionist_listing_from_local_listing_enforces_max_routees() {
 
     assert!(matches!(error, RemoteError::InvalidEnvelope { .. }));
     system.terminate().await.unwrap();
+}
+
+#[test]
+fn remote_receptionist_listing_codec_round_trips_wire_model() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register::<RemoteReceptionistListing, _>(RemoteReceptionistListingCodec)
+        .unwrap();
+    let listing = RemoteReceptionistListing::new(
+        NodeId::new("rakka-0", "uid-a"),
+        "workers",
+        type_name::<Ping>(),
+        vec![RemoteServiceRoutee::new(test_remote_actor_ref())],
+        7,
+        99,
+    )
+    .unwrap();
+
+    let encoded = registry.encode(&listing).unwrap();
+    let decoded: RemoteReceptionistListing = registry.decode(&encoded).unwrap();
+
+    assert_eq!(decoded, listing);
+    assert_eq!(encoded.metadata.codec_id, "json");
+    assert_eq!(
+        encoded.metadata.message_type_id,
+        "rakka.remote.ReceptionistListing"
+    );
+    assert_eq!(encoded.metadata.schema_version, 1);
 }
 
 #[tokio::test]
@@ -883,6 +913,99 @@ async fn in_memory_remote_clustered_receptionist_missing_proxy_codec_never_deliv
 
     assert_no_ping(&mut received).await;
     assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 1);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_remote_clustered_receptionist_routes_group_router_over_loopback() {
+    let Some(fixture) = TcpRemoteRuntimeFixture::new("tcp-receptionist").await else {
+        return;
+    };
+    let key = ServiceKey::<Ping>::new("workers");
+    fixture
+        .runtime_b
+        .register_receptionist_listing_handler::<Ping>(&key)
+        .unwrap();
+    let (_delivered, mut received, worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker.clone())
+        .unwrap();
+
+    assert!(fixture
+        .runtime_a
+        .publish_once_to(&fixture.node_b, &key, 1)
+        .unwrap());
+    wait_for(|| fixture.runtime_b.proxy_snapshot().proxy_count() == 1).await;
+
+    let remote_listing = fixture.runtime_b.receptionist().find(&key).unwrap();
+    assert_eq!(remote_listing.len(), 1);
+    assert_ne!(remote_listing.routees()[0].path(), worker.path());
+
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "tcp-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "tcp-proxy".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap(),
+        Some("tcp-proxy".to_string())
+    );
+    wait_for(|| fixture.transport_b.snapshot().inbound_envelopes() >= 1).await;
+    wait_for(|| fixture.transport_a.snapshot().inbound_envelopes() >= 1).await;
+    wait_for(|| {
+        fixture
+            .transport_a
+            .peer_snapshot(&fixture.node_b)
+            .is_some_and(|snapshot| snapshot.sent() >= 1)
+            && fixture
+                .transport_b
+                .peer_snapshot(&fixture.node_a)
+                .is_some_and(|snapshot| snapshot.sent() >= 1)
+    })
+    .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_remote_clustered_receptionist_missing_peer_fails_closed() {
+    let Some(fixture) = TcpRemoteRuntimeFixture::new("tcp-receptionist-missing").await else {
+        return;
+    };
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let missing = NodeId::new("rakka-missing", "uid-z");
+
+    let error = fixture
+        .runtime_a
+        .publish_once_to(&missing, &key, 1)
+        .unwrap_err();
+
+    assert_eq!(error.code(), "remote-transport-error");
+    assert!(matches!(
+        &error,
+        RemoteClusteredReceptionistError::Transport {
+            node_id,
+            error,
+        } if node_id == &missing
+            && matches!(
+                error.as_ref(),
+                RemoteTransportError::UnknownNode { node_id } if node_id == &missing
+            )
+    ));
     fixture.shutdown().await;
 }
 
@@ -1430,9 +1553,8 @@ fn endpoint_fails_closed_for_unhandled_destination_and_entity_type() {
         .unwrap_err();
     assert!(matches!(
         service_error,
-        RemoteEndpointError::UnexpectedDestination {
-            destination: RemoteDestination::Service { service_key },
-        } if service_key == "payments"
+        RemoteEndpointError::UnregisteredServiceHandler { service_key }
+            if service_key == "payments"
     ));
 
     let entity_error = endpoint
@@ -1722,6 +1844,79 @@ impl RemoteRuntimeFixture {
     }
 }
 
+struct TcpRemoteRuntimeFixture {
+    node_a: NodeId,
+    node_b: NodeId,
+    system_a: rakka_core::ActorSystem,
+    system_b: rakka_core::ActorSystem,
+    runtime_a: RemoteClusteredReceptionist,
+    runtime_b: RemoteClusteredReceptionist,
+    transport_a: TcpRemoteTransport,
+    transport_b: TcpRemoteTransport,
+}
+
+impl TcpRemoteRuntimeFixture {
+    async fn new(name: &str) -> Option<Self> {
+        let system_a = rakka_core::ActorSystem::new(format!("{name}-a"));
+        let system_b = rakka_core::ActorSystem::new(format!("{name}-b"));
+        let node_a = NodeId::new(format!("{name}-a"), "uid-a");
+        let node_b = NodeId::new(format!("{name}-b"), "uid-b");
+        let endpoint_a = RemoteEndpoint::new(node_a.clone());
+        let endpoint_b = RemoteEndpoint::new(node_b.clone());
+        let Some(transport_a) = bind_tcp_transport(node_a.clone(), endpoint_a.clone()).await else {
+            system_a.terminate().await.unwrap();
+            system_b.terminate().await.unwrap();
+            return None;
+        };
+        let Some(transport_b) = bind_tcp_transport(node_b.clone(), endpoint_b.clone()).await else {
+            system_a.terminate().await.unwrap();
+            system_b.terminate().await.unwrap();
+            return None;
+        };
+        let cluster_node_a = tcp_cluster_node(&node_a, transport_a.local_addr().port());
+        let cluster_node_b = tcp_cluster_node(&node_b, transport_b.local_addr().port());
+        let cluster_a = remote_cluster_with_nodes(cluster_node_a.clone(), cluster_node_b.clone());
+        let cluster_b = remote_cluster_with_nodes(cluster_node_b.clone(), cluster_node_a.clone());
+        transport_a.register_peer(cluster_node_b).unwrap();
+        transport_b.register_peer(cluster_node_a).unwrap();
+
+        let runtime_a = RemoteClusteredReceptionist::with_transport(
+            system_a.clone(),
+            cluster_a,
+            endpoint_a,
+            transport_a.clone(),
+            tcp_receptionist_registry(),
+            ClusteredReceptionistSettings::default(),
+        );
+        let runtime_b = RemoteClusteredReceptionist::with_transport(
+            system_b.clone(),
+            cluster_b,
+            endpoint_b,
+            transport_b.clone(),
+            tcp_receptionist_registry(),
+            ClusteredReceptionistSettings::default(),
+        );
+        runtime_a.register_actor_ref_handler::<Ping>().unwrap();
+        runtime_b.register_actor_ref_handler::<Ping>().unwrap();
+
+        Some(Self {
+            node_a,
+            node_b,
+            system_a,
+            system_b,
+            runtime_a,
+            runtime_b,
+            transport_a,
+            transport_b,
+        })
+    }
+
+    async fn shutdown(self) {
+        self.system_a.terminate().await.unwrap();
+        self.system_b.terminate().await.unwrap();
+    }
+}
+
 fn remote_cluster_with_nodes(local: ClusterNode, remote: ClusterNode) -> Cluster {
     let cluster = Cluster::for_local_node(
         local.clone(),
@@ -1735,6 +1930,48 @@ fn remote_cluster_node(logical_id: impl Into<String>, incarnation: &str, port: u
     ClusterNode::new(
         NodeId::new(logical_id, incarnation),
         NodeAddress::new("127.0.0.1", port),
+    )
+}
+
+fn tcp_cluster_node(node_id: &NodeId, port: u16) -> ClusterNode {
+    ClusterNode::new(node_id.clone(), NodeAddress::new("127.0.0.1", port))
+}
+
+async fn bind_tcp_transport(
+    node_id: NodeId,
+    endpoint: RemoteEndpoint,
+) -> Option<TcpRemoteTransport> {
+    match TcpRemoteTransport::bind(
+        node_id,
+        ClusterProtocol::default(),
+        endpoint,
+        tcp_test_config(),
+    )
+    .await
+    {
+        Ok(transport) => Some(transport),
+        Err(error) if tcp_bind_denied(&error) => {
+            eprintln!("skipping tcp receptionist test; loopback bind denied: {error}");
+            None
+        }
+        Err(error) => panic!("tcp remote transport should bind: {error:?}"),
+    }
+}
+
+fn tcp_test_config() -> TcpRemoteTransportConfig {
+    TcpRemoteTransportConfig::new()
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .connect_timeout(Duration::from_millis(500))
+        .reconnect_backoff(Duration::from_millis(10))
+        .idle_timeout(Duration::from_secs(10))
+}
+
+fn tcp_bind_denied(error: &rakka_remote::TcpRemoteTransportError) -> bool {
+    matches!(
+        error,
+        rakka_remote::TcpRemoteTransportError::Io { message }
+            if message.contains("Operation not permitted")
+                || message.contains("Permission denied")
     )
 }
 
@@ -1753,6 +1990,14 @@ fn ping_registry() -> SerializationRegistry {
     let mut registry = SerializationRegistry::new();
     registry
         .register_protobuf::<Ping>("rakka.test.Ping", 1)
+        .unwrap();
+    registry
+}
+
+fn tcp_receptionist_registry() -> SerializationRegistry {
+    let mut registry = ping_registry();
+    registry
+        .register::<RemoteReceptionistListing, _>(RemoteReceptionistListingCodec)
         .unwrap();
     registry
 }
@@ -1870,6 +2115,20 @@ where
             key.id()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for(mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for condition"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

@@ -482,9 +482,10 @@ Implementation status on 2026-06-13:
   `ClusteredReceptionist`, local-only publish snapshots, remote listing
   installation, source-revision stale update rejection, same-version TTL
   refresh, TTL expiry, non-`Up` member pruning, listing-size limits, and
-  group-router discovery over propagated listings. TCP loopback propagation
-  remains pending until remote service references have a transport-serializable
-  representation.
+  group-router discovery over propagated listings. The TCP clustered
+  receptionist follow-up is now implemented through TCP loopback propagation in
+  `rakka-remote`; docs, example, and testkit polish remain tracked in Slice
+  5R-H.
 - Implemented Phase 5G consistent-hash routing for local pool and
   receptionist-backed group routers with `with_consistent_hash`, configurable
   virtual nodes, routee-incarnation-aware ring points, stable same-key routing,
@@ -498,9 +499,11 @@ Implementation status on 2026-06-13:
 
 Phase 5 follow-ups:
 
-- TCP clustered receptionist propagation remains pending until remote service
-  routees have a transport-serializable reference model rather than
-  deterministic in-process `ActorRef<M>` propagation.
+- TCP clustered receptionist propagation is implemented through Slice 5R-G:
+  remote actor-ref wire identity, typed inbound actor-ref delivery, remote
+  receptionist listings, proxy materialization, explicit runtime helper,
+  in-memory validation, and TCP loopback validation. Remaining work is Slice
+  5R-H docs, example, and reusable testkit polish.
 
 Detailed follow-up plan:
 `docs/plans/rakka-akka-parity-phase-5-followup-clustered-receptionist.md`.

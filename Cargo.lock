@@ -1226,6 +1226,7 @@ dependencies = [
  "rakka-cluster",
  "rakka-core",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

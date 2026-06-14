@@ -9,9 +9,10 @@ use rakka_cluster::{Cluster, ClusteredReceptionistSettings, MembershipState, Nod
 use rakka_core::{ActorSystem, Message, RakkaError, Receptionist, ServiceKey, Subsystem};
 
 use crate::{
-    RemoteActorRefInbound, RemoteEndpoint, RemoteEndpointResult, RemoteError,
-    RemoteReceptionistListing, RemoteServiceProxyError, RemoteServiceProxyRegistry,
-    RemoteServiceProxyRegistrySnapshot, RemoteTransport, SerializationRegistry,
+    RemoteActorRefInbound, RemoteDestination, RemoteEndpoint, RemoteEndpointError,
+    RemoteEndpointResult, RemoteEnvelope, RemoteError, RemoteReceptionistListing,
+    RemoteServiceProxyError, RemoteServiceProxyRegistry, RemoteServiceProxyRegistrySnapshot,
+    RemoteTransport, RemoteTransportError, SerializationRegistry,
 };
 
 /// Failure returned by the explicit remote clustered receptionist helper.
@@ -34,6 +35,13 @@ pub enum RemoteClusteredReceptionistError {
         /// Proxy materialization failure.
         error: Box<RemoteServiceProxyError>,
     },
+    /// Transport send failed.
+    Transport {
+        /// Destination node.
+        node_id: NodeId,
+        /// Transport failure.
+        error: Box<RemoteTransportError>,
+    },
     /// A listing exceeded the configured routee limit.
     ListingTooLarge {
         /// Receptionist service id.
@@ -53,6 +61,7 @@ impl RemoteClusteredReceptionistError {
             Self::Receptionist { .. } => "receptionist-error",
             Self::Remote { .. } => "remote-error",
             Self::Proxy { .. } => "remote-service-proxy-error",
+            Self::Transport { .. } => "remote-transport-error",
             Self::ListingTooLarge { .. } => "remote-receptionist-listing-too-large",
         }
     }
@@ -80,6 +89,10 @@ impl Display for RemoteClusteredReceptionistError {
             Self::Proxy { error } => {
                 write!(f, "remote clustered receptionist proxy operation failed: {error}")
             }
+            Self::Transport { node_id, error } => write!(
+                f,
+                "remote clustered receptionist transport send to {node_id} failed: {error}"
+            ),
             Self::ListingTooLarge {
                 service_id,
                 actual,
@@ -232,6 +245,46 @@ impl RemoteClusteredReceptionist {
             ))
     }
 
+    /// Registers inbound delivery for remote receptionist listing envelopes for `key`.
+    pub fn register_receptionist_listing_handler<M>(
+        &self,
+        key: &ServiceKey<M>,
+    ) -> RemoteEndpointResult<()>
+    where
+        M: Message + Sync,
+    {
+        let cluster = self.cluster.clone();
+        let proxy_registry = self.proxy_registry.clone();
+        let serialization = self.serialization.clone();
+        let settings = self.settings.clone();
+        let service_id = key.id().to_string();
+
+        self.endpoint.register_service_handler(
+            service_id.clone(),
+            move |envelope: RemoteEnvelope| {
+                let destination = envelope.destination.clone();
+                let listing: RemoteReceptionistListing =
+                    serialization.decode_envelope(&envelope).map_err(|error| {
+                        RemoteEndpointError::HandlerRejected {
+                            destination: destination.clone(),
+                            message: format!("remote receptionist listing decode failed: {error}"),
+                        }
+                    })?;
+                RemoteClusteredReceptionist::apply_wire_listing_parts::<M>(
+                    &cluster,
+                    &proxy_registry,
+                    &settings,
+                    listing,
+                )
+                .map(|_changed| ())
+                .map_err(|error| RemoteEndpointError::HandlerRejected {
+                    destination,
+                    message: error.to_string(),
+                })
+            },
+        )
+    }
+
     /// Captures a local-only typed receptionist listing as a remote wire listing.
     pub fn publish_once<M>(
         &self,
@@ -264,6 +317,40 @@ impl RemoteClusteredReceptionist {
         .map_err(|error| RemoteClusteredReceptionistError::Remote { error })
     }
 
+    /// Captures and sends a local typed receptionist listing to a remote node.
+    pub fn publish_once_to<M>(
+        &self,
+        destination: &NodeId,
+        key: &ServiceKey<M>,
+        observed_at_millis: u64,
+    ) -> RemoteClusteredReceptionistResult<bool>
+    where
+        M: Message,
+    {
+        let Some(listing) = self.publish_once(key, observed_at_millis)? else {
+            return Ok(false);
+        };
+        let payload = self
+            .serialization
+            .encode(&listing)
+            .map_err(|error| RemoteClusteredReceptionistError::Remote { error })?;
+        let envelope = RemoteEnvelope::new(
+            RemoteDestination::Service {
+                service_key: key.id().to_string(),
+            },
+            payload,
+        )
+        .with_source(self.cluster.local_node_id().to_string());
+
+        self.transport
+            .send(destination, envelope)
+            .map_err(|error| RemoteClusteredReceptionistError::Transport {
+                node_id: destination.clone(),
+                error: Box::new(error),
+            })?;
+        Ok(true)
+    }
+
     /// Applies a remote wire listing by materializing local proxy routees.
     pub fn apply_wire_listing<M>(
         &self,
@@ -272,29 +359,12 @@ impl RemoteClusteredReceptionist {
     where
         M: Message + Sync,
     {
-        if !self.settings.enabled() {
-            return Ok(false);
-        }
-
-        listing
-            .validate()
-            .map_err(|error| RemoteClusteredReceptionistError::Remote { error })?;
-        if listing.source_node() == &self.cluster.local_node_id() {
-            return Ok(false);
-        }
-
-        if !self.source_node_is_up(listing.source_node()) {
-            self.proxy_registry
-                .remove_remote_node(listing.source_node());
-            return Ok(false);
-        }
-
-        self.check_routee_limit(listing.service_id(), listing.len())?;
-        self.proxy_registry
-            .apply_listing::<M>(listing)
-            .map_err(|error| RemoteClusteredReceptionistError::Proxy {
-                error: Box::new(error),
-            })
+        Self::apply_wire_listing_parts::<M>(
+            &self.cluster,
+            &self.proxy_registry,
+            &self.settings,
+            listing,
+        )
     }
 
     /// Removes proxy listings whose source member is no longer `Up`.
@@ -330,8 +400,41 @@ impl RemoteClusteredReceptionist {
         self.proxy_registry.snapshot()
     }
 
-    fn source_node_is_up(&self, source_node: &NodeId) -> bool {
-        self.cluster
+    fn apply_wire_listing_parts<M>(
+        cluster: &Cluster,
+        proxy_registry: &RemoteServiceProxyRegistry,
+        settings: &ClusteredReceptionistSettings,
+        listing: RemoteReceptionistListing,
+    ) -> RemoteClusteredReceptionistResult<bool>
+    where
+        M: Message + Sync,
+    {
+        if !settings.enabled() {
+            return Ok(false);
+        }
+
+        listing
+            .validate()
+            .map_err(|error| RemoteClusteredReceptionistError::Remote { error })?;
+        if listing.source_node() == &cluster.local_node_id() {
+            return Ok(false);
+        }
+
+        if !Self::source_node_is_up(cluster, listing.source_node()) {
+            proxy_registry.remove_remote_node(listing.source_node());
+            return Ok(false);
+        }
+
+        Self::check_routee_limit_for(settings, listing.service_id(), listing.len())?;
+        proxy_registry.apply_listing::<M>(listing).map_err(|error| {
+            RemoteClusteredReceptionistError::Proxy {
+                error: Box::new(error),
+            }
+        })
+    }
+
+    fn source_node_is_up(cluster: &Cluster, source_node: &NodeId) -> bool {
+        cluster
             .state()
             .member(source_node)
             .is_some_and(|member| member.state() == MembershipState::Up)
@@ -342,7 +445,15 @@ impl RemoteClusteredReceptionist {
         service_id: &str,
         actual: usize,
     ) -> RemoteClusteredReceptionistResult<()> {
-        let Some(max) = self.settings.max_routees_per_listing() else {
+        Self::check_routee_limit_for(&self.settings, service_id, actual)
+    }
+
+    fn check_routee_limit_for(
+        settings: &ClusteredReceptionistSettings,
+        service_id: &str,
+        actual: usize,
+    ) -> RemoteClusteredReceptionistResult<()> {
+        let Some(max) = settings.max_routees_per_listing() else {
             return Ok(());
         };
         if actual <= max {
