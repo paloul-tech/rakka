@@ -127,9 +127,10 @@ pub mod prelude {
 
     #[cfg(feature = "stream")]
     pub use rakka_stream::{
-        AckProtocol, ActorSinkMessage, ActorSourceError, ActorSourceMessage, ActorStreamError,
-        BoundedStream, Flow, RunnableStream, Sink, Source, StreamError, StreamResult,
-        StreamRunError, StreamRunResult, StreamRunSettings, StreamSink, StreamSource,
+        register_stream_sink_drain, register_stream_source_drain, AckProtocol, ActorSinkMessage,
+        ActorSourceError, ActorSourceMessage, ActorStreamError, BoundedStream, Flow,
+        RunnableStream, Sink, Source, StreamError, StreamResult, StreamRunError, StreamRunResult,
+        StreamRunSettings, StreamSink, StreamSource,
     };
 }
 

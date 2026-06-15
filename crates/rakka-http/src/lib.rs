@@ -11,6 +11,7 @@ mod metrics;
 mod observability;
 mod routes;
 mod server;
+mod shutdown;
 mod streaming;
 
 pub use axum::Router;
@@ -30,6 +31,10 @@ pub use routes::{
     json_entity_ask_route, json_entity_tell_route, json_service_route, HttpAccepted, HttpRouter,
 };
 pub use server::serve_with_graceful_shutdown;
+pub use shutdown::{
+    register_http_shutdown_task, serve_with_coordinated_shutdown, HttpServerShutdownResult,
+    HttpShutdownHandle, HttpShutdownSignal, HttpShutdownSnapshot,
+};
 pub use streaming::{
     byte_stream_response, byte_stream_response_with_content_type, byte_stream_route,
     request_body_stream_from_body, request_body_stream_from_request, request_body_stream_route,

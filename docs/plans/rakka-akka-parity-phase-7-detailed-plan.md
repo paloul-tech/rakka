@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 7 Detailed Plan
 
-Status: implemented through Slice 7C
+Status: implemented through Slice 7D
 Date: 2026-06-15
 
 ## Purpose
@@ -356,7 +356,7 @@ cargo clippy -p rakka-core --all-targets -- -D warnings
 
 Goal: connect public ingress and stream lifecycles to coordinated shutdown.
 
-Status: planned.
+Status: implemented.
 
 Scope:
 
@@ -382,6 +382,24 @@ Acceptance criteria:
 - Stream sink/source drains run in the adapter-drain phase.
 - Closed or already-cancelled streams are reported as completed, not failed.
 - Task reports include stable names for ingress and stream resources.
+
+Implementation status:
+
+- Added `rakka-http` shutdown handles, signals, snapshots, and server result
+  recording.
+- Added `register_http_shutdown_task` for `stop-ingress` and
+  `serve_with_coordinated_shutdown` to bridge coordinated shutdown into Axum
+  graceful shutdown.
+- Added matching `rakka-grpc` shutdown handles, signals, snapshots, server
+  result recording, and `register_grpc_shutdown_task`.
+- Added `rakka-stream` drain registration helpers for `StreamSink` and
+  `StreamSource` in the `drain-http-grpc-and-streams` phase.
+- Treat closed and already-cancelled stream drains as completed shutdown work so
+  repeated or late shutdown does not fail a report for terminal resources.
+- Re-exported the new helpers from the integration crates and stream drain
+  helpers through the top-level `rakka` prelude.
+- Added focused tests for HTTP/gRPC signal triggering, result snapshots, stream
+  drain task placement, and terminal stream drain completion.
 
 Review commands:
 
