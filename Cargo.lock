@@ -1304,6 +1304,7 @@ dependencies = [
  "rakka-http",
  "rakka-k8s",
  "rakka-persistence",
+ "rakka-process",
  "rakka-remote",
  "rakka-sharding",
  "rakka-stream",

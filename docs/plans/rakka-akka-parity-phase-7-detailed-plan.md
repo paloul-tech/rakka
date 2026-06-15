@@ -783,7 +783,7 @@ Completion notes:
   readiness, liveness, `/drain`, `RAKKA_K8S_PRESTOP_TIMEOUT_MS`, and
   `terminationGracePeriodSeconds`.
 - Updated the main parity plan with Phase 7 implementation status through 7J
-  while leaving Slice 7K as the remaining full operational validation slice.
+  and handed off the remaining full operational validation work to Slice 7K.
 - Added rustdoc examples for the core coordinated-shutdown registry lookup and
   the HTTP, stream, and process shutdown registration helpers.
 
@@ -792,7 +792,7 @@ Completion notes:
 Goal: verify the integrated shutdown path across crates and preserve the
 Phase 7 parity boundary.
 
-Status: planned.
+Status: completed in Slice 7K.
 
 Scope:
 
@@ -830,6 +830,30 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --all-features --no-deps
 git diff --check
 ```
+
+Completion notes:
+
+- Added `crates/rakka-testkit/tests/phase7_operational_validation.rs` as a
+  cross-crate operational validation test for the actor-system-owned
+  coordinated shutdown path.
+- The validation test covers built-in phase ordering, Kubernetes pre-stop report
+  mapping, repeated `ActorSystem::terminate_with_report` idempotency,
+  HTTP/gRPC graceful shutdown signals, stream drain, persistence query cancel,
+  in-memory persistence no-op flush reporting, cluster leave, sharding handoff,
+  process actor cleanup, and actor-system stop-user/stop-system tasks.
+- Added actor-system-owned failure-policy and task-timeout validation so
+  partial and timed-out reports remain observable through the operational path.
+- TCP remote drain registration is exercised when loopback bind is available;
+  sandboxed environments that deny bind skip only that assertion while the
+  existing remote crate TCP shutdown tests continue to cover the transport when
+  loopback is permitted.
+- PostgreSQL and Kubernetes local-cluster validation remain gated by their
+  existing environment-variable behavior.
+- Full Phase 7 review commands passed on 2026-06-15:
+  `cargo fmt --all -- --check`, `cargo check --workspace --all-features`,
+  `cargo test --workspace --all-features`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `cargo doc --workspace --all-features --no-deps`, and `git diff --check`.
 
 ## Suggested Implementation Order
 

@@ -646,7 +646,7 @@ Validation:
   Kubernetes drain integration, shard handoff during shutdown, and process actor
   cleanup.
 
-Implementation status through Slice 7J on 2026-06-15:
+Implementation status through Slice 7K on 2026-06-15:
 
 - Added `rakka-core::CoordinatedShutdown` with built-in Akka-shaped phases,
   serializable reports, idempotent execution, task/phase timeouts, failure
@@ -662,11 +662,19 @@ Implementation status through Slice 7J on 2026-06-15:
 - Added `docs/rakka-akka-parity-phase-7-coordinated-shutdown.md`, Phase 7
   migration notes, Kubernetes coordinated pre-stop timing guidance, and the
   runnable `rakka-example-coordinated-shutdown` example.
+- Added full operational validation in
+  `crates/rakka-testkit/tests/phase7_operational_validation.rs`, covering the
+  system-owned shutdown path across HTTP, gRPC, streams, persistence, cluster,
+  sharding, process actors, Kubernetes drain mapping, idempotency, failure
+  policy, timeout reporting, and TCP remote drain when loopback bind is
+  available.
 
-Remaining Phase 7 work:
+Phase 7 status:
 
-- Run and document the full operational validation slice in Phase 7K, including
-  workspace-wide tests/docs and focused cross-crate integration coverage.
+- Complete for the current Akka parity boundary. PostgreSQL and Kubernetes
+  local-cluster validation remain gated by their existing explicit environment
+  variables, and future hardening can move into later operational or release
+  phases.
 
 ## Cross-Cutting Requirements
 

@@ -32,6 +32,7 @@ tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
 prost.workspace = true
+rakka-process = { path = "../rakka-process", version = "0.1.0" }
 rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 
 [lints]
