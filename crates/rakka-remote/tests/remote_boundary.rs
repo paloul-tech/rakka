@@ -7,17 +7,19 @@ use rakka_cluster::{
 };
 use rakka_core::{
     actor_fn, actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorPath,
-    ActorUid, Receptionist, Routers, SerializedActorRef, ServiceKey,
+    ActorUid, CoordinatedShutdown, CoordinatedShutdownReason, Receptionist, Routers,
+    SerializedActorRef, ServiceKey, ShutdownOutcome,
 };
 use rakka_remote::{
-    EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef,
-    RemoteActorRefInbound, RemoteClusteredReceptionist, RemoteClusteredReceptionistError,
-    RemoteDestination, RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata,
-    RemoteError, RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteRequestError,
+    register_remote_service_proxy_remove_node_task, register_tcp_remote_drain_task, EncodedPayload,
+    InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef, RemoteActorRefInbound,
+    RemoteClusteredReceptionist, RemoteClusteredReceptionistError, RemoteDestination,
+    RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
+    RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteRequestError,
     RemoteRequestRegistry, RemoteServiceProxyError, RemoteServiceProxyRegistry,
     RemoteServiceRoutee, RemoteServiceRouteeKey, RemoteTransport, RemoteTransportError,
     SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransport, TcpRemoteTransportConfig,
-    DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    TcpRemoteTransportError, DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
     DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
     DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
     DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
@@ -84,6 +86,65 @@ fn tcp_remote_defaults_are_loopback_bounded_and_known_peer_only() {
         config.requires_registered_peers(),
         TCP_REMOTE_REQUIRES_REGISTERED_PEERS
     );
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_drains_tcp_remote_peers_and_rejects_future_sends() {
+    let local = NodeId::new("rakka-0", "uid-a");
+    let remote = ClusterNode::new(
+        NodeId::new("rakka-1", "uid-b"),
+        NodeAddress::new("127.0.0.1", 1),
+    );
+    let endpoint = RemoteEndpoint::new(local.clone());
+    let transport = match TcpRemoteTransport::bind(
+        local,
+        ClusterProtocol::default(),
+        endpoint,
+        TcpRemoteTransportConfig::new()
+            .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .connect_timeout(Duration::from_millis(10))
+            .reconnect_backoff(Duration::from_millis(1)),
+    )
+    .await
+    {
+        Ok(transport) => transport,
+        Err(TcpRemoteTransportError::Io { message })
+            if message.contains("Operation not permitted")
+                || message.contains("Permission denied") =>
+        {
+            eprintln!("skipping tcp remote shutdown test; loopback bind denied: {message}");
+            return;
+        }
+        Err(error) => panic!("tcp transport should bind: {error:?}"),
+    };
+    transport.register_peer(remote.clone()).unwrap();
+    let shutdown = CoordinatedShutdown::new();
+
+    register_tcp_remote_drain_task(&shutdown, "drain-tcp-peers", transport.clone()).unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+    let send = transport.send(
+        remote.id(),
+        RemoteEnvelope::new(
+            RemoteDestination::Entity {
+                entity_type: "cart".to_string(),
+                entity_id: "cart-1".to_string(),
+            },
+            EncodedPayload::new(
+                RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+                Vec::new(),
+            ),
+        ),
+    );
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert!(matches!(
+        send,
+        Err(RemoteTransportError::Draining { node_id }) if node_id == *remote.id()
+    ));
 }
 
 #[test]
@@ -520,6 +581,39 @@ async fn remote_service_proxy_registry_removes_proxy_for_source_node_removal() {
         fixture.proxy_registry.remove_remote_node(&fixture.node_a),
         1
     );
+    assert_eq!(fixture.proxy_registry.proxy_count(), 0);
+    assert_eq!(fixture.proxy_registry.listing_count(), 0);
+    assert!(fixture.receptionist_b.find(&key).unwrap().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_removes_remote_service_proxies_for_source_node() {
+    let fixture = RemoteProxyFixture::new("proxy-shutdown-node-removal");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+    fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap();
+    let shutdown = CoordinatedShutdown::new();
+
+    register_remote_service_proxy_remove_node_task(
+        &shutdown,
+        "remove-remote-proxies",
+        fixture.proxy_registry.clone(),
+        fixture.node_a.clone(),
+    )
+    .unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
     assert_eq!(fixture.proxy_registry.proxy_count(), 0);
     assert_eq!(fixture.proxy_registry.listing_count(), 0);
     assert!(fixture.receptionist_b.find(&key).unwrap().is_empty());

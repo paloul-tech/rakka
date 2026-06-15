@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 7 Detailed Plan
 
-Status: implemented through Slice 7D
+Status: implemented through Slice 7E
 Date: 2026-06-15
 
 ## Purpose
@@ -416,7 +416,7 @@ cargo clippy -p rakka-http -p rakka-grpc -p rakka-stream --all-targets -- -D war
 Goal: make distributed runtime components participate in the same shutdown
 sequence.
 
-Status: planned.
+Status: implemented.
 
 Scope:
 
@@ -444,6 +444,28 @@ Acceptance criteria:
   drain task begins.
 - Clustered receptionist proxies are removed during shutdown.
 - Existing Phase 4 and Phase 5 remote/sharding tests continue to pass.
+
+Implementation status:
+
+- Added explicit cluster coordinated-shutdown hooks for local graceful leave and
+  force/test-only down-self behavior in the `leave-cluster` phase.
+- Added a clustered receptionist prune hook in the `stop-remoting` phase so
+  propagated listings from non-up members are removed during shutdown.
+- Added shared synchronous and async sharding shutdown handles for mutable
+  `ClusterShardingRuntime` and `ClusterNodeRuntime` ownership.
+- Added sharding and networked-node leave task registration helpers in the
+  `handoff-shards` phase, preserving the existing handoff update summaries for
+  stopped entity counts and ownership transitions.
+- Added TCP remoting drain and force-close task registration helpers in the
+  `stop-remoting` phase.
+- Added remote service proxy cleanup hooks for source-node removal and stale
+  listing expiry during remoting shutdown.
+- Re-exported the cluster and sharding hooks through the top-level `rakka`
+  prelude; remote hooks are available through `rakka::remote`.
+- Added tests covering local cluster leave/down tasks, clustered receptionist
+  prune during shutdown, sharding handoff through coordinated shutdown, TCP
+  drain rejecting future sends, and remote service proxy removal during
+  shutdown.
 
 Review commands:
 

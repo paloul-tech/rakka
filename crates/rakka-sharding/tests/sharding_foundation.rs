@@ -8,15 +8,17 @@ use rakka_cluster::{
     DiscoverySnapshot, MembershipConfig, MembershipEvent, NodeAddress, NodeId, ProtocolVersion,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem,
-    InMemoryMetricsRecorder, ReplyTo, METRIC_SHARD_OWNERSHIP_COUNT,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, CoordinatedShutdown,
+    CoordinatedShutdownReason, InMemoryMetricsRecorder, ReplyTo, ShutdownOutcome, ShutdownPhase,
+    ShutdownTaskStatus, METRIC_SHARD_OWNERSHIP_COUNT,
 };
 use rakka_remote::{
     InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope,
     RemoteRequestRegistry, SerializationRegistry,
 };
 use rakka_sharding::{
-    AsyncShardCoordinatorStore, ClusterSharding, ClusterShardingError, ClusterShardingRuntime,
+    register_cluster_sharding_leave_task, AsyncShardCoordinatorStore, ClusterSharding,
+    ClusterShardingError, ClusterShardingRuntime, ClusterShardingShutdownHandle,
     CoordinatorStoreFuture, Entity, EntityAskError, EntityContext, EntityDeliveryFailure, EntityId,
     EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryRememberedEntityStore,
     InMemoryShardCoordinatorLease, InMemoryShardCoordinatorStore, LeastShardAllocationStrategy,
@@ -1682,6 +1684,80 @@ async fn cluster_sharding_runtime_runs_graceful_handoff_before_ownership_publish
         .tell(&region_a, CartCommand::Add("banana".to_string()))
         .unwrap();
     assert_eq!(route_a.entity_count(), 1);
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_runs_cluster_sharding_local_leave_handoff() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let remote = node("rakka-1", "uid-b");
+    let entity_type = EntityType::new("CartShutdown");
+    let config = ShardingConfig::new(4).unwrap();
+    let route_a = LocalEntityRoute::new(
+        local_id.clone(),
+        ActorSystem::new("shutdown-handoff-node-a-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let route_b = LocalEntityRoute::new(
+        remote.id().clone(),
+        ActorSystem::new("shutdown-handoff-node-b-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region_a = ShardRegion::new(entity_type.clone(), config.clone(), route_a.clone());
+    let region_b = ShardRegion::new(entity_type.clone(), config.clone(), route_b);
+    let mut runtime = runtime_with_local(local.clone());
+
+    runtime.register_region(region_a.clone()).unwrap();
+    runtime.register_region(region_b).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, remote]))
+        .unwrap();
+
+    let entity_id = entity_owned_by(runtime.coordinator(&entity_type).unwrap(), "rakka-0");
+    let entity = EntityRef::<CartCommand>::new(entity_type.clone(), entity_id);
+    let shard_key = entity.shard_key(&config);
+    let shard_id = shard_key.shard_id();
+    entity
+        .tell(&region_a, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    assert_eq!(route_a.entity_count(), 1);
+
+    let handle = ClusterShardingShutdownHandle::new(runtime);
+    let shutdown = CoordinatedShutdown::new();
+    register_cluster_sharding_leave_task(&shutdown, "handoff-local-shards", handle.clone())
+        .unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+    let update = handle.last_update().expect("shutdown update should record");
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert_eq!(
+        report
+            .phases()
+            .iter()
+            .find(|phase| phase.phase() == &ShutdownPhase::handoff_shards())
+            .and_then(|phase| phase.tasks().first())
+            .map(|task| task.status()),
+        Some(ShutdownTaskStatus::Completed)
+    );
+    assert!(update.handoffs().iter().any(|handoff| {
+        handoff.shard() == &shard_key
+            && handoff.state() == ShardHandoffState::Transferring
+            && handoff.stopped_entities() == 1
+    }));
+    assert_eq!(
+        route_a.shard_handoff_state(shard_id),
+        ShardHandoffState::Transferring
+    );
 }
 
 #[tokio::test]

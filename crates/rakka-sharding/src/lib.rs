@@ -17,6 +17,7 @@ pub mod remembered_entities;
 pub mod remote;
 pub mod routing;
 pub mod runtime;
+pub mod shutdown;
 
 use rakka_core::Subsystem;
 
@@ -64,6 +65,12 @@ pub use routing::{
 pub use runtime::{
     ClusterShardingError, ClusterShardingResult, ClusterShardingRuntime, ClusterShardingUpdate,
     EntityShardRebalance,
+};
+pub use shutdown::{
+    register_async_cluster_node_leave_task, register_async_cluster_sharding_leave_task,
+    register_cluster_node_leave_task, register_cluster_sharding_leave_task,
+    AsyncClusterNodeShutdownHandle, AsyncClusterShardingShutdownHandle, ClusterNodeShutdownHandle,
+    ClusterShardingShutdownHandle,
 };
 
 /// Crate name used in diagnostics.

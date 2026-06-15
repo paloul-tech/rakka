@@ -13,6 +13,7 @@ mod proto;
 pub mod receptionist;
 pub mod registry;
 pub mod request;
+pub mod shutdown;
 pub mod transport;
 
 use rakka_core::Subsystem;
@@ -53,6 +54,10 @@ pub use registry::{
 };
 pub use request::{
     RemotePendingReply, RemoteRequestError, RemoteRequestRegistry, RemoteRequestResult,
+};
+pub use shutdown::{
+    register_remote_service_proxy_expire_task, register_remote_service_proxy_remove_node_task,
+    register_tcp_remote_drain_task, register_tcp_remote_force_close_task,
 };
 pub use transport::{
     InMemoryRemoteTransport, RemoteTransport, RemoteTransportError, RemoteTransportResult,

@@ -82,11 +82,13 @@ pub mod prelude {
 
     #[cfg(feature = "cluster")]
     pub use rakka_cluster::{
-        Cluster, ClusterEvent, ClusterManager, ClusterRuntime, ClusterSettings, ClusterState,
-        ClusterSubscription, ClusterSubscriptionError, ClusterSubscriptionReplay,
-        ClusterSubscriptions, ClusterUpdate, ClusteredReceptionist, ClusteredReceptionistListing,
-        ClusteredReceptionistSettings, DowningStrategy, FailureDetector, NoDowningStrategy,
-        SelfMember, TimeoutDowningStrategy, TimeoutFailureDetector,
+        register_cluster_down_self_task, register_cluster_leave_task,
+        register_clustered_receptionist_prune_task, Cluster, ClusterEvent, ClusterManager,
+        ClusterRuntime, ClusterSettings, ClusterState, ClusterSubscription,
+        ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions, ClusterUpdate,
+        ClusteredReceptionist, ClusteredReceptionistListing, ClusteredReceptionistSettings,
+        DowningStrategy, FailureDetector, NoDowningStrategy, SelfMember, TimeoutDowningStrategy,
+        TimeoutFailureDetector,
     };
 
     #[cfg(feature = "persistence")]
@@ -114,15 +116,18 @@ pub mod prelude {
 
     #[cfg(feature = "sharding")]
     pub use rakka_sharding::{
-        AsyncShardCoordinatorStore, CoordinatorLeaseFuture, CoordinatorStoreFuture,
-        DeterministicModuloShardAllocationStrategy, EntityId, EntityRef, EntityType,
-        InMemoryRememberedEntityStore, InMemoryShardCoordinatorLease,
-        InMemoryShardCoordinatorStore, LeaseToken, LeastShardAllocationStrategy,
-        PersistedShardCoordinatorState, RememberedEntities, RememberedEntityReplay,
-        RememberedEntityReplaySettings, RememberedEntityStore, RememberedStoreFuture,
-        ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig, ShardBufferOverflow,
-        ShardCoordinatorLease, ShardCoordinatorStore, ShardReassignment, ShardRebalanceContext,
-        ShardingConfig,
+        register_async_cluster_node_leave_task, register_async_cluster_sharding_leave_task,
+        register_cluster_node_leave_task, register_cluster_sharding_leave_task,
+        AsyncClusterNodeShutdownHandle, AsyncClusterShardingShutdownHandle,
+        AsyncShardCoordinatorStore, ClusterNodeShutdownHandle, ClusterShardingShutdownHandle,
+        CoordinatorLeaseFuture, CoordinatorStoreFuture, DeterministicModuloShardAllocationStrategy,
+        EntityId, EntityRef, EntityType, InMemoryRememberedEntityStore,
+        InMemoryShardCoordinatorLease, InMemoryShardCoordinatorStore, LeaseToken,
+        LeastShardAllocationStrategy, PersistedShardCoordinatorState, RememberedEntities,
+        RememberedEntityReplay, RememberedEntityReplaySettings, RememberedEntityStore,
+        RememberedStoreFuture, ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig,
+        ShardBufferOverflow, ShardCoordinatorLease, ShardCoordinatorStore, ShardReassignment,
+        ShardRebalanceContext, ShardingConfig,
     };
 
     #[cfg(feature = "stream")]
