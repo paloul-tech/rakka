@@ -6,6 +6,7 @@
 //! adapters.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -13,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::{RakkaError, RakkaResult};
 
@@ -44,7 +47,12 @@ pub type ShutdownTaskFuture = Pin<Box<dyn Future<Output = ShutdownTaskResult> + 
 /// Result returned by a coordinated shutdown task.
 pub type ShutdownTaskResult = RakkaResult<()>;
 
+/// Result returned by coordinated shutdown runner APIs.
+pub type CoordinatedShutdownResult<T> = Result<T, CoordinatedShutdownError>;
+
 type ShutdownTaskRunner = dyn Fn(ShutdownTaskContext) -> ShutdownTaskFuture + Send + Sync + 'static;
+
+type ShutdownRunResult = CoordinatedShutdownResult<CoordinatedShutdownReport>;
 
 /// Registry of named shutdown phases and tasks.
 #[derive(Clone)]
@@ -157,10 +165,97 @@ impl CoordinatedShutdown {
         self.lock().tasks_for_phase(phase)
     }
 
+    /// Runs coordinated shutdown once with the supplied reason.
+    ///
+    /// Repeated calls return the original completed result. Concurrent calls
+    /// await the in-flight shutdown instead of running tasks a second time.
+    pub async fn run(
+        &self,
+        reason: CoordinatedShutdownReason,
+    ) -> CoordinatedShutdownResult<CoordinatedShutdownReport> {
+        self.run_internal(reason, None).await
+    }
+
+    /// Runs coordinated shutdown once with an overall deadline.
+    ///
+    /// If another caller already started shutdown, this call observes that
+    /// in-flight run instead of replacing its deadline.
+    pub async fn run_with_deadline(
+        &self,
+        reason: CoordinatedShutdownReason,
+        deadline: Instant,
+    ) -> CoordinatedShutdownResult<CoordinatedShutdownReport> {
+        self.run_internal(reason, Some(deadline)).await
+    }
+
+    /// Returns a serializable snapshot of the current shutdown state.
+    #[must_use]
+    pub fn snapshot(&self) -> CoordinatedShutdownSnapshot {
+        self.lock().snapshot()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ShutdownRegistry> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn run_internal(
+        &self,
+        reason: CoordinatedShutdownReason,
+        deadline: Option<Instant>,
+    ) -> CoordinatedShutdownResult<CoordinatedShutdownReport> {
+        loop {
+            let action = {
+                let mut registry = self.lock();
+                match &registry.run_state {
+                    ShutdownRunState::NotStarted => {
+                        let plan = registry.execution_plan()?;
+                        let (sender, receiver) = watch::channel(None::<ShutdownRunResult>);
+                        registry.run_state = ShutdownRunState::Running {
+                            receiver: receiver.clone(),
+                        };
+                        ShutdownRunAction::Start {
+                            sender,
+                            plan,
+                            reason: reason.clone(),
+                            deadline,
+                        }
+                    }
+                    ShutdownRunState::Running { receiver } => {
+                        ShutdownRunAction::Wait(receiver.clone())
+                    }
+                    ShutdownRunState::Finished { result } => {
+                        return result.clone();
+                    }
+                }
+            };
+
+            match action {
+                ShutdownRunAction::Start {
+                    sender,
+                    plan,
+                    reason,
+                    deadline,
+                } => {
+                    let result = execute_shutdown_plan(plan, reason, deadline).await;
+                    let _sent = sender.send(Some(result.clone()));
+                    self.lock().run_state = ShutdownRunState::Finished {
+                        result: result.clone(),
+                    };
+                    return result;
+                }
+                ShutdownRunAction::Wait(mut receiver) => loop {
+                    if let Some(result) = receiver.borrow().clone() {
+                        return result;
+                    }
+
+                    if receiver.changed().await.is_err() {
+                        break;
+                    }
+                },
+            }
+        }
     }
 }
 
@@ -177,7 +272,109 @@ impl Debug for CoordinatedShutdown {
             .field("settings", &registry.settings)
             .field("phase_count", &registry.phases.len())
             .field("task_count", &registry.task_count())
+            .field("outcome", &registry.snapshot().outcome())
             .finish()
+    }
+}
+
+/// Error returned by coordinated shutdown runner APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatedShutdownError {
+    /// Shutdown could not start because the registry was invalid.
+    Registry {
+        /// Underlying registry error.
+        error: RakkaError,
+    },
+    /// Shutdown stopped because a fail-fast task returned an error.
+    Failed {
+        /// Partial shutdown report.
+        report: CoordinatedShutdownReport,
+    },
+    /// Shutdown stopped because a task, phase, or overall deadline elapsed.
+    TimedOut {
+        /// Partial shutdown report.
+        report: CoordinatedShutdownReport,
+    },
+}
+
+impl CoordinatedShutdownError {
+    /// Returns the partial shutdown report when available.
+    #[must_use]
+    pub const fn report(&self) -> Option<&CoordinatedShutdownReport> {
+        match self {
+            Self::Registry { .. } => None,
+            Self::Failed { report } | Self::TimedOut { report } => Some(report),
+        }
+    }
+
+    /// Returns the shutdown outcome represented by this error.
+    #[must_use]
+    pub const fn outcome(&self) -> ShutdownOutcome {
+        match self {
+            Self::Registry { .. } => ShutdownOutcome::Failed,
+            Self::Failed { .. } => ShutdownOutcome::Failed,
+            Self::TimedOut { .. } => ShutdownOutcome::TimedOut,
+        }
+    }
+}
+
+impl Display for CoordinatedShutdownError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry { error } => Display::fmt(error, f),
+            Self::Failed { report } => write!(
+                f,
+                "coordinated shutdown '{}' failed",
+                report.reason().code()
+            ),
+            Self::TimedOut { report } => write!(
+                f,
+                "coordinated shutdown '{}' timed out",
+                report.reason().code()
+            ),
+        }
+    }
+}
+
+impl Error for CoordinatedShutdownError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Registry { error } => Some(error),
+            Self::Failed { .. } | Self::TimedOut { .. } => None,
+        }
+    }
+}
+
+impl From<RakkaError> for CoordinatedShutdownError {
+    fn from(error: RakkaError) -> Self {
+        Self::Registry { error }
+    }
+}
+
+/// Serializable point-in-time view of coordinated shutdown state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatedShutdownSnapshot {
+    outcome: ShutdownOutcome,
+    report: Option<CoordinatedShutdownReport>,
+}
+
+impl CoordinatedShutdownSnapshot {
+    /// Creates a shutdown snapshot.
+    #[must_use]
+    pub const fn new(outcome: ShutdownOutcome, report: Option<CoordinatedShutdownReport>) -> Self {
+        Self { outcome, report }
+    }
+
+    /// Current shutdown outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> ShutdownOutcome {
+        self.outcome
+    }
+
+    /// Completed or partial report, when available.
+    #[must_use]
+    pub const fn report(&self) -> Option<&CoordinatedShutdownReport> {
+        self.report.as_ref()
     }
 }
 
@@ -809,7 +1006,7 @@ impl CoordinatedShutdownReport {
 #[derive(Clone)]
 struct ShutdownTaskEntry {
     descriptor: ShutdownTask,
-    _run: Arc<ShutdownTaskRunner>,
+    run: Arc<ShutdownTaskRunner>,
 }
 
 impl Debug for ShutdownTaskEntry {
@@ -818,6 +1015,34 @@ impl Debug for ShutdownTaskEntry {
             .field("descriptor", &self.descriptor)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone)]
+struct ShutdownExecutionPlan {
+    settings: CoordinatedShutdownSettings,
+    phases: Vec<ShutdownPhase>,
+    tasks: BTreeMap<String, Vec<ShutdownTaskEntry>>,
+}
+
+#[derive(Debug, Clone)]
+enum ShutdownRunState {
+    NotStarted,
+    Running {
+        receiver: watch::Receiver<Option<ShutdownRunResult>>,
+    },
+    Finished {
+        result: ShutdownRunResult,
+    },
+}
+
+enum ShutdownRunAction {
+    Start {
+        sender: watch::Sender<Option<ShutdownRunResult>>,
+        plan: ShutdownExecutionPlan,
+        reason: CoordinatedShutdownReason,
+        deadline: Option<Instant>,
+    },
+    Wait(watch::Receiver<Option<ShutdownRunResult>>),
 }
 
 #[derive(Debug, Clone)]
@@ -831,6 +1056,7 @@ struct ShutdownRegistry {
     settings: CoordinatedShutdownSettings,
     phases: BTreeMap<String, PhaseNode>,
     tasks: BTreeMap<String, BTreeMap<String, ShutdownTaskEntry>>,
+    run_state: ShutdownRunState,
 }
 
 impl ShutdownRegistry {
@@ -855,6 +1081,7 @@ impl ShutdownRegistry {
             settings,
             phases,
             tasks: BTreeMap::new(),
+            run_state: ShutdownRunState::NotStarted,
         }
     }
 
@@ -863,6 +1090,7 @@ impl ShutdownRegistry {
         name: String,
         after: ShutdownPhase,
     ) -> RakkaResult<ShutdownPhase> {
+        self.ensure_not_started()?;
         self.ensure_phase_exists(&after)?;
         let phase = ShutdownPhase::new(name)?;
         self.ensure_phase_absent(&phase)?;
@@ -884,6 +1112,7 @@ impl ShutdownRegistry {
         name: String,
         before: ShutdownPhase,
     ) -> RakkaResult<ShutdownPhase> {
+        self.ensure_not_started()?;
         self.ensure_phase_exists(&before)?;
         let phase = ShutdownPhase::new(name)?;
         self.ensure_phase_absent(&phase)?;
@@ -908,6 +1137,7 @@ impl ShutdownRegistry {
         phase: ShutdownPhase,
         depends_on: ShutdownPhase,
     ) -> RakkaResult<()> {
+        self.ensure_not_started()?;
         self.ensure_phase_exists(&phase)?;
         self.ensure_phase_exists(&depends_on)?;
 
@@ -1003,6 +1233,7 @@ impl ShutdownRegistry {
         options: ShutdownTaskOptions,
         run: Arc<ShutdownTaskRunner>,
     ) -> RakkaResult<ShutdownTask> {
+        self.ensure_not_started()?;
         self.ensure_phase_exists(&phase)?;
         let descriptor = ShutdownTask::new(phase.clone(), name, options)?;
         let phase_tasks = self.tasks.entry(phase.name().to_owned()).or_default();
@@ -1021,7 +1252,7 @@ impl ShutdownRegistry {
             descriptor.name().to_owned(),
             ShutdownTaskEntry {
                 descriptor: descriptor.clone(),
-                _run: run,
+                run,
             },
         );
         Ok(descriptor)
@@ -1055,6 +1286,61 @@ impl ShutdownRegistry {
         self.tasks.values().map(BTreeMap::len).sum()
     }
 
+    fn execution_plan(&self) -> CoordinatedShutdownResult<ShutdownExecutionPlan> {
+        let phase_names = self.ordered_phase_names()?;
+        let phases = phase_names
+            .iter()
+            .map(|name| {
+                self.phases
+                    .get(name)
+                    .expect("topological sort only returns known phases")
+                    .phase
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let tasks = phase_names
+            .into_iter()
+            .filter_map(|phase_name| {
+                self.tasks.get(&phase_name).map(|phase_tasks| {
+                    (
+                        phase_name,
+                        phase_tasks.values().cloned().collect::<Vec<_>>(),
+                    )
+                })
+            })
+            .collect();
+
+        Ok(ShutdownExecutionPlan {
+            settings: self.settings,
+            phases,
+            tasks,
+        })
+    }
+
+    fn snapshot(&self) -> CoordinatedShutdownSnapshot {
+        match &self.run_state {
+            ShutdownRunState::NotStarted => {
+                CoordinatedShutdownSnapshot::new(ShutdownOutcome::NotStarted, None)
+            }
+            ShutdownRunState::Running { receiver } => receiver.borrow().as_ref().map_or_else(
+                || CoordinatedShutdownSnapshot::new(ShutdownOutcome::Running, None),
+                snapshot_from_result,
+            ),
+            ShutdownRunState::Finished { result } => snapshot_from_result(result),
+        }
+    }
+
+    fn ensure_not_started(&self) -> RakkaResult<()> {
+        if matches!(self.run_state, ShutdownRunState::NotStarted) {
+            Ok(())
+        } else {
+            Err(RakkaError::core(
+                "shutdown-already-started",
+                "cannot modify coordinated shutdown after it has started",
+            ))
+        }
+    }
+
     fn ensure_phase_exists(&self, phase: &ShutdownPhase) -> RakkaResult<()> {
         if self.phases.contains_key(phase.name()) {
             Ok(())
@@ -1074,6 +1360,243 @@ impl ShutdownRegistry {
             ))
         } else {
             Ok(())
+        }
+    }
+}
+
+async fn execute_shutdown_plan(
+    plan: ShutdownExecutionPlan,
+    reason: CoordinatedShutdownReason,
+    overall_deadline: Option<Instant>,
+) -> ShutdownRunResult {
+    let mut final_outcome = ShutdownOutcome::Complete;
+    let mut phase_reports = Vec::new();
+
+    for phase in plan.phases {
+        let phase_start = Instant::now();
+        let phase_timeout_deadline = plan
+            .settings
+            .default_phase_timeout()
+            .map(|timeout| phase_start + timeout);
+        let phase_deadline = min_deadline(overall_deadline, phase_timeout_deadline);
+        let mut task_reports = Vec::new();
+        let mut phase_outcome = ShutdownOutcome::Complete;
+        let mut stop_after_phase = false;
+        let phase_tasks = plan.tasks.get(phase.name()).cloned().unwrap_or_default();
+
+        if deadline_elapsed(phase_deadline) {
+            phase_outcome = ShutdownOutcome::TimedOut;
+            stop_after_phase = true;
+        }
+
+        for task in phase_tasks {
+            if stop_after_phase {
+                break;
+            }
+
+            if deadline_elapsed(phase_deadline) {
+                task_reports.push(ShutdownTaskReport::new(
+                    phase.clone(),
+                    task.descriptor.name().to_owned(),
+                    ShutdownTaskStatus::TimedOut,
+                    Some(Duration::ZERO),
+                    Some("shutdown phase deadline elapsed before task started".to_owned()),
+                ));
+                phase_outcome = ShutdownOutcome::TimedOut;
+                stop_after_phase = true;
+                break;
+            }
+
+            let task_deadline = task_deadline(&plan.settings, &task, phase_deadline);
+            let task_report = run_shutdown_task(&task, reason.clone(), task_deadline).await;
+            let task_status = task_report.status();
+            let task_policy = task
+                .descriptor
+                .options()
+                .failure_policy()
+                .unwrap_or(plan.settings.failure_policy());
+
+            task_reports.push(task_report);
+
+            match task_status {
+                ShutdownTaskStatus::Completed => {}
+                ShutdownTaskStatus::Failed => {
+                    if task_policy == ShutdownFailurePolicy::FailFast {
+                        phase_outcome = ShutdownOutcome::Failed;
+                        stop_after_phase = true;
+                    } else {
+                        phase_outcome =
+                            combine_shutdown_outcome(phase_outcome, ShutdownOutcome::Partial);
+                        final_outcome =
+                            combine_shutdown_outcome(final_outcome, ShutdownOutcome::Partial);
+                    }
+                }
+                ShutdownTaskStatus::TimedOut => {
+                    phase_outcome =
+                        combine_shutdown_outcome(phase_outcome, ShutdownOutcome::TimedOut);
+                    final_outcome =
+                        combine_shutdown_outcome(final_outcome, ShutdownOutcome::TimedOut);
+                    if task_policy == ShutdownFailurePolicy::FailFast
+                        || deadline_elapsed(phase_deadline)
+                    {
+                        stop_after_phase = true;
+                    }
+                }
+                ShutdownTaskStatus::Pending
+                | ShutdownTaskStatus::Running
+                | ShutdownTaskStatus::Skipped => {}
+            }
+        }
+
+        if phase_outcome == ShutdownOutcome::Complete && deadline_elapsed(phase_deadline) {
+            phase_outcome = ShutdownOutcome::TimedOut;
+            stop_after_phase = true;
+        }
+
+        final_outcome = combine_shutdown_outcome(final_outcome, phase_outcome);
+        phase_reports.push(ShutdownPhaseReport::new(
+            phase,
+            phase_outcome,
+            Some(phase_start.elapsed()),
+            task_reports,
+        ));
+
+        if stop_after_phase {
+            let report = CoordinatedShutdownReport::new(reason, final_outcome, phase_reports);
+            return report_to_result(report);
+        }
+    }
+
+    report_to_result(CoordinatedShutdownReport::new(
+        reason,
+        final_outcome,
+        phase_reports,
+    ))
+}
+
+async fn run_shutdown_task(
+    task: &ShutdownTaskEntry,
+    reason: CoordinatedShutdownReason,
+    deadline: Option<Instant>,
+) -> ShutdownTaskReport {
+    let task_start = Instant::now();
+    let descriptor = task.descriptor.clone();
+    let context = ShutdownTaskContext::new(
+        reason,
+        descriptor.phase().clone(),
+        descriptor.name().to_owned(),
+    );
+
+    let result = if deadline_elapsed(deadline) {
+        TaskRunOutcome::TimedOut
+    } else {
+        let run = (task.run)(context);
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, run).await {
+                Ok(Ok(())) => TaskRunOutcome::Completed,
+                Ok(Err(error)) => TaskRunOutcome::Failed(error.to_string()),
+                Err(_elapsed) => TaskRunOutcome::TimedOut,
+            },
+            None => match run.await {
+                Ok(()) => TaskRunOutcome::Completed,
+                Err(error) => TaskRunOutcome::Failed(error.to_string()),
+            },
+        }
+    };
+
+    match result {
+        TaskRunOutcome::Completed => ShutdownTaskReport::new(
+            descriptor.phase().clone(),
+            descriptor.name().to_owned(),
+            ShutdownTaskStatus::Completed,
+            Some(task_start.elapsed()),
+            None,
+        ),
+        TaskRunOutcome::Failed(message) => ShutdownTaskReport::new(
+            descriptor.phase().clone(),
+            descriptor.name().to_owned(),
+            ShutdownTaskStatus::Failed,
+            Some(task_start.elapsed()),
+            Some(message),
+        ),
+        TaskRunOutcome::TimedOut => ShutdownTaskReport::new(
+            descriptor.phase().clone(),
+            descriptor.name().to_owned(),
+            ShutdownTaskStatus::TimedOut,
+            Some(task_start.elapsed()),
+            Some("shutdown task timed out".to_owned()),
+        ),
+    }
+}
+
+enum TaskRunOutcome {
+    Completed,
+    Failed(String),
+    TimedOut,
+}
+
+fn task_deadline(
+    settings: &CoordinatedShutdownSettings,
+    task: &ShutdownTaskEntry,
+    phase_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let task_timeout = task
+        .descriptor
+        .options()
+        .timeout()
+        .or(settings.default_task_timeout());
+    let task_deadline = task_timeout.map(|timeout| Instant::now() + timeout);
+    min_deadline(phase_deadline, task_deadline)
+}
+
+fn min_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
+fn deadline_elapsed(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn combine_shutdown_outcome(left: ShutdownOutcome, right: ShutdownOutcome) -> ShutdownOutcome {
+    match (left, right) {
+        (ShutdownOutcome::TimedOut, _) | (_, ShutdownOutcome::TimedOut) => {
+            ShutdownOutcome::TimedOut
+        }
+        (ShutdownOutcome::Failed, _) | (_, ShutdownOutcome::Failed) => ShutdownOutcome::Failed,
+        (ShutdownOutcome::Partial, _) | (_, ShutdownOutcome::Partial) => ShutdownOutcome::Partial,
+        (ShutdownOutcome::Running, _) | (_, ShutdownOutcome::Running) => ShutdownOutcome::Running,
+        (ShutdownOutcome::NotStarted, outcome) => outcome,
+        (outcome, ShutdownOutcome::NotStarted) => outcome,
+        (ShutdownOutcome::Complete, ShutdownOutcome::Complete) => ShutdownOutcome::Complete,
+    }
+}
+
+fn report_to_result(report: CoordinatedShutdownReport) -> ShutdownRunResult {
+    match report.outcome() {
+        ShutdownOutcome::Failed => Err(CoordinatedShutdownError::Failed { report }),
+        ShutdownOutcome::TimedOut => Err(CoordinatedShutdownError::TimedOut { report }),
+        ShutdownOutcome::NotStarted
+        | ShutdownOutcome::Running
+        | ShutdownOutcome::Complete
+        | ShutdownOutcome::Partial => Ok(report),
+    }
+}
+
+fn snapshot_from_result(result: &ShutdownRunResult) -> CoordinatedShutdownSnapshot {
+    match result {
+        Ok(report) => CoordinatedShutdownSnapshot::new(report.outcome(), Some(report.clone())),
+        Err(CoordinatedShutdownError::Registry { .. }) => {
+            CoordinatedShutdownSnapshot::new(ShutdownOutcome::Failed, None)
+        }
+        Err(CoordinatedShutdownError::Failed { report }) => {
+            CoordinatedShutdownSnapshot::new(ShutdownOutcome::Failed, Some(report.clone()))
+        }
+        Err(CoordinatedShutdownError::TimedOut { report }) => {
+            CoordinatedShutdownSnapshot::new(ShutdownOutcome::TimedOut, Some(report.clone()))
         }
     }
 }

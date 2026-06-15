@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 7 Detailed Plan
 
-Status: implemented through Slice 7A
+Status: implemented through Slice 7B
 Date: 2026-06-15
 
 ## Purpose
@@ -223,7 +223,7 @@ cargo doc -p rakka-core --no-deps
 Goal: make the registry executable with deterministic phase reports and
 idempotent lifecycle semantics.
 
-Status: planned.
+Status: implemented.
 
 Scope:
 
@@ -252,6 +252,26 @@ Acceptance criteria:
 - A timed-out task stops further phases under fail-fast policy.
 - Continue-on-error policy completes later tasks and marks the report partial.
 - Reports are deterministic enough for snapshot-style tests.
+
+Implementation status:
+
+- Added `CoordinatedShutdown::run` and `run_with_deadline` with one-shot
+  execution semantics.
+- Added watch-backed idempotency so repeated calls return the completed result
+  and concurrent callers await the same in-flight shutdown.
+- Added `CoordinatedShutdownError`, `CoordinatedShutdownResult`, and
+  `CoordinatedShutdownSnapshot` so failed and timed-out shutdowns preserve
+  partial reports.
+- Added runner state tracking for not-started, running, and finished outcomes.
+- Enforced default phase timeouts, default task timeouts, task-specific
+  timeouts, and overall deadlines.
+- Implemented fail-fast versus continue-on-error task policy behavior.
+- Added deterministic phase and task reports with duration, status, and failure
+  or timeout messages.
+- Prevented registry mutation after shutdown has started.
+- Added tests for phase-order execution, repeated-run idempotency, concurrent
+  run sharing, fail-fast failure, continue-on-error partial reports, task
+  timeout behavior, and overall deadline timeout behavior.
 
 Review commands:
 

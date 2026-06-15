@@ -26,8 +26,9 @@ pub use actor::{
     TellError, TerminationReason, TimerHandle, WatchHandle, DEFAULT_MAILBOX_CAPACITY,
 };
 pub use coordinated_shutdown::{
-    CoordinatedShutdown, CoordinatedShutdownReason, CoordinatedShutdownReport,
-    CoordinatedShutdownSettings, ShutdownFailurePolicy, ShutdownOutcome, ShutdownPhase,
+    CoordinatedShutdown, CoordinatedShutdownError, CoordinatedShutdownReason,
+    CoordinatedShutdownReport, CoordinatedShutdownResult, CoordinatedShutdownSettings,
+    CoordinatedShutdownSnapshot, ShutdownFailurePolicy, ShutdownOutcome, ShutdownPhase,
     ShutdownPhaseReport, ShutdownTask, ShutdownTaskAttribute, ShutdownTaskContext,
     ShutdownTaskFuture, ShutdownTaskOptions, ShutdownTaskReport, ShutdownTaskResult,
     ShutdownTaskStatus,
