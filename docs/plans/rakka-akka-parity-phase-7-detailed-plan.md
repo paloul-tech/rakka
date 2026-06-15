@@ -675,7 +675,7 @@ Completion notes:
 Goal: add reusable testkit utilities so applications and Rakka crates can test
 shutdown behavior without sleeps.
 
-Status: planned.
+Status: completed in Slice 7I.
 
 Scope:
 
@@ -710,6 +710,22 @@ cargo test -p rakka-testkit coordinated_shutdown
 cargo test -p rakka-core coordinated_shutdown
 cargo clippy -p rakka-testkit --all-targets -- -D warnings
 ```
+
+Completion notes:
+
+- Added `rakka_testkit::CoordinatedShutdownTestKit` for core-only registries,
+  existing registries, and `ActorSystem`-owned coordinated shutdown.
+- Added reusable probe task helpers for immediate success, controlled pending
+  tasks, manual release, and injected failures.
+- Added task event capture for deterministic start/finish ordering assertions
+  without arbitrary sleeps.
+- Added report and metrics assertions for shutdown outcome, phase ordering,
+  task status, and timeout metric labels.
+- Added focused coordinated-shutdown testkit tests covering manual release,
+  failure/idempotency, actor-system integration, and timeout metric labels.
+- Added a rustdoc example showing how application tests can register a
+  controlled shutdown task, wait for it to start, release it, and assert the
+  final report.
 
 ## Slice 7J: Docs, Examples, And Migration Notes
 

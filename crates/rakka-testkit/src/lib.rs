@@ -8,7 +8,7 @@ pub mod compatibility;
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -18,8 +18,11 @@ use futures_util::StreamExt;
 use rakka_cluster::{ClusterEvent, ClusterSubscription, ClusterSubscriptionError, NodeId};
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, ActorTerminated,
-    AskError, GroupRouter, GroupRouterSnapshot, Listing, Message, PoolRouter, RakkaError,
-    RakkaResult, ReceptionistSubscription, ReplyTo, Subsystem,
+    AskError, CoordinatedShutdown, CoordinatedShutdownReason, CoordinatedShutdownReport,
+    CoordinatedShutdownResult, CoordinatedShutdownSettings, GroupRouter, GroupRouterSnapshot,
+    Listing, Message, PoolRouter, RakkaError, RakkaResult, ReceptionistSubscription, ReplyTo,
+    ShutdownOutcome, ShutdownPhase, ShutdownTask, ShutdownTaskOptions, ShutdownTaskReport,
+    ShutdownTaskStatus, Subsystem, METRIC_SHUTDOWN_TIMEOUTS,
 };
 use rakka_core::{MetricKind, MetricObservation, MetricsSnapshot};
 use rakka_grpc::{GrpcResponseStream, GrpcResult};
@@ -55,6 +58,609 @@ pub const fn subsystem() -> Subsystem {
 /// Runs a future on Tokio for testkit callers.
 pub async fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
     future.await
+}
+
+/// Default timeout used by coordinated shutdown testkit probes.
+pub const DEFAULT_SHUTDOWN_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Event recorded by [`CoordinatedShutdownTestKit`] task probes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownTaskProbeEvent {
+    /// A registered task started.
+    Started {
+        /// Phase that owns the task.
+        phase: ShutdownPhase,
+        /// Stable task name.
+        task_name: String,
+    },
+    /// A registered task finished before the runner moved on.
+    Finished {
+        /// Phase that owns the task.
+        phase: ShutdownPhase,
+        /// Stable task name.
+        task_name: String,
+        /// Status recorded by the probe task.
+        status: ShutdownTaskStatus,
+    },
+}
+
+impl ShutdownTaskProbeEvent {
+    /// Phase associated with the event.
+    #[must_use]
+    pub const fn phase(&self) -> &ShutdownPhase {
+        match self {
+            Self::Started { phase, .. } | Self::Finished { phase, .. } => phase,
+        }
+    }
+
+    /// Task name associated with the event.
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        match self {
+            Self::Started { task_name, .. } | Self::Finished { task_name, .. } => task_name,
+        }
+    }
+
+    /// Status associated with a finished event.
+    #[must_use]
+    pub const fn status(&self) -> Option<ShutdownTaskStatus> {
+        match self {
+            Self::Started { .. } => None,
+            Self::Finished { status, .. } => Some(*status),
+        }
+    }
+}
+
+/// Descriptor returned for a registered shutdown probe task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShutdownTaskProbe {
+    descriptor: ShutdownTask,
+}
+
+impl ShutdownTaskProbe {
+    /// Creates a task probe descriptor.
+    #[must_use]
+    pub fn new(descriptor: ShutdownTask) -> Self {
+        Self { descriptor }
+    }
+
+    /// Registered task descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &ShutdownTask {
+        &self.descriptor
+    }
+
+    /// Phase this probe task belongs to.
+    #[must_use]
+    pub const fn phase(&self) -> &ShutdownPhase {
+        self.descriptor.phase()
+    }
+
+    /// Stable task name.
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        self.descriptor.name()
+    }
+}
+
+/// Handle for a controlled shutdown task that waits until released.
+#[derive(Debug, Clone)]
+pub struct ControlledShutdownTask {
+    descriptor: ShutdownTask,
+    release: Arc<Semaphore>,
+    started: Arc<Semaphore>,
+    finished: Arc<Semaphore>,
+    timeout: Duration,
+}
+
+impl ControlledShutdownTask {
+    /// Creates a controlled task handle.
+    #[must_use]
+    pub fn new(
+        descriptor: ShutdownTask,
+        release: Arc<Semaphore>,
+        started: Arc<Semaphore>,
+        finished: Arc<Semaphore>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            descriptor,
+            release,
+            started,
+            finished,
+            timeout,
+        }
+    }
+
+    /// Registered task descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &ShutdownTask {
+        &self.descriptor
+    }
+
+    /// Phase this controlled task belongs to.
+    #[must_use]
+    pub const fn phase(&self) -> &ShutdownPhase {
+        self.descriptor.phase()
+    }
+
+    /// Stable task name.
+    #[must_use]
+    pub fn task_name(&self) -> &str {
+        self.descriptor.name()
+    }
+
+    /// Releases the controlled task so shutdown can continue.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    /// Waits until the controlled task has started.
+    pub async fn wait_started(&self) -> RakkaResult<()> {
+        self.wait_started_within(self.timeout).await
+    }
+
+    /// Waits until the controlled task has started within a custom timeout.
+    pub async fn wait_started_within(&self, timeout: Duration) -> RakkaResult<()> {
+        acquire_probe_permit(
+            self.started.clone(),
+            timeout,
+            "shutdown-probe-start-timeout",
+            "timed out waiting for controlled shutdown task to start",
+        )
+        .await
+    }
+
+    /// Waits until the controlled task has completed after being released.
+    pub async fn wait_finished(&self) -> RakkaResult<()> {
+        self.wait_finished_within(self.timeout).await
+    }
+
+    /// Waits until the controlled task has completed within a custom timeout.
+    pub async fn wait_finished_within(&self, timeout: Duration) -> RakkaResult<()> {
+        acquire_probe_permit(
+            self.finished.clone(),
+            timeout,
+            "shutdown-probe-finish-timeout",
+            "timed out waiting for controlled shutdown task to finish",
+        )
+        .await
+    }
+}
+
+/// Reusable testkit for real coordinated shutdown registries.
+///
+/// ```no_run
+/// use rakka_core::{
+///     CoordinatedShutdownReason, ShutdownOutcome, ShutdownPhase, ShutdownTaskStatus,
+/// };
+/// use rakka_testkit::{
+///     assert_shutdown_outcome, assert_shutdown_task_status, CoordinatedShutdownTestKit,
+/// };
+///
+/// # async fn example() -> rakka_core::RakkaResult<()> {
+/// let kit = CoordinatedShutdownTestKit::new();
+/// let phase = ShutdownPhase::stop_ingress();
+/// let controlled = kit.register_controlled_task(phase.clone(), "drain-ingress")?;
+///
+/// let shutdown = kit.shutdown();
+/// let run = tokio::spawn(async move {
+///     shutdown
+///         .run(CoordinatedShutdownReason::user_request())
+///         .await
+/// });
+///
+/// controlled.wait_started().await?;
+/// controlled.release();
+/// let report = run.await.expect("shutdown task should join").unwrap();
+///
+/// assert_shutdown_outcome(&report, ShutdownOutcome::Complete);
+/// assert_shutdown_task_status(
+///     &report,
+///     &phase,
+///     "drain-ingress",
+///     ShutdownTaskStatus::Completed,
+/// );
+/// # Ok(()) }
+/// ```
+#[derive(Clone)]
+pub struct CoordinatedShutdownTestKit {
+    shutdown: CoordinatedShutdown,
+    events: Arc<Mutex<Vec<ShutdownTaskProbeEvent>>>,
+    timeout: Duration,
+}
+
+impl CoordinatedShutdownTestKit {
+    /// Creates a testkit around a fresh core-only coordinated shutdown registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::from_shutdown(CoordinatedShutdown::new())
+    }
+
+    /// Creates a testkit around a fresh core-only registry with custom settings.
+    #[must_use]
+    pub fn with_settings(settings: CoordinatedShutdownSettings) -> Self {
+        Self::from_shutdown(CoordinatedShutdown::with_settings(settings))
+    }
+
+    /// Creates a testkit around an existing coordinated shutdown registry.
+    #[must_use]
+    pub fn from_shutdown(shutdown: CoordinatedShutdown) -> Self {
+        Self {
+            shutdown,
+            events: Arc::new(Mutex::new(Vec::new())),
+            timeout: DEFAULT_SHUTDOWN_PROBE_TIMEOUT,
+        }
+    }
+
+    /// Creates a testkit around an actor system's owned coordinated shutdown registry.
+    #[must_use]
+    pub fn for_system(system: &ActorSystem) -> Self {
+        Self::from_shutdown(system.coordinated_shutdown())
+    }
+
+    /// Returns this testkit with a different default probe timeout.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Returns the wrapped coordinated shutdown registry.
+    #[must_use]
+    pub fn shutdown(&self) -> CoordinatedShutdown {
+        self.shutdown.clone()
+    }
+
+    /// Returns recorded task probe events in insertion order.
+    #[must_use]
+    pub fn events(&self) -> Vec<ShutdownTaskProbeEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Clears recorded task probe events.
+    pub fn clear_events(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Registers an immediately completing task that records start and finish events.
+    pub fn register_task(
+        &self,
+        phase: ShutdownPhase,
+        name: impl Into<String>,
+    ) -> RakkaResult<ShutdownTaskProbe> {
+        self.register_task_with_options(phase, name, ShutdownTaskOptions::default())
+    }
+
+    /// Registers an immediately completing task with explicit options.
+    pub fn register_task_with_options(
+        &self,
+        phase: ShutdownPhase,
+        name: impl Into<String>,
+        options: ShutdownTaskOptions,
+    ) -> RakkaResult<ShutdownTaskProbe> {
+        let events = self.events.clone();
+        let descriptor =
+            self.shutdown
+                .add_task_with_options(phase, name, options, move |context| {
+                    let events = events.clone();
+                    async move {
+                        record_shutdown_probe_event(
+                            &events,
+                            ShutdownTaskProbeEvent::Started {
+                                phase: context.phase().clone(),
+                                task_name: context.task_name().to_owned(),
+                            },
+                        );
+                        record_shutdown_probe_event(
+                            &events,
+                            ShutdownTaskProbeEvent::Finished {
+                                phase: context.phase().clone(),
+                                task_name: context.task_name().to_owned(),
+                                status: ShutdownTaskStatus::Completed,
+                            },
+                        );
+                        Ok(())
+                    }
+                })?;
+        Ok(ShutdownTaskProbe::new(descriptor))
+    }
+
+    /// Registers a task that records start, waits for manual release, then completes.
+    pub fn register_controlled_task(
+        &self,
+        phase: ShutdownPhase,
+        name: impl Into<String>,
+    ) -> RakkaResult<ControlledShutdownTask> {
+        self.register_controlled_task_with_options(phase, name, ShutdownTaskOptions::default())
+    }
+
+    /// Registers a controlled task with explicit options.
+    pub fn register_controlled_task_with_options(
+        &self,
+        phase: ShutdownPhase,
+        name: impl Into<String>,
+        options: ShutdownTaskOptions,
+    ) -> RakkaResult<ControlledShutdownTask> {
+        let events = self.events.clone();
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        let finished = Arc::new(Semaphore::new(0));
+        let release_task = release.clone();
+        let started_task = started.clone();
+        let finished_task = finished.clone();
+        let descriptor =
+            self.shutdown
+                .add_task_with_options(phase, name, options, move |context| {
+                    let events = events.clone();
+                    let release = release_task.clone();
+                    let started = started_task.clone();
+                    let finished = finished_task.clone();
+                    async move {
+                        record_shutdown_probe_event(
+                            &events,
+                            ShutdownTaskProbeEvent::Started {
+                                phase: context.phase().clone(),
+                                task_name: context.task_name().to_owned(),
+                            },
+                        );
+                        started.add_permits(1);
+                        let _permit = release.acquire().await.map_err(|_closed| {
+                            shutdown_testkit_error(
+                                "shutdown-probe-release-closed",
+                                "controlled shutdown task release semaphore closed",
+                            )
+                        })?;
+                        record_shutdown_probe_event(
+                            &events,
+                            ShutdownTaskProbeEvent::Finished {
+                                phase: context.phase().clone(),
+                                task_name: context.task_name().to_owned(),
+                                status: ShutdownTaskStatus::Completed,
+                            },
+                        );
+                        finished.add_permits(1);
+                        Ok(())
+                    }
+                })?;
+        Ok(ControlledShutdownTask::new(
+            descriptor,
+            release,
+            started,
+            finished,
+            self.timeout,
+        ))
+    }
+
+    /// Registers a task that records start and then fails with the provided error code.
+    pub fn register_failing_task(
+        &self,
+        phase: ShutdownPhase,
+        name: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> RakkaResult<ShutdownTaskProbe> {
+        self.register_failing_task_with_options(
+            phase,
+            name,
+            ShutdownTaskOptions::default(),
+            code,
+            message,
+        )
+    }
+
+    /// Registers a failing task with explicit options.
+    pub fn register_failing_task_with_options(
+        &self,
+        phase: ShutdownPhase,
+        name: impl Into<String>,
+        options: ShutdownTaskOptions,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> RakkaResult<ShutdownTaskProbe> {
+        let events = self.events.clone();
+        let code = code.into();
+        let message = message.into();
+        let descriptor =
+            self.shutdown
+                .add_task_with_options(phase, name, options, move |context| {
+                    let events = events.clone();
+                    let code = code.clone();
+                    let message = message.clone();
+                    async move {
+                        record_shutdown_probe_event(
+                            &events,
+                            ShutdownTaskProbeEvent::Started {
+                                phase: context.phase().clone(),
+                                task_name: context.task_name().to_owned(),
+                            },
+                        );
+                        record_shutdown_probe_event(
+                            &events,
+                            ShutdownTaskProbeEvent::Finished {
+                                phase: context.phase().clone(),
+                                task_name: context.task_name().to_owned(),
+                                status: ShutdownTaskStatus::Failed,
+                            },
+                        );
+                        Err(shutdown_testkit_error(code, message))
+                    }
+                })?;
+        Ok(ShutdownTaskProbe::new(descriptor))
+    }
+
+    /// Runs the wrapped coordinated shutdown registry.
+    pub async fn run(
+        &self,
+        reason: CoordinatedShutdownReason,
+    ) -> CoordinatedShutdownResult<CoordinatedShutdownReport> {
+        self.shutdown.run(reason).await
+    }
+
+    /// Runs shutdown twice and asserts both calls return the same outcome and report.
+    pub async fn assert_idempotent(
+        &self,
+        reason: CoordinatedShutdownReason,
+    ) -> CoordinatedShutdownResult<CoordinatedShutdownReport> {
+        let first = self.shutdown.run(reason.clone()).await;
+        let second = self.shutdown.run(reason).await;
+        assert_eq!(first, second, "coordinated shutdown should be idempotent");
+        first
+    }
+}
+
+impl Default for CoordinatedShutdownTestKit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Asserts a coordinated shutdown report outcome.
+pub fn assert_shutdown_outcome(report: &CoordinatedShutdownReport, expected: ShutdownOutcome) {
+    assert_eq!(report.outcome(), expected);
+}
+
+/// Asserts that expected phases appear in the report in the provided order.
+pub fn assert_shutdown_phase_order(report: &CoordinatedShutdownReport, expected: &[ShutdownPhase]) {
+    let actual = report
+        .phases()
+        .iter()
+        .map(|phase| phase.phase().name())
+        .collect::<Vec<_>>();
+    let mut search_from = 0;
+    for expected_phase in expected {
+        let Some(relative_index) = actual[search_from..]
+            .iter()
+            .position(|phase| *phase == expected_phase.name())
+        else {
+            panic!(
+                "expected shutdown phase '{}' after index {search_from}; actual phases: {actual:?}",
+                expected_phase.name()
+            );
+        };
+        search_from += relative_index + 1;
+    }
+}
+
+/// Asserts the exact start-event order for shutdown probe tasks.
+pub fn assert_shutdown_task_start_order(
+    events: &[ShutdownTaskProbeEvent],
+    expected: &[(&ShutdownPhase, &str)],
+) {
+    let actual = events
+        .iter()
+        .filter_map(|event| match event {
+            ShutdownTaskProbeEvent::Started { phase, task_name } => {
+                Some((phase.name().to_owned(), task_name.clone()))
+            }
+            ShutdownTaskProbeEvent::Finished { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .map(|(phase, task_name)| (phase.name().to_owned(), (*task_name).to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "unexpected shutdown task start order");
+}
+
+/// Returns a task report from a coordinated shutdown report.
+#[must_use]
+pub fn expect_shutdown_task_report<'a>(
+    report: &'a CoordinatedShutdownReport,
+    phase: &ShutdownPhase,
+    task_name: &str,
+) -> &'a ShutdownTaskReport {
+    report
+        .phases()
+        .iter()
+        .find(|phase_report| phase_report.phase() == phase)
+        .and_then(|phase_report| {
+            phase_report
+                .tasks()
+                .iter()
+                .find(|task| task.task_name() == task_name)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected shutdown task '{}' in phase '{}'",
+                task_name,
+                phase.name()
+            )
+        })
+}
+
+/// Asserts a task status in a coordinated shutdown report.
+pub fn assert_shutdown_task_status(
+    report: &CoordinatedShutdownReport,
+    phase: &ShutdownPhase,
+    task_name: &str,
+    expected: ShutdownTaskStatus,
+) {
+    let task = expect_shutdown_task_report(report, phase, task_name);
+    assert_eq!(task.status(), expected);
+}
+
+/// Asserts a shutdown timeout counter with the expected bounded labels exists.
+pub fn assert_shutdown_timeout_metric(
+    snapshot: &MetricsSnapshot,
+    phase: &ShutdownPhase,
+    task_name: &str,
+    scope: &str,
+) {
+    let matched = snapshot
+        .observations_named(METRIC_SHUTDOWN_TIMEOUTS)
+        .into_iter()
+        .any(|observation| {
+            observation.kind() == MetricKind::Counter
+                && observation.attribute("phase") == Some(phase.name())
+                && observation.attribute("task") == Some(task_name)
+                && observation.attribute("scope") == Some(scope)
+                && observation.attribute("status") == Some(ShutdownOutcome::TimedOut.as_str())
+        });
+    assert!(
+        matched,
+        "expected shutdown timeout metric for phase '{}', task '{task_name}', scope '{scope}'",
+        phase.name()
+    );
+}
+
+fn record_shutdown_probe_event(
+    events: &Arc<Mutex<Vec<ShutdownTaskProbeEvent>>>,
+    event: ShutdownTaskProbeEvent,
+) {
+    events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(event);
+}
+
+async fn acquire_probe_permit(
+    semaphore: Arc<Semaphore>,
+    timeout: Duration,
+    timeout_code: &'static str,
+    timeout_message: &'static str,
+) -> RakkaResult<()> {
+    match tokio::time::timeout(timeout, semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            drop(permit);
+            Ok(())
+        }
+        Ok(Err(_closed)) => Err(shutdown_testkit_error(
+            "shutdown-probe-closed",
+            "controlled shutdown task probe semaphore closed",
+        )),
+        Err(_elapsed) => Err(shutdown_testkit_error(timeout_code, timeout_message)),
+    }
+}
+
+fn shutdown_testkit_error(code: impl Into<String>, message: impl Into<String>) -> RakkaError {
+    RakkaError::new(Subsystem::Testkit, code, message)
 }
 
 /// Reusable in-memory persistence stores for event-sourced and durable-state tests.
