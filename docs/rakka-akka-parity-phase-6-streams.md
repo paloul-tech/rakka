@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6G entity sink integration
+Status: implemented through Slice 6H adapter migration
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -98,6 +98,13 @@ sink.drain()?;
 
 let items = Source::from_stream_source(source).run_collect().await?;
 assert_eq!(items, vec!["work"]);
+```
+
+The consuming conversion helpers keep adapter migrations terse:
+
+```rust
+let items = source.into_source().run_collect().await?;
+let written = Source::from_iter(items).run_with(sink.into_sink()).await?;
 ```
 
 ## Linear Operators
@@ -291,6 +298,49 @@ Entity sources are intentionally not implicit. When an entity needs to emit a
 stream, use the actor-backed source boundary from Slice 6F or send to an
 explicit `Source::actor_ref`/`Source::actor_ref_with_ack` boundary. This keeps
 streams from pretending arbitrary entities are queryable sources.
+
+## Process IO Boundaries
+
+Slice 6H migrates process pipe adapters onto the facade without removing the
+low-level pipe-control APIs.
+
+Use the facade constructors when a managed process pipe is simply part of a
+stream pipeline:
+
+```rust
+let (stdout, stdout_pump) = Source::process_stdout(
+    &mut process,
+    ProcessOutputConfig::default(),
+)?;
+
+let chunks = stdout.run_collect().await?;
+let bytes_read = stdout_pump
+    .expect("stdout pump")
+    .await
+    .expect("pump task")?;
+```
+
+For stdin, the facade owns the writer boundary and closes it when the stream
+finishes or the sink is dropped:
+
+```rust
+let written = Source::from_iter(chunks)
+    .run_with(Sink::process_stdin(&mut process)?)
+    .await?;
+```
+
+Adapters that already own low-level process handles can migrate with consuming
+conversions:
+
+```rust
+let (stdout, stdout_pump) = process_output.into_source();
+let stdin = process_input.into_sink();
+```
+
+`ProcessOutputStream::into_source()` returns the pump handle alongside the
+facade `Source<Vec<u8>>` so callers can still observe read completion or read
+errors. `ProcessInputSink::into_sink()` is consuming rather than borrowed
+because facade sinks are owned, `'static` stream boundaries.
 
 Test probes arrive in later slices.
 

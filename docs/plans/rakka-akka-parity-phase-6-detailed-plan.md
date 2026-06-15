@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6G
+Status: implemented through Slice 6H
 Date: 2026-06-14
 
 ## Purpose
@@ -561,6 +561,22 @@ cargo test -p rakka-grpc
 cargo test -p rakka-stream --test stream_adapters
 cargo test -p rakka-process
 ```
+
+Implementation note:
+
+- Added consuming conversion helpers from the low-level bounded runtime into the
+  facade: `StreamSource<T>::into_source()` and `StreamSink<T>::into_sink()`.
+- Added process IO facade entry points while keeping direct pipe-control APIs:
+  `ProcessOutputStream::into_source()`, `ProcessInputSink::into_sink()`,
+  `Source::process_stdout`, `Source::process_stderr`, and
+  `Sink::process_stdin`.
+- `ProcessOutputStream::into_source()` returns the facade source plus the
+  existing pump handle so callers can still observe process output completion
+  and read errors after migrating to the facade.
+- The originally planned borrowed `ProcessInputSink::as_sink()` was narrowed to
+  a consuming `into_sink()` API because a facade sink must own a `'static`
+  writer boundary. A borrowed async sink would expose higher-ranked lifetime
+  constraints to callers and make normal pipelines harder to write.
 
 ## Slice 6I: Stream Testkit Probes
 

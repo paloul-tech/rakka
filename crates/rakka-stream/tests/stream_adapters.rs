@@ -18,7 +18,7 @@ use rakka_stream::{
     bounded_channel, process_input_sink_from_writer, process_output_stream_from_reader,
     protocol_actor_process_stream_unsupported, spawn_actor_source, ActorSink, ActorSinkError,
     EntitySink, EntitySinkError, ProcessIoOwner, ProcessIoStream, ProcessOutputConfig,
-    ProcessStreamError, StreamError,
+    ProcessStreamError, Source, StreamError,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Notify};
@@ -308,6 +308,100 @@ async fn process_input_sink_drains_source_and_closes_writer() {
         2
     );
     assert_eq!(observed, b"hello world");
+}
+
+#[tokio::test]
+async fn low_level_stream_handles_convert_to_facade() {
+    let (input, source) = bounded_channel(2).expect("source stream should be created");
+    input
+        .try_send("one".to_owned())
+        .expect("first item should fit");
+    input
+        .try_send("two".to_owned())
+        .expect("second item should fit");
+    input.drain().expect("input should drain");
+
+    let collected = source
+        .into_source()
+        .run_collect()
+        .await
+        .expect("facade source should collect low-level items");
+    assert_eq!(collected, vec!["one".to_owned(), "two".to_owned()]);
+
+    let (output, output_source) = bounded_channel(2).expect("output stream should be created");
+    let written = Source::from_iter(["three".to_owned(), "four".to_owned()])
+        .run_with(output.into_sink())
+        .await
+        .expect("facade sink should write low-level items");
+
+    assert_eq!(written, 2);
+    output_source.drain().expect("output source should drain");
+    assert_eq!(
+        output_source.next().await.expect("first output item"),
+        Some("three".to_owned())
+    );
+    assert_eq!(
+        output_source.next().await.expect("second output item"),
+        Some("four".to_owned())
+    );
+    assert_eq!(output_source.next().await.expect("output eof"), None);
+}
+
+#[tokio::test]
+async fn process_output_stream_converts_into_facade_source_and_preserves_pump() {
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let output = process_output_stream_from_reader(
+        reader,
+        ProcessIoStream::Stdout,
+        ProcessOutputConfig::new(2).chunk_size(64),
+    )
+    .expect("output stream should be created");
+    let (source, pump) = output.into_source();
+
+    writer
+        .write_all(b"hello facade")
+        .await
+        .expect("duplex writer should accept bytes");
+    drop(writer);
+
+    let chunks = source
+        .run_collect()
+        .await
+        .expect("facade source should collect process output");
+    assert_eq!(chunks, vec![b"hello facade".to_vec()]);
+    assert_eq!(
+        pump.expect("pump should be returned")
+            .await
+            .expect("pump task should finish")
+            .expect("pump should report byte count"),
+        12
+    );
+}
+
+#[tokio::test]
+async fn process_input_sink_converts_into_facade_sink_and_closes_writer() {
+    let (writer, mut reader) = tokio::io::duplex(64);
+    let input = process_input_sink_from_writer(writer, ProcessIoStream::Stdin);
+
+    let drain = tokio::spawn(async move {
+        Source::from_iter([b"hello ".to_vec(), b"facade".to_vec()])
+            .run_with(input.into_sink())
+            .await
+    });
+    let mut observed = Vec::new();
+    reader
+        .read_to_end(&mut observed)
+        .await
+        .expect("reader should observe writer close");
+
+    assert_eq!(
+        drain
+            .await
+            .expect("drain task should finish")
+            .expect("facade stdin sink should finish"),
+        2
+    );
+    assert_eq!(observed, b"hello facade");
 }
 
 #[test]

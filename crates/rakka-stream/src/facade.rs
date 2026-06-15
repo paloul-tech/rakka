@@ -913,6 +913,17 @@ impl<T> Source<T> {
     }
 }
 
+impl<T> StreamSource<T> {
+    /// Converts this low-level bounded source into the Akka-shaped facade.
+    #[must_use]
+    pub fn into_source(self) -> Source<T>
+    where
+        T: Send + 'static,
+    {
+        Source::from_stream_source(self)
+    }
+}
+
 impl<T> FromIterator<T> for Source<T>
 where
     T: Send + 'static,
@@ -1106,6 +1117,24 @@ where
         }
     }
 
+    #[cfg(feature = "process-io")]
+    pub(crate) fn from_async_consumer<F, Fut>(consumer: F) -> Self
+    where
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), StreamSendError<T>>> + Send + 'static,
+    {
+        Self {
+            stage: Box::new(AsyncConsumerSinkStage {
+                consumer,
+                count: 0,
+                _item: PhantomData,
+                _future: PhantomData,
+            }),
+            kind: SinkKind::AsyncConsumer,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
     /// Creates a sink facade that forwards each item to an actor without acknowledgements.
     #[must_use]
     pub fn actor_ref(actor: ActorRef<T>) -> Self
@@ -1276,6 +1305,17 @@ impl<T, M> Debug for RunnableStream<T, M> {
             .field("source_settings", self.source.settings())
             .field("sink_settings", self.sink.settings())
             .finish_non_exhaustive()
+    }
+}
+
+impl<T> StreamSink<T> {
+    /// Converts this low-level bounded sink into the Akka-shaped facade.
+    #[must_use]
+    pub fn into_sink(self) -> Sink<T, usize>
+    where
+        T: Send + 'static,
+    {
+        Sink::from_stream_sink(self)
     }
 }
 
@@ -1826,6 +1866,8 @@ enum SinkKind {
     Foreach,
     Fold,
     StreamSink,
+    #[cfg(feature = "process-io")]
+    AsyncConsumer,
     ActorRef,
     ActorRefWithAck,
     #[cfg(feature = "adapters")]
@@ -1954,6 +1996,39 @@ where
         Box::pin(async move {
             self.sink
                 .send(item)
+                .await
+                .map_err(|error| StreamRunError::Sink { error })?;
+            self.count = self.count.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        self.count
+    }
+}
+
+#[cfg(feature = "process-io")]
+struct AsyncConsumerSinkStage<T, F, Fut> {
+    consumer: F,
+    count: usize,
+    _item: PhantomData<fn() -> T>,
+    _future: PhantomData<fn() -> Fut>,
+}
+
+#[cfg(feature = "process-io")]
+impl<T, F, Fut> SinkStage<T, usize> for AsyncConsumerSinkStage<T, F, Fut>
+where
+    T: Send + 'static,
+    F: FnMut(T) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), StreamSendError<T>>> + Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        Box::pin(async move {
+            (self.consumer)(item)
                 .await
                 .map_err(|error| StreamRunError::Sink { error })?;
             self.count = self.count.saturating_add(1);
