@@ -383,6 +383,8 @@ impl ActorSystem {
 
         validate_actor_path_segment(&builder.name)?;
         let (dead_letters, _) = broadcast::channel(1024);
+        let system_name = builder.name.clone();
+        let metrics = builder.metrics.clone();
         let system = Self {
             inner: Arc::new(ActorSystemInner {
                 name: builder.name,
@@ -392,8 +394,10 @@ impl ActorSystem {
                 serialization_registry: builder.serialization_registry,
                 runtime_settings: builder.runtime_settings,
                 shutdown_config: builder.shutdown_config,
-                coordinated_shutdown: CoordinatedShutdown::with_settings(
+                coordinated_shutdown: CoordinatedShutdown::with_settings_and_metrics(
                     builder.shutdown_config.coordinated_shutdown_settings(),
+                    system_name,
+                    metrics,
                 ),
                 receptionist: Arc::new(ReceptionistRegistry::new()),
                 actors: Mutex::new(Vec::new()),

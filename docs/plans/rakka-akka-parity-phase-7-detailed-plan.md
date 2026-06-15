@@ -616,7 +616,7 @@ Completion note:
 Goal: make coordinated shutdown visible through existing metrics and
 operational snapshot surfaces.
 
-Status: planned.
+Status: completed in Slice 7H.
 
 Scope:
 
@@ -654,6 +654,21 @@ cargo test -p rakka-core operational_metrics
 cargo test -p rakka-http observability_routes
 cargo clippy -p rakka-core -p rakka-http --all-targets -- -D warnings
 ```
+
+Completion notes:
+
+- Added coordinated shutdown metric constants for running state, phase
+  durations, task durations, task failures, and timeouts.
+- Wired `CoordinatedShutdown` into the actor-system metrics recorder so
+  `ActorSystem::terminate` and coordinated-shutdown-backed adapters emit the
+  same observations.
+- Extended `CoordinatedShutdownSnapshot` with current phase/task progress
+  while running and retained final/partial reports after completion.
+- Added HTTP observability helpers for registering coordinated shutdown state
+  in `OperationalSnapshotRegistry` under the default
+  `coordinated_shutdown` name or a caller-provided name.
+- Covered stable JSON shape plus Prometheus/OpenTelemetry exporter visibility
+  through focused core and HTTP tests.
 
 ## Slice 7I: Coordinated Shutdown Testkit
 

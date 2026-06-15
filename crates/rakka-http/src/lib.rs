@@ -24,7 +24,9 @@ pub use error::{HttpError, HttpErrorBody, HttpResult};
 pub use metrics::record_http_request_metrics;
 pub use observability::{
     json_snapshot_route, open_telemetry_metrics_json_route, operational_snapshots_route,
-    prometheus_metrics_route, OperationalSnapshotRegistry, OperationalSnapshots,
+    prometheus_metrics_route, register_coordinated_shutdown_snapshot,
+    register_named_coordinated_shutdown_snapshot, OperationalSnapshotRegistry,
+    OperationalSnapshots, DEFAULT_COORDINATED_SHUTDOWN_SNAPSHOT_NAME,
 };
 pub use routes::{
     binary_service_route, into_response, json_actor_ask_route, json_actor_tell_route,

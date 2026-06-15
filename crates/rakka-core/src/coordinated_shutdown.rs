@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::metrics::{
+    MetricsRecorder, NoopMetricsRecorder, METRIC_SHUTDOWN_PHASE_DURATION_MS,
+    METRIC_SHUTDOWN_RUNNING, METRIC_SHUTDOWN_TASK_DURATION_MS, METRIC_SHUTDOWN_TASK_FAILURES,
+    METRIC_SHUTDOWN_TIMEOUTS,
+};
 use crate::system::ActorSystem;
 use crate::{RakkaError, RakkaResult};
 
@@ -41,6 +46,8 @@ const BUILT_IN_PHASES: &[&str] = &[
     STOP_SYSTEM_ACTORS,
     STOP_REMOTING,
 ];
+
+const STANDALONE_METRICS_SYSTEM: &str = "standalone";
 
 /// Future returned by a coordinated shutdown task.
 pub type ShutdownTaskFuture = Pin<Box<dyn Future<Output = ShutdownTaskResult> + Send + 'static>>;
@@ -77,8 +84,36 @@ impl CoordinatedShutdown {
     /// Creates a registry with custom settings and built-in phases.
     #[must_use]
     pub fn with_settings(settings: CoordinatedShutdownSettings) -> Self {
+        Self::with_settings_and_metrics(
+            settings,
+            STANDALONE_METRICS_SYSTEM,
+            Arc::new(NoopMetricsRecorder),
+        )
+    }
+
+    /// Creates a registry with default settings, built-in phases, and a metrics recorder.
+    #[must_use]
+    pub fn with_metrics(system_name: impl Into<String>, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        Self::with_settings_and_metrics(
+            CoordinatedShutdownSettings::default(),
+            system_name,
+            metrics,
+        )
+    }
+
+    /// Creates a registry with custom settings, built-in phases, and a metrics recorder.
+    #[must_use]
+    pub fn with_settings_and_metrics(
+        settings: CoordinatedShutdownSettings,
+        system_name: impl Into<String>,
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ShutdownRegistry::new(settings))),
+            inner: Arc::new(Mutex::new(ShutdownRegistry::new(
+                settings,
+                system_name,
+                metrics,
+            ))),
         }
     }
 
@@ -217,10 +252,12 @@ impl CoordinatedShutdown {
                 let mut registry = self.lock();
                 match &registry.run_state {
                     ShutdownRunState::NotStarted => {
-                        let plan = registry.execution_plan()?;
+                        let progress = Arc::new(Mutex::new(ShutdownProgress::default()));
+                        let plan = registry.execution_plan(progress.clone())?;
                         let (sender, receiver) = watch::channel(None::<ShutdownRunResult>);
                         registry.run_state = ShutdownRunState::Running {
                             receiver: receiver.clone(),
+                            progress,
                         };
                         ShutdownRunAction::Start {
                             sender,
@@ -229,7 +266,7 @@ impl CoordinatedShutdown {
                             deadline,
                         }
                     }
-                    ShutdownRunState::Running { receiver } => {
+                    ShutdownRunState::Running { receiver, .. } => {
                         ShutdownRunAction::Wait(receiver.clone())
                     }
                     ShutdownRunState::Finished { result } => {
@@ -362,6 +399,8 @@ impl From<RakkaError> for CoordinatedShutdownError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatedShutdownSnapshot {
     outcome: ShutdownOutcome,
+    current_phase: Option<ShutdownPhase>,
+    current_task: Option<String>,
     report: Option<CoordinatedShutdownReport>,
 }
 
@@ -369,13 +408,41 @@ impl CoordinatedShutdownSnapshot {
     /// Creates a shutdown snapshot.
     #[must_use]
     pub const fn new(outcome: ShutdownOutcome, report: Option<CoordinatedShutdownReport>) -> Self {
-        Self { outcome, report }
+        Self {
+            outcome,
+            current_phase: None,
+            current_task: None,
+            report,
+        }
+    }
+
+    /// Creates a running shutdown snapshot with current progress.
+    #[must_use]
+    pub fn running(current_phase: Option<ShutdownPhase>, current_task: Option<String>) -> Self {
+        Self {
+            outcome: ShutdownOutcome::Running,
+            current_phase,
+            current_task,
+            report: None,
+        }
     }
 
     /// Current shutdown outcome.
     #[must_use]
     pub const fn outcome(&self) -> ShutdownOutcome {
         self.outcome
+    }
+
+    /// Current phase while shutdown is running.
+    #[must_use]
+    pub const fn current_phase(&self) -> Option<&ShutdownPhase> {
+        self.current_phase.as_ref()
+    }
+
+    /// Current task while shutdown is running.
+    #[must_use]
+    pub fn current_task(&self) -> Option<&str> {
+        self.current_task.as_deref()
     }
 
     /// Completed or partial report, when available.
@@ -1024,11 +1091,22 @@ impl Debug for ShutdownTaskEntry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ShutdownExecutionPlan {
     settings: CoordinatedShutdownSettings,
     phases: Vec<ShutdownPhase>,
     tasks: BTreeMap<String, Vec<ShutdownTaskEntry>>,
+    metrics_system: String,
+    metrics: Arc<dyn MetricsRecorder>,
+    progress: ShutdownProgressHandle,
+}
+
+type ShutdownProgressHandle = Arc<Mutex<ShutdownProgress>>;
+
+#[derive(Debug, Default, Clone)]
+struct ShutdownProgress {
+    current_phase: Option<ShutdownPhase>,
+    current_task: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1036,6 +1114,7 @@ enum ShutdownRunState {
     NotStarted,
     Running {
         receiver: watch::Receiver<Option<ShutdownRunResult>>,
+        progress: ShutdownProgressHandle,
     },
     Finished {
         result: ShutdownRunResult,
@@ -1058,16 +1137,21 @@ struct PhaseNode {
     depends_on: BTreeSet<String>,
 }
 
-#[derive(Debug)]
 struct ShutdownRegistry {
     settings: CoordinatedShutdownSettings,
     phases: BTreeMap<String, PhaseNode>,
     tasks: BTreeMap<String, BTreeMap<String, ShutdownTaskEntry>>,
+    metrics_system: String,
+    metrics: Arc<dyn MetricsRecorder>,
     run_state: ShutdownRunState,
 }
 
 impl ShutdownRegistry {
-    fn new(settings: CoordinatedShutdownSettings) -> Self {
+    fn new(
+        settings: CoordinatedShutdownSettings,
+        system_name: impl Into<String>,
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> Self {
         let mut phases = BTreeMap::new();
         for (index, name) in BUILT_IN_PHASES.iter().enumerate() {
             let mut depends_on = BTreeSet::new();
@@ -1084,10 +1168,19 @@ impl ShutdownRegistry {
             );
         }
 
+        let system_name = system_name.into();
+        let metrics_system = if system_name.is_empty() {
+            STANDALONE_METRICS_SYSTEM.to_owned()
+        } else {
+            system_name
+        };
+
         Self {
             settings,
             phases,
             tasks: BTreeMap::new(),
+            metrics_system,
+            metrics,
             run_state: ShutdownRunState::NotStarted,
         }
     }
@@ -1293,7 +1386,10 @@ impl ShutdownRegistry {
         self.tasks.values().map(BTreeMap::len).sum()
     }
 
-    fn execution_plan(&self) -> CoordinatedShutdownResult<ShutdownExecutionPlan> {
+    fn execution_plan(
+        &self,
+        progress: ShutdownProgressHandle,
+    ) -> CoordinatedShutdownResult<ShutdownExecutionPlan> {
         let phase_names = self.ordered_phase_names()?;
         let phases = phase_names
             .iter()
@@ -1321,6 +1417,9 @@ impl ShutdownRegistry {
             settings: self.settings,
             phases,
             tasks,
+            metrics_system: self.metrics_system.clone(),
+            metrics: self.metrics.clone(),
+            progress,
         })
     }
 
@@ -1329,10 +1428,20 @@ impl ShutdownRegistry {
             ShutdownRunState::NotStarted => {
                 CoordinatedShutdownSnapshot::new(ShutdownOutcome::NotStarted, None)
             }
-            ShutdownRunState::Running { receiver } => receiver.borrow().as_ref().map_or_else(
-                || CoordinatedShutdownSnapshot::new(ShutdownOutcome::Running, None),
-                snapshot_from_result,
-            ),
+            ShutdownRunState::Running { receiver, progress } => {
+                receiver.borrow().as_ref().map_or_else(
+                    || {
+                        let progress = progress
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        CoordinatedShutdownSnapshot::running(
+                            progress.current_phase.clone(),
+                            progress.current_task.clone(),
+                        )
+                    },
+                    snapshot_from_result,
+                )
+            }
             ShutdownRunState::Finished { result } => snapshot_from_result(result),
         }
     }
@@ -1376,11 +1485,24 @@ async fn execute_shutdown_plan(
     reason: CoordinatedShutdownReason,
     overall_deadline: Option<Instant>,
 ) -> ShutdownRunResult {
+    record_shutdown_running(&plan, &reason, 1.0);
+    let result = execute_shutdown_plan_inner(&plan, reason.clone(), overall_deadline).await;
+    clear_shutdown_progress(&plan.progress);
+    record_shutdown_running(&plan, &reason, 0.0);
+    result
+}
+
+async fn execute_shutdown_plan_inner(
+    plan: &ShutdownExecutionPlan,
+    reason: CoordinatedShutdownReason,
+    overall_deadline: Option<Instant>,
+) -> ShutdownRunResult {
     let mut final_outcome = ShutdownOutcome::Complete;
     let mut phase_reports = Vec::new();
 
-    for phase in plan.phases {
+    for phase in plan.phases.clone() {
         let phase_start = Instant::now();
+        update_shutdown_progress(&plan.progress, Some(&phase), None);
         let phase_timeout_deadline = plan
             .settings
             .default_phase_timeout()
@@ -1402,19 +1524,27 @@ async fn execute_shutdown_plan(
             }
 
             if deadline_elapsed(phase_deadline) {
-                task_reports.push(ShutdownTaskReport::new(
+                update_shutdown_progress(
+                    &plan.progress,
+                    Some(&phase),
+                    Some(task.descriptor.name()),
+                );
+                let task_report = ShutdownTaskReport::new(
                     phase.clone(),
                     task.descriptor.name().to_owned(),
                     ShutdownTaskStatus::TimedOut,
                     Some(Duration::ZERO),
                     Some("shutdown phase deadline elapsed before task started".to_owned()),
-                ));
+                );
+                record_shutdown_task_report(plan, &reason, &task_report);
+                task_reports.push(task_report);
                 phase_outcome = ShutdownOutcome::TimedOut;
                 stop_after_phase = true;
                 break;
             }
 
             let task_deadline = task_deadline(&plan.settings, &task, phase_deadline);
+            update_shutdown_progress(&plan.progress, Some(&phase), Some(task.descriptor.name()));
             let task_report = run_shutdown_task(&task, reason.clone(), task_deadline).await;
             let task_status = task_report.status();
             let task_policy = task
@@ -1423,7 +1553,9 @@ async fn execute_shutdown_plan(
                 .failure_policy()
                 .unwrap_or(plan.settings.failure_policy());
 
+            record_shutdown_task_report(plan, &reason, &task_report);
             task_reports.push(task_report);
+            update_shutdown_progress(&plan.progress, Some(&phase), None);
 
             match task_status {
                 ShutdownTaskStatus::Completed => {}
@@ -1461,12 +1593,14 @@ async fn execute_shutdown_plan(
         }
 
         final_outcome = combine_shutdown_outcome(final_outcome, phase_outcome);
-        phase_reports.push(ShutdownPhaseReport::new(
+        let phase_report = ShutdownPhaseReport::new(
             phase,
             phase_outcome,
             Some(phase_start.elapsed()),
             task_reports,
-        ));
+        );
+        record_shutdown_phase_report(plan, &reason, &phase_report);
+        phase_reports.push(phase_report);
 
         if stop_after_phase {
             let report = CoordinatedShutdownReport::new(reason, final_outcome, phase_reports);
@@ -1534,6 +1668,133 @@ async fn run_shutdown_task(
             Some("shutdown task timed out".to_owned()),
         ),
     }
+}
+
+fn update_shutdown_progress(
+    progress: &ShutdownProgressHandle,
+    phase: Option<&ShutdownPhase>,
+    task: Option<&str>,
+) {
+    let mut progress = progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    progress.current_phase = phase.cloned();
+    progress.current_task = task.map(ToOwned::to_owned);
+}
+
+fn clear_shutdown_progress(progress: &ShutdownProgressHandle) {
+    update_shutdown_progress(progress, None, None);
+}
+
+fn record_shutdown_running(
+    plan: &ShutdownExecutionPlan,
+    reason: &CoordinatedShutdownReason,
+    value: f64,
+) {
+    plan.metrics.record_gauge(
+        METRIC_SHUTDOWN_RUNNING,
+        value,
+        &[
+            ("system", plan.metrics_system.as_str()),
+            ("reason", reason.code()),
+        ],
+    );
+}
+
+fn record_shutdown_task_report(
+    plan: &ShutdownExecutionPlan,
+    reason: &CoordinatedShutdownReason,
+    report: &ShutdownTaskReport,
+) {
+    let status = report.status().as_str();
+    plan.metrics.record_histogram(
+        METRIC_SHUTDOWN_TASK_DURATION_MS,
+        duration_millis(report.duration().unwrap_or(Duration::ZERO)),
+        &[
+            ("system", plan.metrics_system.as_str()),
+            ("phase", report.phase().name()),
+            ("task", report.task_name()),
+            ("reason", reason.code()),
+            ("status", status),
+        ],
+    );
+
+    if report.status() == ShutdownTaskStatus::Failed {
+        plan.metrics.increment_counter(
+            METRIC_SHUTDOWN_TASK_FAILURES,
+            1,
+            &[
+                ("system", plan.metrics_system.as_str()),
+                ("phase", report.phase().name()),
+                ("task", report.task_name()),
+                ("reason", reason.code()),
+                ("status", status),
+            ],
+        );
+    }
+
+    if report.status() == ShutdownTaskStatus::TimedOut {
+        record_shutdown_timeout(
+            plan,
+            reason,
+            "task",
+            report.phase(),
+            report.task_name(),
+            status,
+        );
+    }
+}
+
+fn record_shutdown_phase_report(
+    plan: &ShutdownExecutionPlan,
+    reason: &CoordinatedShutdownReason,
+    report: &ShutdownPhaseReport,
+) {
+    let status = report.outcome().as_str();
+    plan.metrics.record_histogram(
+        METRIC_SHUTDOWN_PHASE_DURATION_MS,
+        duration_millis(report.duration().unwrap_or(Duration::ZERO)),
+        &[
+            ("system", plan.metrics_system.as_str()),
+            ("phase", report.phase().name()),
+            ("reason", reason.code()),
+            ("status", status),
+        ],
+    );
+
+    let has_timed_out_task = report
+        .tasks()
+        .iter()
+        .any(|task| task.status() == ShutdownTaskStatus::TimedOut);
+    if report.outcome() == ShutdownOutcome::TimedOut && !has_timed_out_task {
+        record_shutdown_timeout(plan, reason, "phase", report.phase(), "none", status);
+    }
+}
+
+fn record_shutdown_timeout(
+    plan: &ShutdownExecutionPlan,
+    reason: &CoordinatedShutdownReason,
+    scope: &'static str,
+    phase: &ShutdownPhase,
+    task: &str,
+    status: &'static str,
+) {
+    plan.metrics.increment_counter(
+        METRIC_SHUTDOWN_TIMEOUTS,
+        1,
+        &[
+            ("system", plan.metrics_system.as_str()),
+            ("phase", phase.name()),
+            ("task", task),
+            ("reason", reason.code()),
+            ("status", status),
+            ("scope", scope),
+        ],
+    );
+}
+
+fn duration_millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 enum TaskRunOutcome {
