@@ -15,6 +15,7 @@ mod file_watch;
 mod managed;
 mod oneshot;
 mod sharded;
+mod shutdown;
 mod spec;
 mod stdio;
 #[cfg(feature = "testkit")]
@@ -45,6 +46,11 @@ pub use sharded::{
     process_backed_entity_route, ProcessBackedEntity, ProcessBackedEntityAction,
     ProcessBackedEntityBehavior, ProcessBackedEntityContext, ProcessBackedEntityFuture,
     ProcessBackedEntityProcess, ProcessBackedEntityState, ProcessBackedEntityStatus,
+};
+pub use shutdown::{
+    configured_process_actor_stop_timeout, register_configured_process_actor_stop_task,
+    register_managed_process_shutdown_task, register_process_actor_stop_task,
+    PROCESS_ACTOR_STOP_TASK_GRACE,
 };
 pub use spec::{
     ExecutableAllowlist, GracefulShutdown, ProcessSpec, ProcessStdio, ResourceHints,

@@ -4,7 +4,8 @@
 # exposes:
 # - HTTP readiness at /ready on port 8080
 # - HTTP liveness at /live on port 8080
-# - HTTP drain at /drain on port 8080
+# - HTTP drain at /drain on port 8080, backed by coordinated shutdown with
+#   reason kubernetes-prestop
 # - Prometheus metrics at /metrics on port 8080
 # - JSON operational snapshots at /snapshots on port 8080
 # - A scenario route at /scenario/sharding/route-remote that verifies remote
@@ -414,6 +415,8 @@ spec:
             failureThreshold: 3
           lifecycle:
             preStop:
+              # Runs the same coordinated shutdown path as application
+              # termination, after marking readiness false.
               httpGet:
                 path: /drain
                 port: http

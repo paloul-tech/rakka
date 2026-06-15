@@ -9,11 +9,14 @@ use axum::http::{Response, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
 use rakka_core::{
-    export_open_telemetry_metrics, export_prometheus_text, MetricAttribute, MetricsSnapshot,
-    OpenTelemetryMetricsExport,
+    export_open_telemetry_metrics, export_prometheus_text, CoordinatedShutdown,
+    CoordinatedShutdownSnapshot, MetricAttribute, MetricsSnapshot, OpenTelemetryMetricsExport,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+
+/// Default operational snapshot name for coordinated shutdown state.
+pub const DEFAULT_COORDINATED_SHUTDOWN_SNAPSHOT_NAME: &str = "coordinated_shutdown";
 
 /// Shared snapshot provider stored by the operational snapshot registry.
 type SnapshotProvider = Arc<dyn Fn() -> Value + Send + Sync>;
@@ -63,6 +66,27 @@ impl OperationalSnapshotRegistry {
             .collect();
         OperationalSnapshots::new(snapshots)
     }
+}
+
+/// Registers coordinated shutdown state under the default snapshot name.
+pub fn register_coordinated_shutdown_snapshot(
+    registry: &OperationalSnapshotRegistry,
+    shutdown: CoordinatedShutdown,
+) {
+    register_named_coordinated_shutdown_snapshot(
+        registry,
+        DEFAULT_COORDINATED_SHUTDOWN_SNAPSHOT_NAME,
+        shutdown,
+    );
+}
+
+/// Registers coordinated shutdown state under a custom snapshot name.
+pub fn register_named_coordinated_shutdown_snapshot(
+    registry: &OperationalSnapshotRegistry,
+    name: impl Into<String>,
+    shutdown: CoordinatedShutdown,
+) {
+    registry.register_snapshot::<CoordinatedShutdownSnapshot, _>(name, move || shutdown.snapshot());
 }
 
 /// Serializable collection of named operational snapshots.

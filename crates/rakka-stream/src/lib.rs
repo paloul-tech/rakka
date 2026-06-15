@@ -24,6 +24,7 @@ mod adapters;
 mod facade;
 #[cfg(feature = "process-io")]
 mod process_io;
+mod shutdown;
 
 #[cfg(feature = "adapters")]
 pub use adapters::{
@@ -44,6 +45,7 @@ pub use process_io::{
     ProcessIoOwner, ProcessIoStream, ProcessOutputConfig, ProcessOutputStream, ProcessStreamError,
     ProcessStreamPump, ProcessStreamResult, DEFAULT_PROCESS_IO_CHUNK_SIZE,
 };
+pub use shutdown::{register_stream_sink_drain, register_stream_source_drain};
 
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-stream";

@@ -3,12 +3,12 @@
 use std::time::Duration;
 
 use rakka_cluster::{
-    Cluster, ClusterNode, ClusteredReceptionist, ClusteredReceptionistSettings, MembershipConfig,
-    MembershipState, NodeAddress, NodeId,
+    register_clustered_receptionist_prune_task, Cluster, ClusterNode, ClusteredReceptionist,
+    ClusteredReceptionistSettings, MembershipConfig, MembershipState, NodeAddress, NodeId,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, Receptionist,
-    Routers, ServiceKey,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, CoordinatedShutdown,
+    CoordinatedShutdownReason, Receptionist, Routers, ServiceKey, ShutdownOutcome,
 };
 use tokio::sync::mpsc;
 
@@ -108,6 +108,48 @@ async fn down_node_prunes_remote_routees() {
         MembershipState::Down
     );
 
+    fixture.shutdown();
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_prunes_clustered_receptionist_routees() {
+    let fixture = ClusteredReceptionistFixture::new("shutdown-prunes");
+    let key = ServiceKey::<WorkCommand>::new("workers");
+    let (delivered, _received) = mpsc::unbounded_channel();
+    let worker = fixture.spawn_worker_on_a("worker-a", 0, delivered);
+    let _registration = fixture
+        .receptionist_a
+        .register(&key, worker)
+        .expect("worker should register on node a");
+    fixture
+        .clustered_a
+        .propagate_to(&fixture.clustered_b, &key, 1)
+        .expect("initial listing should propagate");
+    fixture
+        .cluster_b
+        .manager()
+        .down(fixture.node_a.id())
+        .expect("node a should be marked down from node b");
+    let shutdown = CoordinatedShutdown::new();
+
+    register_clustered_receptionist_prune_task(
+        &shutdown,
+        "prune-clustered-receptionist",
+        fixture.clustered_b.clone(),
+    )
+    .unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert!(fixture
+        .receptionist_b
+        .find(&key)
+        .expect("remote listing should resolve")
+        .is_empty());
     fixture.shutdown();
 }
 

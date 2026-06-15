@@ -2,8 +2,14 @@
 
 use std::time::Duration;
 
-use rakka_core::{InMemoryMetricsRecorder, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE};
-use rakka_stream::{bounded_channel, StreamError, StreamLifecycle};
+use rakka_core::{
+    CoordinatedShutdown, CoordinatedShutdownReason, InMemoryMetricsRecorder, ShutdownOutcome,
+    ShutdownPhase, ShutdownTaskStatus, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
+};
+use rakka_stream::{
+    bounded_channel, register_stream_sink_drain, register_stream_source_drain, StreamError,
+    StreamLifecycle,
+};
 
 #[tokio::test]
 async fn producer_observes_backpressure_and_resumes_when_space_is_available() {
@@ -211,4 +217,56 @@ fn stream_status_records_pressure_and_cancellation_metrics() {
             .and_then(|observation| observation.attribute("reason")),
         Some("client disconnected")
     );
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_drains_registered_stream_sink() {
+    let shutdown = CoordinatedShutdown::new();
+    let (sink, source) = bounded_channel(2).expect("stream should be created");
+    sink.try_send("first".to_owned())
+        .expect("first item should enqueue");
+
+    register_stream_sink_drain(&shutdown, "drain-orders-stream", sink.clone()).unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert_eq!(source.status().lifecycle(), StreamLifecycle::Draining);
+    assert_eq!(
+        report
+            .phases()
+            .iter()
+            .find(|phase| phase.phase() == &ShutdownPhase::drain_adapters())
+            .and_then(|phase| phase.tasks().first())
+            .map(|task| task.status()),
+        Some(ShutdownTaskStatus::Completed)
+    );
+    let rejected = sink
+        .try_send("second".to_owned())
+        .expect_err("drained stream should reject new sends");
+    assert_eq!(rejected.error(), &StreamError::Draining);
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_stream_drain_treats_terminal_streams_as_completed() {
+    let shutdown = CoordinatedShutdown::new();
+    let (closed_sink, closed_source) = bounded_channel::<String>(1).expect("closed stream");
+    let (cancelled_sink, cancelled_source) =
+        bounded_channel::<String>(1).expect("cancelled stream");
+
+    assert_eq!(closed_source.close(), 0);
+    assert_eq!(cancelled_sink.cancel("already gone"), 0);
+
+    register_stream_sink_drain(&shutdown, "drain-closed-stream", closed_sink).unwrap();
+    register_stream_source_drain(&shutdown, "drain-cancelled-stream", cancelled_source).unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
 }

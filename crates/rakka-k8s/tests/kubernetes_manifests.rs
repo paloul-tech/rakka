@@ -33,6 +33,7 @@ fn manifest_references_readiness_liveness_and_drain_hooks() {
     assert!(MANIFEST.contains("livenessProbe:"));
     assert!(MANIFEST.contains("preStop:"));
     assert!(MANIFEST.contains("path: /drain"));
+    assert!(MANIFEST.contains("reason kubernetes-prestop"));
 }
 
 #[test]
@@ -166,6 +167,8 @@ fn kubernetes_readme_explains_multi_node_scenario_contract() {
         "partitioned rolling update",
         "RAKKA_K8S_NEXT_IMAGE",
         "readiness should fail after drain",
+        "coordinated pre-stop path",
+        "kubernetes-prestop",
     ] {
         assert!(
             KUBERNETES_README.contains(expected),

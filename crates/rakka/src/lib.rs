@@ -65,23 +65,30 @@ pub mod prelude {
         ActorFuture, ActorPath, ActorProps, ActorRef, ActorRefResolver, ActorResult, ActorSystem,
         ActorSystemBuilder, ActorSystemRuntimeSettings, ActorSystemSerializationRegistry,
         ActorSystemShutdownConfig, ActorTerminated, ActorTraceContext, ActorUid, AskError,
-        Behavior, BehaviorActor, DispatcherHint, GroupNoRouteeBehavior, GroupRouter,
-        GroupRouterBuilder, GroupRouterSnapshot, GroupRouterTellError, GroupRoutingStrategy,
-        InMemoryMetricsRecorder, Listing, Message, MetricsRecorder, NoopMetricsRecorder,
-        PoolRouter, PoolRouterBuilder, PoolRouterTellError, PoolRoutingStrategy, RakkaError,
-        RakkaResult, Receptionist, ReceptionistError, ReceptionistRegistration, ReceptionistResult,
-        ReceptionistSubscription, ReplyTo, Routers, SerializedActorRef, ServiceKey, SetupActor,
-        SpawnOptions, StopError, SupervisionStrategy, TellError, TerminationReason, TimerHandle,
-        WatchHandle,
+        Behavior, BehaviorActor, CoordinatedShutdown, CoordinatedShutdownError,
+        CoordinatedShutdownReason, CoordinatedShutdownReport, CoordinatedShutdownResult,
+        CoordinatedShutdownSettings, CoordinatedShutdownSnapshot, DispatcherHint,
+        GroupNoRouteeBehavior, GroupRouter, GroupRouterBuilder, GroupRouterSnapshot,
+        GroupRouterTellError, GroupRoutingStrategy, InMemoryMetricsRecorder, Listing, Message,
+        MetricsRecorder, NoopMetricsRecorder, PoolRouter, PoolRouterBuilder, PoolRouterTellError,
+        PoolRoutingStrategy, RakkaError, RakkaResult, Receptionist, ReceptionistError,
+        ReceptionistRegistration, ReceptionistResult, ReceptionistSubscription, ReplyTo, Routers,
+        SerializedActorRef, ServiceKey, SetupActor, ShutdownFailurePolicy, ShutdownOutcome,
+        ShutdownPhase, ShutdownPhaseReport, ShutdownTask, ShutdownTaskAttribute,
+        ShutdownTaskContext, ShutdownTaskFuture, ShutdownTaskOptions, ShutdownTaskReport,
+        ShutdownTaskResult, ShutdownTaskStatus, SpawnOptions, StopError, SupervisionStrategy,
+        TellError, TerminationReason, TimerHandle, WatchHandle,
     };
 
     #[cfg(feature = "cluster")]
     pub use rakka_cluster::{
-        Cluster, ClusterEvent, ClusterManager, ClusterRuntime, ClusterSettings, ClusterState,
-        ClusterSubscription, ClusterSubscriptionError, ClusterSubscriptionReplay,
-        ClusterSubscriptions, ClusterUpdate, ClusteredReceptionist, ClusteredReceptionistListing,
-        ClusteredReceptionistSettings, DowningStrategy, FailureDetector, NoDowningStrategy,
-        SelfMember, TimeoutDowningStrategy, TimeoutFailureDetector,
+        register_cluster_down_self_task, register_cluster_leave_task,
+        register_clustered_receptionist_prune_task, Cluster, ClusterEvent, ClusterManager,
+        ClusterRuntime, ClusterSettings, ClusterState, ClusterSubscription,
+        ClusterSubscriptionError, ClusterSubscriptionReplay, ClusterSubscriptions, ClusterUpdate,
+        ClusteredReceptionist, ClusteredReceptionistListing, ClusteredReceptionistSettings,
+        DowningStrategy, FailureDetector, NoDowningStrategy, SelfMember, TimeoutDowningStrategy,
+        TimeoutFailureDetector,
     };
 
     #[cfg(feature = "persistence")]
@@ -89,15 +96,17 @@ pub mod prelude {
         current_durable_state_by_id, current_durable_state_ids, current_events_by_persistence_id,
         current_events_by_tag, current_persistence_ids, durable_actor_future,
         event_sourced_actor_future, events_by_persistence_id, events_by_tag, persistence_ids,
-        spawn_durable_actor, spawn_durable_actor_factory, spawn_durable_state_behavior,
-        spawn_event_sourced_actor, spawn_event_sourced_actor_factory, spawn_event_sourced_behavior,
-        DurableActor, DurableActorContext, DurableActorFuture, DurableEffect, DurableState,
-        DurableStateBehavior, DurableStateBehaviorBuilder, DurableStateSignal, DurableStateStore,
-        EventJournal, EventMetadata, EventRecord, EventSourcedActor, EventSourcedActorContext,
-        EventSourcedActorFuture, EventSourcedBehavior, EventSourcedBehaviorBuilder,
-        EventSourcedEffect, InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore,
-        PersistFailureBackoff, PersistenceEvent, PersistenceId, PersistenceSignal, RecoveryOptions,
-        RetentionCriteria, Revision, SequenceNr, SnapshotMetadata, SnapshotRecord,
+        register_persistence_flush_task, register_persistence_query_cancel_task,
+        register_persistence_shutdown_task, spawn_durable_actor, spawn_durable_actor_factory,
+        spawn_durable_state_behavior, spawn_event_sourced_actor, spawn_event_sourced_actor_factory,
+        spawn_event_sourced_behavior, DurableActor, DurableActorContext, DurableActorFuture,
+        DurableEffect, DurableState, DurableStateBehavior, DurableStateBehaviorBuilder,
+        DurableStateSignal, DurableStateStore, EventJournal, EventMetadata, EventRecord,
+        EventSourcedActor, EventSourcedActorContext, EventSourcedActorFuture, EventSourcedBehavior,
+        EventSourcedBehaviorBuilder, EventSourcedEffect, InMemoryDurableStateStore,
+        InMemoryEventJournal, InMemorySnapshotStore, PersistFailureBackoff, PersistenceEvent,
+        PersistenceId, PersistenceShutdown, PersistenceShutdownFuture, PersistenceSignal,
+        RecoveryOptions, RetentionCriteria, Revision, SequenceNr, SnapshotMetadata, SnapshotRecord,
         SnapshotSelection, SnapshotStore, StashDirective, TaggedEvent,
     };
 
@@ -109,22 +118,33 @@ pub mod prelude {
 
     #[cfg(feature = "sharding")]
     pub use rakka_sharding::{
-        AsyncShardCoordinatorStore, CoordinatorLeaseFuture, CoordinatorStoreFuture,
-        DeterministicModuloShardAllocationStrategy, EntityId, EntityRef, EntityType,
-        InMemoryRememberedEntityStore, InMemoryShardCoordinatorLease,
-        InMemoryShardCoordinatorStore, LeaseToken, LeastShardAllocationStrategy,
-        PersistedShardCoordinatorState, RememberedEntities, RememberedEntityReplay,
-        RememberedEntityReplaySettings, RememberedEntityStore, RememberedStoreFuture,
-        ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig, ShardBufferOverflow,
-        ShardCoordinatorLease, ShardCoordinatorStore, ShardReassignment, ShardRebalanceContext,
-        ShardingConfig,
+        register_async_cluster_node_leave_task, register_async_cluster_sharding_leave_task,
+        register_cluster_node_leave_task, register_cluster_sharding_leave_task,
+        AsyncClusterNodeShutdownHandle, AsyncClusterShardingShutdownHandle,
+        AsyncShardCoordinatorStore, ClusterNodeShutdownHandle, ClusterShardingShutdownHandle,
+        CoordinatorLeaseFuture, CoordinatorStoreFuture, DeterministicModuloShardAllocationStrategy,
+        EntityId, EntityRef, EntityType, InMemoryRememberedEntityStore,
+        InMemoryShardCoordinatorLease, InMemoryShardCoordinatorStore, LeaseToken,
+        LeastShardAllocationStrategy, PersistedShardCoordinatorState, RememberedEntities,
+        RememberedEntityReplay, RememberedEntityReplaySettings, RememberedEntityStore,
+        RememberedStoreFuture, ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig,
+        ShardBufferOverflow, ShardCoordinatorLease, ShardCoordinatorStore, ShardReassignment,
+        ShardRebalanceContext, ShardingConfig,
     };
 
     #[cfg(feature = "stream")]
     pub use rakka_stream::{
-        AckProtocol, ActorSinkMessage, ActorSourceError, ActorSourceMessage, ActorStreamError,
-        BoundedStream, Flow, RunnableStream, Sink, Source, StreamError, StreamResult,
-        StreamRunError, StreamRunResult, StreamRunSettings, StreamSink, StreamSource,
+        register_stream_sink_drain, register_stream_source_drain, AckProtocol, ActorSinkMessage,
+        ActorSourceError, ActorSourceMessage, ActorStreamError, BoundedStream, Flow,
+        RunnableStream, Sink, Source, StreamError, StreamResult, StreamRunError, StreamRunResult,
+        StreamRunSettings, StreamSink, StreamSource,
+    };
+
+    #[cfg(feature = "process")]
+    pub use rakka_process::{
+        configured_process_actor_stop_timeout, register_configured_process_actor_stop_task,
+        register_managed_process_shutdown_task, register_process_actor_stop_task,
+        PROCESS_ACTOR_STOP_TASK_GRACE,
     };
 }
 

@@ -7,6 +7,7 @@
 //! persistence, and external-process ownership are implemented in later phases.
 
 pub mod actor;
+pub mod coordinated_shutdown;
 pub mod dead_letter;
 pub mod error;
 pub mod metrics;
@@ -24,6 +25,14 @@ pub use actor::{
     AskError, Behavior, BehaviorActor, Message, ReplyTo, SerializedActorRef, SetupActor, StopError,
     TellError, TerminationReason, TimerHandle, WatchHandle, DEFAULT_MAILBOX_CAPACITY,
 };
+pub use coordinated_shutdown::{
+    CoordinatedShutdown, CoordinatedShutdownError, CoordinatedShutdownReason,
+    CoordinatedShutdownReport, CoordinatedShutdownResult, CoordinatedShutdownSettings,
+    CoordinatedShutdownSnapshot, ShutdownFailurePolicy, ShutdownOutcome, ShutdownPhase,
+    ShutdownPhaseReport, ShutdownTask, ShutdownTaskAttribute, ShutdownTaskContext,
+    ShutdownTaskFuture, ShutdownTaskOptions, ShutdownTaskReport, ShutdownTaskResult,
+    ShutdownTaskStatus,
+};
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
 pub use metrics::{
@@ -35,7 +44,9 @@ pub use metrics::{
     METRIC_ACTOR_MAILBOX_DEPTH, METRIC_CLUSTER_MEMBERS, METRIC_GRPC_REQUEST_LATENCY_MS,
     METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_K8S_COMPATIBILITY, METRIC_K8S_READINESS,
     METRIC_PERSISTENCE_LATENCY_MS, METRIC_PROCESS_EXITS, METRIC_REMOTE_FAILURES,
-    METRIC_SHARD_OWNERSHIP_COUNT, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
+    METRIC_SHARD_OWNERSHIP_COUNT, METRIC_SHUTDOWN_PHASE_DURATION_MS, METRIC_SHUTDOWN_RUNNING,
+    METRIC_SHUTDOWN_TASK_DURATION_MS, METRIC_SHUTDOWN_TASK_FAILURES, METRIC_SHUTDOWN_TIMEOUTS,
+    METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
 };
 pub use operational::{
     DeploymentProfile, OperationalTimeoutDefaults, SecurityDefaults, DEFAULT_ACTOR_ASK_TIMEOUT,

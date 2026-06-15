@@ -6,7 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rakka_cluster::MembershipState;
-use rakka_core::ActorRef;
+use rakka_core::{
+    ActorRef, CoordinatedShutdown, CoordinatedShutdownError, CoordinatedShutdownReason,
+    CoordinatedShutdownReport, RakkaError, RakkaResult, ShutdownOutcome, ShutdownPhase,
+    ShutdownTaskOptions, ShutdownTaskStatus, Subsystem,
+};
 use rakka_process::{ProcessActorCommand, ProcessActorStatus, ProcessError};
 use rakka_sharding::ClusterShardingRuntime;
 use rakka_stream::{StreamError, StreamSink, StreamSource};
@@ -159,12 +163,74 @@ impl KubernetesDrainReport {
     pub const fn is_complete(&self) -> bool {
         matches!(self.outcome, KubernetesDrainOutcome::Complete)
     }
+
+    /// Maps a coordinated shutdown report into the Kubernetes pre-stop report shape.
+    #[must_use]
+    pub fn from_coordinated_shutdown_report(report: &CoordinatedShutdownReport) -> Self {
+        Self::from_coordinated_shutdown_report_with_names(report, &[])
+    }
+
+    fn from_coordinated_shutdown_report_with_names(
+        report: &CoordinatedShutdownReport,
+        step_names: &[CoordinatedDrainStepTask],
+    ) -> Self {
+        let mut steps = Vec::new();
+        for phase in report.phases() {
+            if phase.tasks().is_empty() && phase.outcome() == ShutdownOutcome::TimedOut {
+                steps.push(KubernetesDrainStepReport::new(
+                    phase.phase().name(),
+                    KubernetesDrainStepStatus::TimedOut,
+                    format!(
+                        "coordinated-shutdown reason={} phase={} status=timed-out",
+                        report.reason().code(),
+                        phase.phase().name()
+                    ),
+                ));
+            }
+
+            for task in phase.tasks() {
+                let name = coordinated_step_name(step_names, task.phase(), task.task_name());
+                steps.push(KubernetesDrainStepReport::new(
+                    name,
+                    kubernetes_status_from_shutdown_status(task.status()),
+                    coordinated_task_message(report, task),
+                ));
+            }
+        }
+
+        if steps.is_empty() {
+            steps.push(KubernetesDrainStepReport::new(
+                "coordinated-shutdown",
+                if report.outcome() == ShutdownOutcome::TimedOut {
+                    KubernetesDrainStepStatus::TimedOut
+                } else if report.outcome() == ShutdownOutcome::Complete {
+                    KubernetesDrainStepStatus::Completed
+                } else {
+                    KubernetesDrainStepStatus::Failed
+                },
+                format!(
+                    "coordinated-shutdown reason={} outcome={}",
+                    report.reason().code(),
+                    report.outcome().as_str()
+                ),
+            ));
+        }
+
+        Self::new(
+            kubernetes_outcome_from_shutdown_outcome(report.outcome()),
+            steps,
+        )
+    }
 }
 
 /// Pre-stop drain controller that marks readiness false and runs registered hooks.
+#[derive(Clone)]
 pub struct KubernetesDrainController {
     health: KubernetesNodeHealth,
     steps: Vec<Arc<dyn KubernetesDrainStep>>,
+    coordinated_shutdown: Option<CoordinatedShutdown>,
+    coordinated_step_tasks: Vec<CoordinatedDrainStepTask>,
+    coordinated_registration_errors: Vec<KubernetesDrainStepReport>,
 }
 
 impl KubernetesDrainController {
@@ -174,6 +240,29 @@ impl KubernetesDrainController {
         Self {
             health,
             steps: Vec::new(),
+            coordinated_shutdown: None,
+            coordinated_step_tasks: Vec::new(),
+            coordinated_registration_errors: Vec::new(),
+        }
+    }
+
+    /// Creates a drain controller backed by a coordinated shutdown registry.
+    ///
+    /// Existing custom drain steps added through [`Self::add_step`] are wrapped
+    /// as coordinated shutdown tasks in the `drain-adapters` phase. Calling
+    /// [`Self::drain`] marks readiness false and then runs the shared shutdown
+    /// path with reason `kubernetes-prestop`.
+    #[must_use]
+    pub fn from_coordinated_shutdown(
+        health: KubernetesNodeHealth,
+        shutdown: CoordinatedShutdown,
+    ) -> Self {
+        Self {
+            health,
+            steps: Vec::new(),
+            coordinated_shutdown: Some(shutdown),
+            coordinated_step_tasks: Vec::new(),
+            coordinated_registration_errors: Vec::new(),
         }
     }
 
@@ -195,10 +284,12 @@ impl KubernetesDrainController {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = KubernetesDrainStepResult> + Send + 'static,
     {
-        self.steps.push(Arc::new(FnDrainStep {
+        let step: Arc<dyn KubernetesDrainStep> = Arc::new(FnDrainStep {
             name: name.into(),
             run,
-        }));
+        });
+        self.register_coordinated_step(step.clone());
+        self.steps.push(step);
         self
     }
 
@@ -291,6 +382,10 @@ impl KubernetesDrainController {
     /// Runs pre-stop drain steps until all complete or the deadline elapses.
     pub async fn drain(&self, timeout: Duration) -> KubernetesDrainReport {
         self.health.begin_drain();
+        if let Some(shutdown) = &self.coordinated_shutdown {
+            return self.drain_coordinated(shutdown.clone(), timeout).await;
+        }
+
         let steps = self.steps.clone();
         let deadline = Instant::now() + timeout;
         let mut reports = Vec::new();
@@ -348,6 +443,95 @@ impl KubernetesDrainController {
 
         KubernetesDrainReport::new(outcome, reports)
     }
+
+    async fn drain_coordinated(
+        &self,
+        shutdown: CoordinatedShutdown,
+        timeout: Duration,
+    ) -> KubernetesDrainReport {
+        let deadline = Instant::now() + timeout;
+        let result = shutdown
+            .run_with_deadline(CoordinatedShutdownReason::kubernetes_prestop(), deadline)
+            .await;
+        let mut report = match result {
+            Ok(report) => KubernetesDrainReport::from_coordinated_shutdown_report_with_names(
+                &report,
+                &self.coordinated_step_tasks,
+            ),
+            Err(CoordinatedShutdownError::Failed { report })
+            | Err(CoordinatedShutdownError::TimedOut { report }) => {
+                KubernetesDrainReport::from_coordinated_shutdown_report_with_names(
+                    &report,
+                    &self.coordinated_step_tasks,
+                )
+            }
+            Err(CoordinatedShutdownError::Registry { error }) => KubernetesDrainReport::new(
+                KubernetesDrainOutcome::Partial,
+                vec![KubernetesDrainStepReport::new(
+                    "coordinated-shutdown-registry",
+                    KubernetesDrainStepStatus::Failed,
+                    error.to_string(),
+                )],
+            ),
+        };
+
+        if !self.coordinated_registration_errors.is_empty() {
+            let mut steps = report.steps().to_vec();
+            steps.extend(self.coordinated_registration_errors.iter().cloned());
+            let outcome = if report.outcome() == KubernetesDrainOutcome::TimedOut {
+                KubernetesDrainOutcome::TimedOut
+            } else {
+                KubernetesDrainOutcome::Partial
+            };
+            report = KubernetesDrainReport::new(outcome, steps);
+        }
+
+        report
+    }
+
+    fn register_coordinated_step(&mut self, step: Arc<dyn KubernetesDrainStep>) {
+        let Some(shutdown) = &self.coordinated_shutdown else {
+            return;
+        };
+        let task = CoordinatedDrainStepTask::new(
+            step.name(),
+            self.coordinated_step_tasks.len(),
+            ShutdownPhase::drain_adapters(),
+        );
+        let options = match kubernetes_drain_step_options(step.name()) {
+            Ok(options) => options,
+            Err(error) => {
+                self.coordinated_registration_errors
+                    .push(KubernetesDrainStepReport::new(
+                        step.name(),
+                        KubernetesDrainStepStatus::Failed,
+                        error.to_string(),
+                    ));
+                return;
+            }
+        };
+        let task_name = task.task_name.clone();
+        let step_for_task = step.clone();
+        match shutdown.add_task_with_options(
+            task.phase.clone(),
+            task_name,
+            options,
+            move |_context| {
+                let step = step_for_task.clone();
+                async move { run_legacy_drain_step_as_shutdown_task(step).await }
+            },
+        ) {
+            Ok(_task) => self.coordinated_step_tasks.push(task),
+            Err(error) => {
+                self.coordinated_registration_errors
+                    .push(KubernetesDrainStepReport::new(
+                        step.name(),
+                        KubernetesDrainStepStatus::Failed,
+                        error.to_string(),
+                    ))
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for KubernetesDrainController {
@@ -356,6 +540,26 @@ impl std::fmt::Debug for KubernetesDrainController {
             .field("health", &self.health)
             .field("step_count", &self.step_count())
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoordinatedDrainStepTask {
+    step_name: String,
+    task_name: String,
+    phase: ShutdownPhase,
+}
+
+impl CoordinatedDrainStepTask {
+    fn new(step_name: &str, index: usize, phase: ShutdownPhase) -> Self {
+        Self {
+            step_name: step_name.to_owned(),
+            task_name: format!(
+                "k8s-drain-step-{index}-{}",
+                shutdown_name_fragment(step_name)
+            ),
+            phase,
+        }
     }
 }
 
@@ -394,4 +598,97 @@ fn stream_drain_result(
 
 fn process_stop_completed(status: &ProcessActorStatus) -> KubernetesDrainStepResult {
     KubernetesDrainStepResult::completed(format!("process actor stopped: {:?}", status.state()))
+}
+
+async fn run_legacy_drain_step_as_shutdown_task(
+    step: Arc<dyn KubernetesDrainStep>,
+) -> RakkaResult<()> {
+    match step.run().await {
+        KubernetesDrainStepResult::Completed { .. } => Ok(()),
+        KubernetesDrainStepResult::Failed { message } => Err(RakkaError::new(
+            Subsystem::K8s,
+            "kubernetes-drain-step-failed",
+            message,
+        )),
+    }
+}
+
+fn kubernetes_drain_step_options(step_name: &str) -> RakkaResult<ShutdownTaskOptions> {
+    ShutdownTaskOptions::default()
+        .with_attribute("operation", "kubernetes-drain-step")?
+        .with_attribute("kubernetes-step", step_name)
+}
+
+fn shutdown_name_fragment(name: &str) -> String {
+    let fragment = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    if fragment.is_empty() {
+        "step".to_owned()
+    } else {
+        fragment
+    }
+}
+
+fn coordinated_step_name(
+    step_names: &[CoordinatedDrainStepTask],
+    phase: &ShutdownPhase,
+    task_name: &str,
+) -> String {
+    step_names
+        .iter()
+        .find(|task| task.phase == *phase && task.task_name == task_name)
+        .map_or_else(
+            || format!("{}/{}", phase.name(), task_name),
+            |task| task.step_name.clone(),
+        )
+}
+
+fn coordinated_task_message(
+    report: &CoordinatedShutdownReport,
+    task: &rakka_core::ShutdownTaskReport,
+) -> String {
+    let status = task.status().as_str();
+    let mut message = format!(
+        "coordinated-shutdown reason={} phase={} task={} status={status}",
+        report.reason().code(),
+        task.phase().name(),
+        task.task_name(),
+    );
+    if let Some(detail) = task.message() {
+        message.push_str(": ");
+        message.push_str(detail);
+    }
+    message
+}
+
+fn kubernetes_status_from_shutdown_status(status: ShutdownTaskStatus) -> KubernetesDrainStepStatus {
+    match status {
+        ShutdownTaskStatus::Completed => KubernetesDrainStepStatus::Completed,
+        ShutdownTaskStatus::Failed => KubernetesDrainStepStatus::Failed,
+        ShutdownTaskStatus::TimedOut
+        | ShutdownTaskStatus::Pending
+        | ShutdownTaskStatus::Running
+        | ShutdownTaskStatus::Skipped => KubernetesDrainStepStatus::TimedOut,
+    }
+}
+
+fn kubernetes_outcome_from_shutdown_outcome(outcome: ShutdownOutcome) -> KubernetesDrainOutcome {
+    match outcome {
+        ShutdownOutcome::Complete => KubernetesDrainOutcome::Complete,
+        ShutdownOutcome::TimedOut => KubernetesDrainOutcome::TimedOut,
+        ShutdownOutcome::NotStarted
+        | ShutdownOutcome::Running
+        | ShutdownOutcome::Partial
+        | ShutdownOutcome::Failed => KubernetesDrainOutcome::Partial,
+    }
 }

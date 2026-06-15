@@ -26,6 +26,7 @@ members = [
     "examples/minimal-system",
     "examples/pool-router",
     "examples/clustered-receptionist",
+    "examples/coordinated-shutdown",
     "examples/multi-node-sharding",
     "examples/sharded-cart-persistence",
     "examples/streams",

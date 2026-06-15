@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use rakka_core::{
     actor_fn, actor_future, setup, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions,
-    ActorSystem, ActorSystemRuntimeSettings, ActorSystemShutdownConfig, Behavior, DeadLetterReason,
-    RakkaError, ReplyTo, SerializedActorRef, SupervisionStrategy, TellError,
+    ActorSystem, ActorSystemRuntimeSettings, ActorSystemShutdownConfig, Behavior,
+    CoordinatedShutdown, CoordinatedShutdownReason, DeadLetterReason, RakkaError, ReplyTo,
+    SerializedActorRef, ShutdownOutcome, ShutdownPhase, SupervisionStrategy, TellError,
 };
 use tokio::sync::{mpsc, Notify};
 
@@ -551,6 +552,71 @@ async fn actor_system_builder_and_terminate_complete_lifecycle() {
 
     let late_spawn = system.spawn_actor("late", StopActor).unwrap_err();
     assert_eq!(late_spawn.code(), "system-terminating");
+}
+
+#[tokio::test]
+async fn actor_system_terminate_runs_coordinated_shutdown_tasks_once() {
+    let system = ActorSystem::new("coordinated-terminate");
+    let shutdown = CoordinatedShutdown::get(&system);
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    shutdown
+        .add_task(ShutdownPhase::stop_ingress(), "custom-stop-ingress", {
+            let runs = runs.clone();
+            move |_context| {
+                let runs = runs.clone();
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .unwrap();
+
+    let actor = system.spawn_actor("echo", EchoActor).unwrap();
+    let report = system.terminate_with_report().await.unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        report.reason(),
+        &CoordinatedShutdownReason::actor_system_terminate()
+    );
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert!(actor.is_terminated());
+    assert!(system.is_terminated());
+    assert_eq!(
+        system.coordinated_shutdown().snapshot().outcome(),
+        ShutdownOutcome::Complete
+    );
+
+    let second = system.terminate_with_report().await.unwrap();
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(second, report);
+}
+
+#[tokio::test]
+async fn actor_system_terminate_surfaces_coordinated_shutdown_failures() {
+    let system = ActorSystem::new("coordinated-failure");
+    let actor = system.spawn_actor("echo", EchoActor).unwrap();
+
+    system
+        .coordinated_shutdown()
+        .add_task(
+            ShutdownPhase::stop_ingress(),
+            "fail-before-actors",
+            |_context| async { Err(RakkaError::core("expected-shutdown-failure", "boom")) },
+        )
+        .unwrap();
+
+    let error = system.terminate().await.unwrap_err();
+
+    assert_eq!(error.code(), "system-coordinated-shutdown-failed");
+    assert!(!system.is_terminated());
+    let late_spawn = system.spawn_actor("late", StopActor).unwrap_err();
+    assert_eq!(late_spawn.code(), "system-terminating");
+
+    system.shutdown();
+    actor.when_terminated().await;
 }
 
 #[derive(Debug)]

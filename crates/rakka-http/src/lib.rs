@@ -11,6 +11,7 @@ mod metrics;
 mod observability;
 mod routes;
 mod server;
+mod shutdown;
 mod streaming;
 
 pub use axum::Router;
@@ -23,13 +24,19 @@ pub use error::{HttpError, HttpErrorBody, HttpResult};
 pub use metrics::record_http_request_metrics;
 pub use observability::{
     json_snapshot_route, open_telemetry_metrics_json_route, operational_snapshots_route,
-    prometheus_metrics_route, OperationalSnapshotRegistry, OperationalSnapshots,
+    prometheus_metrics_route, register_coordinated_shutdown_snapshot,
+    register_named_coordinated_shutdown_snapshot, OperationalSnapshotRegistry,
+    OperationalSnapshots, DEFAULT_COORDINATED_SHUTDOWN_SNAPSHOT_NAME,
 };
 pub use routes::{
     binary_service_route, into_response, json_actor_ask_route, json_actor_tell_route,
     json_entity_ask_route, json_entity_tell_route, json_service_route, HttpAccepted, HttpRouter,
 };
 pub use server::serve_with_graceful_shutdown;
+pub use shutdown::{
+    register_http_shutdown_task, serve_with_coordinated_shutdown, HttpServerShutdownResult,
+    HttpShutdownHandle, HttpShutdownSignal, HttpShutdownSnapshot,
+};
 pub use streaming::{
     byte_stream_response, byte_stream_response_with_content_type, byte_stream_route,
     request_body_stream_from_body, request_body_stream_from_request, request_body_stream_route,

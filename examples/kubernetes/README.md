@@ -13,7 +13,7 @@ The manifest is intentionally an application-image contract rather than a hosted
 
 - `GET /ready`: returns success only after cluster join, protocol compatibility acceptance, and required service registration.
 - `GET /live`: stays healthy during normal rebalance and drain, but fails for stuck runtime conditions.
-- `GET /drain`: starts graceful drain, marks readiness false, hands off shards, drains streams, stops process actors, and returns a drain report.
+- `GET /drain`: starts coordinated shutdown with reason `kubernetes-prestop`, marks readiness false, hands off shards, drains streams, stops process actors, and returns a drain report.
 - `GET /metrics`: returns Prometheus text metrics from the Rakka metrics exporter.
 - `GET /snapshots`: returns JSON operational snapshots, including Kubernetes health.
 - `GET /scenario/sharding/route-remote?entity_id=cart-v1g&item=apple&expect_remote=1`: routes a request through Rakka sharding to an entity owned by another pod through internal Rakka remoting, then returns a body containing the owning pod or node name.
@@ -81,9 +81,32 @@ The example expects the application image to expose:
 
 - `GET /ready`: returns success after cluster join, compatibility acceptance, and required service registration.
 - `GET /live`: stays healthy during ordinary shard rebalance and graceful drain, but fails for stuck runtime conditions.
-- `GET /drain`: starts the Slice 5G drain controller and returns a drain report.
+- `GET /drain`: runs the coordinated pre-stop path and returns a drain report mapped from the coordinated shutdown report.
 
-The StatefulSet pre-stop hook calls `/drain`, and `terminationGracePeriodSeconds` gives the node time to mark itself draining, hand off shards, drain streams, stop process actors, and leave membership.
+The StatefulSet pre-stop hook calls `/drain`, and `terminationGracePeriodSeconds` gives the node time to mark itself draining, stop ingress, drain adapters, leave membership, hand off shards, stop process actors, flush persistence hooks, and stop actor-system resources through the same coordinated shutdown path used by application termination.
+
+Recommended timing:
+
+- `/drain` should mark readiness false before it runs coordinated shutdown, so
+  Services stop routing new work to the pod while in-flight work drains.
+- `/live` should keep returning success during a normal coordinated shutdown.
+  Use liveness failure for stuck runtime conditions, not as the graceful-drain
+  trigger.
+- `RAKKA_K8S_PRESTOP_TIMEOUT_MS` should be the budget passed to coordinated
+  shutdown with reason `kubernetes-prestop`.
+- `terminationGracePeriodSeconds` should exceed that pre-stop budget. The
+  manifest uses `45s` around a `30s` pre-stop budget so shutdown reports,
+  final actor-system cleanup, and container exit have room after the hook
+  returns.
+
+The application can build the drain controller from the actor-system registry:
+
+```rust
+let drain = KubernetesDrainController::from_coordinated_shutdown(
+    health,
+    system.coordinated_shutdown(),
+);
+```
 
 ## Observability
 
@@ -91,6 +114,9 @@ The local scenario checks:
 
 - `/metrics` contains a stable Prometheus metric, defaulting to `rakka_http_request_latency_ms`.
 - `/snapshots` contains a Kubernetes health snapshot, defaulting to `kubernetes_health`.
+- `/snapshots` should also include coordinated shutdown state, usually under
+  `coordinated_shutdown`, when the image registers
+  `register_coordinated_shutdown_snapshot`.
 
 Override `RAKKA_K8S_METRICS_EXPECT` or `RAKKA_K8S_SNAPSHOTS_EXPECT` when your image exposes a different first metric or snapshot name.
 

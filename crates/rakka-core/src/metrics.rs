@@ -48,6 +48,21 @@ pub const METRIC_K8S_READINESS: &str = "rakka.k8s.readiness";
 /// Kubernetes cluster compatibility state gauge.
 pub const METRIC_K8S_COMPATIBILITY: &str = "rakka.k8s.compatibility";
 
+/// Coordinated shutdown phase duration histogram in milliseconds.
+pub const METRIC_SHUTDOWN_PHASE_DURATION_MS: &str = "rakka.shutdown.phase.duration_ms";
+
+/// Coordinated shutdown task duration histogram in milliseconds.
+pub const METRIC_SHUTDOWN_TASK_DURATION_MS: &str = "rakka.shutdown.task.duration_ms";
+
+/// Coordinated shutdown task failure counter.
+pub const METRIC_SHUTDOWN_TASK_FAILURES: &str = "rakka.shutdown.task.failures";
+
+/// Coordinated shutdown timeout counter for task and phase deadlines.
+pub const METRIC_SHUTDOWN_TIMEOUTS: &str = "rakka.shutdown.timeouts";
+
+/// Coordinated shutdown running-state gauge.
+pub const METRIC_SHUTDOWN_RUNNING: &str = "rakka.shutdown.running";
+
 /// Minimal metrics sink used across runtime crates.
 pub trait MetricsRecorder: Send + Sync {
     /// Increments a monotonically increasing counter.

@@ -9,10 +9,16 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Notify};
+use tokio::time::Instant;
 
 use crate::actor::{
     spawn_actor_task, Actor, ActorCell, ActorRef, ActorRuntimeSnapshot, ActorStopHandle,
     SerializedActorRef,
+};
+use crate::coordinated_shutdown::{
+    CoordinatedShutdown, CoordinatedShutdownError, CoordinatedShutdownReason,
+    CoordinatedShutdownReport, CoordinatedShutdownResult, CoordinatedShutdownSettings,
+    ShutdownFailurePolicy, ShutdownPhase, ShutdownTaskOptions,
 };
 use crate::dead_letter::DeadLetter;
 use crate::metrics::{
@@ -41,6 +47,7 @@ pub(crate) struct ActorSystemInner {
     serialization_registry: Option<ActorSystemSerializationRegistry>,
     runtime_settings: ActorSystemRuntimeSettings,
     shutdown_config: ActorSystemShutdownConfig,
+    coordinated_shutdown: CoordinatedShutdown,
     receptionist: Arc<ReceptionistRegistry>,
     actors: Mutex<Vec<ActorStopHandle>>,
     live_actors: Mutex<HashMap<ActorPath, Arc<ActorCell>>>,
@@ -203,6 +210,7 @@ impl Default for ActorSystemRuntimeSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorSystemShutdownConfig {
     termination_timeout: Duration,
+    coordinated_shutdown_settings: CoordinatedShutdownSettings,
 }
 
 impl ActorSystemShutdownConfig {
@@ -211,7 +219,19 @@ impl ActorSystemShutdownConfig {
     pub const fn new(termination_timeout: Duration) -> Self {
         Self {
             termination_timeout,
+            coordinated_shutdown_settings: CoordinatedShutdownSettings::new()
+                .with_default_task_timeout(termination_timeout),
         }
+    }
+
+    /// Returns a copy with coordinated shutdown settings configured.
+    #[must_use]
+    pub const fn with_coordinated_shutdown_settings(
+        mut self,
+        settings: CoordinatedShutdownSettings,
+    ) -> Self {
+        self.coordinated_shutdown_settings = settings;
+        self
     }
 
     /// Returns how long `terminate` waits for actors to stop.
@@ -219,12 +239,20 @@ impl ActorSystemShutdownConfig {
     pub const fn termination_timeout(&self) -> Duration {
         self.termination_timeout
     }
+
+    /// Settings used to create the actor system coordinated shutdown registry.
+    #[must_use]
+    pub const fn coordinated_shutdown_settings(&self) -> CoordinatedShutdownSettings {
+        self.coordinated_shutdown_settings
+    }
 }
 
 impl Default for ActorSystemShutdownConfig {
     fn default() -> Self {
         Self {
             termination_timeout: DEFAULT_SYSTEM_TERMINATION_TIMEOUT,
+            coordinated_shutdown_settings: CoordinatedShutdownSettings::new()
+                .with_default_task_timeout(DEFAULT_SYSTEM_TERMINATION_TIMEOUT),
         }
     }
 }
@@ -308,6 +336,21 @@ impl ActorSystemSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorNamespace {
+    User,
+    System,
+}
+
+impl ActorNamespace {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::System => "system",
+        }
+    }
+}
+
 impl ActorSystem {
     /// Creates an actor-system builder.
     #[must_use]
@@ -340,7 +383,9 @@ impl ActorSystem {
 
         validate_actor_path_segment(&builder.name)?;
         let (dead_letters, _) = broadcast::channel(1024);
-        Ok(Self {
+        let system_name = builder.name.clone();
+        let metrics = builder.metrics.clone();
+        let system = Self {
             inner: Arc::new(ActorSystemInner {
                 name: builder.name,
                 next_actor_id: AtomicU64::new(1),
@@ -349,6 +394,11 @@ impl ActorSystem {
                 serialization_registry: builder.serialization_registry,
                 runtime_settings: builder.runtime_settings,
                 shutdown_config: builder.shutdown_config,
+                coordinated_shutdown: CoordinatedShutdown::with_settings_and_metrics(
+                    builder.shutdown_config.coordinated_shutdown_settings(),
+                    system_name,
+                    metrics,
+                ),
                 receptionist: Arc::new(ReceptionistRegistry::new()),
                 actors: Mutex::new(Vec::new()),
                 live_actors: Mutex::new(HashMap::new()),
@@ -356,7 +406,9 @@ impl ActorSystem {
                 terminated: std::sync::atomic::AtomicBool::new(false),
                 termination_notify: Notify::new(),
             }),
-        })
+        };
+        system.register_actor_system_shutdown_tasks()?;
+        Ok(system)
     }
 
     /// Returns the actor system name.
@@ -393,6 +445,12 @@ impl ActorSystem {
     #[must_use]
     pub fn shutdown_config(&self) -> &ActorSystemShutdownConfig {
         &self.inner.shutdown_config
+    }
+
+    /// Coordinated shutdown registry owned by this actor system.
+    #[must_use]
+    pub fn coordinated_shutdown(&self) -> CoordinatedShutdown {
+        self.inner.coordinated_shutdown.clone()
     }
 
     /// Returns an actor reference resolver for this system.
@@ -661,42 +719,29 @@ impl ActorSystem {
         }
     }
 
-    /// Stops all actors and waits for the system to terminate.
+    /// Stops all actors through coordinated shutdown and waits for termination.
     pub async fn terminate(&self) -> RakkaResult<()> {
+        self.terminate_with_report()
+            .await
+            .map(|_report| ())
+            .map_err(|error| self.termination_error(error))
+    }
+
+    /// Runs coordinated shutdown and returns the final or partial shutdown report.
+    pub async fn terminate_with_report(
+        &self,
+    ) -> CoordinatedShutdownResult<CoordinatedShutdownReport> {
         self.inner
             .terminating
             .store(true, std::sync::atomic::Ordering::Release);
-        self.shutdown();
-
         let timeout = self.inner.shutdown_config.termination_timeout();
-        let outcome = tokio::time::timeout(timeout, async {
-            loop {
-                let notified = self.inner.termination_notify.notified();
-                if self.active_actor_count() == 0 {
-                    break;
-                }
-                notified.await;
-            }
-        })
-        .await;
-
-        match outcome {
-            Ok(()) => {
-                self.inner
-                    .terminated
-                    .store(true, std::sync::atomic::Ordering::Release);
-                self.inner.termination_notify.notify_waiters();
-                Ok(())
-            }
-            Err(_elapsed) => Err(RakkaError::core(
-                "system-termination-timeout",
-                format!(
-                    "actor system '{}' did not terminate within {:?}",
-                    self.name(),
-                    timeout
-                ),
-            )),
-        }
+        self.inner
+            .coordinated_shutdown
+            .run_with_deadline(
+                CoordinatedShutdownReason::actor_system_terminate(),
+                Instant::now() + timeout,
+            )
+            .await
     }
 
     /// Waits until `terminate` has completed for this actor system.
@@ -800,12 +845,150 @@ impl ActorSystem {
             .push(actor);
     }
 
+    fn register_actor_system_shutdown_tasks(&self) -> RakkaResult<()> {
+        let timeout = self.inner.shutdown_config.termination_timeout();
+        let task_options = ShutdownTaskOptions::new()
+            .with_timeout(timeout)
+            .with_failure_policy(ShutdownFailurePolicy::FailFast);
+
+        self.inner.coordinated_shutdown.add_task_with_options(
+            ShutdownPhase::stop_user_actors(),
+            "stop-user-actors",
+            task_options.clone(),
+            {
+                let system = self.clone();
+                move |_context| {
+                    let system = system.clone();
+                    async move {
+                        system
+                            .inner
+                            .terminating
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        system.stop_actors_in_namespace(ActorNamespace::User);
+                        system.wait_for_actor_namespace(ActorNamespace::User).await;
+                        Ok(())
+                    }
+                }
+            },
+        )?;
+
+        self.inner.coordinated_shutdown.add_task_with_options(
+            ShutdownPhase::stop_system_actors(),
+            "stop-system-actors",
+            task_options,
+            {
+                let system = self.clone();
+                move |_context| {
+                    let system = system.clone();
+                    async move {
+                        system
+                            .inner
+                            .terminating
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        system.stop_actors_in_namespace(ActorNamespace::System);
+                        system.wait_for_actor_namespace(ActorNamespace::System).await;
+                        if system.active_actor_count() == 0 {
+                            system.mark_terminated();
+                            Ok(())
+                        } else {
+                            Err(RakkaError::core(
+                                "system-termination-incomplete",
+                                format!(
+                                    "actor system '{}' still has {} active actors after coordinated shutdown",
+                                    system.name(),
+                                    system.active_actor_count()
+                                ),
+                            ))
+                        }
+                    }
+                }
+            },
+        )?;
+
+        Ok(())
+    }
+
+    fn stop_actors_in_namespace(&self, namespace: ActorNamespace) -> usize {
+        let actors = self
+            .inner
+            .actors
+            .lock()
+            .expect("actor registry mutex poisoned")
+            .clone();
+
+        let mut stopped = 0usize;
+        for actor in actors {
+            if !actor.is_terminated() && self.actor_in_namespace(actor.path(), namespace) {
+                actor.stop();
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+
+    async fn wait_for_actor_namespace(&self, namespace: ActorNamespace) {
+        loop {
+            let notified = self.inner.termination_notify.notified();
+            if self.active_actor_count_in_namespace(namespace) == 0 {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     fn active_actor_count(&self) -> usize {
         self.inner
             .live_actors
             .lock()
             .expect("live actor registry mutex poisoned")
             .len()
+    }
+
+    fn active_actor_count_in_namespace(&self, namespace: ActorNamespace) -> usize {
+        self.inner
+            .live_actors
+            .lock()
+            .expect("live actor registry mutex poisoned")
+            .keys()
+            .filter(|path| self.actor_in_namespace(path, namespace))
+            .count()
+    }
+
+    fn actor_in_namespace(&self, path: &ActorPath, namespace: ActorNamespace) -> bool {
+        let prefix = format!("rakka://local/{}/{}/", self.name(), namespace.as_str());
+        path.as_str().starts_with(&prefix)
+    }
+
+    fn mark_terminated(&self) {
+        self.inner
+            .terminated
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.termination_notify.notify_waiters();
+    }
+
+    fn termination_error(&self, error: CoordinatedShutdownError) -> RakkaError {
+        match error {
+            CoordinatedShutdownError::Registry { error } => error,
+            CoordinatedShutdownError::Failed { report } => RakkaError::core(
+                "system-coordinated-shutdown-failed",
+                format!(
+                    "actor system '{}' coordinated shutdown failed with outcome {:?} after {} phase reports",
+                    self.name(),
+                    report.outcome(),
+                    report.phases().len()
+                ),
+            ),
+            CoordinatedShutdownError::TimedOut { report } => RakkaError::core(
+                "system-termination-timeout",
+                format!(
+                    "actor system '{}' did not terminate within {:?}; shutdown outcome {:?} after {} phase reports",
+                    self.name(),
+                    self.inner.shutdown_config.termination_timeout(),
+                    report.outcome(),
+                    report.phases().len()
+                ),
+            ),
+        }
     }
 
     fn resolve_actor_ref<M>(&self, serialized: &SerializedActorRef) -> RakkaResult<ActorRef<M>>

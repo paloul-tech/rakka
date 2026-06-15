@@ -397,6 +397,34 @@ Every async probe assertion has a deterministic timeout. Defaults come from
 `StreamTestKit`, and explicit `*_within` variants are available where the test
 needs a custom timeout.
 
+## Coordinated Shutdown Drain
+
+Phase 7 connects bounded stream lifecycles to coordinated shutdown. Register
+owned stream handles during application wiring so shutdown can reject new
+items, let existing consumers flush buffered items, and report the drain task
+in the `drain-http-grpc-and-streams` phase:
+
+```rust
+use rakka_core::{CoordinatedShutdown, CoordinatedShutdownReason, ShutdownOutcome};
+use rakka_stream::{bounded_channel, register_stream_sink_drain};
+
+let shutdown = CoordinatedShutdown::new();
+let (sink, _source) = bounded_channel::<String>(16)?;
+
+register_stream_sink_drain(&shutdown, "drain-orders-stream", sink.clone())?;
+
+let report = shutdown
+    .run(CoordinatedShutdownReason::user_request())
+    .await?;
+
+assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+```
+
+Closed and already-cancelled stream drains are treated as completed shutdown
+work, which keeps repeated application shutdown idempotent. Drains still report
+real lifecycle failures, such as a stream that is already draining when the
+task tries to drain it again.
+
 ## Runnable Example
 
 `examples/streams` is the self-contained Phase 6 adoption example. It covers
