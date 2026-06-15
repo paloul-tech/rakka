@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::system::ActorSystem;
 use crate::{RakkaError, RakkaResult};
 
 const STOP_INGRESS: &str = "stop-ingress";
@@ -61,6 +62,12 @@ pub struct CoordinatedShutdown {
 }
 
 impl CoordinatedShutdown {
+    /// Returns the coordinated shutdown registry owned by an actor system.
+    #[must_use]
+    pub fn get(system: &ActorSystem) -> Self {
+        system.coordinated_shutdown()
+    }
+
     /// Creates a registry with default settings and built-in phases.
     #[must_use]
     pub fn new() -> Self {

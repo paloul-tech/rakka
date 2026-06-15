@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 7 Detailed Plan
 
-Status: implemented through Slice 7B
+Status: implemented through Slice 7C
 Date: 2026-06-15
 
 ## Purpose
@@ -286,7 +286,7 @@ cargo clippy -p rakka-core --all-targets -- -D warnings
 Goal: make `ActorSystem` own a coordinated shutdown registry and use it as the
 single termination path.
 
-Status: planned.
+Status: implemented.
 
 Scope:
 
@@ -318,6 +318,30 @@ Acceptance criteria:
 - `ActorSystem::when_terminated` completes after coordinated shutdown completes.
 - Spawning during termination fails with the existing or improved
   `system-terminating` error.
+
+Implementation status:
+
+- Added an owned `CoordinatedShutdown` registry to `ActorSystemInner` and
+  exposed it through `ActorSystem::coordinated_shutdown`.
+- Added `CoordinatedShutdown::get(&ActorSystem)` as the Akka-shaped extension
+  lookup helper.
+- Extended `ActorSystemShutdownConfig` with coordinated shutdown settings while
+  preserving the existing termination timeout constructor.
+- Registered built-in actor-system shutdown tasks:
+  - `stop-user-actors` in the `stop-user-actors` phase;
+  - `stop-system-actors` in the `stop-system-actors` phase.
+- Updated `ActorSystem::terminate` to run coordinated shutdown with reason
+  `actor-system-terminate` and the configured termination deadline.
+- Added `ActorSystem::terminate_with_report` for callers that need the
+  coordinated shutdown report or report-bearing error.
+- Kept `ActorSystem::shutdown` as the immediate compatibility stop signal.
+- Preserved spawn rejection during termination through the existing
+  `system-terminating` guard.
+- Re-exported coordinated shutdown vocabulary through the top-level `rakka`
+  prelude.
+- Added actor-system lifecycle tests proving custom coordinated shutdown tasks
+  run once through `terminate`, repeated terminate calls are idempotent, failure
+  is surfaced, actors stop, `when_terminated` completes, and late spawns fail.
 
 Review commands:
 
