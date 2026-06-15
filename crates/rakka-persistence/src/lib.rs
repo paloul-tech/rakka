@@ -11,6 +11,7 @@ pub mod error;
 pub mod event_sourced;
 pub mod memory;
 pub mod query;
+pub mod shutdown;
 pub mod store;
 
 use rakka_core::{MetricsRecorder, Subsystem, METRIC_PERSISTENCE_LATENCY_MS};
@@ -39,6 +40,10 @@ pub use query::{
     current_durable_state_by_id, current_durable_state_ids, current_events_by_persistence_id,
     current_events_by_tag, current_persistence_ids, events_by_persistence_id, events_by_tag,
     persistence_ids, QueryFuture, DEFAULT_PERSISTENCE_QUERY_BUFFER_CAPACITY,
+};
+pub use shutdown::{
+    register_persistence_flush_task, register_persistence_query_cancel_task,
+    register_persistence_shutdown_task, PersistenceShutdown, PersistenceShutdownFuture,
 };
 pub use store::{
     DurableState, DurableStateStore, EventJournal, EventMetadata, EventRecord,

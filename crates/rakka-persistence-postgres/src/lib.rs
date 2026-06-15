@@ -6,6 +6,8 @@
 use std::error::Error;
 use std::sync::Arc;
 
+mod shutdown;
+
 use rakka_core::Subsystem;
 use rakka_persistence::{
     DurableError, DurableResult, DurableState, DurableStateStore, EventJournal, EventMetadata,
@@ -869,6 +871,10 @@ fn map_postgres_error(error: tokio_postgres::Error) -> DurableError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rakka_core::{
+        CoordinatedShutdown, CoordinatedShutdownReason, ShutdownPhase, ShutdownTaskStatus,
+    };
+    use rakka_persistence::register_persistence_shutdown_task;
     use tokio_postgres::NoTls;
 
     #[tokio::test]
@@ -999,6 +1005,53 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_shutdown_task_checks_backend_readiness_when_dsn_is_set() {
+        let dsn = match std::env::var("RAKKA_POSTGRES_TEST_DSN") {
+            Ok(dsn) => dsn,
+            Err(_) => return,
+        };
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("postgres shutdown connection error: {error}");
+            }
+        });
+
+        let shutdown = CoordinatedShutdown::new();
+        let store = PostgresDurableStateStore::new(client, BytesStateCodec);
+        let task = register_persistence_shutdown_task(&shutdown, "postgres-readiness", store)
+            .expect("postgres persistence shutdown task should register");
+
+        assert_eq!(task.phase(), &ShutdownPhase::flush_persistence());
+        assert!(task.options().attributes().iter().any(|attribute| {
+            attribute.key() == "operation" && attribute.value() == "postgres-readiness-check"
+        }));
+        assert!(task
+            .options()
+            .attributes()
+            .iter()
+            .any(|attribute| attribute.key() == "backend" && attribute.value() == BACKEND_NAME));
+
+        let report = shutdown
+            .run(CoordinatedShutdownReason::user_request())
+            .await
+            .expect("postgres readiness shutdown should complete");
+        let status = report
+            .phases()
+            .iter()
+            .find(|phase| phase.phase() == &ShutdownPhase::flush_persistence())
+            .and_then(|phase| {
+                phase
+                    .tasks()
+                    .iter()
+                    .find(|task| task.task_name() == "postgres-readiness")
+            })
+            .map(|task| task.status());
+
+        assert_eq!(status, Some(ShutdownTaskStatus::Completed));
     }
 
     fn unique_id(prefix: &str) -> PersistenceId {

@@ -96,15 +96,17 @@ pub mod prelude {
         current_durable_state_by_id, current_durable_state_ids, current_events_by_persistence_id,
         current_events_by_tag, current_persistence_ids, durable_actor_future,
         event_sourced_actor_future, events_by_persistence_id, events_by_tag, persistence_ids,
-        spawn_durable_actor, spawn_durable_actor_factory, spawn_durable_state_behavior,
-        spawn_event_sourced_actor, spawn_event_sourced_actor_factory, spawn_event_sourced_behavior,
-        DurableActor, DurableActorContext, DurableActorFuture, DurableEffect, DurableState,
-        DurableStateBehavior, DurableStateBehaviorBuilder, DurableStateSignal, DurableStateStore,
-        EventJournal, EventMetadata, EventRecord, EventSourcedActor, EventSourcedActorContext,
-        EventSourcedActorFuture, EventSourcedBehavior, EventSourcedBehaviorBuilder,
-        EventSourcedEffect, InMemoryDurableStateStore, InMemoryEventJournal, InMemorySnapshotStore,
-        PersistFailureBackoff, PersistenceEvent, PersistenceId, PersistenceSignal, RecoveryOptions,
-        RetentionCriteria, Revision, SequenceNr, SnapshotMetadata, SnapshotRecord,
+        register_persistence_flush_task, register_persistence_query_cancel_task,
+        register_persistence_shutdown_task, spawn_durable_actor, spawn_durable_actor_factory,
+        spawn_durable_state_behavior, spawn_event_sourced_actor, spawn_event_sourced_actor_factory,
+        spawn_event_sourced_behavior, DurableActor, DurableActorContext, DurableActorFuture,
+        DurableEffect, DurableState, DurableStateBehavior, DurableStateBehaviorBuilder,
+        DurableStateSignal, DurableStateStore, EventJournal, EventMetadata, EventRecord,
+        EventSourcedActor, EventSourcedActorContext, EventSourcedActorFuture, EventSourcedBehavior,
+        EventSourcedBehaviorBuilder, EventSourcedEffect, InMemoryDurableStateStore,
+        InMemoryEventJournal, InMemorySnapshotStore, PersistFailureBackoff, PersistenceEvent,
+        PersistenceId, PersistenceShutdown, PersistenceShutdownFuture, PersistenceSignal,
+        RecoveryOptions, RetentionCriteria, Revision, SequenceNr, SnapshotMetadata, SnapshotRecord,
         SnapshotSelection, SnapshotStore, StashDirective, TaggedEvent,
     };
 
@@ -136,6 +138,13 @@ pub mod prelude {
         ActorSourceError, ActorSourceMessage, ActorStreamError, BoundedStream, Flow,
         RunnableStream, Sink, Source, StreamError, StreamResult, StreamRunError, StreamRunResult,
         StreamRunSettings, StreamSink, StreamSource,
+    };
+
+    #[cfg(feature = "process")]
+    pub use rakka_process::{
+        configured_process_actor_stop_timeout, register_configured_process_actor_stop_task,
+        register_managed_process_shutdown_task, register_process_actor_stop_task,
+        PROCESS_ACTOR_STOP_TASK_GRACE,
     };
 }
 

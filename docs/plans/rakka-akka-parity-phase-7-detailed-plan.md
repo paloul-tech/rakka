@@ -482,7 +482,7 @@ cargo clippy -p rakka-cluster -p rakka-sharding -p rakka-remote --all-targets --
 Goal: provide built-in registration helpers for resources that need explicit
 cleanup before actor-system stop.
 
-Status: planned.
+Status: completed.
 
 Scope:
 
@@ -518,6 +518,30 @@ cargo test -p rakka-persistence
 cargo test -p rakka-persistence-postgres
 cargo clippy -p rakka-process -p rakka-persistence -p rakka-persistence-postgres --all-targets -- -D warnings
 ```
+
+Completion note:
+
+- Added process coordinated-shutdown helpers for process actor stop commands,
+  config-derived stop task timeouts, and directly owned `ManagedProcess`
+  shutdown in the `stop-process-actors` phase.
+- Process actor hooks treat already-stopped actors and `NotRunning` replies as
+  successful idempotent shutdown while preserving real stop failures and task
+  timeouts in coordinated shutdown reports.
+- Added a persistence shutdown vocabulary with `PersistenceShutdown`,
+  `PersistenceShutdownFuture`, a generic flush/check task helper, and query
+  stream cancellation tasks that run in `drain-adapters` before
+  `flush-persistence`.
+- In-memory durable state, event journal, and snapshot store hooks report
+  explicit `noop-flush` semantics for test consistency.
+- PostgreSQL durable state, event journal, and snapshot store hooks report a
+  `postgres-readiness-check` operation without changing the existing
+  write-through commit semantics.
+- Re-exported the new process and persistence helpers through the top-level
+  `rakka` prelude.
+- Added tests covering process actor stop registration, idempotent not-running
+  stops, direct managed process shutdown after graceful timeout, in-memory
+  no-op persistence shutdown, query cancellation before flush, and a DSN-gated
+  PostgreSQL readiness shutdown task.
 
 ## Slice 7G: Kubernetes Pre-Stop Bridge And Operational Routes
 
