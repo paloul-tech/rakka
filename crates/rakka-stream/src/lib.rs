@@ -3,10 +3,10 @@
 
 //! Bounded stream primitives shared by Rakka integration adapters.
 //!
-//! Phase 5 starts with a small core vocabulary: typed stream errors, bounded
-//! source/sink handles, explicit back-pressure, graceful drain, forced close,
-//! and cancellation. HTTP, gRPC, process IO, actor, and entity adapters build
-//! on this crate instead of inventing separate lifecycle semantics.
+//! Rakka streams start with a small core vocabulary: typed stream errors,
+//! bounded source/sink handles, explicit back-pressure, graceful drain, forced
+//! close, and cancellation. Phase 6 adds Akka-shaped facade names such as
+//! `Source`, `Flow`, and `Sink` while keeping the bounded runtime explicit.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -21,8 +21,10 @@ use tokio::sync::Notify;
 
 #[cfg(feature = "adapters")]
 mod adapters;
+mod facade;
 #[cfg(feature = "process-io")]
 mod process_io;
+mod shutdown;
 
 #[cfg(feature = "adapters")]
 pub use adapters::{
@@ -30,6 +32,10 @@ pub use adapters::{
     ActorSinkResult, ActorSource, ActorSourceSpawnError, BroadcastError, BroadcastResult,
     EntitySink, EntitySinkError, EntitySinkResult, StreamPipeError, StreamPipeResult,
     StreamPipeSummary,
+};
+pub use facade::{
+    AckProtocol, ActorSinkMessage, ActorSourceError, ActorSourceMessage, ActorStreamError, Flow,
+    RunnableStream, Sink, Source, StreamRunError, StreamRunResult, StreamRunSettings,
 };
 #[cfg(feature = "process-io")]
 pub use process_io::{
@@ -39,6 +45,7 @@ pub use process_io::{
     ProcessIoOwner, ProcessIoStream, ProcessOutputConfig, ProcessOutputStream, ProcessStreamError,
     ProcessStreamPump, ProcessStreamResult, DEFAULT_PROCESS_IO_CHUNK_SIZE,
 };
+pub use shutdown::{register_stream_sink_drain, register_stream_source_drain};
 
 /// Crate name used in diagnostics.
 pub const CRATE_NAME: &str = "rakka-stream";
@@ -71,6 +78,11 @@ pub enum StreamError {
         /// Optional human-readable cancellation reason.
         reason: Option<String>,
     },
+    /// A facade operator failed while processing the stream.
+    Operator {
+        /// Human-readable operator failure message.
+        message: String,
+    },
 }
 
 impl StreamError {
@@ -89,6 +101,7 @@ impl StreamError {
             Self::Draining => "draining",
             Self::Closed => "closed",
             Self::Cancelled { .. } => "cancelled",
+            Self::Operator { .. } => "operator-error",
         }
     }
 
@@ -97,7 +110,10 @@ impl StreamError {
     pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::InvalidCapacity { .. } | Self::Closed | Self::Cancelled { .. }
+            Self::InvalidCapacity { .. }
+                | Self::Closed
+                | Self::Cancelled { .. }
+                | Self::Operator { .. }
         )
     }
 }
@@ -115,6 +131,7 @@ impl Display for StreamError {
                 Some(reason) => write!(f, "stream was cancelled: {reason}"),
                 None => f.write_str("stream was cancelled"),
             },
+            Self::Operator { message } => write!(f, "stream operator failed: {message}"),
         }
     }
 }

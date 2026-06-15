@@ -959,11 +959,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rakka"
+version = "0.1.0"
+dependencies = [
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-grpc",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-persistence",
+ "rakka-process",
+ "rakka-remote",
+ "rakka-sharding",
+ "rakka-stream",
+ "rakka-testkit",
+ "rakka-workflow",
+]
+
+[[package]]
 name = "rakka-cluster"
 version = "0.1.0"
 dependencies = [
  "rakka-core",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -975,6 +994,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rakka-example-clustered-receptionist"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
+name = "rakka-example-coordinated-shutdown"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
 ]
 
 [[package]]
@@ -1018,6 +1053,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-event-sourced-counter"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-external-binary-wrapper"
 version = "0.1.0"
 dependencies = [
@@ -1055,10 +1098,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-local-receptionist-router"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-minimal-system"
 version = "0.1.0"
 dependencies = [
- "rakka-core",
+ "rakka",
  "tokio",
  "tracing",
 ]
@@ -1072,6 +1123,39 @@ dependencies = [
  "rakka-core",
  "rakka-remote",
  "rakka-sharding",
+ "tokio",
+]
+
+[[package]]
+name = "rakka-example-pool-router"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "tokio",
+]
+
+[[package]]
+name = "rakka-example-sharded-cart-persistence"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "rakka-cluster",
+ "rakka-persistence",
+ "rakka-persistence-postgres",
+ "rakka-sharding",
+ "rakka-sharding-postgres",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
+name = "rakka-example-streams"
+version = "0.1.0"
+dependencies = [
+ "rakka",
+ "rakka-process",
+ "rakka-stream",
+ "rakka-testkit",
  "tokio",
 ]
 
@@ -1112,13 +1196,16 @@ dependencies = [
 name = "rakka-k8s"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "rakka-cluster",
  "rakka-core",
  "rakka-process",
  "rakka-sharding",
  "rakka-stream",
  "serde",
+ "serde_json",
  "tokio",
+ "tower 0.5.3",
 ]
 
 [[package]]
@@ -1126,6 +1213,7 @@ name = "rakka-persistence"
 version = "0.1.0"
 dependencies = [
  "rakka-core",
+ "rakka-stream",
  "serde",
  "tokio",
 ]
@@ -1160,6 +1248,7 @@ dependencies = [
  "rakka-cluster",
  "rakka-core",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -1174,6 +1263,18 @@ dependencies = [
  "rakka-remote",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "rakka-sharding-postgres"
+version = "0.1.0"
+dependencies = [
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-sharding",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -1202,6 +1303,8 @@ dependencies = [
  "rakka-grpc",
  "rakka-http",
  "rakka-k8s",
+ "rakka-persistence",
+ "rakka-process",
  "rakka-remote",
  "rakka-sharding",
  "rakka-stream",

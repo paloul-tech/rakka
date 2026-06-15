@@ -62,6 +62,11 @@ pub enum GrpcError {
     StreamClosed,
     /// Stream was cancelled.
     StreamCancelled,
+    /// Stream facade operator failed while processing an item.
+    StreamOperator {
+        /// Operator failure detail.
+        message: String,
+    },
     /// RPC was cancelled by the caller.
     Cancelled,
     /// Actor mailbox was full.
@@ -107,6 +112,13 @@ pub enum GrpcError {
         shard_id: String,
         /// Current handoff state.
         state: String,
+    },
+    /// Entity shard movement buffer is full.
+    EntityShardBufferFull {
+        /// Shard id whose buffer was full.
+        shard_id: String,
+        /// Configured capacity per shard.
+        capacity: usize,
     },
     /// Entity route rejected the request.
     EntityRejected {
@@ -185,6 +197,7 @@ impl GrpcError {
             Self::StreamDraining => "stream-draining",
             Self::StreamClosed => "stream-closed",
             Self::StreamCancelled => "stream-cancelled",
+            Self::StreamOperator { .. } => "stream-operator-error",
             Self::Cancelled => "cancelled",
             Self::ActorMailboxFull => "actor-mailbox-full",
             Self::ActorMailboxClosed => "actor-mailbox-closed",
@@ -198,6 +211,7 @@ impl GrpcError {
             Self::EntityRemoteEncode { .. } => "entity-remote-encode",
             Self::EntityRemoteSend { .. } => "entity-remote-send",
             Self::EntityShardHandoff { .. } => "entity-shard-handoff",
+            Self::EntityShardBufferFull { .. } => "entity-shard-buffer-full",
             Self::EntityRejected { .. } => "entity-rejected",
             Self::EntityTimeout => "entity-timeout",
             Self::EntityReplyDropped => "entity-reply-dropped",
@@ -217,6 +231,7 @@ impl GrpcError {
             Self::ActorMailboxFull | Self::EntityMailboxFull | Self::StreamFull { .. } => {
                 Code::ResourceExhausted
             }
+            Self::EntityShardBufferFull { .. } => Code::ResourceExhausted,
             Self::ActorMailboxClosed
             | Self::ActorReplyDropped
             | Self::StreamDraining
@@ -231,6 +246,7 @@ impl GrpcError {
             Self::Service { .. }
             | Self::StreamPump { .. }
             | Self::StreamInvalidCapacity { .. }
+            | Self::StreamOperator { .. }
             | Self::EntitySpawnFailed { .. }
             | Self::EntityRemoteEncode { .. } => Code::Internal,
         }
@@ -273,6 +289,10 @@ impl GrpcError {
                 shard_id: shard_id.to_string(),
                 state: state.to_string(),
             },
+            EntityAskError::ShardBufferFull { shard_id, capacity } => Self::EntityShardBufferFull {
+                shard_id: shard_id.to_string(),
+                capacity,
+            },
             EntityAskError::Rejected(message) => Self::EntityRejected { message },
             EntityAskError::Timeout => Self::EntityTimeout,
             EntityAskError::ReplyDropped => Self::EntityReplyDropped,
@@ -297,6 +317,7 @@ impl GrpcError {
             StreamError::Draining => Self::StreamDraining,
             StreamError::Closed => Self::StreamClosed,
             StreamError::Cancelled { .. } => Self::StreamCancelled,
+            StreamError::Operator { message } => Self::StreamOperator { message },
         }
     }
 
@@ -320,6 +341,12 @@ impl GrpcError {
                 shard_id: shard_id.to_string(),
                 state: state.to_string(),
             },
+            EntityDeliveryFailure::ShardBufferFull { shard_id, capacity } => {
+                Self::EntityShardBufferFull {
+                    shard_id: shard_id.to_string(),
+                    capacity,
+                }
+            }
             EntityDeliveryFailure::Rejected(message) => Self::EntityRejected { message },
         }
     }
@@ -350,6 +377,9 @@ impl Display for GrpcError {
             Self::StreamDraining => f.write_str("gRPC stream is draining"),
             Self::StreamClosed => f.write_str("gRPC stream is closed"),
             Self::StreamCancelled => f.write_str("gRPC stream was cancelled"),
+            Self::StreamOperator { message } => {
+                write!(f, "gRPC stream operator failed: {message}")
+            }
             Self::Cancelled => f.write_str("gRPC request was cancelled"),
             Self::ActorMailboxFull => f.write_str("actor mailbox was full"),
             Self::ActorMailboxClosed => f.write_str("actor mailbox was closed"),
@@ -372,6 +402,9 @@ impl Display for GrpcError {
             }
             Self::EntityShardHandoff { shard_id, state } => {
                 write!(f, "shard {shard_id} is {state} during graceful handoff")
+            }
+            Self::EntityShardBufferFull { shard_id, capacity } => {
+                write!(f, "shard {shard_id} buffer is full at capacity {capacity}")
             }
             Self::EntityRejected { message } => {
                 write!(f, "entity route rejected request: {message}")

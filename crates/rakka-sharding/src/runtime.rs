@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rakka_cluster::{
     ClusterError, ClusterMembership, DiscoveryProvider, DiscoverySnapshot, MembershipEvent,
@@ -12,9 +13,10 @@ use rakka_cluster::{
 use rakka_core::Message;
 
 use crate::{
-    EntityType, ShardCoordinator, ShardDecision, ShardHandoff, ShardHandoffState, ShardMoveReason,
-    ShardOwnershipSnapshot, ShardRebalancePlan, ShardRegion, ShardingConfig, ShardingError,
-    ShardingResult,
+    AsyncShardCoordinatorStore, EntityType, LeaseToken, PersistedShardCoordinatorState,
+    ShardAllocationStrategy, ShardCoordinator, ShardCoordinatorLease, ShardCoordinatorStore,
+    ShardDecision, ShardHandoff, ShardHandoffState, ShardMoveReason, ShardOwnershipSnapshot,
+    ShardRebalancePlan, ShardRegion, ShardingConfig, ShardingError, ShardingResult,
 };
 
 /// Convenient result alias for cluster/sharding runtime operations.
@@ -42,6 +44,18 @@ pub enum ClusterShardingError {
         /// Requested number of shards.
         actual_shards: u32,
     },
+    /// Entity type has not been initialized in this sharding facade.
+    EntityTypeNotRegistered {
+        /// Entity type.
+        entity_type: EntityType,
+    },
+    /// Entity type was initialized for a different message protocol.
+    EntityTypeMessageMismatch {
+        /// Entity type.
+        entity_type: EntityType,
+    },
+    /// The facade runtime is currently held by an async operation.
+    RuntimeBusy,
 }
 
 impl Display for ClusterShardingError {
@@ -56,6 +70,17 @@ impl Display for ClusterShardingError {
             } => write!(
                 f,
                 "entity type {entity_type} was registered with {actual_shards} shards; expected {expected_shards}"
+            ),
+            Self::EntityTypeNotRegistered { entity_type } => {
+                write!(f, "entity type {entity_type} has not been initialized")
+            }
+            Self::EntityTypeMessageMismatch { entity_type } => write!(
+                f,
+                "entity type {entity_type} was initialized for a different message protocol"
+            ),
+            Self::RuntimeBusy => write!(
+                f,
+                "cluster sharding runtime is busy; retry or use the async sharding API"
             ),
         }
     }
@@ -150,11 +175,147 @@ impl ClusterShardingUpdate {
     }
 }
 
+#[derive(Clone)]
+enum CoordinatorStoreMode {
+    None,
+    Sync(Arc<dyn ShardCoordinatorStore>),
+    Async(Arc<dyn AsyncShardCoordinatorStore>),
+}
+
+impl CoordinatorStoreMode {
+    fn backend_name(&self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Sync(store) => Some(ShardCoordinatorStore::backend_name(store.as_ref())),
+            Self::Async(store) => Some(AsyncShardCoordinatorStore::backend_name(store.as_ref())),
+        }
+    }
+
+    const fn is_async_only(&self) -> bool {
+        matches!(self, Self::Async(_))
+    }
+
+    fn load_sync(
+        &self,
+        entity_type: &EntityType,
+    ) -> ClusterShardingResult<Option<PersistedShardCoordinatorState>> {
+        match self {
+            Self::None => Ok(None),
+            Self::Sync(store) => Ok(ShardCoordinatorStore::load(store.as_ref(), entity_type)?),
+            Self::Async(store) => Err(async_store_requires_async_api(
+                AsyncShardCoordinatorStore::backend_name(store.as_ref()),
+            )),
+        }
+    }
+
+    async fn load_async(
+        &self,
+        entity_type: &EntityType,
+    ) -> ClusterShardingResult<Option<PersistedShardCoordinatorState>> {
+        match self {
+            Self::None => Ok(None),
+            Self::Sync(store) => Ok(ShardCoordinatorStore::load(store.as_ref(), entity_type)?),
+            Self::Async(store) => {
+                Ok(AsyncShardCoordinatorStore::load(store.as_ref(), entity_type).await?)
+            }
+        }
+    }
+
+    fn compare_and_set_sync(
+        &self,
+        entity_type: &EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+        lease_token: Option<&LeaseToken>,
+    ) -> ClusterShardingResult<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Sync(store) => {
+                ShardCoordinatorStore::compare_and_set_with_lease(
+                    store.as_ref(),
+                    entity_type,
+                    expected_revision,
+                    state,
+                    lease_token,
+                )?;
+                Ok(())
+            }
+            Self::Async(store) => Err(async_store_requires_async_api(
+                AsyncShardCoordinatorStore::backend_name(store.as_ref()),
+            )),
+        }
+    }
+
+    async fn compare_and_set_async(
+        &self,
+        entity_type: &EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+        lease_token: Option<&LeaseToken>,
+    ) -> ClusterShardingResult<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Sync(store) => {
+                ShardCoordinatorStore::compare_and_set_with_lease(
+                    store.as_ref(),
+                    entity_type,
+                    expected_revision,
+                    state,
+                    lease_token,
+                )?;
+                Ok(())
+            }
+            Self::Async(store) => {
+                AsyncShardCoordinatorStore::compare_and_set_with_lease(
+                    store.as_ref(),
+                    entity_type,
+                    expected_revision,
+                    state,
+                    lease_token,
+                )
+                .await?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CoordinatorLeaseMode {
+    None,
+    Async(Arc<dyn ShardCoordinatorLease>),
+}
+
+impl CoordinatorLeaseMode {
+    fn lease_name(&self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Async(lease) => Some(ShardCoordinatorLease::lease_name(lease.as_ref())),
+        }
+    }
+
+    const fn requires_async_api(&self) -> bool {
+        matches!(self, Self::Async(_))
+    }
+
+    fn ensure_sync_api(&self) -> ClusterShardingResult<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::Async(lease) => Err(async_lease_requires_async_api(
+                ShardCoordinatorLease::lease_name(lease.as_ref()),
+            )),
+        }
+    }
+}
+
 /// Deterministic runtime facade that connects membership and shard ownership refresh.
 pub struct ClusterShardingRuntime {
     membership: ClusterMembership,
     coordinators: BTreeMap<EntityType, ShardCoordinator>,
     regions: BTreeMap<EntityType, Vec<Arc<dyn RegisteredShardRegion>>>,
+    coordinator_store: CoordinatorStoreMode,
+    coordinator_lease: CoordinatorLeaseMode,
+    lease_tokens: BTreeMap<EntityType, LeaseToken>,
 }
 
 impl ClusterShardingRuntime {
@@ -165,7 +326,76 @@ impl ClusterShardingRuntime {
             membership,
             coordinators: BTreeMap::new(),
             regions: BTreeMap::new(),
+            coordinator_store: CoordinatorStoreMode::None,
+            coordinator_lease: CoordinatorLeaseMode::None,
+            lease_tokens: BTreeMap::new(),
         }
+    }
+
+    /// Creates a runtime facade with a durable shard coordinator store.
+    #[must_use]
+    pub fn with_coordinator_store(
+        membership: ClusterMembership,
+        coordinator_store: impl ShardCoordinatorStore,
+    ) -> Self {
+        Self::with_coordinator_store_ref(membership, Arc::new(coordinator_store))
+    }
+
+    /// Creates a runtime facade with a shared durable shard coordinator store.
+    #[must_use]
+    pub fn with_coordinator_store_ref(
+        membership: ClusterMembership,
+        coordinator_store: Arc<dyn ShardCoordinatorStore>,
+    ) -> Self {
+        Self {
+            membership,
+            coordinators: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            coordinator_store: CoordinatorStoreMode::Sync(coordinator_store),
+            coordinator_lease: CoordinatorLeaseMode::None,
+            lease_tokens: BTreeMap::new(),
+        }
+    }
+
+    /// Creates a runtime facade with an async durable shard coordinator store.
+    #[must_use]
+    pub fn with_async_coordinator_store(
+        membership: ClusterMembership,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+    ) -> Self {
+        Self::with_async_coordinator_store_ref(membership, Arc::new(coordinator_store))
+    }
+
+    /// Creates a runtime facade with a shared async durable shard coordinator store.
+    #[must_use]
+    pub fn with_async_coordinator_store_ref(
+        membership: ClusterMembership,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+    ) -> Self {
+        Self {
+            membership,
+            coordinators: BTreeMap::new(),
+            regions: BTreeMap::new(),
+            coordinator_store: CoordinatorStoreMode::Async(coordinator_store),
+            coordinator_lease: CoordinatorLeaseMode::None,
+            lease_tokens: BTreeMap::new(),
+        }
+    }
+
+    /// Adds an async coordinator leadership lease backend to this runtime.
+    #[must_use]
+    pub fn with_coordinator_lease(self, coordinator_lease: impl ShardCoordinatorLease) -> Self {
+        self.with_coordinator_lease_ref(Arc::new(coordinator_lease))
+    }
+
+    /// Adds a shared async coordinator leadership lease backend to this runtime.
+    #[must_use]
+    pub fn with_coordinator_lease_ref(
+        mut self,
+        coordinator_lease: Arc<dyn ShardCoordinatorLease>,
+    ) -> Self {
+        self.coordinator_lease = CoordinatorLeaseMode::Async(coordinator_lease);
+        self
     }
 
     /// Returns the current membership table.
@@ -180,6 +410,36 @@ impl ClusterShardingRuntime {
         self.coordinators.get(entity_type)
     }
 
+    /// Durable coordinator store backend name, when configured.
+    #[must_use]
+    pub fn coordinator_store_backend(&self) -> Option<&'static str> {
+        self.coordinator_store.backend_name()
+    }
+
+    /// Coordinator leadership lease backend name, when configured.
+    #[must_use]
+    pub fn coordinator_lease_backend(&self) -> Option<&'static str> {
+        self.coordinator_lease.lease_name()
+    }
+
+    /// Returns true when the configured coordinator store requires async runtime APIs.
+    #[must_use]
+    pub const fn coordinator_store_requires_async_api(&self) -> bool {
+        self.coordinator_store.is_async_only()
+    }
+
+    /// Returns true when the configured coordinator lease requires async runtime APIs.
+    #[must_use]
+    pub const fn coordinator_lease_requires_async_api(&self) -> bool {
+        self.coordinator_lease.requires_async_api()
+    }
+
+    /// Returns the current lease token for an entity type, if this node holds one.
+    #[must_use]
+    pub fn coordinator_lease_token(&self, entity_type: &EntityType) -> Option<&LeaseToken> {
+        self.lease_tokens.get(entity_type)
+    }
+
     /// Registers a shard region for ownership refresh.
     pub fn register_region<M>(&mut self, region: ShardRegion<M>) -> ClusterShardingResult<()>
     where
@@ -187,7 +447,36 @@ impl ClusterShardingRuntime {
     {
         let entity_type = region.entity_type().clone();
         let config = region.config().clone();
-        self.ensure_coordinator(entity_type.clone(), config)?;
+        let allocation_strategy = region.allocation_strategy();
+        self.ensure_coordinator(entity_type.clone(), config, allocation_strategy)?;
+        let snapshot = self
+            .coordinators
+            .get(&entity_type)
+            .expect("coordinator must exist after ensure_coordinator")
+            .snapshot();
+        region
+            .refresh_ownership(&snapshot)
+            .map_err(|error| ClusterShardingError::Sharding { error })?;
+        self.regions
+            .entry(entity_type)
+            .or_default()
+            .push(Arc::new(region));
+        Ok(())
+    }
+
+    /// Registers a shard region for ownership refresh using async durable storage when configured.
+    pub async fn register_region_async<M>(
+        &mut self,
+        region: ShardRegion<M>,
+    ) -> ClusterShardingResult<()>
+    where
+        M: Message,
+    {
+        let entity_type = region.entity_type().clone();
+        let config = region.config().clone();
+        let allocation_strategy = region.allocation_strategy();
+        self.ensure_coordinator_async(entity_type.clone(), config, allocation_strategy)
+            .await?;
         let snapshot = self
             .coordinators
             .get(&entity_type)
@@ -208,10 +497,22 @@ impl ClusterShardingRuntime {
         &mut self,
         snapshot: DiscoverySnapshot,
     ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        self.coordinator_lease.ensure_sync_api()?;
         let observed_at_millis = snapshot.observed_at_millis();
         let mut events = self.membership.record_discovery(snapshot)?;
         events.extend(self.promote_joining_members(observed_at_millis)?);
         self.reconcile_and_publish(events)
+    }
+
+    /// Applies a discovery snapshot and refreshes regions through async durable storage.
+    pub async fn apply_discovery_async(
+        &mut self,
+        snapshot: DiscoverySnapshot,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        let observed_at_millis = snapshot.observed_at_millis();
+        let mut events = self.membership.record_discovery(snapshot)?;
+        events.extend(self.promote_joining_members(observed_at_millis)?);
+        self.reconcile_and_publish_async(events).await
     }
 
     /// Polls a discovery provider and applies the returned snapshot.
@@ -224,8 +525,33 @@ impl ClusterShardingRuntime {
         self.apply_discovery(snapshot)
     }
 
+    /// Polls a discovery provider and applies the returned snapshot through async storage.
+    pub async fn poll_discovery_async(
+        &mut self,
+        provider: &impl DiscoveryProvider,
+        observed_at_millis: u64,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        let snapshot = provider.discover(observed_at_millis)?;
+        self.apply_discovery_async(snapshot).await
+    }
+
     /// Records a heartbeat and refreshes ownership if membership changed.
     pub fn heartbeat(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        self.coordinator_lease.ensure_sync_api()?;
+        let events = self
+            .membership
+            .heartbeat(node_id, observed_at_millis)?
+            .into_iter()
+            .collect();
+        self.reconcile_and_publish(events)
+    }
+
+    /// Records a heartbeat and refreshes ownership through async durable storage.
+    pub async fn heartbeat_async(
         &mut self,
         node_id: &NodeId,
         observed_at_millis: u64,
@@ -235,11 +561,26 @@ impl ClusterShardingRuntime {
             .heartbeat(node_id, observed_at_millis)?
             .into_iter()
             .collect();
-        self.reconcile_and_publish(events)
+        self.reconcile_and_publish_async(events).await
     }
 
     /// Begins graceful leave and refreshes ownership.
     pub fn mark_leaving(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        self.coordinator_lease.ensure_sync_api()?;
+        let events = self
+            .membership
+            .mark_leaving(node_id, observed_at_millis)?
+            .into_iter()
+            .collect();
+        self.reconcile_and_publish(events)
+    }
+
+    /// Begins graceful leave and refreshes ownership through async durable storage.
+    pub async fn mark_leaving_async(
         &mut self,
         node_id: &NodeId,
         observed_at_millis: u64,
@@ -249,11 +590,26 @@ impl ClusterShardingRuntime {
             .mark_leaving(node_id, observed_at_millis)?
             .into_iter()
             .collect();
-        self.reconcile_and_publish(events)
+        self.reconcile_and_publish_async(events).await
     }
 
     /// Marks a member down and refreshes ownership.
     pub fn mark_down(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        self.coordinator_lease.ensure_sync_api()?;
+        let events = self
+            .membership
+            .mark_down(node_id, observed_at_millis)?
+            .into_iter()
+            .collect();
+        self.reconcile_and_publish(events)
+    }
+
+    /// Marks a member down and refreshes ownership through async durable storage.
+    pub async fn mark_down_async(
         &mut self,
         node_id: &NodeId,
         observed_at_millis: u64,
@@ -263,19 +619,105 @@ impl ClusterShardingRuntime {
             .mark_down(node_id, observed_at_millis)?
             .into_iter()
             .collect();
-        self.reconcile_and_publish(events)
+        self.reconcile_and_publish_async(events).await
     }
 
     /// Advances failure detection and refreshes ownership after unreachable/down events.
     pub fn tick(&mut self, now_millis: u64) -> ClusterShardingResult<ClusterShardingUpdate> {
+        self.coordinator_lease.ensure_sync_api()?;
         let events = self.membership.tick(now_millis);
         self.reconcile_and_publish(events)
+    }
+
+    /// Advances failure detection and refreshes ownership through async durable storage.
+    pub async fn tick_async(
+        &mut self,
+        now_millis: u64,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        let events = self.membership.tick(now_millis);
+        self.reconcile_and_publish_async(events).await
+    }
+
+    /// Renews all currently held coordinator leadership leases.
+    pub async fn renew_coordinator_leases_async(&mut self) -> ClusterShardingResult<()> {
+        let CoordinatorLeaseMode::Async(lease) = self.coordinator_lease.clone() else {
+            return Ok(());
+        };
+        let tokens = self.lease_tokens.values().cloned().collect::<Vec<_>>();
+        for token in tokens {
+            if let Err(error) = ShardCoordinatorLease::renew(lease.as_ref(), &token).await {
+                self.lease_tokens.remove(token.entity_type());
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases all currently held coordinator leadership leases.
+    pub async fn release_coordinator_leases_async(&mut self) -> ClusterShardingResult<()> {
+        let CoordinatorLeaseMode::Async(lease) = self.coordinator_lease.clone() else {
+            self.lease_tokens.clear();
+            return Ok(());
+        };
+        let tokens = std::mem::take(&mut self.lease_tokens);
+        for token in tokens.into_values() {
+            ShardCoordinatorLease::release(lease.as_ref(), token).await?;
+        }
+        Ok(())
     }
 
     fn ensure_coordinator(
         &mut self,
         entity_type: EntityType,
         config: ShardingConfig,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> ClusterShardingResult<()> {
+        self.coordinator_lease.ensure_sync_api()?;
+        if let Some(coordinator) = self.coordinators.get(&entity_type) {
+            if coordinator.config().number_of_shards() != config.number_of_shards() {
+                return Err(ClusterShardingError::EntityTypeConfigMismatch {
+                    entity_type,
+                    expected_shards: coordinator.config().number_of_shards(),
+                    actual_shards: config.number_of_shards(),
+                });
+            }
+            return Ok(());
+        }
+
+        let lease_token = self.ensure_coordinator_leadership_sync(&entity_type)?;
+        let mut coordinator = match self.coordinator_store.load_sync(&entity_type)? {
+            Some(state) => ShardCoordinator::from_snapshot_with_allocation_strategy_ref(
+                entity_type.clone(),
+                config,
+                state.snapshot(),
+                allocation_strategy,
+            )?,
+            None => ShardCoordinator::with_allocation_strategy_ref(
+                entity_type.clone(),
+                config,
+                allocation_strategy,
+            ),
+        };
+
+        let plan = coordinator.reconcile(&self.membership);
+        if !plan.is_empty() {
+            let snapshot = coordinator.snapshot();
+            self.persist_coordinator_snapshot(
+                &snapshot,
+                coordinator.allocation_strategy_name(),
+                plan.previous_revision(),
+                lease_token.as_ref(),
+            )?;
+        }
+        self.coordinators.insert(entity_type, coordinator);
+        Ok(())
+    }
+
+    async fn ensure_coordinator_async(
+        &mut self,
+        entity_type: EntityType,
+        config: ShardingConfig,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
     ) -> ClusterShardingResult<()> {
         if let Some(coordinator) = self.coordinators.get(&entity_type) {
             if coordinator.config().number_of_shards() != config.number_of_shards() {
@@ -288,8 +730,35 @@ impl ClusterShardingRuntime {
             return Ok(());
         }
 
-        let mut coordinator = ShardCoordinator::new(entity_type.clone(), config);
-        coordinator.reconcile(&self.membership);
+        let lease_token = self
+            .ensure_coordinator_leadership_async(&entity_type)
+            .await?;
+        let store = self.coordinator_store.clone();
+        let mut coordinator = match store.load_async(&entity_type).await? {
+            Some(state) => ShardCoordinator::from_snapshot_with_allocation_strategy_ref(
+                entity_type.clone(),
+                config,
+                state.snapshot(),
+                allocation_strategy,
+            )?,
+            None => ShardCoordinator::with_allocation_strategy_ref(
+                entity_type.clone(),
+                config,
+                allocation_strategy,
+            ),
+        };
+
+        let plan = coordinator.reconcile(&self.membership);
+        if !plan.is_empty() {
+            let snapshot = coordinator.snapshot();
+            self.persist_coordinator_snapshot_async(
+                &snapshot,
+                coordinator.allocation_strategy_name(),
+                plan.previous_revision(),
+                lease_token.as_ref(),
+            )
+            .await?;
+        }
         self.coordinators.insert(entity_type, coordinator);
         Ok(())
     }
@@ -326,23 +795,30 @@ impl ClusterShardingRuntime {
         let entity_types = self.coordinators.keys().cloned().collect::<Vec<_>>();
 
         for entity_type in entity_types {
-            let plan = {
+            let lease_token = self.ensure_coordinator_leadership_sync(&entity_type)?;
+            let (plan, snapshot, allocation_strategy_name) = {
                 let coordinator = self
                     .coordinators
                     .get_mut(&entity_type)
                     .expect("coordinator key was collected from map");
-                coordinator.reconcile(&self.membership)
+                let plan = coordinator.reconcile(&self.membership);
+                (
+                    plan,
+                    coordinator.snapshot(),
+                    coordinator.allocation_strategy_name(),
+                )
             };
             if plan.is_empty() {
                 continue;
             }
 
+            self.persist_coordinator_snapshot(
+                &snapshot,
+                allocation_strategy_name,
+                plan.previous_revision(),
+                lease_token.as_ref(),
+            )?;
             handoffs.extend(self.apply_graceful_handoffs(&plan)?);
-            let snapshot = self
-                .coordinators
-                .get(&entity_type)
-                .expect("coordinator key was collected from map")
-                .snapshot();
             self.publish_snapshot(&snapshot)?;
             rebalances.push(EntityShardRebalance::new(entity_type, plan));
         }
@@ -352,6 +828,122 @@ impl ClusterShardingRuntime {
             handoffs,
             rebalances,
         ))
+    }
+
+    async fn reconcile_and_publish_async(
+        &mut self,
+        membership_events: Vec<MembershipEvent>,
+    ) -> ClusterShardingResult<ClusterShardingUpdate> {
+        let mut handoffs = Vec::new();
+        let mut rebalances = Vec::new();
+        let entity_types = self.coordinators.keys().cloned().collect::<Vec<_>>();
+
+        for entity_type in entity_types {
+            let lease_token = self
+                .ensure_coordinator_leadership_async(&entity_type)
+                .await?;
+            let (plan, snapshot, allocation_strategy_name) = {
+                let coordinator = self
+                    .coordinators
+                    .get_mut(&entity_type)
+                    .expect("coordinator key was collected from map");
+                let plan = coordinator.reconcile(&self.membership);
+                (
+                    plan,
+                    coordinator.snapshot(),
+                    coordinator.allocation_strategy_name(),
+                )
+            };
+            if plan.is_empty() {
+                continue;
+            }
+
+            self.persist_coordinator_snapshot_async(
+                &snapshot,
+                allocation_strategy_name,
+                plan.previous_revision(),
+                lease_token.as_ref(),
+            )
+            .await?;
+            handoffs.extend(self.apply_graceful_handoffs(&plan)?);
+            self.publish_snapshot(&snapshot)?;
+            rebalances.push(EntityShardRebalance::new(entity_type, plan));
+        }
+
+        Ok(ClusterShardingUpdate::new(
+            membership_events,
+            handoffs,
+            rebalances,
+        ))
+    }
+
+    fn persist_coordinator_snapshot(
+        &self,
+        snapshot: &ShardOwnershipSnapshot,
+        allocation_strategy: &str,
+        expected_revision: u64,
+        lease_token: Option<&LeaseToken>,
+    ) -> ClusterShardingResult<()> {
+        self.coordinator_store.compare_and_set_sync(
+            snapshot.entity_type(),
+            expected_revision,
+            PersistedShardCoordinatorState::now(snapshot.clone(), allocation_strategy),
+            lease_token,
+        )
+    }
+
+    async fn persist_coordinator_snapshot_async(
+        &self,
+        snapshot: &ShardOwnershipSnapshot,
+        allocation_strategy: &str,
+        expected_revision: u64,
+        lease_token: Option<&LeaseToken>,
+    ) -> ClusterShardingResult<()> {
+        let store = self.coordinator_store.clone();
+        store
+            .compare_and_set_async(
+                snapshot.entity_type(),
+                expected_revision,
+                PersistedShardCoordinatorState::now(snapshot.clone(), allocation_strategy),
+                lease_token,
+            )
+            .await
+    }
+
+    fn ensure_coordinator_leadership_sync(
+        &self,
+        _entity_type: &EntityType,
+    ) -> ClusterShardingResult<Option<LeaseToken>> {
+        self.coordinator_lease.ensure_sync_api()?;
+        Ok(None)
+    }
+
+    async fn ensure_coordinator_leadership_async(
+        &mut self,
+        entity_type: &EntityType,
+    ) -> ClusterShardingResult<Option<LeaseToken>> {
+        let CoordinatorLeaseMode::Async(lease) = self.coordinator_lease.clone() else {
+            return Ok(None);
+        };
+        let holder = self.membership.local_node_id().clone();
+        let existing = self.lease_tokens.get(entity_type).cloned();
+        let token = match existing {
+            Some(token)
+                if token.holder_node() == &holder
+                    && !token.is_expired_at(current_timestamp_millis()) =>
+            {
+                match ShardCoordinatorLease::renew(lease.as_ref(), &token).await {
+                    Ok(()) => token,
+                    Err(error) => {
+                        self.lease_tokens.remove(entity_type);
+                        return Err(error.into());
+                    }
+                }
+            }
+            _ => ShardCoordinatorLease::acquire(lease.as_ref(), entity_type, &holder).await?,
+        };
+        self.lease_tokens.insert(entity_type.clone(), token);
+        Ok(self.lease_tokens.get(entity_type).cloned())
     }
 
     fn publish_snapshot(&self, snapshot: &ShardOwnershipSnapshot) -> ClusterShardingResult<()> {
@@ -472,12 +1064,37 @@ impl ClusterShardingRuntime {
     }
 }
 
+fn async_store_requires_async_api(backend: &str) -> ClusterShardingError {
+    ShardingError::AsyncCoordinatorStoreRequiresAsyncApi {
+        backend: backend.to_string(),
+    }
+    .into()
+}
+
+fn async_lease_requires_async_api(lease: &str) -> ClusterShardingError {
+    ShardingError::AsyncCoordinatorLeaseRequiresAsyncApi {
+        lease: lease.to_string(),
+    }
+    .into()
+}
+
+fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 impl std::fmt::Debug for ClusterShardingRuntime {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClusterShardingRuntime")
             .field("membership_revision", &self.membership.revision())
             .field("coordinator_count", &self.coordinators.len())
             .field("region_group_count", &self.regions.len())
+            .field("coordinator_store", &self.coordinator_store_backend())
+            .field("coordinator_lease", &self.coordinator_lease_backend())
+            .field("held_lease_count", &self.lease_tokens.len())
             .finish_non_exhaustive()
     }
 }

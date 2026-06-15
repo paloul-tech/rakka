@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
+license-file.workspace = true
 
 [lib]
 name = "rakka_cluster"
@@ -15,6 +16,7 @@ name = "rakka_cluster"
 [dependencies]
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
 serde.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

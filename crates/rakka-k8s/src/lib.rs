@@ -13,6 +13,8 @@ use std::time::Duration;
 
 mod drain;
 mod health;
+mod routes;
+mod signal;
 
 pub use drain::{
     KubernetesDrainController, KubernetesDrainFuture, KubernetesDrainOutcome,
@@ -22,6 +24,10 @@ pub use drain::{
 pub use health::{
     liveness_probe_hook, readiness_probe_hook, KubernetesHealthSnapshot, KubernetesNodeHealth,
     KubernetesProbeHook, KubernetesProbeKind, KubernetesProbeSnapshot,
+};
+pub use routes::kubernetes_drain_route;
+pub use signal::{
+    run_coordinated_shutdown_on_os_signal, run_kubernetes_prestop_shutdown_on_os_signal,
 };
 
 /// Crate name used in diagnostics.

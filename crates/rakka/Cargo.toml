@@ -1,0 +1,56 @@
+[package]
+name = "rakka"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "rakka"
+
+[features]
+default = [
+    "cluster",
+    "grpc",
+    "http",
+    "k8s",
+    "persistence",
+    "process",
+    "remote",
+    "sharding",
+    "stream",
+    "workflow",
+]
+cluster = ["dep:rakka-cluster"]
+grpc = ["dep:rakka-grpc"]
+http = ["dep:rakka-http"]
+k8s = ["dep:rakka-k8s"]
+persistence = ["dep:rakka-persistence"]
+process = ["dep:rakka-process"]
+remote = ["dep:rakka-remote"]
+sharding = ["dep:rakka-sharding"]
+stream = ["dep:rakka-stream"]
+testkit = ["dep:rakka-testkit"]
+workflow = ["dep:rakka-workflow"]
+
+[dependencies]
+rakka-core = { path = "../rakka-core", version = "0.1.0" }
+rakka-cluster = { path = "../rakka-cluster", version = "0.1.0", optional = true }
+rakka-grpc = { path = "../rakka-grpc", version = "0.1.0", optional = true }
+rakka-http = { path = "../rakka-http", version = "0.1.0", optional = true }
+rakka-k8s = { path = "../rakka-k8s", version = "0.1.0", optional = true }
+rakka-persistence = { path = "../rakka-persistence", version = "0.1.0", optional = true }
+rakka-process = { path = "../rakka-process", version = "0.1.0", optional = true }
+rakka-remote = { path = "../rakka-remote", version = "0.1.0", optional = true }
+rakka-sharding = { path = "../rakka-sharding", version = "0.1.0", optional = true }
+rakka-stream = { path = "../rakka-stream", version = "0.1.0", optional = true }
+rakka-testkit = { path = "../rakka-testkit", version = "0.1.0", optional = true }
+rakka-workflow = { path = "../rakka-workflow", version = "0.1.0", optional = true }
+
+[lints]
+workspace = true

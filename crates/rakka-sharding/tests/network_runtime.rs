@@ -3,7 +3,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use rakka_cluster::{ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId};
+use rakka_cluster::{
+    ClusterNode, ClusterRuntime, ClusterSettings, DiscoverySnapshot, MembershipConfig,
+    MembershipState, NodeAddress, NodeId, StaticDiscovery,
+};
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
 };
@@ -12,8 +15,9 @@ use rakka_remote::{
     TcpRemoteTransportError,
 };
 use rakka_sharding::{
-    ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeError, EntityId, EntityRef,
-    EntityType, LocalEntityContext, LocalEntityRoute, RoutedEntityMessage, ShardHandoffState,
+    ClusterNodeRuntime, ClusterNodeRuntimeBuilder, ClusterNodeRuntimeError, ClusterSharding,
+    Entity, EntityContext, EntityDeliveryFailure, EntityId, EntityRef, EntityTellError, EntityType,
+    EntityTypeKey, LocalEntityContext, LocalEntityRoute, RoutedEntityMessage, ShardHandoffState,
     ShardMoveReason, ShardRegion, ShardingConfig,
 };
 
@@ -47,8 +51,17 @@ struct NotifyingCartEntity {
     delivered: tokio::sync::mpsc::UnboundedSender<(String, String)>,
 }
 
+struct FacadeNotifyingCartEntity {
+    context: EntityContext<CartCommand>,
+    delivered: tokio::sync::mpsc::UnboundedSender<(String, String)>,
+}
+
 struct AskCartEntity {
     context: LocalEntityContext,
+}
+
+struct FacadeAskCartEntity {
+    context: EntityContext<CartAskCommand>,
 }
 
 impl Actor for NotifyingCartEntity {
@@ -68,7 +81,46 @@ impl Actor for NotifyingCartEntity {
     }
 }
 
+impl Actor for FacadeNotifyingCartEntity {
+    type Msg = CartCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entity_id = self.context.entity_id().as_str().to_string();
+        let delivered = self.delivered.clone();
+        actor_future(async move {
+            let _ = delivered.send((entity_id, msg.action));
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
 impl Actor for AskCartEntity {
+    type Msg = CartAskCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entity_id = self.context.entity_id().as_str().to_string();
+        actor_future(async move {
+            match msg {
+                CartAskCommand::Get { prefix, reply_to } => {
+                    let _ = reply_to.reply(CartReply {
+                        summary: format!("{entity_id}:{prefix}"),
+                    });
+                }
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+impl Actor for FacadeAskCartEntity {
     type Msg = CartAskCommand;
 
     fn handle<'a>(
@@ -214,6 +266,312 @@ async fn networked_runtime_routes_remote_ask_reply_over_tcp() {
     assert_eq!(node_a.requests().pending_count(), 0);
     wait_for(|| node_a.transport_snapshot().inbound_envelopes() >= 1).await;
 
+    system_b.shutdown();
+}
+
+#[tokio::test]
+async fn networked_facade_routes_remote_tell_over_tcp() {
+    let registry = cart_registry();
+    let Some((mut node_a, mut node_b)) = build_runtime_pair(registry).await else {
+        return;
+    };
+    let entity_type = EntityType::new("FacadeCart");
+    let key = EntityTypeKey::<CartCommand>::new(entity_type.as_str())
+        .with_number_of_shards(8)
+        .expect("valid sharding config");
+    let system_a = ActorSystem::new("networked-facade-tell-node-a");
+    let system_b = ActorSystem::new("networked-facade-tell-node-b");
+    let sharding_a =
+        ClusterSharding::for_node_runtime(&system_a, &node_a).expect("facade should initialize");
+    let sharding_b =
+        ClusterSharding::for_node_runtime(&system_b, &node_b).expect("facade should initialize");
+    let (delivered_a, _received_a) = tokio::sync::mpsc::unbounded_channel();
+    let (delivered_b, mut received_b) = tokio::sync::mpsc::unbounded_channel();
+    let registration_a = sharding_a
+        .init_remote(
+            &mut node_a,
+            Entity::of(key.clone(), move |context: EntityContext<CartCommand>| {
+                FacadeNotifyingCartEntity {
+                    context,
+                    delivered: delivered_a.clone(),
+                }
+            }),
+        )
+        .expect("node a facade region should register");
+    let registration_b = sharding_b
+        .init_remote(
+            &mut node_b,
+            Entity::of(key.clone(), move |context: EntityContext<CartCommand>| {
+                FacadeNotifyingCartEntity {
+                    context,
+                    delivered: delivered_b.clone(),
+                }
+            }),
+        )
+        .expect("node b facade region should register");
+
+    apply_pair_discovery(&mut node_a, &mut node_b);
+    let entity_id = entity_owned_by(&node_a, &entity_type, node_b.local_node().id().logical_id());
+    let entity = sharding_a
+        .entity_ref_for(&key, entity_id.as_str())
+        .expect("facade entity ref should resolve");
+
+    entity
+        .tell(CartCommand {
+            action: "add-apple".to_string(),
+        })
+        .expect("facade remote tell should enqueue");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(1), received_b.recv())
+        .await
+        .expect("facade remote tell should arrive")
+        .expect("delivery channel should remain open");
+    assert_eq!(
+        delivered,
+        (entity_id.as_str().to_string(), "add-apple".to_string())
+    );
+    assert_eq!(
+        sharding_a
+            .registration_state(registration_a.key())
+            .expect("node a state")
+            .local_entity_count(),
+        0
+    );
+    assert_eq!(
+        sharding_b
+            .registration_state(registration_b.key())
+            .expect("node b state")
+            .local_entity_count(),
+        1
+    );
+    wait_for(|| node_b.transport_snapshot().inbound_envelopes() >= 1).await;
+
+    system_a.shutdown();
+    system_b.shutdown();
+}
+
+#[tokio::test]
+async fn networked_facade_routes_remote_ask_reply_over_tcp() {
+    let registry = cart_registry();
+    let Some((mut node_a, mut node_b)) = build_runtime_pair(registry).await else {
+        return;
+    };
+    let entity_type = EntityType::new("FacadeCartAsk");
+    let key = EntityTypeKey::<CartAskCommand>::new(entity_type.as_str())
+        .with_number_of_shards(8)
+        .expect("valid sharding config");
+    let system_a = ActorSystem::new("networked-facade-ask-node-a");
+    let system_b = ActorSystem::new("networked-facade-ask-node-b");
+    let sharding_a =
+        ClusterSharding::for_node_runtime(&system_a, &node_a).expect("facade should initialize");
+    let sharding_b =
+        ClusterSharding::for_node_runtime(&system_b, &node_b).expect("facade should initialize");
+
+    sharding_a
+        .init_remote_with_ask(
+            &mut node_a,
+            Entity::of(key.clone(), |context: EntityContext<CartAskCommand>| {
+                FacadeAskCartEntity { context }
+            }),
+            |request: CartGet, reply_to| CartAskCommand::Get {
+                prefix: request.prefix,
+                reply_to,
+            },
+        )
+        .expect("node a facade ask region should register");
+    sharding_b
+        .init_remote_with_ask(
+            &mut node_b,
+            Entity::of(key.clone(), |context: EntityContext<CartAskCommand>| {
+                FacadeAskCartEntity { context }
+            }),
+            |request: CartGet, reply_to| CartAskCommand::Get {
+                prefix: request.prefix,
+                reply_to,
+            },
+        )
+        .expect("node b facade ask region should register");
+    apply_pair_discovery(&mut node_a, &mut node_b);
+
+    let entity_id = entity_owned_by(&node_a, &entity_type, node_b.local_node().id().logical_id());
+    let entity = sharding_a
+        .entity_ref_for(&key, entity_id.as_str())
+        .expect("facade ask entity ref should resolve");
+    let reply: CartReply = entity
+        .remote_ask(
+            &node_a.ask_client(),
+            CartGet {
+                prefix: "total".to_string(),
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("facade remote ask should receive reply");
+
+    assert_eq!(reply.summary, format!("{}:total", entity_id.as_str()));
+    assert_eq!(node_a.requests().pending_count(), 0);
+    wait_for(|| node_a.transport_snapshot().inbound_envelopes() >= 1).await;
+
+    system_a.shutdown();
+    system_b.shutdown();
+}
+
+#[tokio::test]
+async fn networked_facade_reports_missing_serializer_without_losing_message() {
+    let Some((mut node_a, mut node_b)) = build_runtime_pair(SerializationRegistry::new()).await
+    else {
+        return;
+    };
+    let entity_type = EntityType::new("FacadeCartMissingCodec");
+    let key = EntityTypeKey::<CartCommand>::new(entity_type.as_str())
+        .with_number_of_shards(8)
+        .expect("valid sharding config");
+    let system_a = ActorSystem::new("networked-facade-missing-codec-node-a");
+    let system_b = ActorSystem::new("networked-facade-missing-codec-node-b");
+    let sharding_a =
+        ClusterSharding::for_node_runtime(&system_a, &node_a).expect("facade should initialize");
+    let sharding_b =
+        ClusterSharding::for_node_runtime(&system_b, &node_b).expect("facade should initialize");
+    let (delivered_a, _received_a) = tokio::sync::mpsc::unbounded_channel();
+    let (delivered_b, _received_b) = tokio::sync::mpsc::unbounded_channel();
+
+    sharding_a
+        .init_remote(
+            &mut node_a,
+            Entity::of(key.clone(), move |context: EntityContext<CartCommand>| {
+                FacadeNotifyingCartEntity {
+                    context,
+                    delivered: delivered_a.clone(),
+                }
+            }),
+        )
+        .expect("node a facade region should register");
+    sharding_b
+        .init_remote(
+            &mut node_b,
+            Entity::of(key.clone(), move |context: EntityContext<CartCommand>| {
+                FacadeNotifyingCartEntity {
+                    context,
+                    delivered: delivered_b.clone(),
+                }
+            }),
+        )
+        .expect("node b facade region should register");
+    apply_pair_discovery(&mut node_a, &mut node_b);
+
+    let entity_id = entity_owned_by(&node_a, &entity_type, node_b.local_node().id().logical_id());
+    let entity = sharding_a
+        .entity_ref_for(&key, entity_id.as_str())
+        .expect("facade entity ref should resolve");
+    let error = entity
+        .tell(CartCommand {
+            action: "add-apple".to_string(),
+        })
+        .expect_err("missing codec should fail before remote send");
+
+    match error {
+        EntityTellError::Delivery {
+            message,
+            failure: EntityDeliveryFailure::RemoteEncode(_),
+        } => assert_eq!(message.action, "add-apple"),
+        _other => panic!("unexpected tell error"),
+    }
+
+    system_a.shutdown();
+    system_b.shutdown();
+}
+
+#[tokio::test]
+async fn networked_facade_refreshes_ownership_after_leaving_handoff() {
+    let registry = cart_registry();
+    let Some((mut node_a, mut node_b)) = build_runtime_pair(registry).await else {
+        return;
+    };
+    let node_b_id = node_b.local_node().id().clone();
+    let entity_type = EntityType::new("FacadeCartLeave");
+    let key = EntityTypeKey::<CartCommand>::new(entity_type.as_str())
+        .with_number_of_shards(8)
+        .expect("valid sharding config");
+    let system_a = ActorSystem::new("networked-facade-leave-node-a");
+    let system_b = ActorSystem::new("networked-facade-leave-node-b");
+    let sharding_a =
+        ClusterSharding::for_node_runtime(&system_a, &node_a).expect("facade should initialize");
+    let sharding_b =
+        ClusterSharding::for_node_runtime(&system_b, &node_b).expect("facade should initialize");
+    let (delivered_a, mut received_a) = tokio::sync::mpsc::unbounded_channel();
+    let (delivered_b, mut received_b) = tokio::sync::mpsc::unbounded_channel();
+    let registration_a = sharding_a
+        .init_remote(
+            &mut node_a,
+            Entity::of(key.clone(), move |context: EntityContext<CartCommand>| {
+                FacadeNotifyingCartEntity {
+                    context,
+                    delivered: delivered_a.clone(),
+                }
+            }),
+        )
+        .expect("node a facade region should register");
+    let registration_b = sharding_b
+        .init_remote(
+            &mut node_b,
+            Entity::of(key.clone(), move |context: EntityContext<CartCommand>| {
+                FacadeNotifyingCartEntity {
+                    context,
+                    delivered: delivered_b.clone(),
+                }
+            }),
+        )
+        .expect("node b facade region should register");
+    apply_pair_discovery(&mut node_a, &mut node_b);
+
+    let entity_id = entity_owned_by(&node_a, &entity_type, node_b_id.logical_id());
+    let entity = sharding_a
+        .entity_ref_for(&key, entity_id.as_str())
+        .expect("facade entity ref should resolve");
+    let shard_id = entity
+        .entity_ref()
+        .shard_id(registration_a.region().config());
+    entity
+        .tell(CartCommand {
+            action: "before-leave".to_string(),
+        })
+        .expect("initial facade remote tell should enqueue");
+    let _delivered_b = tokio::time::timeout(Duration::from_secs(1), received_b.recv())
+        .await
+        .expect("initial remote tell should arrive");
+
+    let update_b = node_b
+        .mark_leaving(&node_b_id, 3)
+        .expect("node b should begin graceful leave");
+    let _update_a = node_a
+        .mark_leaving(&node_b_id, 3)
+        .expect("node a should observe node b leaving");
+    assert!(update_b.sharding().handoffs().iter().any(|handoff| {
+        handoff.shard().entity_type() == &entity_type
+            && handoff.state() == ShardHandoffState::Transferring
+            && handoff.reason() == ShardMoveReason::GracefulLeave
+            && handoff.stopped_entities() == 1
+    }));
+    assert_eq!(
+        registration_b.region().shard_handoff_state(shard_id),
+        Some(ShardHandoffState::Transferring)
+    );
+
+    entity
+        .tell(CartCommand {
+            action: "after-leave".to_string(),
+        })
+        .expect("post-handoff facade tell should route locally");
+    let delivered_a = tokio::time::timeout(Duration::from_secs(1), received_a.recv())
+        .await
+        .expect("post-handoff local tell should arrive")
+        .expect("delivery channel should remain open");
+    assert_eq!(
+        delivered_a,
+        (entity_id.as_str().to_string(), "after-leave".to_string())
+    );
+
+    system_a.shutdown();
     system_b.shutdown();
 }
 
@@ -386,6 +744,79 @@ async fn networked_runtime_records_unreachable_remote_delivery_failure() {
     .await;
 
     system_a.shutdown();
+}
+
+#[tokio::test]
+async fn networked_runtime_can_mirror_cluster_facade_state() {
+    let registry = cart_registry();
+    let Some(mut runtime) = build_runtime("rakka-0", "uid-a", registry).await else {
+        return;
+    };
+    let Some(remote_port) = unused_port() else {
+        return;
+    };
+    let remote = node("rakka-1", "uid-b", remote_port);
+    let cluster_runtime = ClusterRuntime::from_settings(
+        ClusterSettings::new(runtime.local_node().clone()).with_min_contact_points(2),
+    );
+    let discovery = StaticDiscovery::new([runtime.local_node().clone(), remote.clone()]);
+    cluster_runtime
+        .poll_discovery(&discovery, 1)
+        .expect("facade discovery should form cluster");
+
+    let state = cluster_runtime.cluster().state();
+    let updates = runtime
+        .apply_cluster_state(&state)
+        .expect("node runtime should mirror facade state");
+    assert!(!updates.is_empty());
+    assert_eq!(
+        runtime
+            .sharding()
+            .membership()
+            .member(remote.id())
+            .expect("remote member")
+            .state(),
+        MembershipState::Up
+    );
+    assert_eq!(runtime.registered_peer_count(), 1);
+
+    cluster_runtime
+        .cluster()
+        .manager()
+        .leave(remote.id())
+        .expect("remote should leave through facade");
+    let state = cluster_runtime.cluster().state();
+    runtime
+        .apply_cluster_state(&state)
+        .expect("leaving state should mirror");
+    assert_eq!(
+        runtime
+            .sharding()
+            .membership()
+            .member(remote.id())
+            .expect("remote member")
+            .state(),
+        MembershipState::Leaving
+    );
+
+    cluster_runtime
+        .cluster()
+        .manager()
+        .down(remote.id())
+        .expect("remote should down through facade");
+    let state = cluster_runtime.cluster().state();
+    runtime
+        .apply_cluster_state(&state)
+        .expect("down state should mirror");
+    assert_eq!(
+        runtime
+            .sharding()
+            .membership()
+            .member(remote.id())
+            .expect("remote member")
+            .state(),
+        MembershipState::Down
+    );
 }
 
 async fn build_runtime_pair(

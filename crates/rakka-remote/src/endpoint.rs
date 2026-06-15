@@ -1,11 +1,13 @@
 //! Remote endpoint routing for inbound envelopes.
 
+use std::any::type_name;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 use rakka_cluster::NodeId;
+use rakka_core::Message;
 
 use crate::{ProtobufEnvelopeCodec, RemoteDestination, RemoteEnvelope, RemoteError};
 
@@ -30,6 +32,16 @@ pub enum RemoteEndpointError {
         /// Entity type carried by the remote envelope.
         entity_type: String,
     },
+    /// No handler is registered for the requested actor-ref message type.
+    UnregisteredActorRefHandler {
+        /// Rust message type carried by the actor-ref descriptor.
+        message_type: String,
+    },
+    /// No handler is registered for the requested service key.
+    UnregisteredServiceHandler {
+        /// Receptionist service key carried by the remote envelope.
+        service_key: String,
+    },
     /// No handler is registered for remote replies.
     UnregisteredReplyHandler {
         /// Request id carried by the reply destination.
@@ -39,6 +51,16 @@ pub enum RemoteEndpointError {
     DuplicateEntityHandler {
         /// Entity type that already has a handler.
         entity_type: String,
+    },
+    /// An actor-ref handler is already registered for this message type.
+    DuplicateActorRefHandler {
+        /// Rust message type that already has a handler.
+        message_type: String,
+    },
+    /// A service handler is already registered for this service key.
+    DuplicateServiceHandler {
+        /// Receptionist service key that already has a handler.
+        service_key: String,
     },
     /// A registered handler rejected the envelope.
     HandlerRejected {
@@ -62,6 +84,18 @@ impl Display for RemoteEndpointError {
             Self::UnregisteredEntityType { entity_type } => {
                 write!(f, "remote endpoint has no entity handler for {entity_type}")
             }
+            Self::UnregisteredActorRefHandler { message_type } => {
+                write!(
+                    f,
+                    "remote endpoint has no actor-ref handler for {message_type}"
+                )
+            }
+            Self::UnregisteredServiceHandler { service_key } => {
+                write!(
+                    f,
+                    "remote endpoint has no service handler for {service_key}"
+                )
+            }
             Self::UnregisteredReplyHandler { request_id } => {
                 write!(
                     f,
@@ -72,6 +106,18 @@ impl Display for RemoteEndpointError {
                 write!(
                     f,
                     "remote endpoint already has an entity handler for {entity_type}"
+                )
+            }
+            Self::DuplicateActorRefHandler { message_type } => {
+                write!(
+                    f,
+                    "remote endpoint already has an actor-ref handler for {message_type}"
+                )
+            }
+            Self::DuplicateServiceHandler { service_key } => {
+                write!(
+                    f,
+                    "remote endpoint already has a service handler for {service_key}"
                 )
             }
             Self::HandlerRejected {
@@ -144,6 +190,46 @@ impl RemoteEndpoint {
         Ok(())
     }
 
+    /// Registers a handler for concrete actor-ref envelopes with message type `M`.
+    pub fn register_actor_ref_handler<M>(
+        &self,
+        handler: impl RemoteEnvelopeHandler,
+    ) -> RemoteEndpointResult<()>
+    where
+        M: Message,
+    {
+        let message_type = type_name::<M>().to_string();
+        let mut handlers = self
+            .handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned");
+        if handlers.actor_refs.contains_key(&message_type) {
+            return Err(RemoteEndpointError::DuplicateActorRefHandler { message_type });
+        }
+
+        handlers.actor_refs.insert(message_type, Arc::new(handler));
+        Ok(())
+    }
+
+    /// Registers a handler for service-key envelopes.
+    pub fn register_service_handler(
+        &self,
+        service_key: impl Into<String>,
+        handler: impl RemoteEnvelopeHandler,
+    ) -> RemoteEndpointResult<()> {
+        let service_key = service_key.into();
+        let mut handlers = self
+            .handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned");
+        if handlers.services.contains_key(&service_key) {
+            return Err(RemoteEndpointError::DuplicateServiceHandler { service_key });
+        }
+
+        handlers.services.insert(service_key, Arc::new(handler));
+        Ok(())
+    }
+
     /// Registers the handler for reply envelopes.
     pub fn register_reply_handler(&self, handler: impl RemoteEnvelopeHandler) {
         self.handlers
@@ -164,6 +250,14 @@ impl RemoteEndpoint {
         match &envelope.destination {
             RemoteDestination::Entity { entity_type, .. } => {
                 let handler = self.entity_handler(entity_type)?;
+                handler.handle(envelope)
+            }
+            RemoteDestination::ActorRef { actor_ref } => {
+                let handler = self.actor_ref_handler(actor_ref.message_type())?;
+                handler.handle(envelope)
+            }
+            RemoteDestination::Service { service_key } => {
+                let handler = self.service_handler(service_key)?;
                 handler.handle(envelope)
             }
             RemoteDestination::Reply { request_id } => {
@@ -191,6 +285,36 @@ impl RemoteEndpoint {
             })
     }
 
+    fn actor_ref_handler(
+        &self,
+        message_type: &str,
+    ) -> RemoteEndpointResult<Arc<dyn RemoteEnvelopeHandler>> {
+        self.handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .actor_refs
+            .get(message_type)
+            .cloned()
+            .ok_or_else(|| RemoteEndpointError::UnregisteredActorRefHandler {
+                message_type: message_type.to_string(),
+            })
+    }
+
+    fn service_handler(
+        &self,
+        service_key: &str,
+    ) -> RemoteEndpointResult<Arc<dyn RemoteEnvelopeHandler>> {
+        self.handlers
+            .lock()
+            .expect("remote endpoint handler mutex poisoned")
+            .services
+            .get(service_key)
+            .cloned()
+            .ok_or_else(|| RemoteEndpointError::UnregisteredServiceHandler {
+                service_key: service_key.to_string(),
+            })
+    }
+
     fn reply_handler(
         &self,
         request_id: &str,
@@ -208,22 +332,16 @@ impl RemoteEndpoint {
 
 impl Debug for RemoteEndpoint {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let entity_handler_count = self
+        let handlers = self
             .handlers
             .lock()
-            .expect("remote endpoint handler mutex poisoned")
-            .entities
-            .len();
-        let has_reply_handler = self
-            .handlers
-            .lock()
-            .expect("remote endpoint handler mutex poisoned")
-            .reply
-            .is_some();
+            .expect("remote endpoint handler mutex poisoned");
         f.debug_struct("RemoteEndpoint")
             .field("node_id", &self.node_id)
-            .field("entity_handler_count", &entity_handler_count)
-            .field("has_reply_handler", &has_reply_handler)
+            .field("entity_handler_count", &handlers.entities.len())
+            .field("actor_ref_handler_count", &handlers.actor_refs.len())
+            .field("service_handler_count", &handlers.services.len())
+            .field("has_reply_handler", &handlers.reply.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -231,5 +349,7 @@ impl Debug for RemoteEndpoint {
 #[derive(Default)]
 struct RemoteEndpointHandlers {
     entities: BTreeMap<String, Arc<dyn RemoteEnvelopeHandler>>,
+    actor_refs: BTreeMap<String, Arc<dyn RemoteEnvelopeHandler>>,
+    services: BTreeMap<String, Arc<dyn RemoteEnvelopeHandler>>,
     reply: Option<Arc<dyn RemoteEnvelopeHandler>>,
 }

@@ -33,6 +33,7 @@ These checks require local services or mutable infrastructure:
 
 ```sh
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-sharding-postgres
 RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture
 RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> RAKKA_K8S_NEXT_IMAGE=<image-next> examples/kubernetes/local-cluster-scenario.sh
 ```
@@ -46,6 +47,8 @@ Optional checks may be deferred, but the deferral should be visible in release-c
 - `docs/rakka-phase-4-process-workflow.md`: process actor and durable workflow foundations.
 - `docs/rakka-phase-5-integration-surfaces.md`: stream, HTTP, gRPC, Kubernetes, and metrics integration foundations.
 - `docs/rakka-compatibility.md`: N/N+1 compatibility policy.
+- `docs/rakka-api-boundary-inventory.md`: facade, foundation, adapter, and test/support API boundaries.
+- `docs/rakka-akka-parity-migration-notes.md`: migration notes toward the Akka-like facade APIs.
 - `docs/rakka-v1-api-review.md`: public API and crate-boundary review.
 - `docs/rakka-v1-generated-contracts.md`: generated gRPC contracts and mirrored HTTP routes.
 - `docs/rakka-v1-observability-exporters.md`: Prometheus/OpenTelemetry adapters and snapshots.

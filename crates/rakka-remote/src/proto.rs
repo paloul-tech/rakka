@@ -58,6 +58,14 @@ pub(crate) struct ProtoRemoteDestination {
     pub(crate) route_key: String,
     #[prost(string, tag = "7")]
     pub(crate) request_id: String,
+    #[prost(string, tag = "8")]
+    pub(crate) actor_node_id: String,
+    #[prost(string, tag = "9")]
+    pub(crate) actor_system_name: String,
+    #[prost(uint64, tag = "10")]
+    pub(crate) actor_uid: u64,
+    #[prost(string, tag = "11")]
+    pub(crate) actor_message_type: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Enumeration)]
@@ -68,4 +76,5 @@ pub(crate) enum ProtoDestinationKind {
     Service = 3,
     RouteKey = 4,
     Reply = 5,
+    ActorRef = 6,
 }

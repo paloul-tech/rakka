@@ -15,12 +15,14 @@ This note records the current public API boundary for the v1 hardening work. It 
 
 | Crate | Tier | Public Boundary |
 | --- | --- | --- |
+| `rakka` | V1 candidate | Top-level facade crate, curated `rakka::prelude`, and feature-gated module re-exports for application code. |
 | `rakka-core` | V1 candidate | Typed actor runtime, actor refs, supervision options, paths, dead letters, telemetry names, `RakkaError`, metrics recorder traits, and Tokio runtime marker. |
 | `rakka-persistence` | V1 candidate | Durable state store traits, in-memory store, durable actor helper, durable effects, revisions, and `DurableError`. |
 | `rakka-persistence-postgres` | Adapter candidate | PostgreSQL durable state store, migration SQL, backend constants, and binary-state codec. |
 | `rakka-cluster` | V1 candidate | Node identity, discovery snapshots/providers, membership state machine, protocol compatibility, and `ClusterError`. |
 | `rakka-remote` | V1 candidate | Remote envelopes, serialization registry, request/reply correlation, in-memory transport, TCP remoting foundation, and `RemoteError`. |
-| `rakka-sharding` | V1 candidate | Entity identity, shard coordinator, region routing, local and remote entity routes, cluster node runtime, and `ShardingError`/`ClusterShardingError`. |
+| `rakka-sharding` | V1 candidate | Entity identity, shard coordinator, region routing, remembered entities, local and remote entity routes, cluster node runtime, and `ShardingError`/`ClusterShardingError`. |
+| `rakka-sharding-postgres` | Adapter candidate | PostgreSQL shard coordinator store, lease, remembered entity store, migration SQL, backend constants, namespace-isolated coordinator snapshots, and fencing tokens. |
 | `rakka-process` | Adapter candidate | Managed process ownership, process actor runtime, stdio/file/socket/local-gRPC modes, process-backed entities, and `ProcessError`. |
 | `rakka-workflow` | V1 candidate | Durable inbox/outbox model, workflow clocks, recovery, retry scheduling, and `WorkflowError`. |
 | `rakka-stream` | V1 candidate | Bounded stream source/sink primitives, lifecycle snapshots, stream errors, telemetry labels, and optional adapters. |
@@ -67,6 +69,7 @@ Internal/runtime errors:
 ## Current Boundary Decisions
 
 - Keep re-exporting the most common types at each crate root for v1 ergonomics.
+- Add `rakka` as the preferred application-facing facade crate while component crates remain directly usable.
 - Keep module namespaces public where they clarify ownership, for example `rakka_remote::registry` and `rakka_sharding::runtime`.
 - Keep examples as separate unpublished packages.
 - Keep `rakka-testkit` as the home for cross-crate compatibility fixtures instead of leaking those helpers into production crates.
@@ -74,11 +77,13 @@ Internal/runtime errors:
 
 ## Review Notes By Crate
 
+- `rakka`: facade crate added during Akka-parity Phase 0; `rakka::prelude` is intentionally curated and should not expose coordinator, route, transport, or adapter internals.
 - `rakka-core`: public actor and metrics primitives are cohesive; no integration dependencies.
 - `rakka-persistence`: durable store traits and in-memory implementation are narrow; PostgreSQL remains a separate plugin crate.
 - `rakka-cluster`: protocol compatibility and membership admission are public and documented by the compatibility matrix.
 - `rakka-remote`: both in-memory and TCP transports are public; TCP remains a v1 foundation but not a full production security story.
-- `rakka-sharding`: local/remote routes and node runtime are public; durable shard coordinator storage remains out of scope.
+- `rakka-sharding`: local/remote routes and node runtime are public; durable shard coordinator storage, remembered entities, and leadership are opt-in through store and lease traits.
+- `rakka-sharding-postgres`: PostgreSQL shard coordinator snapshots, leadership leases, and remembered entity identity are adapter scope and should track the sharding store/lease contracts without expanding the facade prelude.
 - `rakka-process`: `testkit` is feature-gated; process sandbox defaults and allowlists should stay conservative.
 - `rakka-workflow`: durable inbox/outbox is public; workflow engine orchestration beyond these primitives remains out of scope.
 - `rakka-stream`: stream core can compile without process/sharding adapters.

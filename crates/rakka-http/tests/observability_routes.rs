@@ -4,12 +4,13 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{Request, StatusCode};
 use rakka_core::{
-    InMemoryMetricsRecorder, MetricAttribute, MetricsRecorder, OpenTelemetryMetricsExport,
-    METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_STREAM_PRESSURE,
+    CoordinatedShutdown, InMemoryMetricsRecorder, MetricAttribute, MetricsRecorder,
+    OpenTelemetryMetricsExport, METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_STREAM_PRESSURE,
 };
 use rakka_http::{
     json_snapshot_route, open_telemetry_metrics_json_route, operational_snapshots_route,
-    prometheus_metrics_route, OperationalSnapshotRegistry,
+    prometheus_metrics_route, register_coordinated_shutdown_snapshot, OperationalSnapshotRegistry,
+    DEFAULT_COORDINATED_SHUTDOWN_SNAPSHOT_NAME,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -37,6 +38,7 @@ async fn observability_routes_export_metrics_and_snapshots() {
         depth: 2,
     });
     registry.register_snapshot("grpc", || serde_json::json!({ "requests": 1 }));
+    register_coordinated_shutdown_snapshot(&registry, CoordinatedShutdown::new());
 
     let router = prometheus_metrics_route("/metrics", {
         let recorder = recorder.clone();
@@ -88,6 +90,10 @@ async fn observability_routes_export_metrics_and_snapshots() {
         serde_json::from_slice(&snapshots.body).expect("snapshot registry JSON should decode");
     assert_eq!(snapshots["snapshots"]["actor_system"]["state"], "running");
     assert_eq!(snapshots["snapshots"]["grpc"]["requests"], 1);
+    assert_eq!(
+        snapshots["snapshots"][DEFAULT_COORDINATED_SHUTDOWN_SNAPSHOT_NAME]["outcome"],
+        "not-started"
+    );
 
     let stream_snapshot = get(router, "/snapshot/stream").await;
     assert_eq!(stream_snapshot.status, StatusCode::OK);

@@ -8,16 +8,18 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
+license-file.workspace = true
 
 [lib]
 name = "rakka_persistence"
 
 [dependencies]
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
+rakka-stream = { path = "../rakka-stream", version = "0.1.0", default-features = false }
 serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 
 [lints]
 workspace = true

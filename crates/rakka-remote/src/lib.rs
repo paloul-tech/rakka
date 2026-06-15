@@ -3,22 +3,31 @@
 
 //! Remote envelopes, typed transport errors, and payload serialization registry.
 
+pub mod actor_ref;
+pub mod clustered_receptionist;
 pub mod endpoint;
 pub mod envelope;
 pub mod error;
 pub mod network;
 mod proto;
+pub mod receptionist;
 pub mod registry;
 pub mod request;
+pub mod shutdown;
 pub mod transport;
 
 use rakka_core::Subsystem;
 
+pub use actor_ref::{RemoteActorRefInbound, RemoteActorRefInboundError};
+pub use clustered_receptionist::{
+    RemoteClusteredReceptionist, RemoteClusteredReceptionistError,
+    RemoteClusteredReceptionistResult,
+};
 pub use endpoint::{
     RemoteEndpoint, RemoteEndpointError, RemoteEndpointResult, RemoteEnvelopeHandler,
 };
 pub use envelope::{
-    EncodedPayload, ProtobufEnvelopeCodec, RemoteDestination, RemoteEnvelope,
+    EncodedPayload, ProtobufEnvelopeCodec, RemoteActorRef, RemoteDestination, RemoteEnvelope,
     RemoteEnvelopeMetadata,
 };
 pub use error::{RemoteError, RemoteResult};
@@ -32,12 +41,23 @@ pub use network::{
     METRIC_TCP_REMOTE_CONNECTION_STATE, METRIC_TCP_REMOTE_RECEIVES, METRIC_TCP_REMOTE_RECONNECTS,
     METRIC_TCP_REMOTE_SENDS, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
+pub use receptionist::{
+    RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteServiceProxy,
+    RemoteServiceProxyError, RemoteServiceProxyRegistry, RemoteServiceProxyRegistrySnapshot,
+    RemoteServiceProxyResult, RemoteServiceRoutee, RemoteServiceRouteeKey,
+    REMOTE_RECEPTIONIST_LISTING_CODEC_ID, REMOTE_RECEPTIONIST_LISTING_MESSAGE_TYPE_ID,
+    REMOTE_RECEPTIONIST_LISTING_SCHEMA_VERSION,
+};
 pub use registry::{
     CodecKey, PayloadCodec, ProtobufMessage, ProtobufPayloadCodec, SchemaCompatibilityPolicy,
     SerializationRegistry,
 };
 pub use request::{
     RemotePendingReply, RemoteRequestError, RemoteRequestRegistry, RemoteRequestResult,
+};
+pub use shutdown::{
+    register_remote_service_proxy_expire_task, register_remote_service_proxy_remove_node_task,
+    register_tcp_remote_drain_task, register_tcp_remote_force_close_task,
 };
 pub use transport::{
     InMemoryRemoteTransport, RemoteTransport, RemoteTransportError, RemoteTransportResult,

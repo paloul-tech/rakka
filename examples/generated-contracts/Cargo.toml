@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
+license-file.workspace = true
 publish = false
 default-run = "rakka-example-generated-contracts"
 

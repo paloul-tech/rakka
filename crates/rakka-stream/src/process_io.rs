@@ -2,14 +2,17 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
 
 use rakka_process::{ManagedProcess, ProcessError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::ChildStdin;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::{
-    bounded_channel, StreamError, StreamSink, StreamSource, StreamStatus, DEFAULT_BUFFER_CAPACITY,
+    bounded_channel, Sink, Source, StreamError, StreamSendError, StreamSink, StreamSource,
+    StreamStatus, DEFAULT_BUFFER_CAPACITY,
 };
 
 /// Default byte chunk size used when pumping process output.
@@ -258,6 +261,16 @@ impl ProcessOutputStream {
     pub fn into_parts(mut self) -> (StreamSource<Vec<u8>>, Option<ProcessStreamPump>) {
         (self.source, self.pump.take())
     }
+
+    /// Consumes this output stream into a facade source and its pump task.
+    ///
+    /// The returned pump is the same handle exposed by `into_parts`, preserving
+    /// direct access to read completion and read errors after migrating to the
+    /// facade source.
+    #[must_use]
+    pub fn into_source(mut self) -> (Source<Vec<u8>>, Option<ProcessStreamPump>) {
+        (self.source.into_source(), self.pump.take())
+    }
 }
 
 impl fmt::Debug for ProcessOutputStream {
@@ -313,6 +326,24 @@ pub fn managed_process_stderr_stream(
             stream: ProcessIoStream::Stderr,
         })?;
     process_output_stream_from_reader(stderr, ProcessIoStream::Stderr, config)
+}
+
+impl Source<Vec<u8>> {
+    /// Creates a facade source by taking stdout from a managed process.
+    pub fn process_stdout(
+        process: &mut ManagedProcess,
+        config: ProcessOutputConfig,
+    ) -> ProcessStreamResult<(Self, Option<ProcessStreamPump>)> {
+        Ok(managed_process_stdout_stream(process, config)?.into_source())
+    }
+
+    /// Creates a facade source by taking stderr from a managed process.
+    pub fn process_stderr(
+        process: &mut ManagedProcess,
+        config: ProcessOutputConfig,
+    ) -> ProcessStreamResult<(Self, Option<ProcessStreamPump>)> {
+        Ok(managed_process_stderr_stream(process, config)?.into_source())
+    }
 }
 
 /// Creates an error for protocol-actor-owned process pipes.
@@ -438,6 +469,38 @@ where
     }
 }
 
+impl<W> ProcessInputSink<W>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    /// Consumes this process input adapter into a facade sink.
+    ///
+    /// The facade sink writes and flushes each received chunk before accepting
+    /// the next one. Dropping or completing the sink drops the owned stdin pipe.
+    #[must_use]
+    pub fn into_sink(self) -> Sink<Vec<u8>, usize> {
+        let input = Arc::new(AsyncMutex::new(self));
+
+        Sink::from_async_consumer(move |bytes: Vec<u8>| {
+            let input = Arc::clone(&input);
+            async move {
+                let mut input = input.lock().await;
+                input
+                    .write(&bytes)
+                    .await
+                    .map_err(|error| StreamSendError::new(stream_error_from_process(error), bytes))
+            }
+        })
+    }
+}
+
+impl Sink<Vec<u8>, usize> {
+    /// Creates a facade sink by taking stdin from a managed process.
+    pub fn process_stdin(process: &mut ManagedProcess) -> ProcessStreamResult<Self> {
+        Ok(managed_process_stdin_sink(process)?.into_sink())
+    }
+}
+
 impl<W> fmt::Debug for ProcessInputSink<W>
 where
     W: AsyncWrite + Unpin,
@@ -475,4 +538,13 @@ pub fn managed_process_stdin_sink(
         stdin,
         ProcessIoStream::Stdin,
     ))
+}
+
+fn stream_error_from_process(error: ProcessStreamError) -> StreamError {
+    match error {
+        ProcessStreamError::Stream { error } => error,
+        error => StreamError::Operator {
+            message: error.to_string(),
+        },
+    }
 }

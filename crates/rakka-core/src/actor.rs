@@ -1,13 +1,15 @@
 //! Local typed actor runtime.
 
-use std::any::type_name;
+use std::any::{type_name, Any};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -17,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::dead_letter::{DeadLetter, DeadLetterReason};
-use crate::path::ActorPath;
+use crate::path::{ActorPath, ActorUid};
 use crate::supervision::{ActorOptions, SupervisionStrategy};
 use crate::system::ActorSystem;
 use crate::{RakkaError, RakkaResult};
@@ -86,6 +88,181 @@ pub trait Actor: Send + 'static {
     }
 }
 
+/// Function-style behavior used by the Phase 2 actor facade.
+pub trait Behavior<M>: Send + 'static
+where
+    M: Message,
+{
+    /// Handles one message.
+    fn on_message<'a>(&'a mut self, ctx: &'a mut ActorContext<M>, msg: M) -> ActorFuture<'a>;
+}
+
+impl<M, F> Behavior<M> for F
+where
+    M: Message,
+    F: for<'a> FnMut(&'a mut ActorContext<M>, M) -> ActorFuture<'a> + Send + 'static,
+{
+    fn on_message<'a>(&'a mut self, ctx: &'a mut ActorContext<M>, msg: M) -> ActorFuture<'a> {
+        self(ctx, msg)
+    }
+}
+
+/// Actor implementation backed by a function-style behavior.
+pub struct BehaviorActor<M, B>
+where
+    M: Message,
+    B: Behavior<M>,
+{
+    behavior: B,
+    _message: PhantomData<fn(M)>,
+}
+
+impl<M, B> BehaviorActor<M, B>
+where
+    M: Message,
+    B: Behavior<M>,
+{
+    /// Creates a behavior actor.
+    #[must_use]
+    pub fn new(behavior: B) -> Self {
+        Self {
+            behavior,
+            _message: PhantomData,
+        }
+    }
+}
+
+impl<M, B> Actor for BehaviorActor<M, B>
+where
+    M: Message,
+    B: Behavior<M>,
+{
+    type Msg = M;
+
+    fn handle<'a>(
+        &'a mut self,
+        ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        self.behavior.on_message(ctx, msg)
+    }
+}
+
+/// Actor implementation backed by a synchronous handler function.
+pub struct ActorFn<M, F>
+where
+    M: Message,
+    F: FnMut(&mut ActorContext<M>, M) -> ActorResult + Send + 'static,
+{
+    handler: F,
+    _message: PhantomData<fn(M)>,
+}
+
+impl<M, F> Actor for ActorFn<M, F>
+where
+    M: Message,
+    F: FnMut(&mut ActorContext<M>, M) -> ActorResult + Send + 'static,
+{
+    type Msg = M;
+
+    fn handle<'a>(
+        &'a mut self,
+        ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let result = (self.handler)(ctx, msg);
+        actor_future(async move { result })
+    }
+}
+
+/// Creates an actor from a synchronous handler function.
+#[must_use]
+pub fn actor_fn<M, F>(handler: F) -> ActorFn<M, F>
+where
+    M: Message,
+    F: FnMut(&mut ActorContext<M>, M) -> ActorResult + Send + 'static,
+{
+    ActorFn {
+        handler,
+        _message: PhantomData,
+    }
+}
+
+/// Actor that initializes its behavior with access to [`ActorContext`].
+pub struct SetupActor<M, F, B>
+where
+    M: Message,
+    F: FnOnce(&mut ActorContext<M>) -> RakkaResult<B> + Send + 'static,
+    B: Behavior<M>,
+{
+    setup: Option<F>,
+    behavior: Option<B>,
+    _message: PhantomData<fn(M)>,
+}
+
+impl<M, F, B> SetupActor<M, F, B>
+where
+    M: Message,
+    F: FnOnce(&mut ActorContext<M>) -> RakkaResult<B> + Send + 'static,
+    B: Behavior<M>,
+{
+    /// Creates a setup actor.
+    #[must_use]
+    pub fn new(setup: F) -> Self {
+        Self {
+            setup: Some(setup),
+            behavior: None,
+            _message: PhantomData,
+        }
+    }
+}
+
+impl<M, F, B> Actor for SetupActor<M, F, B>
+where
+    M: Message,
+    F: FnOnce(&mut ActorContext<M>) -> RakkaResult<B> + Send + 'static,
+    B: Behavior<M>,
+{
+    type Msg = M;
+
+    fn started<'a>(&'a mut self, ctx: &'a mut ActorContext<Self::Msg>) -> ActorFuture<'a> {
+        actor_future(async move {
+            let setup = self.setup.take().ok_or_else(|| {
+                RakkaError::core("setup-already-consumed", "setup actor initialized twice")
+            })?;
+            self.behavior = Some(setup(ctx)?);
+            Ok(ActorAction::Continue)
+        })
+    }
+
+    fn handle<'a>(
+        &'a mut self,
+        ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        match self.behavior.as_mut() {
+            Some(behavior) => behavior.on_message(ctx, msg),
+            None => actor_future(async {
+                Err(RakkaError::core(
+                    "setup-not-complete",
+                    "setup actor received a message before initialization completed",
+                ))
+            }),
+        }
+    }
+}
+
+/// Creates an actor whose behavior is initialized with its actor context.
+#[must_use]
+pub fn setup<M, F, B>(setup: F) -> SetupActor<M, F, B>
+where
+    M: Message,
+    F: FnOnce(&mut ActorContext<M>) -> RakkaResult<B> + Send + 'static,
+    B: Behavior<M>,
+{
+    SetupActor::new(setup)
+}
+
 /// Failure observed while executing an actor handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActorFailure {
@@ -124,14 +301,132 @@ pub enum TerminationReason {
 pub struct ActorTerminated {
     /// Path of the actor that terminated.
     pub path: ActorPath,
+    /// Incarnation uid of the actor that terminated.
+    pub uid: ActorUid,
     /// Termination reason.
     pub reason: TerminationReason,
+}
+
+/// Serializable descriptor for an actor reference.
+///
+/// The descriptor captures both the logical path and incarnation uid. Resolving
+/// it only succeeds while the same live actor cell is still registered in the
+/// target actor system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializedActorRef {
+    system_name: String,
+    path: ActorPath,
+    uid: ActorUid,
+    message_type: String,
+}
+
+impl SerializedActorRef {
+    /// Creates a serialized actor reference descriptor.
+    #[must_use]
+    pub fn new(
+        system_name: impl Into<String>,
+        path: ActorPath,
+        uid: ActorUid,
+        message_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            system_name: system_name.into(),
+            path,
+            uid,
+            message_type: message_type.into(),
+        }
+    }
+
+    /// Actor system name that produced the descriptor.
+    #[must_use]
+    pub fn system_name(&self) -> &str {
+        &self.system_name
+    }
+
+    /// Logical actor path.
+    #[must_use]
+    pub const fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    /// Incarnation uid.
+    #[must_use]
+    pub const fn uid(&self) -> ActorUid {
+        self.uid
+    }
+
+    /// Rust message type name recorded for typed local resolution.
+    #[must_use]
+    pub fn message_type(&self) -> &str {
+        &self.message_type
+    }
+}
+
+/// Actor identity fields useful for tracing and structured logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorTraceContext {
+    system_name: String,
+    path: ActorPath,
+    uid: ActorUid,
+}
+
+impl ActorTraceContext {
+    /// Creates actor trace context.
+    #[must_use]
+    pub fn new(system_name: impl Into<String>, path: ActorPath, uid: ActorUid) -> Self {
+        Self {
+            system_name: system_name.into(),
+            path,
+            uid,
+        }
+    }
+
+    /// Actor system name.
+    #[must_use]
+    pub fn system_name(&self) -> &str {
+        &self.system_name
+    }
+
+    /// Logical actor path.
+    #[must_use]
+    pub const fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    /// Actor incarnation uid.
+    #[must_use]
+    pub const fn uid(&self) -> ActorUid {
+        self.uid
+    }
+}
+
+/// Handle returned by DeathWatch registration.
+#[derive(Debug, Clone)]
+pub struct WatchHandle {
+    id: u64,
+    target: Weak<ActorCell>,
+}
+
+impl WatchHandle {
+    /// DeathWatch registration id.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Cancels the watch registration if the target is still alive.
+    pub fn cancel(&self) -> bool {
+        self.target
+            .upgrade()
+            .is_some_and(|target| target.unwatch(self.id))
+    }
 }
 
 /// Serializable actor runtime snapshot used by operational diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorRuntimeSnapshot {
     path: ActorPath,
+    uid: ActorUid,
     mailbox_capacity: usize,
     mailbox_depth: usize,
     terminated: bool,
@@ -143,6 +438,7 @@ impl ActorRuntimeSnapshot {
     #[must_use]
     pub fn new(
         path: ActorPath,
+        uid: ActorUid,
         mailbox_capacity: usize,
         mailbox_depth: usize,
         terminated: bool,
@@ -150,6 +446,7 @@ impl ActorRuntimeSnapshot {
     ) -> Self {
         Self {
             path,
+            uid,
             mailbox_capacity,
             mailbox_depth,
             terminated,
@@ -161,6 +458,12 @@ impl ActorRuntimeSnapshot {
     #[must_use]
     pub fn path(&self) -> &ActorPath {
         &self.path
+    }
+
+    /// Incarnation uid.
+    #[must_use]
+    pub const fn uid(&self) -> ActorUid {
+        self.uid
     }
 
     /// Configured mailbox capacity.
@@ -280,6 +583,35 @@ where
         &self.cell.path
     }
 
+    /// Returns this actor's incarnation uid.
+    #[must_use]
+    pub fn uid(&self) -> ActorUid {
+        self.cell.uid
+    }
+
+    /// Returns a serializable descriptor for this actor reference.
+    #[must_use]
+    pub fn to_serialized_ref(&self) -> SerializedActorRef {
+        self.cell.to_serialized_ref()
+    }
+
+    /// Returns actor identity fields for tracing and structured logs.
+    #[must_use]
+    pub fn trace_context(&self) -> ActorTraceContext {
+        self.cell.trace_context()
+    }
+
+    /// Waits until this actor incarnation terminates.
+    pub async fn when_terminated(&self) -> ActorTerminated {
+        let (sender, receiver) = oneshot::channel();
+        self.watch(DeathRecipient::new(move |terminated| {
+            let _ = sender.send(terminated);
+        }));
+        receiver
+            .await
+            .expect("actor termination watcher should always send")
+    }
+
     /// Returns true after the actor has terminated.
     #[must_use]
     pub fn is_terminated(&self) -> bool {
@@ -314,8 +646,8 @@ where
         }
     }
 
-    fn watch(&self, recipient: DeathRecipient) {
-        self.cell.watch(recipient);
+    fn watch(&self, recipient: DeathRecipient) -> WatchHandle {
+        ActorCell::watch(&self.cell, recipient)
     }
 
     fn publish_dead_letter<T>(&self, reason: DeadLetterReason)
@@ -349,6 +681,7 @@ where
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActorRef")
             .field("path", self.path())
+            .field("uid", &self.uid())
             .field("terminated", &self.is_terminated())
             .finish()
     }
@@ -459,7 +792,9 @@ where
 {
     system: ActorSystem,
     myself: ActorRef<M>,
-    children: Vec<ActorStopHandle>,
+    children: HashMap<String, ActorStopHandle>,
+    timers: HashMap<String, TimerHandle<M>>,
+    receive_timeout: Option<ReceiveTimeout<M>>,
 }
 
 impl<M> ActorContext<M>
@@ -470,7 +805,9 @@ where
         Self {
             system,
             myself,
-            children: Vec::new(),
+            children: HashMap::new(),
+            timers: HashMap::new(),
+            receive_timeout: None,
         }
     }
 
@@ -490,6 +827,97 @@ where
     #[must_use]
     pub fn path(&self) -> &ActorPath {
         self.myself.path()
+    }
+
+    /// Returns actor identity fields for tracing and structured logs.
+    #[must_use]
+    pub fn trace_context(&self) -> ActorTraceContext {
+        self.myself.trace_context()
+    }
+
+    /// Spawns a child actor with default options.
+    pub fn spawn<A>(&mut self, name: impl AsRef<str>, actor: A) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+    {
+        self.spawn_child(name, actor)
+    }
+
+    /// Spawns a restartable child actor with default options.
+    pub fn spawn_factory<A, F>(
+        &mut self,
+        name: impl AsRef<str>,
+        factory: F,
+    ) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_child_factory(name, factory)
+    }
+
+    /// Spawns a restartable child actor with explicit options.
+    pub fn spawn_with_options<A, F>(
+        &mut self,
+        name: impl AsRef<str>,
+        factory: F,
+        options: ActorOptions,
+    ) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_child_with_options(name, factory, options)
+    }
+
+    /// Spawns an anonymous child actor with default options.
+    pub fn spawn_anonymous<A>(&mut self, actor: A) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+    {
+        let actor = Mutex::new(Some(actor));
+        self.spawn_anonymous_with_options(
+            move || {
+                actor
+                    .lock()
+                    .expect("actor factory mutex poisoned")
+                    .take()
+                    .expect("single-use actor factory cannot restart")
+            },
+            ActorOptions::default(),
+        )
+    }
+
+    /// Spawns an anonymous restartable child actor with default options.
+    pub fn spawn_anonymous_factory<A, F>(&mut self, factory: F) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        self.spawn_anonymous_with_options(factory, ActorOptions::default())
+    }
+
+    /// Spawns an anonymous restartable child actor with explicit options.
+    pub fn spawn_anonymous_with_options<A, F>(
+        &mut self,
+        factory: F,
+        options: ActorOptions,
+    ) -> RakkaResult<ActorRef<A::Msg>>
+    where
+        A: Actor,
+        F: Fn() -> A + Send + Sync + 'static,
+    {
+        if options.mailbox_capacity == 0 {
+            return Err(RakkaError::core(
+                "invalid-mailbox-capacity",
+                "actor mailbox capacity must be greater than zero",
+            ));
+        }
+
+        let (name, path, uid) = self.system.anonymous_child_identity(self.path());
+        let actor_ref = spawn_actor_task(self.system.clone(), path, uid, factory, options)?;
+        self.children.insert(name, actor_ref.stop_handle());
+        Ok(actor_ref)
     }
 
     /// Spawns a child actor with default options.
@@ -546,23 +974,60 @@ where
             ));
         }
 
-        let path = self.system.child_path(self.path(), name.as_ref());
-        let actor_ref = spawn_actor_task(self.system.clone(), path, factory, options);
+        let (path, uid) = self.system.child_identity(self.path(), name.as_ref())?;
+        let actor_ref = spawn_actor_task(self.system.clone(), path, uid, factory, options)?;
         let stop_handle = actor_ref.stop_handle();
-        self.system.register_actor(stop_handle.clone());
-        self.children.push(stop_handle);
+        self.children.insert(name.as_ref().to_string(), stop_handle);
         Ok(actor_ref)
     }
 
+    /// Returns logical paths for live children known to this context.
+    #[must_use]
+    pub fn children(&self) -> Vec<ActorPath> {
+        self.children
+            .values()
+            .filter(|child| !child.is_terminated())
+            .map(ActorStopHandle::path)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns a live child's logical path by name.
+    #[must_use]
+    pub fn child(&self, name: &str) -> Option<ActorPath> {
+        self.children
+            .get(name)
+            .filter(|child| !child.is_terminated())
+            .map(ActorStopHandle::path)
+            .cloned()
+    }
+
     /// Watches a target actor and sends `msg` to this actor when it terminates.
-    pub fn watch_with<T>(&self, target: &ActorRef<T>, msg: M)
+    pub fn watch_with<T>(&self, target: &ActorRef<T>, msg: M) -> WatchHandle
     where
         T: Message,
     {
         let myself = self.myself.clone();
         target.watch(DeathRecipient::new(move |_terminated| {
             let _ = myself.tell(msg);
-        }));
+        }))
+    }
+
+    /// Watches a target actor and converts termination into this actor's message type.
+    pub fn watch<T>(&self, target: &ActorRef<T>) -> WatchHandle
+    where
+        T: Message,
+        M: From<ActorTerminated>,
+    {
+        let myself = self.myself.clone();
+        target.watch(DeathRecipient::new(move |terminated| {
+            let _ = myself.tell(M::from(terminated));
+        }))
+    }
+
+    /// Cancels a DeathWatch registration.
+    pub fn unwatch(&self, handle: &WatchHandle) -> bool {
+        handle.cancel()
     }
 
     /// Schedules a message to be sent to this actor once after `delay`.
@@ -574,8 +1039,131 @@ where
         });
         TimerHandle {
             handle,
-            _message: std::marker::PhantomData,
+            _message: PhantomData,
         }
+    }
+
+    /// Starts or replaces a keyed one-shot timer.
+    pub fn start_timer_once(&mut self, key: impl Into<String>, delay: Duration, msg: M) {
+        let key = key.into();
+        if let Some(existing) = self.timers.remove(&key) {
+            existing.abort();
+        }
+        let timer = self.schedule_once(delay, msg);
+        self.timers.insert(key, timer);
+    }
+
+    /// Cancels a keyed timer.
+    pub fn cancel_timer(&mut self, key: &str) -> bool {
+        self.timers.remove(key).is_some_and(|timer| {
+            timer.abort();
+            true
+        })
+    }
+
+    /// Returns true when a keyed timer is known and has not finished.
+    #[must_use]
+    pub fn is_timer_active(&self, key: &str) -> bool {
+        self.timers
+            .get(key)
+            .is_some_and(|timer| !timer.is_finished())
+    }
+
+    /// Configures a receive timeout using a message factory.
+    pub fn set_receive_timeout_factory(
+        &mut self,
+        delay: Duration,
+        build: impl Fn() -> M + Send + Sync + 'static,
+    ) {
+        self.receive_timeout = Some(ReceiveTimeout {
+            delay,
+            build: Arc::new(build),
+            timer: None,
+        });
+        self.arm_receive_timeout();
+    }
+
+    /// Configures a receive timeout using a cloneable message.
+    pub fn set_receive_timeout(&mut self, delay: Duration, msg: M)
+    where
+        M: Clone + Sync,
+    {
+        self.set_receive_timeout_factory(delay, move || msg.clone());
+    }
+
+    /// Cancels the current receive timeout, if one is configured.
+    pub fn cancel_receive_timeout(&mut self) -> bool {
+        self.receive_timeout.take().is_some_and(|mut timeout| {
+            if let Some(timer) = timeout.timer.take() {
+                timer.abort();
+            }
+            true
+        })
+    }
+
+    /// Pipes a future result back to this actor.
+    pub fn pipe_to_self<T, E, Fut, Map>(&self, future: Fut, map: Map) -> JoinHandle<()>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        Map: FnOnce(Result<T, E>) -> M + Send + 'static,
+    {
+        let myself = self.myself.clone();
+        tokio::spawn(async move {
+            let msg = map(future.await);
+            let _ = myself.tell(msg);
+        })
+    }
+
+    /// Performs an ask and pipes the result back to this actor.
+    pub fn ask<T, R, Build, Map>(
+        &self,
+        target: &ActorRef<T>,
+        build: Build,
+        timeout: Duration,
+        map: Map,
+    ) -> JoinHandle<()>
+    where
+        T: Message,
+        R: Send + 'static,
+        Build: FnOnce(ReplyTo<R>) -> T + Send + 'static,
+        Map: FnOnce(Result<R, AskError>) -> M + Send + 'static,
+    {
+        let target = target.clone();
+        self.pipe_to_self(async move { target.ask(build, timeout).await }, map)
+    }
+
+    /// Performs an ask whose successful reply is itself a status result.
+    pub fn ask_with_status<T, R, E, Build, Map>(
+        &self,
+        target: &ActorRef<T>,
+        build: Build,
+        timeout: Duration,
+        map: Map,
+    ) -> JoinHandle<()>
+    where
+        T: Message,
+        R: Send + 'static,
+        E: Send + 'static,
+        Build: FnOnce(ReplyTo<Result<R, E>>) -> T + Send + 'static,
+        Map: FnOnce(Result<Result<R, E>, AskError>) -> M + Send + 'static,
+    {
+        let target = target.clone();
+        self.pipe_to_self(async move { target.ask(build, timeout).await }, map)
+    }
+
+    /// Spawns a message adapter that converts another protocol into this actor's protocol.
+    pub fn message_adapter<N, F>(&mut self, adapt: F) -> RakkaResult<ActorRef<N>>
+    where
+        N: Message,
+        F: FnMut(N) -> M + Send + 'static,
+    {
+        self.spawn_anonymous(MessageAdapterActor {
+            target: self.myself.clone(),
+            adapt,
+            _input: PhantomData,
+        })
     }
 
     /// Requests a child actor to stop.
@@ -586,10 +1174,105 @@ where
         child.stop()
     }
 
-    fn stop_children(&self) {
-        for child in &self.children {
+    /// Requests an actor to stop.
+    pub fn stop<T>(&self, actor: &ActorRef<T>) -> Result<(), StopError>
+    where
+        T: Message,
+    {
+        actor.stop()
+    }
+
+    /// Requests a named child to stop.
+    pub fn stop_child_named(&self, name: &str) -> bool {
+        if let Some(child) = self.children.get(name) {
+            child.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn arm_receive_timeout(&mut self) {
+        if let Some(timeout) = self.receive_timeout.as_mut() {
+            if let Some(timer) = timeout.timer.take() {
+                timer.abort();
+            }
+            let myself = self.myself.clone();
+            let delay = timeout.delay;
+            let build = timeout.build.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = myself.tell(build());
+            });
+            timeout.timer = Some(TimerHandle {
+                handle,
+                _message: PhantomData,
+            });
+        }
+    }
+
+    fn stop_runtime_owned_tasks(&mut self) {
+        for child in self.children.values() {
             child.stop();
         }
+        for (_key, timer) in self.timers.drain() {
+            timer.abort();
+        }
+        if let Some(mut timeout) = self.receive_timeout.take() {
+            if let Some(timer) = timeout.timer.take() {
+                timer.abort();
+            }
+        }
+    }
+}
+
+struct ReceiveTimeout<M>
+where
+    M: Message,
+{
+    delay: Duration,
+    build: Arc<dyn Fn() -> M + Send + Sync>,
+    timer: Option<TimerHandle<M>>,
+}
+
+struct MessageAdapterActor<M, N, F>
+where
+    M: Message,
+    N: Message,
+    F: FnMut(N) -> M + Send + 'static,
+{
+    target: ActorRef<M>,
+    adapt: F,
+    _input: PhantomData<fn(N)>,
+}
+
+impl<M, N, F> Actor for MessageAdapterActor<M, N, F>
+where
+    M: Message,
+    N: Message,
+    F: FnMut(N) -> M + Send + 'static,
+{
+    type Msg = N;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let target = self.target.clone();
+        let adapted = (self.adapt)(msg);
+        actor_future(async move {
+            target.tell(adapted).map_err(|error| match error {
+                TellError::Full(_msg) => {
+                    RakkaError::core("message-adapter-mailbox-full", "target mailbox was full")
+                }
+                TellError::Closed(_msg) => RakkaError::core(
+                    "message-adapter-mailbox-closed",
+                    "target mailbox was closed",
+                ),
+            })?;
+            Ok(ActorAction::Continue)
+        })
     }
 }
 
@@ -599,7 +1282,7 @@ where
     M: Message,
 {
     handle: JoinHandle<()>,
-    _message: std::marker::PhantomData<M>,
+    _message: PhantomData<fn(M)>,
 }
 
 impl<M> TimerHandle<M>
@@ -643,34 +1326,49 @@ impl ActorStopHandle {
     pub(crate) fn snapshot(&self) -> ActorRuntimeSnapshot {
         self.cell.snapshot()
     }
+
+    pub(crate) fn path(&self) -> &ActorPath {
+        self.cell.path()
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.cell.is_terminated()
+    }
 }
 
 pub(crate) fn spawn_actor_task<A, F>(
     system: ActorSystem,
     path: ActorPath,
+    uid: ActorUid,
     factory: F,
     options: ActorOptions,
-) -> ActorRef<A::Msg>
+) -> RakkaResult<ActorRef<A::Msg>>
 where
     A: Actor,
     F: Fn() -> A + Send + Sync + 'static,
 {
     let (sender, receiver) = mpsc::channel(options.mailbox_capacity);
     let cell = Arc::new(ActorCell::new(
+        system.name().to_string(),
         path,
+        uid,
+        type_name::<A::Msg>(),
+        Arc::new(sender.clone()),
         system.dead_letters(),
         options.mailbox_capacity,
     ));
+    system.register_actor_cell(cell.clone())?;
     let actor_ref = ActorRef {
         sender,
         cell: cell.clone(),
     };
+    system.register_actor(actor_ref.stop_handle());
     let factory = Arc::new(factory);
     let task_ref = actor_ref.clone();
     tokio::spawn(run_actor_task(
         system, task_ref, receiver, cell, factory, options,
     ));
-    actor_ref
+    Ok(actor_ref)
 }
 
 async fn run_actor_task<A, F>(
@@ -685,13 +1383,14 @@ async fn run_actor_task<A, F>(
     F: Fn() -> A + Send + Sync + 'static,
 {
     let mut actor = factory();
-    let mut ctx = ActorContext::new(system, actor_ref);
+    let mut ctx = ActorContext::new(system.clone(), actor_ref);
     let mut restart_count = 0usize;
     let mut termination_reason = TerminationReason::Normal;
 
     if let Some(reason) = lifecycle_failure(catch_actor_result(actor.started(&mut ctx)).await) {
         termination_reason = reason;
     } else {
+        ctx.arm_receive_timeout();
         while let Some(envelope) = receiver.recv().await {
             cell.mark_dequeued();
             match envelope {
@@ -702,7 +1401,9 @@ async fn run_actor_task<A, F>(
                 Envelope::User(msg) => {
                     let outcome = catch_actor_result(actor.handle(&mut ctx, msg)).await;
                     match outcome {
-                        Ok(Ok(ActorAction::Continue)) => {}
+                        Ok(Ok(ActorAction::Continue)) => {
+                            ctx.arm_receive_timeout();
+                        }
                         Ok(Ok(ActorAction::Stop)) => {
                             termination_reason = TerminationReason::Stopped;
                             break;
@@ -722,6 +1423,7 @@ async fn run_actor_task<A, F>(
                                 termination_reason = reason;
                                 break;
                             }
+                            ctx.arm_receive_timeout();
                         }
                         Err(failure) => {
                             if let Some(reason) = supervise_failure(
@@ -737,6 +1439,7 @@ async fn run_actor_task<A, F>(
                                 termination_reason = reason;
                                 break;
                             }
+                            ctx.arm_receive_timeout();
                         }
                     }
                 }
@@ -745,8 +1448,9 @@ async fn run_actor_task<A, F>(
     }
 
     let _ = catch_actor_result(actor.stopped(&mut ctx, &termination_reason)).await;
-    ctx.stop_children();
+    ctx.stop_runtime_owned_tasks();
     cell.mark_terminated(termination_reason);
+    system.unregister_actor_cell(&cell);
 }
 
 fn lifecycle_failure(outcome: Result<ActorResult, ActorFailure>) -> Option<TerminationReason> {
@@ -816,29 +1520,43 @@ where
     Stop,
 }
 
-struct ActorCell {
+pub(crate) struct ActorCell {
+    system_name: String,
     path: ActorPath,
+    uid: ActorUid,
+    message_type: &'static str,
+    sender: Arc<dyn Any + Send + Sync>,
     dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
     mailbox_capacity: usize,
     mailbox_depth: AtomicUsize,
     terminated: AtomicBool,
     termination_reason: Mutex<Option<TerminationReason>>,
-    watchers: Mutex<Vec<DeathRecipient>>,
+    next_watch_id: AtomicU64,
+    watchers: Mutex<Vec<WatchRegistration>>,
 }
 
 impl ActorCell {
     fn new(
+        system_name: String,
         path: ActorPath,
+        uid: ActorUid,
+        message_type: &'static str,
+        sender: Arc<dyn Any + Send + Sync>,
         dead_letters: tokio::sync::broadcast::Sender<DeadLetter>,
         mailbox_capacity: usize,
     ) -> Self {
         Self {
+            system_name,
             path,
+            uid,
+            message_type,
+            sender,
             dead_letters,
             mailbox_capacity,
             mailbox_depth: AtomicUsize::new(0),
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
+            next_watch_id: AtomicU64::new(1),
             watchers: Mutex::new(Vec::new()),
         }
     }
@@ -849,6 +1567,46 @@ impl ActorCell {
 
     fn mailbox_depth(&self) -> usize {
         self.mailbox_depth.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    pub(crate) const fn uid(&self) -> ActorUid {
+        self.uid
+    }
+
+    pub(crate) fn message_type(&self) -> &'static str {
+        self.message_type
+    }
+
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn to_serialized_ref(&self) -> SerializedActorRef {
+        SerializedActorRef::new(
+            self.system_name.clone(),
+            self.path.clone(),
+            self.uid,
+            self.message_type,
+        )
+    }
+
+    pub(crate) fn trace_context(&self) -> ActorTraceContext {
+        ActorTraceContext::new(self.system_name.clone(), self.path.clone(), self.uid)
+    }
+
+    pub(crate) fn typed_ref<M>(cell: &Arc<Self>) -> Option<ActorRef<M>>
+    where
+        M: Message,
+    {
+        let sender = cell.sender.downcast_ref::<mpsc::Sender<Envelope<M>>>()?;
+        Some(ActorRef {
+            sender: sender.clone(),
+            cell: cell.clone(),
+        })
     }
 
     fn mark_enqueued(&self) {
@@ -874,6 +1632,7 @@ impl ActorCell {
 
         ActorRuntimeSnapshot::new(
             self.path.clone(),
+            self.uid,
             self.mailbox_capacity,
             self.mailbox_depth(),
             self.terminated.load(Ordering::Acquire),
@@ -881,27 +1640,50 @@ impl ActorCell {
         )
     }
 
-    fn watch(&self, recipient: DeathRecipient) {
+    fn watch(cell: &Arc<Self>, recipient: DeathRecipient) -> WatchHandle {
+        let id = cell.next_watch_id.fetch_add(1, Ordering::Relaxed);
+        let mut recipient = Some(recipient);
         let maybe_terminated = {
-            let mut watchers = self.watchers.lock().expect("watchers mutex poisoned");
-            if self.terminated.load(Ordering::Acquire) {
-                self.termination_reason
+            let mut watchers = cell.watchers.lock().expect("watchers mutex poisoned");
+            if cell.terminated.load(Ordering::Acquire) {
+                cell.termination_reason
                     .lock()
                     .expect("termination reason mutex poisoned")
                     .clone()
                     .map(|reason| ActorTerminated {
-                        path: self.path.clone(),
+                        path: cell.path.clone(),
+                        uid: cell.uid,
                         reason,
                     })
             } else {
-                watchers.push(recipient);
-                return;
+                watchers.push(WatchRegistration {
+                    id,
+                    recipient: recipient
+                        .take()
+                        .expect("watch recipient should be available"),
+                });
+                None
             }
         };
 
         if let Some(terminated) = maybe_terminated {
-            recipient.notify(terminated);
+            recipient
+                .take()
+                .expect("watch recipient should be available")
+                .notify(terminated);
         }
+
+        WatchHandle {
+            id,
+            target: Arc::downgrade(cell),
+        }
+    }
+
+    fn unwatch(&self, id: u64) -> bool {
+        let mut watchers = self.watchers.lock().expect("watchers mutex poisoned");
+        let previous = watchers.len();
+        watchers.retain(|watcher| watcher.id != id);
+        watchers.len() != previous
     }
 
     fn mark_terminated(&self, reason: TerminationReason) {
@@ -913,11 +1695,15 @@ impl ActorCell {
                 .expect("termination reason mutex poisoned") = Some(reason.clone());
             self.mailbox_depth.store(0, Ordering::Release);
             self.terminated.store(true, Ordering::Release);
-            watchers.drain(..).collect::<Vec<_>>()
+            watchers
+                .drain(..)
+                .map(|registration| registration.recipient)
+                .collect::<Vec<_>>()
         };
 
         let terminated = ActorTerminated {
             path: self.path.clone(),
+            uid: self.uid,
             reason,
         };
 
@@ -938,6 +1724,11 @@ fn termination_reason_label(reason: &TerminationReason) -> &'static str {
 
 struct DeathRecipient {
     notify: Box<dyn FnOnce(ActorTerminated) + Send + 'static>,
+}
+
+struct WatchRegistration {
+    id: u64,
+    recipient: DeathRecipient,
 }
 
 impl DeathRecipient {

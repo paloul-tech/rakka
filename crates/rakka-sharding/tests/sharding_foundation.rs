@@ -8,21 +8,27 @@ use rakka_cluster::{
     DiscoverySnapshot, MembershipConfig, MembershipEvent, NodeAddress, NodeId, ProtocolVersion,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem,
-    InMemoryMetricsRecorder, ReplyTo, METRIC_SHARD_OWNERSHIP_COUNT,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, CoordinatedShutdown,
+    CoordinatedShutdownReason, InMemoryMetricsRecorder, ReplyTo, ShutdownOutcome, ShutdownPhase,
+    ShutdownTaskStatus, METRIC_SHARD_OWNERSHIP_COUNT,
 };
 use rakka_remote::{
     InMemoryRemoteTransport, RemoteDestination, RemoteEndpoint, RemoteEnvelope,
     RemoteRequestRegistry, SerializationRegistry,
 };
 use rakka_sharding::{
-    ClusterShardingError, ClusterShardingRuntime, EntityAskError, EntityDeliveryFailure, EntityId,
-    EntityRef, EntityTellError, EntityType, LocalEntityContext, LocalEntityRoute,
-    RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound, RemoteEntityInbound,
-    RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute, RemoteEntitySendFailure,
-    RemoteTransportEntityOutbound, RoutedEntityMessage, ShardCoordinator, ShardDecision,
-    ShardHandoffState, ShardId, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig,
-    ShardingError,
+    register_cluster_sharding_leave_task, AsyncShardCoordinatorStore, ClusterSharding,
+    ClusterShardingError, ClusterShardingRuntime, ClusterShardingShutdownHandle,
+    CoordinatorStoreFuture, Entity, EntityAskError, EntityContext, EntityDeliveryFailure, EntityId,
+    EntityRef, EntityTellError, EntityType, EntityTypeKey, InMemoryRememberedEntityStore,
+    InMemoryShardCoordinatorLease, InMemoryShardCoordinatorStore, LeastShardAllocationStrategy,
+    LocalEntityContext, LocalEntityRoute, PersistedShardCoordinatorState, RememberedEntities,
+    RememberedEntityStore, RemoteEntityAskClient, RemoteEntityAskError, RemoteEntityAskInbound,
+    RemoteEntityInbound, RemoteEntityInboundError, RemoteEntityOutbound, RemoteEntityRoute,
+    RemoteEntitySendFailure, RemoteTransportEntityOutbound, RoutedEntityMessage,
+    ShardAllocationContext, ShardAllocationStrategy, ShardBufferConfig, ShardCoordinator,
+    ShardCoordinatorLease, ShardCoordinatorStore, ShardDecision, ShardHandoffState, ShardId,
+    ShardKey, ShardMoveReason, ShardOwnerCache, ShardRegion, ShardingConfig, ShardingError,
 };
 
 #[derive(Debug)]
@@ -34,6 +40,11 @@ enum CartCommand {
 
 struct CartEntity {
     context: LocalEntityContext,
+    items: Vec<String>,
+}
+
+struct FacadeCartEntity {
+    context: EntityContext<CartCommand>,
     items: Vec<String>,
 }
 
@@ -88,6 +99,29 @@ impl Actor for CartEntity {
                 CartCommand::Add(value) => self.items.push(value),
                 CartCommand::Get(reply_to) => {
                     let value = format!("{}:{}", self.context.entity_id(), self.items.join(","));
+                    let _ = reply_to.reply(value);
+                }
+                CartCommand::Passivate => return Ok(ActorAction::Stop),
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+impl Actor for FacadeCartEntity {
+    type Msg = CartCommand;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        actor_future(async move {
+            match msg {
+                CartCommand::Add(value) => self.items.push(value),
+                CartCommand::Get(reply_to) => {
+                    let value =
+                        format!("{}:{}", self.context.persistence_id(), self.items.join(","));
                     let _ = reply_to.reply(value);
                 }
                 CartCommand::Passivate => return Ok(ActorAction::Stop),
@@ -198,6 +232,69 @@ impl RemoteEntityOutbound for FailingRemoteOutbound {
         Err(RemoteEntitySendFailure::Rejected(
             "transport unavailable".to_string(),
         ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LastRoutableAllocationStrategy;
+
+impl ShardAllocationStrategy for LastRoutableAllocationStrategy {
+    fn allocate_shard(
+        &self,
+        context: &ShardAllocationContext<'_>,
+        _shard_id: ShardId,
+    ) -> Option<NodeId> {
+        context.routable_nodes().last().cloned()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AsyncOnlyCoordinatorStore {
+    inner: InMemoryShardCoordinatorStore,
+}
+
+impl AsyncOnlyCoordinatorStore {
+    fn load_sync(&self, entity_type: &EntityType) -> Option<PersistedShardCoordinatorState> {
+        ShardCoordinatorStore::load(&self.inner, entity_type).unwrap()
+    }
+}
+
+impl AsyncShardCoordinatorStore for AsyncOnlyCoordinatorStore {
+    fn backend_name(&self) -> &'static str {
+        "async-only-test"
+    }
+
+    fn load<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+    ) -> CoordinatorStoreFuture<'a, Option<PersistedShardCoordinatorState>> {
+        Box::pin(async move { ShardCoordinatorStore::load(&self.inner, entity_type) })
+    }
+
+    fn compare_and_set<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+        state: PersistedShardCoordinatorState,
+    ) -> CoordinatorStoreFuture<'a, PersistedShardCoordinatorState> {
+        Box::pin(async move {
+            ShardCoordinatorStore::compare_and_set(
+                &self.inner,
+                entity_type,
+                expected_revision,
+                state,
+            )
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        entity_type: &'a EntityType,
+        expected_revision: u64,
+    ) -> CoordinatorStoreFuture<'a, ()> {
+        Box::pin(async move {
+            ShardCoordinatorStore::delete(&self.inner, entity_type, expected_revision)
+        })
     }
 }
 
@@ -326,6 +423,817 @@ async fn wait_for_entity_count<A, F>(
     assert_eq!(route.entity_count(), expected_count);
 }
 
+async fn wait_for_remembered_count(
+    store: &InMemoryRememberedEntityStore,
+    shard: &ShardKey,
+    expected_count: usize,
+) {
+    for _attempt in 0..20 {
+        if store.len_for_shard(shard) == expected_count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(store.len_for_shard(shard), expected_count);
+}
+
+async fn wait_for_entity_count_from_facade<M>(
+    sharding: &ClusterSharding,
+    key: &EntityTypeKey<M>,
+    expected_count: usize,
+) where
+    M: rakka_core::Message,
+{
+    for _attempt in 0..20 {
+        if sharding
+            .registration_state(key)
+            .is_some_and(|state| state.local_entity_count() == expected_count)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        sharding
+            .registration_state(key)
+            .map(|state| state.local_entity_count())
+            .unwrap_or_default(),
+        expected_count
+    );
+}
+
+#[tokio::test]
+async fn cluster_sharding_facade_initializes_and_routes_local_entity() {
+    let system = ActorSystem::new("facade-local-test");
+    let sharding = ClusterSharding::get(&system);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_stop_message_factory(|| CartCommand::Passivate),
+        )
+        .unwrap();
+    let cart = registration.entity_ref_for("cart-1");
+
+    cart.tell(CartCommand::Add("apple".to_string())).unwrap();
+    cart.tell(CartCommand::Add("banana".to_string())).unwrap();
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(value, "FacadeCart|cart-1:apple,banana");
+    let state = sharding.registration_state(&key).unwrap();
+    assert_eq!(state.entity_type(), key.entity_type());
+    assert_eq!(state.number_of_shards(), 4);
+    assert_eq!(state.local_entity_count(), 1);
+    assert!(state.has_stop_message());
+    assert!(!state.proxy_only());
+    assert_eq!(sharding.state().entity_types().len(), 1);
+
+    assert!(sharding.passivate_entity(&key, "cart-1").unwrap());
+    assert_eq!(
+        sharding
+            .registration_state(&key)
+            .unwrap()
+            .local_entity_count(),
+        0
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let cart = sharding.entity_ref_for(&key, "cart-1").unwrap();
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(value, "FacadeCart|cart-1:");
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn cluster_sharding_facade_buffers_messages_during_explicit_passivation() {
+    let system = ActorSystem::new("facade-passivation-buffer-test");
+    let sharding = ClusterSharding::get(&system);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeBufferedCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_stop_message_factory(|| CartCommand::Passivate)
+            .with_passivation_buffer_duration(Duration::from_millis(50)),
+        )
+        .unwrap();
+    let cart = registration.entity_ref_for("cart-1");
+
+    cart.tell(CartCommand::Add("apple".to_string())).unwrap();
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(value, "FacadeBufferedCart|cart-1:apple");
+
+    assert!(sharding.passivate_entity(&key, "cart-1").unwrap());
+    cart.tell(CartCommand::Add("after-passivate".to_string()))
+        .unwrap();
+    assert_eq!(registration.region().buffered_message_count(), 1);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let value = cart
+        .ask(CartCommand::Get, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(value, "FacadeBufferedCart|cart-1:after-passivate");
+    assert_eq!(registration.region().buffered_message_count(), 0);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn in_memory_remembered_entity_store_remembers_forgets_and_lists_by_shard() {
+    let store = InMemoryRememberedEntityStore::new();
+    let cart_shard = ShardKey::new(EntityType::new("RememberedCart"), ShardId::new(1));
+    let other_shard = ShardKey::new(EntityType::new("RememberedCart"), ShardId::new(2));
+    let cart_a = EntityId::new("cart-a");
+    let cart_b = EntityId::new("cart-b");
+
+    store.remember(&cart_shard, &cart_b).await.unwrap();
+    store.remember(&cart_shard, &cart_a).await.unwrap();
+    store.remember(&cart_shard, &cart_a).await.unwrap();
+    store.remember(&other_shard, &cart_a).await.unwrap();
+
+    assert_eq!(store.len(), 3);
+    assert_eq!(
+        store.remembered_for_shard(&cart_shard).await.unwrap(),
+        vec![cart_a.clone(), cart_b]
+    );
+    assert!(store.forget(&cart_shard, &cart_a).await.unwrap());
+    assert!(!store.forget(&cart_shard, &cart_a).await.unwrap());
+    assert_eq!(store.len_for_shard(&cart_shard), 1);
+    assert_eq!(store.len_for_shard(&other_shard), 1);
+}
+
+#[tokio::test]
+async fn remembered_entity_settings_propagate_to_facade_state() {
+    let system = ActorSystem::new("remembered-settings-test");
+    let sharding = ClusterSharding::get(&system);
+    let store = InMemoryRememberedEntityStore::new();
+    let key = EntityTypeKey::<CartCommand>::new("RememberedSettingsCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_remembered_entities(
+                RememberedEntities::enabled()
+                    .with_start_batch_size(3)
+                    .with_start_batch_delay(Duration::from_millis(5))
+                    .with_store(store),
+            ),
+        )
+        .unwrap();
+
+    let state = sharding.registration_state(&key).unwrap();
+    assert!(state.remembered_entities_enabled());
+    assert_eq!(state.remembered_start_batch_size(), 3);
+    assert_eq!(
+        state.remembered_start_batch_delay(),
+        Duration::from_millis(5)
+    );
+    assert_eq!(state.remembered_store_backend(), Some("in-memory"));
+    assert!(registration.region().remembered_entities().is_some());
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn remembered_entities_record_activation_survive_passivation_and_forget_explicitly() {
+    let system = ActorSystem::new("remembered-activation-test");
+    let sharding = ClusterSharding::get(&system);
+    let store = InMemoryRememberedEntityStore::new();
+    let key = EntityTypeKey::<CartCommand>::new("RememberedActivationCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_stop_message_factory(|| CartCommand::Passivate)
+            .with_remembered_entities(
+                RememberedEntities::enabled().with_store_ref(Arc::new(store.clone())),
+            ),
+        )
+        .unwrap();
+    let entity_id = EntityId::new("cart-1");
+    let shard = ShardKey::new(
+        key.entity_type().clone(),
+        ShardId::for_entity(key.entity_type(), &entity_id, key.config()),
+    );
+    let cart = registration.entity_ref_for(entity_id.as_str());
+
+    cart.tell(CartCommand::Add("apple".to_string())).unwrap();
+    wait_for_remembered_count(&store, &shard, 1).await;
+
+    assert!(sharding.passivate_entity_id(&key, &entity_id).unwrap());
+    wait_for_entity_count_from_facade(&sharding, &key, 0).await;
+    assert_eq!(store.len_for_shard(&shard), 1);
+
+    assert!(sharding.forget_entity_id(&key, &entity_id).await.unwrap());
+    assert_eq!(store.len_for_shard(&shard), 0);
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn remembered_entities_replay_on_local_registration() {
+    let system = ActorSystem::new("remembered-registration-replay-test");
+    let sharding = ClusterSharding::get(&system);
+    let store = InMemoryRememberedEntityStore::new();
+    let key = EntityTypeKey::<CartCommand>::new("RememberedReplayCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let entity_id = EntityId::new("cart-1");
+    let shard = ShardKey::new(
+        key.entity_type().clone(),
+        ShardId::for_entity(key.entity_type(), &entity_id, key.config()),
+    );
+    store.remember(&shard, &entity_id).await.unwrap();
+
+    sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_remembered_entities(
+                RememberedEntities::enabled().with_store_ref(Arc::new(store.clone())),
+            ),
+        )
+        .unwrap();
+
+    wait_for_entity_count_from_facade(&sharding, &key, 1).await;
+    system.shutdown();
+}
+
+#[test]
+fn cluster_sharding_facade_passes_allocation_strategy_to_runtime() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local.clone(), remote.clone()]);
+    let system = ActorSystem::new("facade-allocation-strategy-test");
+    let sharding = ClusterSharding::from_membership(&system, local, membership);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeStrategyCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    let registration = sharding
+        .init(
+            Entity::of(key.clone(), |context| FacadeCartEntity {
+                context,
+                items: Vec::new(),
+            })
+            .with_allocation_strategy(LastRoutableAllocationStrategy),
+        )
+        .unwrap();
+    let state = sharding.registration_state(&key).unwrap();
+    let runtime = sharding.runtime();
+    let runtime = runtime.try_lock().expect("cluster sharding runtime busy");
+    let coordinator = runtime.coordinator(key.entity_type()).unwrap();
+
+    assert!(state
+        .allocation_strategy()
+        .contains("LastRoutableAllocationStrategy"));
+    assert!(registration
+        .region()
+        .allocation_strategy_name()
+        .contains("LastRoutableAllocationStrategy"));
+    assert!(coordinator
+        .snapshot()
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner() == remote.id()));
+    system.shutdown();
+}
+
+#[test]
+fn in_memory_coordinator_store_rejects_stale_revision() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("StoredCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config);
+    coordinator.reconcile(&membership);
+
+    let store = InMemoryShardCoordinatorStore::new();
+    let state = PersistedShardCoordinatorState::now(coordinator.snapshot(), "test");
+    ShardCoordinatorStore::compare_and_set(&store, &entity_type, 0, state.clone()).unwrap();
+
+    let error = ShardCoordinatorStore::compare_and_set(&store, &entity_type, 0, state).unwrap_err();
+
+    assert!(matches!(
+        error,
+        ShardingError::CoordinatorRevisionConflict {
+            entity_type,
+            expected_revision: 0,
+            actual_revision: 1,
+        } if entity_type == EntityType::new("StoredCart")
+    ));
+}
+
+#[tokio::test]
+async fn in_memory_coordinator_lease_acquires_renews_and_releases() {
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(50));
+    let entity_type = EntityType::new("LeaseCart");
+    let holder = NodeId::new("rakka-0", "uid-a");
+
+    let token = lease.acquire(&entity_type, &holder).await.unwrap();
+    assert_eq!(token.namespace(), "default");
+    assert_eq!(token.entity_type(), &entity_type);
+    assert_eq!(token.holder_node(), &holder);
+    assert_eq!(token.fencing_token(), 1);
+    assert!(lease.token(&entity_type).is_some());
+
+    lease.renew(&token).await.unwrap();
+    lease.release(token).await.unwrap();
+    assert!(lease.token(&entity_type).is_none());
+}
+
+#[tokio::test]
+async fn in_memory_coordinator_lease_rejects_active_holder_and_fences_stale_token() {
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(5));
+    let entity_type = EntityType::new("LeaseConflictCart");
+    let holder_a = NodeId::new("rakka-0", "uid-a");
+    let holder_b = NodeId::new("rakka-1", "uid-b");
+
+    let token_a = lease.acquire(&entity_type, &holder_a).await.unwrap();
+    let rejected = lease.acquire(&entity_type, &holder_b).await.unwrap_err();
+    assert!(matches!(
+        rejected,
+        ShardingError::CoordinatorLeaseRejected {
+            entity_type,
+            holder_node,
+            current_holder_node: Some(current_holder_node),
+            ..
+        } if *entity_type == EntityType::new("LeaseConflictCart")
+            && *holder_node == holder_b
+            && *current_holder_node == holder_a
+    ));
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let token_b = lease.acquire(&entity_type, &holder_b).await.unwrap();
+    assert_eq!(token_b.fencing_token(), 2);
+
+    let lost = lease.renew(&token_a).await.unwrap_err();
+    assert!(matches!(
+        lost,
+        ShardingError::CoordinatorLeaseLost {
+            entity_type,
+            holder_node,
+            fencing_token: 1,
+            actual_holder_node: Some(actual_holder_node),
+            actual_fencing_token: Some(2),
+            ..
+        } if *entity_type == EntityType::new("LeaseConflictCart")
+            && *holder_node == holder_a
+            && *actual_holder_node == holder_b
+    ));
+}
+
+#[test]
+fn cluster_sharding_runtime_persists_coordinator_snapshot_on_registration() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("DurableRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = InMemoryShardCoordinatorStore::new();
+    let mut runtime = ClusterShardingRuntime::with_coordinator_store(membership, store.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region(region.clone()).unwrap();
+
+    let persisted = ShardCoordinatorStore::load(&store, &entity_type)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.coordinator_store_backend(), Some("in-memory"));
+    assert_eq!(persisted.snapshot().revision(), 1);
+    assert_eq!(persisted.snapshot().assignments().len(), 4);
+    assert_eq!(region.owner_revision(), persisted.snapshot().revision());
+}
+
+#[tokio::test]
+async fn async_runtime_with_lease_allows_only_current_holder_to_coordinate() {
+    let local_a = node("rakka-0", "uid-a");
+    let local_b = node("rakka-1", "uid-b");
+    let entity_type = EntityType::new("LeasedRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(50));
+    let mut runtime_a = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_a.clone()]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease.clone());
+    let mut runtime_b = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_b]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease);
+
+    runtime_a
+        .register_region_async(runtime_region(entity_type.clone(), config.clone()))
+        .await
+        .unwrap();
+    assert_eq!(runtime_a.coordinator_lease_backend(), Some("in-memory"));
+    assert!(runtime_a.coordinator_lease_requires_async_api());
+    assert_eq!(
+        runtime_a
+            .coordinator_lease_token(&entity_type)
+            .unwrap()
+            .holder_node(),
+        local_a.id()
+    );
+
+    let error = runtime_b
+        .register_region_async(runtime_region(entity_type.clone(), config))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::CoordinatorLeaseRejected { entity_type: rejected, .. }
+        } if *rejected == entity_type
+    ));
+
+    assert_eq!(
+        store.load_sync(&entity_type).unwrap().snapshot().revision(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn lost_lease_prevents_stale_runtime_from_publishing_ownership() {
+    let local_a = node("rakka-0", "uid-a");
+    let local_b = node("rakka-1", "uid-b");
+    let remote = node("rakka-2", "uid-c");
+    let entity_type = EntityType::new("LostLeaseCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let lease = InMemoryShardCoordinatorLease::new().with_lease_duration(Duration::from_millis(5));
+    let region_a = runtime_region(entity_type.clone(), config.clone());
+    let region_b = runtime_region(entity_type.clone(), config.clone());
+    let mut runtime_a = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_a, remote.clone()]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease.clone());
+
+    runtime_a
+        .register_region_async(region_a.clone())
+        .await
+        .unwrap();
+    let initial_revision = region_a.owner_revision();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mut runtime_b = ClusterShardingRuntime::with_async_coordinator_store(
+        membership_with_up_nodes(vec![local_b, remote.clone()]),
+        store.clone(),
+    )
+    .with_coordinator_lease(lease);
+    runtime_b.register_region_async(region_b).await.unwrap();
+    let revision_after_takeover = store.load_sync(&entity_type).unwrap().snapshot().revision();
+
+    let error = runtime_a
+        .mark_down_async(remote.id(), 3)
+        .await
+        .expect_err("stale runtime should not regain leadership while another holder is active");
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::CoordinatorLeaseRejected { entity_type: rejected, .. }
+        } if *rejected == entity_type
+    ));
+    assert_eq!(region_a.owner_revision(), initial_revision);
+    assert_eq!(
+        store.load_sync(&entity_type).unwrap().snapshot().revision(),
+        revision_after_takeover
+    );
+}
+
+#[test]
+fn sync_runtime_rejects_async_only_coordinator_store() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("AsyncOnlySyncCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let mut runtime = ClusterShardingRuntime::with_async_coordinator_store(membership, store);
+
+    let error = runtime
+        .register_region(runtime_region(entity_type, config))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::AsyncCoordinatorStoreRequiresAsyncApi { backend }
+        } if backend == "async-only-test"
+    ));
+}
+
+#[tokio::test]
+async fn async_runtime_persists_coordinator_snapshot_on_registration() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("AsyncDurableRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let mut runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership, store.clone());
+    let region = runtime_region(entity_type.clone(), config);
+
+    runtime.register_region_async(region.clone()).await.unwrap();
+
+    let persisted = store.load_sync(&entity_type).unwrap();
+    assert_eq!(runtime.coordinator_store_backend(), Some("async-only-test"));
+    assert!(runtime.coordinator_store_requires_async_api());
+    assert_eq!(persisted.snapshot().revision(), 1);
+    assert_eq!(persisted.snapshot().assignments().len(), 4);
+    assert_eq!(region.owner_revision(), persisted.snapshot().revision());
+}
+
+#[tokio::test]
+async fn async_runtime_recovers_persisted_coordinator_snapshot() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local, remote]);
+    let entity_type = EntityType::new("AsyncRecoveredRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+
+    let mut first_runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership.clone(), store.clone());
+    first_runtime
+        .register_region_async(runtime_region(entity_type.clone(), config.clone()))
+        .await
+        .unwrap();
+    let first_state = store.load_sync(&entity_type).unwrap();
+
+    let mut recovered_runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership, store.clone());
+    let recovered_region = runtime_region(entity_type.clone(), config);
+    recovered_runtime
+        .register_region_async(recovered_region.clone())
+        .await
+        .unwrap();
+    let recovered = recovered_runtime.coordinator(&entity_type).unwrap();
+
+    assert_eq!(recovered.revision(), first_state.snapshot().revision());
+    assert_eq!(
+        recovered.snapshot().assignments(),
+        first_state.snapshot().assignments()
+    );
+    assert_eq!(
+        recovered_region.owner_revision(),
+        first_state.snapshot().revision()
+    );
+}
+
+#[tokio::test]
+async fn async_runtime_persists_rebalance_after_membership_update() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let remote_id = remote.id().clone();
+    let membership = membership_with_up_nodes(vec![local, remote]);
+    let entity_type = EntityType::new("AsyncRebalancedRuntimeCart");
+    let config = ShardingConfig::new(8).unwrap();
+    let store = AsyncOnlyCoordinatorStore::default();
+    let mut runtime =
+        ClusterShardingRuntime::with_async_coordinator_store(membership, store.clone());
+
+    runtime
+        .register_region_async(runtime_region(entity_type.clone(), config))
+        .await
+        .unwrap();
+    let initial = store.load_sync(&entity_type).unwrap();
+
+    let update = runtime.mark_down_async(&remote_id, 3).await.unwrap();
+    let persisted = store.load_sync(&entity_type).unwrap();
+
+    assert!(!update.rebalances().is_empty());
+    assert_eq!(
+        initial.snapshot().revision() + 1,
+        persisted.snapshot().revision()
+    );
+    assert!(persisted
+        .snapshot()
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner() != &remote_id));
+}
+
+#[test]
+fn cluster_sharding_runtime_recovers_persisted_coordinator_snapshot() {
+    let local = node("rakka-0", "uid-a");
+    let remote = node("rakka-1", "uid-b");
+    let membership = membership_with_up_nodes(vec![local, remote]);
+    let entity_type = EntityType::new("RecoveredRuntimeCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = InMemoryShardCoordinatorStore::new();
+
+    let mut first_runtime =
+        ClusterShardingRuntime::with_coordinator_store(membership.clone(), store.clone());
+    first_runtime
+        .register_region(runtime_region(entity_type.clone(), config.clone()))
+        .unwrap();
+    let first_state = ShardCoordinatorStore::load(&store, &entity_type)
+        .unwrap()
+        .unwrap();
+
+    let mut recovered_runtime =
+        ClusterShardingRuntime::with_coordinator_store(membership, store.clone());
+    let recovered_region = runtime_region(entity_type.clone(), config);
+    recovered_runtime
+        .register_region(recovered_region.clone())
+        .unwrap();
+    let recovered = recovered_runtime.coordinator(&entity_type).unwrap();
+
+    assert_eq!(recovered.revision(), first_state.snapshot().revision());
+    assert_eq!(
+        recovered.snapshot().assignments(),
+        first_state.snapshot().assignments()
+    );
+    assert_eq!(
+        recovered_region.owner_revision(),
+        first_state.snapshot().revision()
+    );
+}
+
+#[test]
+fn cluster_sharding_runtime_rejects_mismatched_persisted_coordinator_snapshot() {
+    let local = node("rakka-0", "uid-a");
+    let membership = membership_with_up_nodes(vec![local]);
+    let entity_type = EntityType::new("MismatchedDurableCart");
+    let store = InMemoryShardCoordinatorStore::new();
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config);
+    coordinator.reconcile(&membership);
+    ShardCoordinatorStore::compare_and_set(
+        &store,
+        &entity_type,
+        0,
+        PersistedShardCoordinatorState::now(coordinator.snapshot(), "test"),
+    )
+    .unwrap();
+
+    let mut runtime = ClusterShardingRuntime::with_coordinator_store(membership, store);
+    let error = runtime
+        .register_region(runtime_region(
+            entity_type.clone(),
+            ShardingConfig::new(8).unwrap(),
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::PersistedCoordinatorSnapshotMismatch {
+                expected_entity_type,
+                actual_entity_type,
+                expected_shards: 8,
+                actual_shards: 4,
+            }
+        } if expected_entity_type == entity_type && actual_entity_type == entity_type
+    ));
+}
+
+#[test]
+fn cluster_sharding_facade_can_use_durable_coordinator_store() {
+    let system = ActorSystem::new("facade-durable-coordinator-test");
+    let store = InMemoryShardCoordinatorStore::new();
+    let sharding = ClusterSharding::get_with_coordinator_store(&system, store.clone());
+    let key = EntityTypeKey::<CartCommand>::new("FacadeDurableCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    sharding
+        .init(Entity::of(key.clone(), |context| FacadeCartEntity {
+            context,
+            items: Vec::new(),
+        }))
+        .unwrap();
+
+    let persisted = ShardCoordinatorStore::load(&store, key.entity_type())
+        .unwrap()
+        .unwrap();
+    let runtime = sharding.runtime();
+    let runtime = runtime.try_lock().expect("cluster sharding runtime busy");
+    assert_eq!(runtime.coordinator_store_backend(), Some("in-memory"));
+    assert_eq!(persisted.snapshot().entity_type(), key.entity_type());
+    assert_eq!(persisted.snapshot().number_of_shards(), 4);
+    system.shutdown();
+}
+
+#[test]
+fn sync_facade_rejects_async_only_coordinator_store() {
+    let system = ActorSystem::new("facade-sync-async-store-test");
+    let store = AsyncOnlyCoordinatorStore::default();
+    let sharding = ClusterSharding::get_with_async_coordinator_store(&system, store);
+    let key = EntityTypeKey::<CartCommand>::new("FacadeSyncAsyncStoreCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    let error = sharding
+        .init(Entity::of(key, |context| FacadeCartEntity {
+            context,
+            items: Vec::new(),
+        }))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ClusterShardingError::Sharding {
+            error: ShardingError::AsyncCoordinatorStoreRequiresAsyncApi { backend }
+        } if backend == "async-only-test"
+    ));
+    system.shutdown();
+}
+
+#[tokio::test]
+async fn async_facade_init_uses_async_only_coordinator_store() {
+    let system = ActorSystem::new("facade-async-coordinator-test");
+    let store = AsyncOnlyCoordinatorStore::default();
+    let sharding = ClusterSharding::get_with_async_coordinator_store(&system, store.clone());
+    let key = EntityTypeKey::<CartCommand>::new("FacadeAsyncDurableCart")
+        .with_number_of_shards(4)
+        .unwrap();
+
+    sharding
+        .init_async(Entity::of(key.clone(), |context| FacadeCartEntity {
+            context,
+            items: Vec::new(),
+        }))
+        .await
+        .unwrap();
+
+    let persisted = store.load_sync(key.entity_type()).unwrap();
+    let runtime = sharding.runtime();
+    let runtime = runtime.try_lock().expect("cluster sharding runtime busy");
+    assert_eq!(runtime.coordinator_store_backend(), Some("async-only-test"));
+    assert_eq!(persisted.snapshot().entity_type(), key.entity_type());
+    assert_eq!(persisted.snapshot().number_of_shards(), 4);
+    system.shutdown();
+}
+
+#[test]
+fn cluster_sharding_facade_reports_proxy_and_message_mismatch_state() {
+    let system = ActorSystem::new("facade-proxy-test");
+    let sharding = ClusterSharding::get(&system);
+    let key = EntityTypeKey::<CartCommand>::new("ProxyCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let proxy = sharding.init_proxy(key.clone()).unwrap();
+
+    let state = sharding.registration_state(&key).unwrap();
+    assert!(state.proxy_only());
+    assert_eq!(state.local_entity_count(), 0);
+    let proxy_ref = proxy.entity_ref_for("cart-1");
+    let error = proxy_ref
+        .tell(CartCommand::Add("apple".to_string()))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EntityTellError::Delivery {
+            failure: EntityDeliveryFailure::NotLocal { .. },
+            ..
+        }
+    ));
+
+    let mismatched_key = EntityTypeKey::<RemoteCartCommand>::new("ProxyCart")
+        .with_number_of_shards(4)
+        .unwrap();
+    let error = sharding.region_for(&mismatched_key).unwrap_err();
+    assert!(matches!(
+        error,
+        ClusterShardingError::EntityTypeMessageMismatch { entity_type }
+            if entity_type == EntityType::new("ProxyCart")
+    ));
+    system.shutdown();
+}
+
 #[test]
 fn entity_refs_compute_stable_shard_keys() {
     let config = ShardingConfig::new(16).unwrap();
@@ -406,6 +1314,39 @@ fn coordinator_allocates_all_shards_to_routable_members() {
 }
 
 #[test]
+fn coordinator_uses_custom_strategy_for_initial_allocation() {
+    let membership = membership_with_up_nodes(vec![
+        node("rakka-0", "uid-a"),
+        node("rakka-1", "uid-b"),
+        node("rakka-2", "uid-c"),
+    ]);
+    let mut coordinator = ShardCoordinator::with_allocation_strategy(
+        EntityType::new("Cart"),
+        ShardingConfig::new(6).unwrap(),
+        LastRoutableAllocationStrategy,
+    );
+
+    let plan = coordinator.reconcile(&membership);
+    let snapshot = coordinator.snapshot();
+
+    assert_eq!(plan.decisions().len(), 6);
+    assert!(plan.decisions().iter().all(|decision| {
+        matches!(
+            decision,
+            ShardDecision::Assign {
+                to,
+                reason: ShardMoveReason::InitialAllocation,
+                ..
+            } if to.logical_id() == "rakka-2"
+        )
+    }));
+    assert!(snapshot
+        .assignments()
+        .iter()
+        .all(|assignment| assignment.owner().logical_id() == "rakka-2"));
+}
+
+#[test]
 fn reconciliation_is_empty_when_membership_does_not_change() {
     let membership =
         membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);
@@ -455,6 +1396,54 @@ fn joining_member_rebalances_existing_ownership() {
             .filter(|assignment| assignment.owner().logical_id() == "rakka-2")
             .count(),
         2
+    );
+}
+
+#[test]
+fn least_shard_strategy_rebalances_existing_ownership_with_limit() {
+    let one_node = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let three_nodes = membership_with_up_nodes(vec![
+        node("rakka-0", "uid-a"),
+        node("rakka-1", "uid-b"),
+        node("rakka-2", "uid-c"),
+    ]);
+    let mut coordinator = ShardCoordinator::with_allocation_strategy(
+        EntityType::new("Cart"),
+        ShardingConfig::new(6).unwrap(),
+        LeastShardAllocationStrategy::new(1, 2),
+    );
+
+    coordinator.reconcile(&one_node);
+    let plan = coordinator.reconcile(&three_nodes);
+    let snapshot = coordinator.snapshot();
+
+    let rebalance_moves = plan
+        .decisions()
+        .iter()
+        .filter(|decision| {
+            matches!(
+                decision,
+                ShardDecision::Move {
+                    from,
+                    reason: ShardMoveReason::Rebalance,
+                    ..
+                } if from.logical_id() == "rakka-0"
+            )
+        })
+        .count();
+
+    assert_eq!(rebalance_moves, 2);
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-0", "uid-a")),
+        4
+    );
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-1", "uid-b")),
+        1
+    );
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-2", "uid-c")),
+        1
     );
 }
 
@@ -695,6 +1684,228 @@ async fn cluster_sharding_runtime_runs_graceful_handoff_before_ownership_publish
         .tell(&region_a, CartCommand::Add("banana".to_string()))
         .unwrap();
     assert_eq!(route_a.entity_count(), 1);
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_runs_cluster_sharding_local_leave_handoff() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let remote = node("rakka-1", "uid-b");
+    let entity_type = EntityType::new("CartShutdown");
+    let config = ShardingConfig::new(4).unwrap();
+    let route_a = LocalEntityRoute::new(
+        local_id.clone(),
+        ActorSystem::new("shutdown-handoff-node-a-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let route_b = LocalEntityRoute::new(
+        remote.id().clone(),
+        ActorSystem::new("shutdown-handoff-node-b-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region_a = ShardRegion::new(entity_type.clone(), config.clone(), route_a.clone());
+    let region_b = ShardRegion::new(entity_type.clone(), config.clone(), route_b);
+    let mut runtime = runtime_with_local(local.clone());
+
+    runtime.register_region(region_a.clone()).unwrap();
+    runtime.register_region(region_b).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, remote]))
+        .unwrap();
+
+    let entity_id = entity_owned_by(runtime.coordinator(&entity_type).unwrap(), "rakka-0");
+    let entity = EntityRef::<CartCommand>::new(entity_type.clone(), entity_id);
+    let shard_key = entity.shard_key(&config);
+    let shard_id = shard_key.shard_id();
+    entity
+        .tell(&region_a, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    assert_eq!(route_a.entity_count(), 1);
+
+    let handle = ClusterShardingShutdownHandle::new(runtime);
+    let shutdown = CoordinatedShutdown::new();
+    register_cluster_sharding_leave_task(&shutdown, "handoff-local-shards", handle.clone())
+        .unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+    let update = handle.last_update().expect("shutdown update should record");
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert_eq!(
+        report
+            .phases()
+            .iter()
+            .find(|phase| phase.phase() == &ShutdownPhase::handoff_shards())
+            .and_then(|phase| phase.tasks().first())
+            .map(|task| task.status()),
+        Some(ShutdownTaskStatus::Completed)
+    );
+    assert!(update.handoffs().iter().any(|handoff| {
+        handoff.shard() == &shard_key
+            && handoff.state() == ShardHandoffState::Transferring
+            && handoff.stopped_entities() == 1
+    }));
+    assert_eq!(
+        route_a.shard_handoff_state(shard_id),
+        ShardHandoffState::Transferring
+    );
+}
+
+#[tokio::test]
+async fn remembered_entities_replay_after_graceful_handoff_acquire() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let leaving = node("rakka-1", "uid-b");
+    let leaving_id = leaving.id().clone();
+    let entity_type = EntityType::new("RememberedHandoffCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let store = InMemoryRememberedEntityStore::new();
+    let remembered = RememberedEntities::enabled().with_store_ref(Arc::new(store.clone()));
+    let route_a = LocalEntityRoute::new(
+        local_id.clone(),
+        ActorSystem::new("remembered-handoff-node-a-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let route_b = LocalEntityRoute::new(
+        leaving_id.clone(),
+        ActorSystem::new("remembered-handoff-node-b-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region_a = ShardRegion::new(entity_type.clone(), config.clone(), route_a.clone())
+        .with_remembered_entities(remembered.clone());
+    let region_b = ShardRegion::new(entity_type.clone(), config.clone(), route_b.clone())
+        .with_remembered_entities(remembered);
+    let mut runtime = runtime_with_local(local.clone());
+
+    runtime.register_region(region_a.clone()).unwrap();
+    runtime.register_region(region_b.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local, leaving]))
+        .unwrap();
+
+    let entity_id = entity_owned_by(runtime.coordinator(&entity_type).unwrap(), "rakka-1");
+    let entity = EntityRef::<CartCommand>::new(entity_type.clone(), entity_id.clone());
+    let shard = entity.shard_key(&config);
+    store.remember(&shard, &entity_id).await.unwrap();
+    entity
+        .tell(&region_b, CartCommand::Add("apple".to_string()))
+        .unwrap();
+    assert_eq!(route_b.entity_count(), 1);
+
+    let _leave_update = runtime.mark_leaving(&leaving_id, 2).unwrap();
+
+    assert_eq!(
+        route_a.shard_handoff_state(shard.shard_id()),
+        ShardHandoffState::Acquired
+    );
+    assert_eq!(route_b.entity_count(), 0);
+    wait_for_entity_count(&route_a, 1).await;
+}
+
+#[tokio::test]
+async fn shard_region_buffers_messages_during_local_handoff_until_acquire() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("BufferedCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-handoff-buffer-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap()
+            .with_buffering(ShardBufferConfig::new(8, Duration::from_secs(1)));
+    let entity = region.entity_ref("cart-42");
+    let shard_id = entity.shard_id(region.config());
+
+    assert_eq!(region.begin_shard_handoff(shard_id).unwrap(), 0);
+    entity
+        .tell(&region, CartCommand::Add("buffered".to_string()))
+        .unwrap();
+
+    assert_eq!(region.buffered_message_count_for_shard(shard_id), 1);
+    assert_eq!(route.entity_count(), 0);
+
+    assert_eq!(region.acquire_shard(shard_id).unwrap(), 0);
+    let reply = entity
+        .ask(&region, CartCommand::Get, Duration::from_millis(250))
+        .await
+        .unwrap();
+
+    assert_eq!(reply, "cart-42:buffered");
+    assert_eq!(region.buffered_message_count_for_shard(shard_id), 0);
+    assert_eq!(route.entity_count(), 1);
+}
+
+#[test]
+fn shard_region_reports_buffer_full_when_handoff_buffer_overflows() {
+    let membership = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let local_node_id = membership.local_node_id().clone();
+    let entity_type = EntityType::new("OverflowCart");
+    let config = ShardingConfig::new(4).unwrap();
+    let mut coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    coordinator.reconcile(&membership);
+    let route = LocalEntityRoute::new(
+        local_node_id,
+        ActorSystem::new("local-handoff-buffer-overflow-test"),
+        |context: LocalEntityContext| CartEntity {
+            context,
+            items: Vec::new(),
+        },
+    );
+    let region =
+        ShardRegion::from_snapshot(entity_type, config, &coordinator.snapshot(), route.clone())
+            .unwrap()
+            .with_buffering(ShardBufferConfig::new(1, Duration::from_secs(1)));
+    let entity = region.entity_ref("cart-42");
+    let shard_id = entity.shard_id(region.config());
+
+    region.begin_shard_handoff(shard_id).unwrap();
+    entity
+        .tell(&region, CartCommand::Add("first".to_string()))
+        .unwrap();
+    let error = entity
+        .tell(&region, CartCommand::Add("second".to_string()))
+        .expect_err("second message should overflow the shard buffer");
+
+    assert_eq!(region.buffered_message_count_for_shard(shard_id), 1);
+    match error {
+        EntityTellError::Delivery {
+            message: CartCommand::Add(value),
+            failure:
+                EntityDeliveryFailure::ShardBufferFull {
+                    shard_id: failed_shard_id,
+                    capacity,
+                },
+        } => {
+            assert_eq!(value, "second");
+            assert_eq!(failed_shard_id, shard_id);
+            assert_eq!(capacity, 1);
+        }
+        other => panic!("unexpected buffer overflow error: {other:?}"),
+    }
 }
 
 #[test]

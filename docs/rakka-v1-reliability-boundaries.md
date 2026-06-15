@@ -79,10 +79,15 @@ Guarantees:
 - Remote entity routing can deliver to local owners or forward to non-local owners.
 - N/N+1 compatibility checks prevent incompatible nodes from joining ownership.
 - Graceful handoff stops old local ownership before activating a new owner in the tested path.
+- Remembered entities can record successfully activated ids and restart them
+  after local ownership refresh or shard acquisition when the entity type opts
+  in.
 
 Non-guarantees:
 
 - Remote actor/entity delivery is still at-most-once by default.
+- Remembered entities are liveness metadata, not durable entity state or
+  exactly-once delivery.
 - Rakka internal remoting is not a public client protocol.
 - v1 does not provide built-in TLS/mTLS or certificate lifecycle management.
 - v1 does not include a durable distributed consensus store for shard coordination.

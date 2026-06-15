@@ -1,0 +1,2526 @@
+//! Akka-shaped stream facade vocabulary over Rakka's bounded stream runtime.
+
+use std::collections::VecDeque;
+use std::error::Error;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use rakka_core::{
+    actor_future, Actor, ActorAction, ActorContext, ActorRef, ActorSystem, Message, RakkaError,
+    ReplyTo, TellError,
+};
+#[cfg(feature = "adapters")]
+use rakka_sharding::{EntityRef, EntityTellError, ShardRegion, ShardedEntityRef};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+use crate::{
+    bounded_channel, StreamError, StreamResult, StreamSendError, StreamSink, StreamSource,
+    DEFAULT_BUFFER_CAPACITY,
+};
+
+/// Result returned by materialized stream facade runs.
+pub type StreamRunResult<T, M> = Result<M, StreamRunError<T>>;
+
+/// Failure returned while materializing a stream facade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamRunError<T> {
+    /// The source side terminated with a stream lifecycle error.
+    Source {
+        /// Source lifecycle failure.
+        error: StreamError,
+    },
+    /// The sink side rejected an item.
+    Sink {
+        /// Sink send failure, including the rejected item.
+        error: StreamSendError<T>,
+    },
+    /// The actor sink boundary failed while delivering an item or lifecycle signal.
+    Actor {
+        /// Actor boundary failure.
+        error: ActorStreamError<T>,
+    },
+    /// The sharded entity sink boundary failed while routing an item.
+    #[cfg(feature = "adapters")]
+    Entity {
+        /// Entity boundary failure.
+        error: crate::EntitySinkError<T>,
+    },
+}
+
+impl<T> StreamRunError<T> {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Source { .. } => "source-error",
+            Self::Sink { .. } => "sink-error",
+            Self::Actor { .. } => "actor-error",
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => "entity-error",
+        }
+    }
+
+    /// Returns the source lifecycle error when this is a source failure.
+    #[must_use]
+    pub const fn source_error(&self) -> Option<&StreamError> {
+        match self {
+            Self::Source { error } => Some(error),
+            Self::Sink { .. } | Self::Actor { .. } => None,
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => None,
+        }
+    }
+
+    /// Returns the sink send error when this is a sink failure.
+    #[must_use]
+    pub const fn sink_error(&self) -> Option<&StreamSendError<T>> {
+        match self {
+            Self::Source { .. } | Self::Actor { .. } => None,
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => None,
+            Self::Sink { error } => Some(error),
+        }
+    }
+
+    /// Returns the actor boundary error when this is an actor sink failure.
+    #[must_use]
+    pub const fn actor_error(&self) -> Option<&ActorStreamError<T>> {
+        match self {
+            Self::Source { .. } | Self::Sink { .. } => None,
+            #[cfg(feature = "adapters")]
+            Self::Entity { .. } => None,
+            Self::Actor { error } => Some(error),
+        }
+    }
+
+    /// Returns the entity boundary error when this is a sharded entity sink failure.
+    #[cfg(feature = "adapters")]
+    #[must_use]
+    pub const fn entity_error(&self) -> Option<&crate::EntitySinkError<T>> {
+        match self {
+            Self::Source { .. } | Self::Sink { .. } | Self::Actor { .. } => None,
+            Self::Entity { error } => Some(error),
+        }
+    }
+}
+
+impl<T> Display for StreamRunError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source { error } => write!(f, "stream source failed: {error}"),
+            Self::Sink { error } => write!(f, "stream sink failed: {error}"),
+            Self::Actor { error } => write!(f, "stream actor boundary failed: {error}"),
+            #[cfg(feature = "adapters")]
+            Self::Entity { error } => write!(f, "stream entity boundary failed: {error}"),
+        }
+    }
+}
+
+impl<T> Error for StreamRunError<T> where T: Debug {}
+
+/// Explicit acknowledgement settings for actor stream boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckProtocol<Ack> {
+    ack: Ack,
+    timeout: Duration,
+}
+
+impl<Ack> AckProtocol<Ack> {
+    /// Creates an acknowledgement protocol with a one-second timeout.
+    #[must_use]
+    pub fn new(ack: Ack) -> Self {
+        Self {
+            ack,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// Expected acknowledgement value.
+    #[must_use]
+    pub const fn ack(&self) -> &Ack {
+        &self.ack
+    }
+
+    /// Maximum time to wait for an acknowledgement.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Returns this protocol with an updated acknowledgement timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+/// Message protocol accepted by `Sink::actor_ref_with_ack`.
+pub enum ActorSinkMessage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    /// Initializes an acked actor sink boundary.
+    Init {
+        /// Reply capability used by the target actor to acknowledge readiness.
+        reply_to: ReplyTo<Ack>,
+    },
+    /// One stream element plus an acknowledgement reply capability.
+    Element {
+        /// Stream element being delivered.
+        item: T,
+        /// Reply capability used by the target actor to acknowledge delivery.
+        reply_to: ReplyTo<Ack>,
+    },
+    /// The upstream source completed normally.
+    Complete,
+    /// The upstream source failed before completion.
+    Failure {
+        /// Source-side stream failure.
+        error: StreamError,
+    },
+    /// The actor sink boundary was cancelled or dropped before completion.
+    Cancelled {
+        /// Human-readable cancellation reason.
+        reason: String,
+    },
+}
+
+impl<T, Ack> Debug for ActorSinkMessage<T, Ack>
+where
+    T: Debug + Send + 'static,
+    Ack: Send + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Init { .. } => f.debug_struct("Init").finish_non_exhaustive(),
+            Self::Element { item, .. } => f
+                .debug_struct("Element")
+                .field("item", item)
+                .finish_non_exhaustive(),
+            Self::Complete => f.write_str("Complete"),
+            Self::Failure { error } => f.debug_struct("Failure").field("error", error).finish(),
+            Self::Cancelled { reason } => {
+                f.debug_struct("Cancelled").field("reason", reason).finish()
+            }
+        }
+    }
+}
+
+impl<T, Ack> ActorSinkMessage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    fn into_item(self) -> Option<T> {
+        match self {
+            Self::Element { item, .. } => Some(item),
+            Self::Init { .. } | Self::Complete | Self::Failure { .. } | Self::Cancelled { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// Message protocol accepted by `Source::actor_ref_with_ack`.
+pub enum ActorSourceMessage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    /// Enqueues one stream element and replies after bounded capacity accepts it.
+    Element {
+        /// Stream element to enqueue.
+        item: T,
+        /// Reply capability used after the element is accepted.
+        reply_to: ReplyTo<Ack>,
+    },
+    /// Completes the source normally after buffered items drain.
+    Complete,
+    /// Fails the source and wakes waiting stream consumers.
+    Failure {
+        /// Source-side stream failure.
+        error: StreamError,
+    },
+    /// Cancels the source with a reason.
+    Cancelled {
+        /// Human-readable cancellation reason.
+        reason: String,
+    },
+}
+
+impl<T, Ack> Debug for ActorSourceMessage<T, Ack>
+where
+    T: Debug + Send + 'static,
+    Ack: Send + 'static,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Element { item, .. } => f
+                .debug_struct("Element")
+                .field("item", item)
+                .finish_non_exhaustive(),
+            Self::Complete => f.write_str("Complete"),
+            Self::Failure { error } => f.debug_struct("Failure").field("error", error).finish(),
+            Self::Cancelled { reason } => {
+                f.debug_struct("Cancelled").field("reason", reason).finish()
+            }
+        }
+    }
+}
+
+/// Error returned while creating an actor-backed facade source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorSourceError {
+    /// Source stream could not be created.
+    Stream {
+        /// Stream construction failure.
+        error: StreamError,
+    },
+    /// Actor source relay could not be spawned.
+    Actor {
+        /// Actor spawn failure.
+        error: RakkaError,
+    },
+}
+
+impl Display for ActorSourceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stream { error } => Display::fmt(error, f),
+            Self::Actor { error } => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for ActorSourceError {}
+
+/// Failure returned by actor sink facade boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorStreamError<T> {
+    /// Initial acknowledgement could not be sent because the mailbox was full.
+    InitMailboxFull {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Initial acknowledgement could not be sent because the actor was closed.
+    InitMailboxClosed {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Actor mailbox was full before the item could be delivered.
+    MailboxFull {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Actor mailbox was closed before the item could be delivered.
+    MailboxClosed {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// The actor did not acknowledge before the configured timeout.
+    AckTimeout {
+        /// Timeout that elapsed.
+        timeout: Duration,
+    },
+    /// Initial acknowledgement timed out before the stream item was delivered.
+    InitAckTimeout {
+        /// Stream item that was not delivered.
+        item: T,
+        /// Timeout that elapsed.
+        timeout: Duration,
+    },
+    /// The actor dropped the acknowledgement reply channel.
+    AckDropped,
+    /// Initial acknowledgement was dropped before the stream item was delivered.
+    InitAckDropped {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// The actor replied with a value that did not match the expected ack.
+    UnexpectedAck,
+    /// Initial acknowledgement did not match before the stream item was delivered.
+    InitUnexpectedAck {
+        /// Stream item that was not delivered.
+        item: T,
+    },
+    /// Completion signal could not be sent because the mailbox was full.
+    CompleteMailboxFull,
+    /// Completion signal could not be sent because the actor was closed.
+    CompleteMailboxClosed,
+    /// Failure or cancellation signal could not be sent because the mailbox was full.
+    SignalMailboxFull,
+    /// Failure or cancellation signal could not be sent because the actor was closed.
+    SignalMailboxClosed,
+}
+
+impl<T> ActorStreamError<T> {
+    /// Returns the undelivered stream item when the failure happened before delivery.
+    #[must_use]
+    pub const fn item(&self) -> Option<&T> {
+        match self {
+            Self::InitMailboxFull { item }
+            | Self::InitMailboxClosed { item }
+            | Self::MailboxFull { item }
+            | Self::MailboxClosed { item }
+            | Self::InitAckTimeout { item, .. }
+            | Self::InitAckDropped { item }
+            | Self::InitUnexpectedAck { item } => Some(item),
+            Self::AckTimeout { .. }
+            | Self::AckDropped
+            | Self::UnexpectedAck
+            | Self::CompleteMailboxFull
+            | Self::CompleteMailboxClosed
+            | Self::SignalMailboxFull
+            | Self::SignalMailboxClosed => None,
+        }
+    }
+
+    /// Consumes this error and returns the undelivered stream item, if any.
+    #[must_use]
+    pub fn into_item(self) -> Option<T> {
+        match self {
+            Self::InitMailboxFull { item }
+            | Self::InitMailboxClosed { item }
+            | Self::MailboxFull { item }
+            | Self::MailboxClosed { item }
+            | Self::InitAckTimeout { item, .. }
+            | Self::InitAckDropped { item }
+            | Self::InitUnexpectedAck { item } => Some(item),
+            Self::AckTimeout { .. }
+            | Self::AckDropped
+            | Self::UnexpectedAck
+            | Self::CompleteMailboxFull
+            | Self::CompleteMailboxClosed
+            | Self::SignalMailboxFull
+            | Self::SignalMailboxClosed => None,
+        }
+    }
+}
+
+impl<T> Display for ActorStreamError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InitMailboxFull { .. } => {
+                f.write_str("actor sink init mailbox was full before item delivery")
+            }
+            Self::InitMailboxClosed { .. } => {
+                f.write_str("actor sink init mailbox was closed before item delivery")
+            }
+            Self::MailboxFull { .. } => f.write_str("actor sink mailbox was full"),
+            Self::MailboxClosed { .. } => f.write_str("actor sink mailbox was closed"),
+            Self::AckTimeout { timeout } => {
+                write!(f, "actor sink acknowledgement timed out after {timeout:?}")
+            }
+            Self::InitAckTimeout { timeout, .. } => write!(
+                f,
+                "actor sink init acknowledgement timed out after {timeout:?} before item delivery"
+            ),
+            Self::AckDropped => f.write_str("actor sink acknowledgement channel was dropped"),
+            Self::InitAckDropped { .. } => f.write_str(
+                "actor sink init acknowledgement channel was dropped before item delivery",
+            ),
+            Self::UnexpectedAck => f.write_str("actor sink acknowledgement did not match"),
+            Self::InitUnexpectedAck { .. } => {
+                f.write_str("actor sink init acknowledgement did not match before item delivery")
+            }
+            Self::CompleteMailboxFull => f.write_str("actor sink completion mailbox was full"),
+            Self::CompleteMailboxClosed => f.write_str("actor sink completion mailbox was closed"),
+            Self::SignalMailboxFull => f.write_str("actor sink signal mailbox was full"),
+            Self::SignalMailboxClosed => f.write_str("actor sink signal mailbox was closed"),
+        }
+    }
+}
+
+impl<T> Error for ActorStreamError<T> where T: Debug {}
+
+/// Materialization settings shared by stream facade sources, flows, and sinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRunSettings {
+    default_buffer_capacity: usize,
+    operator_buffer_capacity: usize,
+    stream_name: Option<String>,
+    cancellation_reason: String,
+}
+
+impl StreamRunSettings {
+    /// Creates run settings with explicit bounded capacities.
+    pub fn new(
+        default_buffer_capacity: usize,
+        operator_buffer_capacity: usize,
+    ) -> StreamResult<Self> {
+        validate_capacity(default_buffer_capacity)?;
+        validate_capacity(operator_buffer_capacity)?;
+        Ok(Self {
+            default_buffer_capacity,
+            operator_buffer_capacity,
+            stream_name: None,
+            cancellation_reason: "stream cancelled".to_string(),
+        })
+    }
+
+    /// Bounded capacity used by source and sink boundaries unless overridden.
+    #[must_use]
+    pub const fn default_buffer_capacity(&self) -> usize {
+        self.default_buffer_capacity
+    }
+
+    /// Bounded capacity used by operator output buffers unless overridden.
+    #[must_use]
+    pub const fn operator_buffer_capacity(&self) -> usize {
+        self.operator_buffer_capacity
+    }
+
+    /// Optional stream name used for diagnostics and metrics.
+    #[must_use]
+    pub fn stream_name(&self) -> Option<&str> {
+        self.stream_name.as_deref()
+    }
+
+    /// Default cancellation reason used by facade materialization.
+    #[must_use]
+    pub fn cancellation_reason(&self) -> &str {
+        &self.cancellation_reason
+    }
+
+    /// Sets the default bounded buffer capacity.
+    pub fn with_default_buffer_capacity(mut self, capacity: usize) -> StreamResult<Self> {
+        validate_capacity(capacity)?;
+        self.default_buffer_capacity = capacity;
+        Ok(self)
+    }
+
+    /// Sets the operator output bounded buffer capacity.
+    pub fn with_operator_buffer_capacity(mut self, capacity: usize) -> StreamResult<Self> {
+        validate_capacity(capacity)?;
+        self.operator_buffer_capacity = capacity;
+        Ok(self)
+    }
+
+    /// Sets a stream name used for diagnostics and metrics.
+    #[must_use]
+    pub fn with_stream_name(mut self, stream_name: impl Into<String>) -> Self {
+        self.stream_name = Some(stream_name.into());
+        self
+    }
+
+    /// Clears the stream name.
+    #[must_use]
+    pub fn without_stream_name(mut self) -> Self {
+        self.stream_name = None;
+        self
+    }
+
+    /// Sets the default cancellation reason used by facade materialization.
+    #[must_use]
+    pub fn with_cancellation_reason(mut self, reason: impl Into<String>) -> Self {
+        self.cancellation_reason = reason.into();
+        self
+    }
+}
+
+impl Default for StreamRunSettings {
+    fn default() -> Self {
+        Self {
+            default_buffer_capacity: DEFAULT_BUFFER_CAPACITY,
+            operator_buffer_capacity: DEFAULT_BUFFER_CAPACITY,
+            stream_name: None,
+            cancellation_reason: "stream cancelled".to_string(),
+        }
+    }
+}
+
+/// Finite or live source of stream elements.
+pub struct Source<T> {
+    stage: Box<dyn SourceStage<T> + Send>,
+    settings: StreamRunSettings,
+}
+
+impl<T> Source<T> {
+    /// Creates an empty source facade.
+    #[must_use]
+    pub fn empty() -> Self
+    where
+        T: Send + 'static,
+    {
+        Self::empty_with_settings(StreamRunSettings::default())
+    }
+
+    /// Creates an empty source facade with explicit run settings.
+    #[must_use]
+    pub fn empty_with_settings(settings: StreamRunSettings) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self {
+            stage: Box::new(EmptyStage),
+            settings,
+        }
+    }
+
+    /// Creates a source with one element.
+    #[must_use]
+    pub fn single(item: T) -> Self
+    where
+        T: Send + 'static,
+    {
+        let mut items = VecDeque::with_capacity(1);
+        items.push_back(item);
+        Self {
+            stage: Box::new(ItemsStage { items }),
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a facade source from a low-level bounded stream source.
+    #[must_use]
+    pub fn from_stream_source(source: StreamSource<T>) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self {
+            stage: Box::new(StreamSourceStage { source }),
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a bounded queue source and returns its producer sink.
+    pub fn queue(capacity: usize) -> StreamResult<(StreamSink<T>, Self)>
+    where
+        T: Send + 'static,
+    {
+        let (sink, source) = bounded_channel(capacity)?;
+        Ok((sink, Self::from_stream_source(source)))
+    }
+
+    /// Alias for `queue`, emphasizing that the source boundary is bounded.
+    pub fn bounded(capacity: usize) -> StreamResult<(StreamSink<T>, Self)>
+    where
+        T: Send + 'static,
+    {
+        Self::queue(capacity)
+    }
+
+    /// Spawns an actor reference that forwards received messages into a bounded source.
+    pub fn actor_ref(
+        system: &ActorSystem,
+        name: impl AsRef<str>,
+        capacity: usize,
+    ) -> Result<(ActorRef<T>, Self), ActorSourceError>
+    where
+        T: Message,
+    {
+        let (sink, source) =
+            bounded_channel(capacity).map_err(|error| ActorSourceError::Stream { error })?;
+        let actor = system
+            .spawn_actor(name, FacadeActorSourceActor::new(sink))
+            .map_err(|error| ActorSourceError::Actor { error })?;
+        Ok((actor, Self::from_stream_source(source)))
+    }
+
+    /// Spawns an acked actor reference that forwards accepted messages into a bounded source.
+    pub fn actor_ref_with_ack<Ack>(
+        system: &ActorSystem,
+        name: impl AsRef<str>,
+        capacity: usize,
+        protocol: AckProtocol<Ack>,
+    ) -> Result<(ActorRef<ActorSourceMessage<T, Ack>>, Self), ActorSourceError>
+    where
+        T: Send + 'static,
+        Ack: Clone + Send + 'static,
+    {
+        let (sink, source) =
+            bounded_channel(capacity).map_err(|error| ActorSourceError::Stream { error })?;
+        let actor = system
+            .spawn_actor(name, FacadeAckedActorSourceActor::new(sink, protocol))
+            .map_err(|error| ActorSourceError::Actor { error })?;
+        Ok((actor, Self::from_stream_source(source)))
+    }
+
+    /// Returns true when this source is the empty source vocabulary shape.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stage.kind() == SourceKind::Empty
+    }
+
+    /// Run settings associated with this source.
+    #[must_use]
+    pub const fn settings(&self) -> &StreamRunSettings {
+        &self.settings
+    }
+
+    /// Returns this source with updated run settings.
+    #[must_use]
+    pub fn with_settings(mut self, settings: StreamRunSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Transforms each source element.
+    #[must_use]
+    pub fn map<O, F>(self, mapper: F) -> Source<O>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+        F: FnMut(T) -> O + Send + 'static,
+    {
+        let settings = self.settings.clone();
+        Source {
+            stage: Box::new(MapStage {
+                upstream: self,
+                mapper,
+                _output: PhantomData,
+            }),
+            settings,
+        }
+    }
+
+    /// Transforms each source element with an ordered asynchronous mapper.
+    ///
+    /// At most `parallelism` mapper futures are in flight at once. Outputs are
+    /// emitted in source order, matching Akka's ordered `mapAsync` behavior.
+    pub fn map_async<O, F, Fut>(self, parallelism: usize, mapper: F) -> StreamResult<Source<O>>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        validate_parallelism("map_async", parallelism)?;
+        Ok(self.map_async_validated(parallelism, mapper))
+    }
+
+    fn map_async_validated<O, F, Fut>(self, parallelism: usize, mapper: F) -> Source<O>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let settings = self.settings.clone();
+        Source {
+            stage: Box::new(MapAsyncStage {
+                upstream: self,
+                mapper,
+                parallelism,
+                in_flight: VecDeque::new(),
+                upstream_done: false,
+                _output: PhantomData,
+                _future: PhantomData,
+            }),
+            settings,
+        }
+    }
+
+    /// Merges this source with another source.
+    ///
+    /// Each input preserves its own element order. Interleaving between inputs
+    /// depends on which source has an item available first.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self
+    where
+        T: Send + 'static,
+    {
+        Self::merge_all_with_settings(self.settings.clone(), [self, other])
+    }
+
+    /// Merges many sources into one source.
+    ///
+    /// Empty input produces an empty source. When at least one source is
+    /// supplied, the first source's settings define the bounded operator
+    /// capacity for the merge output.
+    #[must_use]
+    pub fn merge_all<I>(sources: I) -> Self
+    where
+        T: Send + 'static,
+        I: IntoIterator<Item = Self>,
+    {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let settings = sources
+            .first()
+            .map_or_else(StreamRunSettings::default, |source| source.settings.clone());
+        Self::merge_all_with_settings(settings, sources)
+    }
+
+    /// Merges many sources using explicit run settings for the merge output.
+    #[must_use]
+    pub fn merge_all_with_settings<I>(settings: StreamRunSettings, sources: I) -> Self
+    where
+        T: Send + 'static,
+        I: IntoIterator<Item = Self>,
+    {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        if sources.is_empty() {
+            return Self::empty_with_settings(settings);
+        }
+
+        let (sender, receiver) = mpsc::channel(settings.operator_buffer_capacity());
+        Self {
+            stage: Box::new(MergeStage {
+                sources: Some(sources),
+                sender,
+                receiver,
+                handles: Vec::new(),
+                source_count: 0,
+                completed_sources: 0,
+                terminal: false,
+            }),
+            settings,
+        }
+    }
+
+    /// Broadcasts every source element to `branches` bounded branch sources.
+    ///
+    /// A live branch that stops consuming applies back-pressure to the
+    /// upstream. A cancelled or dropped branch is removed from the broadcast.
+    pub fn broadcast(self, branches: usize) -> StreamResult<Vec<Self>>
+    where
+        T: Clone + Send + 'static,
+    {
+        validate_positive("broadcast", "branch count", branches)?;
+
+        let settings = self.settings.clone();
+        let mut branch_sinks = Vec::with_capacity(branches);
+        let mut branch_sources = Vec::with_capacity(branches);
+        for _branch in 0..branches {
+            let (sink, source) = bounded_channel(settings.operator_buffer_capacity())?;
+            branch_sinks.push(Some(sink));
+            branch_sources.push(source);
+        }
+
+        let shared = Arc::new(Mutex::new(BroadcastShared {
+            source: Some(self),
+            branch_sinks,
+            started: false,
+            handle: None,
+        }));
+
+        Ok(branch_sources
+            .into_iter()
+            .enumerate()
+            .map(|(branch_index, branch_source)| Self {
+                stage: Box::new(BroadcastBranchStage {
+                    branch_index,
+                    branch_source,
+                    shared: Arc::clone(&shared),
+                }),
+                settings: settings.clone(),
+            })
+            .collect())
+    }
+
+    /// Keeps source elements that satisfy `predicate`.
+    #[must_use]
+    pub fn filter<F>(self, predicate: F) -> Self
+    where
+        T: Send + 'static,
+        F: FnMut(&T) -> bool + Send + 'static,
+    {
+        let settings = self.settings.clone();
+        Self {
+            stage: Box::new(FilterStage {
+                upstream: self,
+                predicate,
+            }),
+            settings,
+        }
+    }
+
+    /// Emits at most `count` elements and then cancels upstream.
+    #[must_use]
+    pub fn take(self, count: usize) -> Self
+    where
+        T: Send + 'static,
+    {
+        let settings = self.settings.clone();
+        let cancellation_reason = format!("take({count}) completed");
+        Self {
+            stage: Box::new(TakeStage {
+                upstream: self,
+                remaining: count,
+                upstream_cancelled: false,
+                cancellation_reason,
+            }),
+            settings,
+        }
+    }
+
+    /// Applies a flow to this source.
+    #[must_use]
+    pub fn via<O>(self, flow: Flow<T, O>) -> Source<O>
+    where
+        T: Send + 'static,
+        O: Send + 'static,
+    {
+        flow.apply(self)
+    }
+
+    /// Connects this source to a sink, producing a runnable stream descriptor.
+    #[must_use]
+    pub fn to<M>(self, sink: Sink<T, M>) -> RunnableStream<T, M> {
+        RunnableStream { source: self, sink }
+    }
+
+    /// Runs this source with a sink.
+    pub async fn run_with<M>(mut self, mut sink: Sink<T, M>) -> StreamRunResult<T, M>
+    where
+        T: Send + 'static,
+        M: Send + 'static,
+    {
+        loop {
+            match self.next_item().await {
+                Ok(Some(item)) => sink.consume(item).await?,
+                Ok(None) => return Ok(sink.finish()),
+                Err(error) => {
+                    sink.source_failed(error.clone());
+                    return Err(StreamRunError::Source { error });
+                }
+            }
+        }
+    }
+
+    /// Collects this source into a vector.
+    pub async fn run_collect(self) -> StreamRunResult<T, Vec<T>>
+    where
+        T: Send + 'static,
+    {
+        self.run_with(Sink::collect()).await
+    }
+
+    /// Runs a callback for every source item.
+    pub async fn run_foreach<F>(self, callback: F) -> StreamRunResult<T, ()>
+    where
+        T: Send + 'static,
+        F: FnMut(T) + Send + 'static,
+    {
+        self.run_with(Sink::foreach(callback)).await
+    }
+
+    /// Cancels this source boundary.
+    pub fn cancel(&mut self, reason: impl Into<String>) -> usize {
+        self.stage.cancel(reason.into())
+    }
+
+    async fn next_item(&mut self) -> StreamResult<Option<T>> {
+        self.stage.next().await
+    }
+}
+
+impl<T> StreamSource<T> {
+    /// Converts this low-level bounded source into the Akka-shaped facade.
+    #[must_use]
+    pub fn into_source(self) -> Source<T>
+    where
+        T: Send + 'static,
+    {
+        Source::from_stream_source(self)
+    }
+}
+
+impl<T> FromIterator<T> for Source<T>
+where
+    T: Send + 'static,
+{
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        Self {
+            stage: Box::new(ItemsStage {
+                items: iter.into_iter().collect(),
+            }),
+            settings: StreamRunSettings::default(),
+        }
+    }
+}
+
+impl<T> Debug for Source<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Source")
+            .field("kind", &self.stage.kind())
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Single-input single-output stream transformation.
+pub struct Flow<I, O> {
+    kind: FlowKind,
+    settings: StreamRunSettings,
+    transform: Box<dyn FnOnce(Source<I>) -> Source<O> + Send>,
+}
+
+impl<T> Flow<T, T>
+where
+    T: Send + 'static,
+{
+    /// Creates an identity flow facade.
+    #[must_use]
+    pub fn identity() -> Self {
+        Self::identity_with_settings(StreamRunSettings::default())
+    }
+
+    /// Creates an identity flow facade with explicit run settings.
+    #[must_use]
+    pub fn identity_with_settings(settings: StreamRunSettings) -> Self {
+        Self {
+            kind: FlowKind::Identity,
+            settings,
+            transform: Box::new(|source| source),
+        }
+    }
+}
+
+impl<I, O> Flow<I, O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    /// Creates a flow that maps each input into one output.
+    #[must_use]
+    pub fn from_fn<F>(mapper: F) -> Self
+    where
+        F: FnMut(I) -> O + Send + 'static,
+    {
+        Self {
+            kind: FlowKind::Map,
+            settings: StreamRunSettings::default(),
+            transform: Box::new(move |source| source.map(mapper)),
+        }
+    }
+
+    /// Creates a flow that maps each input with an ordered asynchronous mapper.
+    pub fn from_async_fn<F, Fut>(parallelism: usize, mapper: F) -> StreamResult<Self>
+    where
+        F: FnMut(I) -> Fut + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        validate_parallelism("map_async", parallelism)?;
+        Ok(Self {
+            kind: FlowKind::MapAsync,
+            settings: StreamRunSettings::default(),
+            transform: Box::new(move |source| source.map_async_validated(parallelism, mapper)),
+        })
+    }
+
+    /// Run settings associated with this flow.
+    #[must_use]
+    pub const fn settings(&self) -> &StreamRunSettings {
+        &self.settings
+    }
+
+    /// Returns this flow with updated run settings.
+    #[must_use]
+    pub fn with_settings(mut self, settings: StreamRunSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Returns true when this flow is the identity vocabulary shape.
+    #[must_use]
+    pub const fn is_identity(&self) -> bool {
+        matches!(self.kind, FlowKind::Identity)
+    }
+
+    fn apply(self, source: Source<I>) -> Source<O> {
+        let settings = self.settings.clone();
+        (self.transform)(source).with_settings(settings)
+    }
+}
+
+impl<I, O> Debug for Flow<I, O> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Flow")
+            .field("kind", &self.kind)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal stream consumer that materializes a value of type `M`.
+pub struct Sink<T, M> {
+    stage: Box<dyn SinkStage<T, M> + Send>,
+    kind: SinkKind,
+    settings: StreamRunSettings,
+}
+
+impl<T> Sink<T, ()>
+where
+    T: Send + 'static,
+{
+    /// Creates a sink facade that ignores all elements.
+    #[must_use]
+    pub fn ignore() -> Self {
+        Self::ignore_with_settings(StreamRunSettings::default())
+    }
+
+    /// Creates an ignore sink facade with explicit run settings.
+    #[must_use]
+    pub fn ignore_with_settings(settings: StreamRunSettings) -> Self {
+        Self {
+            stage: Box::new(IgnoreStage),
+            kind: SinkKind::Ignore,
+            settings,
+        }
+    }
+
+    /// Creates a sink facade that invokes a callback for every element.
+    #[must_use]
+    pub fn foreach<F>(callback: F) -> Self
+    where
+        F: FnMut(T) + Send + 'static,
+    {
+        Self {
+            stage: Box::new(ForeachStage {
+                callback,
+                _item: PhantomData,
+            }),
+            kind: SinkKind::Foreach,
+            settings: StreamRunSettings::default(),
+        }
+    }
+}
+
+impl<T> Sink<T, Vec<T>>
+where
+    T: Send + 'static,
+{
+    /// Creates a sink facade that collects all elements into a vector.
+    #[must_use]
+    pub fn collect() -> Self {
+        Self {
+            stage: Box::new(CollectStage { items: Vec::new() }),
+            kind: SinkKind::Collect,
+            settings: StreamRunSettings::default(),
+        }
+    }
+}
+
+impl<T> Sink<T, usize>
+where
+    T: Send + 'static,
+{
+    /// Creates a sink facade that forwards elements into a low-level stream sink.
+    #[must_use]
+    pub fn from_stream_sink(sink: StreamSink<T>) -> Self {
+        Self {
+            stage: Box::new(StreamSinkStage {
+                sink,
+                count: 0,
+                lifecycle: StreamSinkLifecycle::Manual,
+            }),
+            kind: SinkKind::StreamSink,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a sink facade that mirrors upstream lifecycle to a low-level stream sink.
+    ///
+    /// The sink drains the low-level stream on normal completion and cancels it
+    /// when upstream fails. This is useful for test probes and adapters that need
+    /// terminal lifecycle observations in addition to forwarded items.
+    #[must_use]
+    pub fn from_stream_sink_with_lifecycle(sink: StreamSink<T>) -> Self {
+        Self {
+            stage: Box::new(StreamSinkStage {
+                sink,
+                count: 0,
+                lifecycle: StreamSinkLifecycle::MirrorUpstream,
+            }),
+            kind: SinkKind::StreamSink,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    #[cfg(feature = "process-io")]
+    pub(crate) fn from_async_consumer<F, Fut>(consumer: F) -> Self
+    where
+        F: FnMut(T) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), StreamSendError<T>>> + Send + 'static,
+    {
+        Self {
+            stage: Box::new(AsyncConsumerSinkStage {
+                consumer,
+                count: 0,
+                _item: PhantomData,
+                _future: PhantomData,
+            }),
+            kind: SinkKind::AsyncConsumer,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a sink facade that forwards each item to an actor without acknowledgements.
+    #[must_use]
+    pub fn actor_ref(actor: ActorRef<T>) -> Self
+    where
+        T: Message,
+    {
+        Self {
+            stage: Box::new(ActorRefSinkStage { actor, count: 0 }),
+            kind: SinkKind::ActorRef,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates an acked actor sink facade using `ActorSinkMessage<T, Ack>`.
+    #[must_use]
+    pub fn actor_ref_with_ack<Ack>(
+        actor: ActorRef<ActorSinkMessage<T, Ack>>,
+        protocol: AckProtocol<Ack>,
+    ) -> Self
+    where
+        Ack: Clone + PartialEq + Send + 'static,
+    {
+        Self {
+            stage: Box::new(ActorRefWithAckSinkStage {
+                actor,
+                protocol,
+                initialized: false,
+                completed: false,
+                count: 0,
+            }),
+            kind: SinkKind::ActorRefWithAck,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a sink facade that forwards each item to one sharded entity.
+    #[cfg(feature = "adapters")]
+    #[must_use]
+    pub fn entity_ref(region: ShardRegion<T>, entity: EntityRef<T>) -> Self
+    where
+        T: Message,
+    {
+        Self {
+            stage: Box::new(EntityRefSinkStage {
+                region,
+                entity,
+                count: 0,
+            }),
+            kind: SinkKind::EntityRef,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a sink facade from a high-level sharded entity reference.
+    #[cfg(feature = "adapters")]
+    #[must_use]
+    pub fn sharded_entity_ref(entity: ShardedEntityRef<T>) -> Self
+    where
+        T: Message,
+    {
+        Self::entity_ref(entity.region().clone(), entity.entity_ref().clone())
+    }
+}
+
+impl<T, M> Sink<T, M>
+where
+    T: Send + 'static,
+    M: Send + 'static,
+{
+    /// Creates a sink facade that folds all elements into one materialized value.
+    #[must_use]
+    pub fn fold<F>(initial: M, folder: F) -> Self
+    where
+        F: FnMut(M, T) -> M + Send + 'static,
+    {
+        Self {
+            stage: Box::new(FoldStage {
+                state: Some(initial),
+                folder,
+                _item: PhantomData,
+            }),
+            kind: SinkKind::Fold,
+            settings: StreamRunSettings::default(),
+        }
+    }
+}
+
+impl<T, M> Sink<T, M> {
+    /// Run settings associated with this sink.
+    #[must_use]
+    pub const fn settings(&self) -> &StreamRunSettings {
+        &self.settings
+    }
+
+    /// Returns this sink with updated run settings.
+    #[must_use]
+    pub fn with_settings(mut self, settings: StreamRunSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Returns true when this sink is the ignore vocabulary shape.
+    #[must_use]
+    pub const fn is_ignore(&self) -> bool {
+        matches!(self.kind, SinkKind::Ignore)
+    }
+}
+
+impl<T, M> Sink<T, M>
+where
+    T: Send + 'static,
+    M: Send + 'static,
+{
+    async fn consume(&mut self, item: T) -> StreamRunResult<T, ()> {
+        self.stage.consume(item).await
+    }
+
+    fn source_failed(&mut self, error: StreamError) {
+        self.stage.source_failed(error);
+    }
+
+    fn finish(self) -> M {
+        self.stage.finish()
+    }
+}
+
+impl<T, M> Debug for Sink<T, M> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sink")
+            .field("kind", &self.kind)
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Descriptor for a source connected to a sink.
+pub struct RunnableStream<T, M> {
+    source: Source<T>,
+    sink: Sink<T, M>,
+}
+
+impl<T, M> RunnableStream<T, M>
+where
+    T: Send + 'static,
+    M: Send + 'static,
+{
+    /// Run settings inherited from the source side of this stream.
+    #[must_use]
+    pub const fn source_settings(&self) -> &StreamRunSettings {
+        self.source.settings()
+    }
+
+    /// Run settings inherited from the sink side of this stream.
+    #[must_use]
+    pub const fn sink_settings(&self) -> &StreamRunSettings {
+        self.sink.settings()
+    }
+
+    /// Runs the connected source and sink.
+    pub async fn run(self) -> StreamRunResult<T, M> {
+        self.source.run_with(self.sink).await
+    }
+}
+
+impl<T, M> Debug for RunnableStream<T, M> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunnableStream")
+            .field("source_settings", self.source.settings())
+            .field("sink_settings", self.sink.settings())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> StreamSink<T> {
+    /// Converts this low-level bounded sink into the Akka-shaped facade.
+    #[must_use]
+    pub fn into_sink(self) -> Sink<T, usize>
+    where
+        T: Send + 'static,
+    {
+        Sink::from_stream_sink(self)
+    }
+}
+
+trait SourceStage<T> {
+    fn next<'a>(&'a mut self)
+        -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>>;
+
+    fn cancel(&mut self, reason: String) -> usize;
+
+    fn kind(&self) -> SourceKind;
+}
+
+struct EmptyStage;
+
+impl<T> SourceStage<T> for EmptyStage
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn cancel(&mut self, _reason: String) -> usize {
+        0
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Empty
+    }
+}
+
+struct ItemsStage<T> {
+    items: VecDeque<T>,
+}
+
+impl<T> SourceStage<T> for ItemsStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async { Ok(self.items.pop_front()) })
+    }
+
+    fn cancel(&mut self, _reason: String) -> usize {
+        let dropped = self.items.len();
+        self.items.clear();
+        dropped
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Items
+    }
+}
+
+struct StreamSourceStage<T> {
+    source: StreamSource<T>,
+}
+
+impl<T> SourceStage<T> for StreamSourceStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async { self.source.next().await })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.source.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::StreamSource
+    }
+}
+
+struct MapStage<I, O, F>
+where
+    F: FnMut(I) -> O,
+{
+    upstream: Source<I>,
+    mapper: F,
+    _output: PhantomData<fn() -> O>,
+}
+
+impl<I, O, F> SourceStage<O> for MapStage<I, O, F>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: FnMut(I) -> O + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<O>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.upstream
+                .next_item()
+                .await
+                .map(|next| next.map(&mut self.mapper))
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Map
+    }
+}
+
+struct MapAsyncStage<I, O, F, Fut>
+where
+    F: FnMut(I) -> Fut,
+{
+    upstream: Source<I>,
+    mapper: F,
+    parallelism: usize,
+    in_flight: VecDeque<JoinHandle<O>>,
+    upstream_done: bool,
+    _output: PhantomData<fn() -> O>,
+    _future: PhantomData<fn() -> Fut>,
+}
+
+impl<I, O, F, Fut> MapAsyncStage<I, O, F, Fut>
+where
+    F: FnMut(I) -> Fut,
+{
+    async fn fill_in_flight(&mut self) -> StreamResult<()>
+    where
+        I: Send + 'static,
+        O: Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        while !self.upstream_done && self.in_flight.len() < self.parallelism {
+            match self.upstream.next_item().await? {
+                Some(item) => {
+                    let future = (self.mapper)(item);
+                    self.in_flight.push_back(tokio::spawn(future));
+                }
+                None => self.upstream_done = true,
+            }
+        }
+
+        Ok(())
+    }
+
+    fn abort_in_flight(&mut self) {
+        for handle in self.in_flight.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl<I, O, F, Fut> Drop for MapAsyncStage<I, O, F, Fut>
+where
+    F: FnMut(I) -> Fut,
+{
+    fn drop(&mut self) {
+        self.abort_in_flight();
+    }
+}
+
+impl<I, O, F, Fut> SourceStage<O> for MapAsyncStage<I, O, F, Fut>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+    F: FnMut(I) -> Fut + Send + 'static,
+    Fut: Future<Output = O> + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<O>>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Err(error) = self.fill_in_flight().await {
+                self.abort_in_flight();
+                return Err(error);
+            }
+
+            let Some(handle) = self.in_flight.pop_front() else {
+                return Ok(None);
+            };
+
+            match handle.await {
+                Ok(output) => Ok(Some(output)),
+                Err(error) => {
+                    self.abort_in_flight();
+                    Err(StreamError::Operator {
+                        message: format!("map_async task failed: {error}"),
+                    })
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.abort_in_flight();
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::MapAsync
+    }
+}
+
+struct FilterStage<T, F>
+where
+    F: FnMut(&T) -> bool,
+{
+    upstream: Source<T>,
+    predicate: F,
+}
+
+impl<T, F> SourceStage<T> for FilterStage<T, F>
+where
+    T: Send + 'static,
+    F: FnMut(&T) -> bool + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            while let Some(item) = self.upstream.next_item().await? {
+                if (self.predicate)(&item) {
+                    return Ok(Some(item));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Filter
+    }
+}
+
+struct TakeStage<T> {
+    upstream: Source<T>,
+    remaining: usize,
+    upstream_cancelled: bool,
+    cancellation_reason: String,
+}
+
+impl<T> TakeStage<T> {
+    fn cancel_upstream_once(&mut self) {
+        if !self.upstream_cancelled {
+            self.upstream_cancelled = true;
+            let _dropped = self.upstream.cancel(self.cancellation_reason.clone());
+        }
+    }
+}
+
+impl<T> SourceStage<T> for TakeStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.remaining == 0 {
+                self.cancel_upstream_once();
+                return Ok(None);
+            }
+
+            match self.upstream.next_item().await? {
+                Some(item) => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    Ok(Some(item))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.upstream_cancelled = true;
+        self.upstream.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Take
+    }
+}
+
+enum MergeMessage<T> {
+    Item(T),
+    SourceCompleted,
+    SourceFailed(StreamError),
+}
+
+struct MergeStage<T> {
+    sources: Option<Vec<Source<T>>>,
+    sender: mpsc::Sender<MergeMessage<T>>,
+    receiver: mpsc::Receiver<MergeMessage<T>>,
+    handles: Vec<JoinHandle<()>>,
+    source_count: usize,
+    completed_sources: usize,
+    terminal: bool,
+}
+
+impl<T> MergeStage<T> {
+    fn abort_pumps(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> MergeStage<T>
+where
+    T: Send + 'static,
+{
+    fn ensure_started(&mut self) {
+        let Some(sources) = self.sources.take() else {
+            return;
+        };
+
+        self.source_count = sources.len();
+        for source in sources {
+            let sender = self.sender.clone();
+            self.handles.push(tokio::spawn(
+                async move { merge_pump(source, sender).await },
+            ));
+        }
+    }
+}
+
+impl<T> Drop for MergeStage<T> {
+    fn drop(&mut self) {
+        self.abort_pumps();
+    }
+}
+
+impl<T> SourceStage<T> for MergeStage<T>
+where
+    T: Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.ensure_started();
+
+            if self.terminal {
+                return Ok(None);
+            }
+
+            while let Some(message) = self.receiver.recv().await {
+                match message {
+                    MergeMessage::Item(item) => return Ok(Some(item)),
+                    MergeMessage::SourceCompleted => {
+                        self.completed_sources = self.completed_sources.saturating_add(1);
+                        if self.completed_sources >= self.source_count {
+                            self.terminal = true;
+                            return Ok(None);
+                        }
+                    }
+                    MergeMessage::SourceFailed(error) => {
+                        self.terminal = true;
+                        self.receiver.close();
+                        self.abort_pumps();
+                        return Err(error);
+                    }
+                }
+            }
+
+            self.terminal = true;
+            Ok(None)
+        })
+    }
+
+    fn cancel(&mut self, _reason: String) -> usize {
+        self.terminal = true;
+        self.receiver.close();
+        self.abort_pumps();
+        0
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Merge
+    }
+}
+
+async fn merge_pump<T>(mut source: Source<T>, sender: mpsc::Sender<MergeMessage<T>>)
+where
+    T: Send + 'static,
+{
+    loop {
+        match source.next_item().await {
+            Ok(Some(item)) => {
+                if sender.send(MergeMessage::Item(item)).await.is_err() {
+                    let _dropped = source.cancel("merge downstream closed");
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ignored = sender.send(MergeMessage::SourceCompleted).await;
+                return;
+            }
+            Err(error) => {
+                let _ignored = sender.send(MergeMessage::SourceFailed(error)).await;
+                return;
+            }
+        }
+    }
+}
+
+struct BroadcastShared<T> {
+    source: Option<Source<T>>,
+    branch_sinks: Vec<Option<StreamSink<T>>>,
+    started: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct BroadcastBranchStage<T> {
+    branch_index: usize,
+    branch_source: StreamSource<T>,
+    shared: Arc<Mutex<BroadcastShared<T>>>,
+}
+
+impl<T> BroadcastBranchStage<T>
+where
+    T: Clone + Send + 'static,
+{
+    fn start_once(&self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if shared.started {
+            return;
+        }
+
+        shared.started = true;
+        let Some(source) = shared.source.take() else {
+            return;
+        };
+        let branch_sinks = shared.branch_sinks.clone();
+        shared.handle = Some(tokio::spawn(async move {
+            broadcast_pump(source, branch_sinks).await;
+        }));
+    }
+}
+
+impl<T> Drop for BroadcastBranchStage<T> {
+    fn drop(&mut self) {
+        let _dropped = self
+            .branch_source
+            .cancel(format!("broadcast branch {} dropped", self.branch_index));
+    }
+}
+
+impl<T> SourceStage<T> for BroadcastBranchStage<T>
+where
+    T: Clone + Send + 'static,
+{
+    fn next<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = StreamResult<Option<T>>> + Send + 'a>> {
+        Box::pin(async move {
+            self.start_once();
+            self.branch_source.next().await
+        })
+    }
+
+    fn cancel(&mut self, reason: String) -> usize {
+        self.branch_source.cancel(reason)
+    }
+
+    fn kind(&self) -> SourceKind {
+        SourceKind::Broadcast
+    }
+}
+
+async fn broadcast_pump<T>(mut source: Source<T>, mut branch_sinks: Vec<Option<StreamSink<T>>>)
+where
+    T: Clone + Send + 'static,
+{
+    loop {
+        match source.next_item().await {
+            Ok(Some(item)) => {
+                for sink in &mut branch_sinks {
+                    let Some(branch_sink) = sink else {
+                        continue;
+                    };
+
+                    if branch_sink.send(item.clone()).await.is_err() {
+                        *sink = None;
+                    }
+                }
+
+                if branch_sinks.iter().all(Option::is_none) {
+                    let _dropped = source.cancel("broadcast has no live branches");
+                    return;
+                }
+            }
+            Ok(None) => {
+                for branch_sink in branch_sinks.iter().flatten() {
+                    let _ignored = branch_sink.drain();
+                }
+                return;
+            }
+            Err(error) => {
+                let reason = format!("broadcast upstream failed: {error}");
+                for branch_sink in branch_sinks.iter().flatten() {
+                    let _dropped = branch_sink.cancel(reason.clone());
+                }
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    Empty,
+    Items,
+    StreamSource,
+    Map,
+    MapAsync,
+    Filter,
+    Take,
+    Merge,
+    Broadcast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowKind {
+    Identity,
+    Map,
+    MapAsync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkKind {
+    Ignore,
+    Collect,
+    Foreach,
+    Fold,
+    StreamSink,
+    #[cfg(feature = "process-io")]
+    AsyncConsumer,
+    ActorRef,
+    ActorRefWithAck,
+    #[cfg(feature = "adapters")]
+    EntityRef,
+}
+
+trait SinkStage<T, M> {
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>>;
+
+    fn source_failed(&mut self, _error: StreamError) {}
+
+    fn finish(self: Box<Self>) -> M;
+}
+
+struct IgnoreStage;
+
+impl<T> SinkStage<T, ()> for IgnoreStage
+where
+    T: Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        _item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish(self: Box<Self>) {}
+}
+
+struct CollectStage<T> {
+    items: Vec<T>,
+}
+
+impl<T> SinkStage<T, Vec<T>> for CollectStage<T>
+where
+    T: Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        self.items.push(item);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish(self: Box<Self>) -> Vec<T> {
+        self.items
+    }
+}
+
+struct ForeachStage<T, F>
+where
+    F: FnMut(T),
+{
+    callback: F,
+    _item: PhantomData<fn() -> T>,
+}
+
+impl<T, F> SinkStage<T, ()> for ForeachStage<T, F>
+where
+    T: Send + 'static,
+    F: FnMut(T) + Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        (self.callback)(item);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish(self: Box<Self>) {}
+}
+
+struct FoldStage<T, M, F>
+where
+    F: FnMut(M, T) -> M,
+{
+    state: Option<M>,
+    folder: F,
+    _item: PhantomData<fn() -> T>,
+}
+
+impl<T, M, F> SinkStage<T, M> for FoldStage<T, M, F>
+where
+    T: Send + 'static,
+    M: Send + 'static,
+    F: FnMut(M, T) -> M + Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        let state = self
+            .state
+            .take()
+            .expect("fold sink state should exist until finish");
+        self.state = Some((self.folder)(state, item));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish(mut self: Box<Self>) -> M {
+        self.state
+            .take()
+            .expect("fold sink state should exist at finish")
+    }
+}
+
+struct StreamSinkStage<T> {
+    sink: StreamSink<T>,
+    count: usize,
+    lifecycle: StreamSinkLifecycle,
+}
+
+impl<T> SinkStage<T, usize> for StreamSinkStage<T>
+where
+    T: Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.sink
+                .send(item)
+                .await
+                .map_err(|error| StreamRunError::Sink { error })?;
+            self.count = self.count.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    fn source_failed(&mut self, error: StreamError) {
+        if matches!(self.lifecycle, StreamSinkLifecycle::MirrorUpstream) {
+            let _dropped = self.sink.cancel(error.to_string());
+        }
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        if matches!(self.lifecycle, StreamSinkLifecycle::MirrorUpstream) {
+            let _ignored = self.sink.drain();
+        }
+        self.count
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSinkLifecycle {
+    Manual,
+    MirrorUpstream,
+}
+
+#[cfg(feature = "process-io")]
+struct AsyncConsumerSinkStage<T, F, Fut> {
+    consumer: F,
+    count: usize,
+    _item: PhantomData<fn() -> T>,
+    _future: PhantomData<fn() -> Fut>,
+}
+
+#[cfg(feature = "process-io")]
+impl<T, F, Fut> SinkStage<T, usize> for AsyncConsumerSinkStage<T, F, Fut>
+where
+    T: Send + 'static,
+    F: FnMut(T) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), StreamSendError<T>>> + Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        Box::pin(async move {
+            (self.consumer)(item)
+                .await
+                .map_err(|error| StreamRunError::Sink { error })?;
+            self.count = self.count.saturating_add(1);
+            Ok(())
+        })
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        self.count
+    }
+}
+
+struct ActorRefSinkStage<T>
+where
+    T: Message,
+{
+    actor: ActorRef<T>,
+    count: usize,
+}
+
+impl<T> SinkStage<T, usize> for ActorRefSinkStage<T>
+where
+    T: Message,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        let result = self
+            .actor
+            .tell(item)
+            .map_err(|error| StreamRunError::Actor {
+                error: actor_stream_error_from_tell(error),
+            });
+        if result.is_ok() {
+            self.count = self.count.saturating_add(1);
+        }
+        Box::pin(async move { result })
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        self.count
+    }
+}
+
+#[cfg(feature = "adapters")]
+struct EntityRefSinkStage<T>
+where
+    T: Message,
+{
+    region: ShardRegion<T>,
+    entity: EntityRef<T>,
+    count: usize,
+}
+
+#[cfg(feature = "adapters")]
+impl<T> SinkStage<T, usize> for EntityRefSinkStage<T>
+where
+    T: Message,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        let result = self
+            .region
+            .tell(&self.entity, item)
+            .map_err(|error| StreamRunError::Entity {
+                error: entity_sink_error_from_tell(error),
+            });
+        if result.is_ok() {
+            self.count = self.count.saturating_add(1);
+        }
+        Box::pin(async move { result })
+    }
+
+    fn finish(self: Box<Self>) -> usize {
+        self.count
+    }
+}
+
+struct ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    actor: ActorRef<ActorSinkMessage<T, Ack>>,
+    protocol: AckProtocol<Ack>,
+    initialized: bool,
+    completed: bool,
+    count: usize,
+}
+
+impl<T, Ack> ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    async fn ensure_initialized(&mut self, item: T) -> Result<T, StreamRunError<T>> {
+        if self.initialized {
+            return Ok(item);
+        }
+
+        match self.ask_init().await {
+            Ok(()) => {
+                self.initialized = true;
+                Ok(item)
+            }
+            Err(ActorControlAckError::MailboxFull) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitMailboxFull { item },
+            }),
+            Err(ActorControlAckError::MailboxClosed) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitMailboxClosed { item },
+            }),
+            Err(ActorControlAckError::Timeout) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitAckTimeout {
+                    item,
+                    timeout: self.protocol.timeout(),
+                },
+            }),
+            Err(ActorControlAckError::Dropped) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitAckDropped { item },
+            }),
+            Err(ActorControlAckError::UnexpectedAck) => Err(StreamRunError::Actor {
+                error: ActorStreamError::InitUnexpectedAck { item },
+            }),
+        }
+    }
+
+    async fn ask_init(&mut self) -> Result<(), ActorControlAckError> {
+        let (sender, receiver) = oneshot::channel();
+        let message = ActorSinkMessage::Init {
+            reply_to: ReplyTo::new(sender),
+        };
+        self.actor
+            .tell(message)
+            .map_err(control_error_from_sink_tell)?;
+        Self::await_ack(
+            self.protocol.timeout(),
+            self.protocol.ack().clone(),
+            receiver,
+        )
+        .await
+    }
+
+    async fn ask_item(&mut self, item: T) -> StreamRunResult<T, ()> {
+        let (sender, receiver) = oneshot::channel();
+        let message = ActorSinkMessage::Element {
+            item,
+            reply_to: ReplyTo::new(sender),
+        };
+
+        self.actor.tell(message).map_err(|error| {
+            let error = match error {
+                TellError::Full(message) => {
+                    let item = message
+                        .into_item()
+                        .expect("element tell error should preserve stream item");
+                    ActorStreamError::MailboxFull { item }
+                }
+                TellError::Closed(message) => {
+                    let item = message
+                        .into_item()
+                        .expect("element tell error should preserve stream item");
+                    ActorStreamError::MailboxClosed { item }
+                }
+            };
+            StreamRunError::Actor { error }
+        })?;
+
+        Self::await_ack(
+            self.protocol.timeout(),
+            self.protocol.ack().clone(),
+            receiver,
+        )
+        .await
+        .map_err(|error| {
+            let error = match error {
+                ActorControlAckError::MailboxFull | ActorControlAckError::MailboxClosed => {
+                    unreachable!("mailbox failures are handled before awaiting item ack")
+                }
+                ActorControlAckError::Timeout => ActorStreamError::AckTimeout {
+                    timeout: self.protocol.timeout(),
+                },
+                ActorControlAckError::Dropped => ActorStreamError::AckDropped,
+                ActorControlAckError::UnexpectedAck => ActorStreamError::UnexpectedAck,
+            };
+            StreamRunError::Actor { error }
+        })?;
+
+        self.count = self.count.saturating_add(1);
+        Ok(())
+    }
+
+    async fn await_ack(
+        timeout: Duration,
+        expected_ack: Ack,
+        receiver: oneshot::Receiver<Ack>,
+    ) -> Result<(), ActorControlAckError> {
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(ack)) if ack == expected_ack => Ok(()),
+            Ok(Ok(_unexpected)) => Err(ActorControlAckError::UnexpectedAck),
+            Ok(Err(_dropped)) => Err(ActorControlAckError::Dropped),
+            Err(_elapsed) => Err(ActorControlAckError::Timeout),
+        }
+    }
+
+    fn send_complete(&mut self) -> Result<(), ActorControlDeliveryError> {
+        self.actor
+            .tell(ActorSinkMessage::Complete)
+            .map_err(delivery_error_from_sink_tell)
+    }
+
+    fn send_signal(
+        &mut self,
+        message: ActorSinkMessage<T, Ack>,
+    ) -> Result<(), ActorControlDeliveryError> {
+        self.actor
+            .tell(message)
+            .map_err(delivery_error_from_sink_tell)
+    }
+}
+
+impl<T, Ack> SinkStage<T, usize> for ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    fn consume<'a>(
+        &'a mut self,
+        item: T,
+    ) -> Pin<Box<dyn Future<Output = StreamRunResult<T, ()>> + Send + 'a>> {
+        Box::pin(async move {
+            let item = self.ensure_initialized(item).await?;
+            self.ask_item(item).await
+        })
+    }
+
+    fn source_failed(&mut self, error: StreamError) {
+        if !self.completed {
+            let _ignored = self.send_signal(ActorSinkMessage::Failure { error });
+            self.completed = true;
+        }
+    }
+
+    fn finish(mut self: Box<Self>) -> usize {
+        if !self.completed {
+            let _ignored = self.send_complete();
+            self.completed = true;
+        }
+        self.count
+    }
+}
+
+impl<T, Ack> Drop for ActorRefWithAckSinkStage<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + PartialEq + Send + 'static,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ignored = self.send_signal(ActorSinkMessage::Cancelled {
+                reason: "actor sink dropped".to_string(),
+            });
+            self.completed = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorControlAckError {
+    MailboxFull,
+    MailboxClosed,
+    Timeout,
+    Dropped,
+    UnexpectedAck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorControlDeliveryError {
+    MailboxFull,
+    MailboxClosed,
+}
+
+fn actor_stream_error_from_tell<T>(error: TellError<T>) -> ActorStreamError<T>
+where
+    T: Message,
+{
+    match error {
+        TellError::Full(item) => ActorStreamError::MailboxFull { item },
+        TellError::Closed(item) => ActorStreamError::MailboxClosed { item },
+    }
+}
+
+#[cfg(feature = "adapters")]
+fn entity_sink_error_from_tell<T>(error: EntityTellError<T>) -> crate::EntitySinkError<T>
+where
+    T: Message,
+{
+    match error {
+        EntityTellError::NoRoute { message, error } => {
+            crate::EntitySinkError::NoRoute { message, error }
+        }
+        EntityTellError::Delivery { message, failure } => {
+            crate::EntitySinkError::Delivery { message, failure }
+        }
+    }
+}
+
+fn control_error_from_sink_tell<T, Ack>(
+    error: TellError<ActorSinkMessage<T, Ack>>,
+) -> ActorControlAckError
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    match error {
+        TellError::Full(_message) => ActorControlAckError::MailboxFull,
+        TellError::Closed(_message) => ActorControlAckError::MailboxClosed,
+    }
+}
+
+fn delivery_error_from_sink_tell<T, Ack>(
+    error: TellError<ActorSinkMessage<T, Ack>>,
+) -> ActorControlDeliveryError
+where
+    T: Send + 'static,
+    Ack: Send + 'static,
+{
+    match error {
+        TellError::Full(_message) => ActorControlDeliveryError::MailboxFull,
+        TellError::Closed(_message) => ActorControlDeliveryError::MailboxClosed,
+    }
+}
+
+struct FacadeActorSourceActor<T>
+where
+    T: Send + 'static,
+{
+    sink: StreamSink<T>,
+}
+
+impl<T> FacadeActorSourceActor<T>
+where
+    T: Send + 'static,
+{
+    fn new(sink: StreamSink<T>) -> Self {
+        Self { sink }
+    }
+}
+
+impl<T> Actor for FacadeActorSourceActor<T>
+where
+    T: Send + 'static,
+{
+    type Msg = T;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        actor_future(async move {
+            match self.sink.send(msg).await {
+                Ok(()) => Ok(ActorAction::Continue),
+                Err(_closed) => Ok(ActorAction::Stop),
+            }
+        })
+    }
+}
+
+struct FacadeAckedActorSourceActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    sink: StreamSink<T>,
+    protocol: AckProtocol<Ack>,
+}
+
+impl<T, Ack> FacadeAckedActorSourceActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    fn new(sink: StreamSink<T>, protocol: AckProtocol<Ack>) -> Self {
+        Self { sink, protocol }
+    }
+}
+
+impl<T, Ack> Actor for FacadeAckedActorSourceActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    type Msg = ActorSourceMessage<T, Ack>;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        actor_future(async move {
+            match msg {
+                ActorSourceMessage::Element { item, reply_to } => {
+                    match self.sink.send(item).await {
+                        Ok(()) => {
+                            let _ignored = reply_to.reply(self.protocol.ack().clone());
+                            Ok(ActorAction::Continue)
+                        }
+                        Err(_closed) => Ok(ActorAction::Stop),
+                    }
+                }
+                ActorSourceMessage::Complete => {
+                    let _ignored = self.sink.drain();
+                    Ok(ActorAction::Stop)
+                }
+                ActorSourceMessage::Failure { error } => {
+                    let _dropped = self.sink.cancel(error.to_string());
+                    Ok(ActorAction::Stop)
+                }
+                ActorSourceMessage::Cancelled { reason } => {
+                    let _dropped = self.sink.cancel(reason);
+                    Ok(ActorAction::Stop)
+                }
+            }
+        })
+    }
+}
+
+fn validate_capacity(capacity: usize) -> StreamResult<()> {
+    if capacity == 0 {
+        Err(StreamError::InvalidCapacity { capacity })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_parallelism(operator: &str, parallelism: usize) -> StreamResult<()> {
+    if parallelism == 0 {
+        Err(StreamError::Operator {
+            message: format!("{operator} parallelism must be greater than zero"),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive(operator: &str, parameter: &str, value: usize) -> StreamResult<()> {
+    if value == 0 {
+        Err(StreamError::Operator {
+            message: format!("{operator} {parameter} must be greater than zero"),
+        })
+    } else {
+        Ok(())
+    }
+}

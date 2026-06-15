@@ -11,7 +11,58 @@ use rakka_core::{
 
 use crate::effect::{DurableEffect, DurableStateChange};
 use crate::error::DurableResult;
-use crate::store::{DurableState, DurableStateStore, PersistenceId, Revision, StateRecord};
+use crate::store::{
+    DurableState, DurableStateStore, PersistFailureBackoff, PersistenceId, Revision, StateRecord,
+};
+
+/// Runtime signal emitted by a durable-state actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableStateSignal {
+    /// Recovery is about to load state.
+    RecoveryStarted {
+        /// Durable identity being recovered.
+        persistence_id: PersistenceId,
+    },
+    /// Recovery completed.
+    RecoveryCompleted {
+        /// Durable identity that recovered.
+        persistence_id: PersistenceId,
+        /// Recovered durable-state revision.
+        revision: Revision,
+    },
+    /// A durable-state write failed.
+    PersistFailed {
+        /// Durable identity being written.
+        persistence_id: PersistenceId,
+        /// Attempt number, starting at zero.
+        attempt: u32,
+        /// Stable error code.
+        error_code: &'static str,
+        /// Human-readable error detail.
+        message: String,
+    },
+    /// A durable-state delete failed.
+    DeleteFailed {
+        /// Durable identity being deleted.
+        persistence_id: PersistenceId,
+        /// Attempt number, starting at zero.
+        attempt: u32,
+        /// Stable error code.
+        error_code: &'static str,
+        /// Human-readable error detail.
+        message: String,
+    },
+    /// The actor is about to recover after a restart.
+    PreRestart {
+        /// Durable identity being restarted.
+        persistence_id: PersistenceId,
+    },
+    /// The actor stopped.
+    PostStop {
+        /// Durable identity that stopped.
+        persistence_id: PersistenceId,
+    },
+}
 
 /// Boxed future returned by durable actor command handlers.
 pub type DurableActorFuture<'a, S> =
@@ -47,6 +98,16 @@ pub trait DurableActor: Send + 'static {
         state: &'a Self::State,
         command: Self::Command,
     ) -> DurableActorFuture<'a, Self::State>;
+
+    /// Returns the retry policy used for failed durable writes.
+    fn persist_failure_backoff(&self) -> PersistFailureBackoff {
+        PersistFailureBackoff::disabled()
+    }
+
+    /// Handles durable-state runtime signals.
+    fn on_signal(&mut self, _signal: DurableStateSignal) -> DurableResult<()> {
+        Ok(())
+    }
 }
 
 /// Durable actor context.
@@ -235,6 +296,11 @@ where
     }
 
     async fn recover(&mut self) -> RakkaResult<()> {
+        self.actor
+            .on_signal(DurableStateSignal::RecoveryStarted {
+                persistence_id: self.persistence_id.clone(),
+            })
+            .map_err(|error| error.into_rakka_error())?;
         let loaded = self
             .store
             .load(&self.persistence_id)
@@ -242,6 +308,16 @@ where
             .map_err(|error| error.into_rakka_error())?;
         self.record =
             Some(loaded.unwrap_or_else(|| StateRecord::missing(self.actor.empty_state())));
+        let revision = self
+            .record
+            .as_ref()
+            .map_or(Revision::INITIAL, |record| record.revision);
+        self.actor
+            .on_signal(DurableStateSignal::RecoveryCompleted {
+                persistence_id: self.persistence_id.clone(),
+                revision,
+            })
+            .map_err(|error| error.into_rakka_error())?;
         Ok(())
     }
 
@@ -259,20 +335,15 @@ where
             .revision;
 
         match state_change {
-            DurableStateChange::None => {}
+            DurableStateChange::None | DurableStateChange::Unhandled => {}
             DurableStateChange::Persist(state) => {
                 let record = self
-                    .store
-                    .compare_and_set(&self.persistence_id, current_revision, state)
-                    .await
-                    .map_err(|error| error.into_rakka_error())?;
+                    .compare_and_set_with_backoff(current_revision, state)
+                    .await?;
                 self.record = Some(record);
             }
             DurableStateChange::Delete => {
-                self.store
-                    .delete(&self.persistence_id, current_revision)
-                    .await
-                    .map_err(|error| error.into_rakka_error())?;
+                self.delete_with_backoff(current_revision).await?;
                 self.record = Some(StateRecord::missing(self.actor.empty_state()));
             }
         }
@@ -285,6 +356,70 @@ where
             Ok(ActorAction::Stop)
         } else {
             Ok(ActorAction::Continue)
+        }
+    }
+
+    async fn compare_and_set_with_backoff(
+        &mut self,
+        expected_revision: Revision,
+        state: A::State,
+    ) -> RakkaResult<StateRecord<A::State>> {
+        let backoff = self.actor.persist_failure_backoff();
+        let mut attempt = 0;
+
+        loop {
+            match self
+                .store
+                .compare_and_set(&self.persistence_id, expected_revision, state.clone())
+                .await
+            {
+                Ok(record) => return Ok(record),
+                Err(error) => {
+                    self.actor
+                        .on_signal(DurableStateSignal::PersistFailed {
+                            persistence_id: self.persistence_id.clone(),
+                            attempt,
+                            error_code: error.code(),
+                            message: error.to_string(),
+                        })
+                        .map_err(|error| error.into_rakka_error())?;
+                    if attempt >= backoff.max_retries() {
+                        return Err(error.into_rakka_error());
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(backoff.retry_delay()).await;
+                }
+            }
+        }
+    }
+
+    async fn delete_with_backoff(&mut self, expected_revision: Revision) -> RakkaResult<Revision> {
+        let backoff = self.actor.persist_failure_backoff();
+        let mut attempt = 0;
+
+        loop {
+            match self
+                .store
+                .delete(&self.persistence_id, expected_revision)
+                .await
+            {
+                Ok(revision) => return Ok(revision),
+                Err(error) => {
+                    self.actor
+                        .on_signal(DurableStateSignal::DeleteFailed {
+                            persistence_id: self.persistence_id.clone(),
+                            attempt,
+                            error_code: error.code(),
+                            message: error.to_string(),
+                        })
+                        .map_err(|error| error.into_rakka_error())?;
+                    if attempt >= backoff.max_retries() {
+                        return Err(error.into_rakka_error());
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(backoff.retry_delay()).await;
+                }
+            }
         }
     }
 }
@@ -309,6 +444,11 @@ where
         _failure: &'a rakka_core::ActorFailure,
     ) -> ActorFuture<'a> {
         actor_future(async move {
+            self.actor
+                .on_signal(DurableStateSignal::PreRestart {
+                    persistence_id: self.persistence_id.clone(),
+                })
+                .map_err(|error| error.into_rakka_error())?;
             self.recover().await?;
             Ok(ActorAction::Continue)
         })
@@ -337,6 +477,21 @@ where
                 .map_err(|error| error.into_rakka_error())?;
 
             self.apply_effect(effect).await
+        })
+    }
+
+    fn stopped<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        _reason: &'a rakka_core::TerminationReason,
+    ) -> ActorFuture<'a> {
+        actor_future(async move {
+            self.actor
+                .on_signal(DurableStateSignal::PostStop {
+                    persistence_id: self.persistence_id.clone(),
+                })
+                .map_err(|error| error.into_rakka_error())?;
+            Ok(ActorAction::Continue)
         })
     }
 }

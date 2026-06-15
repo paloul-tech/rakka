@@ -7,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use rakka_cluster::{
-    ClusterMembership, ClusterNode, DiscoveryProvider, DiscoverySnapshot, MemberRecord,
-    MembershipConfig, MembershipState, NodeAddress, NodeId,
+    ClusterMembership, ClusterNode, ClusterState, DiscoveryProvider, DiscoverySnapshot,
+    MemberRecord, MembershipConfig, MembershipState, NodeAddress, NodeId,
 };
 use rakka_core::{Message, MetricsRecorder, NoopMetricsRecorder, ReplyTo};
 use rakka_remote::{
@@ -18,9 +18,10 @@ use rakka_remote::{
 };
 
 use crate::{
-    ClusterShardingError, ClusterShardingRuntime, ClusterShardingUpdate, EntityRoute,
-    RemoteEntityAskClient, RemoteEntityAskInbound, RemoteEntityInbound, RemoteEntityRoute,
-    RemoteTransportEntityOutbound, ShardRegion,
+    AsyncShardCoordinatorStore, ClusterShardingError, ClusterShardingRuntime,
+    ClusterShardingUpdate, EntityRoute, RemoteEntityAskClient, RemoteEntityAskInbound,
+    RemoteEntityInbound, RemoteEntityRoute, RemoteTransportEntityOutbound, ShardCoordinatorLease,
+    ShardCoordinatorStore, ShardRegion,
 };
 
 /// Convenient result alias for networked cluster node runtime operations.
@@ -96,6 +97,22 @@ pub struct ClusterNodeRuntimeBuilder {
     registry: SerializationRegistry,
     recorder: Arc<dyn MetricsRecorder>,
     advertise_bound_addr: bool,
+    coordinator_store: Option<CoordinatorStoreBuilderMode>,
+    coordinator_lease: Option<Arc<dyn ShardCoordinatorLease>>,
+}
+
+enum CoordinatorStoreBuilderMode {
+    Sync(Arc<dyn ShardCoordinatorStore>),
+    Async(Arc<dyn AsyncShardCoordinatorStore>),
+}
+
+impl CoordinatorStoreBuilderMode {
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Sync(store) => ShardCoordinatorStore::backend_name(store.as_ref()),
+            Self::Async(store) => AsyncShardCoordinatorStore::backend_name(store.as_ref()),
+        }
+    }
 }
 
 impl ClusterNodeRuntimeBuilder {
@@ -109,6 +126,8 @@ impl ClusterNodeRuntimeBuilder {
             registry: SerializationRegistry::new(),
             recorder: Arc::new(NoopMetricsRecorder),
             advertise_bound_addr: false,
+            coordinator_store: None,
+            coordinator_lease: None,
         }
     }
 
@@ -151,6 +170,70 @@ impl ClusterNodeRuntimeBuilder {
         self
     }
 
+    /// Sets a durable store for shard coordinator ownership snapshots.
+    #[must_use]
+    pub fn with_shard_coordinator_store(
+        mut self,
+        coordinator_store: impl ShardCoordinatorStore,
+    ) -> Self {
+        self.coordinator_store = Some(CoordinatorStoreBuilderMode::Sync(Arc::new(
+            coordinator_store,
+        )));
+        self
+    }
+
+    /// Sets a shared durable store for shard coordinator ownership snapshots.
+    #[must_use]
+    pub fn with_shard_coordinator_store_ref(
+        mut self,
+        coordinator_store: Arc<dyn ShardCoordinatorStore>,
+    ) -> Self {
+        self.coordinator_store = Some(CoordinatorStoreBuilderMode::Sync(coordinator_store));
+        self
+    }
+
+    /// Sets an async durable store for shard coordinator ownership snapshots.
+    #[must_use]
+    pub fn with_async_shard_coordinator_store(
+        mut self,
+        coordinator_store: impl AsyncShardCoordinatorStore,
+    ) -> Self {
+        self.coordinator_store = Some(CoordinatorStoreBuilderMode::Async(Arc::new(
+            coordinator_store,
+        )));
+        self
+    }
+
+    /// Sets a shared async durable store for shard coordinator ownership snapshots.
+    #[must_use]
+    pub fn with_async_shard_coordinator_store_ref(
+        mut self,
+        coordinator_store: Arc<dyn AsyncShardCoordinatorStore>,
+    ) -> Self {
+        self.coordinator_store = Some(CoordinatorStoreBuilderMode::Async(coordinator_store));
+        self
+    }
+
+    /// Sets an async leadership lease for shard coordinator decisions.
+    #[must_use]
+    pub fn with_shard_coordinator_lease(
+        mut self,
+        coordinator_lease: impl ShardCoordinatorLease,
+    ) -> Self {
+        self.coordinator_lease = Some(Arc::new(coordinator_lease));
+        self
+    }
+
+    /// Sets a shared async leadership lease for shard coordinator decisions.
+    #[must_use]
+    pub fn with_shard_coordinator_lease_ref(
+        mut self,
+        coordinator_lease: Arc<dyn ShardCoordinatorLease>,
+    ) -> Self {
+        self.coordinator_lease = Some(coordinator_lease);
+        self
+    }
+
     /// Binds TCP remoting and creates the cluster node runtime.
     pub async fn build(self) -> ClusterNodeRuntimeResult<ClusterNodeRuntime> {
         let endpoint = RemoteEndpoint::new(self.local_node.id().clone());
@@ -171,7 +254,18 @@ impl ClusterNodeRuntimeBuilder {
             self.advertise_bound_addr,
         );
         let membership = ClusterMembership::new(local_node.clone(), self.membership_config);
-        let sharding = ClusterShardingRuntime::new(membership);
+        let mut sharding = match self.coordinator_store {
+            Some(CoordinatorStoreBuilderMode::Sync(store)) => {
+                ClusterShardingRuntime::with_coordinator_store_ref(membership, store)
+            }
+            Some(CoordinatorStoreBuilderMode::Async(store)) => {
+                ClusterShardingRuntime::with_async_coordinator_store_ref(membership, store)
+            }
+            None => ClusterShardingRuntime::new(membership),
+        };
+        if let Some(coordinator_lease) = self.coordinator_lease {
+            sharding = sharding.with_coordinator_lease_ref(coordinator_lease);
+        }
 
         Ok(ClusterNodeRuntime {
             local_node,
@@ -192,6 +286,20 @@ impl Debug for ClusterNodeRuntimeBuilder {
             .field("membership_config", &self.membership_config)
             .field("transport_config", &self.transport_config)
             .field("advertise_bound_addr", &self.advertise_bound_addr)
+            .field(
+                "coordinator_store",
+                &self
+                    .coordinator_store
+                    .as_ref()
+                    .map(CoordinatorStoreBuilderMode::backend_name),
+            )
+            .field(
+                "coordinator_lease",
+                &self
+                    .coordinator_lease
+                    .as_ref()
+                    .map(|lease| ShardCoordinatorLease::lease_name(lease.as_ref())),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -343,6 +451,18 @@ impl ClusterNodeRuntime {
         Ok(())
     }
 
+    /// Registers a shard region through async durable coordinator storage when configured.
+    pub async fn register_region_async<M>(
+        &mut self,
+        region: ShardRegion<M>,
+    ) -> ClusterNodeRuntimeResult<()>
+    where
+        M: Message,
+    {
+        self.sharding.register_region_async(region).await?;
+        Ok(())
+    }
+
     /// Registers a shard region and a default inbound remote tell handler for its entity type.
     pub fn register_entity_region<M>(
         &mut self,
@@ -353,6 +473,23 @@ impl ClusterNodeRuntime {
     {
         let entity_type = region.entity_type().clone();
         self.sharding.register_region(region.clone())?;
+        self.endpoint.register_entity_handler(
+            entity_type.as_str(),
+            RemoteEntityInbound::new(region, self.registry.clone()),
+        )?;
+        Ok(())
+    }
+
+    /// Registers a shard region and default inbound remote tell handler through async storage.
+    pub async fn register_entity_region_async<M>(
+        &mut self,
+        region: ShardRegion<M>,
+    ) -> ClusterNodeRuntimeResult<()>
+    where
+        M: Message + Sync,
+    {
+        let entity_type = region.entity_type().clone();
+        self.sharding.register_region_async(region.clone()).await?;
         self.endpoint.register_entity_handler(
             entity_type.as_str(),
             RemoteEntityInbound::new(region, self.registry.clone()),
@@ -371,6 +508,22 @@ impl ClusterNodeRuntime {
     {
         let entity_type = region.entity_type().clone();
         self.sharding.register_region(region)?;
+        self.endpoint
+            .register_entity_handler(entity_type.as_str(), handler)?;
+        Ok(())
+    }
+
+    /// Registers a shard region and custom inbound remote handler through async storage.
+    pub async fn register_entity_handler_async<M>(
+        &mut self,
+        region: ShardRegion<M>,
+        handler: impl RemoteEnvelopeHandler,
+    ) -> ClusterNodeRuntimeResult<()>
+    where
+        M: Message,
+    {
+        let entity_type = region.entity_type().clone();
+        self.sharding.register_region_async(region).await?;
         self.endpoint
             .register_entity_handler(entity_type.as_str(), handler)?;
         Ok(())
@@ -398,12 +551,44 @@ impl ClusterNodeRuntime {
         self.register_entity_handler(region, handler)
     }
 
+    /// Registers a shard region and inbound remote ask handler through async storage.
+    pub async fn register_entity_ask_region_async<Q, M, R, B>(
+        &mut self,
+        region: ShardRegion<M>,
+        build: B,
+    ) -> ClusterNodeRuntimeResult<()>
+    where
+        Q: Message + Sync,
+        M: Message,
+        R: Send + Sync + 'static,
+        B: Fn(Q, ReplyTo<R>) -> M + Send + Sync + 'static,
+    {
+        let handler = RemoteEntityAskInbound::new(
+            self.local_node.id().clone(),
+            region.clone(),
+            self.registry.clone(),
+            self.transport.clone(),
+            build,
+        );
+        self.register_entity_handler_async(region, handler).await
+    }
+
     /// Applies a discovery snapshot, refreshes sharding, and registers newly known TCP peers.
     pub fn apply_discovery(
         &mut self,
         snapshot: DiscoverySnapshot,
     ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
         let update = self.sharding.apply_discovery(snapshot)?;
+        let registered_peers = self.register_peers_from_membership()?;
+        Ok(ClusterNodeRuntimeUpdate::new(update, registered_peers))
+    }
+
+    /// Applies a discovery snapshot through async durable storage and registers TCP peers.
+    pub async fn apply_discovery_async(
+        &mut self,
+        snapshot: DiscoverySnapshot,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let update = self.sharding.apply_discovery_async(snapshot).await?;
         let registered_peers = self.register_peers_from_membership()?;
         Ok(ClusterNodeRuntimeUpdate::new(update, registered_peers))
     }
@@ -420,6 +605,100 @@ impl ClusterNodeRuntime {
         self.apply_discovery(snapshot)
     }
 
+    /// Polls discovery, applies the snapshot through async storage, and registers peers.
+    pub async fn poll_discovery_async(
+        &mut self,
+        provider: &impl DiscoveryProvider,
+        observed_at_millis: u64,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let snapshot = provider
+            .discover(observed_at_millis)
+            .map_err(ClusterShardingError::from)?;
+        self.apply_discovery_async(snapshot).await
+    }
+
+    /// Mirrors a high-level cluster facade state into this node runtime.
+    ///
+    /// This bridge applies member descriptors through discovery, then applies
+    /// leaving and down states that affect shard ownership. It intentionally
+    /// keeps the cluster facade as the membership decision source for callers
+    /// that opt into both surfaces.
+    pub fn apply_cluster_state(
+        &mut self,
+        state: &ClusterState,
+    ) -> ClusterNodeRuntimeResult<Vec<ClusterNodeRuntimeUpdate>> {
+        let mut updates = Vec::new();
+        let snapshot = DiscoverySnapshot::new(
+            "cluster-facade",
+            state.revision(),
+            state
+                .members()
+                .iter()
+                .filter(|member| member.state() != MembershipState::Removed)
+                .map(|member| member.node().clone()),
+        );
+        updates.push(self.apply_discovery(snapshot)?);
+
+        for member in state.members() {
+            match member.state() {
+                MembershipState::Leaving => {
+                    updates.push(self.mark_leaving(member.node().id(), state.revision())?);
+                }
+                MembershipState::Down => {
+                    updates.push(self.mark_down(member.node().id(), state.revision())?);
+                }
+                MembershipState::Joining
+                | MembershipState::Up
+                | MembershipState::Unreachable
+                | MembershipState::Removed => {}
+            }
+        }
+
+        Ok(updates)
+    }
+
+    /// Mirrors a high-level cluster facade state through async durable sharding
+    /// APIs when configured.
+    pub async fn apply_cluster_state_async(
+        &mut self,
+        state: &ClusterState,
+    ) -> ClusterNodeRuntimeResult<Vec<ClusterNodeRuntimeUpdate>> {
+        let mut updates = Vec::new();
+        let snapshot = DiscoverySnapshot::new(
+            "cluster-facade",
+            state.revision(),
+            state
+                .members()
+                .iter()
+                .filter(|member| member.state() != MembershipState::Removed)
+                .map(|member| member.node().clone()),
+        );
+        updates.push(self.apply_discovery_async(snapshot).await?);
+
+        for member in state.members() {
+            match member.state() {
+                MembershipState::Leaving => {
+                    updates.push(
+                        self.mark_leaving_async(member.node().id(), state.revision())
+                            .await?,
+                    );
+                }
+                MembershipState::Down => {
+                    updates.push(
+                        self.mark_down_async(member.node().id(), state.revision())
+                            .await?,
+                    );
+                }
+                MembershipState::Joining
+                | MembershipState::Up
+                | MembershipState::Unreachable
+                | MembershipState::Removed => {}
+            }
+        }
+
+        Ok(updates)
+    }
+
     /// Records a heartbeat and refreshes ownership if membership changed.
     pub fn heartbeat(
         &mut self,
@@ -427,6 +706,19 @@ impl ClusterNodeRuntime {
         observed_at_millis: u64,
     ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
         let sharding = self.sharding.heartbeat(node_id, observed_at_millis)?;
+        Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
+    }
+
+    /// Records a heartbeat and refreshes ownership through async storage.
+    pub async fn heartbeat_async(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let sharding = self
+            .sharding
+            .heartbeat_async(node_id, observed_at_millis)
+            .await?;
         Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
     }
 
@@ -440,6 +732,19 @@ impl ClusterNodeRuntime {
         Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
     }
 
+    /// Begins graceful leave and refreshes ownership through async storage.
+    pub async fn mark_leaving_async(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let sharding = self
+            .sharding
+            .mark_leaving_async(node_id, observed_at_millis)
+            .await?;
+        Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
+    }
+
     /// Begins graceful leave for the local node and refreshes ownership.
     pub fn leave_local(
         &mut self,
@@ -447,6 +752,15 @@ impl ClusterNodeRuntime {
     ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
         let node_id = self.local_node.id().clone();
         self.mark_leaving(&node_id, observed_at_millis)
+    }
+
+    /// Begins graceful leave for the local node through async storage.
+    pub async fn leave_local_async(
+        &mut self,
+        observed_at_millis: u64,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let node_id = self.local_node.id().clone();
+        self.mark_leaving_async(&node_id, observed_at_millis).await
     }
 
     /// Marks a member down and refreshes ownership.
@@ -459,10 +773,44 @@ impl ClusterNodeRuntime {
         Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
     }
 
+    /// Marks a member down and refreshes ownership through async storage.
+    pub async fn mark_down_async(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let sharding = self
+            .sharding
+            .mark_down_async(node_id, observed_at_millis)
+            .await?;
+        Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
+    }
+
     /// Advances failure detection and refreshes ownership after unreachable/down events.
     pub fn tick(&mut self, now_millis: u64) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
         let sharding = self.sharding.tick(now_millis)?;
         Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
+    }
+
+    /// Advances failure detection and refreshes ownership through async storage.
+    pub async fn tick_async(
+        &mut self,
+        now_millis: u64,
+    ) -> ClusterNodeRuntimeResult<ClusterNodeRuntimeUpdate> {
+        let sharding = self.sharding.tick_async(now_millis).await?;
+        Ok(ClusterNodeRuntimeUpdate::new(sharding, 0))
+    }
+
+    /// Renews all currently held shard coordinator leadership leases.
+    pub async fn renew_coordinator_leases_async(&mut self) -> ClusterNodeRuntimeResult<()> {
+        self.sharding.renew_coordinator_leases_async().await?;
+        Ok(())
+    }
+
+    /// Releases all currently held shard coordinator leadership leases.
+    pub async fn release_coordinator_leases_async(&mut self) -> ClusterNodeRuntimeResult<()> {
+        self.sharding.release_coordinator_leases_async().await?;
+        Ok(())
     }
 
     fn register_peers_from_membership(&mut self) -> ClusterNodeRuntimeResult<usize> {

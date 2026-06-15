@@ -1,5 +1,9 @@
 //! Remote envelope types and Protobuf envelope codec.
 
+use std::str::FromStr;
+
+use rakka_cluster::NodeId;
+use rakka_core::{ActorPath, ActorUid, SerializedActorRef};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RemoteError, RemoteResult};
@@ -88,6 +92,108 @@ pub enum RemoteDestination {
         /// Request id being completed.
         request_id: String,
     },
+    /// Route to a concrete actor incarnation.
+    ActorRef {
+        /// Remote actor incarnation descriptor.
+        actor_ref: Box<RemoteActorRef>,
+    },
+}
+
+impl RemoteDestination {
+    /// Creates a destination for one concrete actor incarnation.
+    #[must_use]
+    pub fn actor_ref(actor_ref: RemoteActorRef) -> Self {
+        Self::ActorRef {
+            actor_ref: Box::new(actor_ref),
+        }
+    }
+}
+
+/// Transport-serializable descriptor for one concrete actor incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RemoteActorRef {
+    node_id: NodeId,
+    system_name: String,
+    path: ActorPath,
+    uid: ActorUid,
+    message_type: String,
+}
+
+impl RemoteActorRef {
+    /// Creates a remote actor-reference descriptor.
+    pub fn new(
+        node_id: NodeId,
+        system_name: impl Into<String>,
+        path: ActorPath,
+        uid: ActorUid,
+        message_type: impl Into<String>,
+    ) -> RemoteResult<Self> {
+        validate_node_id(&node_id)?;
+        let system_name = require_non_empty("actor_system_name", system_name.into())?;
+        let path = ActorPath::new(require_non_empty("path", path.to_string())?);
+        let uid = require_non_zero("actor_uid", uid.value()).map(ActorUid::new)?;
+        let message_type = require_non_empty("actor_message_type", message_type.into())?;
+
+        Ok(Self {
+            node_id,
+            system_name,
+            path,
+            uid,
+            message_type,
+        })
+    }
+
+    /// Creates a remote actor-reference descriptor from a local serialized ref.
+    pub fn from_serialized(node_id: NodeId, serialized: &SerializedActorRef) -> RemoteResult<Self> {
+        Self::new(
+            node_id,
+            serialized.system_name(),
+            serialized.path().clone(),
+            serialized.uid(),
+            serialized.message_type(),
+        )
+    }
+
+    /// Node that owns this actor incarnation.
+    #[must_use]
+    pub const fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    /// Actor system name that owns this actor.
+    #[must_use]
+    pub fn system_name(&self) -> &str {
+        &self.system_name
+    }
+
+    /// Logical actor path.
+    #[must_use]
+    pub const fn path(&self) -> &ActorPath {
+        &self.path
+    }
+
+    /// Actor incarnation uid.
+    #[must_use]
+    pub const fn uid(&self) -> ActorUid {
+        self.uid
+    }
+
+    /// Rust message type associated with this actor ref.
+    #[must_use]
+    pub fn message_type(&self) -> &str {
+        &self.message_type
+    }
+
+    /// Converts this descriptor back to a local serialized actor ref.
+    #[must_use]
+    pub fn to_serialized_ref(&self) -> SerializedActorRef {
+        SerializedActorRef::new(
+            self.system_name.clone(),
+            self.path.clone(),
+            self.uid,
+            self.message_type.clone(),
+        )
+    }
 }
 
 /// Wire envelope for remote messages.
@@ -241,6 +347,10 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 service_key: String::new(),
                 route_key: String::new(),
                 request_id: String::new(),
+                actor_node_id: String::new(),
+                actor_system_name: String::new(),
+                actor_uid: 0,
+                actor_message_type: String::new(),
             },
             RemoteDestination::Entity {
                 entity_type,
@@ -253,6 +363,10 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 service_key: String::new(),
                 route_key: String::new(),
                 request_id: String::new(),
+                actor_node_id: String::new(),
+                actor_system_name: String::new(),
+                actor_uid: 0,
+                actor_message_type: String::new(),
             },
             RemoteDestination::Service { service_key } => Self {
                 kind: ProtoDestinationKind::Service as i32,
@@ -262,6 +376,10 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 service_key,
                 route_key: String::new(),
                 request_id: String::new(),
+                actor_node_id: String::new(),
+                actor_system_name: String::new(),
+                actor_uid: 0,
+                actor_message_type: String::new(),
             },
             RemoteDestination::RouteKey { route_key } => Self {
                 kind: ProtoDestinationKind::RouteKey as i32,
@@ -271,6 +389,10 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 service_key: String::new(),
                 route_key,
                 request_id: String::new(),
+                actor_node_id: String::new(),
+                actor_system_name: String::new(),
+                actor_uid: 0,
+                actor_message_type: String::new(),
             },
             RemoteDestination::Reply { request_id } => Self {
                 kind: ProtoDestinationKind::Reply as i32,
@@ -280,7 +402,27 @@ impl From<RemoteDestination> for ProtoRemoteDestination {
                 service_key: String::new(),
                 route_key: String::new(),
                 request_id,
+                actor_node_id: String::new(),
+                actor_system_name: String::new(),
+                actor_uid: 0,
+                actor_message_type: String::new(),
             },
+            RemoteDestination::ActorRef { actor_ref } => {
+                let actor_ref = *actor_ref;
+                Self {
+                    kind: ProtoDestinationKind::ActorRef as i32,
+                    path: actor_ref.path.to_string(),
+                    entity_type: String::new(),
+                    entity_id: String::new(),
+                    service_key: String::new(),
+                    route_key: String::new(),
+                    request_id: String::new(),
+                    actor_node_id: actor_ref.node_id.to_string(),
+                    actor_system_name: actor_ref.system_name,
+                    actor_uid: actor_ref.uid.value(),
+                    actor_message_type: actor_ref.message_type,
+                }
+            }
         }
     }
 }
@@ -314,6 +456,18 @@ impl TryFrom<ProtoRemoteDestination> for RemoteDestination {
                 .map(|route_key| Self::RouteKey { route_key }),
             ProtoDestinationKind::Reply => require_non_empty("request_id", proto.request_id)
                 .map(|request_id| Self::Reply { request_id }),
+            ProtoDestinationKind::ActorRef => {
+                let node_id =
+                    parse_node_id(require_non_empty("actor_node_id", proto.actor_node_id)?)?;
+                RemoteActorRef::new(
+                    node_id,
+                    proto.actor_system_name,
+                    ActorPath::new(proto.path),
+                    ActorUid::new(proto.actor_uid),
+                    proto.actor_message_type,
+                )
+                .map(Self::actor_ref)
+            }
         }
     }
 }
@@ -325,5 +479,121 @@ fn require_non_empty(field: &str, value: String) -> RemoteResult<String> {
         })
     } else {
         Ok(value)
+    }
+}
+
+fn require_non_zero(field: &str, value: u64) -> RemoteResult<u64> {
+    if value == 0 {
+        Err(RemoteError::InvalidEnvelope {
+            message: format!("missing {field}"),
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_node_id(value: String) -> RemoteResult<NodeId> {
+    NodeId::from_str(&value).map_err(|error| RemoteError::InvalidEnvelope {
+        message: error.to_string(),
+    })
+}
+
+fn validate_node_id(node_id: &NodeId) -> RemoteResult<()> {
+    let _parsed = parse_node_id(node_id.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actor_ref_destination_rejects_missing_required_fields() {
+        assert_missing_actor_ref_field(actor_ref_proto_with(|proto| {
+            proto.actor_node_id.clear();
+        }));
+        assert_missing_actor_ref_field(actor_ref_proto_with(|proto| {
+            proto.actor_system_name.clear();
+        }));
+        assert_missing_actor_ref_field(actor_ref_proto_with(|proto| {
+            proto.path.clear();
+        }));
+        assert_missing_actor_ref_field(actor_ref_proto_with(|proto| {
+            proto.actor_uid = 0;
+        }));
+        assert_missing_actor_ref_field(actor_ref_proto_with(|proto| {
+            proto.actor_message_type.clear();
+        }));
+    }
+
+    #[test]
+    fn remote_actor_ref_constructor_rejects_missing_required_fields() {
+        assert!(RemoteActorRef::new(
+            NodeId::new("", ""),
+            "system",
+            ActorPath::new("/user/worker"),
+            ActorUid::new(1),
+            "rakka.test.Ping",
+        )
+        .is_err());
+        assert!(RemoteActorRef::new(
+            NodeId::new("rakka-0", "uid-a"),
+            "",
+            ActorPath::new("/user/worker"),
+            ActorUid::new(1),
+            "rakka.test.Ping",
+        )
+        .is_err());
+        assert!(RemoteActorRef::new(
+            NodeId::new("rakka-0", "uid-a"),
+            "system",
+            ActorPath::new(""),
+            ActorUid::new(1),
+            "rakka.test.Ping",
+        )
+        .is_err());
+        assert!(RemoteActorRef::new(
+            NodeId::new("rakka-0", "uid-a"),
+            "system",
+            ActorPath::new("/user/worker"),
+            ActorUid::new(0),
+            "rakka.test.Ping",
+        )
+        .is_err());
+        assert!(RemoteActorRef::new(
+            NodeId::new("rakka-0", "uid-a"),
+            "system",
+            ActorPath::new("/user/worker"),
+            ActorUid::new(1),
+            "",
+        )
+        .is_err());
+    }
+
+    fn assert_missing_actor_ref_field(proto: ProtoRemoteDestination) {
+        assert!(matches!(
+            RemoteDestination::try_from(proto),
+            Err(RemoteError::InvalidEnvelope { .. })
+        ));
+    }
+
+    fn actor_ref_proto_with(
+        mutate: impl FnOnce(&mut ProtoRemoteDestination),
+    ) -> ProtoRemoteDestination {
+        let mut proto = ProtoRemoteDestination {
+            kind: ProtoDestinationKind::ActorRef as i32,
+            path: "rakka://local/example/user/worker".to_string(),
+            entity_type: String::new(),
+            entity_id: String::new(),
+            service_key: String::new(),
+            route_key: String::new(),
+            request_id: String::new(),
+            actor_node_id: "rakka-0#uid-a".to_string(),
+            actor_system_name: "example".to_string(),
+            actor_uid: 42,
+            actor_message_type: "rakka.test.Ping".to_string(),
+        };
+        mutate(&mut proto);
+        proto
     }
 }

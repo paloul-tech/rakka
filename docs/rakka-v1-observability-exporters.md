@@ -19,6 +19,15 @@ The current exporter helpers are:
 - `rakka_http::open_telemetry_metrics_json_route` for a JSON bridge route;
 - `rakka_http::OperationalSnapshotRegistry` and `rakka_http::operational_snapshots_route` for named operational JSON snapshots.
 
+Coordinated shutdown records through the same boundary when it is created by
+`ActorSystem` or by `CoordinatedShutdown::with_metrics`:
+
+- `METRIC_SHUTDOWN_RUNNING` reports whether a shutdown run is active;
+- `METRIC_SHUTDOWN_PHASE_DURATION_MS` records phase latency with system, phase, reason, and status;
+- `METRIC_SHUTDOWN_TASK_DURATION_MS` records task latency with system, phase, task, reason, and status;
+- `METRIC_SHUTDOWN_TASK_FAILURES` counts failed shutdown tasks;
+- `METRIC_SHUTDOWN_TIMEOUTS` counts task and phase deadline expirations.
+
 ## Prometheus Export
 
 Rakka's canonical metric names use dots, for example `rakka.http.request.latency_ms`. Prometheus metric identifiers cannot contain dots, so the exporter maps dots and other unsupported characters to underscores. The canonical metric remains visible in the `# HELP` line.
@@ -62,9 +71,17 @@ snapshots.register_snapshot("kubernetes_health", {
     let health = health.clone();
     move || health.snapshot()
 });
+
+rakka_http::register_coordinated_shutdown_snapshot(
+    &snapshots,
+    system.coordinated_shutdown(),
+);
 ```
 
-Common snapshot providers include actor system snapshots, cluster membership operational snapshots, shard ownership snapshots, process actor status, stream status, Kubernetes health, HTTP/gRPC adapter state, and application-specific service state.
+Common snapshot providers include actor system snapshots, coordinated shutdown
+state, cluster membership operational snapshots, shard ownership snapshots,
+process actor status, stream status, Kubernetes health, HTTP/gRPC adapter state,
+and application-specific service state.
 
 ## Cardinality Guidance
 

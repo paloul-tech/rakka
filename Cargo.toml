@@ -1,12 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rakka",
     "crates/rakka-core",
     "crates/rakka-persistence",
     "crates/rakka-persistence-postgres",
     "crates/rakka-remote",
     "crates/rakka-cluster",
     "crates/rakka-sharding",
+    "crates/rakka-sharding-postgres",
     "crates/rakka-workflow",
     "crates/rakka-stream",
     "crates/rakka-process",
@@ -19,8 +21,15 @@ members = [
     "examples/external-binary-wrapper",
     "examples/edge-gateway",
     "examples/generated-contracts",
+    "examples/event-sourced-counter",
+    "examples/local-receptionist-router",
     "examples/minimal-system",
+    "examples/pool-router",
+    "examples/clustered-receptionist",
+    "examples/coordinated-shutdown",
     "examples/multi-node-sharding",
+    "examples/sharded-cart-persistence",
+    "examples/streams",
 ]
 
 [workspace.package]
@@ -31,6 +40,7 @@ repository = "https://github.com/rakka-rs/rakka"
 homepage = "https://github.com/rakka-rs/rakka"
 documentation = "https://docs.rs/rakka"
 readme = "README.md"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 axum = { version = "0.7.9", features = ["ws"] }

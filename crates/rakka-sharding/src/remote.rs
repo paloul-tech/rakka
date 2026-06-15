@@ -852,6 +852,16 @@ where
         self.local_route.acquire_shard(shard_id)
     }
 
+    fn activate_entity(
+        &self,
+        entity_type: &crate::EntityType,
+        entity_id: &crate::EntityId,
+        shard_id: crate::ShardId,
+    ) -> crate::ShardingResult<bool> {
+        self.local_route
+            .activate_entity(entity_type, entity_id, shard_id)
+    }
+
     fn shard_handoff_state(&self, shard_id: crate::ShardId) -> Option<crate::ShardHandoffState> {
         self.local_route.shard_handoff_state(shard_id)
     }

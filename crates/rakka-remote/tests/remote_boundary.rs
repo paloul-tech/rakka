@@ -1,18 +1,34 @@
 //! Integration tests for the remote envelope and serialization boundary.
 
 use prost::Message;
-use rakka_cluster::NodeId;
+use rakka_cluster::{
+    Cluster, ClusterNode, ClusterProtocol, ClusteredReceptionistSettings, MembershipConfig,
+    NodeAddress, NodeId,
+};
+use rakka_core::{
+    actor_fn, actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ActorPath,
+    ActorUid, CoordinatedShutdown, CoordinatedShutdownReason, Receptionist, Routers,
+    SerializedActorRef, ServiceKey, ShutdownOutcome,
+};
 use rakka_remote::{
-    EncodedPayload, InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteDestination,
+    register_remote_service_proxy_remove_node_task, register_tcp_remote_drain_task, EncodedPayload,
+    InMemoryRemoteTransport, ProtobufEnvelopeCodec, RemoteActorRef, RemoteActorRefInbound,
+    RemoteClusteredReceptionist, RemoteClusteredReceptionistError, RemoteDestination,
     RemoteEndpoint, RemoteEndpointError, RemoteEnvelope, RemoteEnvelopeMetadata, RemoteError,
-    RemoteRequestError, RemoteRequestRegistry, RemoteTransport, RemoteTransportError,
-    SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransportConfig,
-    DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
+    RemoteReceptionistListing, RemoteReceptionistListingCodec, RemoteRequestError,
+    RemoteRequestRegistry, RemoteServiceProxyError, RemoteServiceProxyRegistry,
+    RemoteServiceRoutee, RemoteServiceRouteeKey, RemoteTransport, RemoteTransportError,
+    SchemaCompatibilityPolicy, SerializationRegistry, TcpRemoteTransport, TcpRemoteTransportConfig,
+    TcpRemoteTransportError, DEFAULT_REMOTE_ENVELOPE_VERSION, DEFAULT_TCP_REMOTE_BIND_ADDR,
     DEFAULT_TCP_REMOTE_CONNECT_TIMEOUT, DEFAULT_TCP_REMOTE_IDLE_TIMEOUT,
     DEFAULT_TCP_REMOTE_MAX_FRAME_BYTES, DEFAULT_TCP_REMOTE_OUTBOUND_QUEUE_CAPACITY,
     DEFAULT_TCP_REMOTE_RECONNECT_BACKOFF, TCP_REMOTE_REQUIRES_REGISTERED_PEERS,
 };
+use std::any::type_name;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Clone, PartialEq, Message)]
 struct Ping {
@@ -72,6 +88,65 @@ fn tcp_remote_defaults_are_loopback_bounded_and_known_peer_only() {
     );
 }
 
+#[tokio::test]
+async fn coordinated_shutdown_drains_tcp_remote_peers_and_rejects_future_sends() {
+    let local = NodeId::new("rakka-0", "uid-a");
+    let remote = ClusterNode::new(
+        NodeId::new("rakka-1", "uid-b"),
+        NodeAddress::new("127.0.0.1", 1),
+    );
+    let endpoint = RemoteEndpoint::new(local.clone());
+    let transport = match TcpRemoteTransport::bind(
+        local,
+        ClusterProtocol::default(),
+        endpoint,
+        TcpRemoteTransportConfig::new()
+            .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .connect_timeout(Duration::from_millis(10))
+            .reconnect_backoff(Duration::from_millis(1)),
+    )
+    .await
+    {
+        Ok(transport) => transport,
+        Err(TcpRemoteTransportError::Io { message })
+            if message.contains("Operation not permitted")
+                || message.contains("Permission denied") =>
+        {
+            eprintln!("skipping tcp remote shutdown test; loopback bind denied: {message}");
+            return;
+        }
+        Err(error) => panic!("tcp transport should bind: {error:?}"),
+    };
+    transport.register_peer(remote.clone()).unwrap();
+    let shutdown = CoordinatedShutdown::new();
+
+    register_tcp_remote_drain_task(&shutdown, "drain-tcp-peers", transport.clone()).unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+    let send = transport.send(
+        remote.id(),
+        RemoteEnvelope::new(
+            RemoteDestination::Entity {
+                entity_type: "cart".to_string(),
+                entity_id: "cart-1".to_string(),
+            },
+            EncodedPayload::new(
+                RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+                Vec::new(),
+            ),
+        ),
+    );
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert!(matches!(
+        send,
+        Err(RemoteTransportError::Draining { node_id }) if node_id == *remote.id()
+    ));
+}
+
 #[test]
 fn protobuf_registry_round_trips_a_payload() {
     let mut registry = SerializationRegistry::new();
@@ -128,6 +203,7 @@ fn all_destination_variants_round_trip_through_envelope_codec() {
         RemoteDestination::ActorPath {
             path: "/user/worker".to_string(),
         },
+        RemoteDestination::actor_ref(test_remote_actor_ref()),
         RemoteDestination::Entity {
             entity_type: "cart".to_string(),
             entity_id: "cart-42".to_string(),
@@ -157,6 +233,874 @@ fn all_destination_variants_round_trip_through_envelope_codec() {
 
         assert_eq!(decoded, envelope);
     }
+}
+
+#[test]
+fn remote_actor_ref_destination_round_trips_serialized_identity() {
+    let serialized = SerializedActorRef::new(
+        "orders",
+        ActorPath::new("rakka://local/orders/user/worker"),
+        ActorUid::new(42),
+        "rakka.test.Ping",
+    );
+    let actor_ref =
+        RemoteActorRef::from_serialized(NodeId::new("rakka-0", "uid-a"), &serialized).unwrap();
+    let envelope = RemoteEnvelope::new(
+        RemoteDestination::actor_ref(actor_ref.clone()),
+        EncodedPayload::new(
+            RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+            vec![1, 2, 3],
+        ),
+    );
+
+    let wire = ProtobufEnvelopeCodec::encode(&envelope).unwrap();
+    let decoded = ProtobufEnvelopeCodec::decode(&wire).unwrap();
+
+    assert_eq!(decoded, envelope);
+    assert_eq!(actor_ref.node_id(), &NodeId::new("rakka-0", "uid-a"));
+    assert_eq!(actor_ref.to_serialized_ref(), serialized);
+}
+
+#[tokio::test]
+async fn remote_receptionist_listing_from_local_listing_converts_routees() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-listing-converts-routees");
+    let key = ServiceKey::<Ping>::new("workers");
+    let receptionist = Receptionist::get(&system);
+    let (_delivered_a, _received_a, actor_a) = spawn_recording_ping_actor(&system, "worker-a");
+    let (_delivered_b, _received_b, actor_b) = spawn_recording_ping_actor(&system, "worker-b");
+    let _registration_a = receptionist.register(&key, actor_a.clone()).unwrap();
+    let _registration_b = receptionist.register(&key, actor_b.clone()).unwrap();
+    let listing = receptionist.find_local(&key).unwrap();
+
+    let remote = RemoteReceptionistListing::from_listing(
+        node_id.clone(),
+        &system.actor_ref_resolver(),
+        &listing,
+        99,
+    )
+    .unwrap();
+
+    assert_eq!(remote.source_node(), &node_id);
+    assert_eq!(remote.service_id(), "workers");
+    assert_eq!(remote.service_message_type(), type_name::<Ping>());
+    assert_eq!(remote.version(), listing.revision());
+    assert_eq!(remote.observed_at_millis(), 99);
+    assert_eq!(remote.len(), 2);
+    assert!(!remote.is_empty());
+    assert!(remote.routees().iter().all(|routee| {
+        routee.actor_ref().node_id() == &node_id && routee.message_type() == type_name::<Ping>()
+    }));
+
+    let mut remote_paths = remote
+        .routees()
+        .iter()
+        .map(|routee| routee.actor_ref().path().to_string())
+        .collect::<Vec<_>>();
+    let mut local_paths = vec![actor_a.path().to_string(), actor_b.path().to_string()];
+    remote_paths.sort();
+    local_paths.sort();
+    assert_eq!(remote_paths, local_paths);
+
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_receptionist_listing_allows_empty_listing_for_deregistration() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-listing-empty");
+    let key = ServiceKey::<Ping>::new("workers");
+    let receptionist = Receptionist::get(&system);
+    let listing = receptionist.find_local(&key).unwrap();
+
+    let remote = RemoteReceptionistListing::from_listing(
+        node_id.clone(),
+        &system.actor_ref_resolver(),
+        &listing,
+        100,
+    )
+    .unwrap();
+
+    assert_eq!(remote.source_node(), &node_id);
+    assert_eq!(remote.service_id(), "workers");
+    assert_eq!(remote.service_message_type(), type_name::<Ping>());
+    assert_eq!(remote.version(), listing.revision());
+    assert_eq!(remote.observed_at_millis(), 100);
+    assert!(remote.is_empty());
+
+    system.terminate().await.unwrap();
+}
+
+#[test]
+fn remote_receptionist_listing_rejects_invalid_inputs() {
+    let source_node = NodeId::new("rakka-0", "uid-a");
+    let routee = RemoteServiceRoutee::new(test_remote_actor_ref());
+
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            NodeId::new("", "uid-a"),
+            "workers",
+            type_name::<Ping>(),
+            Vec::new(),
+            0,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            source_node.clone(),
+            "",
+            type_name::<Ping>(),
+            Vec::new(),
+            0,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+    assert!(matches!(
+        RemoteReceptionistListing::new(source_node.clone(), "workers", "", Vec::new(), 0, 1,),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+
+    let wrong_node_routee = RemoteServiceRoutee::new(
+        RemoteActorRef::new(
+            NodeId::new("rakka-1", "uid-b"),
+            "orders",
+            ActorPath::new("rakka://local/orders/user/worker"),
+            ActorUid::new(42),
+            type_name::<Ping>(),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            source_node.clone(),
+            "workers",
+            type_name::<Ping>(),
+            vec![wrong_node_routee],
+            1,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+
+    let wrong_type_routee = RemoteServiceRoutee::new(
+        RemoteActorRef::new(
+            source_node.clone(),
+            "orders",
+            ActorPath::new("rakka://local/orders/user/worker"),
+            ActorUid::new(42),
+            type_name::<Pong>(),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        RemoteReceptionistListing::new(
+            source_node.clone(),
+            "workers",
+            type_name::<Ping>(),
+            vec![wrong_type_routee],
+            1,
+            1,
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+    assert!(matches!(
+        RemoteReceptionistListing::new_with_max_routees(
+            source_node,
+            "workers",
+            type_name::<Ping>(),
+            vec![routee],
+            1,
+            1,
+            Some(0),
+        ),
+        Err(RemoteError::InvalidEnvelope { .. })
+    ));
+}
+
+#[tokio::test]
+async fn remote_receptionist_listing_from_local_listing_enforces_max_routees() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-listing-max-routees");
+    let key = ServiceKey::<Ping>::new("workers");
+    let receptionist = Receptionist::get(&system);
+    let (_delivered, _received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let _registration = receptionist.register(&key, actor).unwrap();
+    let listing = receptionist.find_local(&key).unwrap();
+
+    let error = RemoteReceptionistListing::from_listing_with_max_routees(
+        node_id,
+        &system.actor_ref_resolver(),
+        &listing,
+        101,
+        Some(0),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, RemoteError::InvalidEnvelope { .. }));
+    system.terminate().await.unwrap();
+}
+
+#[test]
+fn remote_receptionist_listing_codec_round_trips_wire_model() {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register::<RemoteReceptionistListing, _>(RemoteReceptionistListingCodec)
+        .unwrap();
+    let listing = RemoteReceptionistListing::new(
+        NodeId::new("rakka-0", "uid-a"),
+        "workers",
+        type_name::<Ping>(),
+        vec![RemoteServiceRoutee::new(test_remote_actor_ref())],
+        7,
+        99,
+    )
+    .unwrap();
+
+    let encoded = registry.encode(&listing).unwrap();
+    let decoded: RemoteReceptionistListing = registry.decode(&encoded).unwrap();
+
+    assert_eq!(decoded, listing);
+    assert_eq!(encoded.metadata.codec_id, "json");
+    assert_eq!(
+        encoded.metadata.message_type_id,
+        "rakka.remote.ReceptionistListing"
+    );
+    assert_eq!(encoded.metadata.schema_version, 1);
+}
+
+#[tokio::test]
+async fn remote_service_proxy_registry_materializes_proxy_for_group_router() {
+    let fixture = RemoteProxyFixture::new("proxy-routes");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, mut received, worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .receptionist_a
+        .register(&key, worker.clone())
+        .unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+
+    assert!(fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap());
+
+    let remote_listing = fixture.receptionist_b.find(&key).unwrap();
+    assert_eq!(fixture.proxy_registry.proxy_count(), 1);
+    assert_eq!(fixture.proxy_registry.listing_count(), 1);
+    assert_eq!(remote_listing.len(), 1);
+    assert_ne!(remote_listing.routees()[0].path(), worker.path());
+
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "workers-group")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "via-proxy".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap(),
+        Some("via-proxy".to_string())
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_service_proxy_registry_reuses_proxy_on_same_version_refresh() {
+    let fixture = RemoteProxyFixture::new("proxy-refresh");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+    let routee_key = RemoteServiceRouteeKey::from_routee("workers", &listing.routees()[0]);
+
+    assert!(fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap());
+    let first_proxy = fixture.receptionist_b.find(&key).unwrap().routees()[0].clone();
+    let refresh = fixture.publish_listing(&key, 10);
+
+    assert!(!fixture
+        .proxy_registry
+        .apply_listing::<Ping>(refresh)
+        .unwrap());
+
+    let second_proxy = fixture.receptionist_b.find(&key).unwrap().routees()[0].clone();
+    assert_eq!(fixture.proxy_registry.proxy_count(), 1);
+    assert!(fixture.proxy_registry.contains_proxy(&routee_key));
+    assert_eq!(first_proxy.path(), second_proxy.path());
+    assert_eq!(first_proxy.uid(), second_proxy.uid());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_service_proxy_registry_removes_proxy_for_empty_listing() {
+    let fixture = RemoteProxyFixture::new("proxy-empty-listing");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+    fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap();
+
+    assert!(registration.deregister().unwrap());
+    let empty_listing = fixture.publish_listing(&key, 2);
+
+    assert!(fixture
+        .proxy_registry
+        .apply_listing::<Ping>(empty_listing)
+        .unwrap());
+    assert_eq!(fixture.proxy_registry.proxy_count(), 0);
+    assert!(fixture.receptionist_b.find(&key).unwrap().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_service_proxy_registry_removes_proxy_for_source_node_removal() {
+    let fixture = RemoteProxyFixture::new("proxy-node-removal");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+    fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap();
+
+    assert_eq!(
+        fixture.proxy_registry.remove_remote_node(&fixture.node_a),
+        1
+    );
+    assert_eq!(fixture.proxy_registry.proxy_count(), 0);
+    assert_eq!(fixture.proxy_registry.listing_count(), 0);
+    assert!(fixture.receptionist_b.find(&key).unwrap().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn coordinated_shutdown_removes_remote_service_proxies_for_source_node() {
+    let fixture = RemoteProxyFixture::new("proxy-shutdown-node-removal");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+    fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap();
+    let shutdown = CoordinatedShutdown::new();
+
+    register_remote_service_proxy_remove_node_task(
+        &shutdown,
+        "remove-remote-proxies",
+        fixture.proxy_registry.clone(),
+        fixture.node_a.clone(),
+    )
+    .unwrap();
+
+    let report = shutdown
+        .run(CoordinatedShutdownReason::user_request())
+        .await
+        .unwrap();
+
+    assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    assert_eq!(fixture.proxy_registry.proxy_count(), 0);
+    assert_eq!(fixture.proxy_registry.listing_count(), 0);
+    assert!(fixture.receptionist_b.find(&key).unwrap().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_service_proxy_registry_expires_stale_listing_and_stops_proxy() {
+    let fixture = RemoteProxyFixture::new("proxy-ttl");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 5);
+    fixture
+        .proxy_registry
+        .apply_listing::<Ping>(listing)
+        .unwrap();
+
+    assert_eq!(fixture.proxy_registry.expire_stale_listings(5), 0);
+    assert_eq!(fixture.proxy_registry.proxy_count(), 1);
+    assert_eq!(fixture.proxy_registry.expire_stale_listings(6), 1);
+    assert_eq!(fixture.proxy_registry.proxy_count(), 0);
+    assert!(fixture.receptionist_b.find(&key).unwrap().is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_service_proxy_registry_rejects_wrong_typed_listing_application() {
+    let fixture = RemoteProxyFixture::new("proxy-type-mismatch");
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture.receptionist_a.register(&key, worker).unwrap();
+    let listing = fixture.publish_listing(&key, 1);
+
+    let error = fixture
+        .proxy_registry
+        .apply_listing::<Pong>(listing)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteServiceProxyError::MessageTypeMismatch { service_id, .. }
+            if service_id == "workers"
+    ));
+    assert_eq!(fixture.proxy_registry.proxy_count(), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_clustered_receptionist_publish_apply_cycle_routes_via_proxy() {
+    let fixture = RemoteRuntimeFixture::new(
+        "runtime-cycle",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, mut received, worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker.clone())
+        .unwrap();
+
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("enabled runtime should publish");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    let remote_listing = fixture.runtime_b.receptionist().find(&key).unwrap();
+    assert_eq!(remote_listing.len(), 1);
+    assert_ne!(remote_listing.routees()[0].path(), worker.path());
+
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "runtime-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "runtime-proxy".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap(),
+        Some("runtime-proxy".to_string())
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_clustered_receptionist_respects_enabled_and_routee_limit_settings() {
+    let disabled = RemoteRuntimeFixture::new(
+        "runtime-disabled",
+        ClusteredReceptionistSettings::default().with_enabled(false),
+        ClusteredReceptionistSettings::default().with_enabled(false),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) =
+        spawn_recording_ping_actor(&disabled.system_a, "worker-a");
+    let _registration = disabled
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+
+    assert!(disabled.runtime_a.publish_once(&key, 1).unwrap().is_none());
+    let listing = disabled
+        .runtime_a
+        .clone()
+        .with_settings(ClusteredReceptionistSettings::default());
+    let listing = listing
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("enabled clone should publish");
+    assert!(!disabled
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing.clone())
+        .unwrap());
+    disabled.shutdown().await;
+
+    let limited = RemoteRuntimeFixture::new(
+        "runtime-limit",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default().with_max_routees_per_listing(0),
+    );
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&limited.system_a, "worker-a");
+    let _registration = limited
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let listing = limited
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+
+    let error = limited
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteClusteredReceptionistError::ListingTooLarge {
+            ref service_id,
+            actual: 1,
+            max: 0,
+        } if service_id == "workers"
+    ));
+    assert_eq!(error.code(), "remote-receptionist-listing-too-large");
+    limited.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_clustered_receptionist_prunes_and_expires_proxy_listings() {
+    let fixture = RemoteRuntimeFixture::new(
+        "runtime-lifecycle",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default().with_remote_listing_ttl(Duration::from_millis(10)),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 5)
+        .unwrap()
+        .expect("source should publish listing");
+    fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing.clone())
+        .unwrap();
+
+    assert_eq!(fixture.runtime_b.expire_stale_listings(14), 0);
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 1);
+    assert_eq!(fixture.runtime_b.expire_stale_listings(16), 1);
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 0);
+    assert!(fixture
+        .runtime_b
+        .receptionist()
+        .find(&key)
+        .unwrap()
+        .is_empty());
+
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+    fixture
+        .runtime_b
+        .cluster()
+        .manager()
+        .down(&fixture.node_a)
+        .unwrap();
+    assert_eq!(fixture.runtime_b.prune_unreachable_members(), 1);
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 0);
+    assert!(fixture
+        .runtime_b
+        .receptionist()
+        .find(&key)
+        .unwrap()
+        .is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_deregistration_removes_proxy_routees() {
+    let fixture = RemoteRuntimeFixture::new(
+        "in-memory-deregister",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    assert!(registration.deregister().unwrap());
+    let empty_listing = fixture
+        .runtime_a
+        .publish_once(&key, 2)
+        .unwrap()
+        .expect("source should publish empty listing");
+    assert!(empty_listing.is_empty());
+
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(empty_listing)
+        .unwrap());
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 0);
+    assert!(fixture
+        .runtime_b
+        .receptionist()
+        .find(&key)
+        .unwrap()
+        .is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_actor_termination_publishes_empty_listing() {
+    let fixture = RemoteRuntimeFixture::new(
+        "in-memory-terminated",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker.clone())
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    worker.stop().unwrap();
+    worker.when_terminated().await;
+    wait_for_empty_local_listing(fixture.runtime_a.receptionist(), &key).await;
+    let empty_listing = fixture
+        .runtime_a
+        .publish_once(&key, 2)
+        .unwrap()
+        .expect("source should publish empty listing");
+
+    assert!(empty_listing.is_empty());
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(empty_listing)
+        .unwrap());
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 0);
+    assert!(fixture
+        .runtime_b
+        .receptionist()
+        .find(&key)
+        .unwrap()
+        .is_empty());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_stale_uid_routee_never_delivers() {
+    let fixture = RemoteRuntimeFixture::new(
+        "in-memory-stale-uid",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_old_delivered, mut old_received, old_worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, old_worker.clone())
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    old_worker.stop().unwrap();
+    old_worker.when_terminated().await;
+    let (_new_delivered, mut new_received, _new_worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "stale-uid-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "stale-uid".to_string(),
+        })
+        .unwrap();
+
+    assert_no_ping(&mut old_received).await;
+    assert_no_ping(&mut new_received).await;
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 1);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_memory_remote_clustered_receptionist_missing_proxy_codec_never_delivers() {
+    let fixture = RemoteRuntimeFixture::with_registries(
+        "in-memory-missing-codec",
+        ClusteredReceptionistSettings::default(),
+        ClusteredReceptionistSettings::default(),
+        ping_registry(),
+        SerializationRegistry::new(),
+    );
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, mut received, worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let listing = fixture
+        .runtime_a
+        .publish_once(&key, 1)
+        .unwrap()
+        .expect("source should publish listing");
+    assert!(fixture
+        .runtime_b
+        .apply_wire_listing::<Ping>(listing)
+        .unwrap());
+
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "missing-codec-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "missing-codec".to_string(),
+        })
+        .unwrap();
+
+    assert_no_ping(&mut received).await;
+    assert_eq!(fixture.runtime_b.proxy_snapshot().proxy_count(), 1);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_remote_clustered_receptionist_routes_group_router_over_loopback() {
+    let Some(fixture) = TcpRemoteRuntimeFixture::new("tcp-receptionist").await else {
+        return;
+    };
+    let key = ServiceKey::<Ping>::new("workers");
+    fixture
+        .runtime_b
+        .register_receptionist_listing_handler::<Ping>(&key)
+        .unwrap();
+    let (_delivered, mut received, worker) =
+        spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker.clone())
+        .unwrap();
+
+    assert!(fixture
+        .runtime_a
+        .publish_once_to(&fixture.node_b, &key, 1)
+        .unwrap());
+    wait_for(|| fixture.runtime_b.proxy_snapshot().proxy_count() == 1).await;
+
+    let remote_listing = fixture.runtime_b.receptionist().find(&key).unwrap();
+    assert_eq!(remote_listing.len(), 1);
+    assert_ne!(remote_listing.routees()[0].path(), worker.path());
+
+    let router = Routers::group(key)
+        .spawn(&fixture.system_b, "tcp-workers")
+        .unwrap();
+    router
+        .tell(Ping {
+            value: "tcp-proxy".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap(),
+        Some("tcp-proxy".to_string())
+    );
+    wait_for(|| fixture.transport_b.snapshot().inbound_envelopes() >= 1).await;
+    wait_for(|| fixture.transport_a.snapshot().inbound_envelopes() >= 1).await;
+    wait_for(|| {
+        fixture
+            .transport_a
+            .peer_snapshot(&fixture.node_b)
+            .is_some_and(|snapshot| snapshot.sent() >= 1)
+            && fixture
+                .transport_b
+                .peer_snapshot(&fixture.node_a)
+                .is_some_and(|snapshot| snapshot.sent() >= 1)
+    })
+    .await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_remote_clustered_receptionist_missing_peer_fails_closed() {
+    let Some(fixture) = TcpRemoteRuntimeFixture::new("tcp-receptionist-missing").await else {
+        return;
+    };
+    let key = ServiceKey::<Ping>::new("workers");
+    let (_delivered, _received, worker) = spawn_recording_ping_actor(&fixture.system_a, "worker-a");
+    let _registration = fixture
+        .runtime_a
+        .receptionist()
+        .register(&key, worker)
+        .unwrap();
+    let missing = NodeId::new("rakka-missing", "uid-z");
+
+    let error = fixture
+        .runtime_a
+        .publish_once_to(&missing, &key, 1)
+        .unwrap_err();
+
+    assert_eq!(error.code(), "remote-transport-error");
+    assert!(matches!(
+        &error,
+        RemoteClusteredReceptionistError::Transport {
+            node_id,
+            error,
+        } if node_id == &missing
+            && matches!(
+                error.as_ref(),
+                RemoteTransportError::UnknownNode { node_id } if node_id == &missing
+            )
+    ));
+    fixture.shutdown().await;
 }
 
 #[test]
@@ -411,6 +1355,256 @@ fn endpoint_dispatches_entity_envelope_received_over_in_memory_transport() {
     );
 }
 
+#[tokio::test]
+async fn endpoint_dispatches_actor_ref_envelope_received_over_in_memory_transport() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-actor-ref-delivery");
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Ping>("rakka.test.Ping", 1)
+        .unwrap();
+    let (delivered, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let actor = system
+        .spawn(
+            "worker",
+            actor_fn(move |_ctx: &mut ActorContext<Ping>, msg: Ping| {
+                let _sent = delivered.send(msg.value);
+                Ok(ActorAction::Continue)
+            }),
+        )
+        .unwrap();
+    let actor_ref =
+        RemoteActorRef::from_serialized(node_id.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = RemoteEndpoint::new(node_id.clone());
+    endpoint
+        .register_actor_ref_handler::<Ping>(RemoteActorRefInbound::<Ping>::new(
+            node_id.clone(),
+            system.clone(),
+            registry.clone(),
+        ))
+        .unwrap();
+    let transport = InMemoryRemoteTransport::new();
+    transport.register_endpoint(endpoint).unwrap();
+    let envelope = RemoteEnvelope::new(
+        RemoteDestination::actor_ref(actor_ref),
+        registry
+            .encode(&Ping {
+                value: "hello actor".to_string(),
+            })
+            .unwrap(),
+    );
+
+    transport.send(&node_id, envelope).unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap(),
+        Some("hello actor".to_string())
+    );
+    system.terminate().await.unwrap();
+}
+
+#[test]
+fn endpoint_fails_closed_when_actor_ref_handler_is_missing() {
+    let endpoint = RemoteEndpoint::new(NodeId::new("rakka-0", "uid-a"));
+    let error = endpoint
+        .receive_envelope(RemoteEnvelope::new(
+            RemoteDestination::actor_ref(test_remote_actor_ref()),
+            EncodedPayload::new(
+                RemoteEnvelopeMetadata::protobuf("rakka.test.Ping", 1),
+                Vec::new(),
+            ),
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::UnregisteredActorRefHandler { message_type }
+            if message_type == type_name::<Ping>()
+    ));
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_stale_uid_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-stale-uid");
+    let registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref = RemoteActorRef::new(
+        node_id.clone(),
+        actor.to_serialized_ref().system_name(),
+        actor.path().clone(),
+        ActorUid::new(actor.uid().value() + 1000),
+        type_name::<Ping>(),
+    )
+    .unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "stale"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("remote actor-ref resolve failed")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_wrong_message_type_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-wrong-type");
+    let registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref = RemoteActorRef::new(
+        node_id.clone(),
+        actor.to_serialized_ref().system_name(),
+        actor.path().clone(),
+        actor.uid(),
+        type_name::<Pong>(),
+    )
+    .unwrap();
+    let endpoint = RemoteEndpoint::new(node_id.clone());
+    endpoint
+        .register_actor_ref_handler::<Pong>(RemoteActorRefInbound::<Pong>::new(
+            node_id.clone(),
+            system.clone(),
+            registry.clone(),
+        ))
+        .unwrap();
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "wrong-type"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("remote actor-ref resolve failed")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_missing_codec_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-missing-codec");
+    let empty_registry = SerializationRegistry::new();
+    let encode_registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref =
+        RemoteActorRef::from_serialized(node_id.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &empty_registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(
+            actor_ref,
+            &encode_registry,
+            "missing-codec",
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("remote actor-ref decode failed")
+                && message.contains("unknown codec")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_rejects_node_mismatch_before_delivery() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let wrong_node = NodeId::new("rakka-1", "uid-b");
+    let system = rakka_core::ActorSystem::new("remote-node-mismatch");
+    let registry = ping_registry();
+    let (_delivered, mut received, actor) = spawn_recording_ping_actor(&system, "worker");
+    let actor_ref =
+        RemoteActorRef::from_serialized(wrong_node.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "wrong-node"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("cannot be handled by local node")
+                && message.contains(&wrong_node.to_string())
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), received.recv())
+            .await
+            .is_err()
+    );
+    system.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn actor_ref_inbound_reports_full_mailbox() {
+    let node_id = NodeId::new("rakka-0", "uid-a");
+    let system = rakka_core::ActorSystem::new("remote-mailbox-full");
+    let registry = ping_registry();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let entered_for_actor = entered.clone();
+    let release_for_actor = release.clone();
+    let actor = system
+        .spawn_actor_with_options(
+            "worker",
+            move || BlockingPingActor {
+                entered: entered_for_actor.clone(),
+                release: release_for_actor.clone(),
+            },
+            ActorOptions::default().with_mailbox_capacity(1),
+        )
+        .unwrap();
+    actor
+        .tell(Ping {
+            value: "block".to_string(),
+        })
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    actor
+        .tell(Ping {
+            value: "queued".to_string(),
+        })
+        .unwrap();
+    let actor_ref =
+        RemoteActorRef::from_serialized(node_id.clone(), &actor.to_serialized_ref()).unwrap();
+    let endpoint = actor_ref_endpoint(&node_id, &system, &registry);
+    let error = endpoint
+        .receive_envelope(ping_actor_ref_envelope(actor_ref, &registry, "full"))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        RemoteEndpointError::HandlerRejected { message, .. }
+            if message.contains("mailbox was full")
+    ));
+    release.notify_waiters();
+    wait_for_mailbox_depth(&actor, 0).await;
+    system.terminate().await.unwrap();
+}
+
 #[test]
 fn in_memory_transport_reports_unknown_destination_node() {
     let transport = InMemoryRemoteTransport::new();
@@ -453,9 +1647,8 @@ fn endpoint_fails_closed_for_unhandled_destination_and_entity_type() {
         .unwrap_err();
     assert!(matches!(
         service_error,
-        RemoteEndpointError::UnexpectedDestination {
-            destination: RemoteDestination::Service { service_key },
-        } if service_key == "payments"
+        RemoteEndpointError::UnregisteredServiceHandler { service_key }
+            if service_key == "payments"
     ));
 
     let entity_error = endpoint
@@ -605,4 +1798,439 @@ fn endpoint_fails_closed_when_reply_handler_is_missing() {
         RemoteEndpointError::UnregisteredReplyHandler { request_id }
             if request_id == "request-1"
     ));
+}
+
+struct RemoteProxyFixture {
+    node_a: NodeId,
+    system_a: rakka_core::ActorSystem,
+    system_b: rakka_core::ActorSystem,
+    receptionist_a: Receptionist,
+    receptionist_b: Receptionist,
+    proxy_registry: RemoteServiceProxyRegistry,
+}
+
+impl RemoteProxyFixture {
+    fn new(name: &str) -> Self {
+        let node_a = NodeId::new(format!("{name}-a"), "uid-a");
+        let node_b = NodeId::new(format!("{name}-b"), "uid-b");
+        let system_a = rakka_core::ActorSystem::new(format!("{name}-a"));
+        let system_b = rakka_core::ActorSystem::new(format!("{name}-b"));
+        let registry = ping_registry();
+        let transport = InMemoryRemoteTransport::new();
+        transport
+            .register_endpoint(actor_ref_endpoint(&node_a, &system_a, &registry))
+            .unwrap();
+        let receptionist_a = Receptionist::get(&system_a);
+        let receptionist_b = Receptionist::get(&system_b);
+        let proxy_registry = RemoteServiceProxyRegistry::with_transport(
+            node_b,
+            system_b.clone(),
+            transport,
+            registry,
+        );
+
+        Self {
+            node_a,
+            system_a,
+            system_b,
+            receptionist_a,
+            receptionist_b,
+            proxy_registry,
+        }
+    }
+
+    fn publish_listing<M>(
+        &self,
+        key: &ServiceKey<M>,
+        observed_at_millis: u64,
+    ) -> RemoteReceptionistListing
+    where
+        M: rakka_core::Message,
+    {
+        let listing = self.receptionist_a.find_local(key).unwrap();
+        RemoteReceptionistListing::from_listing(
+            self.node_a.clone(),
+            &self.system_a.actor_ref_resolver(),
+            &listing,
+            observed_at_millis,
+        )
+        .unwrap()
+    }
+
+    async fn shutdown(self) {
+        self.system_a.terminate().await.unwrap();
+        self.system_b.terminate().await.unwrap();
+    }
+}
+
+struct RemoteRuntimeFixture {
+    node_a: NodeId,
+    system_a: rakka_core::ActorSystem,
+    system_b: rakka_core::ActorSystem,
+    runtime_a: RemoteClusteredReceptionist,
+    runtime_b: RemoteClusteredReceptionist,
+}
+
+impl RemoteRuntimeFixture {
+    fn new(
+        name: &str,
+        settings_a: ClusteredReceptionistSettings,
+        settings_b: ClusteredReceptionistSettings,
+    ) -> Self {
+        Self::with_registries(
+            name,
+            settings_a,
+            settings_b,
+            ping_registry(),
+            ping_registry(),
+        )
+    }
+
+    fn with_registries(
+        name: &str,
+        settings_a: ClusteredReceptionistSettings,
+        settings_b: ClusteredReceptionistSettings,
+        registry_a: SerializationRegistry,
+        registry_b: SerializationRegistry,
+    ) -> Self {
+        let system_a = rakka_core::ActorSystem::new(format!("{name}-a"));
+        let system_b = rakka_core::ActorSystem::new(format!("{name}-b"));
+        let node_a = remote_cluster_node(format!("{name}-a"), "uid-a", 26_520);
+        let node_b = remote_cluster_node(format!("{name}-b"), "uid-b", 26_521);
+        let cluster_a = remote_cluster_with_nodes(node_a.clone(), node_b.clone());
+        let cluster_b = remote_cluster_with_nodes(node_b.clone(), node_a.clone());
+        let endpoint_a = RemoteEndpoint::new(node_a.id().clone());
+        let endpoint_b = RemoteEndpoint::new(node_b.id().clone());
+        let transport = InMemoryRemoteTransport::new();
+        transport.register_endpoint(endpoint_a.clone()).unwrap();
+        transport.register_endpoint(endpoint_b.clone()).unwrap();
+        let runtime_a = RemoteClusteredReceptionist::with_transport(
+            system_a.clone(),
+            cluster_a,
+            endpoint_a,
+            transport.clone(),
+            registry_a,
+            settings_a,
+        );
+        let runtime_b = RemoteClusteredReceptionist::with_transport(
+            system_b.clone(),
+            cluster_b,
+            endpoint_b,
+            transport,
+            registry_b,
+            settings_b,
+        );
+        runtime_a.register_actor_ref_handler::<Ping>().unwrap();
+        runtime_b.register_actor_ref_handler::<Ping>().unwrap();
+
+        Self {
+            node_a: node_a.id().clone(),
+            system_a,
+            system_b,
+            runtime_a,
+            runtime_b,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.system_a.terminate().await.unwrap();
+        self.system_b.terminate().await.unwrap();
+    }
+}
+
+struct TcpRemoteRuntimeFixture {
+    node_a: NodeId,
+    node_b: NodeId,
+    system_a: rakka_core::ActorSystem,
+    system_b: rakka_core::ActorSystem,
+    runtime_a: RemoteClusteredReceptionist,
+    runtime_b: RemoteClusteredReceptionist,
+    transport_a: TcpRemoteTransport,
+    transport_b: TcpRemoteTransport,
+}
+
+impl TcpRemoteRuntimeFixture {
+    async fn new(name: &str) -> Option<Self> {
+        let system_a = rakka_core::ActorSystem::new(format!("{name}-a"));
+        let system_b = rakka_core::ActorSystem::new(format!("{name}-b"));
+        let node_a = NodeId::new(format!("{name}-a"), "uid-a");
+        let node_b = NodeId::new(format!("{name}-b"), "uid-b");
+        let endpoint_a = RemoteEndpoint::new(node_a.clone());
+        let endpoint_b = RemoteEndpoint::new(node_b.clone());
+        let Some(transport_a) = bind_tcp_transport(node_a.clone(), endpoint_a.clone()).await else {
+            system_a.terminate().await.unwrap();
+            system_b.terminate().await.unwrap();
+            return None;
+        };
+        let Some(transport_b) = bind_tcp_transport(node_b.clone(), endpoint_b.clone()).await else {
+            system_a.terminate().await.unwrap();
+            system_b.terminate().await.unwrap();
+            return None;
+        };
+        let cluster_node_a = tcp_cluster_node(&node_a, transport_a.local_addr().port());
+        let cluster_node_b = tcp_cluster_node(&node_b, transport_b.local_addr().port());
+        let cluster_a = remote_cluster_with_nodes(cluster_node_a.clone(), cluster_node_b.clone());
+        let cluster_b = remote_cluster_with_nodes(cluster_node_b.clone(), cluster_node_a.clone());
+        transport_a.register_peer(cluster_node_b).unwrap();
+        transport_b.register_peer(cluster_node_a).unwrap();
+
+        let runtime_a = RemoteClusteredReceptionist::with_transport(
+            system_a.clone(),
+            cluster_a,
+            endpoint_a,
+            transport_a.clone(),
+            tcp_receptionist_registry(),
+            ClusteredReceptionistSettings::default(),
+        );
+        let runtime_b = RemoteClusteredReceptionist::with_transport(
+            system_b.clone(),
+            cluster_b,
+            endpoint_b,
+            transport_b.clone(),
+            tcp_receptionist_registry(),
+            ClusteredReceptionistSettings::default(),
+        );
+        runtime_a.register_actor_ref_handler::<Ping>().unwrap();
+        runtime_b.register_actor_ref_handler::<Ping>().unwrap();
+
+        Some(Self {
+            node_a,
+            node_b,
+            system_a,
+            system_b,
+            runtime_a,
+            runtime_b,
+            transport_a,
+            transport_b,
+        })
+    }
+
+    async fn shutdown(self) {
+        self.system_a.terminate().await.unwrap();
+        self.system_b.terminate().await.unwrap();
+    }
+}
+
+fn remote_cluster_with_nodes(local: ClusterNode, remote: ClusterNode) -> Cluster {
+    let cluster = Cluster::for_local_node(
+        local.clone(),
+        MembershipConfig::new(2, Duration::from_secs(10), Duration::from_secs(30)),
+    );
+    cluster.manager().join_seed_nodes([local, remote]).unwrap();
+    cluster
+}
+
+fn remote_cluster_node(logical_id: impl Into<String>, incarnation: &str, port: u16) -> ClusterNode {
+    ClusterNode::new(
+        NodeId::new(logical_id, incarnation),
+        NodeAddress::new("127.0.0.1", port),
+    )
+}
+
+fn tcp_cluster_node(node_id: &NodeId, port: u16) -> ClusterNode {
+    ClusterNode::new(node_id.clone(), NodeAddress::new("127.0.0.1", port))
+}
+
+async fn bind_tcp_transport(
+    node_id: NodeId,
+    endpoint: RemoteEndpoint,
+) -> Option<TcpRemoteTransport> {
+    match TcpRemoteTransport::bind(
+        node_id,
+        ClusterProtocol::default(),
+        endpoint,
+        tcp_test_config(),
+    )
+    .await
+    {
+        Ok(transport) => Some(transport),
+        Err(error) if tcp_bind_denied(&error) => {
+            eprintln!("skipping tcp receptionist test; loopback bind denied: {error}");
+            None
+        }
+        Err(error) => panic!("tcp remote transport should bind: {error:?}"),
+    }
+}
+
+fn tcp_test_config() -> TcpRemoteTransportConfig {
+    TcpRemoteTransportConfig::new()
+        .bind_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .connect_timeout(Duration::from_millis(500))
+        .reconnect_backoff(Duration::from_millis(10))
+        .idle_timeout(Duration::from_secs(10))
+}
+
+fn tcp_bind_denied(error: &rakka_remote::TcpRemoteTransportError) -> bool {
+    matches!(
+        error,
+        rakka_remote::TcpRemoteTransportError::Io { message }
+            if message.contains("Operation not permitted")
+                || message.contains("Permission denied")
+    )
+}
+
+fn test_remote_actor_ref() -> RemoteActorRef {
+    RemoteActorRef::new(
+        NodeId::new("rakka-0", "uid-a"),
+        "orders",
+        ActorPath::new("rakka://local/orders/user/worker"),
+        ActorUid::new(42),
+        type_name::<Ping>(),
+    )
+    .expect("remote actor ref should be valid")
+}
+
+fn ping_registry() -> SerializationRegistry {
+    let mut registry = SerializationRegistry::new();
+    registry
+        .register_protobuf::<Ping>("rakka.test.Ping", 1)
+        .unwrap();
+    registry
+}
+
+fn tcp_receptionist_registry() -> SerializationRegistry {
+    let mut registry = ping_registry();
+    registry
+        .register::<RemoteReceptionistListing, _>(RemoteReceptionistListingCodec)
+        .unwrap();
+    registry
+}
+
+fn actor_ref_endpoint(
+    node_id: &NodeId,
+    system: &rakka_core::ActorSystem,
+    registry: &SerializationRegistry,
+) -> RemoteEndpoint {
+    let endpoint = RemoteEndpoint::new(node_id.clone());
+    endpoint
+        .register_actor_ref_handler::<Ping>(RemoteActorRefInbound::<Ping>::new(
+            node_id.clone(),
+            system.clone(),
+            registry.clone(),
+        ))
+        .unwrap();
+    endpoint
+}
+
+fn ping_actor_ref_envelope(
+    actor_ref: RemoteActorRef,
+    registry: &SerializationRegistry,
+    value: &str,
+) -> RemoteEnvelope {
+    RemoteEnvelope::new(
+        RemoteDestination::actor_ref(actor_ref),
+        registry
+            .encode(&Ping {
+                value: value.to_string(),
+            })
+            .unwrap(),
+    )
+}
+
+fn spawn_recording_ping_actor(
+    system: &rakka_core::ActorSystem,
+    name: &str,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<String>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    rakka_core::ActorRef<Ping>,
+) {
+    let (delivered, received) = tokio::sync::mpsc::unbounded_channel();
+    let actor = system
+        .spawn(
+            name,
+            actor_fn({
+                let delivered = delivered.clone();
+                move |_ctx: &mut ActorContext<Ping>, msg: Ping| {
+                    let _sent = delivered.send(msg.value);
+                    Ok(ActorAction::Continue)
+                }
+            }),
+        )
+        .unwrap();
+    (delivered, received, actor)
+}
+
+struct BlockingPingActor {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Actor for BlockingPingActor {
+    type Msg = Ping;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> ActorFuture<'a> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        actor_future(async move {
+            if msg.value == "block" {
+                entered.notify_waiters();
+                release.notified().await;
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+async fn wait_for_mailbox_depth<M>(actor: &rakka_core::ActorRef<M>, expected: usize)
+where
+    M: rakka_core::Message,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if actor.mailbox_depth() == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mailbox depth stayed at {}, expected {expected}",
+            actor.mailbox_depth()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_empty_local_listing<M>(receptionist: &Receptionist, key: &ServiceKey<M>)
+where
+    M: rakka_core::Message,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if receptionist.find_local(key).unwrap().is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "local receptionist listing for {} did not become empty",
+            key.id()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for(mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for condition"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn assert_no_ping(received: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), received.recv())
+            .await
+            .is_err(),
+        "remote routee unexpectedly delivered a ping"
+    );
 }

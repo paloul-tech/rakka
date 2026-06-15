@@ -2,7 +2,7 @@
 
 Rakka is a Rust actor framework built around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
 
-The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, in-memory and PostgreSQL durable state stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
+The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, typed persistence storage foundations, Akka-named event-sourced and durable-state behavior facades, in-memory and PostgreSQL persistence stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
 
 See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
 See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
@@ -17,14 +17,20 @@ See `docs/rakka-v1-reliability-boundaries.md` for v1 reliability guarantees, non
 See `docs/rakka-v1-rolling-update-upgrade.md` for the N/N+1 Kubernetes rolling-update sequence.
 See `docs/rakka-v1-known-limitations-roadmap.md` for known limitations and post-v1 roadmap items.
 See `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklist and example coverage matrix.
+See `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/test-support API boundary.
+See `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
+See `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
+See `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
+See `docs/rakka-akka-parity-phase-6-streams.md` for the Akka-shaped bounded stream facade, process IO migration, and stream testkit probes.
 Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
 
 | Crate | Role |
 | --- | --- |
+| `rakka` | Top-level facade crate and curated prelude for application code. |
 | `rakka-core` | Typed actors, actor refs, supervision, paths, shared metrics, and framework errors. |
-| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs plus PostgreSQL storage plugin. |
+| `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs, typed event/snapshot stores, event-sourced and durable-state behavior facades, query helpers, in-memory stores, and PostgreSQL persistence plugins. |
 | `rakka-cluster`, `rakka-remote`, `rakka-sharding` | Membership, remoting, protocol compatibility, and sharded entity routing. |
 | `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
 | `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |
@@ -52,6 +58,10 @@ cargo test -p rakka-example-generated-contracts --test generated_contracts -- --
 cargo test -p rakka-core --test observability_exporters
 cargo test -p rakka-core --test security_operational_defaults
 cargo test -p rakka-http --test observability_routes
+cargo run -p rakka-example-local-receptionist-router
+cargo run -p rakka-example-pool-router
+cargo run -p rakka-example-clustered-receptionist
+cargo run -p rakka-example-streams
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
@@ -105,7 +115,7 @@ cargo run -p rakka-example-minimal-system
 Expected output:
 
 ```text
-Rakka Phase 1 actor replied with pong on tokio.
+Rakka Phase 2 actor facade replied with pong on tokio.
 ```
 
 ### Durable Counter
@@ -120,6 +130,86 @@ Expected output:
 
 ```text
 Rakka durable counter recovered value 2.
+```
+
+### Event-Sourced Counter
+
+This example uses `EventSourcedBehavior`, the in-memory event journal, snapshots, replies after persistence, and snapshot retention.
+
+```sh
+cargo run -p rakka-example-event-sourced-counter
+```
+
+Expected output:
+
+```text
+Rakka event-sourced counter values: 1, 2, recovered 2.
+```
+
+### Sharded Cart Persistence
+
+This example derives event-sourced persistence ids from sharding entity type and entity ids using `PersistenceId::of`, writes cart state on a shard owned by node A, gracefully moves the shard to node B, and proves node B recovers the same cart state by replaying persistence.
+
+```sh
+cargo run -p rakka-example-sharded-cart-persistence
+```
+
+Expected output:
+
+```text
+Rakka sharded cart movement (in-memory) used entity type CartMovement and persistence id CartMovement|cart-0.
+node A initially owned cart-0 on shard N and wrote cart total 2.
+ownership moved from rakka-0#uid-a to rakka-1#uid-b at coordinator revision N.
+node B recovered cart total 2 from persistence; persisted coordinator revision N was reloadable.
+```
+
+The same example can use PostgreSQL for both the shard coordinator snapshot and entity event/snapshot storage:
+
+```sh
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo run -p rakka-example-sharded-cart-persistence -- --postgres
+```
+
+### Local Receptionist And Group Router
+
+This example registers two typed service actors with the local receptionist and routes work through a receptionist-backed group router.
+
+```sh
+cargo run -p rakka-example-local-receptionist-router
+```
+
+Expected output:
+
+```text
+Rakka local receptionist group router delivered [worker-a:1, worker-b:2] across 2 routees.
+```
+
+### Pool Router
+
+This example spawns a local worker pool and routes six jobs in deterministic round-robin order.
+
+```sh
+cargo run -p rakka-example-pool-router
+```
+
+Expected output:
+
+```text
+Rakka pool router sent 6 jobs through 3 routees: [(0, 0), (1, 1), (2, 2), (3, 0), (4, 1), (5, 2)].
+```
+
+### Clustered Receptionist
+
+This example creates two logical cluster nodes in one process, propagates a local receptionist listing from node A to node B, and routes from node B through the propagated listing.
+
+```sh
+cargo run -p rakka-example-clustered-receptionist
+```
+
+Expected output:
+
+```text
+Rakka clustered receptionist propagated true and routed rakka-0:7 through 1 remote routee.
 ```
 
 ### Durable Workflow
@@ -202,6 +292,23 @@ Expected output:
 ```text
 Rakka wrapped legacy-calculator and received result 42.
 Captured child stderr: ["legacy child handled increment"]
+```
+
+### Stream Facade
+
+This example exercises the Akka-shaped bounded stream facade: finite operators, an acked actor sink, process stdout as a facade source, and stream testkit probes. It is self-contained and starts itself with a hidden child flag for the process stdout example.
+
+```sh
+cargo run -p rakka-example-streams
+```
+
+Expected output:
+
+```text
+Finite stream operators produced [6, 8].
+Acked actor sink delivered ["init", "apple", "banana", "complete"].
+Process stdout facade source read "child-stream-output".
+Stream testkit probe collected ["probe-one", "probe-two"].
 ```
 
 ### Edge Gateway

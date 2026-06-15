@@ -1,0 +1,25 @@
+[package]
+name = "rakka-example-sharded-cart-persistence"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+rakka = { path = "../../crates/rakka", default-features = false, features = ["persistence", "sharding"] }
+rakka-cluster = { path = "../../crates/rakka-cluster" }
+rakka-persistence = { path = "../../crates/rakka-persistence" }
+rakka-persistence-postgres = { path = "../../crates/rakka-persistence-postgres" }
+rakka-sharding = { path = "../../crates/rakka-sharding" }
+rakka-sharding-postgres = { path = "../../crates/rakka-sharding-postgres" }
+tokio.workspace = true
+tokio-postgres.workspace = true
+
+[lints]
+workspace = true

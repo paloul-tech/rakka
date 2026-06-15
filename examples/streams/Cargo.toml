@@ -1,0 +1,22 @@
+[package]
+name = "rakka-example-streams"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+rakka = { path = "../../crates/rakka", default-features = false }
+rakka-process = { path = "../../crates/rakka-process" }
+rakka-stream = { path = "../../crates/rakka-stream" }
+rakka-testkit = { path = "../../crates/rakka-testkit" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use rakka_core::{RakkaError, Subsystem};
+use rakka_core::{RakkaError, ReceptionistError, Subsystem};
 
 use crate::membership::MembershipState;
 use crate::node::{ClusterProtocol, NodeId};
@@ -44,9 +44,31 @@ pub enum ClusterError {
         /// Failure detail.
         message: String,
     },
+    /// Clustered receptionist operation failed.
+    Receptionist {
+        /// Failure detail.
+        message: String,
+    },
+    /// A propagated receptionist listing exceeded the configured routee limit.
+    ReceptionistListingTooLarge {
+        /// Service id.
+        service_id: String,
+        /// Actual routee count.
+        actual: usize,
+        /// Configured maximum routee count.
+        max: usize,
+    },
 }
 
 impl ClusterError {
+    /// Converts a core receptionist error into a cluster error.
+    #[must_use]
+    pub fn from_receptionist(error: ReceptionistError) -> Self {
+        Self::Receptionist {
+            message: error.to_string(),
+        }
+    }
+
     /// Converts this error to a core framework error.
     #[must_use]
     pub fn into_rakka_error(self) -> RakkaError {
@@ -61,6 +83,8 @@ impl ClusterError {
             Self::InvalidTransition { .. } => "invalid-transition",
             Self::IncompatibleNode { .. } => "incompatible-node",
             Self::Discovery { .. } => "discovery-error",
+            Self::Receptionist { .. } => "receptionist-error",
+            Self::ReceptionistListingTooLarge { .. } => "receptionist-listing-too-large",
         }
     }
 }
@@ -84,6 +108,17 @@ impl Display for ClusterError {
             Self::Discovery { provider, message } => {
                 write!(f, "cluster discovery provider {provider} failed: {message}")
             }
+            Self::Receptionist { message } => {
+                write!(f, "clustered receptionist failed: {message}")
+            }
+            Self::ReceptionistListingTooLarge {
+                service_id,
+                actual,
+                max,
+            } => write!(
+                f,
+                "clustered receptionist listing for '{service_id}' has {actual} routees, above configured maximum {max}"
+            ),
         }
     }
 }

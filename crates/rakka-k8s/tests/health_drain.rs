@@ -1,18 +1,23 @@
 //! Kubernetes health and pre-stop drain behavior tests.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::body::{to_bytes, Body, Bytes};
+use axum::http::{Request, StatusCode};
 use rakka_cluster::{
     ClusterMembership, ClusterNode, DiscoverySnapshot, MembershipConfig, MembershipState,
     NodeAddress, NodeId,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, ReplyTo,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorSystem, CoordinatedShutdown,
+    ReplyTo,
 };
 use rakka_k8s::{
-    KubernetesDrainController, KubernetesDrainOutcome, KubernetesDrainStepResult,
-    KubernetesDrainStepStatus, KubernetesNodeHealth, DEFAULT_KUBERNETES_PRESTOP_TIMEOUT,
+    kubernetes_drain_route, KubernetesDrainController, KubernetesDrainOutcome,
+    KubernetesDrainReport, KubernetesDrainStepResult, KubernetesDrainStepStatus,
+    KubernetesNodeHealth, DEFAULT_KUBERNETES_PRESTOP_TIMEOUT,
     DEFAULT_TERMINATION_GRACE_PERIOD_SECONDS,
 };
 use rakka_process::{ProcessActorCommand, ProcessActorState, ProcessActorStatus, ProcessHealth};
@@ -21,6 +26,7 @@ use rakka_sharding::{
 };
 use rakka_stream::{bounded_channel, StreamLifecycle};
 use tokio::sync::mpsc;
+use tower::ServiceExt;
 
 #[test]
 fn readiness_is_false_before_join_and_true_after_required_services_register() {
@@ -144,6 +150,89 @@ async fn drain_marks_readiness_false_and_reports_partial_and_timeout() {
         timeout_report.steps()[0].status(),
         KubernetesDrainStepStatus::TimedOut
     );
+}
+
+#[tokio::test]
+async fn coordinated_drain_runs_shared_shutdown_and_preserves_legacy_step_names() {
+    let system = ActorSystem::new("k8s-coordinated-drain");
+    let shutdown = CoordinatedShutdown::get(&system);
+    let health = ready_health();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut controller =
+        KubernetesDrainController::from_coordinated_shutdown(health.clone(), shutdown.clone());
+    controller.add_step("legacy step", {
+        let runs = runs.clone();
+        move || {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                KubernetesDrainStepResult::completed("legacy step drained")
+            }
+        }
+    });
+
+    let report = controller.drain(Duration::from_secs(1)).await;
+
+    assert_eq!(report.outcome(), KubernetesDrainOutcome::Complete);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert!(!health.readiness_probe().passed());
+    let legacy_step = report
+        .steps()
+        .iter()
+        .find(|step| step.name() == "legacy step")
+        .expect("legacy step should be mapped back into the Kubernetes report");
+    assert_eq!(legacy_step.status(), KubernetesDrainStepStatus::Completed);
+
+    let terminate_report = system
+        .terminate_with_report()
+        .await
+        .expect("terminate should observe the completed coordinated shutdown report");
+    assert_eq!(terminate_report.reason().code(), "kubernetes-prestop");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn coordinated_drain_timeout_maps_to_kubernetes_timeout_report() {
+    let health = ready_health();
+    let shutdown = CoordinatedShutdown::new();
+    let mut controller =
+        KubernetesDrainController::from_coordinated_shutdown(health.clone(), shutdown);
+    controller.add_step("slow-step", || async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        KubernetesDrainStepResult::completed("late")
+    });
+
+    let report = controller.drain(Duration::from_millis(5)).await;
+
+    assert_eq!(report.outcome(), KubernetesDrainOutcome::TimedOut);
+    assert_eq!(report.steps()[0].name(), "slow-step");
+    assert_eq!(
+        report.steps()[0].status(),
+        KubernetesDrainStepStatus::TimedOut
+    );
+    assert!(report.steps()[0]
+        .message()
+        .contains("reason=kubernetes-prestop"));
+    assert!(!health.readiness_probe().passed());
+}
+
+#[tokio::test]
+async fn drain_route_runs_controller_and_returns_report_json() {
+    let health = ready_health();
+    let mut controller = KubernetesDrainController::new(health.clone());
+    controller.add_step("ok", || async {
+        KubernetesDrainStepResult::completed("done")
+    });
+    let router = kubernetes_drain_route("/drain", controller, Duration::from_secs(1));
+
+    let response = get(router, "/drain").await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let report: KubernetesDrainReport =
+        serde_json::from_slice(&response.body).expect("drain report should decode");
+    assert_eq!(report.outcome(), KubernetesDrainOutcome::Complete);
+    assert_eq!(report.steps()[0].name(), "ok");
+    assert!(!health.readiness_probe().passed());
 }
 
 #[tokio::test]
@@ -302,6 +391,38 @@ fn reply_status(
     status: ProcessActorStatus,
 ) {
     let _sent = reply_to.reply(Ok(status));
+}
+
+struct CapturedResponse {
+    status: StatusCode,
+    body: Bytes,
+}
+
+async fn get(router: axum::Router, path: &str) -> CapturedResponse {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should collect");
+    CapturedResponse { status, body }
+}
+
+fn ready_health() -> KubernetesNodeHealth {
+    let mut membership = membership_with_local_joining();
+    let local = membership.local_node_id().clone();
+    membership.mark_up(&local, 1).expect("local node up");
+    let health = KubernetesNodeHealth::from_membership(&membership);
+    health.accept_compatibility();
+    health
 }
 
 fn membership_with_local_joining() -> ClusterMembership {

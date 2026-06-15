@@ -1,11 +1,16 @@
-//! Deterministic shard ownership coordinator model.
+//! Shard ownership coordinator model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rakka_cluster::{ClusterMembership, MembershipState, NodeId};
 use rakka_core::{MetricsRecorder, METRIC_SHARD_OWNERSHIP_COUNT};
 use serde::{Deserialize, Serialize};
 
+use crate::allocation::{
+    DeterministicModuloShardAllocationStrategy, ShardAllocationContext, ShardAllocationStrategy,
+    ShardRebalanceContext,
+};
 use crate::error::{ShardingError, ShardingResult};
 use crate::identity::{EntityId, EntityType, ShardId, ShardKey, ShardingConfig};
 
@@ -247,25 +252,130 @@ impl ShardRebalancePlan {
     }
 }
 
-/// Rakka-owned deterministic shard coordinator for one entity type.
+/// Rakka-owned shard coordinator for one entity type.
 #[derive(Debug, Clone)]
 pub struct ShardCoordinator {
     entity_type: EntityType,
     config: ShardingConfig,
     assignments: BTreeMap<ShardId, NodeId>,
     revision: u64,
+    allocation_strategy: Arc<dyn ShardAllocationStrategy>,
 }
 
 impl ShardCoordinator {
     /// Creates a coordinator for one entity type.
     #[must_use]
     pub fn new(entity_type: EntityType, config: ShardingConfig) -> Self {
+        Self::with_allocation_strategy(
+            entity_type,
+            config,
+            DeterministicModuloShardAllocationStrategy,
+        )
+    }
+
+    /// Creates a coordinator for one entity type with a custom allocation strategy.
+    #[must_use]
+    pub fn with_allocation_strategy(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> Self {
+        Self::with_allocation_strategy_ref(entity_type, config, Arc::new(allocation_strategy))
+    }
+
+    /// Creates a coordinator for one entity type with a shared allocation strategy.
+    #[must_use]
+    pub fn with_allocation_strategy_ref(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> Self {
         Self {
             entity_type,
             config,
             assignments: BTreeMap::new(),
             revision: 0,
+            allocation_strategy,
         }
+    }
+
+    /// Restores a coordinator from a stable ownership snapshot.
+    pub fn from_snapshot(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        snapshot: &ShardOwnershipSnapshot,
+    ) -> ShardingResult<Self> {
+        Self::from_snapshot_with_allocation_strategy(
+            entity_type,
+            config,
+            snapshot,
+            DeterministicModuloShardAllocationStrategy,
+        )
+    }
+
+    /// Restores a coordinator from a stable ownership snapshot with a custom allocation strategy.
+    pub fn from_snapshot_with_allocation_strategy(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        snapshot: &ShardOwnershipSnapshot,
+        allocation_strategy: impl ShardAllocationStrategy,
+    ) -> ShardingResult<Self> {
+        Self::from_snapshot_with_allocation_strategy_ref(
+            entity_type,
+            config,
+            snapshot,
+            Arc::new(allocation_strategy),
+        )
+    }
+
+    /// Restores a coordinator from a stable ownership snapshot with a shared allocation strategy.
+    pub fn from_snapshot_with_allocation_strategy_ref(
+        entity_type: EntityType,
+        config: ShardingConfig,
+        snapshot: &ShardOwnershipSnapshot,
+        allocation_strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> ShardingResult<Self> {
+        if snapshot.entity_type() != &entity_type
+            || snapshot.number_of_shards() != config.number_of_shards()
+        {
+            return Err(ShardingError::PersistedCoordinatorSnapshotMismatch {
+                expected_entity_type: entity_type,
+                actual_entity_type: snapshot.entity_type().clone(),
+                expected_shards: config.number_of_shards(),
+                actual_shards: snapshot.number_of_shards(),
+            });
+        }
+
+        let mut assignments = BTreeMap::new();
+        for assignment in snapshot.assignments() {
+            let shard = assignment.shard();
+            if shard.entity_type() != &entity_type {
+                return Err(ShardingError::PersistedCoordinatorSnapshotMismatch {
+                    expected_entity_type: entity_type,
+                    actual_entity_type: shard.entity_type().clone(),
+                    expected_shards: config.number_of_shards(),
+                    actual_shards: snapshot.number_of_shards(),
+                });
+            }
+
+            let shard_id = shard.shard_id();
+            if !config.contains_shard(shard_id) {
+                return Err(ShardingError::UnknownShard {
+                    shard_id,
+                    number_of_shards: config.number_of_shards(),
+                });
+            }
+
+            assignments.insert(shard_id, assignment.owner().clone());
+        }
+
+        Ok(Self {
+            entity_type,
+            config,
+            assignments,
+            revision: snapshot.revision(),
+            allocation_strategy,
+        })
     }
 
     /// Entity type coordinated by this instance.
@@ -284,6 +394,18 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Allocation strategy used by this coordinator.
+    #[must_use]
+    pub fn allocation_strategy(&self) -> Arc<dyn ShardAllocationStrategy> {
+        self.allocation_strategy.clone()
+    }
+
+    /// Stable allocation strategy name used for diagnostics.
+    #[must_use]
+    pub fn allocation_strategy_name(&self) -> &'static str {
+        self.allocation_strategy.strategy_name()
     }
 
     /// Computes the shard id for an entity id.
@@ -341,32 +463,106 @@ impl ShardCoordinator {
             };
         }
 
+        let mut assignments = self.assignments.clone();
         for shard_index in 0..self.config.number_of_shards() {
             let shard_id = ShardId::new(shard_index);
-            let desired_owner = desired_owner(&routable_nodes, shard_id).clone();
-            match self.assignments.get(&shard_id).cloned() {
-                None => {
-                    self.assignments.insert(shard_id, desired_owner.clone());
+            let current_owner = assignments.get(&shard_id).cloned();
+            let needs_allocation = match current_owner.as_ref() {
+                Some(owner) => !is_routable_node(&routable_nodes, owner),
+                None => true,
+            };
+            if !needs_allocation {
+                continue;
+            }
+
+            let desired_owner = {
+                let context = ShardAllocationContext::new(
+                    &self.entity_type,
+                    &self.config,
+                    membership,
+                    &routable_nodes,
+                    &assignments,
+                );
+                self.allocation_strategy
+                    .allocate_shard(&context, shard_id)
+                    .filter(|owner| is_routable_node(&routable_nodes, owner))
+            };
+
+            match (current_owner, desired_owner) {
+                (None, Some(to)) => {
+                    assignments.insert(shard_id, to.clone());
                     decisions.push(ShardDecision::Assign {
                         shard: self.shard_key(shard_id),
-                        to: desired_owner,
+                        to,
                         reason: ShardMoveReason::InitialAllocation,
                     });
                 }
-                Some(current_owner) if current_owner != desired_owner => {
-                    let reason = move_reason(membership, &current_owner);
-                    self.assignments.insert(shard_id, desired_owner.clone());
+                (Some(from), Some(to)) if from != to => {
+                    let reason = move_reason(membership, &from);
+                    assignments.insert(shard_id, to.clone());
                     decisions.push(ShardDecision::Move {
                         shard: self.shard_key(shard_id),
-                        from: current_owner,
-                        to: desired_owner,
+                        from,
+                        to,
                         reason,
                     });
                 }
-                Some(_current_owner) => {}
+                (Some(from), None) => {
+                    assignments.remove(&shard_id);
+                    decisions.push(ShardDecision::Unassign {
+                        shard: self.shard_key(shard_id),
+                        from: from.clone(),
+                        reason: move_reason(membership, &from),
+                    });
+                }
+                (None, None) | (Some(_), Some(_)) => {}
             }
         }
 
+        let reassignments = {
+            let context = ShardRebalanceContext::new(
+                &self.entity_type,
+                &self.config,
+                membership,
+                &routable_nodes,
+                &assignments,
+            );
+            self.allocation_strategy.rebalance(&context)
+        };
+        let mut reassigned_shards = BTreeSet::new();
+        for reassignment in reassignments {
+            let shard_id = reassignment.shard_id();
+            if !self.config.contains_shard(shard_id) || !reassigned_shards.insert(shard_id) {
+                continue;
+            }
+            let to = reassignment.to().clone();
+            if !is_routable_node(&routable_nodes, &to) {
+                continue;
+            }
+            match assignments.get(&shard_id).cloned() {
+                None => {
+                    assignments.insert(shard_id, to.clone());
+                    decisions.push(ShardDecision::Assign {
+                        shard: self.shard_key(shard_id),
+                        to,
+                        reason: ShardMoveReason::InitialAllocation,
+                    });
+                }
+                Some(from) if from != to => {
+                    let reason = move_reason(membership, &from);
+                    assignments.insert(shard_id, to.clone());
+                    decisions.push(ShardDecision::Move {
+                        shard: self.shard_key(shard_id),
+                        from,
+                        to,
+                        reason,
+                    });
+                }
+                Some(_from) => {}
+            }
+        }
+
+        self.assignments = assignments;
         self.bump_revision_if_changed(&decisions);
         ShardRebalancePlan {
             previous_revision,
@@ -414,9 +610,8 @@ impl ShardCoordinator {
     }
 }
 
-fn desired_owner(routable_nodes: &[NodeId], shard_id: ShardId) -> &NodeId {
-    let index = shard_id.as_u32() as usize % routable_nodes.len();
-    &routable_nodes[index]
+fn is_routable_node(routable_nodes: &[NodeId], node_id: &NodeId) -> bool {
+    routable_nodes.contains(node_id)
 }
 
 fn move_reason(membership: &ClusterMembership, current_owner: &NodeId) -> ShardMoveReason {

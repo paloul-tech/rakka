@@ -31,6 +31,12 @@ pub struct ActorOptions {
     pub mailbox_capacity: usize,
     /// Supervision strategy used when the actor handler fails or panics.
     pub supervision: SupervisionStrategy,
+    /// Dispatcher hint for future runtime integrations.
+    pub dispatcher: DispatcherHint,
+    /// Whether actor-level instrumentation should be enabled.
+    pub instrumentation: bool,
+    /// Whether this actor is expected to run blocking work.
+    pub blocking: bool,
 }
 
 impl ActorOptions {
@@ -47,6 +53,27 @@ impl ActorOptions {
         self.supervision = supervision;
         self
     }
+
+    /// Creates options with a dispatcher hint.
+    #[must_use]
+    pub const fn with_dispatcher(mut self, dispatcher: DispatcherHint) -> Self {
+        self.dispatcher = dispatcher;
+        self
+    }
+
+    /// Creates options with instrumentation enabled or disabled.
+    #[must_use]
+    pub const fn with_instrumentation(mut self, instrumentation: bool) -> Self {
+        self.instrumentation = instrumentation;
+        self
+    }
+
+    /// Creates options with a blocking-work hint.
+    #[must_use]
+    pub const fn with_blocking_hint(mut self, blocking: bool) -> Self {
+        self.blocking = blocking;
+        self
+    }
 }
 
 impl Default for ActorOptions {
@@ -54,6 +81,24 @@ impl Default for ActorOptions {
         Self {
             mailbox_capacity: crate::actor::DEFAULT_MAILBOX_CAPACITY,
             supervision: SupervisionStrategy::Stop,
+            dispatcher: DispatcherHint::Default,
+            instrumentation: true,
+            blocking: false,
         }
     }
 }
+
+/// Dispatcher hint recorded on spawn options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatcherHint {
+    /// Use the actor system's default asynchronous dispatcher.
+    Default,
+    /// The actor may perform blocking work and should be isolated by future dispatchers.
+    Blocking,
+}
+
+/// Akka-like spawn options alias.
+pub type SpawnOptions = ActorOptions;
+
+/// Akka-like actor props alias.
+pub type ActorProps = ActorOptions;

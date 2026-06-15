@@ -11,12 +11,14 @@ ROOT_DIR=$(CDPATH= cd "$SCRIPT_DIR/.." && pwd)
 cd "$ROOT_DIR"
 
 PUBLISHABLE_CRATES="
+rakka
 rakka-core
 rakka-persistence
 rakka-persistence-postgres
 rakka-remote
 rakka-cluster
 rakka-sharding
+rakka-sharding-postgres
 rakka-workflow
 rakka-stream
 rakka-process

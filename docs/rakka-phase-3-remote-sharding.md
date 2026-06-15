@@ -52,9 +52,19 @@ cargo run -p rakka-example-multi-node-sharding -- --networked-processes
 
 This establishes the internal coordination model for Rakka-owned clustering. It is intentionally deterministic so the semantics can be tested before adding distributed consensus and production networking.
 
+Phase 4D adds durable coordinator stores and recovery-after-movement examples on
+top of this model. See
+`docs/rakka-akka-parity-phase-4d6-recovery-after-movement.md` for the sharded
+cart example that writes event-sourced state on node A, moves the owning shard
+to node B, and proves node B recovers the entity by `PersistenceId`.
+
 ## Durability and Lifecycle
 
 Phase 3 sharding is compatible with the durable-state foundation from Phase 2, but it does not force every entity to be durable. Entity actors are normal typed actors; an application can choose a durable actor implementation for stateful entities.
+
+Coordinator durability and entity persistence remain separate concerns:
+coordinator stores recover shard ownership decisions, while typed persistence
+stores recover the entity's domain state.
 
 Local entity lifecycle support now includes:
 

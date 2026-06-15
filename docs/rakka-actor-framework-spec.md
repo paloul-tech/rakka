@@ -104,20 +104,20 @@ Requirements:
 Rakka actor paths follow this logical form:
 
 ```text
-rakka://<cluster>/<system>/<scope>/<segments>#<incarnation>
+rakka://<cluster>/<system>/<scope>/<segments>
 ```
 
 Examples:
 
 ```text
 rakka://prod/orders/user/gateway
-rakka://prod/orders/entity/cart/tenant-7/cart-123#i-42
+rakka://prod/orders/entity/cart/tenant-7/cart-123
 ```
 
 Identity types:
 
 - `ActorPath`: logical name that may or may not currently be inhabited.
-- `ActorIncarnation`: unique runtime identity for a concrete actor lifetime.
+- `ActorUid`: unique runtime identity for a concrete actor lifetime.
 - `EntityId`: domain identity for sharded stateful actors.
 - `PersistenceId`: stable durable-state identity, derived from entity type plus entity id.
 - `NodeId`: stable process incarnation identity, including pod identity plus runtime UID.

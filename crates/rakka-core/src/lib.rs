@@ -7,19 +7,31 @@
 //! persistence, and external-process ownership are implemented in later phases.
 
 pub mod actor;
+pub mod coordinated_shutdown;
 pub mod dead_letter;
 pub mod error;
 pub mod metrics;
 pub mod operational;
 pub mod path;
+pub mod receptionist;
+pub mod routers;
 pub mod supervision;
 pub mod system;
 pub mod telemetry;
 
 pub use actor::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFailure, ActorFuture, ActorRef,
-    ActorResult, ActorRuntimeSnapshot, ActorTerminated, AskError, Message, ReplyTo, StopError,
-    TellError, TerminationReason, TimerHandle, DEFAULT_MAILBOX_CAPACITY,
+    actor_fn, actor_future, setup, Actor, ActorAction, ActorContext, ActorFailure, ActorFn,
+    ActorFuture, ActorRef, ActorResult, ActorRuntimeSnapshot, ActorTerminated, ActorTraceContext,
+    AskError, Behavior, BehaviorActor, Message, ReplyTo, SerializedActorRef, SetupActor, StopError,
+    TellError, TerminationReason, TimerHandle, WatchHandle, DEFAULT_MAILBOX_CAPACITY,
+};
+pub use coordinated_shutdown::{
+    CoordinatedShutdown, CoordinatedShutdownError, CoordinatedShutdownReason,
+    CoordinatedShutdownReport, CoordinatedShutdownResult, CoordinatedShutdownSettings,
+    CoordinatedShutdownSnapshot, ShutdownFailurePolicy, ShutdownOutcome, ShutdownPhase,
+    ShutdownPhaseReport, ShutdownTask, ShutdownTaskAttribute, ShutdownTaskContext,
+    ShutdownTaskFuture, ShutdownTaskOptions, ShutdownTaskReport, ShutdownTaskResult,
+    ShutdownTaskStatus,
 };
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
@@ -32,7 +44,9 @@ pub use metrics::{
     METRIC_ACTOR_MAILBOX_DEPTH, METRIC_CLUSTER_MEMBERS, METRIC_GRPC_REQUEST_LATENCY_MS,
     METRIC_HTTP_REQUEST_LATENCY_MS, METRIC_K8S_COMPATIBILITY, METRIC_K8S_READINESS,
     METRIC_PERSISTENCE_LATENCY_MS, METRIC_PROCESS_EXITS, METRIC_REMOTE_FAILURES,
-    METRIC_SHARD_OWNERSHIP_COUNT, METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
+    METRIC_SHARD_OWNERSHIP_COUNT, METRIC_SHUTDOWN_PHASE_DURATION_MS, METRIC_SHUTDOWN_RUNNING,
+    METRIC_SHUTDOWN_TASK_DURATION_MS, METRIC_SHUTDOWN_TASK_FAILURES, METRIC_SHUTDOWN_TIMEOUTS,
+    METRIC_STREAM_CANCELLATIONS, METRIC_STREAM_PRESSURE,
 };
 pub use operational::{
     DeploymentProfile, OperationalTimeoutDefaults, SecurityDefaults, DEFAULT_ACTOR_ASK_TIMEOUT,
@@ -41,9 +55,24 @@ pub use operational::{
     DEFAULT_REMOTE_CONNECT_TIMEOUT, DEFAULT_REMOTE_IDLE_TIMEOUT,
     DEFAULT_REMOTE_OUTBOUND_QUEUE_CAPACITY, DEFAULT_STREAM_DRAIN_TIMEOUT,
 };
-pub use path::ActorPath;
-pub use supervision::{ActorOptions, SupervisionStrategy};
-pub use system::{ActorSystem, ActorSystemSnapshot};
+pub use path::{validate_actor_path_segment, ActorPath, ActorUid};
+pub use receptionist::{
+    Listing, Receptionist, ReceptionistError, ReceptionistRegistration, ReceptionistResult,
+    ReceptionistSubscription, ServiceKey,
+};
+pub use routers::{
+    GroupNoRouteeBehavior, GroupRouter, GroupRouterBuilder, GroupRouterSnapshot,
+    GroupRouterTellError, GroupRoutingStrategy, PoolRouter, PoolRouterBuilder, PoolRouterTellError,
+    PoolRoutingStrategy, Routers,
+};
+pub use supervision::{
+    ActorOptions, ActorProps, DispatcherHint, SpawnOptions, SupervisionStrategy,
+};
+pub use system::{
+    ActorRefResolver, ActorSystem, ActorSystemBuilder, ActorSystemRuntimeSettings,
+    ActorSystemSerializationRegistry, ActorSystemShutdownConfig, ActorSystemSnapshot,
+    DEFAULT_SYSTEM_TERMINATION_TIMEOUT,
+};
 
 /// Framework name used in diagnostics and metric prefixes.
 pub const FRAMEWORK_NAME: &str = "rakka";

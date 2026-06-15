@@ -549,6 +549,21 @@ impl ClusterMembership {
         )
     }
 
+    /// Marks a silent member unreachable.
+    pub fn mark_unreachable(
+        &mut self,
+        node_id: &NodeId,
+        observed_at_millis: u64,
+    ) -> ClusterResult<Option<MembershipEvent>> {
+        self.transition(
+            node_id,
+            observed_at_millis,
+            MembershipState::Unreachable,
+            |from| matches!(from, MembershipState::Joining | MembershipState::Up),
+            |node_id| MembershipEvent::MemberUnreachable { node_id },
+        )
+    }
+
     /// Begins graceful leave for the local node.
     pub fn leave_local(
         &mut self,

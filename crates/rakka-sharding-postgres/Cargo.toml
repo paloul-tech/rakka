@@ -1,0 +1,27 @@
+[package]
+name = "rakka-sharding-postgres"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "rakka_sharding_postgres"
+
+[dependencies]
+rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
+rakka-core = { path = "../rakka-core", version = "0.1.0" }
+rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
+serde_json.workspace = true
+tokio-postgres.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

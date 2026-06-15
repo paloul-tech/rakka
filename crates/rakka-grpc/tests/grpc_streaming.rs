@@ -6,9 +6,10 @@ use futures_util::stream;
 use futures_util::StreamExt;
 use rakka_grpc::{
     bidi_stream_pair_from_stream, client_stream_from_stream, server_streaming_response,
-    GrpcResponseStream, GrpcResult, GrpcStreamConfig, RAKKA_GRPC_ERROR_CODE_METADATA,
+    stream_status, GrpcResponseStream, GrpcResult, GrpcStreamConfig,
+    RAKKA_GRPC_ERROR_CODE_METADATA,
 };
-use rakka_stream::{bounded_channel, StreamLifecycle};
+use rakka_stream::{bounded_channel, StreamError, StreamLifecycle};
 use tonic::{Code, Status};
 
 #[tokio::test]
@@ -55,6 +56,17 @@ async fn stream_error_maps_to_sanitized_grpc_status() {
     assert_eq!(status.code(), Code::Cancelled);
     assert_status_error_code(&status, "stream-cancelled");
     assert!(!status.message().contains("remote envelope"));
+}
+
+#[test]
+fn stream_operator_error_maps_to_grpc_internal_status() {
+    let status = stream_status(StreamError::Operator {
+        message: "map_async task failed".to_owned(),
+    });
+
+    assert_eq!(status.code(), Code::Internal);
+    assert_status_error_code(&status, "stream-operator-error");
+    assert!(status.message().contains("map_async task failed"));
 }
 
 #[tokio::test]
