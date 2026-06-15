@@ -646,6 +646,28 @@ Validation:
   Kubernetes drain integration, shard handoff during shutdown, and process actor
   cleanup.
 
+Implementation status through Slice 7J on 2026-06-15:
+
+- Added `rakka-core::CoordinatedShutdown` with built-in Akka-shaped phases,
+  serializable reports, idempotent execution, task/phase timeouts, failure
+  policies, and actor-system integration through `ActorSystem::terminate` and
+  `terminate_with_report`.
+- Added adapter registration helpers for HTTP, gRPC, streams, cluster, sharding,
+  process actors, persistence flush/query cancellation, Kubernetes pre-stop
+  drain, and OS signal driven shutdown.
+- Added shutdown observability with stable metrics, running/final snapshots, and
+  HTTP operational snapshot registration.
+- Added `rakka-testkit::CoordinatedShutdownTestKit` for deterministic shutdown
+  tests without arbitrary sleeps.
+- Added `docs/rakka-akka-parity-phase-7-coordinated-shutdown.md`, Phase 7
+  migration notes, Kubernetes coordinated pre-stop timing guidance, and the
+  runnable `rakka-example-coordinated-shutdown` example.
+
+Remaining Phase 7 work:
+
+- Run and document the full operational validation slice in Phase 7K, including
+  workspace-wide tests/docs and focused cross-crate integration coverage.
+
 ## Cross-Cutting Requirements
 
 - Keep `unsafe_code` forbidden.

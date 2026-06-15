@@ -7,6 +7,18 @@ use rakka_core::{
 use crate::{StreamError, StreamResult, StreamSink, StreamSource};
 
 /// Registers a drain task for a bounded stream sink.
+///
+/// ```no_run
+/// use rakka_core::CoordinatedShutdown;
+/// use rakka_stream::{bounded_channel, register_stream_sink_drain};
+///
+/// # fn example() -> rakka_core::RakkaResult<()> {
+/// let shutdown = CoordinatedShutdown::new();
+/// let (sink, _source) =
+///     bounded_channel::<String>(16).map_err(rakka_stream::StreamError::into_rakka_error)?;
+/// register_stream_sink_drain(&shutdown, "drain-orders-stream", sink)?;
+/// # Ok(()) }
+/// ```
 pub fn register_stream_sink_drain<T>(
     shutdown: &CoordinatedShutdown,
     task_name: impl Into<String>,
@@ -27,6 +39,18 @@ where
 }
 
 /// Registers a drain task for a bounded stream source.
+///
+/// ```no_run
+/// use rakka_core::CoordinatedShutdown;
+/// use rakka_stream::{bounded_channel, register_stream_source_drain};
+///
+/// # fn example() -> rakka_core::RakkaResult<()> {
+/// let shutdown = CoordinatedShutdown::new();
+/// let (_sink, source) =
+///     bounded_channel::<String>(16).map_err(rakka_stream::StreamError::into_rakka_error)?;
+/// register_stream_source_drain(&shutdown, "drain-orders-source", source)?;
+/// # Ok(()) }
+/// ```
 pub fn register_stream_source_drain<T>(
     shutdown: &CoordinatedShutdown,
     task_name: impl Into<String>,

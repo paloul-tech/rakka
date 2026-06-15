@@ -22,6 +22,26 @@ pub const PROCESS_ACTOR_STOP_TASK_GRACE: Duration = Duration::from_secs(1);
 /// The provided timeout is used for both the actor ask and the coordinated
 /// shutdown task. A process actor that has already stopped, or whose child is
 /// already absent, is treated as a successful idempotent shutdown.
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use rakka_core::{ActorSystem, CoordinatedShutdown};
+/// use rakka_process::{
+///     register_process_actor_stop_task, spawn_process_actor, ExecutableAllowlist,
+///     ProcessActorConfig, ProcessSpec,
+/// };
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let system = ActorSystem::new("docs");
+/// let shutdown = CoordinatedShutdown::get(&system);
+/// let executable = std::env::current_exe()?;
+/// let allowlist = ExecutableAllowlist::from_exact_paths([executable.clone()]);
+/// let config = ProcessActorConfig::new(ProcessSpec::new(executable), allowlist);
+/// let actor = spawn_process_actor(&system, "child", config)?;
+/// register_process_actor_stop_task(&shutdown, "stop-child", actor, Duration::from_secs(1))?;
+/// # Ok(()) }
+/// ```
 pub fn register_process_actor_stop_task(
     shutdown: &CoordinatedShutdown,
     task_name: impl Into<String>,

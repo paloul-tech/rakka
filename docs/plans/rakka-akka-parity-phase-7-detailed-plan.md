@@ -731,7 +731,7 @@ Completion notes:
 
 Goal: make the coordinated shutdown path easy to discover and migrate to.
 
-Status: planned.
+Status: completed in Slice 7J.
 
 Scope:
 
@@ -767,6 +767,25 @@ cargo test --workspace --all-features
 cargo doc --workspace --all-features --no-deps
 git diff --check
 ```
+
+Completion notes:
+
+- Added `docs/rakka-akka-parity-phase-7-coordinated-shutdown.md` covering the
+  phase graph, task registration, adapter hooks, observability, Kubernetes
+  drain, testkit usage, and the runnable example.
+- Updated `docs/rakka-akka-parity-migration-notes.md` with Phase 7 before/after
+  guidance for direct `system.shutdown`, standalone drain registries, Kubernetes
+  pre-stop, low-level helper boundaries, snapshots, and testkit usage.
+- Added `rakka-example-coordinated-shutdown`, a self-contained workspace
+  example that registers custom tasks, HTTP graceful-shutdown signaling, stream
+  drain, process actor stop, and final `ActorSystem::terminate_with_report`.
+- Updated `examples/kubernetes/README.md` with coordinated pre-stop timing for
+  readiness, liveness, `/drain`, `RAKKA_K8S_PRESTOP_TIMEOUT_MS`, and
+  `terminationGracePeriodSeconds`.
+- Updated the main parity plan with Phase 7 implementation status through 7J
+  while leaving Slice 7K as the remaining full operational validation slice.
+- Added rustdoc examples for the core coordinated-shutdown registry lookup and
+  the HTTP, stream, and process shutdown registration helpers.
 
 ## Slice 7K: Full Operational Validation
 

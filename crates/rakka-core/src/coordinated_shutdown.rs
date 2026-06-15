@@ -70,6 +70,23 @@ pub struct CoordinatedShutdown {
 
 impl CoordinatedShutdown {
     /// Returns the coordinated shutdown registry owned by an actor system.
+    ///
+    /// ```no_run
+    /// use rakka_core::{
+    ///     ActorSystem, CoordinatedShutdown, ShutdownOutcome, ShutdownPhase,
+    /// };
+    ///
+    /// # async fn example() -> rakka_core::RakkaResult<()> {
+    /// let system = ActorSystem::new("docs");
+    /// let shutdown = CoordinatedShutdown::get(&system);
+    /// shutdown.add_task(ShutdownPhase::flush_persistence(), "flush-cache", |_context| async {
+    ///     Ok(())
+    /// })?;
+    ///
+    /// let report = system.terminate_with_report().await.unwrap();
+    /// assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+    /// # Ok(()) }
+    /// ```
     #[must_use]
     pub fn get(system: &ActorSystem) -> Self {
         system.coordinated_shutdown()

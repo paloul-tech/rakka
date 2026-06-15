@@ -180,6 +180,17 @@ struct HttpShutdownState {
 }
 
 /// Registers a stop-ingress task that requests HTTP graceful shutdown.
+///
+/// ```no_run
+/// use rakka_core::CoordinatedShutdown;
+/// use rakka_http::{register_http_shutdown_task, HttpShutdownHandle};
+///
+/// # fn example() -> rakka_core::RakkaResult<()> {
+/// let shutdown = CoordinatedShutdown::new();
+/// let handle = HttpShutdownHandle::new();
+/// register_http_shutdown_task(&shutdown, "stop-public-http", handle.clone())?;
+/// # Ok(()) }
+/// ```
 pub fn register_http_shutdown_task(
     shutdown: &CoordinatedShutdown,
     task_name: impl Into<String>,

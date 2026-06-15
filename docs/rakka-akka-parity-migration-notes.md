@@ -1,7 +1,7 @@
 # Rakka Akka Parity Migration Notes
 
-Status: updated through Phase 6
-Date: 2026-06-14
+Status: updated through Phase 7J
+Date: 2026-06-15
 
 ## Phase 0
 
@@ -329,3 +329,89 @@ sinks, process stdout, and probe usage:
 ```bash
 cargo run -p rakka-example-streams
 ```
+
+## Phase 7
+
+Phase 7 makes coordinated shutdown the preferred operational path. New
+application code should register shutdown tasks against the `ActorSystem`'s
+owned `CoordinatedShutdown` registry and call `system.terminate()` or
+`system.terminate_with_report()` instead of mixing direct stops, ad hoc
+channels, and adapter-specific drain calls.
+
+Before:
+
+```rust
+// Fire-and-forget compatibility stop.
+system.shutdown();
+```
+
+After:
+
+```rust
+let shutdown = CoordinatedShutdown::get(&system);
+
+shutdown.add_task(ShutdownPhase::flush_persistence(), "flush-search-index", |_context| async {
+    Ok(())
+})?;
+
+let report = system.terminate_with_report().await?;
+assert_eq!(report.outcome(), ShutdownOutcome::Complete);
+```
+
+Direct low-level helpers remain useful in focused tests and manually wired
+runtime experiments:
+
+```rust
+let shutdown = CoordinatedShutdown::new();
+register_stream_sink_drain(&shutdown, "drain-orders", sink)?;
+let report = shutdown.run(CoordinatedShutdownReason::user_request()).await?;
+```
+
+Application code should prefer the actor-system registry so built-in actor stop
+tasks, adapter tasks, metrics, snapshots, Kubernetes pre-stop drain, and
+repeated terminate calls all share one idempotent lifecycle.
+
+For Kubernetes, replace standalone drain-only code with the coordinated path:
+
+```rust
+let health = KubernetesNodeHealth::new(node_id);
+let drain = KubernetesDrainController::from_coordinated_shutdown(
+    health,
+    system.coordinated_shutdown(),
+);
+let report = drain.drain(pre_stop_timeout).await;
+```
+
+The readiness endpoint should fail immediately after drain begins; liveness
+should continue to pass unless the runtime is stuck; `terminationGracePeriodSeconds`
+should be longer than the pre-stop timeout so final reports and actor-system
+cleanup have room to complete.
+
+HTTP, gRPC, stream, process, persistence, cluster, sharding, and Kubernetes
+adapters now expose registration helpers for the built-in phase graph. Prefer
+those helpers over application-owned shutdown channels unless a component is
+not owned by Rakka and has to be bridged manually with `add_task`.
+
+Operational snapshots can include the coordinated shutdown state:
+
+```rust
+let snapshots = rakka_http::OperationalSnapshotRegistry::new();
+rakka_http::register_coordinated_shutdown_snapshot(
+    &snapshots,
+    system.coordinated_shutdown(),
+);
+```
+
+Tests should prefer `CoordinatedShutdownTestKit` for ordering, manual release,
+failure injection, idempotency, report-status assertions, and timeout metric
+label assertions without arbitrary sleeps.
+
+Run the self-contained coordinated shutdown example:
+
+```bash
+cargo run -p rakka-example-coordinated-shutdown
+```
+
+See `docs/rakka-akka-parity-phase-7-coordinated-shutdown.md` for the phase
+graph, adapter registration examples, observability guidance, Kubernetes
+timing, and testkit usage.
