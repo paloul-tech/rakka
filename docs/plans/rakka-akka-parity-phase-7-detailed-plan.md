@@ -548,7 +548,7 @@ Completion note:
 Goal: make Kubernetes pre-stop drain run coordinated shutdown while preserving
 the existing Kubernetes health and drain APIs.
 
-Status: planned.
+Status: completed.
 
 Scope:
 
@@ -584,6 +584,32 @@ cargo test -p rakka-http observability
 cargo clippy -p rakka-k8s --all-targets -- -D warnings
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh
 ```
+
+Completion note:
+
+- Added `KubernetesDrainController::from_coordinated_shutdown` so Kubernetes
+  pre-stop drain can run the same coordinated shutdown registry used by
+  `ActorSystem::terminate`.
+- Coordinated drain marks readiness false before running shutdown with reason
+  `kubernetes-prestop`, and maps `CoordinatedShutdownReport` plus failed or
+  timed-out runs back into `KubernetesDrainReport`.
+- Existing `KubernetesDrainController::add_step` usage remains compatible; in
+  coordinated mode each legacy drain step is wrapped as a coordinated shutdown
+  task in `drain-adapters` while Kubernetes reports preserve the original step
+  names.
+- Added `KubernetesDrainReport::from_coordinated_shutdown_report` for callers
+  that need direct report conversion.
+- Added `kubernetes_drain_route` for a GET `/drain` style route that returns
+  JSON drain reports and status codes for complete, partial, and timed-out
+  drains.
+- Added OS signal helpers for Ctrl-C/SIGTERM-driven coordinated shutdown,
+  including a Kubernetes pre-stop reason helper.
+- Updated the Kubernetes example README and manifest comments to describe the
+  coordinated pre-stop path.
+- Added tests covering coordinated drain/report mapping, shared
+  `ActorSystem::terminate` report source behavior, timeout mapping with stable
+  `kubernetes-prestop` reason text, `/drain` route JSON behavior, and updated
+  example documentation assertions.
 
 ## Slice 7H: Shutdown Observability, Metrics, And Snapshots
 

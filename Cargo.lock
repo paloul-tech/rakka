@@ -1188,13 +1188,16 @@ dependencies = [
 name = "rakka-k8s"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "rakka-cluster",
  "rakka-core",
  "rakka-process",
  "rakka-sharding",
  "rakka-stream",
  "serde",
+ "serde_json",
  "tokio",
+ "tower 0.5.3",
 ]
 
 [[package]]

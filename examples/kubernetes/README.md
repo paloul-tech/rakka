@@ -13,7 +13,7 @@ The manifest is intentionally an application-image contract rather than a hosted
 
 - `GET /ready`: returns success only after cluster join, protocol compatibility acceptance, and required service registration.
 - `GET /live`: stays healthy during normal rebalance and drain, but fails for stuck runtime conditions.
-- `GET /drain`: starts graceful drain, marks readiness false, hands off shards, drains streams, stops process actors, and returns a drain report.
+- `GET /drain`: starts coordinated shutdown with reason `kubernetes-prestop`, marks readiness false, hands off shards, drains streams, stops process actors, and returns a drain report.
 - `GET /metrics`: returns Prometheus text metrics from the Rakka metrics exporter.
 - `GET /snapshots`: returns JSON operational snapshots, including Kubernetes health.
 - `GET /scenario/sharding/route-remote?entity_id=cart-v1g&item=apple&expect_remote=1`: routes a request through Rakka sharding to an entity owned by another pod through internal Rakka remoting, then returns a body containing the owning pod or node name.
@@ -81,9 +81,9 @@ The example expects the application image to expose:
 
 - `GET /ready`: returns success after cluster join, compatibility acceptance, and required service registration.
 - `GET /live`: stays healthy during ordinary shard rebalance and graceful drain, but fails for stuck runtime conditions.
-- `GET /drain`: starts the Slice 5G drain controller and returns a drain report.
+- `GET /drain`: runs the coordinated pre-stop path and returns a drain report mapped from the coordinated shutdown report.
 
-The StatefulSet pre-stop hook calls `/drain`, and `terminationGracePeriodSeconds` gives the node time to mark itself draining, hand off shards, drain streams, stop process actors, and leave membership.
+The StatefulSet pre-stop hook calls `/drain`, and `terminationGracePeriodSeconds` gives the node time to mark itself draining, stop ingress, drain adapters, leave membership, hand off shards, stop process actors, flush persistence hooks, and stop actor-system resources through the same coordinated shutdown path used by application termination.
 
 ## Observability
 

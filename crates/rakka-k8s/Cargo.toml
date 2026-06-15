@@ -14,6 +14,7 @@ license-file.workspace = true
 name = "rakka_k8s"
 
 [dependencies]
+axum.workspace = true
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
 rakka-process = { path = "../rakka-process", version = "0.1.0" }
@@ -21,6 +22,10 @@ rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 rakka-stream = { path = "../rakka-stream", version = "0.1.0", default-features = false }
 serde.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true
