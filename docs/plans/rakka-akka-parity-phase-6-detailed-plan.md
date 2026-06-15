@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6I
+Status: implemented through Slice 6J
 Date: 2026-06-14
 
 ## Purpose
@@ -673,6 +673,16 @@ cargo run -p rakka-example-streams
 cargo test -p rakka-testkit
 cargo doc --workspace --all-features --no-deps
 ```
+
+Implementation note:
+
+- Added `examples/streams` as `rakka-example-streams`, covering finite facade
+  operators, `Sink::actor_ref_with_ack`, `Source::process_stdout`, and
+  `StreamTestKit` source probes in one self-contained run.
+- Updated `README.md` and `docs/rakka-akka-parity-migration-notes.md` with
+  stream facade migration guidance and the runnable example command.
+- Updated `docs/rakka-akka-parity-phase-6-streams.md` with a runnable examples
+  section that points to the new package.
 
 ## Full Validation Gate
 

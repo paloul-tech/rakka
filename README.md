@@ -21,6 +21,7 @@ See `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/tes
 See `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
 See `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
 See `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
+See `docs/rakka-akka-parity-phase-6-streams.md` for the Akka-shaped bounded stream facade, process IO migration, and stream testkit probes.
 Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
@@ -60,6 +61,7 @@ cargo test -p rakka-http --test observability_routes
 cargo run -p rakka-example-local-receptionist-router
 cargo run -p rakka-example-pool-router
 cargo run -p rakka-example-clustered-receptionist
+cargo run -p rakka-example-streams
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
 cargo doc --workspace --all-features --no-deps
@@ -290,6 +292,23 @@ Expected output:
 ```text
 Rakka wrapped legacy-calculator and received result 42.
 Captured child stderr: ["legacy child handled increment"]
+```
+
+### Stream Facade
+
+This example exercises the Akka-shaped bounded stream facade: finite operators, an acked actor sink, process stdout as a facade source, and stream testkit probes. It is self-contained and starts itself with a hidden child flag for the process stdout example.
+
+```sh
+cargo run -p rakka-example-streams
+```
+
+Expected output:
+
+```text
+Finite stream operators produced [6, 8].
+Acked actor sink delivered ["init", "apple", "banana", "complete"].
+Process stdout facade source read "child-stream-output".
+Stream testkit probe collected ["probe-one", "probe-two"].
 ```
 
 ### Edge Gateway

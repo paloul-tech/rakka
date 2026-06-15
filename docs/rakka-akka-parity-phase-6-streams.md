@@ -397,6 +397,25 @@ Every async probe assertion has a deterministic timeout. Defaults come from
 `StreamTestKit`, and explicit `*_within` variants are available where the test
 needs a custom timeout.
 
+## Runnable Example
+
+`examples/streams` is the self-contained Phase 6 adoption example. It covers
+finite source operators, `Sink::actor_ref_with_ack`, `Source::process_stdout`,
+and `StreamTestKit` source probes:
+
+```bash
+cargo run -p rakka-example-streams
+```
+
+Expected output:
+
+```text
+Finite stream operators produced [6, 8].
+Acked actor sink delivered ["init", "apple", "banana", "complete"].
+Process stdout facade source read "child-stream-output".
+Stream testkit probe collected ["probe-one", "probe-two"].
+```
+
 ## Design Rules
 
 - All facade materialization must remain bounded by `StreamRunSettings`.

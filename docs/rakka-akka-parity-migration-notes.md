@@ -1,7 +1,7 @@
 # Rakka Akka Parity Migration Notes
 
-Status: updated through Phase 5
-Date: 2026-06-13
+Status: updated through Phase 6
+Date: 2026-06-14
 
 ## Phase 0
 
@@ -255,3 +255,77 @@ Clustered receptionist propagation now has two reviewable paths:
 listing model and group-router integration, while `rakka-remote` provides TCP
 loopback propagation with transport-serializable remote service routees,
 materialized local proxies, and normal group-router delivery.
+
+## Phase 6
+
+Phase 6 adds an Akka-shaped bounded stream facade over Rakka's existing
+`StreamSink<T>` and `StreamSource<T>` runtime. New stream code should prefer
+`Source<T>`, `Flow<I, O>`, and `Sink<T, M>` when the pipeline is easier to read
+as a materialized stream.
+
+Before:
+
+```rust
+let (sink, source) = bounded_channel(8)?;
+sink.send("work".to_owned()).await?;
+sink.drain()?;
+let items = collect_stream_source(&source).await?;
+```
+
+After:
+
+```rust
+let items = Source::from_iter(["work".to_owned()])
+    .map(|item| item.to_uppercase())
+    .run_collect()
+    .await?;
+```
+
+Low-level bounded handles remain valid and now have consuming facade
+conversions:
+
+```rust
+let (sink, source) = bounded_channel(8)?;
+sink.send("work".to_owned()).await?;
+sink.drain()?;
+
+let items = source.into_source().run_collect().await?;
+let written = Source::from_iter(items).run_with(sink.into_sink()).await?;
+```
+
+Use explicit ack boundaries when an actor sink must provide back-pressure:
+
+```rust
+let delivered = Source::from_iter(commands)
+    .run_with(Sink::actor_ref_with_ack(
+        worker,
+        AckProtocol::new("ack").with_timeout(Duration::from_secs(1)),
+    ))
+    .await?;
+```
+
+Process IO adapters have facade entry points for ordinary stream pipelines:
+
+```rust
+let (stdout, stdout_pump) =
+    Source::process_stdout(&mut process, ProcessOutputConfig::default())?;
+let chunks = stdout.run_collect().await?;
+let bytes_read = stdout_pump.expect("stdout pump").await??;
+```
+
+Tests should prefer `rakka-testkit` stream probes over sleeps:
+
+```rust
+let (source, source_probe) = StreamTestKit::source_probe::<String>()?;
+let run = tokio::spawn(async move { source.run_collect().await });
+source_probe.send_next("one".to_owned()).await?;
+source_probe.send_complete()?;
+assert_eq!(run.await??, vec!["one".to_owned()]);
+```
+
+Run the self-contained stream facade example for finite operators, acked actor
+sinks, process stdout, and probe usage:
+
+```bash
+cargo run -p rakka-example-streams
+```

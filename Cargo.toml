@@ -28,6 +28,7 @@ members = [
     "examples/clustered-receptionist",
     "examples/multi-node-sharding",
     "examples/sharded-cart-persistence",
+    "examples/streams",
 ]
 
 [workspace.package]

@@ -601,6 +601,22 @@ Validation:
 - HTTP/gRPC/process adapters moved onto the facade where it reduces duplicate
   lifecycle semantics.
 
+Completion notes:
+
+- Implemented an Akka-shaped bounded-stream subset in `rakka-stream` with
+  `Source<T>`, `Flow<I, O>`, `Sink<T, M>`, finite materialization, linear
+  operators, ordered async mapping, fan-in/fan-out, actor boundaries with
+  explicit ack back-pressure, sharded entity sinks, process IO facade
+  conversions, and low-level handle migration helpers.
+- Added reusable stream probes in `rakka-testkit`: `StreamTestKit`,
+  `TestSourceProbe<T>`, `TestSinkProbe<T>`, and `TestDemandProbe<T>`.
+- Documented the parity boundary and migration path in
+  `docs/rakka-akka-parity-phase-6-streams.md` and
+  `docs/rakka-akka-parity-migration-notes.md`.
+- Added `rakka-example-streams` to demonstrate finite operators, acked actor
+  sinks, process stdout facade sources, and stream testkit probes without
+  external services.
+
 ## Phase 7: Coordinated Shutdown and Operational Integration
 
 Objectives:
