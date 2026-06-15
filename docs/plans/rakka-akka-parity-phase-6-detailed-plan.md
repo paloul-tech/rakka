@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6 Detailed Plan
 
-Status: implemented through Slice 6H
+Status: implemented through Slice 6I
 Date: 2026-06-14
 
 ## Purpose
@@ -625,6 +625,21 @@ cargo test -p rakka-testkit --test integration_helpers
 cargo test -p rakka-stream
 cargo doc -p rakka-testkit --no-deps
 ```
+
+Implementation note:
+
+- Added `StreamTestKit`, `TestSourceProbe<T>`, `TestSinkProbe<T>`,
+  `TestDemandProbe<T>`, and `TestDemandProbeEvent<T>` in `rakka-testkit`.
+- Source probes can `send_next`, `send_complete`, `send_error`/`cancel_with`,
+  and `expect_cancelled` with deterministic timeouts.
+- Sink probes can `request(n)`, `expect_next`, `expect_next_n`,
+  `expect_no_message`, `expect_complete`, `expect_error`, and `cancel`.
+- Demand probes provide an ack-controlled actor sink target so tests can prove
+  `Sink::actor_ref_with_ack` does not over-pull before an element ack is
+  released.
+- Added `Sink::from_stream_sink_with_lifecycle` in `rakka-stream` so testkit
+  sinks can observe normal completion and upstream failure while preserving the
+  existing low-level `StreamSink<T>` behavior.
 
 ## Slice 6J: Docs, Examples, And Migration Notes
 

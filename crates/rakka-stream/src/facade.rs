@@ -1111,7 +1111,29 @@ where
     #[must_use]
     pub fn from_stream_sink(sink: StreamSink<T>) -> Self {
         Self {
-            stage: Box::new(StreamSinkStage { sink, count: 0 }),
+            stage: Box::new(StreamSinkStage {
+                sink,
+                count: 0,
+                lifecycle: StreamSinkLifecycle::Manual,
+            }),
+            kind: SinkKind::StreamSink,
+            settings: StreamRunSettings::default(),
+        }
+    }
+
+    /// Creates a sink facade that mirrors upstream lifecycle to a low-level stream sink.
+    ///
+    /// The sink drains the low-level stream on normal completion and cancels it
+    /// when upstream fails. This is useful for test probes and adapters that need
+    /// terminal lifecycle observations in addition to forwarded items.
+    #[must_use]
+    pub fn from_stream_sink_with_lifecycle(sink: StreamSink<T>) -> Self {
+        Self {
+            stage: Box::new(StreamSinkStage {
+                sink,
+                count: 0,
+                lifecycle: StreamSinkLifecycle::MirrorUpstream,
+            }),
             kind: SinkKind::StreamSink,
             settings: StreamRunSettings::default(),
         }
@@ -1983,6 +2005,7 @@ where
 struct StreamSinkStage<T> {
     sink: StreamSink<T>,
     count: usize,
+    lifecycle: StreamSinkLifecycle,
 }
 
 impl<T> SinkStage<T, usize> for StreamSinkStage<T>
@@ -2003,9 +2026,24 @@ where
         })
     }
 
+    fn source_failed(&mut self, error: StreamError) {
+        if matches!(self.lifecycle, StreamSinkLifecycle::MirrorUpstream) {
+            let _dropped = self.sink.cancel(error.to_string());
+        }
+    }
+
     fn finish(self: Box<Self>) -> usize {
+        if matches!(self.lifecycle, StreamSinkLifecycle::MirrorUpstream) {
+            let _ignored = self.sink.drain();
+        }
         self.count
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSinkLifecycle {
+    Manual,
+    MirrorUpstream,
 }
 
 #[cfg(feature = "process-io")]

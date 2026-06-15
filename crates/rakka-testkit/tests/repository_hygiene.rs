@@ -164,7 +164,17 @@ fn facade_prelude_is_curated() {
         "ShardingConfig",
         "ShardCoordinatorLease",
         "ShardCoordinatorStore",
-        "pub use rakka_stream::{BoundedStream, StreamError, StreamResult, StreamSink, StreamSource};",
+        "pub use rakka_stream::{",
+        "AckProtocol",
+        "ActorSinkMessage",
+        "ActorSourceMessage",
+        "Flow",
+        "RunnableStream",
+        "Sink",
+        "Source",
+        "StreamRunError",
+        "StreamSink",
+        "StreamSource",
     ] {
         assert!(prelude.contains(expected), "prelude missing {expected}");
     }

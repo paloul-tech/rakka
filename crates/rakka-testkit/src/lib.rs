@@ -7,6 +7,8 @@ pub mod compatibility;
 
 use std::fmt::Debug;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body, Bytes};
@@ -31,10 +33,13 @@ use rakka_persistence::{
     Revision, SequenceNr, StashDirective, TaggedEvent,
 };
 use rakka_remote::{RemoteReceptionistListing, RemoteServiceProxyRegistrySnapshot};
-use rakka_stream::{StreamLifecycle, StreamSource};
+use rakka_stream::{
+    bounded_channel, ActorSinkMessage, Sink, Source, StreamError, StreamLifecycle, StreamSink,
+    StreamSource, StreamStatus,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tonic::{Code, Request as GrpcRequest, Response as GrpcResponse, Status};
 use tower::ServiceExt;
 
@@ -516,6 +521,611 @@ pub async fn wait_for_stream_depth<T>(
 /// Asserts that a bounded stream has the expected lifecycle.
 pub fn assert_stream_lifecycle<T>(source: &StreamSource<T>, expected: StreamLifecycle) {
     assert_eq!(source.status().lifecycle(), expected);
+}
+
+/// Default timeout used by stream testkit probes.
+pub const DEFAULT_STREAM_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Default bounded capacity used by stream testkit probes.
+pub const DEFAULT_STREAM_PROBE_CAPACITY: usize = 16;
+
+/// Factory for Akka-shaped stream testkit probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamTestKit {
+    capacity: usize,
+    timeout: Duration,
+}
+
+impl StreamTestKit {
+    /// Creates a stream testkit with the default bounded capacity and timeout.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            capacity: DEFAULT_STREAM_PROBE_CAPACITY,
+            timeout: DEFAULT_STREAM_PROBE_TIMEOUT,
+        }
+    }
+
+    /// Returns this testkit with a different bounded probe capacity.
+    #[must_use]
+    pub const fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
+
+    /// Returns this testkit with a different assertion timeout.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Creates a default source probe and facade source.
+    pub fn source_probe<T>() -> RakkaResult<(Source<T>, TestSourceProbe<T>)>
+    where
+        T: Send + 'static,
+    {
+        Self::new().source_probe_pair()
+    }
+
+    /// Creates a source probe and facade source with explicit bounded capacity.
+    pub fn source_probe_with_capacity<T>(
+        capacity: usize,
+    ) -> RakkaResult<(Source<T>, TestSourceProbe<T>)>
+    where
+        T: Send + 'static,
+    {
+        Self::new().with_capacity(capacity).source_probe_pair()
+    }
+
+    /// Creates a source probe and facade source from this testkit configuration.
+    pub fn source_probe_pair<T>(&self) -> RakkaResult<(Source<T>, TestSourceProbe<T>)>
+    where
+        T: Send + 'static,
+    {
+        let (sink, source) =
+            bounded_channel(self.capacity).map_err(|error| error.into_rakka_error())?;
+        Ok((
+            Source::from_stream_source(source),
+            TestSourceProbe {
+                sink,
+                timeout: self.timeout,
+            },
+        ))
+    }
+
+    /// Creates a default sink probe and facade sink.
+    pub fn sink_probe<T>() -> RakkaResult<(Sink<T, usize>, TestSinkProbe<T>)>
+    where
+        T: Send + 'static,
+    {
+        Self::new().sink_probe_pair()
+    }
+
+    /// Creates a sink probe and facade sink with explicit bounded capacity.
+    pub fn sink_probe_with_capacity<T>(
+        capacity: usize,
+    ) -> RakkaResult<(Sink<T, usize>, TestSinkProbe<T>)>
+    where
+        T: Send + 'static,
+    {
+        Self::new().with_capacity(capacity).sink_probe_pair()
+    }
+
+    /// Creates a sink probe and facade sink from this testkit configuration.
+    pub fn sink_probe_pair<T>(&self) -> RakkaResult<(Sink<T, usize>, TestSinkProbe<T>)>
+    where
+        T: Send + 'static,
+    {
+        let (sink, source) =
+            bounded_channel(self.capacity).map_err(|error| error.into_rakka_error())?;
+        Ok((
+            Sink::from_stream_sink_with_lifecycle(sink),
+            TestSinkProbe {
+                source,
+                requested: 0,
+                timeout: self.timeout,
+            },
+        ))
+    }
+
+    /// Creates a demand-controlled actor sink probe using the default settings.
+    pub fn demand_probe<T, Ack>(
+        system: &ActorSystem,
+        name: impl AsRef<str>,
+        ack: Ack,
+    ) -> RakkaResult<TestDemandProbePair<T, Ack>>
+    where
+        T: Send + 'static,
+        Ack: Clone + Send + 'static,
+    {
+        Self::new().demand_probe_pair(system, name, ack)
+    }
+
+    /// Creates a demand-controlled actor sink probe from this testkit configuration.
+    pub fn demand_probe_pair<T, Ack>(
+        &self,
+        system: &ActorSystem,
+        name: impl AsRef<str>,
+        ack: Ack,
+    ) -> RakkaResult<TestDemandProbePair<T, Ack>>
+    where
+        T: Send + 'static,
+        Ack: Clone + Send + 'static,
+    {
+        let (events, receiver) = mpsc::channel(self.capacity);
+        let permits = Arc::new(Semaphore::new(0));
+        let actor_ref = system.spawn_actor(
+            name,
+            DemandProbeActor {
+                events,
+                permits: Arc::clone(&permits),
+                ack,
+                _item: PhantomData,
+            },
+        )?;
+        Ok((
+            actor_ref,
+            TestDemandProbe {
+                receiver,
+                permits,
+                timeout: self.timeout,
+            },
+        ))
+    }
+}
+
+impl Default for StreamTestKit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Probe handle that manually drives a facade source.
+#[derive(Debug, Clone)]
+pub struct TestSourceProbe<T> {
+    sink: StreamSink<T>,
+    timeout: Duration,
+}
+
+impl<T> TestSourceProbe<T>
+where
+    T: Send + 'static,
+{
+    /// Returns the low-level producer handle backing this probe.
+    #[must_use]
+    pub fn stream_sink(&self) -> StreamSink<T> {
+        self.sink.clone()
+    }
+
+    /// Returns the current bounded source-side status.
+    #[must_use]
+    pub fn status(&self) -> StreamStatus {
+        self.sink.status()
+    }
+
+    /// Sends one source element using the probe's default timeout.
+    pub async fn send_next(&self, item: T) -> RakkaResult<()> {
+        self.send_next_within(item, self.timeout).await
+    }
+
+    /// Sends one source element using an explicit timeout.
+    pub async fn send_next_within(&self, item: T, timeout: Duration) -> RakkaResult<()> {
+        tokio::time::timeout(timeout, self.sink.send(item))
+            .await
+            .map_err(|_elapsed| {
+                stream_probe_error(
+                    "stream-source-send-timeout",
+                    "timed out sending stream probe item",
+                )
+            })?
+            .map_err(|error| {
+                let (error, _item) = error.into_parts();
+                error.into_rakka_error()
+            })
+    }
+
+    /// Completes the source normally after buffered items drain.
+    pub fn send_complete(&self) -> RakkaResult<()> {
+        self.sink.drain().map_err(|error| error.into_rakka_error())
+    }
+
+    /// Cancels the source with a test failure reason.
+    pub fn send_error(&self, reason: impl Into<String>) -> usize {
+        self.cancel_with(reason)
+    }
+
+    /// Cancels the source with a custom reason.
+    pub fn cancel_with(&self, reason: impl Into<String>) -> usize {
+        self.sink.cancel(reason)
+    }
+
+    /// Waits for downstream cancellation using the probe's default timeout.
+    pub async fn expect_cancelled(&self) -> RakkaResult<StreamStatus> {
+        self.expect_cancelled_within(self.timeout).await
+    }
+
+    /// Waits for downstream cancellation using an explicit timeout.
+    pub async fn expect_cancelled_within(&self, timeout: Duration) -> RakkaResult<StreamStatus> {
+        wait_for_stream_lifecycle(
+            || self.sink.status(),
+            StreamLifecycle::Cancelled,
+            timeout,
+            "source probe",
+        )
+        .await
+    }
+}
+
+/// Probe handle that asserts items and lifecycle observed by a facade sink.
+#[derive(Debug, Clone)]
+pub struct TestSinkProbe<T> {
+    source: StreamSource<T>,
+    requested: usize,
+    timeout: Duration,
+}
+
+impl<T> TestSinkProbe<T>
+where
+    T: Send + 'static,
+{
+    /// Returns the low-level consumer handle backing this probe.
+    #[must_use]
+    pub fn stream_source(&self) -> StreamSource<T> {
+        self.source.clone()
+    }
+
+    /// Returns the current bounded sink-side status.
+    #[must_use]
+    pub fn status(&self) -> StreamStatus {
+        self.source.status()
+    }
+
+    /// Records demand for `n` items.
+    pub fn request(&mut self, n: usize) -> RakkaResult<()> {
+        if n == 0 {
+            return Err(stream_probe_error(
+                "stream-probe-zero-demand",
+                "stream sink probe demand must be greater than zero",
+            ));
+        }
+        self.requested = self.requested.saturating_add(n);
+        Ok(())
+    }
+
+    /// Expects the next item using the probe's default timeout.
+    pub async fn expect_next(&mut self) -> RakkaResult<T> {
+        self.expect_next_within(self.timeout).await
+    }
+
+    /// Expects the next item using an explicit timeout.
+    pub async fn expect_next_within(&mut self, timeout: Duration) -> RakkaResult<T> {
+        if self.requested == 0 {
+            return Err(stream_probe_error(
+                "stream-probe-no-demand",
+                "stream sink probe must request demand before expecting an item",
+            ));
+        }
+
+        match tokio::time::timeout(timeout, self.source.next()).await {
+            Ok(Ok(Some(item))) => {
+                self.requested = self.requested.saturating_sub(1);
+                Ok(item)
+            }
+            Ok(Ok(None)) => Err(stream_probe_error(
+                "stream-probe-unexpected-complete",
+                "stream sink probe completed before the expected item arrived",
+            )),
+            Ok(Err(error)) => Err(stream_probe_error(
+                "stream-probe-unexpected-error",
+                format!("stream sink probe failed before the expected item arrived: {error}"),
+            )),
+            Err(_elapsed) => Err(stream_probe_error(
+                "stream-probe-next-timeout",
+                "timed out waiting for stream sink probe item",
+            )),
+        }
+    }
+
+    /// Expects `count` items using the probe's default timeout for each item.
+    pub async fn expect_next_n(&mut self, count: usize) -> RakkaResult<Vec<T>> {
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(self.expect_next().await?);
+        }
+        Ok(items)
+    }
+
+    /// Asserts that no item or terminal signal arrives before the timeout.
+    pub async fn expect_no_message(&mut self, timeout: Duration) -> RakkaResult<()> {
+        match tokio::time::timeout(timeout, self.source.next()).await {
+            Ok(Ok(Some(_item))) => Err(stream_probe_error(
+                "stream-probe-unexpected-item",
+                "stream sink probe received an unexpected item",
+            )),
+            Ok(Ok(None)) => Err(stream_probe_error(
+                "stream-probe-unexpected-complete",
+                "stream sink probe completed unexpectedly",
+            )),
+            Ok(Err(error)) => Err(stream_probe_error(
+                "stream-probe-unexpected-error",
+                format!("stream sink probe failed unexpectedly: {error}"),
+            )),
+            Err(_elapsed) => Ok(()),
+        }
+    }
+
+    /// Expects normal sink completion using the probe's default timeout.
+    pub async fn expect_complete(&mut self) -> RakkaResult<()> {
+        self.expect_complete_within(self.timeout).await
+    }
+
+    /// Expects normal sink completion using an explicit timeout.
+    pub async fn expect_complete_within(&mut self, timeout: Duration) -> RakkaResult<()> {
+        match tokio::time::timeout(timeout, self.source.next()).await {
+            Ok(Ok(None)) => Ok(()),
+            Ok(Ok(Some(_item))) => Err(stream_probe_error(
+                "stream-probe-unexpected-item",
+                "stream sink probe received an item while expecting completion",
+            )),
+            Ok(Err(error)) => Err(stream_probe_error(
+                "stream-probe-unexpected-error",
+                format!("stream sink probe failed while expecting completion: {error}"),
+            )),
+            Err(_elapsed) => Err(stream_probe_error(
+                "stream-probe-complete-timeout",
+                "timed out waiting for stream sink probe completion",
+            )),
+        }
+    }
+
+    /// Expects a stream error using the probe's default timeout.
+    pub async fn expect_error(&mut self) -> RakkaResult<StreamError> {
+        self.expect_error_within(self.timeout).await
+    }
+
+    /// Expects a stream error using an explicit timeout.
+    pub async fn expect_error_within(&mut self, timeout: Duration) -> RakkaResult<StreamError> {
+        match tokio::time::timeout(timeout, self.source.next()).await {
+            Ok(Err(error)) => Ok(error),
+            Ok(Ok(Some(_item))) => Err(stream_probe_error(
+                "stream-probe-unexpected-item",
+                "stream sink probe received an item while expecting an error",
+            )),
+            Ok(Ok(None)) => Err(stream_probe_error(
+                "stream-probe-unexpected-complete",
+                "stream sink probe completed while expecting an error",
+            )),
+            Err(_elapsed) => Err(stream_probe_error(
+                "stream-probe-error-timeout",
+                "timed out waiting for stream sink probe error",
+            )),
+        }
+    }
+
+    /// Cancels the probe sink and returns the number of buffered items dropped.
+    pub fn cancel(&self, reason: impl Into<String>) -> usize {
+        self.source.cancel(reason)
+    }
+}
+
+/// Event observed by a demand-controlled actor sink probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestDemandProbeEvent<T> {
+    /// The actor sink initialized.
+    Init,
+    /// One stream element reached the actor sink boundary.
+    Element(T),
+    /// The actor sink completed normally.
+    Complete,
+    /// The actor sink observed an upstream failure.
+    Failure(StreamError),
+    /// The actor sink was cancelled before normal completion.
+    Cancelled(String),
+}
+
+/// Probe actor handle for ack-driven actor sink demand tests.
+pub struct TestDemandProbe<T> {
+    receiver: mpsc::Receiver<TestDemandProbeEvent<T>>,
+    permits: Arc<Semaphore>,
+    timeout: Duration,
+}
+
+/// Actor reference and probe handle returned by demand probe factories.
+pub type TestDemandProbePair<T, Ack> = (ActorRef<ActorSinkMessage<T, Ack>>, TestDemandProbe<T>);
+
+impl<T> TestDemandProbe<T>
+where
+    T: Send + 'static,
+{
+    /// Grants demand for `n` pending or future elements.
+    pub fn request(&self, n: usize) -> RakkaResult<()> {
+        if n == 0 {
+            return Err(stream_probe_error(
+                "stream-probe-zero-demand",
+                "stream demand probe demand must be greater than zero",
+            ));
+        }
+        self.permits.add_permits(n);
+        Ok(())
+    }
+
+    /// Expects actor sink initialization using the probe's default timeout.
+    pub async fn expect_init(&mut self) -> RakkaResult<()> {
+        match self.expect_event().await? {
+            TestDemandProbeEvent::Init => Ok(()),
+            event => Err(unexpected_demand_event("init", event)),
+        }
+    }
+
+    /// Expects the next demanded item using the probe's default timeout.
+    pub async fn expect_next(&mut self) -> RakkaResult<T> {
+        match self.expect_event().await? {
+            TestDemandProbeEvent::Element(item) => Ok(item),
+            event => Err(unexpected_demand_event("element", event)),
+        }
+    }
+
+    /// Expects normal actor sink completion using the probe's default timeout.
+    pub async fn expect_complete(&mut self) -> RakkaResult<()> {
+        match self.expect_event().await? {
+            TestDemandProbeEvent::Complete => Ok(()),
+            event => Err(unexpected_demand_event("completion", event)),
+        }
+    }
+
+    /// Expects actor sink failure using the probe's default timeout.
+    pub async fn expect_error(&mut self) -> RakkaResult<StreamError> {
+        match self.expect_event().await? {
+            TestDemandProbeEvent::Failure(error) => Ok(error),
+            event => Err(unexpected_demand_event("failure", event)),
+        }
+    }
+
+    /// Expects actor sink cancellation using the probe's default timeout.
+    pub async fn expect_cancelled(&mut self) -> RakkaResult<String> {
+        match self.expect_event().await? {
+            TestDemandProbeEvent::Cancelled(reason) => Ok(reason),
+            event => Err(unexpected_demand_event("cancellation", event)),
+        }
+    }
+
+    /// Asserts that no actor sink event arrives before the timeout.
+    pub async fn expect_no_message(&mut self, timeout: Duration) -> RakkaResult<()> {
+        match tokio::time::timeout(timeout, self.receiver.recv()).await {
+            Ok(Some(event)) => Err(unexpected_demand_event("no event", event)),
+            Ok(None) => Err(stream_probe_error(
+                "stream-probe-closed",
+                "stream demand probe channel closed",
+            )),
+            Err(_elapsed) => Ok(()),
+        }
+    }
+
+    async fn expect_event(&mut self) -> RakkaResult<TestDemandProbeEvent<T>> {
+        match tokio::time::timeout(self.timeout, self.receiver.recv()).await {
+            Ok(Some(event)) => Ok(event),
+            Ok(None) => Err(stream_probe_error(
+                "stream-probe-closed",
+                "stream demand probe channel closed",
+            )),
+            Err(_elapsed) => Err(stream_probe_error(
+                "stream-probe-event-timeout",
+                "timed out waiting for stream demand probe event",
+            )),
+        }
+    }
+}
+
+struct DemandProbeActor<T, Ack> {
+    events: mpsc::Sender<TestDemandProbeEvent<T>>,
+    permits: Arc<Semaphore>,
+    ack: Ack,
+    _item: PhantomData<fn() -> T>,
+}
+
+impl<T, Ack> Actor for DemandProbeActor<T, Ack>
+where
+    T: Send + 'static,
+    Ack: Clone + Send + 'static,
+{
+    type Msg = ActorSinkMessage<T, Ack>;
+
+    fn handle<'a>(
+        &'a mut self,
+        _ctx: &'a mut ActorContext<Self::Msg>,
+        msg: Self::Msg,
+    ) -> rakka_core::ActorFuture<'a> {
+        let events = self.events.clone();
+        let permits = Arc::clone(&self.permits);
+        let ack = self.ack.clone();
+        actor_future(async move {
+            match msg {
+                ActorSinkMessage::Init { reply_to } => {
+                    let _sent = events.send(TestDemandProbeEvent::Init).await;
+                    let _ignored = reply_to.reply(ack);
+                }
+                ActorSinkMessage::Element { item, reply_to } => {
+                    if events
+                        .send(TestDemandProbeEvent::Element(item))
+                        .await
+                        .is_ok()
+                    {
+                        if let Ok(permit) = permits.acquire().await {
+                            permit.forget();
+                            let _ignored = reply_to.reply(ack);
+                        }
+                    } else {
+                        let _ignored = reply_to.reply(ack);
+                    }
+                }
+                ActorSinkMessage::Complete => {
+                    let _sent = events.send(TestDemandProbeEvent::Complete).await;
+                }
+                ActorSinkMessage::Failure { error } => {
+                    let _sent = events.send(TestDemandProbeEvent::Failure(error)).await;
+                }
+                ActorSinkMessage::Cancelled { reason } => {
+                    let _sent = events.send(TestDemandProbeEvent::Cancelled(reason)).await;
+                }
+            }
+            Ok(ActorAction::Continue)
+        })
+    }
+}
+
+fn stream_probe_error(code: &'static str, message: impl Into<String>) -> RakkaError {
+    RakkaError::new(Subsystem::Testkit, code, message)
+}
+
+fn unexpected_demand_event<T>(
+    expected: &'static str,
+    event: TestDemandProbeEvent<T>,
+) -> RakkaError {
+    stream_probe_error(
+        "stream-probe-unexpected-event",
+        format!(
+            "stream demand probe expected {expected}, received {}",
+            demand_event_name(&event)
+        ),
+    )
+}
+
+fn demand_event_name<T>(event: &TestDemandProbeEvent<T>) -> &'static str {
+    match event {
+        TestDemandProbeEvent::Init => "init",
+        TestDemandProbeEvent::Element(_) => "element",
+        TestDemandProbeEvent::Complete => "completion",
+        TestDemandProbeEvent::Failure(_) => "failure",
+        TestDemandProbeEvent::Cancelled(_) => "cancellation",
+    }
+}
+
+async fn wait_for_stream_lifecycle(
+    mut status: impl FnMut() -> StreamStatus,
+    expected: StreamLifecycle,
+    timeout: Duration,
+    label: &'static str,
+) -> RakkaResult<StreamStatus> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let current = status();
+        if current.lifecycle() == expected {
+            return Ok(current);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(stream_probe_error(
+                "stream-probe-lifecycle-timeout",
+                format!(
+                    "timed out waiting for {label} lifecycle {expected:?}; current lifecycle is {:?}",
+                    current.lifecycle()
+                ),
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Asserts that a receptionist listing has the expected routee count.

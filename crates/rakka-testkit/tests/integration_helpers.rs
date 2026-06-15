@@ -23,7 +23,7 @@ use rakka_remote::{
     RemoteActorRef, RemoteReceptionistListing, RemoteServiceProxyRegistrySnapshot,
     RemoteServiceRoutee,
 };
-use rakka_stream::{bounded_channel, StreamLifecycle};
+use rakka_stream::{bounded_channel, AckProtocol, Sink, Source, StreamError, StreamLifecycle};
 use rakka_testkit::{
     assert_cluster_event_node, assert_counter_total, assert_drain_complete,
     assert_group_routee_count, assert_group_router_snapshot_routee_count, assert_http_status,
@@ -36,7 +36,7 @@ use rakka_testkit::{
     expect_stream_source_items, expect_terminated, grpc_request, http_post_json,
     spawn_actor_context_probe, spawn_echo_probe, spawn_stop_probe, ActorContextProbeCommand,
     ActorContextProbeEvent, DurableStateBehaviorTestKit, EventSourcedBehaviorTestKit,
-    PersistenceTestKit, StopProbeCommand, TestProbe,
+    PersistenceTestKit, StopProbeCommand, StreamTestKit, TestProbe,
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +108,129 @@ async fn testkit_helpers_cover_phase_5_surfaces() {
         MetricKind::Counter,
     );
     assert_metric_attribute(&observation, "surface", "testkit");
+}
+
+#[tokio::test]
+async fn stream_testkit_probes_drive_facade_streams_without_sleeps() {
+    let (source, source_probe) =
+        StreamTestKit::source_probe::<String>().expect("source probe should be created");
+    let (sink, mut sink_probe) =
+        StreamTestKit::sink_probe::<String>().expect("sink probe should be created");
+    let run = tokio::spawn(async move { source.run_with(sink).await });
+
+    source_probe
+        .send_next("one".to_owned())
+        .await
+        .expect("first source item should send");
+    source_probe
+        .send_next("two".to_owned())
+        .await
+        .expect("second source item should send");
+    source_probe
+        .send_complete()
+        .expect("source probe should complete");
+
+    sink_probe.request(2).expect("sink probe should request");
+    assert_eq!(
+        sink_probe
+            .expect_next_n(2)
+            .await
+            .expect("sink probe should observe items"),
+        vec!["one".to_owned(), "two".to_owned()]
+    );
+    sink_probe
+        .expect_complete()
+        .await
+        .expect("sink probe should observe completion");
+
+    assert_eq!(run.await.expect("stream task should finish").unwrap(), 2);
+}
+
+#[tokio::test]
+async fn stream_testkit_probes_report_cancellation_and_failure() {
+    let (source, source_probe) = StreamTestKit::source_probe_with_capacity::<String>(1)
+        .expect("source probe should be created");
+    let take_run = tokio::spawn(async move { source.take(1).run_collect().await });
+
+    source_probe
+        .send_next("kept".to_owned())
+        .await
+        .expect("source item should send");
+    assert_eq!(
+        take_run.await.expect("take task should finish").unwrap(),
+        vec!["kept".to_owned()]
+    );
+    source_probe
+        .expect_cancelled()
+        .await
+        .expect("source probe should observe downstream cancellation");
+
+    let (source, source_probe) =
+        StreamTestKit::source_probe::<String>().expect("source probe should be created");
+    let (sink, mut sink_probe) =
+        StreamTestKit::sink_probe::<String>().expect("sink probe should be created");
+    let run = tokio::spawn(async move { source.run_with(sink).await });
+
+    source_probe.send_error("synthetic failure");
+    let sink_error = sink_probe
+        .expect_error()
+        .await
+        .expect("sink probe should observe upstream failure");
+    assert!(matches!(
+        sink_error,
+        StreamError::Cancelled {
+            reason: Some(reason)
+        } if reason.contains("synthetic failure")
+    ));
+
+    let run_error = run
+        .await
+        .expect("stream task should finish")
+        .expect_err("stream should fail");
+    assert!(matches!(
+        run_error.source_error(),
+        Some(StreamError::Cancelled {
+            reason: Some(reason)
+        }) if reason == "synthetic failure"
+    ));
+}
+
+#[tokio::test]
+async fn stream_testkit_demand_probe_proves_acked_actor_sink_does_not_overpull() {
+    let system = ActorSystem::new("stream-testkit-demand");
+    let (actor, mut probe) = StreamTestKit::demand_probe::<u64, _>(&system, "demand", "ack")
+        .expect("demand probe should spawn");
+    let run = tokio::spawn(async move {
+        Source::from_iter([1_u64, 2])
+            .run_with(Sink::actor_ref_with_ack(
+                actor,
+                AckProtocol::new("ack").with_timeout(Duration::from_secs(1)),
+            ))
+            .await
+    });
+
+    probe.expect_init().await.expect("sink should initialize");
+    assert_eq!(probe.expect_next().await.expect("first item"), 1);
+    probe
+        .expect_no_message(Duration::from_millis(50))
+        .await
+        .expect("second item should wait for first ack");
+
+    probe.request(1).expect("first demand should release ack");
+    assert_eq!(probe.expect_next().await.expect("second item"), 2);
+    probe
+        .expect_no_message(Duration::from_millis(50))
+        .await
+        .expect("completion should wait for second ack");
+
+    probe.request(1).expect("second demand should release ack");
+    probe
+        .expect_complete()
+        .await
+        .expect("sink should complete after demanded items");
+    assert_eq!(run.await.expect("stream task should finish").unwrap(), 2);
+
+    system.terminate().await.expect("system should terminate");
 }
 
 #[tokio::test]

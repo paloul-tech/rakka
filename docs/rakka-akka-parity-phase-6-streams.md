@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 6: Streams Facade And Testkit
 
-Status: implemented through Slice 6H adapter migration
+Status: implemented through Slice 6I stream testkit probes
 Date: 2026-06-14
 
 Phase 6 introduces Akka-shaped stream names over Rakka's existing bounded stream
@@ -342,7 +342,60 @@ facade `Source<Vec<u8>>` so callers can still observe read completion or read
 errors. `ProcessInputSink::into_sink()` is consuming rather than borrowed
 because facade sinks are owned, `'static` stream boundaries.
 
-Test probes arrive in later slices.
+## Stream Testkit Probes
+
+Slice 6I adds reusable probes in `rakka-testkit` for source, sink, lifecycle,
+error, cancellation, and ack-demand assertions.
+
+Use a source probe to drive a facade source manually:
+
+```rust
+let (source, source_probe) = StreamTestKit::source_probe::<String>()?;
+let run = tokio::spawn(async move { source.run_collect().await });
+
+source_probe.send_next("one".to_owned()).await?;
+source_probe.send_complete()?;
+
+assert_eq!(run.await??, vec!["one".to_owned()]);
+```
+
+Use a sink probe to assert elements and terminal signals without sleeps:
+
+```rust
+let (sink, mut sink_probe) = StreamTestKit::sink_probe::<String>()?;
+let run = tokio::spawn(async move {
+    Source::from_iter(["one".to_owned()]).run_with(sink).await
+});
+
+sink_probe.request(1)?;
+assert_eq!(sink_probe.expect_next().await?, "one");
+sink_probe.expect_complete().await?;
+assert_eq!(run.await??, 1);
+```
+
+Use a demand probe with `Sink::actor_ref_with_ack` when the test needs to prove
+the stream does not over-pull while an element ack is withheld:
+
+```rust
+let (actor, mut probe) = StreamTestKit::demand_probe(&system, "demand", "ack")?;
+let run = tokio::spawn(async move {
+    Source::from_iter([1_u64, 2])
+        .run_with(Sink::actor_ref_with_ack(
+            actor,
+            AckProtocol::new("ack"),
+        ))
+        .await
+});
+
+probe.expect_init().await?;
+assert_eq!(probe.expect_next().await?, 1);
+probe.expect_no_message(Duration::from_millis(50)).await?;
+probe.request(1)?;
+```
+
+Every async probe assertion has a deterministic timeout. Defaults come from
+`StreamTestKit`, and explicit `*_within` variants are available where the test
+needs a custom timeout.
 
 ## Design Rules
 
