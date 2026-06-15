@@ -1,6 +1,6 @@
 # Rakka Akka Parity Phase 7 Detailed Plan
 
-Status: planned
+Status: implemented through Slice 7A
 Date: 2026-06-15
 
 ## Purpose
@@ -153,7 +153,7 @@ shutdown.add_phase_before("publish-final-metrics", ShutdownPhase::stop_remoting(
 Goal: add the public coordinated shutdown vocabulary and built-in phase graph
 without changing existing termination behavior.
 
-Status: planned.
+Status: implemented.
 
 Scope:
 
@@ -192,6 +192,23 @@ Acceptance criteria:
 - Task registration does not require running an actor system.
 - Public docs state that this is the Rakka equivalent of Akka Coordinated
   Shutdown, adapted to Rust async tasks.
+
+Implementation status:
+
+- Added `rakka-core::coordinated_shutdown` with the public 7A vocabulary:
+  `CoordinatedShutdown`, settings, phases, reasons, task descriptors, task
+  options, failure policy, report types, task statuses, and task context.
+- Added the built-in phase topology from the main parity plan with deterministic
+  dependency ordering.
+- Added custom phase insertion before or after built-in phases, explicit phase
+  dependencies, duplicate validation, unknown-phase validation, and dependency
+  cycle rollback.
+- Added task registration APIs that accept async closures and store task
+  descriptors without requiring an `ActorSystem`.
+- Re-exported the stable vocabulary from `rakka_core`.
+- Added public API tests covering built-in ordering, custom phase ordering,
+  duplicate phases, unknown phases, cycle detection and rollback, task
+  registration, duplicate tasks, and invalid names.
 
 Review commands:
 

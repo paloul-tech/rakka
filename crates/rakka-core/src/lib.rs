@@ -7,6 +7,7 @@
 //! persistence, and external-process ownership are implemented in later phases.
 
 pub mod actor;
+pub mod coordinated_shutdown;
 pub mod dead_letter;
 pub mod error;
 pub mod metrics;
@@ -23,6 +24,13 @@ pub use actor::{
     ActorFuture, ActorRef, ActorResult, ActorRuntimeSnapshot, ActorTerminated, ActorTraceContext,
     AskError, Behavior, BehaviorActor, Message, ReplyTo, SerializedActorRef, SetupActor, StopError,
     TellError, TerminationReason, TimerHandle, WatchHandle, DEFAULT_MAILBOX_CAPACITY,
+};
+pub use coordinated_shutdown::{
+    CoordinatedShutdown, CoordinatedShutdownReason, CoordinatedShutdownReport,
+    CoordinatedShutdownSettings, ShutdownFailurePolicy, ShutdownOutcome, ShutdownPhase,
+    ShutdownPhaseReport, ShutdownTask, ShutdownTaskAttribute, ShutdownTaskContext,
+    ShutdownTaskFuture, ShutdownTaskOptions, ShutdownTaskReport, ShutdownTaskResult,
+    ShutdownTaskStatus,
 };
 pub use dead_letter::{DeadLetter, DeadLetterReason};
 pub use error::{RakkaError, RakkaResult, Subsystem};
