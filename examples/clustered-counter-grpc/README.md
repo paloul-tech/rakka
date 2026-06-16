@@ -85,7 +85,7 @@ Every request may be sent to either node. Rakka routes the command to the sharde
   "revision": 3,
   "initialized": true,
   "created": false,
-  "owner_node": "counter-node-25520#uid-25520"
+  "owner_node": "counter-node-25520#uid-25520-..."
 }
 ```
 
@@ -97,6 +97,8 @@ If a process that owns a counter shard exits, the remaining processes continue p
 
 During the detection window, requests for counters owned by the exited process may time out. With the default settings, a graceful Ctrl-C exit is typically detected after the 10 second membership failure timeout. A hard-killed process can take longer because its stale discovery file is retained until the 30 second discovery TTL expires. Counter values recover on the new owner only when the processes share the same `RAKKA_COUNTER_STORE_DIR`.
 
+When a process restarts, the example keeps the same default logical node id for the port but generates a fresh default node incarnation. Do not reuse a fixed `RAKKA_NODE_INCARNATION` across restarts unless you deliberately want to model the same cluster incarnation; a member that was already marked down is not resurrected by reusing its old incarnation.
+
 Useful environment variables:
 
 - `RAKKA_TCP_PORT`: Rakka TCP remoting port for this process.
@@ -105,11 +107,13 @@ Useful environment variables:
 - `RAKKA_COUNTER_STORE_DIR`: shared directory for counter durable state. Defaults to `/tmp/rakka-clustered-counter-grpc/counter-state`.
 - `RAKKA_BIND_HOST`: local IP address to bind. Defaults to `127.0.0.1`.
 - `RAKKA_ADVERTISE_HOST`: host written into Rakka node discovery records. Defaults to `RAKKA_BIND_HOST`.
-- `RAKKA_NODE_LOGICAL_ID` and `RAKKA_NODE_INCARNATION`: override the generated node id.
+- `RAKKA_NODE_LOGICAL_ID`: override the stable logical node id. Defaults to `counter-node-<RAKKA_TCP_PORT>`.
+- `RAKKA_NODE_INCARNATION`: override the per-process node incarnation. Defaults to a unique value generated at process start.
 
 ## Current Gaps Documented By The Example
 
 - Rakka does not yet provide a turnkey generated gRPC service facade. The `rakka::grpc` crate provides adapters and timeout/error helpers, while this example owns the `.proto`, `build.rs`, and tonic service implementation.
 - Rakka's cluster node runtime is discovery-snapshot driven. This example supplies a tiny file-based discovery loop so local processes can join as they start. Production code should plug in a real discovery provider such as Kubernetes DNS, Consul, or a control plane.
+- The example uses deterministic in-memory shard coordination for local demonstration. Production multi-process deployments should configure a shared durable shard coordinator store and lease, such as the PostgreSQL sharding plugin, so there is one fenced ownership authority.
 - The example-local file durable store is for local demos. It persists counter state across actor restarts and local process restarts that share the same directory, but it is not a production distributed CAS store. For real multi-host durability, use the PostgreSQL persistence plugin or another external `DurableStateStore`.
 - There is no `rakka::grpc` helper that maps `RemoteEntityAskError` directly into a tonic status yet. The service maps the common cases locally.

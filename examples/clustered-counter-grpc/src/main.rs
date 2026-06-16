@@ -440,8 +440,8 @@ impl ExampleConfig {
             env::var("RAKKA_ADVERTISE_HOST").unwrap_or_else(|_| bind_host.to_string());
         let node_logical_id = env::var("RAKKA_NODE_LOGICAL_ID")
             .unwrap_or_else(|_| format!("counter-node-{tcp_port}"));
-        let node_incarnation =
-            env::var("RAKKA_NODE_INCARNATION").unwrap_or_else(|_| format!("uid-{tcp_port}"));
+        let node_incarnation = env::var("RAKKA_NODE_INCARNATION")
+            .unwrap_or_else(|_| default_node_incarnation(tcp_port));
         let base_dir = env::temp_dir().join("rakka-clustered-counter-grpc");
         let discovery_dir = env::var_os("RAKKA_DISCOVERY_DIR")
             .map(PathBuf::from)
@@ -940,6 +940,14 @@ fn parse_u16(name: &str, value: &str) -> ExampleResult<u16> {
     value
         .parse::<u16>()
         .map_err(|error| example_error(format!("{name} must be a TCP port: {error}")).into())
+}
+
+fn default_node_incarnation(tcp_port: u16) -> String {
+    format!(
+        "uid-{tcp_port}-{}-{}",
+        current_timestamp_millis(),
+        std::process::id()
+    )
 }
 
 fn current_timestamp_millis() -> u64 {

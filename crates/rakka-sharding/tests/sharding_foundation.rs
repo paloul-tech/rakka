@@ -1554,6 +1554,63 @@ fn cluster_sharding_runtime_rebalances_and_refreshes_region_when_node_joins() {
     );
 }
 
+#[tokio::test]
+async fn ownership_refresh_passivates_entities_for_shards_lost_to_joining_node() {
+    let local = node("rakka-0", "uid-a");
+    let local_id = local.id().clone();
+    let remote = node("rakka-1", "uid-b");
+    let remote_id = remote.id().clone();
+    let entity_type = EntityType::new("CartJoinPassivation");
+    let config = ShardingConfig::new(4).unwrap();
+    let system = ActorSystem::new("join-passivation-node-a-test");
+    let route = LocalEntityRoute::new(local_id, system.clone(), |context: LocalEntityContext| {
+        CartEntity {
+            context,
+            items: Vec::new(),
+        }
+    });
+    let region = ShardRegion::new(entity_type.clone(), config.clone(), route.clone());
+    let mut runtime = runtime_with_local(local.clone());
+    let mut joined_coordinator = ShardCoordinator::new(entity_type.clone(), config.clone());
+    joined_coordinator.reconcile(&membership_with_up_nodes(vec![
+        local.clone(),
+        remote.clone(),
+    ]));
+    let entity_id = entity_owned_by(&joined_coordinator, remote_id.logical_id());
+    let entity = EntityRef::<CartCommand>::new(entity_type.clone(), entity_id);
+    let shard_id = entity.shard_id(&config);
+
+    runtime.register_region(region.clone()).unwrap();
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 1, [local.clone()]))
+        .unwrap();
+
+    entity
+        .tell(&region, CartCommand::Add("before-join".to_string()))
+        .unwrap();
+    assert_eq!(route.entity_count(), 1);
+
+    runtime
+        .apply_discovery(DiscoverySnapshot::new("test", 2, [local, remote]))
+        .unwrap();
+
+    assert_eq!(route.entity_count(), 0);
+    assert_eq!(
+        route.shard_handoff_state(shard_id),
+        ShardHandoffState::Transferring
+    );
+    assert_eq!(
+        runtime
+            .coordinator(&entity_type)
+            .unwrap()
+            .owner_for_shard(shard_id)
+            .unwrap(),
+        &remote_id
+    );
+
+    system.shutdown();
+}
+
 #[test]
 fn cluster_sharding_runtime_moves_shards_from_leaving_node() {
     let local = node("rakka-0", "uid-a");

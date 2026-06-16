@@ -774,10 +774,30 @@ where
 
     /// Refreshes the shard owner cache.
     pub fn refresh_ownership(&self, snapshot: &ShardOwnershipSnapshot) -> ShardingResult<()> {
+        validate_snapshot(&self.entity_type, &self.config, snapshot)?;
+        let local_changes = self.local_node_id().cloned().map(|local_node_id| {
+            let owner_cache = self
+                .owner_cache
+                .lock()
+                .expect("shard owner cache mutex poisoned");
+            local_ownership_changes(&owner_cache.owners, snapshot, &self.config, &local_node_id)
+        });
+        if let Some((lost_shards, _gained_shards)) = &local_changes {
+            for shard_id in lost_shards {
+                self.route.complete_shard_handoff(*shard_id)?;
+            }
+        }
+
         self.owner_cache
             .lock()
             .expect("shard owner cache mutex poisoned")
             .refresh(snapshot)?;
+
+        if let Some((_lost_shards, gained_shards)) = local_changes {
+            for shard_id in gained_shards {
+                self.route.acquire_shard(shard_id)?;
+            }
+        }
         self.flush_buffered();
         self.replay_remembered_for_owned_shards(snapshot);
         Ok(())
@@ -1214,4 +1234,37 @@ fn validate_snapshot(
             actual_shards: snapshot.number_of_shards(),
         })
     }
+}
+
+fn local_ownership_changes(
+    previous_owners: &BTreeMap<ShardId, NodeId>,
+    snapshot: &ShardOwnershipSnapshot,
+    config: &ShardingConfig,
+    local_node_id: &NodeId,
+) -> (Vec<ShardId>, Vec<ShardId>) {
+    let next_owners = snapshot
+        .assignments()
+        .iter()
+        .map(|assignment| (assignment.shard().shard_id(), assignment.owner()))
+        .collect::<BTreeMap<_, _>>();
+    let mut lost_shards = Vec::new();
+    let mut gained_shards = Vec::new();
+
+    for shard_index in 0..config.number_of_shards() {
+        let shard_id = ShardId::new(shard_index);
+        let was_local = previous_owners
+            .get(&shard_id)
+            .is_some_and(|owner| owner == local_node_id);
+        let is_local = next_owners
+            .get(&shard_id)
+            .is_some_and(|owner| *owner == local_node_id);
+
+        match (was_local, is_local) {
+            (true, false) => lost_shards.push(shard_id),
+            (false, true) => gained_shards.push(shard_id),
+            (true, true) | (false, false) => {}
+        }
+    }
+
+    (lost_shards, gained_shards)
 }
