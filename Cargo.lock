@@ -997,6 +997,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-clustered-counter-grpc"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "rakka",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "rakka-example-clustered-counter-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rakka",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-clustered-receptionist"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package rakka.examples.clustered_counter.v1;
+
+enum CounterAction {
+  COUNTER_ACTION_UNSPECIFIED = 0;
+  COUNTER_ACTION_INITIATE = 1;
+  COUNTER_ACTION_INCREASE = 2;
+  COUNTER_ACTION_DECREASE = 3;
+  COUNTER_ACTION_GET = 4;
+}
+
+message InitiateCounterRequest {
+  string name = 1;
+  int64 initial_value = 2;
+}
+
+message GetCounterRequest {
+  string name = 1;
+}
+
+message ChangeCounterRequest {
+  string name = 1;
+  int64 amount = 2;
+}
+
+message CounterOperation {
+  string name = 1;
+  int64 amount = 2;
+  CounterAction action = 3;
+}
+
+message CounterValue {
+  string name = 1;
+  int64 value = 2;
+  uint64 revision = 3;
+  bool initialized = 4;
+  bool created = 5;
+  string owner_node = 6;
+}
+
+service CounterService {
+  rpc Initiate(InitiateCounterRequest) returns (CounterValue);
+  rpc Get(GetCounterRequest) returns (CounterValue);
+  rpc Increase(ChangeCounterRequest) returns (CounterValue);
+  rpc Decrease(ChangeCounterRequest) returns (CounterValue);
+}
