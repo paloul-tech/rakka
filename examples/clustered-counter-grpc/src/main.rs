@@ -500,7 +500,7 @@ impl CounterService for CounterGrpc {
     ) -> Result<Response<CounterValue>, Status> {
         let timeout = effective_request_timeout(&request, GrpcUnaryConfig::default());
         let request = request.into_inner();
-        validate_counter_name(&request.name)?;
+        validate_counter_name(&request.name).map_err(validation_status)?;
         self.apply(
             CounterOperation {
                 name: request.name,
@@ -518,7 +518,7 @@ impl CounterService for CounterGrpc {
     ) -> Result<Response<CounterValue>, Status> {
         let timeout = effective_request_timeout(&request, GrpcUnaryConfig::default());
         let request = request.into_inner();
-        validate_counter_name(&request.name)?;
+        validate_counter_name(&request.name).map_err(validation_status)?;
         self.apply(
             CounterOperation {
                 name: request.name,
@@ -536,8 +536,8 @@ impl CounterService for CounterGrpc {
     ) -> Result<Response<CounterValue>, Status> {
         let timeout = effective_request_timeout(&request, GrpcUnaryConfig::default());
         let request = request.into_inner();
-        validate_counter_name(&request.name)?;
-        validate_non_negative_amount(request.amount)?;
+        validate_counter_name(&request.name).map_err(validation_status)?;
+        validate_non_negative_amount(request.amount).map_err(validation_status)?;
         self.apply(
             CounterOperation {
                 name: request.name,
@@ -555,8 +555,8 @@ impl CounterService for CounterGrpc {
     ) -> Result<Response<CounterValue>, Status> {
         let timeout = effective_request_timeout(&request, GrpcUnaryConfig::default());
         let request = request.into_inner();
-        validate_counter_name(&request.name)?;
-        validate_non_negative_amount(request.amount)?;
+        validate_counter_name(&request.name).map_err(validation_status)?;
+        validate_non_negative_amount(request.amount).map_err(validation_status)?;
         self.apply(
             CounterOperation {
                 name: request.name,
@@ -882,19 +882,19 @@ async fn run_client(args: &[String]) -> ExampleResult<()> {
     Ok(())
 }
 
-fn validate_counter_name(name: &str) -> Result<(), Status> {
+fn validate_counter_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
-        return Err(validation_status("counter name must not be empty"));
+        return Err("counter name must not be empty");
     }
     if name.contains('|') {
-        return Err(validation_status("counter name must not contain '|'"));
+        return Err("counter name must not contain '|'");
     }
     Ok(())
 }
 
-fn validate_non_negative_amount(amount: i64) -> Result<(), Status> {
+fn validate_non_negative_amount(amount: i64) -> Result<(), &'static str> {
     if amount < 0 {
-        return Err(validation_status("amount must be non-negative"));
+        return Err("amount must be non-negative");
     }
     Ok(())
 }
