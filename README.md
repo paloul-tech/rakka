@@ -1,27 +1,31 @@
-# Rakka
+[![CI](https://github.com/paloul-tech/rakka/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/paloul-tech/rakka/actions/workflows/ci.yml)
+
+![Rakka - Rust Actor Framework](media/rakka-banner.png)
 
 Rakka is a Rust actor framework built around typed actors, durable state, Rakka-owned cluster coordination, Kubernetes operation, Protobuf remoting, and supervised child-process actors.
 
 The current repository state is a v1 release-candidate foundation: local typed actors, durable state APIs, typed persistence storage foundations, Akka-named event-sourced and durable-state behavior facades, in-memory and PostgreSQL persistence stores, cluster membership/discovery foundations, TCP and deterministic remoting, sharding, supervised process actors, process-backed entities, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC adapters, Kubernetes health/drain hooks, operational metrics, generated contract examples, and reviewable Kubernetes manifests.
 
-See `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
-See `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
-See `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kubernetes, and metrics integration boundaries.
-See `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, allowed version skew, and compatibility test commands.
-See `docs/rakka-v1-api-review.md` for the current public API review notes, crate map, feature boundaries, and error-code policy.
-See `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrored HTTP routes, and the adapter boundary.
-See `docs/rakka-v1-observability-exporters.md` for Prometheus/OpenTelemetry exporter adapters, snapshot routes, and cardinality guidance.
-See `docs/rakka-v1-security-operational-defaults.md` for trusted remoting boundaries, process execution defaults, timeout budgets, and Kubernetes security assumptions.
-See `docs/rakka-v1-release-packaging.md` for CI, release-candidate validation, packaging, and image build notes.
-See `docs/rakka-v1-reliability-boundaries.md` for v1 reliability guarantees, non-guarantees, and operator/application responsibilities.
-See `docs/rakka-v1-rolling-update-upgrade.md` for the N/N+1 Kubernetes rolling-update sequence.
-See `docs/rakka-v1-known-limitations-roadmap.md` for known limitations and post-v1 roadmap items.
-See `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklist and example coverage matrix.
-See `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/test-support API boundary.
-See `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
-See `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
-See `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
-See `docs/rakka-akka-parity-phase-6-streams.md` for the Akka-shaped bounded stream facade, process IO migration, and stream testkit probes.
+## Documentation
+- `docs/rakka-phase-3-remote-sharding.md` for the current remote entity routing flow and the boundary between production foundations and deterministic test scaffolding.
+- `docs/rakka-phase-4-process-workflow.md` for process actor ownership, security defaults, and durable workflow reliability boundaries.
+- `docs/rakka-phase-5-integration-surfaces.md` for HTTP, gRPC, stream, Kubernetes, and metrics integration boundaries.
+- `docs/rakka-compatibility.md` for v1 rolling-update compatibility rules, allowed version skew, and compatibility test commands.
+- `docs/rakka-v1-api-review.md` for the current public API review notes, crate map, feature boundaries, and error-code policy.
+- `docs/rakka-v1-generated-contracts.md` for generated gRPC contracts, mirrored HTTP routes, and the adapter boundary.
+- `docs/rakka-v1-observability-exporters.md` for Prometheus/OpenTelemetry exporter adapters, snapshot routes, and cardinality guidance.
+- `docs/rakka-v1-security-operational-defaults.md` for trusted remoting boundaries, process execution defaults, timeout budgets, and Kubernetes security assumptions.
+- `docs/rakka-v1-release-packaging.md` for CI, release-candidate validation, packaging, and image build notes.
+- `docs/rakka-v1-reliability-boundaries.md` for v1 reliability guarantees, non-guarantees, and operator/application responsibilities.
+- `docs/rakka-v1-rolling-update-upgrade.md` for the N/N+1 Kubernetes rolling-update sequence.
+- `docs/rakka-v1-known-limitations-roadmap.md` for known limitations and post-v1 roadmap items.
+- `docs/rakka-v1-release-candidate-review.md` for the final v1 review checklist and example coverage matrix.
+- `docs/rakka-api-boundary-inventory.md` for the facade/foundation/adapter/test-support API boundary.
+- `docs/rakka-akka-parity-migration-notes.md` for the first migration notes toward Akka-like Rakka APIs.
+- `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
+- `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
+- `docs/rakka-akka-parity-phase-6-streams.md` for the Akka-shaped bounded stream facade, process IO migration, and stream testkit probes.
+
 Historical implementation plans live in `docs/plans/`.
 
 ## Crate Map
