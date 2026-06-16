@@ -91,6 +91,12 @@ Every request may be sent to either node. Rakka routes the command to the sharde
 
 The exact `value`, `revision`, `created`, and `owner_node` fields depend on the calls made so far and which Rakka node owns the shard.
 
+## Failover Behavior
+
+If a process that owns a counter shard exits, the remaining processes continue polling discovery and advancing Rakka membership failure detection. Once the old owner is no longer routable, shard ownership is recalculated and the counter can be started on a live node.
+
+During the detection window, requests for counters owned by the exited process may time out. With the default settings, a graceful Ctrl-C exit is typically detected after the 10 second membership failure timeout. A hard-killed process can take longer because its stale discovery file is retained until the 30 second discovery TTL expires. Counter values recover on the new owner only when the processes share the same `RAKKA_COUNTER_STORE_DIR`.
+
 Useful environment variables:
 
 - `RAKKA_TCP_PORT`: Rakka TCP remoting port for this process.

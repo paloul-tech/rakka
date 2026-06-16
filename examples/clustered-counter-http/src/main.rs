@@ -794,11 +794,14 @@ async fn discovery_loop(
                 continue;
             }
         };
-        let snapshot =
-            DiscoverySnapshot::new("example-file-discovery", current_timestamp_millis(), nodes);
-        let update = runtime.lock().await.apply_discovery(snapshot);
-        if let Err(error) = update {
+        let now = current_timestamp_millis();
+        let snapshot = DiscoverySnapshot::new("example-file-discovery", now, nodes);
+        let mut runtime = runtime.lock().await;
+        if let Err(error) = runtime.apply_discovery(snapshot) {
             eprintln!("discovery apply failed: {error}");
+        }
+        if let Err(error) = runtime.tick(now) {
+            eprintln!("membership tick failed: {error}");
         }
     }
 }
