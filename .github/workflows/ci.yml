@@ -77,6 +77,9 @@ jobs:
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
 
+      - name: Fetch package dependencies
+        run: cargo fetch --locked
+
       - name: Validate crate packages
         run: scripts/package-check.sh
 
