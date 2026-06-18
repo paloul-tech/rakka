@@ -216,6 +216,8 @@ fleet dispatch, query indexes, or Kubernetes scale.
 
 ### Slice 1.1: Agent Workflow Definitions
 
+Status: implemented.
+
 Scope:
 
 - Define `AgentWorkflow` registration API.
@@ -235,6 +237,21 @@ Acceptance:
 
 - An application can register at least one workflow definition and query the
   registry by workflow type and version.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/definition.rs` with
+  `AgentWorkflowRegistry`, `AgentWorkflowKey`, `AgentWorkflowRegistryError`,
+  and `AgentPayload`.
+- Extended `AgentWorkflow` metadata with `status_labels` and
+  `payload_types`.
+- Added `AgentPayloadDescriptor` for typed application payloads and opaque
+  serialized payload/schema references.
+- Added registry validation for required metadata, duplicate command types,
+  duplicate step ids, duplicate payload types, and duplicate workflow
+  type/version registrations.
+- Added rustdoc usage documentation and registry tests in
+  `crates/rakka-agent-workflow/tests/workflow_registry.rs`.
 
 ### Slice 1.2: Command and Effect Facade
 

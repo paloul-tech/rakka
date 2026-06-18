@@ -13,11 +13,11 @@ use rakka_workflow::{
 use crate::{
     AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
     AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-    AgentEffectTarget, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep,
-    AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis,
-    AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, PrincipalRef, RedactionStatus, StateSchemaVersion,
-    WorkflowDefinitionVersion,
+    AgentEffectTarget, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
+    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
+    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
+    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, PrincipalRef, RedactionStatus,
+    StateSchemaVersion, WorkflowDefinitionVersion,
 };
 
 /// Durable inbox type used by [`MinimalAgentFixture`].
@@ -536,12 +536,20 @@ impl MinimalAgentFixture {
             definition_version: WorkflowDefinitionVersion::new("test-v1"),
             state_schema_version: StateSchemaVersion::new(1),
             display_name: Some("Test workflow".to_string()),
+            status_labels: vec![
+                AgentRunStatus::Accepted.as_label().to_string(),
+                AgentRunStatus::Running.as_label().to_string(),
+                AgentRunStatus::Completed.as_label().to_string(),
+            ],
             command_types: vec![
                 "StartRun".to_string(),
                 "EffectCompleted".to_string(),
                 "HumanDecisionSubmitted".to_string(),
             ],
             steps: vec![step],
+            payload_types: vec![
+                AgentPayloadDescriptor::new("fixture.input").content_type("application/json")
+            ],
             retry_policy_ref: None,
             timeout_policy_ref: None,
             approval_policy_ref: None,

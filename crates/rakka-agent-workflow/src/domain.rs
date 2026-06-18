@@ -209,10 +209,14 @@ pub struct AgentWorkflow {
     pub state_schema_version: StateSchemaVersion,
     /// Optional display name.
     pub display_name: Option<String>,
+    /// Bounded lifecycle status labels this workflow may report.
+    pub status_labels: Vec<String>,
     /// Accepted command type names.
     pub command_types: Vec<String>,
     /// Step definitions owned by this workflow.
     pub steps: Vec<AgentStep>,
+    /// Application-owned payload types used by this workflow.
+    pub payload_types: Vec<AgentPayloadDescriptor>,
     /// Optional artifact reference for retry policy details.
     pub retry_policy_ref: Option<ArtifactRef>,
     /// Optional artifact reference for timeout policy details.
@@ -221,6 +225,63 @@ pub struct AgentWorkflow {
     pub approval_policy_ref: Option<ArtifactRef>,
     /// Bounded labels suitable for telemetry when values are controlled.
     pub observability_labels: AgentAttributes,
+}
+
+/// Application-owned payload descriptor for workflow inputs, state, commands,
+/// effects, or adapter payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPayloadDescriptor {
+    /// Stable payload type name.
+    pub type_name: String,
+    /// Optional content type for serialized payload bytes.
+    pub content_type: Option<String>,
+    /// Optional schema artifact reference.
+    pub schema_ref: Option<ArtifactRef>,
+    /// Bounded payload metadata.
+    pub attributes: AgentAttributes,
+}
+
+impl AgentPayloadDescriptor {
+    /// Creates a payload descriptor by explicit type name.
+    #[must_use]
+    pub fn new(type_name: impl Into<String>) -> Self {
+        Self {
+            type_name: type_name.into(),
+            content_type: None,
+            schema_ref: None,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    /// Creates a descriptor from a Rust type name.
+    #[must_use]
+    pub fn for_type<T>() -> Self
+    where
+        T: 'static,
+    {
+        Self::new(std::any::type_name::<T>())
+    }
+
+    /// Sets the serialized content type.
+    #[must_use]
+    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Sets an opaque schema artifact reference.
+    #[must_use]
+    pub fn schema_ref(mut self, schema_ref: ArtifactRef) -> Self {
+        self.schema_ref = Some(schema_ref);
+        self
+    }
+
+    /// Adds bounded payload metadata.
+    #[must_use]
+    pub fn attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.attributes.insert(key.into(), value.into());
+        self
+    }
 }
 
 /// One durable execution of an agent workflow definition.
@@ -309,6 +370,25 @@ pub enum AgentRunStatus {
     Compensating,
     /// Run was cancelled.
     Cancelled,
+}
+
+impl AgentRunStatus {
+    /// Stable lowercase label for telemetry and registry metadata.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Running => "running",
+            Self::WaitingForTimer => "waiting-for-timer",
+            Self::WaitingForHuman => "waiting-for-human",
+            Self::WaitingForEffect => "waiting-for-effect",
+            Self::Cancelling => "cancelling",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Compensating => "compensating",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// One resumable workflow step.

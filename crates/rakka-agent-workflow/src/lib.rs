@@ -16,20 +16,25 @@
 //! behavior must continue to be built from durable state, durable inbox
 //! acceptance, durable outbox effects, idempotency keys, and recovery.
 
+pub mod definition;
 pub mod domain;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+pub use definition::{
+    AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
+    AgentWorkflowRegistryResult,
+};
 pub use domain::{
     AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCancellation,
     AgentCausationId, AgentCommandId, AgentCorrelationId, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentRunId, AgentRunState,
-    AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
-    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
-    ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    HumanDecisionOption, InlineState, PrincipalRef, RedactionStatus, StateSchemaVersion,
-    WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS,
-    TRACE_LOG_AUDIT_ID_FIELDS,
+    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentPayloadDescriptor, AgentRunId,
+    AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId,
+    AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
+    AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, HumanDecisionOption, InlineState, PrincipalRef, RedactionStatus,
+    StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
+    FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
 };
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
@@ -59,10 +64,11 @@ pub mod prelude {
     pub use crate::{
         AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
         AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-        AgentEffectTarget, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep,
-        AgentStepId, AgentStepKind, AgentTelemetryContext, AgentWorkflow, AgentWorkflowId,
-        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-        CRATE_NAME,
+        AgentEffectTarget, AgentPayload, AgentPayloadDescriptor, AgentRunId, AgentRunState,
+        AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+        AgentTelemetryContext, AgentWorkflow, AgentWorkflowId, AgentWorkflowRegistry,
+        AgentWorkflowRegistryError, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
+        HumanCheckpointStatus, HumanDecisionOption, RedactionStatus, StateSchemaVersion,
+        WorkflowDefinitionVersion, CRATE_NAME,
     };
 }

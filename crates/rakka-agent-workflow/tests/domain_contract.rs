@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use rakka_agent_workflow::{
     AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
     AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-    AgentEffectTarget, AgentRunId, AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload,
-    AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
+    AgentEffectTarget, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
+    AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext,
+    AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
     HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, PrincipalRef,
     RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
     FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
@@ -77,8 +77,16 @@ fn sample_workflow() -> AgentWorkflow {
         definition_version: WorkflowDefinitionVersion::new("2026-06-18"),
         state_schema_version: StateSchemaVersion::new(1),
         display_name: Some("Research".to_string()),
+        status_labels: vec![
+            AgentRunStatus::Accepted.as_label().to_string(),
+            AgentRunStatus::WaitingForHuman.as_label().to_string(),
+            AgentRunStatus::Completed.as_label().to_string(),
+        ],
         command_types: vec!["StartRun".to_string(), "HumanDecisionSubmitted".to_string()],
         steps: vec![sample_step()],
+        payload_types: vec![
+            AgentPayloadDescriptor::new("research.input").content_type("application/json")
+        ],
         retry_policy_ref: Some(sample_artifact(
             "artifact:retry-policy",
             ArtifactKind::Other,
