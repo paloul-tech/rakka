@@ -18,6 +18,7 @@
 
 pub mod definition;
 pub mod domain;
+pub mod facade;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -27,14 +28,20 @@ pub use definition::{
 };
 pub use domain::{
     AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCancellation,
-    AgentCausationId, AgentCommandId, AgentCorrelationId, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentPayloadDescriptor, AgentRunId,
-    AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId,
-    AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, HumanDecisionOption, InlineState, PrincipalRef, RedactionStatus,
-    StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
-    FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
+    AgentCausationId, AgentCommandId, AgentCorrelationId, AgentDeduplicationKey, AgentEffect,
+    AgentEffectId, AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
+    AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentSpanLink,
+    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
+    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
+    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InlineState,
+    PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+    BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
+};
+pub use facade::{
+    validate_command, validate_command_metadata, validate_effect_metadata,
+    validate_effect_schedule, AgentCommand, AgentCommandKind, AgentCommandMetadata,
+    AgentDurabilityMetadata, AgentEffectMetadata, AgentEffectSchedule, AgentFacadeError,
+    AgentFacadeResult,
 };
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
@@ -62,13 +69,16 @@ pub mod substrate {
 /// stable enough for application code.
 pub mod prelude {
     pub use crate::{
-        AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
-        AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-        AgentEffectTarget, AgentPayload, AgentPayloadDescriptor, AgentRunId, AgentRunState,
-        AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
-        AgentTelemetryContext, AgentWorkflow, AgentWorkflowId, AgentWorkflowRegistry,
-        AgentWorkflowRegistryError, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-        HumanCheckpointStatus, HumanDecisionOption, RedactionStatus, StateSchemaVersion,
-        WorkflowDefinitionVersion, CRATE_NAME,
+        AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommand,
+        AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
+        AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
+        AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectStatus,
+        AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentIdempotencyKey, AgentPayload,
+        AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload,
+        AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentWorkflow,
+        AgentWorkflowId, AgentWorkflowRegistry, AgentWorkflowRegistryError, ArtifactKind,
+        ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+        CRATE_NAME,
     };
 }

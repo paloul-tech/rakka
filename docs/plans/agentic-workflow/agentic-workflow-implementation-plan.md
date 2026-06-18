@@ -255,6 +255,8 @@ Implementation notes:
 
 ### Slice 1.2: Command and Effect Facade
 
+Status: implemented.
+
 Scope:
 
 - Define first-class commands: `StartRun`, `SubmitSignal`, `ContinueRun`,
@@ -276,6 +278,30 @@ Acceptance:
 
 - Public command construction makes durability metadata explicit.
 - Effects cannot be scheduled without stable ids and idempotency metadata.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/facade.rs` with first-class
+  `AgentCommand`, `AgentCommandKind`, `AgentCommandMetadata`,
+  `AgentDurabilityMetadata`, `AgentEffectMetadata`, `AgentEffectSchedule`,
+  `AgentFacadeError`, and validation helpers.
+- Added stable command message types for `StartRun`, `SubmitSignal`,
+  `ContinueRun`, `EffectCompleted`, `EffectFailed`,
+  `HumanDecisionSubmitted`, `TimerFired`, `CancelRun`, `RetryRun`, and
+  `ForgetRun`.
+- Added stable effect message labels for model, tool, process, HTTP, gRPC,
+  stream publish, artifact write, human approval, notification, child workflow,
+  and audit event effects.
+- Added `AgentDeduplicationKey` and `AgentIdempotencyKey` domain identifiers
+  and made scheduled `AgentEffect` values carry both stable outbox
+  deduplication and downstream idempotency metadata.
+- Kept trace context optional through `AgentTelemetryContext` while requiring
+  tenant or namespace, command id, run id, workflow id, deduplication key,
+  causation id, and correlation id on command metadata.
+- Added facade tests in
+  `crates/rakka-agent-workflow/tests/command_effect_facade.rs` for accepted
+  valid commands, rejected invalid commands, stable command/effect message
+  types, and rejected effect schedules without stable idempotency metadata.
 
 ### Slice 1.3: Durable Inbox Facade
 

@@ -12,12 +12,12 @@ use rakka_workflow::{
 
 use crate::{
     AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
-    AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-    AgentEffectTarget, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
-    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
-    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, PrincipalRef, RedactionStatus,
-    StateSchemaVersion, WorkflowDefinitionVersion,
+    AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId, AgentEffectKind,
+    AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunId,
+    AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
 };
 
 /// Durable inbox type used by [`MinimalAgentFixture`].
@@ -601,8 +601,10 @@ impl MinimalAgentFixture {
 
     /// Creates a sample effect.
     pub fn sample_effect(&mut self, kind: AgentEffectKind) -> AgentEffect {
+        let effect_id = self.ids.next_effect_id();
         AgentEffect {
-            effect_id: self.ids.next_effect_id(),
+            effect_id: effect_id.clone(),
+            deduplication_key: AgentDeduplicationKey::new(format!("effect:{}", effect_id.as_str())),
             kind,
             target: AgentEffectTarget {
                 target_type: "application".to_string(),
@@ -614,7 +616,7 @@ impl MinimalAgentFixture {
             payload_ref: None,
             result_ref: None,
             timeout_ms: Some(1_000),
-            idempotency_key: Some("effect-idempotency".to_string()),
+            idempotency_key: AgentIdempotencyKey::new("effect-idempotency"),
             expected_result_type: Some("TestResult".to_string()),
             causation_id: self.ids.next_causation_id(),
             correlation_id: self.ids.next_correlation_id(),
@@ -724,7 +726,7 @@ impl MinimalAgentFixture {
             "agent.effect",
             effect.effect_id.as_str().as_bytes().to_vec(),
         )
-        .deduplication_key(format!("effect:{}", effect.effect_id.as_str()));
+        .deduplication_key(effect.deduplication_key.as_str());
         inbox.schedule_outbox(command).await
     }
 }

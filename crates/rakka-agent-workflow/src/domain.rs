@@ -85,6 +85,16 @@ string_id! {
 }
 
 string_id! {
+    /// Stable key used to deduplicate durable inbox and outbox writes.
+    pub AgentDeduplicationKey
+}
+
+string_id! {
+    /// Stable key supplied to external effect targets for idempotent execution.
+    pub AgentIdempotencyKey
+}
+
+string_id! {
     /// Stable id describing the command or event that caused another action.
     pub AgentCausationId
 }
@@ -160,6 +170,8 @@ pub const FORBIDDEN_HOT_METRIC_FIELDS: &[&str] = &[
     "checkpoint_id",
     "correlation_id",
     "causation_id",
+    "deduplication_key",
+    "idempotency_key",
     "prompt_text",
     "completion_text",
     "tool_arguments",
@@ -194,6 +206,8 @@ pub const TRACE_LOG_AUDIT_ID_FIELDS: &[&str] = &[
     "audit_event_id",
     "correlation_id",
     "causation_id",
+    "deduplication_key",
+    "idempotency_key",
 ];
 
 /// A registered agent workflow definition.
@@ -439,6 +453,8 @@ pub enum AgentStepKind {
 pub struct AgentEffect {
     /// Stable effect id.
     pub effect_id: AgentEffectId,
+    /// Stable durable outbox deduplication key.
+    pub deduplication_key: AgentDeduplicationKey,
     /// Effect kind.
     pub kind: AgentEffectKind,
     /// Dispatch target.
@@ -451,8 +467,8 @@ pub struct AgentEffect {
     pub result_ref: Option<ArtifactRef>,
     /// Timeout in milliseconds.
     pub timeout_ms: Option<u64>,
-    /// Idempotency key supplied to the downstream target when applicable.
-    pub idempotency_key: Option<String>,
+    /// Idempotency key supplied to the downstream target.
+    pub idempotency_key: AgentIdempotencyKey,
     /// Expected result type name.
     pub expected_result_type: Option<String>,
     /// Command or step that caused this effect.

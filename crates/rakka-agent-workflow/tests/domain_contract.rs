@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
     AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
-    AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-    AgentEffectTarget, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
-    AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext,
-    AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
-    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, PrincipalRef,
-    RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
-    FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
+    AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId, AgentEffectKind,
+    AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunId,
+    AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId,
+    AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
+    AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus, StateSchemaVersion,
+    WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS,
+    TRACE_LOG_AUDIT_ID_FIELDS,
 };
 
 #[test]
@@ -54,9 +55,12 @@ fn identifier_types_round_trip_as_strings() {
 #[test]
 fn high_cardinality_policy_separates_metrics_from_trace_log_audit_ids() {
     assert!(FORBIDDEN_HOT_METRIC_FIELDS.contains(&"run_id"));
+    assert!(FORBIDDEN_HOT_METRIC_FIELDS.contains(&"deduplication_key"));
+    assert!(FORBIDDEN_HOT_METRIC_FIELDS.contains(&"idempotency_key"));
     assert!(FORBIDDEN_HOT_METRIC_FIELDS.contains(&"prompt_text"));
     assert!(TRACE_LOG_AUDIT_ID_FIELDS.contains(&"run_id"));
     assert!(TRACE_LOG_AUDIT_ID_FIELDS.contains(&"effect_id"));
+    assert!(TRACE_LOG_AUDIT_ID_FIELDS.contains(&"deduplication_key"));
     assert!(BOUNDED_METRIC_FIELDS.contains(&"workflow_type"));
     assert!(BOUNDED_METRIC_FIELDS.contains(&"status"));
 }
@@ -143,6 +147,7 @@ fn sample_step() -> AgentStep {
 fn sample_effect() -> AgentEffect {
     AgentEffect {
         effect_id: AgentEffectId::new("effect-1"),
+        deduplication_key: AgentDeduplicationKey::new("effect:effect-1"),
         kind: AgentEffectKind::HumanApprovalRequest,
         target: AgentEffectTarget {
             target_type: "notification".to_string(),
@@ -157,7 +162,7 @@ fn sample_effect() -> AgentEffect {
         )),
         result_ref: None,
         timeout_ms: Some(60_000),
-        idempotency_key: Some("approval-request-1".to_string()),
+        idempotency_key: AgentIdempotencyKey::new("approval-request-1"),
         expected_result_type: Some("HumanDecision".to_string()),
         causation_id: AgentCausationId::new("step-approval"),
         correlation_id: AgentCorrelationId::new("corr-1"),
