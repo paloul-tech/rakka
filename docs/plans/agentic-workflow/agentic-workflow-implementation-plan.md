@@ -347,6 +347,8 @@ Implementation notes:
 
 ### Slice 1.4: Minimal Local Workflow Example
 
+Status: implemented.
+
 Scope:
 
 - Add a small local example or test fixture that starts a workflow, executes one
@@ -362,6 +364,21 @@ Acceptance:
 
 - The example demonstrates the agent facade without requiring sharding,
   PostgreSQL, OpenTelemetry Collector, or Kubernetes.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/tests/minimal_local_workflow.rs` as an
+  executable single-process example.
+- The example registers a workflow definition, accepts `StartRun` through
+  `AgentRunInbox`, recovers the serialized command from the durable inbox,
+  executes one deterministic planner step, transitions the inbox entry to
+  completed, and returns a completed `AgentRunState`.
+- Kept the example in-memory and local by using
+  `InMemoryDurableStateStore`, `ManualWorkflowClock`, and
+  `InMemoryMetricsRecorder`.
+- Added `docs/plans/agentic-workflow/phase-1-4-minimal-local-workflow.md` to
+  document the reliability boundary and clarify that the local runner is not
+  yet the Phase 2 durable run engine.
 
 ## Phase 2: Durable Run Engine
 
