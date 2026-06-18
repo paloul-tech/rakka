@@ -509,6 +509,8 @@ Implementation notes:
 
 ### Slice 2.4: Sharded Run Integration
 
+Status: implemented.
+
 Scope:
 
 - Register agent runs as sharded entities keyed by workflow id or run id.
@@ -524,6 +526,24 @@ Acceptance:
 
 - A command routes to the correct run entity by stable id.
 - An idle waiting run can be passivated and later resumed from durable state.
+
+Implementation notes:
+
+- Added an optional `sharding` feature to `rakka-agent-workflow`, wired through
+  the top-level `rakka` crate feature surface.
+- Added sharded agent run helpers under `rakka_agent_workflow::sharding`:
+  entity type/id helpers, registration helpers with clock and metrics injection,
+  sharded ref lookup, explicit passivation, and remembered-entity forget support.
+- Agent run entity ids map directly to `AgentRunId`, so Kubernetes-scale
+  routing can address a durable run by stable id while the actor runtime remains
+  process-local and recoverable from the durable run, inbox, and outbox stores.
+- Remembered entities are opt-in via `AgentRunShardingSettings`; most long-lived
+  waiting runs can remain passivated and restart lazily on the next command,
+  while runs that must come back on shard acquisition can use the sharding
+  facade's remembered-entity store.
+- Added feature-gated integration coverage showing stable run-id routing,
+  passivation of an idle waiting run, durable recovery on the next sharded
+  message, and remembered-entity registration diagnostics.
 
 ### Slice 2.5: Runtime Snapshots
 

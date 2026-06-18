@@ -988,6 +988,7 @@ dependencies = [
  "rakka-persistence",
  "rakka-persistence-postgres",
  "rakka-process",
+ "rakka-sharding",
  "rakka-sharding-postgres",
  "rakka-testkit",
  "rakka-workflow",

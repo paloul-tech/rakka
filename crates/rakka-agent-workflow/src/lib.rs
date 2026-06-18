@@ -23,6 +23,8 @@ pub mod inbox;
 pub mod outbox;
 pub mod runner;
 pub mod runtime;
+#[cfg(feature = "sharding")]
+pub mod sharding;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -64,6 +66,14 @@ pub use runner::{
 pub use runtime::{
     AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunRuntimeError,
     AgentRunRuntimeResult,
+};
+#[cfg(feature = "sharding")]
+pub use sharding::{
+    agent_run_entity_id, agent_run_entity_ref, agent_run_entity_type_key, forget_agent_run,
+    init_agent_run_sharding, init_agent_run_sharding_with_clock_and_metrics,
+    init_agent_run_sharding_with_metrics, passivate_agent_run, registered_agent_run_entity_ref,
+    AgentRunEntityRef, AgentRunEntityRegistration, AgentRunEntityTypeKey, AgentRunShardingSettings,
+    DEFAULT_AGENT_RUN_ENTITY_TYPE,
 };
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
@@ -107,5 +117,14 @@ pub mod prelude {
         AgentWorkflowRegistry, AgentWorkflowRegistryError, ArtifactKind, ArtifactRef,
         HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
         RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, CRATE_NAME,
+    };
+
+    #[cfg(feature = "sharding")]
+    pub use crate::{
+        agent_run_entity_id, agent_run_entity_ref, agent_run_entity_type_key, forget_agent_run,
+        init_agent_run_sharding, init_agent_run_sharding_with_clock_and_metrics,
+        init_agent_run_sharding_with_metrics, passivate_agent_run, registered_agent_run_entity_ref,
+        AgentRunEntityRef, AgentRunEntityRegistration, AgentRunEntityTypeKey,
+        AgentRunShardingSettings, DEFAULT_AGENT_RUN_ENTITY_TYPE,
     };
 }
