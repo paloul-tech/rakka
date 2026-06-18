@@ -21,13 +21,15 @@ k8s = ["dep:rakka-k8s"]
 otel = []
 postgres = ["dep:rakka-persistence-postgres", "dep:rakka-sharding-postgres"]
 process-tools = ["dep:rakka-process"]
-testkit = ["dep:rakka-testkit"]
+testkit = ["dep:rakka-core", "dep:rakka-persistence", "dep:rakka-testkit"]
 
 [dependencies]
+rakka-core = { path = "../rakka-core", version = "0.1.0", optional = true }
 rakka-workflow = { path = "../rakka-workflow", version = "0.1.0" }
 rakka-grpc = { path = "../rakka-grpc", version = "0.1.0", optional = true }
 rakka-http = { path = "../rakka-http", version = "0.1.0", optional = true }
 rakka-k8s = { path = "../rakka-k8s", version = "0.1.0", optional = true }
+rakka-persistence = { path = "../rakka-persistence", version = "0.1.0", optional = true }
 rakka-persistence-postgres = { path = "../rakka-persistence-postgres", version = "0.1.0", optional = true }
 rakka-process = { path = "../rakka-process", version = "0.1.0", optional = true }
 rakka-sharding-postgres = { path = "../rakka-sharding-postgres", version = "0.1.0", optional = true }
@@ -36,6 +38,7 @@ serde.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

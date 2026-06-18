@@ -981,9 +981,11 @@ dependencies = [
 name = "rakka-agent-workflow"
 version = "0.1.0"
 dependencies = [
+ "rakka-core",
  "rakka-grpc",
  "rakka-http",
  "rakka-k8s",
+ "rakka-persistence",
  "rakka-persistence-postgres",
  "rakka-process",
  "rakka-sharding-postgres",
@@ -991,6 +993,7 @@ dependencies = [
  "rakka-workflow",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

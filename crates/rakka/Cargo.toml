@@ -37,7 +37,7 @@ process = ["dep:rakka-process"]
 remote = ["dep:rakka-remote"]
 sharding = ["dep:rakka-sharding"]
 stream = ["dep:rakka-stream"]
-testkit = ["dep:rakka-testkit"]
+testkit = ["dep:rakka-testkit", "rakka-agent-workflow?/testkit"]
 workflow = ["dep:rakka-workflow"]
 
 [dependencies]

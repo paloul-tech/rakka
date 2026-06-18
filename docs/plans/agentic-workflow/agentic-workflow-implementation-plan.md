@@ -174,6 +174,8 @@ Implementation notes:
 
 ### Slice 0.3: Agent Test Harness Foundation
 
+Status: implemented.
+
 Scope:
 
 - Add test helpers for fake clocks, fake model/tool adapters, fake artifact
@@ -191,6 +193,21 @@ Acceptance:
 
 - Unit tests can exercise start, duplicate start, effect scheduling, and state
   serialization deterministically.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/testkit.rs` behind the `testkit`
+  feature and for crate-local unit tests.
+- Added deterministic id generation, fake clock, in-memory artifact store,
+  fake model/tool adapters, fake audit sink, and a `MinimalAgentFixture`.
+- Built the fixture on the real `rakka-workflow::DurableInbox` plus
+  `rakka-persistence::InMemoryDurableStateStore` so early tests exercise the
+  substrate boundary.
+- Wired `rakka-agent-workflow/testkit` through the top-level `rakka` `testkit`
+  feature when the agent workflow facade is enabled.
+- Added fixture tests for deterministic ids, artifact storage, fake adapter
+  outcomes, durable start deduplication, effect scheduling, and run-state JSON
+  serialization.
 
 ## Phase 1: Agent Domain Facade
 

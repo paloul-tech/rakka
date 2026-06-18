@@ -17,6 +17,8 @@
 //! acceptance, durable outbox effects, idempotency keys, and recovery.
 
 pub mod domain;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 pub use domain::{
     AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCancellation,
