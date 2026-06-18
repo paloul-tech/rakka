@@ -305,6 +305,8 @@ Implementation notes:
 
 ### Slice 1.3: Durable Inbox Facade
 
+Status: implemented.
+
 Scope:
 
 - Wrap `rakka-workflow::DurableInbox` with agent-specific command acceptance.
@@ -322,6 +324,26 @@ Acceptance:
 
 - `StartRun` is acknowledged only after durable inbox persistence.
 - Duplicate `StartRun` returns the existing durable command outcome.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/inbox.rs` with `AgentRunInbox`,
+  `AgentInboxAcceptance`, `AgentInboxDuplicateReason`, `AgentInboxError`, and
+  `agent_run_workflow_id`.
+- Mapped `AgentCommand` values to `rakka-workflow::InboxCommand` by using the
+  command id as the durable message id, the command deduplication key as the
+  durable inbox deduplication key, and the serialized command envelope as the
+  durable payload.
+- Preserved the substrate persistence boundary: `AgentInboxAcceptance::Accepted`
+  is returned only after `DurableInbox::accept` persists the entry.
+- Mapped duplicate outcomes back to agent-level duplicate reasons for message id
+  matches and deduplication-key matches.
+- Added bounded command acceptance metrics through `rakka-core::MetricsRecorder`
+  with command type, message type, outcome, and detail labels, while avoiding
+  workflow id, run id, command id, and deduplication key labels.
+- Added `crates/rakka-agent-workflow/tests/inbox_facade.rs` covering persisted
+  `StartRun` acceptance, duplicate message id, duplicate deduplication key after
+  recovery, rejected invalid commands, and lower-level `WorkflowError` mapping.
 
 ### Slice 1.4: Minimal Local Workflow Example
 

@@ -19,6 +19,7 @@
 pub mod definition;
 pub mod domain;
 pub mod facade;
+pub mod inbox;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -42,6 +43,10 @@ pub use facade::{
     validate_effect_schedule, AgentCommand, AgentCommandKind, AgentCommandMetadata,
     AgentDurabilityMetadata, AgentEffectMetadata, AgentEffectSchedule, AgentFacadeError,
     AgentFacadeResult,
+};
+pub use inbox::{
+    agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
+    AgentInboxResult, AgentRunInbox, METRIC_AGENT_INBOX_COMMANDS,
 };
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
@@ -73,12 +78,13 @@ pub mod prelude {
         AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
         AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
         AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectStatus,
-        AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentIdempotencyKey, AgentPayload,
-        AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload,
-        AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentWorkflow,
-        AgentWorkflowId, AgentWorkflowRegistry, AgentWorkflowRegistryError, ArtifactKind,
-        ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-        CRATE_NAME,
+        AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentIdempotencyKey,
+        AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError, AgentInboxResult,
+        AgentPayload, AgentPayloadDescriptor, AgentRunId, AgentRunInbox, AgentRunState,
+        AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+        AgentTelemetryContext, AgentTenantId, AgentWorkflow, AgentWorkflowId,
+        AgentWorkflowRegistry, AgentWorkflowRegistryError, ArtifactKind, ArtifactRef,
+        HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
+        RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, CRATE_NAME,
     };
 }
