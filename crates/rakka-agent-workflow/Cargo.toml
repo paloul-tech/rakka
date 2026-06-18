@@ -1,0 +1,37 @@
+[package]
+name = "rakka-agent-workflow"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "rakka_agent_workflow"
+
+[features]
+default = []
+grpc = ["dep:rakka-grpc"]
+http = ["dep:rakka-http"]
+k8s = ["dep:rakka-k8s"]
+otel = []
+postgres = ["dep:rakka-persistence-postgres", "dep:rakka-sharding-postgres"]
+process-tools = ["dep:rakka-process"]
+testkit = ["dep:rakka-testkit"]
+
+[dependencies]
+rakka-workflow = { path = "../rakka-workflow", version = "0.1.0" }
+rakka-grpc = { path = "../rakka-grpc", version = "0.1.0", optional = true }
+rakka-http = { path = "../rakka-http", version = "0.1.0", optional = true }
+rakka-k8s = { path = "../rakka-k8s", version = "0.1.0", optional = true }
+rakka-persistence-postgres = { path = "../rakka-persistence-postgres", version = "0.1.0", optional = true }
+rakka-process = { path = "../rakka-process", version = "0.1.0", optional = true }
+rakka-sharding-postgres = { path = "../rakka-sharding-postgres", version = "0.1.0", optional = true }
+rakka-testkit = { path = "../rakka-testkit", version = "0.1.0", optional = true }
+
+[lints]
+workspace = true

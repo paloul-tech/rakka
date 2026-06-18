@@ -10,6 +10,7 @@ members = [
     "crates/rakka-sharding",
     "crates/rakka-sharding-postgres",
     "crates/rakka-workflow",
+    "crates/rakka-agent-workflow",
     "crates/rakka-stream",
     "crates/rakka-process",
     "crates/rakka-http",

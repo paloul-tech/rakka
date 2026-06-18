@@ -962,6 +962,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rakka"
 version = "0.1.0"
 dependencies = [
+ "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",
  "rakka-grpc",
@@ -972,6 +973,20 @@ dependencies = [
  "rakka-remote",
  "rakka-sharding",
  "rakka-stream",
+ "rakka-testkit",
+ "rakka-workflow",
+]
+
+[[package]]
+name = "rakka-agent-workflow"
+version = "0.1.0"
+dependencies = [
+ "rakka-grpc",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-persistence-postgres",
+ "rakka-process",
+ "rakka-sharding-postgres",
  "rakka-testkit",
  "rakka-workflow",
 ]

@@ -97,6 +97,8 @@ before adding runtime behavior.
 
 ### Slice 0.1: Crate and API Boundary Decision
 
+Status: implemented.
+
 Scope:
 
 - Decide whether the first implementation lands in a new
@@ -117,6 +119,17 @@ Acceptance:
 - Existing workspace tests remain unaffected.
 - The new API boundary does not require changing the reliability semantics of
   `rakka-workflow`.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow` as the additive agent orchestration
+  facade.
+- Kept `rakka-workflow` as the durable inbox/outbox substrate.
+- Added the optional `agent-workflow` feature and `rakka::agent_workflow`
+  re-export in the top-level `rakka` facade.
+- Recorded the boundary decision, initial module map, feature map, and
+  substrate-owned type list in
+  `docs/plans/agentic-workflow/phase-0-1-api-boundary.md`.
 
 ### Slice 0.2: Domain Data Contract Draft
 
