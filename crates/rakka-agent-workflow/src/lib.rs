@@ -22,6 +22,7 @@ pub mod facade;
 pub mod inbox;
 pub mod outbox;
 pub mod runner;
+pub mod runtime;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -60,6 +61,10 @@ pub use runner::{
     AgentRunTransitionKind, AgentRunWaitReason, AgentStepRunner, AgentStepSuccess,
     AGENT_RUN_PERSISTENCE_PREFIX,
 };
+pub use runtime::{
+    AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunRuntimeError,
+    AgentRunRuntimeResult,
+};
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
 pub const CRATE_NAME: &str = "rakka-agent-workflow";
@@ -93,13 +98,14 @@ pub mod prelude {
         AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentIdempotencyKey,
         AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError, AgentInboxResult,
         AgentOutboxAcceptance, AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult,
-        AgentPayload, AgentPayloadDescriptor, AgentRunEngineError, AgentRunEngineResult,
-        AgentRunId, AgentRunInbox, AgentRunState, AgentRunStatus, AgentRunTransition,
-        AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId,
-        AgentStepKind, AgentStepRunner, AgentStepSuccess, AgentTelemetryContext, AgentTenantId,
-        AgentWorkflow, AgentWorkflowId, AgentWorkflowRegistry, AgentWorkflowRegistryError,
-        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-        CRATE_NAME,
+        AgentPayload, AgentPayloadDescriptor, AgentRunActor, AgentRunActorCommand,
+        AgentRunActorSnapshot, AgentRunEngineError, AgentRunEngineResult, AgentRunId,
+        AgentRunInbox, AgentRunRuntimeError, AgentRunRuntimeResult, AgentRunState, AgentRunStatus,
+        AgentRunTransition, AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload,
+        AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess,
+        AgentTelemetryContext, AgentTenantId, AgentWorkflow, AgentWorkflowId,
+        AgentWorkflowRegistry, AgentWorkflowRegistryError, ArtifactKind, ArtifactRef,
+        HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
+        RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, CRATE_NAME,
     };
 }

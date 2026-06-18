@@ -470,6 +470,8 @@ Implementation notes:
 
 ### Slice 2.3: Actor-Backed Run Runtime
 
+Status: implemented.
+
 Scope:
 
 - Host one active run inside a typed actor or sharded-entity-compatible runtime.
@@ -485,6 +487,25 @@ Acceptance:
 
 - A process-local restart recovers a run and continues pending work without
   duplicate accepted commands.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/runtime.rs` with `AgentRunActor`,
+  `AgentRunActorCommand`, `AgentRunActorSnapshot`, `AgentRunRuntimeError`, and
+  `AgentRunRuntimeResult`.
+- Hosted one active run behind a typed Rakka actor by composing
+  `AgentStepRunner` with `AgentRunInbox`; the actor recovers both durable
+  components in `started` and `restarted`.
+- Exposed small actor messages for recovery, snapshots, durable inbox command
+  acceptance, step transitions, waits, cancellation, compensation, effect
+  scheduling, and due-effect discovery.
+- Kept large workflow data out of actor mailbox expectations by relying on the
+  existing `AgentRunState`, `AgentEffect`, and `ArtifactRef` payload-reference
+  policy for prompts, completions, files, and tool outputs.
+- Added `crates/rakka-agent-workflow/tests/runtime_actor.rs` covering
+  process-local actor restart over shared durable stores, recovered run state,
+  recovered inbox work, duplicate command acceptance after restart, continued
+  step execution to completion, and recovered due outbox effects.
 
 ### Slice 2.4: Sharded Run Integration
 
