@@ -22,7 +22,7 @@ use crate::{
     AgentCommand, AgentDueEffect, AgentEffect, AgentInboxAcceptance, AgentInboxError,
     AgentOutboxAcceptance, AgentOutboxError, AgentOutboxResult, AgentRunEngineError, AgentRunId,
     AgentRunInbox, AgentRunState, AgentRunTransition, AgentRunWaitReason, AgentStepRunner,
-    AgentStepSuccess, AgentTimestampMillis, AgentWorkflow,
+    AgentStepSuccess, AgentTimestampMillis, AgentWorkflow, AgentWorkflowSnapshotRegistry,
 };
 
 /// Shared result type for actor-backed agent run runtime operations.
@@ -246,6 +246,7 @@ where
 {
     runner: AgentStepRunner<RunStore>,
     inbox: AgentRunInbox<WorkflowStore, Clock>,
+    snapshots: Option<AgentWorkflowSnapshotRegistry>,
 }
 
 impl<RunStore, WorkflowStore> AgentRunActor<RunStore, WorkflowStore, SystemWorkflowClock>
@@ -335,7 +336,18 @@ where
         runner: AgentStepRunner<RunStore>,
         inbox: AgentRunInbox<WorkflowStore, Clock>,
     ) -> Self {
-        Self { runner, inbox }
+        Self {
+            runner,
+            inbox,
+            snapshots: None,
+        }
+    }
+
+    /// Publishes bounded operational snapshots to the provided registry.
+    #[must_use]
+    pub fn with_snapshot_registry(mut self, snapshots: AgentWorkflowSnapshotRegistry) -> Self {
+        self.snapshots = Some(snapshots);
+        self
     }
 
     /// Durable run state-machine facade.
@@ -351,9 +363,14 @@ where
     }
 
     async fn recover_components(&mut self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
-        self.runner.recover().await?;
-        self.inbox.recover().await?;
-        self.snapshot()
+        let result = async {
+            self.runner.recover().await?;
+            self.inbox.recover().await?;
+            self.snapshot()
+        }
+        .await;
+        self.record_snapshot_result("recover", &result);
+        result
     }
 
     fn snapshot(&self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {
@@ -371,6 +388,36 @@ where
             recoverable_command_count,
             due_effect_count,
         })
+    }
+
+    fn record_snapshot_result(
+        &self,
+        phase: &'static str,
+        result: &AgentRunRuntimeResult<AgentRunActorSnapshot>,
+    ) {
+        if let Some(snapshots) = &self.snapshots {
+            match result {
+                Ok(snapshot) => snapshots.record_run_actor_snapshot(snapshot),
+                Err(error) => {
+                    snapshots.record_run_runtime_error(self.runner.run_id().clone(), phase, error);
+                }
+            }
+        }
+    }
+
+    fn record_current_snapshot(&self, phase: &'static str) {
+        let result = self.snapshot();
+        self.record_snapshot_result(phase, &result);
+    }
+
+    fn record_operation_result<T>(&self, phase: &'static str, result: &AgentRunRuntimeResult<T>) {
+        if let Err(error) = result {
+            if let Some(snapshots) = &self.snapshots {
+                snapshots.record_run_runtime_error(self.runner.run_id().clone(), phase, error);
+            }
+        } else {
+            self.record_current_snapshot(phase);
+        }
     }
 }
 
@@ -415,7 +462,9 @@ where
                     let _reply_dropped = reply_to.reply(self.recover_components().await);
                 }
                 AgentRunActorCommand::Snapshot { reply_to } => {
-                    let _reply_dropped = reply_to.reply(self.snapshot());
+                    let result = self.snapshot();
+                    self.record_snapshot_result("snapshot", &result);
+                    let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::AcceptCommand { command, reply_to } => {
                     let result = self
@@ -423,6 +472,7 @@ where
                         .accept_command(command)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("accept-command", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::Start {
@@ -434,6 +484,7 @@ where
                         .start(initial_state)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("start", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::BeginStep { now, reply_to } => {
@@ -442,6 +493,7 @@ where
                         .begin_step(now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("begin-step", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::SucceedStep {
@@ -454,6 +506,7 @@ where
                         .succeed_step(success, now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("succeed-step", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::FailStep {
@@ -466,6 +519,7 @@ where
                         .fail_step(error_code, now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("fail-step", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::Wait {
@@ -478,6 +532,7 @@ where
                         .wait(reason, now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("wait", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::Resume { now, reply_to } => {
@@ -486,6 +541,7 @@ where
                         .resume(now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("resume", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::Complete { now, reply_to } => {
@@ -494,6 +550,7 @@ where
                         .complete(now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("complete", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::FailRun {
@@ -506,6 +563,7 @@ where
                         .fail_run(error_code, now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("fail-run", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::RequestCancellation {
@@ -519,6 +577,7 @@ where
                         .request_cancellation(reason_code, reason_summary, now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("request-cancellation", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::Cancel { now, reply_to } => {
@@ -527,6 +586,7 @@ where
                         .cancel(now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("cancel", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::BeginCompensation { now, reply_to } => {
@@ -535,6 +595,7 @@ where
                         .begin_compensation(now)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("begin-compensation", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::ScheduleEffect { effect, reply_to } => {
@@ -543,11 +604,14 @@ where
                         .schedule_effect(effect)
                         .await
                         .map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("schedule-effect", &result);
                     let _reply_dropped = reply_to.reply(result);
                 }
                 AgentRunActorCommand::DueEffects { reply_to } => {
                     let result: AgentOutboxResult<Vec<AgentDueEffect>> = self.inbox.due_effects();
-                    let _reply_dropped = reply_to.reply(result.map_err(AgentRunRuntimeError::from));
+                    let result = result.map_err(AgentRunRuntimeError::from);
+                    self.record_operation_result("due-effects", &result);
+                    let _reply_dropped = reply_to.reply(result);
                 }
             }
             Ok(ActorAction::Continue)

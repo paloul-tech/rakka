@@ -25,6 +25,7 @@ pub mod runner;
 pub mod runtime;
 #[cfg(feature = "sharding")]
 pub mod sharding;
+pub mod snapshots;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -75,6 +76,22 @@ pub use sharding::{
     AgentRunEntityRef, AgentRunEntityRegistration, AgentRunEntityTypeKey, AgentRunShardingSettings,
     DEFAULT_AGENT_RUN_ENTITY_TYPE,
 };
+#[cfg(feature = "http")]
+pub use snapshots::register_agent_workflow_operational_snapshots;
+#[cfg(all(feature = "http", feature = "sharding"))]
+pub use snapshots::register_agent_workflow_shard_snapshot;
+#[cfg(feature = "sharding")]
+pub use snapshots::{
+    agent_workflow_shards_snapshot, AgentWorkflowShardEntityTypeSnapshot,
+    AgentWorkflowShardSnapshot,
+};
+pub use snapshots::{
+    AgentRunOperationalSnapshot, AgentRunOutboxSnapshot, AgentRunRecoveryErrorSnapshot,
+    AgentRunStatusCount, AgentWorkflowOutboxSnapshot, AgentWorkflowRecoverySnapshot,
+    AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
+    SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
+    SNAPSHOT_AGENT_WORKFLOW_SHARDS,
+};
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
 pub const CRATE_NAME: &str = "rakka-agent-workflow";
@@ -114,9 +131,12 @@ pub mod prelude {
         AgentRunTransition, AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload,
         AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess,
         AgentTelemetryContext, AgentTenantId, AgentWorkflow, AgentWorkflowId,
-        AgentWorkflowRegistry, AgentWorkflowRegistryError, ArtifactKind, ArtifactRef,
-        HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
-        RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, CRATE_NAME,
+        AgentWorkflowOutboxSnapshot, AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry,
+        AgentWorkflowRegistryError, AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry,
+        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+        CRATE_NAME, SNAPSHOT_AGENT_WORKFLOW_OUTBOX, SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
+        SNAPSHOT_AGENT_WORKFLOW_RUNTIME, SNAPSHOT_AGENT_WORKFLOW_SHARDS,
     };
 
     #[cfg(feature = "sharding")]
@@ -127,4 +147,16 @@ pub mod prelude {
         AgentRunEntityRef, AgentRunEntityRegistration, AgentRunEntityTypeKey,
         AgentRunShardingSettings, DEFAULT_AGENT_RUN_ENTITY_TYPE,
     };
+
+    #[cfg(feature = "sharding")]
+    pub use crate::{
+        agent_workflow_shards_snapshot, AgentWorkflowShardEntityTypeSnapshot,
+        AgentWorkflowShardSnapshot,
+    };
+
+    #[cfg(feature = "http")]
+    pub use crate::register_agent_workflow_operational_snapshots;
+
+    #[cfg(all(feature = "http", feature = "sharding"))]
+    pub use crate::register_agent_workflow_shard_snapshot;
 }

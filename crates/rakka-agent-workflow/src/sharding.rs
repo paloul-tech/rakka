@@ -17,7 +17,10 @@ use rakka_sharding::{
 };
 use rakka_workflow::{SystemWorkflowClock, WorkflowClock, WorkflowState};
 
-use crate::{AgentRunActor, AgentRunActorCommand, AgentRunId, AgentRunState, AgentWorkflow};
+use crate::{
+    AgentRunActor, AgentRunActorCommand, AgentRunId, AgentRunState, AgentWorkflow,
+    AgentWorkflowSnapshotRegistry,
+};
 
 /// Default sharded entity type used for agent runs.
 pub const DEFAULT_AGENT_RUN_ENTITY_TYPE: &str = "AgentRun";
@@ -42,6 +45,7 @@ pub struct AgentRunShardingSettings {
     buffer_config: Option<ShardBufferConfig>,
     passivation_buffer_duration: Duration,
     remembered_entities: Option<RememberedEntities>,
+    snapshot_registry: Option<AgentWorkflowSnapshotRegistry>,
 }
 
 impl Debug for AgentRunShardingSettings {
@@ -57,6 +61,7 @@ impl Debug for AgentRunShardingSettings {
                 &self.passivation_buffer_duration,
             )
             .field("remembered_entities", &self.remembered_entities)
+            .field("snapshot_registry", &self.snapshot_registry.is_some())
             .finish()
     }
 }
@@ -72,6 +77,7 @@ impl AgentRunShardingSettings {
             buffer_config: Some(ShardBufferConfig::default()),
             passivation_buffer_duration: DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION,
             remembered_entities: None,
+            snapshot_registry: None,
         }
     }
 
@@ -109,6 +115,12 @@ impl AgentRunShardingSettings {
     #[must_use]
     pub const fn remembered_entities(&self) -> Option<&RememberedEntities> {
         self.remembered_entities.as_ref()
+    }
+
+    /// Operational snapshot registry used by spawned run actors, when enabled.
+    #[must_use]
+    pub const fn snapshot_registry(&self) -> Option<&AgentWorkflowSnapshotRegistry> {
+        self.snapshot_registry.as_ref()
     }
 
     /// Sets options used when each run actor is spawned.
@@ -165,6 +177,23 @@ impl AgentRunShardingSettings {
     #[must_use]
     pub fn without_remembered_entities(mut self) -> Self {
         self.remembered_entities = None;
+        self
+    }
+
+    /// Publishes bounded run snapshots from spawned run actors.
+    #[must_use]
+    pub fn with_snapshot_registry(
+        mut self,
+        snapshot_registry: AgentWorkflowSnapshotRegistry,
+    ) -> Self {
+        self.snapshot_registry = Some(snapshot_registry);
+        self
+    }
+
+    /// Disables run snapshot publication for spawned run actors.
+    #[must_use]
+    pub fn without_snapshot_registry(mut self) -> Self {
+        self.snapshot_registry = None;
         self
     }
 }
@@ -256,16 +285,22 @@ where
     let workflow_store_for_factory = workflow_store;
     let clock_for_factory = clock;
     let metrics_for_factory = metrics;
+    let snapshot_registry_for_factory = settings.snapshot_registry.clone();
 
     let mut entity = Entity::of(key.clone(), move |context| {
-        AgentRunActor::with_clock_and_metrics(
+        let actor = AgentRunActor::with_clock_and_metrics(
             workflow_for_factory.clone(),
             AgentRunId::new(context.entity_id().as_str()),
             run_store_for_factory.clone(),
             workflow_store_for_factory.clone(),
             clock_for_factory.clone(),
             metrics_for_factory.clone(),
-        )
+        );
+        if let Some(snapshot_registry) = &snapshot_registry_for_factory {
+            actor.with_snapshot_registry(snapshot_registry.clone())
+        } else {
+            actor
+        }
     })
     .with_actor_options(settings.actor_options)
     .with_passivation_buffer_duration(settings.passivation_buffer_duration);

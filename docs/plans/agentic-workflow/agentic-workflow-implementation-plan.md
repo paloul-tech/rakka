@@ -547,6 +547,8 @@ Implementation notes:
 
 ### Slice 2.5: Runtime Snapshots
 
+Status: implemented.
+
 Scope:
 
 - Register operational snapshots for runtime, shards, outbox, recovery, and
@@ -562,6 +564,27 @@ Acceptance:
 
 - Operators can inspect active status counts, pending commands, due effects,
   and recovery state without reading raw persistence records.
+
+Implementation notes:
+
+- Added `AgentWorkflowSnapshotRegistry` as the process-local, synchronous
+  observation source used by operational snapshot providers. It records bounded
+  run summaries from actor-hosted run snapshots rather than querying raw
+  persistence records.
+- Added serializable snapshot payloads and spec-aligned names for
+  `agent_workflow_runtime`, `agent_workflow_outbox`, `agent_workflow_recovery`,
+  and `agent_workflow_shards`.
+- Updated `AgentRunActor` to publish snapshots after recovery, durable inbox
+  command acceptance, state-machine transitions, durable outbox scheduling, and
+  due-effect checks. Recovery/runtime errors are recorded with stable error
+  codes for diagnostic inspection.
+- Added HTTP registration helpers behind the `http` feature and shard snapshot
+  conversion/registration behind the `sharding` feature, so Kubernetes
+  deployments can expose the payloads through the existing `/snapshots` route.
+- Extended sharded run settings with an optional snapshot registry so
+  actor-backed sharded runs can publish the same bounded operational snapshots.
+- Added tests covering active status counts, pending command counts, due effect
+  counts, recovery state, HTTP snapshot names, and sharding facade summaries.
 
 ## Phase 3: Durable Async Boundaries
 
