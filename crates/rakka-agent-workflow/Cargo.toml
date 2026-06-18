@@ -32,6 +32,10 @@ rakka-persistence-postgres = { path = "../rakka-persistence-postgres", version =
 rakka-process = { path = "../rakka-process", version = "0.1.0", optional = true }
 rakka-sharding-postgres = { path = "../rakka-sharding-postgres", version = "0.1.0", optional = true }
 rakka-testkit = { path = "../rakka-testkit", version = "0.1.0", optional = true }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -989,6 +989,8 @@ dependencies = [
  "rakka-sharding-postgres",
  "rakka-testkit",
  "rakka-workflow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

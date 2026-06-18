@@ -16,6 +16,20 @@
 //! behavior must continue to be built from durable state, durable inbox
 //! acceptance, durable outbox effects, idempotency keys, and recovery.
 
+pub mod domain;
+
+pub use domain::{
+    AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCancellation,
+    AgentCausationId, AgentCommandId, AgentCorrelationId, AgentEffect, AgentEffectId,
+    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentRunId, AgentRunState,
+    AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    HumanDecisionOption, InlineState, PrincipalRef, RedactionStatus, StateSchemaVersion,
+    WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS,
+    TRACE_LOG_AUDIT_ID_FIELDS,
+};
+
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
 pub const CRATE_NAME: &str = "rakka-agent-workflow";
 
@@ -40,5 +54,13 @@ pub mod substrate {
 /// Later phases should add first-class agent domain types here as they become
 /// stable enough for application code.
 pub mod prelude {
-    pub use crate::CRATE_NAME;
+    pub use crate::{
+        AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
+        AgentCorrelationId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
+        AgentEffectTarget, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep,
+        AgentStepId, AgentStepKind, AgentTelemetryContext, AgentWorkflow, AgentWorkflowId,
+        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+        CRATE_NAME,
+    };
 }

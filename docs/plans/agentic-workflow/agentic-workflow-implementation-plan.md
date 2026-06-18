@@ -133,6 +133,8 @@ Implementation notes:
 
 ### Slice 0.2: Domain Data Contract Draft
 
+Status: implemented.
+
 Scope:
 
 - Draft serializable data contracts for `AgentRunState`, `AgentWorkflow`,
@@ -154,6 +156,21 @@ Acceptance:
 - Persisted structs can be serialized and deserialized without application code.
 - Large payload fields are represented by artifact references or application
   extension points.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/domain.rs` with serde-compatible
+  domain contracts for agent workflow definitions, run state, steps, effects,
+  human checkpoints, artifact references, telemetry context, and audit events.
+- Added explicit id newtypes for workflow, run, step, effect, checkpoint,
+  command, causation, correlation, audit event, tenant, and workflow definition
+  version values.
+- Added `StateSchemaVersion` and `AgentTimestampMillis` for persisted version
+  and timestamp fields.
+- Added high-cardinality policy constants that separate forbidden hot metric
+  fields from bounded metric fields and trace/log/audit id fields.
+- Added round-trip JSON tests for the persisted shapes in
+  `crates/rakka-agent-workflow/tests/domain_contract.rs`.
 
 ### Slice 0.3: Agent Test Harness Foundation
 
