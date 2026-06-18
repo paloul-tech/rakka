@@ -387,6 +387,8 @@ the durable inbox/outbox boundary.
 
 ### Slice 2.1: Step Runner State Machine
 
+Status: implemented.
+
 Scope:
 
 - Implement the core state transition loop for agent runs.
@@ -405,6 +407,25 @@ Acceptance:
 
 - A run can recover from stored state and continue from the expected status.
 - Invalid transitions fail with stable error codes.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/runner.rs` with
+  `AgentStepRunner`, `AgentRunTransition`, `AgentRunTransitionKind`,
+  `AgentRunWaitReason`, `AgentStepSuccess`, and `AgentRunEngineError`.
+- Persisted all run transitions through `DurableStateStore<AgentRunState>`
+  using optimistic revision fencing before returning transition outcomes.
+- Added recovery through the stable `agent-run:<run_id>` persistence id, so a
+  fresh runner can load stored state and continue from the recovered status.
+- Covered accepted, running, waiting-for-timer, waiting-for-human,
+  waiting-for-effect, cancelling, completed, failed, compensating, and
+  cancelled statuses.
+- Added stable error codes for unrecovered runners, missing durable state,
+  already-started runs, workflow mismatch, missing current step, unknown step,
+  invalid transition, invalid state, and underlying persistence failures.
+- Added `crates/rakka-agent-workflow/tests/step_runner.rs` for start,
+  recovery, step success, completion, step failure, run failure, wait, resume,
+  cancellation, compensation, and invalid-transition cases.
 
 ### Slice 2.2: Durable Outbox Scheduling
 
