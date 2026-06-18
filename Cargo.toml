@@ -24,6 +24,7 @@ members = [
     "examples/generated-contracts",
     "examples/event-sourced-counter",
     "examples/local-receptionist-router",
+    "examples/minimal-local-agent-workflow",
     "examples/minimal-system",
     "examples/pool-router",
     "examples/clustered-receptionist",
