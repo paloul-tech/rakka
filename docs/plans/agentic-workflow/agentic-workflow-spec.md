@@ -26,7 +26,7 @@ The current repository already contains many of the required primitives:
 - bounded streams;
 - HTTP and gRPC integration adapters;
 - Kubernetes readiness, liveness, drain, and compatibility hooks;
-- backend-neutral metrics, Prometheus/OpenTelemetry export helpers, tracing
+- backend-neutral metrics, OpenTelemetry-oriented export helpers, tracing
   conventions, and operational snapshot routes.
 
 The missing layer is an agent workflow orchestration model that composes these
@@ -42,8 +42,12 @@ durable timers, observability, and operational policies.
 - Support human-in-the-loop pauses without occupying a live task, mailbox, or
   stream while waiting.
 - Support Kubernetes scale-out, rolling updates, pod drains, and shard movement.
+- Use OpenTelemetry as the standard observability contract for traces, metrics,
+  logs, resources, semantic conventions, context propagation, and collector
+  integration.
 - Provide complete agent-domain telemetry requirements on top of Rakka's
-  existing metrics, tracing, logs, and snapshots.
+  existing metrics, tracing, logs, and snapshots while keeping storage and
+  visualization backends pluggable.
 - Identify implementation gaps and organize them into future planning slices.
 
 ## Non-Goals
@@ -52,6 +56,8 @@ durable timers, observability, and operational policies.
 - Do not promise exactly-once external side effects against arbitrary systems.
 - Do not require one hosted observability vendor, tracing backend, queue, or
   dashboard product.
+- Do not require Rakka applications to bypass OpenTelemetry by coupling
+  directly to a single vendor SDK, agent, or protocol.
 - Do not require per-agent Kubernetes pods or sidecars for v1. Process actors
   remain local child processes inside a Rakka node container until a later
   workload ownership model is designed.
@@ -59,6 +65,37 @@ durable timers, observability, and operational policies.
   engine.
 - Do not replace application-owned prompt engineering, model selection,
   authorization, or business approval policy.
+
+## OpenTelemetry Alignment
+
+OpenTelemetry should be the primary observability standard for agentic
+workflows. Rakka should treat OpenTelemetry as the contract for generating,
+correlating, processing, and exporting telemetry, while leaving backend storage
+and visualization to tools chosen by the application or operator.
+
+The agent workflow layer should align with these OpenTelemetry concepts:
+
+- signals: traces, metrics, logs, baggage, and later profiles;
+- context propagation: W3C `traceparent` and `tracestate` through public
+  ingress, durable inbox commands, durable outbox entries, remoting metadata,
+  process/tool protocols, callbacks, and human approval submissions;
+- resources: stable `service.name`, `service.namespace`, `service.version`,
+  `deployment.environment.name`, Kubernetes pod/namespace, container, node, and
+  cluster attributes;
+- semantic conventions: standard names for HTTP, gRPC, messaging, database,
+  RPC, errors, Kubernetes, service, process, and model/tool telemetry where
+  current conventions apply;
+- instrumentation scope: each Rakka crate and each application workflow layer
+  should emit telemetry under an explicit scope name and version;
+- Collector pipeline: application telemetry should be exported through OTLP to
+  an OpenTelemetry Collector whenever practical, then routed to Prometheus,
+  traces, logs, and commercial or open-source backends.
+
+Rakka's existing backend-neutral `MetricsRecorder`, `tracing` spans, and
+OpenTelemetry-oriented metrics bridge can support a transition path. The target
+state for production agent workflows should be native OTLP export for traces,
+metrics, and logs, with Prometheus text exposition retained as a compatibility
+option.
 
 ## Target Runtime
 
@@ -71,8 +108,10 @@ pods. A production deployment should assume:
 - PostgreSQL or an equivalent durable store is available;
 - internal remoting runs on trusted cluster networking, not public ingress;
 - public workflow ingress uses application HTTP/gRPC APIs;
-- observability is collected by Prometheus, OpenTelemetry Collector, or a
-  compatible backend;
+- Rakka applications emit OpenTelemetry traces, metrics, and logs through OTLP
+  to a local or gateway OpenTelemetry Collector;
+- Prometheus scraping remains available for compatibility, but OTLP is the
+  preferred telemetry path for complete correlation;
 - secrets, network policies, service accounts, TLS/mTLS, pod security, resource
   limits, and autoscaling are operator responsibilities.
 
@@ -344,7 +383,7 @@ Limits:
 - Kubernetes NetworkPolicy, PodDisruptionBudget, service accounts, secrets,
   resource limits, and autoscaling must be supplied by deployment code.
 
-### Metrics, Tracing, Logs, and Snapshots
+### OpenTelemetry, Metrics, Tracing, Logs, and Snapshots
 
 What exists:
 
@@ -360,23 +399,36 @@ What exists:
 How agentic workflows use it:
 
 - Register workflow runtime snapshots under `/snapshots`.
-- Record workflow metrics through the configured actor-system recorder.
-- Attach `workflow_id`, `run_id`, `step_id`, `tenant`, and bounded labels to
-  spans and structured logs.
-- Export metrics through Prometheus or OpenTelemetry bridge routes.
+- Record workflow metrics through the configured actor-system recorder while
+  adding an OTLP-capable metrics exporter path.
+- Install a `tracing` subscriber with OpenTelemetry propagation/export at the
+  application boundary.
+- Attach workflow, run, step, effect, tenant-tier, and error-code attributes to
+  spans and structured logs according to OpenTelemetry semantic conventions and
+  Rakka-specific extensions.
+- Export traces, metrics, and logs through OTLP to an OpenTelemetry Collector.
+- Retain `/metrics`, `/otel/metrics`, and `/snapshots` as useful compatibility
+  and diagnostics routes.
 
 Benefits:
 
 - Backend-neutral instrumentation.
-- Production collector choice stays outside Rakka.
+- Production backend choice stays outside Rakka.
+- OpenTelemetry context propagation can correlate public ingress, sharded
+  workflow execution, durable resumes, outbox dispatch, process tools, and
+  human approval callbacks.
+- OpenTelemetry resource attributes can identify cloud, Kubernetes, service,
+  deployment, pod, container, and process dimensions consistently.
 - Operational snapshots can include application-owned state.
 
 Limits:
 
 - No workflow-specific metric constants yet.
-- No agent trace schema yet.
-- No audit-log schema for prompts, model calls, tool calls, approvals, and
-  artifacts.
+- No native OTLP exporter integration yet; the current bridge is a serialized
+  OpenTelemetry-oriented model rather than an SDK-backed OTLP pipeline.
+- No agent trace schema or span-link policy yet.
+- No OpenTelemetry log/audit schema for prompts, model calls, tool calls,
+  approvals, and artifacts.
 - No hosted dashboards, alert rules, or vendor-specific agents.
 
 ## Proposed Agentic Workflow Model
@@ -569,8 +621,14 @@ For the first cloud Kubernetes deployment:
 - PostgreSQL for workflow state, event journal, snapshots, shard coordinator
   state, shard coordinator lease, and remembered entities.
 - Object storage for large artifacts.
-- Prometheus or OpenTelemetry Collector for metrics.
-- OpenTelemetry tracing subscriber installed by the application binary.
+- OpenTelemetry Collector deployed as a DaemonSet for node/pod/container
+  telemetry and as a gateway Deployment for cluster-wide processing, sampling,
+  routing, and backend export.
+- Rakka application pods exporting OTLP traces, metrics, and logs to the local
+  Collector endpoint.
+- Optional Prometheus scrape endpoint for compatibility and local debugging.
+- OpenTelemetry tracing subscriber and metrics/log exporters installed by the
+  application binary.
 - Kubernetes readiness, liveness, and pre-stop drain endpoints exposed through
   HTTP.
 
@@ -588,17 +646,23 @@ For the first cloud Kubernetes deployment:
 
 On startup:
 
-1. Configure tracing subscriber and metrics recorder.
-2. Connect to PostgreSQL and run explicit migrations when enabled by deployment
+1. Configure OpenTelemetry resource attributes such as `service.name`,
+   `service.namespace`, `service.version`, `deployment.environment.name`,
+   Kubernetes namespace, pod name, node name, and cluster name.
+2. Configure `tracing` plus OpenTelemetry propagation and OTLP export.
+3. Configure the Rakka metrics recorder and OpenTelemetry meter/export path.
+4. Connect to PostgreSQL and run explicit migrations when enabled by deployment
    policy.
-3. Create actor system with metrics recorder.
-4. Configure cluster node identity and compatibility metadata.
-5. Configure remote registry and schema compatibility.
-6. Configure sharding with async PostgreSQL coordinator store and lease.
-7. Register agent workflow entity types.
-8. Register workflow snapshot providers.
-9. Mark required services registered.
-10. Accept readiness only after cluster compatibility and service registration.
+5. Create actor system with metrics recorder.
+6. Configure cluster node identity and compatibility metadata.
+7. Configure remote registry, schema compatibility, and trace context
+   propagation metadata.
+8. Configure sharding with async PostgreSQL coordinator store and lease.
+9. Register agent workflow entity types.
+10. Register workflow snapshot providers.
+11. Mark required services registered.
+12. Accept readiness only after cluster compatibility, telemetry exporter
+   initialization, and service registration.
 
 ### Pod Drain
 
@@ -610,7 +674,8 @@ On pre-stop:
 4. Mark local node leaving.
 5. Handoff shards when possible.
 6. Stop process actors and external tool children.
-7. Flush persistence and metrics buffers controlled by the application.
+7. Flush persistence and telemetry buffers controlled by the application,
+   including OpenTelemetry span, metric, and log processors.
 8. Stop user actors, system actors, and remoting through coordinated shutdown.
 
 Workflow correctness should not depend on drain completing. Drain improves
@@ -645,8 +710,8 @@ The workflow layer should treat tenant or namespace as a first-class field:
 
 - persistence id namespace;
 - shard entity id prefix or entity type partition;
-- metric resource attribute;
-- trace attribute;
+- bounded metric attribute where appropriate;
+- trace/log attribute;
 - authorization scope;
 - artifact bucket/prefix;
 - retention policy;
@@ -661,10 +726,54 @@ Rakka's current observability primitives are necessary but not sufficient for
 complete agent operations. The agent workflow layer should add a domain
 observability contract.
 
+The agent workflow layer should emit OpenTelemetry-native telemetry first.
+Rakka-specific names should remain stable, but they should be shaped so they
+can be exported through OTLP and interpreted with OpenTelemetry resources,
+instrumentation scopes, semantic conventions, and context propagation.
+Prometheus-compatible exposition remains useful for local debugging,
+compatibility, and autoscaling integrations, but it should not be the only
+production observability path.
+
+### Resource Model
+
+Every Rakka process that hosts agent workflows should configure an
+OpenTelemetry resource before creating tracers, meters, or loggers. Required
+attributes:
+
+- `service.name`;
+- `service.namespace`;
+- `service.version`;
+- `deployment.environment.name`;
+- `k8s.cluster.name`;
+- `k8s.namespace.name`;
+- `k8s.deployment.name`;
+- `k8s.pod.name`;
+- `k8s.node.name`;
+- `container.name`;
+- `container.image.name`;
+- `container.image.tag`.
+
+SDK-provided attributes such as `telemetry.sdk.name`,
+`telemetry.sdk.language`, and `telemetry.sdk.version` should be retained.
+
+Rakka-specific resource attributes should be bounded and stable:
+
+- `rakka.cluster.name`;
+- `rakka.node.id`;
+- `rakka.protocol.version`;
+- `rakka.compatibility.version`;
+- `rakka.workflow.runtime.version`.
+
+Configuration should work through OpenTelemetry environment variables such as
+`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_EXPORTER_OTLP_*`, as
+well as explicit Rakka application config. In Kubernetes, resource detectors
+and the Collector Kubernetes attributes processor should enrich telemetry with
+pod, namespace, node, deployment, and cluster metadata where possible.
+
 ### Metrics
 
-Add stable workflow metric constants, likely in `rakka-core` or
-`rakka-workflow`:
+Add stable OpenTelemetry metric instruments, likely in `rakka-core` or
+`rakka-workflow`, with Prometheus-compatible mappings where applicable:
 
 - `rakka.workflow.runs`
 - `rakka.workflow.commands.accepted`
@@ -691,6 +800,20 @@ Add stable workflow metric constants, likely in `rakka-core` or
 - `rakka.workflow.recovery.count`
 - `rakka.workflow.recovery.latency_ms`
 
+Recommended instrument types:
+
+- counters for accepted, duplicate, rejected, started, completed, failed,
+  retry, exhausted, recovery, model-call, tool-call, and dispatch-failure
+  totals;
+- up-down counters or observable gauges for running workflows, waiting
+  workflows, inbox depth, outbox pending depth, due timers, human checkpoints,
+  and active dispatcher leases;
+- histograms for command acceptance latency, step latency, effect dispatch
+  latency, model/tool latency, human wait duration, recovery latency, database
+  latency, remote routing latency, and process execution latency;
+- optional histograms for model tokens and cost units when the application can
+  bound cardinality and unit semantics.
+
 Recommended bounded labels:
 
 - workflow type;
@@ -703,6 +826,12 @@ Recommended bounded labels:
 - retry attempt bucket;
 - tenant tier, not raw tenant id unless bounded;
 - Kubernetes namespace/pod/node as resource attributes.
+
+Use current OpenTelemetry semantic conventions for HTTP, gRPC/RPC, messaging,
+database, error, service, process, and Kubernetes telemetry at boundaries that
+already fit those domains. Use `rakka.*` attributes only for workflow-specific
+concepts such as workflow type, run status, effect type, retry bucket, and
+approval status.
 
 Avoid labels for:
 
@@ -728,6 +857,36 @@ Every workflow command and effect should participate in a trace:
 - `workflow.recover`
 - `workflow.timer.fire`
 
+Span roles:
+
+- public HTTP/gRPC APIs create server spans using the existing adapter
+  conventions;
+- workflow command acceptance, state transition, step execution, recovery, and
+  timer handling create internal spans;
+- model calls, tool calls, HTTP/gRPC calls, database calls, process calls, and
+  callback dispatch create client spans;
+- durable inbox and outbox writes should record messaging-like or database
+  attributes where the current semantic conventions fit;
+- long pauses should end the active span rather than holding it open.
+
+Durable trace context is required. Workflow commands, inbox entries, outbox
+entries, timer entries, process protocols, remote envelopes, callbacks, and
+human approval submissions should persist or carry W3C Trace Context values
+such as `traceparent` and `tracestate`.
+
+Long-running workflows should use span links for asynchronous resume points.
+For example, a `HumanDecisionSubmitted` span may start from the human
+submission request and link to the original checkpoint span. A retry dispatch
+span may link to the span that originally scheduled the effect. This preserves
+causal history without forcing a single parent-child trace tree across hours or
+days of idle time.
+
+Baggage can carry low-cardinality routing context such as tenant tier,
+deployment environment, workflow type, and policy class. It must not carry
+secrets, raw prompts, raw completions, unbounded user ids, auth tokens,
+personal data, or tool payloads unless an application-specific policy explicitly
+allows it.
+
 Required span attributes:
 
 - `rakka.workflow.type`
@@ -743,10 +902,29 @@ Required span attributes:
 - `messaging.message_id`
 - `messaging.conversation_id` or correlation id when available.
 
+Boundary spans should also use standard OpenTelemetry attributes where
+applicable, including current equivalents of:
+
+- `http.route`;
+- `rpc.service`;
+- `rpc.method`;
+- `db.system.name`;
+- `db.operation.name`;
+- `messaging.message.id`;
+- `messaging.operation.name`;
+- `process.command`;
+- `error.type`.
+
 High-cardinality ids can appear in traces because trace storage is designed for
 individual requests, but metrics must stay bounded.
 
 ### Structured Logs
+
+Structured runtime logs should be emitted as OpenTelemetry log records when the
+application installs an SDK-backed log pipeline. A JSON log format that can be
+ingested by the OpenTelemetry Collector filelog receiver is acceptable as a
+transition path, but records must include trace and span correlation fields when
+a current span exists.
 
 Required log events:
 
@@ -769,6 +947,22 @@ Required log events:
 - workflow failed;
 - workflow cancelled;
 - compensation started/completed/failed.
+
+Required log record fields:
+
+- timestamp;
+- severity;
+- event name;
+- trace id and span id when available;
+- resource attributes supplied by OpenTelemetry;
+- instrumentation scope;
+- workflow type and version;
+- bounded workflow/run/step/effect identifiers according to policy;
+- outcome;
+- stable error code;
+- retry attempt bucket;
+- artifact references;
+- redaction status.
 
 Logs should include stable ids and artifact references, but should avoid raw
 prompt/model/tool payloads by default. Payload logging must be opt-in,
@@ -810,7 +1004,9 @@ Audit events should include:
 - redaction status.
 
 The event journal can support this, but the agent layer should define the
-schema and retention policy.
+schema and retention policy. Audit events can also be emitted as OpenTelemetry
+logs or span events for correlation, but the telemetry backend must not be the
+only compliance or forensic retention mechanism.
 
 ### Operational Snapshots
 
@@ -836,6 +1032,12 @@ Snapshots should answer:
 - whether leases are held;
 - whether any workflow scopes are stuck;
 - whether pod drain is blocking on workflow tasks.
+
+Operational snapshots are not a replacement for OpenTelemetry. They are
+point-in-time diagnostic views for humans and automation. Selected snapshot
+counters can be surfaced as metrics, and snapshot changes can produce
+OpenTelemetry logs, but the canonical snapshot payload should remain directly
+queryable through the existing operational route.
 
 ## Main Gaps
 
@@ -914,41 +1116,61 @@ Planning slice:
 
 - Add a workflow index store with PostgreSQL implementation.
 
-### Gap 5: No Workflow Metrics Constants
+### Gap 5: No OpenTelemetry-Native Workflow Instruments
 
 Current state:
 
 - Metrics constants cover many runtime boundaries.
 - `WorkflowTelemetryEvent` exists but is returned to caller code.
+- Prometheus text and OpenTelemetry-oriented JSON export paths exist, but the
+  workflow layer does not yet define SDK-backed OTLP metrics, traces, and logs
+  as one correlated signal set.
 
 Needed:
 
-- Stable workflow metric names.
-- Recorder integration for inbox/outbox/status/steps/human/model/tool events.
+- Stable workflow metric instruments and attribute keys.
+- Recorder integration for inbox/outbox/status/steps/human/model/tool events
+  that can feed OpenTelemetry meters.
+- OTLP-capable metrics export path and Collector example.
+- Resource attribute configuration helpers for Kubernetes.
+- Semantic convention mapping for HTTP, gRPC/RPC, messaging, database,
+  process, Kubernetes, errors, and model/tool calls.
+- Rakka-specific `rakka.*` attribute registry for workflow concepts that do not
+  fit current OpenTelemetry semantic conventions.
 - Cardinality guidance specific to agent workloads.
 
 Planning slice:
 
-- Add workflow observability helpers and tests similar to HTTP/gRPC metrics
-  helpers.
+- Add workflow OpenTelemetry helpers and tests similar to HTTP/gRPC metrics
+  helpers, with Prometheus compatibility retained as an output format.
 
-### Gap 6: No Agent Trace and Audit Schema
+### Gap 6: No OpenTelemetry Context, Trace, Log, and Audit Schema
 
 Current state:
 
 - Tracing conventions are minimal and framework-level.
 - HTTP/gRPC, streams, and remoting add spans/events.
+- Workflow inbox/outbox state can carry trace context by convention, but there
+  is no first-class schema for persisted trace context, baggage, span links, or
+  correlated log/audit events.
 
 Needed:
 
 - Trace context propagation through inbox commands, outbox entries, remote
   envelopes, process actors, HTTP/gRPC adapters, and human decisions.
+- W3C Trace Context propagation policy for `traceparent` and `tracestate`.
+- Baggage allowlist and redaction policy.
+- Span-link policy for async resumes, retries, timers, human decisions, and
+  outbox dispatch.
+- OpenTelemetry log schema for workflow lifecycle events.
 - Durable audit event schema for prompts, model calls, tools, artifacts, and
   approvals.
+- Clear split between durable audit storage and telemetry correlation.
 
 Planning slice:
 
-- Define `AgentTraceContext` and `AgentAuditEvent`.
+- Define `AgentTelemetryContext`, `AgentTraceContext`, `AgentSpanLink`,
+  `AgentLogEvent`, and `AgentAuditEvent`.
 
 ### Gap 7: No Human Approval Primitive
 
@@ -1110,22 +1332,35 @@ Acceptance:
 - Approval resumes workflow.
 - Timeout path escalates or fails according to policy.
 
-### Slice F: Agent Observability
+### Slice F: Agent OpenTelemetry Observability
 
 Deliverables:
 
-- Stable workflow metric constants.
-- Metric recording helpers.
-- Agent trace context.
-- Audit event schema.
+- Stable workflow metric instruments and attribute definitions.
+- Metric recording helpers that can feed the existing `MetricsRecorder` and an
+  OpenTelemetry meter.
+- OTLP exporter integration or an adapter path for metrics, traces, and logs.
+- OpenTelemetry resource configuration helpers for Kubernetes deployments.
+- Semantic convention mapping plus a Rakka-specific `rakka.*` attribute
+  registry.
+- Agent trace context, baggage allowlist, and span-link model.
+- OpenTelemetry log event schema.
+- Durable audit event schema with trace/log correlation ids.
+- Collector example config for local development and Kubernetes.
 - Snapshot providers.
-- Testkit assertions.
+- Testkit assertions for metrics, spans, span links, logs, resource
+  attributes, and cardinality.
 
 Acceptance:
 
 - Example exposes workflow metrics on `/metrics`.
-- OpenTelemetry bridge includes workflow metrics.
-- Spans connect public command, workflow step, effect dispatch, and completion.
+- Example exports OTLP metrics, traces, and logs to an OpenTelemetry Collector.
+- OpenTelemetry bridge includes workflow metrics for compatibility.
+- Spans connect public command, workflow step, effect dispatch, and completion
+  through parent relationships or span links.
+- Logs are correlated with trace id and span id when a current span exists.
+- Resource attributes identify service, namespace, version, environment,
+  Kubernetes pod, node, deployment, container, and Rakka node.
 - Cardinality tests ensure raw ids are not used as hot metric labels.
 
 ### Slice G: Kubernetes Reference Deployment
@@ -1135,6 +1370,11 @@ Deliverables:
 - Reference manifest or Helm-style plan.
 - Pod startup/drain sequence.
 - Autoscaling metric guidance.
+- OpenTelemetry Collector DaemonSet and gateway Deployment guidance.
+- OTLP endpoint, resource attribute, and exporter environment variable
+  guidance.
+- Collector processors for batching, memory limiting, Kubernetes attributes,
+  redaction/filtering, and sampling where appropriate.
 - PostgreSQL migration guidance.
 - Network/security guidance.
 
@@ -1142,6 +1382,8 @@ Acceptance:
 
 - Local dry-run validates required ports, probes, labels, env vars, and
   compatibility metadata.
+- Local or integration test can route OTLP telemetry from a Rakka app to a
+  Collector and inspect metrics, traces, and logs.
 - Drain marks readiness false and runs workflow-aware shutdown steps.
 - Rolling update compatibility checks include workflow entity routing.
 
@@ -1224,7 +1466,12 @@ Integration tests:
 - duplicate human approval handling;
 - process tool crash and restart;
 - HTTP/gRPC command ingress;
-- Prometheus and OpenTelemetry exporter output.
+- OTLP metrics, traces, and logs reaching an OpenTelemetry Collector;
+- Prometheus-compatible metrics exposition;
+- trace context propagation across inbox, outbox, timers, process actors,
+  callbacks, and human decisions;
+- log correlation with trace id and span id;
+- OpenTelemetry resource attributes on exported telemetry.
 
 Failure-injection tests:
 
@@ -1247,7 +1494,9 @@ Kubernetes tests:
 - rolling update with N/N+1 schema policy;
 - shard handoff during pre-stop;
 - workflow resumes on replacement pod;
-- autoscaling metrics are exposed.
+- autoscaling metrics are exposed;
+- Collector DaemonSet and gateway Deployment configs route OTLP data and enrich
+  it with Kubernetes attributes.
 
 ## Example Workflow
 
@@ -1268,7 +1517,33 @@ An approval-gated research workflow:
 13. Approval command enters durable inbox.
 14. Workflow resumes, performs final model/tool steps, writes artifacts, and
     completes.
-15. Metrics, traces, audit events, and snapshots show every boundary.
+15. OpenTelemetry metrics, traces, logs, audit events, and snapshots show every
+    boundary.
+
+## OpenTelemetry Background References
+
+The OpenTelemetry portions of this spec are based on the following official
+documentation:
+
+- `https://opentelemetry.io/docs/what-is-opentelemetry/`: OpenTelemetry as a
+  vendor-agnostic framework for generating, collecting, and exporting telemetry
+  while leaving storage and visualization to backend tools.
+- `https://opentelemetry.io/docs/concepts/signals/`: supported signal model for
+  traces, metrics, logs, baggage, and developing profile support.
+- `https://opentelemetry.io/docs/concepts/context-propagation/`: propagation of
+  trace and span context across process and network boundaries using W3C Trace
+  Context by default.
+- `https://opentelemetry.io/docs/concepts/resources/`: resource attributes such
+  as service, process, container, pod, namespace, and deployment metadata.
+- `https://opentelemetry.io/docs/concepts/semantic-conventions/`: common
+  operation and attribute names across traces, metrics, logs, profiles, and
+  resources.
+- `https://opentelemetry.io/docs/collector/`: Collector architecture for
+  receiving, processing, and exporting traces, metrics, and logs.
+- `https://opentelemetry.io/docs/platforms/kubernetes/getting-started/`:
+  Kubernetes Collector topology using DaemonSet and Deployment collectors.
+- `https://opentelemetry.io/docs/languages/rust/`: Rust API, SDK, OTLP,
+  Prometheus, and semantic convention crates relevant to a Rakka implementation.
 
 ## Open Questions
 
@@ -1285,6 +1560,10 @@ An approval-gated research workflow:
 - What is the right default retention policy for prompts and completions?
 - Should raw workflow ids be allowed in traces by default while forbidden in
   metrics?
+- Should Rakka ship a feature-gated OpenTelemetry SDK integration, an adapter
+  API that applications wire to their own SDK, or both?
+- Which model/tool semantic convention version should be adopted first, and how
+  should Rakka handle convention changes over time?
 - What deployment artifact comes first: raw manifests, Helm chart, or operator
   design?
 
@@ -1297,8 +1576,8 @@ operation hooks, metrics, tracing, and snapshots.
 
 The next step is to make agent workflow orchestration first-class: define runs,
 steps, effects, human checkpoints, timers, dispatcher fleets, workflow queries,
-retention, audit events, and workflow-specific observability. The design should
-continue Rakka's current philosophy: keep failure modes explicit, make durable
-semantics opt-in and visible, preserve bounded runtime behavior, and let
-applications and operators choose their production security and observability
-backends.
+retention, audit events, and OpenTelemetry-native workflow observability. The
+design should continue Rakka's current philosophy: keep failure modes explicit,
+make durable semantics opt-in and visible, preserve bounded runtime behavior,
+emit complete telemetry through standard protocols, and let applications and
+operators choose their production security and observability backends.
