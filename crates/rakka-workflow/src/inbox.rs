@@ -10,7 +10,7 @@ use crate::error::{map_durable_error, WorkflowError, WorkflowResult};
 use crate::{
     DeduplicationKey, InboxEntry, InboxStatus, OutboxEntry, OutboxFailureTransition,
     OutboxMessageId, OutboxStatus, OutboxTarget, RetryPolicy, WorkflowId, WorkflowMessageId,
-    WorkflowState, WorkflowTelemetryEvent,
+    WorkflowState, WorkflowTelemetryEvent, WorkflowTimestamp,
 };
 
 /// Command accepted into a durable inbox.
@@ -121,6 +121,7 @@ pub struct OutboxCommand {
     target: OutboxTarget,
     message_type: String,
     payload: Vec<u8>,
+    scheduled_at: Option<WorkflowTimestamp>,
     retry_policy: RetryPolicy,
 }
 
@@ -139,6 +140,7 @@ impl OutboxCommand {
             target,
             message_type: message_type.into(),
             payload: payload.into(),
+            scheduled_at: None,
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -154,6 +156,13 @@ impl OutboxCommand {
     #[must_use]
     pub const fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
+        self
+    }
+
+    /// Sets the first dispatch timestamp.
+    #[must_use]
+    pub const fn scheduled_at(mut self, scheduled_at: WorkflowTimestamp) -> Self {
+        self.scheduled_at = Some(scheduled_at);
         self
     }
 
@@ -185,6 +194,12 @@ impl OutboxCommand {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// First dispatch timestamp, when explicitly supplied.
+    #[must_use]
+    pub const fn scheduled_at_value(&self) -> Option<WorkflowTimestamp> {
+        self.scheduled_at
     }
 
     /// Retry policy.
@@ -455,13 +470,14 @@ where
         }
 
         let now = self.clock.now();
+        let scheduled_at = command.scheduled_at.unwrap_or(now);
         let entry = OutboxEntry::new(
             command.message_id,
             command.deduplication_key,
             command.target,
             command.message_type,
             command.payload,
-            now,
+            scheduled_at,
             command.retry_policy,
         );
         let mut next_state = record.state.clone();

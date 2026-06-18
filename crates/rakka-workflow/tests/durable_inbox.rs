@@ -274,6 +274,50 @@ async fn durable_outbox_recovers_due_entry_and_dispatches_success() {
 }
 
 #[tokio::test]
+async fn outbox_command_scheduled_at_controls_due_discovery() {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(500));
+    let workflow_id = WorkflowId::new("workflow-outbox-scheduled-at");
+    let mut workflow = DurableInbox::with_clock(workflow_id.clone(), store.clone(), clock.clone());
+    workflow.recover().await.unwrap();
+
+    let scheduled = workflow
+        .schedule_outbox(
+            OutboxCommand::new(
+                "out-scheduled-at",
+                OutboxTarget::application("email"),
+                "rakka.test.SendEmail",
+                b"send".to_vec(),
+            )
+            .scheduled_at(WorkflowTimestamp::from_millis(750)),
+        )
+        .await
+        .expect("future outbox command should be scheduled");
+
+    assert!(scheduled.is_scheduled());
+    assert_eq!(
+        scheduled.entry().scheduled_at(),
+        WorkflowTimestamp::from_millis(750)
+    );
+    assert!(workflow.due_outbox().unwrap().is_empty());
+
+    let mut restarted = DurableInbox::with_clock(workflow_id, store, clock.clone());
+    restarted
+        .recover()
+        .await
+        .expect("workflow should recover future outbox");
+    assert!(restarted.due_outbox().unwrap().is_empty());
+
+    clock.set(WorkflowTimestamp::from_millis(750));
+    let due = restarted.due_outbox().unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(
+        due[0].message_id(),
+        &OutboxMessageId::new("out-scheduled-at")
+    );
+}
+
+#[tokio::test]
 async fn outbox_failure_schedules_retry_and_respects_due_time() {
     let store = InMemoryDurableStateStore::<WorkflowState>::new();
     let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(600));

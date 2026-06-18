@@ -429,6 +429,8 @@ Implementation notes:
 
 ### Slice 2.2: Durable Outbox Scheduling
 
+Status: implemented.
+
 Scope:
 
 - Schedule `AgentEffect` values through the existing durable outbox model.
@@ -444,6 +446,27 @@ Deliverables:
 Acceptance:
 
 - No external dispatcher can observe an effect before it is durably scheduled.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/outbox.rs` with agent-level durable
+  outbox scheduling, duplicate mapping, due-effect decoding, stable error
+  codes, and bounded scheduling metrics.
+- Extended `AgentRunInbox` with `schedule_effect` and `due_effects`, keeping
+  the durable persistence boundary in `rakka-workflow::DurableInbox`.
+- Mapped `AgentEffect` to `OutboxCommand` by using the effect id as the durable
+  outbox message id, the effect deduplication key as the durable outbox
+  deduplication key, the effect kind message type as the substrate message
+  type, and the full serialized `AgentEffect` as the durable payload.
+- Preserved causation id, correlation id, idempotency key, and
+  `AgentTelemetryContext` in the persisted outbox payload so dispatchers and
+  recovery paths can reconstruct telemetry context after pauses or restarts.
+- Added optional first-dispatch scheduling to `rakka-workflow::OutboxCommand`
+  so `AgentEffect::due_at` controls outbox due discovery while existing callers
+  continue to default to the workflow clock's current time.
+- Added `crates/rakka-agent-workflow/tests/outbox_facade.rs` for persisted
+  scheduled effects, recovered due effects, duplicate effect ids, duplicate
+  deduplication keys, delayed due discovery, and rejected invalid effects.
 
 ### Slice 2.3: Actor-Backed Run Runtime
 

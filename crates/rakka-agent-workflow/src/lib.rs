@@ -20,6 +20,7 @@ pub mod definition;
 pub mod domain;
 pub mod facade;
 pub mod inbox;
+pub mod outbox;
 pub mod runner;
 #[cfg(feature = "testkit")]
 pub mod testkit;
@@ -48,6 +49,11 @@ pub use facade::{
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
     AgentInboxResult, AgentRunInbox, METRIC_AGENT_INBOX_COMMANDS,
+};
+pub use outbox::{
+    agent_effect_outbox_target, agent_effect_to_outbox_command,
+    agent_timestamp_to_workflow_timestamp, AgentDueEffect, AgentOutboxAcceptance,
+    AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult, METRIC_AGENT_OUTBOX_EFFECTS,
 };
 pub use runner::{
     agent_run_persistence_id, AgentRunEngineError, AgentRunEngineResult, AgentRunTransition,
@@ -82,10 +88,11 @@ pub mod prelude {
     pub use crate::{
         AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommand,
         AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
-        AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
+        AgentDeduplicationKey, AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
         AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectStatus,
         AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentIdempotencyKey,
         AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError, AgentInboxResult,
+        AgentOutboxAcceptance, AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult,
         AgentPayload, AgentPayloadDescriptor, AgentRunEngineError, AgentRunEngineResult,
         AgentRunId, AgentRunInbox, AgentRunState, AgentRunStatus, AgentRunTransition,
         AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId,
