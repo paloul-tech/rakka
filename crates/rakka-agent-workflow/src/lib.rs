@@ -34,6 +34,7 @@ pub mod snapshots;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod timers;
+pub mod trace_context;
 
 #[cfg(feature = "process-tools")]
 pub use adapters::ProcessFileWatchToolAdapter;
@@ -164,6 +165,12 @@ pub use timers::{
     AgentTimerScannerSettings, AgentTimerStatus, AgentTimerStore, AgentTimerStoreState,
     AGENT_TIMER_PERSISTENCE_PREFIX, DEFAULT_AGENT_TIMER_STORE_ID, METRIC_AGENT_TIMERS,
 };
+pub use trace_context::{
+    agent_child_telemetry_context, agent_durable_resume_telemetry_context,
+    extract_agent_trace_context, inject_agent_trace_context, parse_agent_trace_context,
+    require_agent_trace_context, validate_agent_span_link, validate_agent_telemetry_context,
+    AgentTraceContext, AgentTraceError, AgentTraceResult, TRACEPARENT_HEADER, TRACESTATE_HEADER,
+};
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
 pub const CRATE_NAME: &str = "rakka-agent-workflow";
@@ -190,14 +197,17 @@ pub mod substrate {
 /// stable enough for application code.
 pub mod prelude {
     pub use crate::{
-        agent_audit_artifact_refs, agent_dispatch_id,
+        agent_audit_artifact_refs, agent_child_telemetry_context, agent_dispatch_id,
         agent_dispatch_timestamp_from_workflow_timestamp,
         agent_dispatch_timestamp_to_workflow_timestamp, agent_dispatcher_fleet_persistence_id,
-        agent_effect_artifact_refs, agent_metric_instrument, agent_run_artifact_refs,
-        agent_timer_store_persistence_id, human_decision_command,
+        agent_durable_resume_telemetry_context, agent_effect_artifact_refs,
+        agent_metric_instrument, agent_run_artifact_refs, agent_timer_store_persistence_id,
+        extract_agent_trace_context, human_decision_command, inject_agent_trace_context,
         is_bounded_agent_metric_attribute, is_forbidden_agent_metric_attribute,
-        record_agent_counter, record_agent_gauge, record_agent_histogram, timer_fired_command,
-        validate_agent_metric_attributes, validate_artifact_ref, validate_effect_artifact_policy,
+        parse_agent_trace_context, record_agent_counter, record_agent_gauge,
+        record_agent_histogram, require_agent_trace_context, timer_fired_command,
+        validate_agent_metric_attributes, validate_agent_span_link,
+        validate_agent_telemetry_context, validate_artifact_ref, validate_effect_artifact_policy,
         validate_inline_state, validate_run_state_artifact_policy, AgentAdapterError,
         AgentAdapterFailureClass, AgentAdapterFuture, AgentAdapterOutcome, AgentAdapterReceipt,
         AgentAdapterRequestMetadata, AgentAdapterResult, AgentAdapterUsage, AgentArtifactError,
@@ -230,16 +240,17 @@ pub mod prelude {
         AgentTimerEntry, AgentTimerError, AgentTimerFiring, AgentTimerId, AgentTimerPolicy,
         AgentTimerResult, AgentTimerScan, AgentTimerScanner, AgentTimerScannerSettings,
         AgentTimerStatus, AgentTimerStore, AgentTimerStoreState, AgentToolAdapter,
-        AgentToolRequest, AgentWorkflow, AgentWorkflowHumanCheckpointSnapshot, AgentWorkflowId,
-        AgentWorkflowOutboxSnapshot, AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry,
-        AgentWorkflowRegistryError, AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry,
-        ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-        HumanCheckpointStatus, HumanDecisionOption, RedactionStatus, StateSchemaVersion,
-        WorkflowDefinitionVersion, AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX,
-        AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES, AGENT_METRIC_ATTR_ADAPTER_KIND,
-        AGENT_METRIC_ATTR_ARTIFACT_KIND, AGENT_METRIC_ATTR_CHECKPOINT_STATUS,
-        AGENT_METRIC_ATTR_COMMAND_TYPE, AGENT_METRIC_ATTR_DEFINITION_VERSION,
-        AGENT_METRIC_ATTR_DETAIL, AGENT_METRIC_ATTR_EFFECT_KIND, AGENT_METRIC_ATTR_ERROR_CODE,
+        AgentToolRequest, AgentTraceContext, AgentTraceError, AgentTraceResult, AgentWorkflow,
+        AgentWorkflowHumanCheckpointSnapshot, AgentWorkflowId, AgentWorkflowOutboxSnapshot,
+        AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry, AgentWorkflowRegistryError,
+        AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry, ArtifactEncryptionRef,
+        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+        AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX, AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES,
+        AGENT_METRIC_ATTR_ADAPTER_KIND, AGENT_METRIC_ATTR_ARTIFACT_KIND,
+        AGENT_METRIC_ATTR_CHECKPOINT_STATUS, AGENT_METRIC_ATTR_COMMAND_TYPE,
+        AGENT_METRIC_ATTR_DEFINITION_VERSION, AGENT_METRIC_ATTR_DETAIL,
+        AGENT_METRIC_ATTR_EFFECT_KIND, AGENT_METRIC_ATTR_ERROR_CODE,
         AGENT_METRIC_ATTR_MESSAGE_TYPE, AGENT_METRIC_ATTR_OPERATION, AGENT_METRIC_ATTR_OUTCOME,
         AGENT_METRIC_ATTR_REDACTION, AGENT_METRIC_ATTR_RETRY_ATTEMPT_BUCKET,
         AGENT_METRIC_ATTR_STATUS, AGENT_METRIC_ATTR_STEP_KIND, AGENT_METRIC_ATTR_TARGET_CLASS,
@@ -258,7 +269,7 @@ pub mod prelude {
         METRIC_AGENT_TOOL_ADAPTER_CALLS, METRIC_AGENT_TOOL_ADAPTER_LATENCY_MS,
         SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
         SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
-        SNAPSHOT_AGENT_WORKFLOW_SHARDS,
+        SNAPSHOT_AGENT_WORKFLOW_SHARDS, TRACEPARENT_HEADER, TRACESTATE_HEADER,
     };
 
     #[cfg(feature = "process-tools")]

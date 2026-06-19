@@ -848,6 +848,8 @@ Implementation notes:
 
 ### Slice 4.2: Trace Context and Span Links
 
+Status: implemented.
+
 Scope:
 
 - Define `AgentTelemetryContext`, `AgentTraceContext`, and span link metadata.
@@ -866,6 +868,22 @@ Acceptance:
 
 - Public ingress, workflow step, effect dispatch, callback, human approval, and
   recovery can be correlated in traces.
+
+Implementation notes:
+
+- Added `AgentTraceContext` plus strict W3C `traceparent` and `tracestate`
+  validation helpers for durable agent workflow metadata.
+- Added injection and extraction helpers for lowercase W3C text-map carriers,
+  with case-insensitive reads and overwrite-safe writes for HTTP, gRPC,
+  process, tool, callback, and remoting metadata boundaries.
+- Added synchronous child telemetry helpers that preserve trace ids, flags,
+  tracestate, and baggage without span links.
+- Added durable resume telemetry helpers that create a new propagated context
+  and attach span-link metadata back to the parked span for timers, callbacks,
+  human decisions, retries, and recovery.
+- Added tests proving trace context survives public ingress commands, workflow
+  step propagation, effect dispatch, callbacks, timers, human approvals,
+  recovery commands, and serialization with span links.
 
 ### Slice 4.3: Structured Logs and Durable Audit
 
