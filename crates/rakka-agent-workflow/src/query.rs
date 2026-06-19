@@ -308,6 +308,8 @@ pub struct AgentDispatchIndexEntry {
     pub status: AgentDispatchStatus,
     /// Worker holding the lease, when claimed.
     pub worker_id: Option<AgentDispatcherWorkerId>,
+    /// Current dispatcher fencing token, when known.
+    pub fencing_token: Option<u64>,
     /// Claim timestamp, when claimed.
     pub claimed_at: Option<AgentTimestampMillis>,
     /// Lease expiration timestamp, when claimed.
@@ -330,6 +332,7 @@ impl AgentDispatchIndexEntry {
             due_at: entry.due_at,
             status: entry.status,
             worker_id: entry.lease.as_ref().map(|lease| lease.worker_id.clone()),
+            fencing_token: Some(entry.last_fencing_token),
             claimed_at: entry.lease.as_ref().map(|lease| lease.claimed_at),
             lease_expires_at: entry.lease.as_ref().map(|lease| lease.lease_expires_at),
             updated_at: entry.updated_at,
@@ -350,21 +353,21 @@ impl AgentDispatchIndexEntry {
 /// Query dimensions for agent workflow runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentWorkflowRunQuery {
-    tenant: Option<AgentTenantId>,
-    namespace: Option<String>,
-    workflow_type: Option<String>,
-    definition_version: Option<WorkflowDefinitionVersion>,
-    statuses: Vec<AgentRunStatus>,
-    updated_at_from: Option<AgentTimestampMillis>,
-    updated_at_to: Option<AgentTimestampMillis>,
-    waiting_reasons: Vec<AgentRunQueryWaitingReason>,
-    checkpoint_created_at_or_before: Option<AgentTimestampMillis>,
-    failed_step_id: Option<AgentStepId>,
-    due_timer_at_or_before: Option<AgentTimestampMillis>,
-    stuck_dispatcher_at_or_before: Option<AgentTimestampMillis>,
-    shard_owner_node_id: Option<String>,
-    shard_id: Option<String>,
-    limit: Option<usize>,
+    pub(crate) tenant: Option<AgentTenantId>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) workflow_type: Option<String>,
+    pub(crate) definition_version: Option<WorkflowDefinitionVersion>,
+    pub(crate) statuses: Vec<AgentRunStatus>,
+    pub(crate) updated_at_from: Option<AgentTimestampMillis>,
+    pub(crate) updated_at_to: Option<AgentTimestampMillis>,
+    pub(crate) waiting_reasons: Vec<AgentRunQueryWaitingReason>,
+    pub(crate) checkpoint_created_at_or_before: Option<AgentTimestampMillis>,
+    pub(crate) failed_step_id: Option<AgentStepId>,
+    pub(crate) due_timer_at_or_before: Option<AgentTimestampMillis>,
+    pub(crate) stuck_dispatcher_at_or_before: Option<AgentTimestampMillis>,
+    pub(crate) shard_owner_node_id: Option<String>,
+    pub(crate) shard_id: Option<String>,
+    pub(crate) limit: Option<usize>,
 }
 
 impl AgentWorkflowRunQuery {
@@ -498,13 +501,13 @@ impl AgentWorkflowRunQuery {
 /// Query dimensions for durable timers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentTimerQuery {
-    run_id: Option<AgentRunId>,
-    workflow_id: Option<AgentWorkflowId>,
-    tenant: Option<AgentTenantId>,
-    namespace: Option<String>,
-    statuses: Vec<AgentTimerStatus>,
-    due_at_or_before: Option<AgentTimestampMillis>,
-    limit: Option<usize>,
+    pub(crate) run_id: Option<AgentRunId>,
+    pub(crate) workflow_id: Option<AgentWorkflowId>,
+    pub(crate) tenant: Option<AgentTenantId>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) statuses: Vec<AgentTimerStatus>,
+    pub(crate) due_at_or_before: Option<AgentTimestampMillis>,
+    pub(crate) limit: Option<usize>,
 }
 
 impl AgentTimerQuery {
@@ -567,13 +570,13 @@ impl AgentTimerQuery {
 /// Query dimensions for dispatcher work.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentDispatchQuery {
-    run_id: Option<AgentRunId>,
-    workflow_id: Option<AgentWorkflowId>,
-    statuses: Vec<AgentDispatchStatus>,
-    target_class: Option<AgentDispatchTargetClass>,
-    due_at_or_before: Option<AgentTimestampMillis>,
-    stuck_at_or_before: Option<AgentTimestampMillis>,
-    limit: Option<usize>,
+    pub(crate) run_id: Option<AgentRunId>,
+    pub(crate) workflow_id: Option<AgentWorkflowId>,
+    pub(crate) statuses: Vec<AgentDispatchStatus>,
+    pub(crate) target_class: Option<AgentDispatchTargetClass>,
+    pub(crate) due_at_or_before: Option<AgentTimestampMillis>,
+    pub(crate) stuck_at_or_before: Option<AgentTimestampMillis>,
+    pub(crate) limit: Option<usize>,
 }
 
 impl AgentDispatchQuery {

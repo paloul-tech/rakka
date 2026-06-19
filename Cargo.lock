@@ -995,6 +995,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

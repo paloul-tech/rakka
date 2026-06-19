@@ -245,6 +245,23 @@ async fn query_index_finds_due_timers_stuck_dispatchers_and_shard_owners() {
     assert!(recovered.is_empty());
 }
 
+#[test]
+fn dispatch_projection_preserves_last_fencing_token_after_lease_clears() {
+    let mut entry = dispatch("dispatch-completed", "run-completed", ts(120), ts(150));
+    entry.status = AgentDispatchStatus::Completed;
+    entry.lease = None;
+    entry.last_fencing_token = 7;
+    entry.completed_at = Some(ts(180));
+    entry.updated_at = ts(180);
+
+    let projection = AgentDispatchIndexEntry::from_dispatch_entry(&entry);
+
+    assert_eq!(projection.worker_id, None);
+    assert_eq!(projection.claimed_at, None);
+    assert_eq!(projection.lease_expires_at, None);
+    assert_eq!(projection.fencing_token, Some(7));
+}
+
 async fn upsert_run(index: &mut InMemoryAgentWorkflowQueryIndex, run: AgentRunState) {
     index
         .upsert_run(AgentRunIndexEntry::from_run_state(&run, "research").namespace("prod"))

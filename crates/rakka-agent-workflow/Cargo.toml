@@ -19,7 +19,7 @@ grpc = ["dep:rakka-grpc"]
 http = ["dep:rakka-http"]
 k8s = ["dep:rakka-k8s"]
 otel = []
-postgres = ["dep:rakka-persistence-postgres", "dep:rakka-sharding-postgres"]
+postgres = ["dep:rakka-persistence-postgres", "dep:rakka-sharding-postgres", "dep:tokio-postgres"]
 process-tools = ["dep:rakka-process"]
 sharding = ["dep:rakka-sharding"]
 testkit = ["dep:rakka-testkit"]
@@ -38,6 +38,7 @@ rakka-sharding-postgres = { path = "../rakka-sharding-postgres", version = "0.1.
 rakka-testkit = { path = "../rakka-testkit", version = "0.1.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
+tokio-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

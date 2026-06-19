@@ -28,6 +28,8 @@ pub mod inbox;
 pub mod metrics;
 pub mod otlp;
 pub mod outbox;
+#[cfg(feature = "postgres")]
+pub mod postgres_query;
 pub mod query;
 pub mod runner;
 pub mod runtime;
@@ -152,6 +154,14 @@ pub use outbox::{
     agent_effect_outbox_target, agent_effect_to_outbox_command,
     agent_timestamp_to_workflow_timestamp, AgentDueEffect, AgentOutboxAcceptance,
     AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult, METRIC_AGENT_OUTBOX_EFFECTS,
+};
+#[cfg(feature = "postgres")]
+pub use postgres_query::{
+    PostgresAgentWorkflowQueryIndex, PostgresAgentWorkflowQueryIndexBuilder,
+    AGENT_WORKFLOW_AUDIT_INDEX_TABLE, AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE,
+    AGENT_WORKFLOW_DISPATCH_INDEX_TABLE, AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID,
+    AGENT_WORKFLOW_QUERY_MIGRATION_SQL, AGENT_WORKFLOW_RUN_INDEX_TABLE,
+    AGENT_WORKFLOW_TIMER_INDEX_TABLE, DEFAULT_AGENT_WORKFLOW_QUERY_NAMESPACE,
 };
 pub use query::{
     AgentDispatchIndexEntry, AgentDispatchQuery, AgentRunIndexEntry, AgentRunQueryWaitingReason,
@@ -338,6 +348,15 @@ pub mod prelude {
     #[cfg(feature = "http")]
     pub use crate::{
         human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
+    };
+
+    #[cfg(feature = "postgres")]
+    pub use crate::{
+        PostgresAgentWorkflowQueryIndex, PostgresAgentWorkflowQueryIndexBuilder,
+        AGENT_WORKFLOW_AUDIT_INDEX_TABLE, AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE,
+        AGENT_WORKFLOW_DISPATCH_INDEX_TABLE, AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID,
+        AGENT_WORKFLOW_QUERY_MIGRATION_SQL, AGENT_WORKFLOW_RUN_INDEX_TABLE,
+        AGENT_WORKFLOW_TIMER_INDEX_TABLE, DEFAULT_AGENT_WORKFLOW_QUERY_NAMESPACE,
     };
 
     #[cfg(feature = "sharding")]

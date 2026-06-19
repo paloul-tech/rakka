@@ -1055,6 +1055,8 @@ Implementation notes:
 
 ### Slice 5.2: PostgreSQL Index Store
 
+Status: implemented.
+
 Scope:
 
 - Add PostgreSQL schema for workflow run index, timer index, checkpoint index,
@@ -1071,6 +1073,22 @@ Acceptance:
 - Query paths remain bounded under high run counts.
 - Lease/fencing behavior prevents stale writers from corrupting dispatcher or
   timer ownership.
+
+Implementation notes:
+
+- Added a `postgres` feature-gated `PostgresAgentWorkflowQueryIndex` with
+  namespaced run, timer, checkpoint, dispatcher, and audit index tables.
+- Forwarded the top-level `rakka/postgres` feature to the agent workflow
+  PostgreSQL index so application imports can use the main facade crate.
+- Added migration SQL guarded by a PostgreSQL advisory lock so Kubernetes
+  replicas can safely start concurrently against the same database.
+- Added bounded indexed query paths for running, waiting, failed, due-timer,
+  stuck-dispatcher, shard-owner, timer, and dispatcher lookups.
+- Added projection freshness rules for runs and timers plus dispatcher fencing
+  token checks so stale writers cannot overwrite newer operational state.
+- Added gated PostgreSQL integration tests using `RAKKA_POSTGRES_TEST_DSN`,
+  including migration verification, query round trips, and stale-write
+  rejection against the local Postgres container.
 
 ### Slice 5.3: Retention Windows and Snapshot Compaction
 
