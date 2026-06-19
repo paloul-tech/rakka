@@ -1134,6 +1134,8 @@ Implementation notes:
 
 ### Slice 5.4: Migration and Backfill Policy
 
+Status: implemented.
+
 Scope:
 
 - Define how workflow definition versions, persisted state schema versions, and
@@ -1149,6 +1151,27 @@ Deliverables:
 Acceptance:
 
 - N/N+1 compatibility policy covers workflow state and index schemas.
+
+Implementation notes:
+
+- Added `AgentWorkflowMigrationPolicy` with an explicit N/N+1 compatibility
+  constructor covering durable run-state schema versions and query index schema
+  versions.
+- Added `AgentWorkflowIndexSchemaVersion` and
+  `CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION` so operational projections can
+  evolve independently from durable run-state serialization.
+- Added workflow definition version allow-listing for deployments that need to
+  reject or quarantine runs whose definitions are not enabled in the current
+  rollout.
+- Added migration assessments and machine-readable reasons for current,
+  compatible previous, too-old, and ahead-of-binary state/index versions.
+- Added a dry-run backfill planner plus `repair_agent_workflow_index`, a small
+  admin API or Kubernetes Job building block that rebuilds query projections
+  from durable `AgentRunState` through the existing `AgentWorkflowQueryIndex`
+  trait.
+- Added versioned serialization tests for durable run state and index repair
+  tests that rebuild supported runs while skipping unsupported state or disabled
+  definition versions.
 
 ## Phase 6: Kubernetes Scale and Deployment
 
