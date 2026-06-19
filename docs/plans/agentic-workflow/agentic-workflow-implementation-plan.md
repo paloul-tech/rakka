@@ -1016,6 +1016,8 @@ Goal: avoid full scans and unbounded workflow state growth as run volume grows.
 
 ### Slice 5.1: Workflow Query Model
 
+Status: implemented.
+
 Scope:
 
 - Define query dimensions: tenant, namespace, workflow type, version, status,
@@ -1033,6 +1035,23 @@ Acceptance:
 
 - Tests can list waiting, failed, running, and stuck workflows without scanning
   every persistence id.
+
+Implementation notes:
+
+- Added an operational query model that keeps durable run state as the source of
+  truth while projecting runs, timers, dispatch entries, and optional shard
+  ownership into bounded query records.
+- Added `AgentWorkflowQueryIndex` with in-memory support for upserting and
+  removing run, timer, and dispatcher projections plus querying runs, due
+  timers, and dispatcher work.
+- Added run query dimensions for tenant, namespace, workflow type, definition
+  version, status, updated-at range, waiting reason, checkpoint age, failed
+  step, due timer, stuck dispatcher, shard owner, shard id, and limit.
+- Added timer and dispatcher query dimensions so Phase 5.2 can map the same
+  trait to PostgreSQL indexes without changing the public query vocabulary.
+- Added tests proving waiting, running, failed, stale-checkpoint, due-timer,
+  stuck-dispatcher, and shard-owner lookups work through the operational index
+  without reading durable persistence records.
 
 ### Slice 5.2: PostgreSQL Index Store
 
