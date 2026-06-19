@@ -812,6 +812,8 @@ pause, retry, and human decision boundaries.
 
 ### Slice 4.1: Workflow Metric Instruments
 
+Status: implemented.
+
 Scope:
 
 - Add stable workflow metric names and attribute keys.
