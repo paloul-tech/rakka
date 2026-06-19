@@ -928,6 +928,8 @@ Implementation notes:
 
 ### Slice 4.4: OTLP and Collector Integration
 
+Status: implemented.
+
 Scope:
 
 - Decide whether Rakka ships feature-gated OpenTelemetry SDK integration,
@@ -948,6 +950,27 @@ Acceptance:
 
 - Example telemetry includes resource attributes and can be exported through an
   OpenTelemetry-compatible path.
+
+Implementation notes:
+
+- Kept Rakka aligned with the existing v1 observability boundary: application
+  code owns concrete OpenTelemetry SDK/exporter setup, while Rakka provides a
+  stable adapter-facing bridge model.
+- Added OpenTelemetry resource helpers for service name, namespace, version,
+  instance id, deployment environment name, Kubernetes namespace, pod, pod UID,
+  node, deployment, container, and Rakka node id attributes.
+- Added OTLP exporter configuration helpers using standard `OTEL_EXPORTER_OTLP_*`
+  names, protocol selection, signal-specific endpoint overrides, timeouts, and
+  headers.
+- Added `AgentOtlpBridgeExport`, `AgentOtelSpanExport`, `AgentOtlpBridgeReceiver`,
+  and `InMemoryAgentOtlpReceiver` so metrics, traces, and logs can be exported
+  through a deterministic OpenTelemetry-compatible handoff.
+- Added local development Collector config at
+  `docs/plans/agentic-workflow/otel-collector-local.yaml` with OTLP gRPC/HTTP
+  receivers and traces, metrics, and logs pipelines.
+- Added tests proving resource attributes, exporter config parsing, metrics,
+  spans, and logs route to a deterministic receiver, and the Collector config
+  exposes all three signal pipelines.
 
 ### Slice 4.5: Observability Testkit
 
