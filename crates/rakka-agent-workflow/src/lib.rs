@@ -28,6 +28,7 @@ pub mod sharding;
 pub mod snapshots;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+pub mod timers;
 
 pub use definition::{
     AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
@@ -39,7 +40,7 @@ pub use domain::{
     AgentEffectId, AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
     AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentSpanLink,
     AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
+    AgentTimerId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
     HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InlineState,
     PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
     BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
@@ -92,6 +93,12 @@ pub use snapshots::{
     SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
     SNAPSHOT_AGENT_WORKFLOW_SHARDS,
 };
+pub use timers::{
+    agent_timer_store_persistence_id, timer_fired_command, AgentTimerEntry, AgentTimerError,
+    AgentTimerFiring, AgentTimerPolicy, AgentTimerResult, AgentTimerScan, AgentTimerScanner,
+    AgentTimerScannerSettings, AgentTimerStatus, AgentTimerStore, AgentTimerStoreState,
+    AGENT_TIMER_PERSISTENCE_PREFIX, DEFAULT_AGENT_TIMER_STORE_ID, METRIC_AGENT_TIMERS,
+};
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
 pub const CRATE_NAME: &str = "rakka-agent-workflow";
@@ -118,24 +125,28 @@ pub mod substrate {
 /// stable enough for application code.
 pub mod prelude {
     pub use crate::{
-        AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommand,
-        AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
-        AgentDeduplicationKey, AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
-        AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectStatus,
-        AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentIdempotencyKey,
-        AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError, AgentInboxResult,
-        AgentOutboxAcceptance, AgentOutboxDuplicateReason, AgentOutboxError, AgentOutboxResult,
-        AgentPayload, AgentPayloadDescriptor, AgentRunActor, AgentRunActorCommand,
-        AgentRunActorSnapshot, AgentRunEngineError, AgentRunEngineResult, AgentRunId,
-        AgentRunInbox, AgentRunRuntimeError, AgentRunRuntimeResult, AgentRunState, AgentRunStatus,
-        AgentRunTransition, AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload,
-        AgentStep, AgentStepId, AgentStepKind, AgentStepRunner, AgentStepSuccess,
-        AgentTelemetryContext, AgentTenantId, AgentWorkflow, AgentWorkflowId,
-        AgentWorkflowOutboxSnapshot, AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry,
-        AgentWorkflowRegistryError, AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry,
-        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-        HumanDecisionOption, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-        CRATE_NAME, SNAPSHOT_AGENT_WORKFLOW_OUTBOX, SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
+        agent_timer_store_persistence_id, timer_fired_command, AgentAuditEvent, AgentAuditEventId,
+        AgentAuditEventKind, AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind,
+        AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey, AgentDueEffect,
+        AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
+        AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentFacadeError,
+        AgentFacadeResult, AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxDuplicateReason,
+        AgentInboxError, AgentInboxResult, AgentOutboxAcceptance, AgentOutboxDuplicateReason,
+        AgentOutboxError, AgentOutboxResult, AgentPayload, AgentPayloadDescriptor, AgentRunActor,
+        AgentRunActorCommand, AgentRunActorSnapshot, AgentRunEngineError, AgentRunEngineResult,
+        AgentRunId, AgentRunInbox, AgentRunRuntimeError, AgentRunRuntimeResult, AgentRunState,
+        AgentRunStatus, AgentRunTransition, AgentRunTransitionKind, AgentRunWaitReason,
+        AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner,
+        AgentStepSuccess, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
+        AgentTimerFiring, AgentTimerId, AgentTimerPolicy, AgentTimerResult, AgentTimerScan,
+        AgentTimerScanner, AgentTimerScannerSettings, AgentTimerStatus, AgentTimerStore,
+        AgentTimerStoreState, AgentWorkflow, AgentWorkflowId, AgentWorkflowOutboxSnapshot,
+        AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry, AgentWorkflowRegistryError,
+        AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry, ArtifactKind, ArtifactRef,
+        HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
+        RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+        AGENT_TIMER_PERSISTENCE_PREFIX, CRATE_NAME, DEFAULT_AGENT_TIMER_STORE_ID,
+        METRIC_AGENT_TIMERS, SNAPSHOT_AGENT_WORKFLOW_OUTBOX, SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
         SNAPSHOT_AGENT_WORKFLOW_RUNTIME, SNAPSHOT_AGENT_WORKFLOW_SHARDS,
     };
 

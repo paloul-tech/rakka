@@ -593,6 +593,8 @@ pauses, adapters, and artifacts.
 
 ### Slice 3.1: Durable Timer Model
 
+Status: implemented.
+
 Scope:
 
 - Define durable timer entries with run id, timer id, due time, deduplication
@@ -610,6 +612,27 @@ Acceptance:
 
 - A run waiting for a timer resumes after restart.
 - Duplicate timer delivery is deduplicated by inbox key.
+
+Implementation notes:
+
+- Added `AgentTimerId`, durable timer entries, timer policy metadata, timer
+  statuses, and a durable timer-store state backed by the existing
+  `DurableStateStore` abstraction.
+- Added `AgentTimerStore` for scheduling, due selection, idempotent fired
+  marking, cancellation, and recovery from the durable timer index.
+- Added `AgentTimerScanner` with explicit clock injection, configurable
+  `max_batch_size`, due-count reporting, and `backpressure_limited` reporting
+  when more timers are due than can be fired in one scan.
+- Timer firing builds a first-class `TimerFired` command from the timer's
+  deduplication key, causation id, correlation id, trace context, tenant, run id,
+  and workflow id, then accepts it through `AgentRunInbox`.
+- After durable inbox acceptance, the scanner resumes the target run when its
+  recovered durable state is still `waiting-for-timer`; duplicate or late
+  delivery against an already-running run remains idempotent at the inbox layer.
+- Added timer firing metrics and late-by-milliseconds reporting for overdue
+  scans.
+- Added tests for restart recovery, due timer firing, duplicate `TimerFired`
+  delivery deduplication, bounded scans, and late firing.
 
 ### Slice 3.2: Dispatcher Fleet
 

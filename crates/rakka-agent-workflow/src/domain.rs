@@ -80,6 +80,11 @@ string_id! {
 }
 
 string_id! {
+    /// Stable id for one durable timer.
+    pub AgentTimerId
+}
+
+string_id! {
     /// Stable id for one accepted command.
     pub AgentCommandId
 }
