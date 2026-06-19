@@ -752,6 +752,18 @@ Acceptance:
 - Model/tool effects can complete, fail retryably, fail permanently, time out,
   and write artifact references.
 
+Implementation notes:
+
+- Added `AgentModelAdapter` and `AgentToolAdapter` boundaries in
+  `rakka-agent-workflow`, with request metadata derived from durable effects.
+- Added adapter outcomes for completion, retryable/permanent failure, and
+  timeout, preserving receipts, idempotency, token/cost usage, redaction, and
+  artifact references.
+- Extended the testkit fake model/tool adapters to exercise adapter traits
+  before real provider integrations are added.
+- Added a feature-gated process file-watch tool adapter example backed by
+  `rakka-process` for Kubernetes-friendly external tool execution patterns.
+
 ### Slice 3.5: Artifact Reference Policy
 
 Scope:

@@ -11,11 +11,13 @@ use rakka_workflow::{
 };
 
 use crate::{
-    AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommandId,
-    AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId, AgentEffectKind,
-    AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunId,
-    AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
-    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    AgentAdapterFailureClass, AgentAdapterFuture, AgentAdapterOutcome, AgentAdapterRequestMetadata,
+    AgentAdapterUsage, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId,
+    AgentCommandId, AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId,
+    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentModelAdapter,
+    AgentModelRequest, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
+    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
+    AgentTimestampMillis, AgentToolAdapter, AgentToolRequest, AgentWorkflow, AgentWorkflowId,
     ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
     PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
 };
@@ -272,6 +274,13 @@ pub enum FakeAdapterOutcome {
         /// Stable error code.
         error_code: String,
     },
+    /// Adapter timed out.
+    Timeout {
+        /// Timeout budget that elapsed.
+        timeout_ms: u64,
+        /// Optional partial result artifact.
+        partial_result_ref: Option<ArtifactRef>,
+    },
 }
 
 impl FakeAdapterOutcome {
@@ -294,6 +303,42 @@ impl FakeAdapterOutcome {
     pub fn permanent_failure(error_code: impl Into<String>) -> Self {
         Self::PermanentFailure {
             error_code: error_code.into(),
+        }
+    }
+
+    /// Creates a timeout outcome.
+    #[must_use]
+    pub const fn timeout(timeout_ms: u64, partial_result_ref: Option<ArtifactRef>) -> Self {
+        Self::Timeout {
+            timeout_ms,
+            partial_result_ref,
+        }
+    }
+
+    fn into_adapter_outcome(
+        self,
+        metadata: &AgentAdapterRequestMetadata,
+        provider: &'static str,
+    ) -> AgentAdapterOutcome {
+        let receipt = metadata.receipt(provider, AgentTimestampMillis::new(0));
+        match self {
+            Self::Success { result_ref } => {
+                AgentAdapterOutcome::completed(receipt, result_ref, AgentAdapterUsage::new())
+            }
+            Self::RetryableFailure { error_code } => AgentAdapterOutcome::failed(
+                receipt,
+                AgentAdapterFailureClass::Retryable,
+                error_code,
+            ),
+            Self::PermanentFailure { error_code } => AgentAdapterOutcome::failed(
+                receipt,
+                AgentAdapterFailureClass::Permanent,
+                error_code,
+            ),
+            Self::Timeout {
+                timeout_ms,
+                partial_result_ref,
+            } => AgentAdapterOutcome::timed_out(receipt, timeout_ms, partial_result_ref),
         }
     }
 }
@@ -326,6 +371,17 @@ impl FakeModelAdapter {
     }
 }
 
+impl AgentModelAdapter for FakeModelAdapter {
+    fn invoke_model<'a>(&'a mut self, request: AgentModelRequest) -> AgentAdapterFuture<'a> {
+        let metadata = request.metadata.clone();
+        let outcome = self.invoke(FakeAdapterRequest {
+            effect: request.effect,
+            payload_ref: request.prompt_ref,
+        });
+        Box::pin(async move { Ok(outcome.into_adapter_outcome(&metadata, "fake-model")) })
+    }
+}
+
 /// Fake tool adapter with queued deterministic outcomes.
 #[derive(Debug, Clone, Default)]
 pub struct FakeToolAdapter {
@@ -351,6 +407,17 @@ impl FakeToolAdapter {
     #[must_use]
     pub fn requests(&self) -> &[FakeAdapterRequest] {
         &self.requests
+    }
+}
+
+impl AgentToolAdapter for FakeToolAdapter {
+    fn invoke_tool<'a>(&'a mut self, request: AgentToolRequest) -> AgentAdapterFuture<'a> {
+        let metadata = request.metadata.clone();
+        let outcome = self.invoke(FakeAdapterRequest {
+            effect: request.effect,
+            payload_ref: request.input_ref,
+        });
+        Box::pin(async move { Ok(outcome.into_adapter_outcome(&metadata, "fake-tool")) })
     }
 }
 
@@ -808,6 +875,82 @@ mod tests {
             }
         );
         assert_eq!(fixture.model_adapter().requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fake_adapters_implement_model_and_tool_traits() {
+        let mut fixture = MinimalAgentFixture::new();
+        let prompt_ref =
+            fixture.write_artifact(ArtifactKind::Prompt, "text/plain", b"prompt".to_vec());
+        let result_ref =
+            fixture.write_artifact(ArtifactKind::Completion, "text/plain", b"done".to_vec());
+        let mut model_effect = fixture.sample_effect(AgentEffectKind::ModelCall);
+        model_effect.payload_ref = Some(prompt_ref.clone());
+        fixture
+            .model_adapter_mut()
+            .push_outcome(FakeAdapterOutcome::success(Some(result_ref.clone())));
+
+        let model_request = AgentModelRequest::from_effect(model_effect).expect("model request");
+        let model_outcome = fixture
+            .model_adapter_mut()
+            .invoke_model(model_request)
+            .await
+            .expect("fake model adapter should return outcome");
+
+        match model_outcome {
+            AgentAdapterOutcome::Completed {
+                receipt,
+                result_ref: Some(actual_ref),
+                ..
+            } => {
+                assert_eq!(receipt.provider, "fake-model");
+                assert_eq!(actual_ref, result_ref);
+            }
+            other => panic!("unexpected model outcome: {other:?}"),
+        }
+        assert_eq!(fixture.model_adapter().requests().len(), 1);
+        assert_eq!(
+            fixture.model_adapter().requests()[0].payload_ref,
+            Some(prompt_ref)
+        );
+
+        let input_ref =
+            fixture.write_artifact(ArtifactKind::Input, "application/json", b"{}".to_vec());
+        let partial_ref = fixture.write_artifact(
+            ArtifactKind::ToolOutput,
+            "application/json",
+            b"{\"partial\":true}".to_vec(),
+        );
+        let mut tool_effect = fixture.sample_effect(AgentEffectKind::ToolCall);
+        tool_effect.payload_ref = Some(input_ref.clone());
+        fixture
+            .tool_adapter_mut()
+            .push_outcome(FakeAdapterOutcome::timeout(250, Some(partial_ref.clone())));
+
+        let tool_request = AgentToolRequest::from_effect(tool_effect).expect("tool request");
+        let tool_outcome = fixture
+            .tool_adapter_mut()
+            .invoke_tool(tool_request)
+            .await
+            .expect("fake tool adapter should return outcome");
+
+        match tool_outcome {
+            AgentAdapterOutcome::TimedOut {
+                receipt,
+                timeout_ms,
+                partial_result_ref: Some(actual_ref),
+            } => {
+                assert_eq!(receipt.provider, "fake-tool");
+                assert_eq!(timeout_ms, 250);
+                assert_eq!(actual_ref, partial_ref);
+            }
+            other => panic!("unexpected tool outcome: {other:?}"),
+        }
+        assert_eq!(fixture.tool_adapter().requests().len(), 1);
+        assert_eq!(
+            fixture.tool_adapter().requests()[0].payload_ref,
+            Some(input_ref)
+        );
     }
 
     #[tokio::test]
