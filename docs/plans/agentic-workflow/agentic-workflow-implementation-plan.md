@@ -768,6 +768,8 @@ Implementation notes:
 
 ### Slice 3.5: Artifact Reference Policy
 
+Status: implemented.
+
 Scope:
 
 - Define `ArtifactRef` semantics for prompts, completions, files, embeddings,
