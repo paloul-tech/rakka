@@ -636,6 +636,8 @@ Implementation notes:
 
 ### Slice 3.2: Dispatcher Fleet
 
+Status: implemented.
+
 Scope:
 
 - Implement workers that scan due outbox effects across many workflows.
@@ -655,6 +657,29 @@ Acceptance:
 - Multiple workers do not intentionally execute the same claimed effect
   concurrently.
 - Crash after marking dispatching leads to recoverable retry or reconciliation.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/dispatcher.rs` with a durable
+  dispatcher fleet index backed by `DurableStateStore`.
+- Added stable dispatcher ids and worker ids, dispatcher entries, leases,
+  monotonic fencing tokens, statuses, target classes, claim batches, worker
+  cycles, health snapshots, and bounded dispatcher metrics.
+- Dispatcher workers refresh due effects from per-run durable outboxes into the
+  fleet index, claim bounded due work with lease duration and target concurrency
+  limits, and dispatch claimed effects through an application-supplied
+  `AgentEffectDispatcher`.
+- The per-run durable outbox remains the source of execution truth. Workers mark
+  the source outbox entry dispatching before external execution, then record
+  success, retry, timeout, or exhaustion back into the durable outbox before
+  updating the fleet entry.
+- Fencing checks run before dispatch and again before result persistence, so an
+  expired or superseded claim cannot write a stale dispatch result.
+- Added class and target-name concurrency limits for model, tool, process, HTTP,
+  gRPC, notification, and related effect classes.
+- Added tests covering concurrent worker claiming, lease expiry after marking an
+  effect dispatching, recovered redispatch with a newer fencing token, target
+  concurrency throttling, retry-after scheduling, and outbox status updates.
 
 ### Slice 3.3: Human Checkpoints
 

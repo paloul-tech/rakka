@@ -85,6 +85,16 @@ string_id! {
 }
 
 string_id! {
+    /// Stable id for one dispatcher fleet work item.
+    pub AgentDispatchId
+}
+
+string_id! {
+    /// Stable id for one dispatcher fleet worker.
+    pub AgentDispatcherWorkerId
+}
+
+string_id! {
     /// Stable id for one accepted command.
     pub AgentCommandId
 }

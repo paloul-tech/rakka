@@ -17,6 +17,7 @@
 //! acceptance, durable outbox effects, idempotency keys, and recovery.
 
 pub mod definition;
+pub mod dispatcher;
 pub mod domain;
 pub mod facade;
 pub mod inbox;
@@ -34,16 +35,31 @@ pub use definition::{
     AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
     AgentWorkflowRegistryResult,
 };
+pub use dispatcher::{
+    agent_dispatch_id, agent_dispatch_timestamp_from_workflow_timestamp,
+    agent_dispatch_timestamp_to_workflow_timestamp, agent_dispatcher_fleet_persistence_id,
+    AgentDispatchClaim, AgentDispatchClaimBatch, AgentDispatchCompletion,
+    AgentDispatchConcurrencyLimits, AgentDispatchEntry, AgentDispatchJob, AgentDispatchLease,
+    AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherCycle,
+    AgentDispatcherEntrySnapshot, AgentDispatcherError, AgentDispatcherFleet,
+    AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherRegistration,
+    AgentDispatcherResult, AgentDispatcherSnapshot, AgentDispatcherStatusCount,
+    AgentDispatcherTargetClassCount, AgentDispatcherWorker, AgentEffectDispatchFuture,
+    AgentEffectDispatcher, AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX,
+    DEFAULT_AGENT_DISPATCHER_FLEET_ID, METRIC_AGENT_DISPATCHER_BACKLOG,
+    METRIC_AGENT_DISPATCHER_FLEET, METRIC_AGENT_DISPATCHER_IN_FLIGHT,
+};
 pub use domain::{
     AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCancellation,
-    AgentCausationId, AgentCommandId, AgentCorrelationId, AgentDeduplicationKey, AgentEffect,
-    AgentEffectId, AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
-    AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentSpanLink,
-    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
-    AgentTimerId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef,
-    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InlineState,
-    PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-    BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
+    AgentCausationId, AgentCommandId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchId,
+    AgentDispatcherWorkerId, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
+    AgentEffectTarget, AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunId, AgentRunState,
+    AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+    AgentTelemetryContext, AgentTenantId, AgentTimerId, AgentTimestampMillis, AgentWorkflow,
+    AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, HumanDecisionOption, InlineState, PrincipalRef, RedactionStatus,
+    StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
+    FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
 };
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,
@@ -125,10 +141,20 @@ pub mod substrate {
 /// stable enough for application code.
 pub mod prelude {
     pub use crate::{
+        agent_dispatch_id, agent_dispatch_timestamp_from_workflow_timestamp,
+        agent_dispatch_timestamp_to_workflow_timestamp, agent_dispatcher_fleet_persistence_id,
         agent_timer_store_persistence_id, timer_fired_command, AgentAuditEvent, AgentAuditEventId,
         AgentAuditEventKind, AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind,
-        AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey, AgentDueEffect,
-        AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
+        AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchClaim,
+        AgentDispatchClaimBatch, AgentDispatchCompletion, AgentDispatchConcurrencyLimits,
+        AgentDispatchEntry, AgentDispatchId, AgentDispatchJob, AgentDispatchLease,
+        AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherCycle,
+        AgentDispatcherEntrySnapshot, AgentDispatcherError, AgentDispatcherFleet,
+        AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherRegistration,
+        AgentDispatcherResult, AgentDispatcherSnapshot, AgentDispatcherStatusCount,
+        AgentDispatcherTargetClassCount, AgentDispatcherWorker, AgentDispatcherWorkerId,
+        AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
+        AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
         AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentFacadeError,
         AgentFacadeResult, AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxDuplicateReason,
         AgentInboxError, AgentInboxResult, AgentOutboxAcceptance, AgentOutboxDuplicateReason,
@@ -145,9 +171,12 @@ pub mod prelude {
         AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry, ArtifactKind, ArtifactRef,
         HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
         RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-        AGENT_TIMER_PERSISTENCE_PREFIX, CRATE_NAME, DEFAULT_AGENT_TIMER_STORE_ID,
-        METRIC_AGENT_TIMERS, SNAPSHOT_AGENT_WORKFLOW_OUTBOX, SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
-        SNAPSHOT_AGENT_WORKFLOW_RUNTIME, SNAPSHOT_AGENT_WORKFLOW_SHARDS,
+        AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX, AGENT_TIMER_PERSISTENCE_PREFIX, CRATE_NAME,
+        DEFAULT_AGENT_DISPATCHER_FLEET_ID, DEFAULT_AGENT_TIMER_STORE_ID,
+        METRIC_AGENT_DISPATCHER_BACKLOG, METRIC_AGENT_DISPATCHER_FLEET,
+        METRIC_AGENT_DISPATCHER_IN_FLIGHT, METRIC_AGENT_TIMERS, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
+        SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
+        SNAPSHOT_AGENT_WORKFLOW_SHARDS,
     };
 
     #[cfg(feature = "sharding")]
