@@ -16,6 +16,7 @@
 //! behavior must continue to be built from durable state, durable inbox
 //! acceptance, durable outbox effects, idempotency keys, and recovery.
 
+pub mod checkpoints;
 pub mod definition;
 pub mod dispatcher;
 pub mod domain;
@@ -31,6 +32,16 @@ pub mod snapshots;
 pub mod testkit;
 pub mod timers;
 
+pub use checkpoints::{
+    human_decision_command, AgentHumanApprovalRequest, AgentHumanCheckpointError,
+    AgentHumanCheckpointOpening, AgentHumanCheckpointResult, AgentHumanCheckpointRuntime,
+    AgentHumanDecisionResult, AgentHumanDecisionSubmission, METRIC_AGENT_HUMAN_CHECKPOINTS,
+    METRIC_AGENT_HUMAN_WAIT_LATENCY_MS,
+};
+#[cfg(feature = "http")]
+pub use checkpoints::{
+    human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
+};
 pub use definition::{
     AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
     AgentWorkflowRegistryResult,
@@ -103,11 +114,12 @@ pub use snapshots::{
     AgentWorkflowShardSnapshot,
 };
 pub use snapshots::{
-    AgentRunOperationalSnapshot, AgentRunOutboxSnapshot, AgentRunRecoveryErrorSnapshot,
-    AgentRunStatusCount, AgentWorkflowOutboxSnapshot, AgentWorkflowRecoverySnapshot,
-    AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
-    SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
-    SNAPSHOT_AGENT_WORKFLOW_SHARDS,
+    AgentRunHumanCheckpointSnapshot, AgentRunOperationalSnapshot, AgentRunOutboxSnapshot,
+    AgentRunRecoveryErrorSnapshot, AgentRunStatusCount, AgentWorkflowHumanCheckpointSnapshot,
+    AgentWorkflowOutboxSnapshot, AgentWorkflowRecoverySnapshot, AgentWorkflowRuntimeSnapshot,
+    AgentWorkflowSnapshotRegistry, SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS,
+    SNAPSHOT_AGENT_WORKFLOW_OUTBOX, SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
+    SNAPSHOT_AGENT_WORKFLOW_RUNTIME, SNAPSHOT_AGENT_WORKFLOW_SHARDS,
 };
 pub use timers::{
     agent_timer_store_persistence_id, timer_fired_command, AgentTimerEntry, AgentTimerError,
@@ -143,30 +155,34 @@ pub mod prelude {
     pub use crate::{
         agent_dispatch_id, agent_dispatch_timestamp_from_workflow_timestamp,
         agent_dispatch_timestamp_to_workflow_timestamp, agent_dispatcher_fleet_persistence_id,
-        agent_timer_store_persistence_id, timer_fired_command, AgentAuditEvent, AgentAuditEventId,
-        AgentAuditEventKind, AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind,
-        AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchClaim,
-        AgentDispatchClaimBatch, AgentDispatchCompletion, AgentDispatchConcurrencyLimits,
-        AgentDispatchEntry, AgentDispatchId, AgentDispatchJob, AgentDispatchLease,
-        AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherCycle,
-        AgentDispatcherEntrySnapshot, AgentDispatcherError, AgentDispatcherFleet,
-        AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherRegistration,
-        AgentDispatcherResult, AgentDispatcherSnapshot, AgentDispatcherStatusCount,
-        AgentDispatcherTargetClassCount, AgentDispatcherWorker, AgentDispatcherWorkerId,
-        AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
-        AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
-        AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentFacadeError,
-        AgentFacadeResult, AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxDuplicateReason,
-        AgentInboxError, AgentInboxResult, AgentOutboxAcceptance, AgentOutboxDuplicateReason,
-        AgentOutboxError, AgentOutboxResult, AgentPayload, AgentPayloadDescriptor, AgentRunActor,
+        agent_timer_store_persistence_id, human_decision_command, timer_fired_command,
+        AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId, AgentCommand,
+        AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
+        AgentDeduplicationKey, AgentDispatchClaim, AgentDispatchClaimBatch,
+        AgentDispatchCompletion, AgentDispatchConcurrencyLimits, AgentDispatchEntry,
+        AgentDispatchId, AgentDispatchJob, AgentDispatchLease, AgentDispatchStatus,
+        AgentDispatchTargetClass, AgentDispatcherCycle, AgentDispatcherEntrySnapshot,
+        AgentDispatcherError, AgentDispatcherFleet, AgentDispatcherFleetSettings,
+        AgentDispatcherFleetState, AgentDispatcherRegistration, AgentDispatcherResult,
+        AgentDispatcherSnapshot, AgentDispatcherStatusCount, AgentDispatcherTargetClassCount,
+        AgentDispatcherWorker, AgentDispatcherWorkerId, AgentDueEffect, AgentDurabilityMetadata,
+        AgentEffect, AgentEffectDispatchFuture, AgentEffectDispatcher, AgentEffectId,
+        AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectStatus,
+        AgentEffectTarget, AgentFacadeError, AgentFacadeResult, AgentHumanApprovalRequest,
+        AgentHumanCheckpointError, AgentHumanCheckpointOpening, AgentHumanCheckpointResult,
+        AgentHumanCheckpointRuntime, AgentHumanDecisionResult, AgentHumanDecisionSubmission,
+        AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
+        AgentInboxResult, AgentOutboxAcceptance, AgentOutboxDuplicateReason, AgentOutboxError,
+        AgentOutboxResult, AgentPayload, AgentPayloadDescriptor, AgentRunActor,
         AgentRunActorCommand, AgentRunActorSnapshot, AgentRunEngineError, AgentRunEngineResult,
-        AgentRunId, AgentRunInbox, AgentRunRuntimeError, AgentRunRuntimeResult, AgentRunState,
-        AgentRunStatus, AgentRunTransition, AgentRunTransitionKind, AgentRunWaitReason,
-        AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner,
-        AgentStepSuccess, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
-        AgentTimerFiring, AgentTimerId, AgentTimerPolicy, AgentTimerResult, AgentTimerScan,
-        AgentTimerScanner, AgentTimerScannerSettings, AgentTimerStatus, AgentTimerStore,
-        AgentTimerStoreState, AgentWorkflow, AgentWorkflowId, AgentWorkflowOutboxSnapshot,
+        AgentRunHumanCheckpointSnapshot, AgentRunId, AgentRunInbox, AgentRunRuntimeError,
+        AgentRunRuntimeResult, AgentRunState, AgentRunStatus, AgentRunTransition,
+        AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId,
+        AgentStepKind, AgentStepRunner, AgentStepSuccess, AgentTelemetryContext, AgentTenantId,
+        AgentTimerEntry, AgentTimerError, AgentTimerFiring, AgentTimerId, AgentTimerPolicy,
+        AgentTimerResult, AgentTimerScan, AgentTimerScanner, AgentTimerScannerSettings,
+        AgentTimerStatus, AgentTimerStore, AgentTimerStoreState, AgentWorkflow,
+        AgentWorkflowHumanCheckpointSnapshot, AgentWorkflowId, AgentWorkflowOutboxSnapshot,
         AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry, AgentWorkflowRegistryError,
         AgentWorkflowRuntimeSnapshot, AgentWorkflowSnapshotRegistry, ArtifactKind, ArtifactRef,
         HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
@@ -174,9 +190,16 @@ pub mod prelude {
         AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX, AGENT_TIMER_PERSISTENCE_PREFIX, CRATE_NAME,
         DEFAULT_AGENT_DISPATCHER_FLEET_ID, DEFAULT_AGENT_TIMER_STORE_ID,
         METRIC_AGENT_DISPATCHER_BACKLOG, METRIC_AGENT_DISPATCHER_FLEET,
-        METRIC_AGENT_DISPATCHER_IN_FLIGHT, METRIC_AGENT_TIMERS, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
+        METRIC_AGENT_DISPATCHER_IN_FLIGHT, METRIC_AGENT_HUMAN_CHECKPOINTS,
+        METRIC_AGENT_HUMAN_WAIT_LATENCY_MS, METRIC_AGENT_TIMERS,
+        SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
         SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
         SNAPSHOT_AGENT_WORKFLOW_SHARDS,
+    };
+
+    #[cfg(feature = "http")]
+    pub use crate::{
+        human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
     };
 
     #[cfg(feature = "sharding")]

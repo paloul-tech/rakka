@@ -683,6 +683,8 @@ Implementation notes:
 
 ### Slice 3.3: Human Checkpoints
 
+Status: implemented.
+
 Scope:
 
 - Add first-class checkpoint state with allowed decisions, roles/policy hints,
@@ -701,6 +703,34 @@ Acceptance:
 
 - A workflow can wait without holding a task, appear in snapshots, resume after
   approval, and handle duplicate approval submissions.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/checkpoints.rs` with a durable human
+  checkpoint facade that composes `AgentStepRunner`, `AgentRunInbox`, and
+  durable outbox scheduling.
+- Existing `HumanCheckpoint` state is now used as the durable source of truth
+  for allowed decisions, required roles, due timestamps, escalation targets,
+  artifact references, principals, and audit references.
+- Added runner transitions to open a checkpoint, persist
+  `waiting-for-human`, resolve a checkpoint and resume the run, and mark an
+  overdue checkpoint escalated while the run remains idle.
+- Opening a checkpoint schedules a first-class `HumanApprovalRequest` effect
+  through the durable outbox, so the dispatcher fleet can deliver approval work
+  to UI, ticketing, chat, or service integrations.
+- Added `AgentHumanDecisionSubmission` and `human_decision_command` so public
+  HTTP/gRPC ingress can build `HumanDecisionSubmitted` commands with stable
+  command ids and deduplication keys.
+- Added a feature-gated JSON HTTP route helper for human decision submission;
+  gRPC integrations can use the same submission and command-building facade.
+- Added human checkpoint metrics, wait latency reporting, overdue discovery, and
+  escalation hooks.
+- Added the `agent_workflow_human_checkpoints` operational snapshot with bounded
+  per-run samples, waiting-run count, open checkpoint count, escalated count, and
+  due checkpoint count.
+- Added tests covering checkpoint open, approval-request outbox scheduling,
+  approval resume, duplicate approval deduplication, overdue discovery,
+  escalation, and snapshot visibility.
 
 ### Slice 3.4: Model and Tool Adapter Traits
 

@@ -23,6 +23,9 @@ pub const SNAPSHOT_AGENT_WORKFLOW_OUTBOX: &str = "agent_workflow_outbox";
 /// Operational snapshot name for aggregate recovery status.
 pub const SNAPSHOT_AGENT_WORKFLOW_RECOVERY: &str = "agent_workflow_recovery";
 
+/// Operational snapshot name for aggregate human checkpoint status.
+pub const SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS: &str = "agent_workflow_human_checkpoints";
+
 const DEFAULT_MAX_SAMPLED_RUNS: usize = 64;
 
 /// Process-local registry of bounded agent workflow operational snapshots.
@@ -110,6 +113,13 @@ impl AgentWorkflowSnapshotRegistry {
         AgentWorkflowRecoverySnapshot::from_state(&state)
     }
 
+    /// Returns a bounded aggregate human checkpoint snapshot.
+    #[must_use]
+    pub fn human_checkpoint_snapshot(&self) -> AgentWorkflowHumanCheckpointSnapshot {
+        let state = self.lock();
+        AgentWorkflowHumanCheckpointSnapshot::from_state(&state)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, AgentWorkflowSnapshotState> {
         self.inner
             .lock()
@@ -140,6 +150,10 @@ pub struct AgentRunOperationalSnapshot {
     current_attempt: u32,
     pending_command_count: usize,
     due_effect_count: usize,
+    pending_human_checkpoint: Option<String>,
+    open_checkpoint_count: usize,
+    escalated_checkpoint_count: usize,
+    due_checkpoint_count: usize,
     recovered: bool,
     terminal: bool,
     updated_at_millis: Option<u64>,
@@ -158,6 +172,12 @@ impl AgentRunOperationalSnapshot {
             current_attempt: run_state.map_or(0, |state| state.current_attempt),
             pending_command_count: snapshot.recoverable_command_count,
             due_effect_count: snapshot.due_effect_count,
+            pending_human_checkpoint: run_state
+                .and_then(|state| state.pending_human_checkpoint.as_ref())
+                .map(|checkpoint_id| checkpoint_id.as_str().to_string()),
+            open_checkpoint_count: run_state.map_or(0, open_checkpoint_count),
+            escalated_checkpoint_count: run_state.map_or(0, escalated_checkpoint_count),
+            due_checkpoint_count: run_state.map_or(0, due_checkpoint_count),
             recovered: run_state.is_some(),
             terminal: run_state.is_some_and(is_terminal_run_state),
             updated_at_millis: run_state.map(|state| state.updated_at.as_millis()),
@@ -204,6 +224,30 @@ impl AgentRunOperationalSnapshot {
     #[must_use]
     pub const fn due_effect_count(&self) -> usize {
         self.due_effect_count
+    }
+
+    /// Pending human checkpoint id, if the run is waiting for human input.
+    #[must_use]
+    pub fn pending_human_checkpoint(&self) -> Option<&str> {
+        self.pending_human_checkpoint.as_deref()
+    }
+
+    /// Open or escalated checkpoint count.
+    #[must_use]
+    pub const fn open_checkpoint_count(&self) -> usize {
+        self.open_checkpoint_count
+    }
+
+    /// Escalated checkpoint count.
+    #[must_use]
+    pub const fn escalated_checkpoint_count(&self) -> usize {
+        self.escalated_checkpoint_count
+    }
+
+    /// Open or escalated checkpoint count with a due timestamp.
+    #[must_use]
+    pub const fn due_checkpoint_count(&self) -> usize {
+        self.due_checkpoint_count
     }
 
     /// Returns true when durable run state has recovered.
@@ -357,6 +401,160 @@ impl AgentWorkflowRuntimeSnapshot {
     /// Bounded sampled run summaries.
     #[must_use]
     pub fn sampled_runs(&self) -> &[AgentRunOperationalSnapshot] {
+        &self.sampled_runs
+    }
+}
+
+/// Bounded human checkpoint summary for one observed run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentRunHumanCheckpointSnapshot {
+    run_id: String,
+    status: Option<String>,
+    pending_checkpoint_id: Option<String>,
+    open_checkpoint_count: usize,
+    escalated_checkpoint_count: usize,
+    due_checkpoint_count: usize,
+}
+
+impl AgentRunHumanCheckpointSnapshot {
+    fn from_run(run: &AgentRunOperationalSnapshot) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            status: run.status.clone(),
+            pending_checkpoint_id: run.pending_human_checkpoint.clone(),
+            open_checkpoint_count: run.open_checkpoint_count,
+            escalated_checkpoint_count: run.escalated_checkpoint_count,
+            due_checkpoint_count: run.due_checkpoint_count,
+        }
+    }
+
+    /// Run id.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Run status label, when known.
+    #[must_use]
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    /// Pending checkpoint id, when the run is waiting on a checkpoint.
+    #[must_use]
+    pub fn pending_checkpoint_id(&self) -> Option<&str> {
+        self.pending_checkpoint_id.as_deref()
+    }
+
+    /// Open or escalated checkpoint count.
+    #[must_use]
+    pub const fn open_checkpoint_count(&self) -> usize {
+        self.open_checkpoint_count
+    }
+
+    /// Escalated checkpoint count.
+    #[must_use]
+    pub const fn escalated_checkpoint_count(&self) -> usize {
+        self.escalated_checkpoint_count
+    }
+
+    /// Open or escalated checkpoint count with a due timestamp.
+    #[must_use]
+    pub const fn due_checkpoint_count(&self) -> usize {
+        self.due_checkpoint_count
+    }
+}
+
+/// Aggregate human checkpoint snapshot for process-local agent runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentWorkflowHumanCheckpointSnapshot {
+    observed_run_count: usize,
+    waiting_run_count: usize,
+    open_checkpoint_count: usize,
+    escalated_checkpoint_count: usize,
+    due_checkpoint_count: usize,
+    max_sampled_runs: usize,
+    truncated_runs: usize,
+    sampled_runs: Vec<AgentRunHumanCheckpointSnapshot>,
+}
+
+impl AgentWorkflowHumanCheckpointSnapshot {
+    fn from_state(state: &AgentWorkflowSnapshotState) -> Self {
+        let runs: Vec<_> = state
+            .runs
+            .values()
+            .filter(|run| run.open_checkpoint_count > 0 || run.pending_human_checkpoint.is_some())
+            .collect();
+        let waiting_run_count = runs
+            .iter()
+            .filter(|run| run.status.as_deref() == Some("waiting-for-human"))
+            .count();
+        let open_checkpoint_count = runs.iter().map(|run| run.open_checkpoint_count).sum();
+        let escalated_checkpoint_count =
+            runs.iter().map(|run| run.escalated_checkpoint_count).sum();
+        let due_checkpoint_count = runs.iter().map(|run| run.due_checkpoint_count).sum();
+        let sampled_runs = runs
+            .iter()
+            .take(state.max_sampled_runs)
+            .map(|run| AgentRunHumanCheckpointSnapshot::from_run(run))
+            .collect();
+        Self {
+            observed_run_count: state.runs.len(),
+            waiting_run_count,
+            open_checkpoint_count,
+            escalated_checkpoint_count,
+            due_checkpoint_count,
+            max_sampled_runs: state.max_sampled_runs,
+            truncated_runs: truncated_count(runs.len(), state.max_sampled_runs),
+            sampled_runs,
+        }
+    }
+
+    /// Number of observed runs.
+    #[must_use]
+    pub const fn observed_run_count(&self) -> usize {
+        self.observed_run_count
+    }
+
+    /// Number of observed runs waiting for human input.
+    #[must_use]
+    pub const fn waiting_run_count(&self) -> usize {
+        self.waiting_run_count
+    }
+
+    /// Open or escalated checkpoint count.
+    #[must_use]
+    pub const fn open_checkpoint_count(&self) -> usize {
+        self.open_checkpoint_count
+    }
+
+    /// Escalated checkpoint count.
+    #[must_use]
+    pub const fn escalated_checkpoint_count(&self) -> usize {
+        self.escalated_checkpoint_count
+    }
+
+    /// Open or escalated checkpoint count with a due timestamp.
+    #[must_use]
+    pub const fn due_checkpoint_count(&self) -> usize {
+        self.due_checkpoint_count
+    }
+
+    /// Maximum number of sampled runs included in this payload.
+    #[must_use]
+    pub const fn max_sampled_runs(&self) -> usize {
+        self.max_sampled_runs
+    }
+
+    /// Number of checkpoint runs omitted from sampled run details.
+    #[must_use]
+    pub const fn truncated_runs(&self) -> usize {
+        self.truncated_runs
+    }
+
+    /// Bounded sampled run checkpoint summaries.
+    #[must_use]
+    pub fn sampled_runs(&self) -> &[AgentRunHumanCheckpointSnapshot] {
         &self.sampled_runs
     }
 }
@@ -776,9 +974,16 @@ pub fn register_agent_workflow_operational_snapshots(
         move || outbox_snapshots.outbox_snapshot(),
     );
 
+    let recovery_snapshots = snapshots.clone();
     registry.register_snapshot::<AgentWorkflowRecoverySnapshot, _>(
         SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
-        move || snapshots.recovery_snapshot(),
+        move || recovery_snapshots.recovery_snapshot(),
+    );
+
+    let human_snapshots = snapshots.clone();
+    registry.register_snapshot::<AgentWorkflowHumanCheckpointSnapshot, _>(
+        SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS,
+        move || human_snapshots.human_checkpoint_snapshot(),
     );
 }
 
@@ -812,4 +1017,38 @@ const fn is_terminal_run_state(state: &AgentRunState) -> bool {
             | crate::AgentRunStatus::Failed
             | crate::AgentRunStatus::Cancelled
     )
+}
+
+fn open_checkpoint_count(state: &AgentRunState) -> usize {
+    state
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            matches!(
+                checkpoint.status,
+                crate::HumanCheckpointStatus::Open | crate::HumanCheckpointStatus::Escalated
+            )
+        })
+        .count()
+}
+
+fn escalated_checkpoint_count(state: &AgentRunState) -> usize {
+    state
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.status == crate::HumanCheckpointStatus::Escalated)
+        .count()
+}
+
+fn due_checkpoint_count(state: &AgentRunState) -> usize {
+    state
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            matches!(
+                checkpoint.status,
+                crate::HumanCheckpointStatus::Open | crate::HumanCheckpointStatus::Escalated
+            ) && checkpoint.due_at.is_some()
+        })
+        .count()
 }

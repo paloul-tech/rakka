@@ -11,7 +11,8 @@ use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision
 
 use crate::{
     AgentCancellation, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep,
-    AgentStepId, AgentTimestampMillis, AgentWorkflow, HumanCheckpointId,
+    AgentStepId, AgentTimestampMillis, AgentWorkflow, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, PrincipalRef,
 };
 
 /// Prefix used for durable agent-run state persistence ids.
@@ -46,6 +47,8 @@ pub enum AgentRunTransitionKind {
     WaitForHuman,
     /// Run is waiting for an external effect result.
     WaitForEffect,
+    /// A human checkpoint was escalated but remains waiting.
+    CheckpointEscalated,
     /// Run resumed from a waiting status.
     Resume,
     /// Run completed successfully.
@@ -72,6 +75,7 @@ impl AgentRunTransitionKind {
             Self::WaitForTimer => "wait-for-timer",
             Self::WaitForHuman => "wait-for-human",
             Self::WaitForEffect => "wait-for-effect",
+            Self::CheckpointEscalated => "checkpoint-escalated",
             Self::Resume => "resume",
             Self::Complete => "complete",
             Self::Fail => "fail",
@@ -508,6 +512,173 @@ where
 
         self.persist_transition(
             transition_kind,
+            Some(previous_status),
+            record.revision,
+            next,
+        )
+        .await
+    }
+
+    /// Persists an open human checkpoint and pauses the run for a decision.
+    pub async fn open_human_checkpoint(
+        &mut self,
+        checkpoint: HumanCheckpoint,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEngineResult<AgentRunTransition> {
+        let record = self.current_record()?;
+        let previous_status = record.state.status;
+        self.require_status(
+            previous_status,
+            &[AgentRunStatus::Running],
+            AgentRunTransitionKind::WaitForHuman,
+            "human checkpoints can only be opened while running",
+        )?;
+
+        if checkpoint.status != HumanCheckpointStatus::Open {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "human checkpoint must be open",
+            });
+        }
+
+        if record
+            .state
+            .checkpoints
+            .iter()
+            .any(|existing| existing.checkpoint_id == checkpoint.checkpoint_id)
+        {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "human checkpoint id already exists",
+            });
+        }
+
+        let mut next = record.state;
+        next.status = AgentRunStatus::WaitingForHuman;
+        next.pending_human_checkpoint = Some(checkpoint.checkpoint_id.clone());
+        next.checkpoints.push(checkpoint);
+        next.updated_at = now;
+
+        self.persist_transition(
+            AgentRunTransitionKind::WaitForHuman,
+            Some(previous_status),
+            record.revision,
+            next,
+        )
+        .await
+    }
+
+    /// Resolves the currently pending human checkpoint and resumes the run.
+    pub async fn resolve_human_checkpoint(
+        &mut self,
+        checkpoint_id: &HumanCheckpointId,
+        resolved_status: HumanCheckpointStatus,
+        resolved_by: Option<PrincipalRef>,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEngineResult<AgentRunTransition> {
+        if matches!(
+            resolved_status,
+            HumanCheckpointStatus::Open
+                | HumanCheckpointStatus::Escalated
+                | HumanCheckpointStatus::TimedOut
+        ) {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "human decision must resolve to a terminal decision status",
+            });
+        }
+
+        let record = self.current_record()?;
+        let previous_status = record.state.status;
+        self.require_status(
+            previous_status,
+            &[AgentRunStatus::WaitingForHuman],
+            AgentRunTransitionKind::Resume,
+            "human checkpoint decisions can only resume a human wait",
+        )?;
+        if record.state.pending_human_checkpoint.as_ref() != Some(checkpoint_id) {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "human decision does not match the pending checkpoint",
+            });
+        }
+
+        let mut next = record.state;
+        let checkpoint = next
+            .checkpoints
+            .iter_mut()
+            .find(|checkpoint| &checkpoint.checkpoint_id == checkpoint_id)
+            .ok_or_else(|| AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "pending human checkpoint is missing from run state",
+            })?;
+        if checkpoint.status != HumanCheckpointStatus::Open
+            && checkpoint.status != HumanCheckpointStatus::Escalated
+        {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "human checkpoint is not open",
+            });
+        }
+
+        checkpoint.status = resolved_status;
+        checkpoint.resolved_by = resolved_by;
+        checkpoint.resolved_at = Some(now);
+        next.status = AgentRunStatus::Running;
+        next.pending_human_checkpoint = None;
+        next.updated_at = now;
+
+        self.persist_transition(
+            AgentRunTransitionKind::Resume,
+            Some(previous_status),
+            record.revision,
+            next,
+        )
+        .await
+    }
+
+    /// Marks the pending checkpoint escalated while the run remains waiting.
+    pub async fn escalate_human_checkpoint(
+        &mut self,
+        checkpoint_id: &HumanCheckpointId,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEngineResult<AgentRunTransition> {
+        let record = self.current_record()?;
+        let previous_status = record.state.status;
+        self.require_status(
+            previous_status,
+            &[AgentRunStatus::WaitingForHuman],
+            AgentRunTransitionKind::CheckpointEscalated,
+            "human checkpoint escalation can only happen while waiting for human input",
+        )?;
+        if record.state.pending_human_checkpoint.as_ref() != Some(checkpoint_id) {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "escalation does not match the pending checkpoint",
+            });
+        }
+
+        let mut next = record.state;
+        let checkpoint = next
+            .checkpoints
+            .iter_mut()
+            .find(|checkpoint| &checkpoint.checkpoint_id == checkpoint_id)
+            .ok_or_else(|| AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "pending human checkpoint is missing from run state",
+            })?;
+        if checkpoint.status != HumanCheckpointStatus::Open {
+            return Err(AgentRunEngineError::InvalidRunState {
+                run_id: self.run_id.clone(),
+                reason: "only open human checkpoints can be escalated",
+            });
+        }
+
+        checkpoint.status = HumanCheckpointStatus::Escalated;
+        next.updated_at = now;
+
+        self.persist_transition(
+            AgentRunTransitionKind::CheckpointEscalated,
             Some(previous_status),
             record.revision,
             next,

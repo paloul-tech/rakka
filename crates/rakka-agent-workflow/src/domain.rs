@@ -420,6 +420,31 @@ impl AgentRunStatus {
     }
 }
 
+impl HumanCheckpointStatus {
+    /// Stable lowercase label for telemetry and snapshots.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Edited => "edited",
+            Self::Escalated => "escalated",
+            Self::TimedOut => "timed-out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Returns true when no further human decision should resolve this status.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Approved | Self::Rejected | Self::Edited | Self::TimedOut | Self::Cancelled
+        )
+    }
+}
+
 /// One resumable workflow step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStep {

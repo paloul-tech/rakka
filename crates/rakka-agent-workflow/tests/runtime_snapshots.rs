@@ -141,8 +141,9 @@ async fn runtime_snapshots_report_status_pending_commands_due_effects_and_recove
 #[test]
 fn http_registration_uses_spec_snapshot_names() {
     use rakka_agent_workflow::{
-        register_agent_workflow_operational_snapshots, SNAPSHOT_AGENT_WORKFLOW_OUTBOX,
-        SNAPSHOT_AGENT_WORKFLOW_RECOVERY, SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
+        register_agent_workflow_operational_snapshots, SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS,
+        SNAPSHOT_AGENT_WORKFLOW_OUTBOX, SNAPSHOT_AGENT_WORKFLOW_RECOVERY,
+        SNAPSHOT_AGENT_WORKFLOW_RUNTIME,
     };
     use rakka_http::OperationalSnapshotRegistry;
 
@@ -154,6 +155,7 @@ fn http_registration_uses_spec_snapshot_names() {
     assert!(value["snapshots"][SNAPSHOT_AGENT_WORKFLOW_RUNTIME].is_object());
     assert!(value["snapshots"][SNAPSHOT_AGENT_WORKFLOW_OUTBOX].is_object());
     assert!(value["snapshots"][SNAPSHOT_AGENT_WORKFLOW_RECOVERY].is_object());
+    assert!(value["snapshots"][SNAPSHOT_AGENT_WORKFLOW_HUMAN_CHECKPOINTS].is_object());
 }
 
 #[cfg(feature = "sharding")]
