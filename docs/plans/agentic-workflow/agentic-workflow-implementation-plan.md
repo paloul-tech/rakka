@@ -734,6 +734,8 @@ Implementation notes:
 
 ### Slice 3.4: Model and Tool Adapter Traits
 
+Status: implemented.
+
 Scope:
 
 - Define adapter traits for model calls and tool calls.
