@@ -58,7 +58,8 @@ PostgreSQL stores, durable state, query indexes, artifact-store configuration,
 actor system, remoting, sharding, workflow registry, snapshots, and
 compatibility policy are ready. The pre-stop drain endpoint should mark
 readiness false before stopping ingress or handing off workflow work. The
-complete startup order is captured in `kubernetes-startup-readiness.md`.
+complete startup order is captured in `kubernetes-startup-readiness.md`, and
+the drain/shutdown order is captured in `kubernetes-drain-shutdown.md`.
 
 ## Service Boundaries
 

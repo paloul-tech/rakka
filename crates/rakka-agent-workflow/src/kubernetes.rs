@@ -7,9 +7,35 @@
 //! initialized.
 
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
+use rakka_core::{
+    CoordinatedShutdown, RakkaResult, ShutdownFailurePolicy, ShutdownPhase, ShutdownTask,
+    ShutdownTaskOptions,
+};
 use rakka_k8s::{KubernetesHealthSnapshot, KubernetesNodeHealth, KubernetesProbeSnapshot};
 use serde::{Deserialize, Serialize};
+
+use crate::{AgentCommand, AgentInboxAcceptance, AgentInboxError, AgentRunInbox};
+
+/// Coordinated shutdown task name that stops public workflow ingress.
+pub const AGENT_WORKFLOW_STOP_INGRESS_TASK: &str = "agent-workflow-stop-ingress";
+
+/// Coordinated shutdown task name for flushing workflow telemetry.
+pub const AGENT_WORKFLOW_FLUSH_TELEMETRY_TASK: &str = "agent-workflow-flush-telemetry";
+
+/// Task operation attribute for workflow shutdown hooks.
+pub const AGENT_WORKFLOW_SHUTDOWN_OPERATION_ATTR: &str = "operation";
+
+/// Task operation value for stopping public workflow ingress.
+pub const AGENT_WORKFLOW_STOP_INGRESS_OPERATION: &str = "agent-workflow-stop-ingress";
+
+/// Task operation value for flushing workflow telemetry.
+pub const AGENT_WORKFLOW_FLUSH_TELEMETRY_OPERATION: &str = "agent-workflow-flush-telemetry";
 
 /// Readiness service name for OpenTelemetry resource configuration.
 pub const AGENT_WORKFLOW_STARTUP_TELEMETRY_RESOURCE: &str = "telemetry-resource";
@@ -58,6 +84,185 @@ pub const DEFAULT_AGENT_WORKFLOW_STARTUP_STEPS: [AgentWorkflowStartupStep; 11] =
     AgentWorkflowStartupStep::WorkflowRegistry,
     AgentWorkflowStartupStep::OperationalSnapshots,
 ];
+
+/// Shared result type for agent workflow Kubernetes drain helpers.
+pub type AgentWorkflowDrainResult<T> = Result<T, AgentWorkflowDrainError>;
+
+/// Errors returned by agent workflow Kubernetes drain helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentWorkflowDrainError {
+    /// Public workflow ingress is closed because the pod is draining.
+    Draining {
+        /// Human-readable rejection detail.
+        message: String,
+    },
+    /// Durable inbox command acceptance failed after the drain gate allowed it.
+    Inbox {
+        /// Durable inbox failure.
+        error: AgentInboxError,
+    },
+}
+
+impl AgentWorkflowDrainError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Draining { .. } => "agent-workflow-draining",
+            Self::Inbox { error } => error.code(),
+        }
+    }
+}
+
+impl Display for AgentWorkflowDrainError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Draining { message } => f.write_str(message),
+            Self::Inbox { error } => Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for AgentWorkflowDrainError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Draining { .. } => None,
+            Self::Inbox { error } => Some(error),
+        }
+    }
+}
+
+impl From<AgentInboxError> for AgentWorkflowDrainError {
+    fn from(error: AgentInboxError) -> Self {
+        Self::Inbox { error }
+    }
+}
+
+/// Gate for public workflow command ingress during Kubernetes drain.
+#[derive(Debug, Clone)]
+pub struct AgentWorkflowIngressGate {
+    health: KubernetesNodeHealth,
+}
+
+impl AgentWorkflowIngressGate {
+    /// Creates an ingress gate backed by the shared Kubernetes health model.
+    #[must_use]
+    pub fn new(health: KubernetesNodeHealth) -> Self {
+        Self { health }
+    }
+
+    /// Shared Kubernetes health model.
+    #[must_use]
+    pub fn health(&self) -> &KubernetesNodeHealth {
+        &self.health
+    }
+
+    /// Marks public workflow ingress closed by beginning Kubernetes drain.
+    pub fn begin_drain(&self) {
+        self.health.begin_drain();
+    }
+
+    /// Returns true when public workflow commands may still be accepted.
+    #[must_use]
+    pub fn accepts_public_commands(&self) -> bool {
+        !self.health.is_draining()
+    }
+
+    /// Returns an error when public workflow commands should be rejected.
+    pub fn ensure_accepting(&self) -> AgentWorkflowDrainResult<()> {
+        if self.accepts_public_commands() {
+            Ok(())
+        } else {
+            Err(AgentWorkflowDrainError::Draining {
+                message: "agent workflow ingress is draining; reject new public commands"
+                    .to_string(),
+            })
+        }
+    }
+
+    /// Accepts a command only if public workflow ingress is still open.
+    ///
+    /// If this returns [`AgentInboxAcceptance::Accepted`], the command has
+    /// already crossed the durable inbox boundary. Later drain interruption or
+    /// pod termination must rely on durable recovery instead of process-local
+    /// memory.
+    pub async fn accept_command<Store, Clock>(
+        &self,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+        command: AgentCommand,
+    ) -> AgentWorkflowDrainResult<AgentInboxAcceptance>
+    where
+        Store: rakka_persistence::DurableStateStore<rakka_workflow::WorkflowState>,
+        Clock: rakka_workflow::WorkflowClock,
+    {
+        self.ensure_accepting()?;
+        inbox
+            .accept_command(command)
+            .await
+            .map_err(AgentWorkflowDrainError::from)
+    }
+}
+
+/// Registers the standard stop-ingress task for agent workflow public commands.
+///
+/// The task begins drain on the shared health model, making Kubernetes
+/// readiness fail and causing [`AgentWorkflowIngressGate`] to reject new public
+/// commands before later drain phases run.
+pub fn register_agent_workflow_ingress_stop_task(
+    shutdown: &CoordinatedShutdown,
+    gate: AgentWorkflowIngressGate,
+) -> RakkaResult<ShutdownTask> {
+    let options = agent_workflow_shutdown_task_options(AGENT_WORKFLOW_STOP_INGRESS_OPERATION)?;
+    shutdown.add_task_with_options(
+        ShutdownPhase::stop_ingress(),
+        AGENT_WORKFLOW_STOP_INGRESS_TASK,
+        options,
+        move |_context| {
+            let gate = gate.clone();
+            async move {
+                gate.begin_drain();
+                Ok(())
+            }
+        },
+    )
+}
+
+/// Registers a telemetry flush task for agent workflow shutdown.
+///
+/// Applications can use this for OTLP SDK flush, bridge export flush, or a
+/// no-op local collector acknowledgement. The task is registered in the
+/// `flush-persistence` phase so durable state and telemetry buffers are flushed
+/// before actors and remoting stop.
+pub fn register_agent_workflow_telemetry_flush_task<F, Fut>(
+    shutdown: &CoordinatedShutdown,
+    flush: F,
+) -> RakkaResult<ShutdownTask>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = RakkaResult<()>> + Send + 'static,
+{
+    let flush = Arc::new(flush);
+    let options = agent_workflow_shutdown_task_options(AGENT_WORKFLOW_FLUSH_TELEMETRY_OPERATION)?
+        .with_failure_policy(ShutdownFailurePolicy::Continue)
+        .with_timeout(Duration::from_secs(5));
+    shutdown.add_task_with_options(
+        ShutdownPhase::flush_persistence(),
+        AGENT_WORKFLOW_FLUSH_TELEMETRY_TASK,
+        options,
+        move |_context| {
+            let flush = Arc::clone(&flush);
+            async move { flush().await }
+        },
+    )
+}
+
+fn agent_workflow_shutdown_task_options(
+    operation: &'static str,
+) -> RakkaResult<ShutdownTaskOptions> {
+    ShutdownTaskOptions::default()
+        .with_attribute(AGENT_WORKFLOW_SHUTDOWN_OPERATION_ATTR, operation)?
+        .with_attribute("component", "agent-workflow")
+}
 
 /// One ordered startup requirement for Kubernetes readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

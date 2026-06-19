@@ -170,6 +170,7 @@ fn topology_readme_explains_local_runtime_and_helm_path() {
         "kubectl apply --dry-run=client",
         "pg-check",
         "kubernetes-startup-readiness.md",
+        "kubernetes-drain-shutdown.md",
         "Service Boundaries",
         "Object Storage",
         "Compatibility And Migration",

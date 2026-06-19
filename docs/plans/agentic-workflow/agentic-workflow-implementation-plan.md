@@ -1270,6 +1270,8 @@ Implementation notes:
 
 ### Slice 6.3: Drain and Shutdown
 
+Status: implemented.
+
 Scope:
 
 - Extend coordinated shutdown with workflow-aware drain hooks.
@@ -1288,6 +1290,20 @@ Acceptance:
 - Readiness flips false before drain work starts.
 - Abrupt termination during drain still recovers accepted commands and
   scheduled effects.
+
+Implementation notes:
+
+- Added `AgentWorkflowIngressGate` behind the `k8s` feature to close public
+  workflow ingress when `KubernetesNodeHealth` enters drain.
+- Added workflow-specific coordinated shutdown registration helpers for
+  stop-ingress and best-effort telemetry flush tasks, with stable task and
+  operation names for drain reports and observability.
+- Added `kubernetes-drain-shutdown.md` documenting shutdown order, readiness
+  behavior, durable recovery expectations, local validation, and open runtime
+  hooks.
+- Added tests proving pre-drain commands cross the durable inbox boundary,
+  coordinated drain flips readiness false, telemetry flush runs, post-drain
+  public commands are rejected, and accepted work remains recoverable.
 
 ### Slice 6.4: Autoscaling Signals
 
