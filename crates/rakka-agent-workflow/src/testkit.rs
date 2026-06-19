@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use rakka_core::InMemoryMetricsRecorder;
+use rakka_core::{InMemoryMetricsRecorder, MetricKind, MetricObservation, MetricsSnapshot};
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_workflow::{
     DurableInbox, InboxAcceptance, InboxCommand, ManualWorkflowClock, OutboxAcceptance,
@@ -11,17 +11,21 @@ use rakka_workflow::{
 };
 
 use crate::{
+    agent_metric_instrument, require_agent_trace_context, validate_agent_audit_event,
+    validate_agent_log_event, validate_agent_metric_attributes, validate_agent_span_link,
     AgentAdapterFailureClass, AgentAdapterFuture, AgentAdapterOutcome, AgentAdapterRequestMetadata,
     AgentAdapterUsage, AgentArtifactError, AgentArtifactRead, AgentArtifactStore,
     AgentArtifactStoreFuture, AgentArtifactWriteRequest, AgentAuditEvent, AgentAuditEventId,
     AgentAuditEventKind, AgentCausationId, AgentCommandId, AgentCorrelationId,
     AgentDeduplicationKey, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
-    AgentEffectTarget, AgentIdempotencyKey, AgentModelAdapter, AgentModelRequest,
-    AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload,
-    AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
-    AgentTimestampMillis, AgentToolAdapter, AgentToolRequest, AgentWorkflow, AgentWorkflowId,
-    ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+    AgentEffectTarget, AgentIdempotencyKey, AgentLogEvent, AgentLogSeverity, AgentMetricInstrument,
+    AgentModelAdapter, AgentModelRequest, AgentOtelResource, AgentOtelSpanExport,
+    AgentOtlpBridgeExport, AgentPayloadDescriptor, AgentRedactionPolicy, AgentRunId, AgentRunState,
+    AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentToolAdapter, AgentToolRequest,
+    AgentWorkflow, AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, PrincipalRef, RedactionStatus, StateSchemaVersion,
+    WorkflowDefinitionVersion,
 };
 
 /// Durable inbox type used by [`MinimalAgentFixture`].
@@ -463,6 +467,207 @@ impl AgentToolAdapter for FakeToolAdapter {
             payload_ref: request.input_ref,
         });
         Box::pin(async move { Ok(outcome.into_adapter_outcome(&metadata, "fake-tool")) })
+    }
+}
+
+/// Asserts that an agent metric is registered with the expected instrument kind.
+///
+/// Returns the registered instrument so tests can continue with additional
+/// assertions without repeating the lookup.
+pub fn assert_agent_metric_registered(
+    name: &str,
+    expected_kind: MetricKind,
+) -> &'static AgentMetricInstrument {
+    let instrument = agent_metric_instrument(name)
+        .unwrap_or_else(|| panic!("expected registered agent workflow metric {name:?}"));
+    assert_eq!(
+        instrument.kind, expected_kind,
+        "metric {name:?} was registered with an unexpected kind"
+    );
+    instrument
+}
+
+/// Asserts that every metric attribute is approved for hot-path agent metrics.
+pub fn assert_agent_metric_attributes_bounded(observation: &MetricObservation) {
+    let attributes = observation
+        .attributes()
+        .iter()
+        .map(|attribute| (attribute.key(), attribute.value()))
+        .collect::<Vec<_>>();
+    validate_agent_metric_attributes(&attributes).unwrap_or_else(|error| {
+        panic!(
+            "metric {:?} contains unbounded agent workflow attributes: {error}",
+            observation.name()
+        )
+    });
+}
+
+/// Finds a metric observation by name, kind, and expected bounded attributes.
+///
+/// The matched observation is also checked against the agent metric label
+/// policy, so accidental high-cardinality labels fail before an exporter or
+/// dashboard sees them.
+#[must_use]
+pub fn expect_agent_metric_observation<'a>(
+    snapshot: &'a MetricsSnapshot,
+    name: &str,
+    kind: MetricKind,
+    expected_attributes: &[(&str, &str)],
+) -> &'a MetricObservation {
+    assert_agent_metric_registered(name, kind);
+    let observation = snapshot
+        .observations_named(name)
+        .into_iter()
+        .find(|observation| {
+            observation.kind() == kind
+                && expected_attributes
+                    .iter()
+                    .all(|(key, value)| observation.attribute(key) == Some(*value))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected agent metric {name:?} with kind {kind:?} and attributes {:?}",
+                expected_attributes
+            )
+        });
+    assert_agent_metric_attributes_bounded(observation);
+    observation
+}
+
+/// Asserts span name, validity, and expected span attributes.
+pub fn assert_agent_span_attributes(
+    span: &AgentOtelSpanExport,
+    expected_name: &str,
+    expected_attributes: &[(&str, &str)],
+) {
+    span.validate()
+        .unwrap_or_else(|error| panic!("agent span export should be valid: {error}"));
+    assert_eq!(span.name, expected_name);
+    assert_agent_attributes(&span.attributes, expected_attributes, "span attributes");
+}
+
+/// Finds and validates a span link with expected bounded attributes.
+pub fn assert_agent_span_has_link<'a>(
+    span: &'a AgentOtelSpanExport,
+    expected_trace_id: &str,
+    expected_span_id: &str,
+    expected_attributes: &[(&str, &str)],
+) -> &'a AgentSpanLink {
+    let link = span
+        .links
+        .iter()
+        .find(|link| link.trace_id == expected_trace_id && link.span_id == expected_span_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected span {:?} to link trace {expected_trace_id:?} span {expected_span_id:?}",
+                span.name
+            )
+        });
+    validate_agent_span_link(link)
+        .unwrap_or_else(|error| panic!("agent span link should be valid: {error}"));
+    assert_agent_attributes(
+        &link.attributes,
+        expected_attributes,
+        "span link attributes",
+    );
+    link
+}
+
+/// Asserts OpenTelemetry-compatible log fields and expected event attributes.
+pub fn assert_agent_log_fields(
+    event: &AgentLogEvent,
+    expected_event_name: &str,
+    expected_severity: AgentLogSeverity,
+    expected_trace_id: Option<&str>,
+    expected_span_id: Option<&str>,
+    expected_attributes: &[(&str, &str)],
+) {
+    validate_agent_log_event(event, AgentRedactionPolicy::new())
+        .unwrap_or_else(|error| panic!("agent log event should be valid: {error}"));
+    assert_eq!(event.event_name, expected_event_name);
+    assert_eq!(event.severity_text, expected_severity.severity_text());
+    assert_eq!(event.severity_number, expected_severity.severity_number());
+    assert_eq!(event.trace_id.as_deref(), expected_trace_id);
+    assert_eq!(event.span_id.as_deref(), expected_span_id);
+    assert_agent_attributes(&event.attributes, expected_attributes, "log attributes");
+}
+
+/// Asserts durable audit causation, correlation, and optional trace identity.
+pub fn assert_agent_audit_correlation(
+    event: &AgentAuditEvent,
+    expected_causation_id: &str,
+    expected_correlation_id: &str,
+    expected_trace_id: Option<&str>,
+) {
+    validate_agent_audit_event(event, AgentRedactionPolicy::new())
+        .unwrap_or_else(|error| panic!("agent audit event should be valid: {error}"));
+    assert_eq!(event.causation_id.as_str(), expected_causation_id);
+    assert_eq!(event.correlation_id.as_str(), expected_correlation_id);
+    if let Some(expected_trace_id) = expected_trace_id {
+        let trace = require_agent_trace_context(&event.telemetry_context).unwrap_or_else(|error| {
+            panic!("agent audit event should carry trace context: {error}")
+        });
+        assert_eq!(trace.trace_id, expected_trace_id);
+    }
+}
+
+/// Asserts OpenTelemetry resource attributes used by agent workflow exports.
+pub fn assert_agent_resource_attributes(
+    resource: &AgentOtelResource,
+    expected_attributes: &[(&str, &str)],
+) {
+    resource
+        .validate()
+        .unwrap_or_else(|error| panic!("agent OpenTelemetry resource should be valid: {error}"));
+    assert_agent_attributes(
+        &resource.attributes,
+        expected_attributes,
+        "resource attributes",
+    );
+}
+
+/// Asserts an OTLP bridge export contains valid resource, metrics, spans, and logs.
+pub fn assert_agent_otlp_bridge_export(
+    export: &AgentOtlpBridgeExport,
+    expected_metric_names: &[&str],
+    expected_resource_attributes: &[(&str, &str)],
+) {
+    export
+        .exporter
+        .validate()
+        .unwrap_or_else(|error| panic!("agent OTLP exporter config should be valid: {error}"));
+    assert_agent_resource_attributes(&export.resource, expected_resource_attributes);
+    for metric_name in expected_metric_names {
+        assert!(
+            export
+                .metrics
+                .metrics()
+                .iter()
+                .any(|metric| metric.name() == *metric_name),
+            "expected OTLP bridge export to include metric {metric_name:?}"
+        );
+    }
+    for span in &export.spans {
+        span.validate()
+            .unwrap_or_else(|error| panic!("agent span export should be valid: {error}"));
+    }
+    for event in &export.logs {
+        validate_agent_log_event(event, AgentRedactionPolicy::new())
+            .unwrap_or_else(|error| panic!("agent log event should be valid: {error}"));
+    }
+}
+
+fn assert_agent_attributes(
+    attributes: &BTreeMap<String, String>,
+    expected_attributes: &[(&str, &str)],
+    surface: &str,
+) {
+    for (key, expected_value) in expected_attributes {
+        assert_eq!(
+            attributes.get(*key).map(String::as_str),
+            Some(*expected_value),
+            "expected {surface} to include {key:?}={expected_value:?}"
+        );
     }
 }
 

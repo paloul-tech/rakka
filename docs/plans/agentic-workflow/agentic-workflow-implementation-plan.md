@@ -974,6 +974,8 @@ Implementation notes:
 
 ### Slice 4.5: Observability Testkit
 
+Status: implemented.
+
 Scope:
 
 - Add assertions for metric names, bounded labels, span attributes, span links,
@@ -988,6 +990,25 @@ Acceptance:
 
 - Observability regressions fail tests before dashboards or backends are
   involved.
+
+Implementation notes:
+
+- Added feature-gated agent workflow testkit assertions for registered metric
+  instruments, bounded metric labels, span attributes, span links, structured
+  log fields, audit causation/correlation ids, OpenTelemetry resource
+  attributes, and OTLP bridge exports.
+- Assertions reuse production validation helpers for metric label policy, trace
+  context, structured logs, durable audit events, resource attributes, spans,
+  and exporter configuration so test expectations stay aligned with runtime
+  behavior.
+- Added a representative observability test that records a workflow transition
+  metric, creates a durable resume span with a link back to the parked span,
+  converts an audit event into an OpenTelemetry-compatible log, validates audit
+  correlation ids, checks Kubernetes/service resource attributes, and verifies
+  the OTLP bridge export contains the expected metric.
+- Phase 4 now has implemented coverage for workflow metrics, trace propagation
+  and span links, structured logs and durable audit, OTLP/Collector bridge
+  integration, and pre-export observability regression assertions.
 
 ## Phase 5: Query, Indexing, Retention, and Compaction
 
