@@ -707,6 +707,121 @@ pub enum WorkflowTelemetryEvent {
     },
 }
 
+/// Retention policy for compacting durable workflow inbox/outbox snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowStateCompactionPolicy {
+    completed_inbox_entry_retention_ms: Option<u64>,
+    completed_outbox_entry_retention_ms: Option<u64>,
+    deduplication_key_retention_ms: Option<u64>,
+}
+
+impl WorkflowStateCompactionPolicy {
+    /// Creates a policy that does not compact workflow state.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            completed_inbox_entry_retention_ms: None,
+            completed_outbox_entry_retention_ms: None,
+            deduplication_key_retention_ms: None,
+        }
+    }
+
+    /// Creates a policy that does not compact workflow state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::disabled()
+    }
+
+    /// Retains completed inbox entries for the given window in milliseconds.
+    #[must_use]
+    pub const fn completed_inbox_entry_retention_ms(mut self, retention_ms: u64) -> Self {
+        self.completed_inbox_entry_retention_ms = Some(retention_ms);
+        self
+    }
+
+    /// Retains terminal outbox entries for the given window in milliseconds.
+    #[must_use]
+    pub const fn completed_outbox_entry_retention_ms(mut self, retention_ms: u64) -> Self {
+        self.completed_outbox_entry_retention_ms = Some(retention_ms);
+        self
+    }
+
+    /// Retains deduplication keys for the given window in milliseconds.
+    #[must_use]
+    pub const fn deduplication_key_retention_ms(mut self, retention_ms: u64) -> Self {
+        self.deduplication_key_retention_ms = Some(retention_ms);
+        self
+    }
+
+    /// Completed inbox entry retention window, when enabled.
+    #[must_use]
+    pub const fn completed_inbox_entry_retention_window_ms(self) -> Option<u64> {
+        self.completed_inbox_entry_retention_ms
+    }
+
+    /// Terminal outbox entry retention window, when enabled.
+    #[must_use]
+    pub const fn completed_outbox_entry_retention_window_ms(self) -> Option<u64> {
+        self.completed_outbox_entry_retention_ms
+    }
+
+    /// Deduplication key retention window, when enabled.
+    #[must_use]
+    pub const fn deduplication_key_retention_window_ms(self) -> Option<u64> {
+        self.deduplication_key_retention_ms
+    }
+}
+
+impl Default for WorkflowStateCompactionPolicy {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// Counts returned after compacting a durable workflow snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkflowStateCompactionReport {
+    removed_inbox_entries: usize,
+    removed_inbox_deduplication_keys: usize,
+    removed_outbox_entries: usize,
+    removed_outbox_deduplication_keys: usize,
+}
+
+impl WorkflowStateCompactionReport {
+    /// Removed completed inbox entries.
+    #[must_use]
+    pub const fn removed_inbox_entries(self) -> usize {
+        self.removed_inbox_entries
+    }
+
+    /// Removed inbox deduplication keys.
+    #[must_use]
+    pub const fn removed_inbox_deduplication_keys(self) -> usize {
+        self.removed_inbox_deduplication_keys
+    }
+
+    /// Removed terminal outbox entries.
+    #[must_use]
+    pub const fn removed_outbox_entries(self) -> usize {
+        self.removed_outbox_entries
+    }
+
+    /// Removed outbox deduplication keys.
+    #[must_use]
+    pub const fn removed_outbox_deduplication_keys(self) -> usize {
+        self.removed_outbox_deduplication_keys
+    }
+
+    /// Returns true when compaction removed no state.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.removed_inbox_entries == 0
+            && self.removed_inbox_deduplication_keys == 0
+            && self.removed_outbox_entries == 0
+            && self.removed_outbox_deduplication_keys == 0
+    }
+}
+
 /// Durable workflow snapshot stored under one `PersistenceId`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
@@ -820,6 +935,79 @@ impl WorkflowState {
             .collect()
     }
 
+    /// Compacts completed inbox entries, terminal outbox entries, and their
+    /// deduplication keys according to the supplied policy.
+    ///
+    /// Retryable or in-flight work is always retained. A terminal entry with a
+    /// deduplication key is retained until both the entry retention window and
+    /// the deduplication window have elapsed, preserving duplicate detection
+    /// for the configured deduplication period.
+    pub fn compact(
+        &mut self,
+        policy: WorkflowStateCompactionPolicy,
+        now: WorkflowTimestamp,
+    ) -> WorkflowStateCompactionReport {
+        let mut report = WorkflowStateCompactionReport::default();
+        let inbox_ids_to_remove: Vec<_> = self
+            .inbox
+            .iter()
+            .filter(|(_message_id, entry)| {
+                entry.status() == InboxStatus::Completed
+                    && should_remove_terminal_workflow_entry(
+                        entry.updated_at(),
+                        policy.completed_inbox_entry_retention_ms,
+                        entry.deduplication_key().is_some(),
+                        policy.deduplication_key_retention_ms,
+                        now,
+                    )
+            })
+            .map(|(message_id, _entry)| message_id.clone())
+            .collect();
+        for message_id in inbox_ids_to_remove {
+            if let Some(entry) = self.inbox.remove(&message_id) {
+                report.removed_inbox_entries += 1;
+                if let Some(key) = entry.deduplication_key() {
+                    if self.inbox_deduplication.remove(key).is_some() {
+                        report.removed_inbox_deduplication_keys += 1;
+                    }
+                }
+            }
+        }
+
+        let outbox_ids_to_remove: Vec<_> = self
+            .outbox
+            .iter()
+            .filter(|(_message_id, entry)| {
+                matches!(
+                    entry.status(),
+                    OutboxStatus::Dispatched | OutboxStatus::Exhausted
+                ) && should_remove_terminal_workflow_entry(
+                    entry.updated_at(),
+                    policy.completed_outbox_entry_retention_ms,
+                    entry.deduplication_key().is_some(),
+                    policy.deduplication_key_retention_ms,
+                    now,
+                )
+            })
+            .map(|(message_id, _entry)| message_id.clone())
+            .collect();
+        for message_id in outbox_ids_to_remove {
+            if let Some(entry) = self.outbox.remove(&message_id) {
+                report.removed_outbox_entries += 1;
+                if let Some(key) = entry.deduplication_key() {
+                    if self.outbox_deduplication.remove(key).is_some() {
+                        report.removed_outbox_deduplication_keys += 1;
+                    }
+                }
+            }
+        }
+
+        if !report.is_empty() {
+            self.updated_at = now;
+        }
+        report
+    }
+
     pub(crate) fn insert_inbox(&mut self, entry: InboxEntry) {
         if let Some(key) = entry.deduplication_key().cloned() {
             self.inbox_deduplication
@@ -860,4 +1048,28 @@ impl WorkflowState {
         self.updated_at = entry.updated_at();
         Some(entry.clone())
     }
+}
+
+fn should_remove_terminal_workflow_entry(
+    terminal_at: WorkflowTimestamp,
+    entry_retention_ms: Option<u64>,
+    has_deduplication_key: bool,
+    deduplication_retention_ms: Option<u64>,
+    now: WorkflowTimestamp,
+) -> bool {
+    let Some(entry_retention_ms) = entry_retention_ms else {
+        return false;
+    };
+    if !window_elapsed(terminal_at, entry_retention_ms, now) {
+        return false;
+    }
+    if !has_deduplication_key {
+        return true;
+    }
+    deduplication_retention_ms
+        .is_some_and(|retention_ms| window_elapsed(terminal_at, retention_ms, now))
+}
+
+fn window_elapsed(timestamp: WorkflowTimestamp, retention_ms: u64, now: WorkflowTimestamp) -> bool {
+    now.as_millis().saturating_sub(timestamp.as_millis()) >= retention_ms
 }

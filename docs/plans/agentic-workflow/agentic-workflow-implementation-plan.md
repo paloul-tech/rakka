@@ -1092,6 +1092,8 @@ Implementation notes:
 
 ### Slice 5.3: Retention Windows and Snapshot Compaction
 
+Status: implemented.
+
 Scope:
 
 - Define retention windows for completed inbox entries, completed outbox
@@ -1110,6 +1112,25 @@ Acceptance:
 
 - Completed high-volume workflows do not grow snapshots without bound.
 - Deduplication remains correct within configured windows.
+
+Implementation notes:
+
+- Added `WorkflowStateCompactionPolicy` and `WorkflowState::compact` to the
+  durable workflow substrate so completed inbox entries, terminal outbox
+  entries, and deduplication keys can be trimmed without touching retryable or
+  in-flight work.
+- Preserved deduplication correctness by retaining terminal entries with
+  deduplication keys until both the terminal-entry window and deduplication-key
+  window have elapsed.
+- Added `AgentRetentionPolicy` with windows for terminal checkpoints, terminal
+  effects, audit events, general artifact refs, prompt refs, completion refs,
+  and inline state, plus per-run caps for terminal checkpoints/effects.
+- Added pure compaction helpers for `AgentRunState` and durable audit event
+  batches that return archive handoff records for event journals or
+  application-owned storage before hot-state references are removed.
+- Added tests for completed history trimming, deduplication-window
+  preservation, active/retryable work preservation, archive records, artifact
+  reference cleanup, inline state cleanup, and audit event retention.
 
 ### Slice 5.4: Migration and Backfill Policy
 

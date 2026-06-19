@@ -8,8 +8,8 @@ use rakka_workflow::{
     DurableInbox, InboxAcceptance, InboxCommand, InboxStatus, ManualWorkflowClock,
     OutboxAcceptance, OutboxCommand, OutboxDispatchFuture, OutboxDispatchResult, OutboxDispatcher,
     OutboxEntry, OutboxMessageId, OutboxStatus, OutboxTarget, RetryJitter, RetryPolicy,
-    WorkflowError, WorkflowId, WorkflowMessageId, WorkflowState, WorkflowTelemetryEvent,
-    WorkflowTimestamp,
+    WorkflowError, WorkflowId, WorkflowMessageId, WorkflowState, WorkflowStateCompactionPolicy,
+    WorkflowTelemetryEvent, WorkflowTimestamp,
 };
 
 #[derive(Debug, Default)]
@@ -527,6 +527,142 @@ async fn duplicate_outbound_deduplication_key_does_not_create_duplicate_work() {
     );
     assert_eq!(duplicate.revision(), Revision::new(1));
     assert_eq!(workflow.state().unwrap().outbox().len(), 1);
+}
+
+#[tokio::test]
+async fn workflow_state_compaction_preserves_deduplication_until_window_expires() {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(1_000));
+    let workflow_id = WorkflowId::new("workflow-compact-dedup");
+    let mut workflow = DurableInbox::with_clock(workflow_id, store, clock.clone());
+    workflow.recover().await.unwrap();
+
+    workflow
+        .accept(
+            InboxCommand::new("message-dedup", "Command", b"payload".to_vec())
+                .deduplication_key("command-key"),
+        )
+        .await
+        .unwrap();
+    workflow
+        .transition_inbox(
+            &WorkflowMessageId::new("message-dedup"),
+            InboxStatus::Completed,
+        )
+        .await
+        .unwrap();
+    workflow
+        .schedule_outbox(
+            OutboxCommand::new(
+                "outbox-dedup",
+                OutboxTarget::application("audit"),
+                "Audit",
+                b"payload".to_vec(),
+            )
+            .deduplication_key("outbox-key"),
+        )
+        .await
+        .unwrap();
+    workflow
+        .dispatch_due_outbox(&mut RecordingDispatcher::with_results([
+            OutboxDispatchResult::Success,
+        ]))
+        .await
+        .unwrap();
+
+    let policy = WorkflowStateCompactionPolicy::new()
+        .completed_inbox_entry_retention_ms(100)
+        .completed_outbox_entry_retention_ms(100)
+        .deduplication_key_retention_ms(10_000);
+    let mut state = workflow.state().unwrap().clone();
+    let report = state.compact(policy, WorkflowTimestamp::from_millis(1_500));
+
+    assert!(report.is_empty());
+    assert!(state
+        .inbox_entry_by_deduplication_key(&rakka_workflow::DeduplicationKey::new("command-key"))
+        .is_some());
+    assert!(state
+        .outbox_entry_by_deduplication_key(&rakka_workflow::DeduplicationKey::new("outbox-key"))
+        .is_some());
+
+    let report = state.compact(policy, WorkflowTimestamp::from_millis(12_000));
+
+    assert_eq!(report.removed_inbox_entries(), 1);
+    assert_eq!(report.removed_inbox_deduplication_keys(), 1);
+    assert_eq!(report.removed_outbox_entries(), 1);
+    assert_eq!(report.removed_outbox_deduplication_keys(), 1);
+    assert!(state.inbox().is_empty());
+    assert!(state.outbox().is_empty());
+}
+
+#[tokio::test]
+async fn workflow_state_compaction_preserves_retryable_and_in_flight_work() {
+    let store = InMemoryDurableStateStore::<WorkflowState>::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(2_000));
+    let workflow_id = WorkflowId::new("workflow-compact-active");
+    let mut workflow = DurableInbox::with_clock(workflow_id, store, clock);
+    workflow.recover().await.unwrap();
+
+    workflow
+        .accept(InboxCommand::new(
+            "message-processing",
+            "Command",
+            b"payload".to_vec(),
+        ))
+        .await
+        .unwrap();
+    workflow
+        .transition_inbox(
+            &WorkflowMessageId::new("message-processing"),
+            InboxStatus::Processing,
+        )
+        .await
+        .unwrap();
+    workflow
+        .schedule_outbox(
+            OutboxCommand::new(
+                "outbox-retry",
+                OutboxTarget::application("payments"),
+                "Charge",
+                b"payload".to_vec(),
+            )
+            .retry_policy(RetryPolicy::new(3, 100, 1_000)),
+        )
+        .await
+        .unwrap();
+    workflow
+        .dispatch_due_outbox(&mut RecordingDispatcher::with_results([
+            OutboxDispatchResult::failure("temporary"),
+        ]))
+        .await
+        .unwrap();
+
+    let mut state = workflow.state().unwrap().clone();
+    let report = state.compact(
+        WorkflowStateCompactionPolicy::new()
+            .completed_inbox_entry_retention_ms(0)
+            .completed_outbox_entry_retention_ms(0)
+            .deduplication_key_retention_ms(0),
+        WorkflowTimestamp::from_millis(10_000),
+    );
+
+    assert!(report.is_empty());
+    assert_eq!(state.inbox().len(), 1);
+    assert_eq!(
+        state
+            .inbox_entry(&WorkflowMessageId::new("message-processing"))
+            .unwrap()
+            .status(),
+        InboxStatus::Processing,
+    );
+    assert_eq!(state.outbox().len(), 1);
+    assert_eq!(
+        state
+            .outbox_entry(&OutboxMessageId::new("outbox-retry"))
+            .unwrap()
+            .status(),
+        OutboxStatus::Failed,
+    );
 }
 
 struct InspectingDispatcher {
