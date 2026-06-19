@@ -887,6 +887,8 @@ Implementation notes:
 
 ### Slice 4.3: Structured Logs and Durable Audit
 
+Status: implemented.
+
 Scope:
 
 - Define OpenTelemetry-compatible log event schema for workflow lifecycle
@@ -906,6 +908,23 @@ Acceptance:
 
 - Logs include trace/span correlation when a span exists.
 - Durable audit events can be queried independently from the telemetry backend.
+
+Implementation notes:
+
+- Added OpenTelemetry-compatible `AgentLogEvent` fields for event name,
+  timestamp, observed timestamp, trace id, span id, trace flags, severity text,
+  severity number, body, resource, instrumentation scope, and attributes.
+- Added audit-derived log helpers that map `AgentAuditEvent` into structured
+  log events while preserving workflow/run ids, causation id, correlation id,
+  redaction status, artifact references, and trace correlation.
+- Added `AgentAuditSink`, query, write acceptance, and deterministic
+  `InMemoryAgentAuditSink` so audit records can be stored and queried
+  independently from telemetry backend retention.
+- Added `AgentRedactionPolicy` hooks for unredacted log bodies, log body size,
+  and redacted/reference-only audit evidence requirements.
+- Added tests for structured log trace correlation, audit sink record/query and
+  duplicate handling, redaction policy failures, trace field consistency, and
+  stable audit event names.
 
 ### Slice 4.4: OTLP and Collector Integration
 
