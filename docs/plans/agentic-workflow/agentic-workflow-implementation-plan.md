@@ -830,6 +830,20 @@ Acceptance:
 - Raw workflow ids, run ids, entity ids, prompts, and full error strings are not
   used as hot metric labels.
 
+Implementation notes:
+
+- Added a central workflow metric registry with stable instrument names, kinds,
+  units, and descriptions for inbox, outbox, run/step transitions, human
+  checkpoints, model/tool adapters, timers, dispatcher, and recovery.
+- Added bounded metric attribute constants and helper validation that rejects
+  raw ids, prompts, tool payloads, full error strings, unknown label keys, and
+  overlong or multi-line label values.
+- Added recording helpers for counters, gauges, and histograms on top of
+  Rakka's existing `MetricsRecorder`, preserving Prometheus text export and the
+  current OpenTelemetry bridge model.
+- Example Prometheus output:
+  `rakka_agent_workflow_run_transitions{workflow_type="research",transition="begin-step",status="running",outcome="success"} 1`
+
 ### Slice 4.2: Trace Context and Span Links
 
 Scope:

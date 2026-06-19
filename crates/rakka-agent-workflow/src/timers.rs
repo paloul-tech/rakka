@@ -14,6 +14,7 @@ use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision
 use rakka_workflow::{SystemWorkflowClock, WorkflowClock, WorkflowState, WorkflowTimestamp};
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::METRIC_AGENT_TIMERS_LATE_BY_MS;
 use crate::{
     AgentAttributes, AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind,
     AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata,
@@ -866,7 +867,7 @@ where
             ],
         );
         self.metrics.record_gauge(
-            "rakka.agent_workflow.timers.late_by_ms",
+            METRIC_AGENT_TIMERS_LATE_BY_MS,
             entry.late_by_ms(now) as f64,
             &[("outcome", outcome)],
         );

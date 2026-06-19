@@ -201,12 +201,23 @@ pub const BOUNDED_METRIC_FIELDS: &[&str] = &[
     "definition_version",
     "state_schema_version",
     "status",
+    "operation",
+    "command_type",
+    "message_type",
     "step_kind",
+    "transition",
     "effect_kind",
+    "target_class",
+    "timer_status",
+    "checkpoint_status",
+    "adapter_kind",
+    "artifact_kind",
     "outcome",
+    "detail",
     "error_code",
     "retry_attempt_bucket",
     "tenant_tier",
+    "redaction",
 ];
 
 /// High-cardinality fields that may appear in traces, logs, audit records, and
