@@ -1,0 +1,343 @@
+# Rakka agent workflow Kubernetes reference topology.
+#
+# This manifest is intentionally reviewable raw YAML. It is shaped so the same
+# fields can become Helm values/templates later while still giving local
+# Docker Desktop clusters a concrete contract today.
+#
+# Local defaults:
+# - namespace: rakka-system
+# - PostgreSQL: host Docker container published as 0.0.0.0:5432->5432/tcp
+# - pod access to PostgreSQL: rakka-postgres -> host.docker.internal
+# - OTLP collector service name: rakka-otel-collector
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rakka-system
+  labels:
+    app.kubernetes.io/part-of: rakka
+    rakka.rs/topology: agent-workflow
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rakka-agent-workflow
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: agent-runtime
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-agent-workflow-config
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: agent-runtime
+data:
+  RAKKA_DEPLOYMENT_PROFILE: production-like
+  RAKKA_DEPLOYMENT_NAME: rakka-agent-workflow
+  RAKKA_WORKFLOW_NAMESPACE: rakka-system
+  RAKKA_WORKFLOW_STORE_NAMESPACE: rakka-agent-workflow
+  RAKKA_AGENT_WORKFLOW_QUERY_NAMESPACE: rakka-agent-workflow
+  RAKKA_AGENT_WORKFLOW_CURRENT_STATE_SCHEMA_VERSION: "1"
+  RAKKA_AGENT_WORKFLOW_CURRENT_INDEX_SCHEMA_VERSION: "1"
+  RAKKA_AGENT_WORKFLOW_COMPAT_POLICY: n-to-n-plus-one
+  RAKKA_AGENT_WORKFLOW_EXPECTED_DEFINITION_VERSIONS: v1
+  RAKKA_DISCOVERY_PROVIDER: kubernetes-dns
+  RAKKA_HEADLESS_SERVICE: rakka-agent-internal
+  RAKKA_CLUSTER_DOMAIN: cluster.local
+  RAKKA_EXPECTED_REPLICAS: "3"
+  RAKKA_REMOTING_TRUST_BOUNDARY: trusted-cluster
+  RAKKA_REMOTING_ALLOWED_PEERS: discovery
+  RAKKA_REMOTING_PORT: "2552"
+  RAKKA_REMOTING_BIND_ADDR: 0.0.0.0:2552
+  RAKKA_REMOTING_ADVERTISE_PORT: "2552"
+  RAKKA_HTTP_PORT: "8080"
+  RAKKA_HTTP_BIND_ADDR: 0.0.0.0:8080
+  RAKKA_GRPC_PORT: "50051"
+  RAKKA_GRPC_BIND_ADDR: 0.0.0.0:50051
+  RAKKA_READINESS_PATH: /ready
+  RAKKA_LIVENESS_PATH: /live
+  RAKKA_DRAIN_PATH: /drain
+  RAKKA_METRICS_PATH: /metrics
+  RAKKA_SNAPSHOTS_PATH: /snapshots
+  RAKKA_REQUIRED_SERVICES: workflow-registry,postgres,query-index,artifact-store,otlp
+  RAKKA_POSTGRES_HOST: rakka-postgres.rakka-system.svc.cluster.local
+  RAKKA_POSTGRES_PORT: "5432"
+  RAKKA_POSTGRES_DATABASE: postgres
+  RAKKA_POSTGRES_SSL_MODE: disable
+  RAKKA_POSTGRES_DSN_SECRET: rakka-postgres-credentials
+  RAKKA_ARTIFACT_STORE_KIND: s3-compatible
+  RAKKA_ARTIFACT_ENDPOINT: http://rakka-object-store.rakka-system.svc.cluster.local:9000
+  RAKKA_ARTIFACT_BUCKET: rakka-agent-artifacts
+  RAKKA_ARTIFACT_REGION: local
+  OTEL_SERVICE_NAME: rakka-agent-workflow
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://rakka-otel-collector.rakka-system.svc.cluster.local:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  RAKKA_K8S_PRESTOP_TIMEOUT_MS: "30000"
+  RAKKA_PROCESS_ALLOWLIST_REQUIRED: "true"
+  RAKKA_PROCESS_INHERIT_ENVIRONMENT: "false"
+  RAKKA_SHARD_COUNT: "128"
+  RAKKA_MANIFEST_VERSION: "1.0"
+  RAKKA_GENERATED_API_VERSION: "1.0"
+  RAKKA_PROTOCOL_VERSION: "1.0"
+  RAKKA_COMPAT_MIN: "1.0"
+  RAKKA_COMPAT_MAX: "1.1"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rakka-postgres-credentials
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: postgres-config
+type: Opaque
+stringData:
+  username: postgres
+  password: postgres
+  database: postgres
+  dsn: postgres://postgres:postgres@rakka-postgres.rakka-system.svc.cluster.local:5432/postgres
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rakka-artifact-store-credentials
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: artifact-store
+type: Opaque
+stringData:
+  access-key-id: local-dev-access-key
+  secret-access-key: local-dev-secret-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-postgres
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-postgres
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: postgres
+spec:
+  type: ExternalName
+  externalName: host.docker.internal
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-agent-internal
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: internal-remoting
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/component: agent-runtime
+  ports:
+    - name: remoting
+      port: 2552
+      targetPort: remoting
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-agent-public
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: public-api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/component: agent-runtime
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rakka-agent-workflow
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: agent-runtime
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rakka-agent-workflow
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: agent-runtime
+    app.kubernetes.io/version: "0.1.0"
+  annotations:
+    rakka.rs/agent-workflow-spec-version: "1.0"
+    rakka.rs/protocol-version: "1.0"
+    rakka.rs/compatible-min: "1.0"
+    rakka.rs/compatible-max: "1.1"
+    rakka.rs/compat-policy: n-to-n-plus-one
+    rakka.rs/manifest-version: "1.0"
+    rakka.rs/generated-api-version: "1.0"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-agent-workflow
+        app.kubernetes.io/part-of: rakka
+        app.kubernetes.io/component: agent-runtime
+      annotations:
+        rakka.rs/agent-workflow-spec-version: "1.0"
+        rakka.rs/protocol-version: "1.0"
+        rakka.rs/compatible-min: "1.0"
+        rakka.rs/compatible-max: "1.1"
+        rakka.rs/compat-policy: n-to-n-plus-one
+        rakka.rs/manifest-version: "1.0"
+        rakka.rs/generated-api-version: "1.0"
+    spec:
+      serviceAccountName: rakka-agent-workflow
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rakka-agent-workflow
+          image: ghcr.io/rakka-rs/rakka-agent-workflow:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: remoting
+              containerPort: 2552
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 50051
+          envFrom:
+            - configMapRef:
+                name: rakka-agent-workflow-config
+          env:
+            - name: RAKKA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RAKKA_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: RAKKA_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RAKKA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RAKKA_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RAKKA_NODE_ID
+              value: $(RAKKA_POD_NAME):$(RAKKA_POD_UID)
+            - name: RAKKA_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-postgres-credentials
+                  key: dsn
+            - name: RAKKA_POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-postgres-credentials
+                  key: username
+            - name: RAKKA_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-postgres-credentials
+                  key: password
+            - name: RAKKA_ARTIFACT_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-artifact-store-credentials
+                  key: access-key-id
+            - name: RAKKA_ARTIFACT_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-artifact-store-credentials
+                  key: secret-access-key
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.name=rakka-agent-workflow,service.namespace=rakka-system,service.version=0.1.0,deployment.environment.name=local,k8s.namespace.name=$(RAKKA_NAMESPACE),k8s.pod.name=$(RAKKA_POD_NAME),k8s.pod.uid=$(RAKKA_POD_UID),k8s.node.name=$(RAKKA_NODE_NAME),k8s.deployment.name=rakka-agent-workflow,rakka.node.id=$(RAKKA_NODE_ID)
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          lifecycle:
+            preStop:
+              httpGet:
+                path: /drain
+                port: http
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi

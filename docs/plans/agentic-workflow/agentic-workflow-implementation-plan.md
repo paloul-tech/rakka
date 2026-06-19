@@ -1180,6 +1180,8 @@ cloud-based Kubernetes environment.
 
 ### Slice 6.1: Reference Topology
 
+Status: implemented.
+
 Scope:
 
 - Define reference manifests or Helm-style templates for Rakka app Deployment,
@@ -1196,6 +1198,24 @@ Acceptance:
 
 - Required ports, probes, labels, env vars, compatibility metadata, and service
   names are validated by tests.
+
+Implementation notes:
+
+- Added `kubernetes-reference-topology.yaml` as a raw, Helm-friendly reference
+  topology for `rakka-system`, a three-replica agent workflow `Deployment`,
+  separate public HTTP/gRPC and internal remoting Services, pre-stop drain,
+  readiness, liveness, startup probes, compatibility annotations, PostgreSQL,
+  artifact-store, and OpenTelemetry configuration.
+- Modeled local Docker Desktop PostgreSQL access with
+  `Service/rakka-postgres` as an `ExternalName` to `host.docker.internal` and
+  a local `rakka-postgres-credentials` Secret.
+- Added `kubernetes-reference-topology.md` with the local runtime contract,
+  service boundary notes, object-storage placeholder, compatibility policy,
+  validation commands, and future Helm values map.
+- Added `agent_workflow_topology` manifest contract tests in `rakka-k8s` to
+  validate namespace defaults, service separation, local PostgreSQL wiring,
+  required ports/probes/env vars, compatibility metadata, documentation, and
+  optional `kubectl apply --dry-run=client` validation.
 
 ### Slice 6.2: Startup and Readiness
 
