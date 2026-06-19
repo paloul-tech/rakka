@@ -25,6 +25,8 @@ pub mod dispatcher;
 pub mod domain;
 pub mod facade;
 pub mod inbox;
+#[cfg(feature = "k8s")]
+pub mod kubernetes;
 pub mod metrics;
 pub mod migration;
 pub mod otlp;
@@ -121,6 +123,17 @@ pub use facade::{
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
     AgentInboxResult, AgentRunInbox, METRIC_AGENT_INBOX_COMMANDS,
+};
+#[cfg(feature = "k8s")]
+pub use kubernetes::{
+    default_agent_workflow_required_services, parse_agent_workflow_required_services,
+    AgentWorkflowKubernetesStartup, AgentWorkflowStartupSnapshot, AgentWorkflowStartupStep,
+    AGENT_WORKFLOW_STARTUP_ACTOR_SYSTEM, AGENT_WORKFLOW_STARTUP_ARTIFACT_STORE,
+    AGENT_WORKFLOW_STARTUP_DURABLE_STATE, AGENT_WORKFLOW_STARTUP_OPERATIONAL_SNAPSHOTS,
+    AGENT_WORKFLOW_STARTUP_OTLP_EXPORTER, AGENT_WORKFLOW_STARTUP_POSTGRES,
+    AGENT_WORKFLOW_STARTUP_QUERY_INDEX, AGENT_WORKFLOW_STARTUP_REMOTING,
+    AGENT_WORKFLOW_STARTUP_SHARDING, AGENT_WORKFLOW_STARTUP_TELEMETRY_RESOURCE,
+    AGENT_WORKFLOW_STARTUP_WORKFLOW_REGISTRY, DEFAULT_AGENT_WORKFLOW_STARTUP_STEPS,
 };
 pub use metrics::{
     agent_metric_instrument, is_bounded_agent_metric_attribute,
@@ -371,6 +384,18 @@ pub mod prelude {
     #[cfg(feature = "http")]
     pub use crate::{
         human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
+    };
+
+    #[cfg(feature = "k8s")]
+    pub use crate::{
+        default_agent_workflow_required_services, parse_agent_workflow_required_services,
+        AgentWorkflowKubernetesStartup, AgentWorkflowStartupSnapshot, AgentWorkflowStartupStep,
+        AGENT_WORKFLOW_STARTUP_ACTOR_SYSTEM, AGENT_WORKFLOW_STARTUP_ARTIFACT_STORE,
+        AGENT_WORKFLOW_STARTUP_DURABLE_STATE, AGENT_WORKFLOW_STARTUP_OPERATIONAL_SNAPSHOTS,
+        AGENT_WORKFLOW_STARTUP_OTLP_EXPORTER, AGENT_WORKFLOW_STARTUP_POSTGRES,
+        AGENT_WORKFLOW_STARTUP_QUERY_INDEX, AGENT_WORKFLOW_STARTUP_REMOTING,
+        AGENT_WORKFLOW_STARTUP_SHARDING, AGENT_WORKFLOW_STARTUP_TELEMETRY_RESOURCE,
+        AGENT_WORKFLOW_STARTUP_WORKFLOW_REGISTRY, DEFAULT_AGENT_WORKFLOW_STARTUP_STEPS,
     };
 
     #[cfg(feature = "postgres")]

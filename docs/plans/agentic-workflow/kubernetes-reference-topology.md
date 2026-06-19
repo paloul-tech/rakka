@@ -53,10 +53,12 @@ The application image should expose:
 - Public gRPC on port `50051`, when the application enables gRPC.
 - Internal Rakka remoting on port `2552`.
 
-Readiness should stay false until the workflow registry, PostgreSQL stores,
-query indexes, artifact-store configuration, compatibility policy, and
-required telemetry setup are ready. The pre-stop drain endpoint should mark
-readiness false before stopping ingress or handing off workflow work.
+Readiness should stay false until the telemetry resource, OTLP exporter,
+PostgreSQL stores, durable state, query indexes, artifact-store configuration,
+actor system, remoting, sharding, workflow registry, snapshots, and
+compatibility policy are ready. The pre-stop drain endpoint should mark
+readiness false before stopping ingress or handing off workflow work. The
+complete startup order is captured in `kubernetes-startup-readiness.md`.
 
 ## Service Boundaries
 

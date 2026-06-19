@@ -981,6 +981,7 @@ dependencies = [
 name = "rakka-agent-workflow"
 version = "0.1.0"
 dependencies = [
+ "rakka-cluster",
  "rakka-core",
  "rakka-grpc",
  "rakka-http",

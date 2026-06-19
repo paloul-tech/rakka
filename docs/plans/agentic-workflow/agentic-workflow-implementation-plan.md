@@ -1219,6 +1219,8 @@ Implementation notes:
 
 ### Slice 6.2: Startup and Readiness
 
+Status: implemented.
+
 Scope:
 
 - Implement or document startup order: configure telemetry resources, configure
@@ -1238,6 +1240,33 @@ Acceptance:
 - A pod does not accept public workflow commands before durable stores,
   workflow registrations, compatibility checks, and required telemetry setup
   are ready.
+
+Implementation notes:
+
+- Added `rakka-agent-workflow` Kubernetes startup helpers behind the `k8s`
+  feature, including `AgentWorkflowStartupStep`,
+  `AgentWorkflowKubernetesStartup`, startup snapshots, and stable readiness
+  service-name constants.
+- The startup helper registers required services with
+  `rakka_k8s::KubernetesNodeHealth`, then marks them available as each startup
+  step completes so the existing Kubernetes readiness probe fails closed until
+  cluster membership, compatibility, and every required agent workflow service
+  are ready.
+- Added parsing and default-service helpers for the `RAKKA_REQUIRED_SERVICES`
+  vocabulary used by the reference topology.
+- Forwarded the top-level `rakka/k8s` feature into
+  `rakka-agent-workflow?/k8s` so facade users get the startup helpers when both
+  the top-level Kubernetes and agent workflow surfaces are enabled.
+- Expanded the reference topology's `RAKKA_REQUIRED_SERVICES` to include
+  telemetry resource configuration, OTLP exporter setup, PostgreSQL, durable
+  state, query index, artifact store, actor system, remoting, sharding,
+  workflow registry, and operational snapshots.
+- Added `kubernetes-startup-readiness.md` with the intended startup order,
+  readiness/liveness behavior, app wiring, and failure handling.
+- Added tests proving readiness remains false until required startup services
+  complete, compatibility failures fail closed, drain flips readiness false,
+  snapshots report pending steps, and manifest contract tests use the expanded
+  startup service vocabulary.
 
 ### Slice 6.3: Drain and Shutdown
 

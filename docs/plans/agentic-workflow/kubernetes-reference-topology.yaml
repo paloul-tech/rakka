@@ -65,7 +65,7 @@ data:
   RAKKA_DRAIN_PATH: /drain
   RAKKA_METRICS_PATH: /metrics
   RAKKA_SNAPSHOTS_PATH: /snapshots
-  RAKKA_REQUIRED_SERVICES: workflow-registry,postgres,query-index,artifact-store,otlp
+  RAKKA_REQUIRED_SERVICES: telemetry-resource,otlp-exporter,postgres,durable-state,query-index,artifact-store,actor-system,remoting,sharding,workflow-registry,operational-snapshots
   RAKKA_POSTGRES_HOST: rakka-postgres.rakka-system.svc.cluster.local
   RAKKA_POSTGRES_PORT: "5432"
   RAKKA_POSTGRES_DATABASE: postgres
