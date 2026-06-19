@@ -41,6 +41,36 @@ pub const METRIC_AGENT_RECOVERY_LATENCY_MS: &str = "rakka.agent_workflow.recover
 /// Gauge for how late timer firing was when observed by a scanner.
 pub const METRIC_AGENT_TIMERS_LATE_BY_MS: &str = "rakka.agent_workflow.timers.late_by_ms";
 
+/// Gauge for active non-terminal workflow runs.
+pub const METRIC_AGENT_ACTIVE_RUNS: &str = "rakka.agent_workflow.run.active";
+
+/// Gauge for recoverable durable inbox commands waiting on workflow runs.
+pub const METRIC_AGENT_PENDING_INBOX_COMMANDS: &str = "rakka.agent_workflow.inbox.pending_commands";
+
+/// Gauge for due durable outbox effects waiting for dispatch.
+pub const METRIC_AGENT_DUE_OUTBOX_EFFECTS: &str = "rakka.agent_workflow.outbox.due_effects";
+
+/// Histogram for due-effect dispatch latency in milliseconds.
+pub const METRIC_AGENT_DISPATCH_LATENCY_MS: &str = "rakka.agent_workflow.dispatcher.latency_ms";
+
+/// Gauge for workflow runs waiting on human input.
+pub const METRIC_AGENT_HUMAN_WAITING_RUNS: &str = "rakka.agent_workflow.human.waiting_runs";
+
+/// Gauge for agent workflow actor mailbox depth.
+pub const METRIC_AGENT_MAILBOX_DEPTH: &str = "rakka.agent_workflow.runtime.mailbox_depth";
+
+/// Gauge for agent workflow stream bounded-buffer pressure.
+pub const METRIC_AGENT_STREAM_PRESSURE: &str = "rakka.agent_workflow.stream.pressure";
+
+/// Gauge for child process state observed by agent workflow process adapters.
+pub const METRIC_AGENT_PROCESS_RUNNING: &str = "rakka.agent_workflow.process.running";
+
+/// Histogram for agent workflow PostgreSQL operation latency in milliseconds.
+pub const METRIC_AGENT_POSTGRES_LATENCY_MS: &str = "rakka.agent_workflow.postgres.latency_ms";
+
+/// Gauge for sharded agent workflow ownership distribution.
+pub const METRIC_AGENT_SHARD_OWNERSHIP_COUNT: &str = "rakka.agent_workflow.shard.owned";
+
 /// Maximum byte length for one hot metric attribute value.
 pub const AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES: usize = 96;
 
@@ -104,6 +134,24 @@ pub const AGENT_METRIC_ATTR_TENANT_TIER: &str = "tenant_tier";
 /// Workflow metric attribute key for redaction status labels.
 pub const AGENT_METRIC_ATTR_REDACTION: &str = "redaction";
 
+/// Workflow metric attribute key for bounded runtime component labels.
+pub const AGENT_METRIC_ATTR_COMPONENT: &str = "component";
+
+/// Workflow metric attribute key for bounded queue labels.
+pub const AGENT_METRIC_ATTR_QUEUE: &str = "queue";
+
+/// Workflow metric attribute key for bounded direction labels.
+pub const AGENT_METRIC_ATTR_DIRECTION: &str = "direction";
+
+/// Workflow metric attribute key for bounded database operation labels.
+pub const AGENT_METRIC_ATTR_DATABASE_OPERATION: &str = "database_operation";
+
+/// Workflow metric attribute key for bounded sharded entity type labels.
+pub const AGENT_METRIC_ATTR_ENTITY_TYPE: &str = "entity_type";
+
+/// Workflow metric attribute key for bounded autoscaling signal labels.
+pub const AGENT_METRIC_ATTR_SIGNAL: &str = "signal";
+
 /// Bounded metric attribute keys accepted by agent workflow helpers.
 pub const AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES: &[&str] = &[
     AGENT_METRIC_ATTR_OPERATION,
@@ -127,10 +175,20 @@ pub const AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES: &[&str] = &[
     AGENT_METRIC_ATTR_ERROR_CODE,
     AGENT_METRIC_ATTR_TENANT_TIER,
     AGENT_METRIC_ATTR_REDACTION,
+    AGENT_METRIC_ATTR_COMPONENT,
+    AGENT_METRIC_ATTR_QUEUE,
+    AGENT_METRIC_ATTR_DIRECTION,
+    AGENT_METRIC_ATTR_DATABASE_OPERATION,
+    AGENT_METRIC_ATTR_ENTITY_TYPE,
+    AGENT_METRIC_ATTR_SIGNAL,
 ];
 
 const ADDITIONAL_FORBIDDEN_METRIC_ATTRIBUTE_KEYS: &[&str] = &[
     "shard_id",
+    "owner_node_id",
+    "node_id",
+    "pod_name",
+    "pod_uid",
     "message_id",
     "artifact_id",
     "prompt",
@@ -171,8 +229,272 @@ impl AgentMetricInstrument {
     }
 }
 
+/// Role a metric plays in autoscaling decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AgentAutoscalingSignalRole {
+    /// Current amount of active workflow work.
+    Workload,
+    /// Queue or backlog pressure.
+    Backlog,
+    /// Latency or lag observed while moving work.
+    Latency,
+    /// Runtime saturation such as mailbox depth or stream pressure.
+    Saturation,
+    /// Availability of backing process capacity.
+    Availability,
+    /// Distribution of sharded ownership across replicas.
+    Distribution,
+}
+
+impl AgentAutoscalingSignalRole {
+    /// Stable lowercase role label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Workload => "workload",
+            Self::Backlog => "backlog",
+            Self::Latency => "latency",
+            Self::Saturation => "saturation",
+            Self::Availability => "availability",
+            Self::Distribution => "distribution",
+        }
+    }
+}
+
+/// Autoscaling-oriented metric signal definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentAutoscalingSignal {
+    /// Stable metric name.
+    pub metric_name: &'static str,
+    /// Instrument kind.
+    pub kind: MetricKind,
+    /// UCUM-compatible unit label where possible.
+    pub unit: &'static str,
+    /// Autoscaling role.
+    pub role: AgentAutoscalingSignalRole,
+    /// Recommended operator-side aggregation.
+    pub recommended_aggregation: &'static str,
+    /// Bounded attributes that may be used with this signal.
+    pub bounded_attributes: &'static [&'static str],
+    /// Human-readable signal description.
+    pub description: &'static str,
+}
+
+impl AgentAutoscalingSignal {
+    /// Creates an autoscaling signal definition.
+    #[must_use]
+    pub const fn new(
+        metric_name: &'static str,
+        kind: MetricKind,
+        unit: &'static str,
+        role: AgentAutoscalingSignalRole,
+        recommended_aggregation: &'static str,
+        bounded_attributes: &'static [&'static str],
+        description: &'static str,
+    ) -> Self {
+        Self {
+            metric_name,
+            kind,
+            unit,
+            role,
+            recommended_aggregation,
+            bounded_attributes,
+            description,
+        }
+    }
+}
+
+const WORKFLOW_STATUS_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_WORKFLOW_TYPE,
+    AGENT_METRIC_ATTR_DEFINITION_VERSION,
+    AGENT_METRIC_ATTR_STATUS,
+    AGENT_METRIC_ATTR_TENANT_TIER,
+];
+const QUEUE_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_QUEUE,
+    AGENT_METRIC_ATTR_WORKFLOW_TYPE,
+    AGENT_METRIC_ATTR_DEFINITION_VERSION,
+    AGENT_METRIC_ATTR_TARGET_CLASS,
+    AGENT_METRIC_ATTR_TENANT_TIER,
+];
+const DISPATCH_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_TARGET_CLASS,
+    AGENT_METRIC_ATTR_OUTCOME,
+    AGENT_METRIC_ATTR_DETAIL,
+];
+const HUMAN_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_WORKFLOW_TYPE,
+    AGENT_METRIC_ATTR_DEFINITION_VERSION,
+    AGENT_METRIC_ATTR_CHECKPOINT_STATUS,
+    AGENT_METRIC_ATTR_TENANT_TIER,
+];
+const RUNTIME_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_COMPONENT,
+    AGENT_METRIC_ATTR_WORKFLOW_TYPE,
+    AGENT_METRIC_ATTR_DEFINITION_VERSION,
+];
+const STREAM_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_COMPONENT,
+    AGENT_METRIC_ATTR_DIRECTION,
+    AGENT_METRIC_ATTR_TARGET_CLASS,
+];
+const PROCESS_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_COMPONENT,
+    AGENT_METRIC_ATTR_STATUS,
+    AGENT_METRIC_ATTR_TARGET_CLASS,
+];
+const POSTGRES_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_DATABASE_OPERATION,
+    AGENT_METRIC_ATTR_OUTCOME,
+    AGENT_METRIC_ATTR_DETAIL,
+];
+const SHARD_ATTRS: &[&str] = &[
+    AGENT_METRIC_ATTR_ENTITY_TYPE,
+    AGENT_METRIC_ATTR_STATUS,
+    AGENT_METRIC_ATTR_COMPONENT,
+];
+
+/// Stable autoscaling signal catalog for agent workflow deployments.
+pub const AGENT_WORKFLOW_AUTOSCALING_SIGNALS: &[AgentAutoscalingSignal] = &[
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_ACTIVE_RUNS,
+        MetricKind::Gauge,
+        "{run}",
+        AgentAutoscalingSignalRole::Workload,
+        "sum by workflow_type, definition_version, tenant_tier",
+        WORKFLOW_STATUS_ATTRS,
+        "Active non-terminal workflow runs.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_PENDING_INBOX_COMMANDS,
+        MetricKind::Gauge,
+        "{command}",
+        AgentAutoscalingSignalRole::Backlog,
+        "sum by workflow_type, definition_version, tenant_tier",
+        QUEUE_ATTRS,
+        "Recoverable durable inbox commands waiting on workflow runs.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_DUE_OUTBOX_EFFECTS,
+        MetricKind::Gauge,
+        "{effect}",
+        AgentAutoscalingSignalRole::Backlog,
+        "sum by workflow_type, definition_version, target_class",
+        QUEUE_ATTRS,
+        "Due durable outbox effects waiting for dispatch.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_DISPATCHER_BACKLOG,
+        MetricKind::Gauge,
+        "{effect}",
+        AgentAutoscalingSignalRole::Backlog,
+        "sum by target_class",
+        DISPATCH_ATTRS,
+        "Dispatcher backlog by target class.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_DISPATCHER_IN_FLIGHT,
+        MetricKind::Gauge,
+        "{effect}",
+        AgentAutoscalingSignalRole::Saturation,
+        "sum by target_class",
+        DISPATCH_ATTRS,
+        "Dispatcher in-flight work by target class.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_DISPATCH_LATENCY_MS,
+        MetricKind::Histogram,
+        "ms",
+        AgentAutoscalingSignalRole::Latency,
+        "avg or p95 by target_class",
+        DISPATCH_ATTRS,
+        "Observed due-effect dispatch latency.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_HUMAN_WAITING_RUNS,
+        MetricKind::Gauge,
+        "{run}",
+        AgentAutoscalingSignalRole::Workload,
+        "sum by workflow_type, definition_version, tenant_tier",
+        HUMAN_ATTRS,
+        "Workflow runs waiting on human checkpoint decisions.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_HUMAN_WAIT_LATENCY_MS,
+        MetricKind::Histogram,
+        "ms",
+        AgentAutoscalingSignalRole::Latency,
+        "avg or p95 by checkpoint_status, tenant_tier",
+        HUMAN_ATTRS,
+        "Human checkpoint wait latency.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_MAILBOX_DEPTH,
+        MetricKind::Gauge,
+        "{message}",
+        AgentAutoscalingSignalRole::Saturation,
+        "max or avg by component",
+        RUNTIME_ATTRS,
+        "Agent workflow actor mailbox depth.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_STREAM_PRESSURE,
+        MetricKind::Gauge,
+        "1",
+        AgentAutoscalingSignalRole::Saturation,
+        "max by component, direction, target_class",
+        STREAM_ATTRS,
+        "Agent workflow stream bounded-buffer pressure ratio.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_PROCESS_RUNNING,
+        MetricKind::Gauge,
+        "{process}",
+        AgentAutoscalingSignalRole::Availability,
+        "sum by component, status, target_class",
+        PROCESS_ATTRS,
+        "Process adapter capacity by bounded process state.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_POSTGRES_LATENCY_MS,
+        MetricKind::Histogram,
+        "ms",
+        AgentAutoscalingSignalRole::Latency,
+        "avg or p95 by database_operation, outcome",
+        POSTGRES_ATTRS,
+        "Agent workflow PostgreSQL operation latency.",
+    ),
+    AgentAutoscalingSignal::new(
+        METRIC_AGENT_SHARD_OWNERSHIP_COUNT,
+        MetricKind::Gauge,
+        "{shard}",
+        AgentAutoscalingSignalRole::Distribution,
+        "stddev or max by entity_type",
+        SHARD_ATTRS,
+        "Sharded agent workflow ownership distribution.",
+    ),
+];
+
 /// Stable agent workflow metric instruments.
 pub const AGENT_WORKFLOW_METRIC_INSTRUMENTS: &[AgentMetricInstrument] = &[
+    AgentMetricInstrument::new(
+        METRIC_AGENT_ACTIVE_RUNS,
+        MetricKind::Gauge,
+        "{run}",
+        "Active non-terminal workflow runs.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_PENDING_INBOX_COMMANDS,
+        MetricKind::Gauge,
+        "{command}",
+        "Recoverable durable inbox commands waiting on workflow runs.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_DUE_OUTBOX_EFFECTS,
+        MetricKind::Gauge,
+        "{effect}",
+        "Due durable outbox effects waiting for dispatch.",
+    ),
     AgentMetricInstrument::new(
         METRIC_AGENT_INBOX_COMMANDS,
         MetricKind::Counter,
@@ -270,6 +592,48 @@ pub const AGENT_WORKFLOW_METRIC_INSTRUMENTS: &[AgentMetricInstrument] = &[
         "Dispatcher in-flight work by target class.",
     ),
     AgentMetricInstrument::new(
+        METRIC_AGENT_DISPATCH_LATENCY_MS,
+        MetricKind::Histogram,
+        "ms",
+        "Observed due-effect dispatch latency.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_HUMAN_WAITING_RUNS,
+        MetricKind::Gauge,
+        "{run}",
+        "Workflow runs waiting on human checkpoint decisions.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_MAILBOX_DEPTH,
+        MetricKind::Gauge,
+        "{message}",
+        "Agent workflow actor mailbox depth.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_STREAM_PRESSURE,
+        MetricKind::Gauge,
+        "1",
+        "Agent workflow stream bounded-buffer pressure ratio.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_PROCESS_RUNNING,
+        MetricKind::Gauge,
+        "{process}",
+        "Process adapter capacity by bounded process state.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_POSTGRES_LATENCY_MS,
+        MetricKind::Histogram,
+        "ms",
+        "Agent workflow PostgreSQL operation latency.",
+    ),
+    AgentMetricInstrument::new(
+        METRIC_AGENT_SHARD_OWNERSHIP_COUNT,
+        MetricKind::Gauge,
+        "{shard}",
+        "Sharded agent workflow ownership distribution.",
+    ),
+    AgentMetricInstrument::new(
         METRIC_AGENT_RECOVERY_EVENTS,
         MetricKind::Counter,
         "{recovery}",
@@ -353,6 +717,20 @@ pub fn agent_metric_instrument(name: &str) -> Option<&'static AgentMetricInstrum
     AGENT_WORKFLOW_METRIC_INSTRUMENTS
         .iter()
         .find(|instrument| instrument.name == name)
+}
+
+/// Returns an autoscaling signal definition by metric name.
+#[must_use]
+pub fn agent_autoscaling_signal(name: &str) -> Option<&'static AgentAutoscalingSignal> {
+    AGENT_WORKFLOW_AUTOSCALING_SIGNALS
+        .iter()
+        .find(|signal| signal.metric_name == name)
+}
+
+/// Returns true when a metric is part of the autoscaling signal catalog.
+#[must_use]
+pub fn is_agent_autoscaling_metric(name: &str) -> bool {
+    agent_autoscaling_signal(name).is_some()
 }
 
 /// Returns true when an attribute key is accepted for hot metrics.

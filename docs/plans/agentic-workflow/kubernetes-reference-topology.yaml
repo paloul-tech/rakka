@@ -64,6 +64,8 @@ data:
   RAKKA_LIVENESS_PATH: /live
   RAKKA_DRAIN_PATH: /drain
   RAKKA_METRICS_PATH: /metrics
+  RAKKA_AUTOSCALING_METRICS_ENABLED: "true"
+  RAKKA_AUTOSCALING_METRICS_INTERVAL_MS: "10000"
   RAKKA_SNAPSHOTS_PATH: /snapshots
   RAKKA_REQUIRED_SERVICES: telemetry-resource,otlp-exporter,postgres,durable-state,query-index,artifact-store,actor-system,remoting,sharding,workflow-registry,operational-snapshots
   RAKKA_POSTGRES_HOST: rakka-postgres.rakka-system.svc.cluster.local

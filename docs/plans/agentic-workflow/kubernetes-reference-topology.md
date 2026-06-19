@@ -60,6 +60,8 @@ compatibility policy are ready. The pre-stop drain endpoint should mark
 readiness false before stopping ingress or handing off workflow work. The
 complete startup order is captured in `kubernetes-startup-readiness.md`, and
 the drain/shutdown order is captured in `kubernetes-drain-shutdown.md`.
+Autoscaling metric signals are captured in
+`kubernetes-autoscaling-signals.md`.
 
 ## Service Boundaries
 

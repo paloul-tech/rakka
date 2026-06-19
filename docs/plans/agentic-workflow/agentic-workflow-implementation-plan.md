@@ -1307,6 +1307,8 @@ Implementation notes:
 
 ### Slice 6.4: Autoscaling Signals
 
+Status: implemented.
+
 Scope:
 
 - Expose bounded metrics for active workflows, pending inbox commands, due
@@ -1323,6 +1325,21 @@ Acceptance:
 
 - Operators can scale on pending/due workflow work and dispatch latency, not
   only CPU and memory.
+
+Implementation notes:
+
+- Added `AGENT_WORKFLOW_AUTOSCALING_SIGNALS` with stable metric names, kinds,
+  units, roles, bounded label sets, and recommended aggregation hints.
+- Added agent workflow autoscaling metrics for active runs, pending inbox
+  commands, due outbox effects, dispatch latency, human waiting runs, mailbox
+  depth, stream pressure, process capacity, PostgreSQL latency, and shard
+  ownership distribution.
+- Added `kubernetes-autoscaling-signals.md` with HPA/KEDA-style guidance,
+  Prometheus examples, recording guidance, and bounded-label policy.
+- Updated the reference topology with autoscaling metric emission defaults and
+  linked the new guide from the Kubernetes topology documentation.
+- Added tests covering the autoscaling catalog, bounded labels, representative
+  Prometheus/OTLP export names, and topology documentation wiring.
 
 ### Slice 6.5: OpenTelemetry Collector Topology
 
