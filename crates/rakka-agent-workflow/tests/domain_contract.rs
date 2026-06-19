@@ -8,10 +8,10 @@ use rakka_agent_workflow::{
     AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunId,
     AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStep, AgentStepId,
     AgentStepKind, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowId, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus, StateSchemaVersion,
-    WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS, FORBIDDEN_HOT_METRIC_FIELDS,
-    TRACE_LOG_AUDIT_ID_FIELDS,
+    AgentWorkflowId, ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint,
+    HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus,
+    StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
+    FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
 };
 
 #[test]
@@ -236,6 +236,10 @@ fn sample_artifact(artifact_id: &str, kind: ArtifactKind) -> ArtifactRef {
         content_type: Some("application/json".to_string()),
         byte_len: Some(128),
         retention_class: Some("standard".to_string()),
+        encryption: Some(
+            ArtifactEncryptionRef::new("AES256-GCM", "kms://agent-workflow/test-key")
+                .context("tenant", "tenant-a"),
+        ),
         redaction: RedactionStatus::ReferenceOnly,
         created_at: AgentTimestampMillis::new(123),
         metadata: attributes([("classification", "internal")]),

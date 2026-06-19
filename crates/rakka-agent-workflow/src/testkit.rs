@@ -12,11 +12,13 @@ use rakka_workflow::{
 
 use crate::{
     AgentAdapterFailureClass, AgentAdapterFuture, AgentAdapterOutcome, AgentAdapterRequestMetadata,
-    AgentAdapterUsage, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId,
-    AgentCommandId, AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentModelAdapter,
-    AgentModelRequest, AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus,
-    AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
+    AgentAdapterUsage, AgentArtifactError, AgentArtifactRead, AgentArtifactStore,
+    AgentArtifactStoreFuture, AgentArtifactWriteRequest, AgentAuditEvent, AgentAuditEventId,
+    AgentAuditEventKind, AgentCausationId, AgentCommandId, AgentCorrelationId,
+    AgentDeduplicationKey, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
+    AgentEffectTarget, AgentIdempotencyKey, AgentModelAdapter, AgentModelRequest,
+    AgentPayloadDescriptor, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload,
+    AgentStep, AgentStepId, AgentStepKind, AgentTelemetryContext, AgentTenantId,
     AgentTimestampMillis, AgentToolAdapter, AgentToolRequest, AgentWorkflow, AgentWorkflowId,
     ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
     PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
@@ -244,6 +246,49 @@ impl FakeArtifactStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.artifacts.is_empty()
+    }
+}
+
+impl AgentArtifactStore for FakeArtifactStore {
+    fn put_artifact<'a>(
+        &'a mut self,
+        request: AgentArtifactWriteRequest,
+    ) -> AgentArtifactStoreFuture<'a, ArtifactRef> {
+        let artifact_id = request
+            .artifact_id
+            .unwrap_or_else(|| format!("artifact-{}", self.artifacts.len() + 1));
+        let byte_len = request.bytes.len() as u64;
+        let reference = ArtifactRef {
+            artifact_id: artifact_id.clone(),
+            kind: request.kind,
+            uri: format!("memory://agent-fixture/{artifact_id}"),
+            checksum: request.checksum.or_else(|| Some(format!("len:{byte_len}"))),
+            content_type: request.content_type,
+            byte_len: Some(byte_len),
+            retention_class: request.retention_class,
+            encryption: request.encryption,
+            redaction: request.redaction,
+            created_at: request.created_at,
+            metadata: request.metadata,
+        };
+        self.insert(reference.clone(), request.bytes);
+        Box::pin(async move { Ok(reference) })
+    }
+
+    fn get_artifact<'a>(
+        &'a self,
+        reference: &'a ArtifactRef,
+    ) -> AgentArtifactStoreFuture<'a, AgentArtifactRead> {
+        let artifact_id = reference.artifact_id.clone();
+        let record = self.artifacts.get(&artifact_id).cloned();
+        Box::pin(async move {
+            record
+                .map(|record| AgentArtifactRead {
+                    reference: record.reference,
+                    bytes: record.bytes,
+                })
+                .ok_or(AgentArtifactError::ArtifactNotFound { artifact_id })
+        })
     }
 }
 
@@ -586,6 +631,7 @@ impl MinimalAgentFixture {
             content_type: Some(content_type.into()),
             byte_len: Some(bytes.len() as u64),
             retention_class: Some("test".to_string()),
+            encryption: None,
             redaction: RedactionStatus::ReferenceOnly,
             created_at: self.clock.now(),
             metadata: BTreeMap::new(),
@@ -808,6 +854,8 @@ impl Default for MinimalAgentFixture {
 mod tests {
     use rakka_workflow::{InboxAcceptance, OutboxAcceptance};
 
+    use crate::{validate_artifact_ref, ArtifactEncryptionRef};
+
     use super::*;
 
     #[test]
@@ -831,6 +879,38 @@ mod tests {
             fixture.artifact_store().bytes(&reference.artifact_id),
             Some(&b"hello"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn fake_artifact_store_implements_artifact_store_trait() {
+        let mut store = FakeArtifactStore::default();
+        let request = AgentArtifactWriteRequest::new(
+            ArtifactKind::Prompt,
+            "text/plain",
+            b"hello".to_vec(),
+            AgentTimestampMillis::new(10),
+        )
+        .artifact_id("prompt-artifact")
+        .checksum("sha256:test")
+        .retention_class("test")
+        .redaction(RedactionStatus::ReferenceOnly)
+        .encryption(
+            ArtifactEncryptionRef::new("AES256-GCM", "kms://agent-workflow/test-key")
+                .context("tenant", "tenant-test"),
+        );
+
+        let reference = store
+            .put_artifact(request)
+            .await
+            .expect("fake store should write artifact");
+        validate_artifact_ref(&reference).expect("fake store should create valid references");
+
+        let read = store
+            .get_artifact(&reference)
+            .await
+            .expect("fake store should read artifact");
+        assert_eq!(read.reference, reference);
+        assert_eq!(read.bytes, b"hello");
     }
 
     #[test]

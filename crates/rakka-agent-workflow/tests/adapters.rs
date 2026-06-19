@@ -313,6 +313,7 @@ fn artifact(id: &str, kind: ArtifactKind, redaction: RedactionStatus) -> Artifac
         content_type: Some("application/json".to_string()),
         byte_len: Some(id.len() as u64),
         retention_class: Some("test".to_string()),
+        encryption: None,
         redaction,
         created_at: AgentTimestampMillis::new(90),
         metadata: attrs([("purpose", "adapter-contract")]),

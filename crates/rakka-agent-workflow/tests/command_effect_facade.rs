@@ -244,6 +244,7 @@ fn artifact(artifact_id: &str, kind: ArtifactKind) -> ArtifactRef {
         content_type: Some("application/json".to_string()),
         byte_len: Some(128),
         retention_class: Some("standard".to_string()),
+        encryption: None,
         redaction: RedactionStatus::ReferenceOnly,
         created_at: AgentTimestampMillis::new(123),
         metadata: BTreeMap::new(),

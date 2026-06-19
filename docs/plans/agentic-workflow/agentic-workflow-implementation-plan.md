@@ -787,6 +787,22 @@ Acceptance:
 - Large model/tool payloads are represented by refs and can be correlated from
   audit events, logs, and workflow state.
 
+Implementation notes:
+
+- Added an artifact policy module with validation for artifact references,
+  inline state size limits, effect references, run-state references, and audit
+  artifact correlation.
+- Extended `ArtifactRef` with typed optional encryption metadata while keeping
+  storage application-owned for v1.
+- Added `AgentArtifactStore` and deterministic in-memory testkit support so
+  examples and future harnesses can exercise artifact reads/writes without
+  choosing a production object store.
+- Added default hot-state policy that rejects large inline run state unless an
+  explicit policy raises the limit.
+- Phase 3 is complete after this slice: timers, dispatcher fleet, human
+  checkpoints, model/tool adapters, and artifact reference policy are now in
+  place.
+
 ## Phase 4: OpenTelemetry Observability and Audit
 
 Goal: make agent workflow execution observable across process, pod, durable

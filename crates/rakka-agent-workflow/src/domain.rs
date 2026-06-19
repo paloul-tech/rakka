@@ -678,12 +678,44 @@ pub struct ArtifactRef {
     pub byte_len: Option<u64>,
     /// Retention class selected by application policy.
     pub retention_class: Option<String>,
+    /// Optional encryption metadata for application-owned storage.
+    pub encryption: Option<ArtifactEncryptionRef>,
     /// Redaction status.
     pub redaction: RedactionStatus,
     /// Artifact creation timestamp.
     pub created_at: AgentTimestampMillis,
     /// Bounded artifact metadata.
     pub metadata: AgentAttributes,
+}
+
+/// Encryption metadata for an artifact reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactEncryptionRef {
+    /// Encryption algorithm or policy name.
+    pub algorithm: String,
+    /// Application-owned key reference, such as a KMS key URI.
+    pub key_ref: String,
+    /// Bounded encryption context metadata.
+    pub context: AgentAttributes,
+}
+
+impl ArtifactEncryptionRef {
+    /// Creates encryption metadata for an artifact reference.
+    #[must_use]
+    pub fn new(algorithm: impl Into<String>, key_ref: impl Into<String>) -> Self {
+        Self {
+            algorithm: algorithm.into(),
+            key_ref: key_ref.into(),
+            context: AgentAttributes::new(),
+        }
+    }
+
+    /// Adds bounded encryption context metadata.
+    #[must_use]
+    pub fn context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.context.insert(key.into(), value.into());
+        self
+    }
 }
 
 /// Artifact categories expected by agent workflows.
@@ -712,6 +744,25 @@ pub enum ArtifactKind {
     Other,
 }
 
+impl ArtifactKind {
+    /// Stable lowercase label for telemetry, logs, and storage policy.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Prompt => "prompt",
+            Self::Completion => "completion",
+            Self::File => "file",
+            Self::Embedding => "embedding",
+            Self::ToolOutput => "tool-output",
+            Self::Screenshot => "screenshot",
+            Self::Log => "log",
+            Self::State => "state",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Redaction status for payloads, artifacts, logs, and audit records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -724,6 +775,19 @@ pub enum RedactionStatus {
     Redacted,
     /// Payload is represented only by a reference.
     ReferenceOnly,
+}
+
+impl RedactionStatus {
+    /// Stable lowercase label for telemetry, logs, and storage policy.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Unredacted => "unredacted",
+            Self::Redacted => "redacted",
+            Self::ReferenceOnly => "reference-only",
+        }
+    }
 }
 
 /// Serializable trace, baggage, and span-link context.
