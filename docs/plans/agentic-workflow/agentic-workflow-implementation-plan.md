@@ -1441,6 +1441,8 @@ by teams that did not build it.
 
 ### Slice 7.1: Failure-Injection Suite
 
+Status: implemented.
+
 Scope:
 
 - Test crashes after inbox acceptance, after effect scheduling, after marking
@@ -1460,6 +1462,23 @@ Acceptance:
 
 - Every documented reliability guarantee and non-guarantee has at least one
   test or example.
+
+Implementation notes:
+
+- Added `failure_injection` integration tests in `rakka-agent-workflow` that
+  simulate process/pod crashes by dropping and recreating facades over shared
+  durable stores.
+- Covered crash after inbox acceptance, crash after effect scheduling, crash
+  after external result before success persistence, human checkpoint recovery
+  after runtime restart, timer firing after scanner restart, lease-loss
+  fencing, duplicate command/timer/decision delivery, and model-provider
+  timeout mapping.
+- Added `phase-7-1-failure-injection-suite.md` with the reliability boundary
+  matrix, mapping every planned Slice 7.1 failure to a deterministic test or
+  gated example.
+- Captured repeatable commands for local deterministic tests, sharding feature
+  tests, PostgreSQL-backed revision-conflict tests, remote delivery failures,
+  process restart-budget exhaustion, and optional multi-process compatibility.
 
 ### Slice 7.2: Load, Back-Pressure, and Cardinality
 

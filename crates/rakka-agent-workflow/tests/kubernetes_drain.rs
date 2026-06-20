@@ -1,6 +1,6 @@
-#![cfg(feature = "k8s")]
-
 //! Kubernetes drain and shutdown tests for agent workflows.
+
+#![cfg(feature = "k8s")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

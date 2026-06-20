@@ -1,6 +1,6 @@
-#![cfg(feature = "k8s")]
-
 //! Kubernetes startup and readiness tests for agent workflows.
+
+#![cfg(feature = "k8s")]
 
 use std::time::Duration;
 
