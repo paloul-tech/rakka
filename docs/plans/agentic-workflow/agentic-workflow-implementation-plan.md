@@ -1593,6 +1593,8 @@ Implementation notes:
 
 ### Slice 7.5: Production Candidate Gate
 
+Status: implemented.
+
 Scope:
 
 - Finalize docs, examples, tests, feature flags, and release notes for the
@@ -1608,6 +1610,29 @@ Acceptance:
 
 - The release candidate demonstrates durable long-running workflows at local,
   multi-process, PostgreSQL-backed, and Kubernetes-reference levels.
+
+Implementation notes:
+
+- Added `phase-7-5-production-candidate-gate.md` with the final Phase 7
+  release position, gate inputs, required local validation commands, example
+  acceptance matrix, optional Kubernetes cluster gates, release checklist,
+  known limitations, non-goals, and Phase 7 finalization guidance.
+- Added a root README pointer to `docs/plans/agentic-workflow/` so the agent
+  workflow spec, implementation plan, Kubernetes manifests, OpenTelemetry
+  topology, runbooks, dashboard guidance, and production-candidate support
+  material are discoverable from the repository front door.
+- Added `production_candidate_gate` integration tests that keep the gate tied
+  to the local example, failure/load/API/runbook tests, PostgreSQL checks,
+  multi-process compatibility command, Kubernetes topology checks,
+  OpenTelemetry Collector validation, security policy validation, known
+  limitations, no-publishing boundary, and root README pointer.
+
+Phase 7 status:
+
+- Complete. Production hardening now has failure-injection coverage,
+  load/back-pressure/cardinality coverage, API compatibility coverage,
+  operational runbooks and dashboard guidance, and a production-candidate gate
+  for deciding between preview and production-candidate release posture.
 
 ## Suggested Sequencing
 
