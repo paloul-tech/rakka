@@ -1521,6 +1521,8 @@ Implementation notes:
 
 ### Slice 7.3: API Review and Compatibility
 
+Status: implemented.
+
 Scope:
 
 - Review public agent workflow APIs, error codes, feature flags, docs, and
@@ -1537,6 +1539,22 @@ Acceptance:
 
 - Additive changes are clearly separated from breaking changes.
 - Rolling-update compatibility expectations are test-backed.
+
+Implementation notes:
+
+- Added `api_compatibility` integration tests in `rakka-agent-workflow` that
+  cover public root re-exports, feature-gated Kubernetes API exports, command
+  and effect JSON wire contracts, durable run-state N/N+1 migration policy,
+  trace context metadata, query index projections, additive feature flags, and
+  Kubernetes reference-topology compatibility metadata.
+- Verified additive JSON fields are accepted by current readers while missing
+  required command, effect, and durable-state fields fail closed as breaking
+  schema changes.
+- Verified query index projections for runs, timers, and dispatcher entries
+  remain queryable through bounded query APIs.
+- Added `phase-7-3-api-review-compatibility.md` with the API review, additive
+  vs breaking compatibility rules, test matrix, versioning notes, and
+  production rollout interpretation.
 
 ### Slice 7.4: Operational Runbooks and Dashboards
 
