@@ -1482,6 +1482,8 @@ Implementation notes:
 
 ### Slice 7.2: Load, Back-Pressure, and Cardinality
 
+Status: implemented.
+
 Scope:
 
 - Run high-volume workflows with bounded mailbox sizes, dispatcher concurrency,
@@ -1498,6 +1500,24 @@ Acceptance:
 
 - Work queues apply back-pressure instead of unbounded memory growth.
 - Metrics remain bounded under large run counts.
+
+Implementation notes:
+
+- Added `load_backpressure_cardinality` integration tests in
+  `rakka-agent-workflow` with deterministic local load scenarios for dispatcher
+  backlog, timer backlog, query view limits, bounded dispatcher snapshots, and
+  hot metric cardinality.
+- Dispatcher load now verifies target-concurrency limits, backlog reporting,
+  bounded sampled snapshots, and low-cardinality dispatcher metric series under
+  many due effects.
+- Timer load now verifies scanner `max_batch_size`, `backpressure_limited`
+  reporting, durable resume behavior, remaining backlog counts, and bounded
+  timer/inbox metric labels under many due timers.
+- Query load now verifies capped operator result sets over a larger indexed run
+  population and preserves rejection for invalid zero limits.
+- Added `phase-7-2-load-backpressure-cardinality.md` with the load matrix,
+  repeatable commands, tuning notes, cardinality policy, and production testing
+  boundaries for future Kubernetes and PostgreSQL load work.
 
 ### Slice 7.3: API Review and Compatibility
 
