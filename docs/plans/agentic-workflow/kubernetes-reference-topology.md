@@ -70,7 +70,8 @@ complete startup order is captured in `kubernetes-startup-readiness.md`, and
 the drain/shutdown order is captured in `kubernetes-drain-shutdown.md`.
 Autoscaling metric signals are captured in
 `kubernetes-autoscaling-signals.md`. The OpenTelemetry Collector topology is
-captured in `kubernetes-otel-collector-topology.md`.
+captured in `kubernetes-otel-collector-topology.md`. The deployment security
+envelope and policy checklist are captured in `kubernetes-security-policy.md`.
 
 ## Service Boundaries
 
@@ -97,6 +98,19 @@ The manifest models object storage as S3-compatible configuration:
 The endpoint is a placeholder for local MinIO or a production object store.
 Phase 6.6 should lock down credentials, network policy, and tool-access
 boundaries.
+
+## Security Envelope
+
+The runtime ServiceAccount does not mount a Kubernetes API token by default.
+The Deployment uses non-root pods, `RuntimeDefault` seccomp, no container
+privilege escalation, dropped Linux capabilities, and a read-only root
+filesystem. Process/tool execution defaults require explicit allowlists and do
+not inherit the ambient environment.
+
+Apply `kubernetes-security-policy.yaml` after the runtime and Collector
+topologies to start from default-deny NetworkPolicy and reopen only the public
+API, internal remoting, PostgreSQL, artifact-store, DNS, and Collector traffic
+lanes described in `kubernetes-security-policy.md`.
 
 ## Compatibility And Migration
 
@@ -144,6 +158,9 @@ The current names should become chart values:
 - `otel.collector.agent.enabled`, `otel.collector.gateway.enabled`.
 - `otel.collector.gateway.replicaCount`.
 - `otel.collector.gateway.backend.endpoint`.
+- `security.networkPolicy.enabled`.
+- `security.serviceAccount.automountToken`.
+- `security.podSecurity.readOnlyRootFilesystem`.
 - `service.public.name`, `service.internal.name`.
 - `ports.http`, `ports.grpc`, `ports.remoting`.
 - `compat.protocolVersion`, `compat.min`, `compat.max`.

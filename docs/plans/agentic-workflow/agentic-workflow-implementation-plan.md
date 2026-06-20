@@ -1389,6 +1389,8 @@ Implementation notes:
 
 ### Slice 6.6: Security and Policy Envelope
 
+Status: implemented.
+
 Scope:
 
 - Document required authN/authZ boundaries for public APIs and human approval
@@ -1407,6 +1409,30 @@ Acceptance:
 
 - The reference deployment does not imply public access to internal remoting or
   unsafe tool execution defaults.
+
+Implementation notes:
+
+- Added `kubernetes-security-policy.md` with the deployment security boundary
+  model for public APIs, human checkpoints, internal remoting, PostgreSQL,
+  OpenTelemetry Collector access, secrets, service accounts, pod security,
+  tool/process execution, telemetry, audit, and operational endpoints.
+- Added `kubernetes-security-policy.yaml` with a default-deny NetworkPolicy
+  envelope for `rakka-system`, then explicit lanes for DNS, public ingress,
+  internal remoting, PostgreSQL, artifact storage, Rakka-to-Collector export,
+  Collector gateway intake/export, and Collector agent kubelet/API access.
+- Hardened the Rakka app reference topology so the runtime ServiceAccount and
+  Pod do not mount Kubernetes API tokens by default, and the container drops
+  Linux capabilities, disallows privilege escalation, and uses a read-only root
+  filesystem.
+- Hardened Collector agent and gateway containers with dropped capabilities,
+  no privilege escalation, and read-only root filesystems while keeping the
+  intentional Collector RBAC exception for Kubernetes metadata enrichment.
+- Linked the security envelope from the reference topology guide and added
+  future Helm value names for NetworkPolicy, service-account token mounting,
+  and pod-security settings.
+- Added `agent_workflow_security_policy` contract tests to validate the policy
+  manifest, docs, service boundaries, tool/process defaults, app pod hardening,
+  Collector RBAC, and optional `kubectl apply --dry-run=client` validation.
 
 ## Phase 7: Production Hardening and Release Readiness
 

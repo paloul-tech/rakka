@@ -27,6 +27,7 @@ metadata:
     app.kubernetes.io/name: rakka-agent-workflow
     app.kubernetes.io/part-of: rakka
     app.kubernetes.io/component: agent-runtime
+automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -240,6 +241,7 @@ spec:
         rakka.rs/generated-api-version: "1.0"
     spec:
       serviceAccountName: rakka-agent-workflow
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
@@ -249,6 +251,12 @@ spec:
         - name: rakka-agent-workflow
           image: ghcr.io/rakka-rs/rakka-agent-workflow:0.1.0
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - name: remoting
               containerPort: 2552

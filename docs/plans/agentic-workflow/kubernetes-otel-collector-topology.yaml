@@ -368,6 +368,12 @@ spec:
         - name: otel-collector
           image: otel/opentelemetry-collector-contrib:0.107.0
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           args:
             - --config=/conf/collector.yaml
           env:
@@ -456,6 +462,12 @@ spec:
         - name: otel-collector
           image: otel/opentelemetry-collector-contrib:0.107.0
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           args:
             - --config=/conf/collector.yaml
           env:

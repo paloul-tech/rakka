@@ -176,6 +176,7 @@ fn topology_readme_explains_local_runtime_and_helm_path() {
         "kubernetes-drain-shutdown.md",
         "kubernetes-autoscaling-signals.md",
         "kubernetes-otel-collector-topology.md",
+        "kubernetes-security-policy.md",
         "Service Boundaries",
         "Object Storage",
         "Compatibility And Migration",
