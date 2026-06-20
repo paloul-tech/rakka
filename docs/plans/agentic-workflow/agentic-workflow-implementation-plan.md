@@ -1343,6 +1343,8 @@ Implementation notes:
 
 ### Slice 6.5: OpenTelemetry Collector Topology
 
+Status: implemented.
+
 Scope:
 
 - Provide Collector DaemonSet guidance for local pod/node/container telemetry
@@ -1361,6 +1363,29 @@ Acceptance:
 - Rakka app pods can export OTLP telemetry to a local or gateway Collector
   endpoint with service, pod, namespace, deployment, node, container, and Rakka
   node attributes present.
+
+Implementation notes:
+
+- Added `kubernetes-otel-collector-topology.yaml` with a `rakka-system`
+  OpenTelemetry Collector topology: shared RBAC, node-agent DaemonSet,
+  gateway Deployment, agent/gateway Services, Collector ConfigMaps, and a
+  gateway PodDisruptionBudget.
+- The node-agent Collector accepts OTLP, collects kubelet node/pod/container
+  metrics and host metrics, enriches Kubernetes metadata, and forwards all
+  signals to the gateway Collector with retry and bounded queueing.
+- The gateway Collector provides the stable application OTLP endpoint,
+  memory limiting, Kubernetes and Rakka resource enrichment, redaction,
+  trace sampling, batching, local debug export, and a backend OTLP exporter
+  placeholder.
+- Added `kubernetes-otel-collector-topology.md` documenting the runtime shape,
+  resource attribute contract, local validation, Collector scaling signals,
+  future Helm values, and Slice 6.6 security follow-ups.
+- Updated the application reference topology so `OTEL_RESOURCE_ATTRIBUTES`
+  includes `container.name` alongside service, namespace, pod, deployment,
+  node, and Rakka node attributes.
+- Added `agent_workflow_otel_collector_topology` manifest contract tests and
+  expanded existing topology/OTLP tests to guard the Collector topology and
+  resource enrichment contract.
 
 ### Slice 6.6: Security and Policy Envelope
 

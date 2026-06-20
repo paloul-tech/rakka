@@ -110,6 +110,7 @@ fn topology_defines_agent_workflow_runtime_contract() {
         "OTEL_RESOURCE_ATTRIBUTES",
         "k8s.namespace.name=$(RAKKA_NAMESPACE)",
         "k8s.pod.name=$(RAKKA_POD_NAME)",
+        "container.name=rakka-agent-workflow",
         "rakka.node.id=$(RAKKA_NODE_ID)",
     ] {
         assert!(
@@ -174,6 +175,7 @@ fn topology_readme_explains_local_runtime_and_helm_path() {
         "kubernetes-startup-readiness.md",
         "kubernetes-drain-shutdown.md",
         "kubernetes-autoscaling-signals.md",
+        "kubernetes-otel-collector-topology.md",
         "Service Boundaries",
         "Object Storage",
         "Compatibility And Migration",

@@ -19,7 +19,8 @@ Helm-style templates later.
 - Local PostgreSQL DSN:
   `postgres://postgres:postgres@rakka-postgres.rakka-system.svc.cluster.local:5432/postgres`.
 - OTLP endpoint:
-  `http://rakka-otel-collector.rakka-system.svc.cluster.local:4317`.
+  `http://rakka-otel-collector.rakka-system.svc.cluster.local:4317`, backed by
+  the gateway Collector in `kubernetes-otel-collector-topology.md`.
 - Default app image placeholder:
   `ghcr.io/rakka-rs/rakka-agent-workflow:0.1.0`.
 
@@ -53,6 +54,13 @@ The application image should expose:
 - Public gRPC on port `50051`, when the application enables gRPC.
 - Internal Rakka remoting on port `2552`.
 
+The pod resource attribute contract should include `service.name`,
+`service.namespace`, `service.version`, `deployment.environment.name`,
+`k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.node.name`,
+`k8s.deployment.name`, `container.name`, and `rakka.node.id` so the
+OpenTelemetry Collector can enrich and route telemetry without relying only on
+connection metadata.
+
 Readiness should stay false until the telemetry resource, OTLP exporter,
 PostgreSQL stores, durable state, query indexes, artifact-store configuration,
 actor system, remoting, sharding, workflow registry, snapshots, and
@@ -61,7 +69,8 @@ readiness false before stopping ingress or handing off workflow work. The
 complete startup order is captured in `kubernetes-startup-readiness.md`, and
 the drain/shutdown order is captured in `kubernetes-drain-shutdown.md`.
 Autoscaling metric signals are captured in
-`kubernetes-autoscaling-signals.md`.
+`kubernetes-autoscaling-signals.md`. The OpenTelemetry Collector topology is
+captured in `kubernetes-otel-collector-topology.md`.
 
 ## Service Boundaries
 
@@ -132,6 +141,9 @@ The current names should become chart values:
 - `postgres.externalName`, `postgres.port`, `postgres.secretName`.
 - `artifactStore.kind`, `artifactStore.endpoint`, `artifactStore.bucket`.
 - `otel.endpoint`, `otel.protocol`.
+- `otel.collector.agent.enabled`, `otel.collector.gateway.enabled`.
+- `otel.collector.gateway.replicaCount`.
+- `otel.collector.gateway.backend.endpoint`.
 - `service.public.name`, `service.internal.name`.
 - `ports.http`, `ports.grpc`, `ports.remoting`.
 - `compat.protocolVersion`, `compat.min`, `compat.max`.

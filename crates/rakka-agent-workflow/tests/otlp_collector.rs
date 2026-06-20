@@ -222,6 +222,44 @@ fn collector_config_example_defines_three_otlp_pipelines() {
     assert!(config.contains("exporters: [debug]"));
 }
 
+#[test]
+fn kubernetes_collector_topology_defines_agent_gateway_and_resource_enrichment() {
+    let topology = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/plans/agentic-workflow/kubernetes-otel-collector-topology.yaml"
+    ));
+
+    for expected in [
+        "kind: DaemonSet",
+        "name: rakka-otel-agent",
+        "kind: Deployment",
+        "name: rakka-otel-gateway",
+        "kind: Service",
+        "name: rakka-otel-collector",
+        "rakka-otel-agent-config",
+        "rakka-otel-gateway-config",
+        "kubeletstats:",
+        "hostmetrics:",
+        "k8sattributes:",
+        "k8s.namespace.name",
+        "k8s.pod.name",
+        "k8s.pod.uid",
+        "k8s.node.name",
+        "k8s.deployment.name",
+        "container.name",
+        "service.namespace",
+        "deployment.environment.name",
+        "otlp/gateway:",
+        "otlp/primary:",
+        "transform/redact:",
+        "probabilistic_sampler:",
+        "sending_queue:",
+        "retry_on_failure:",
+    ] {
+        assert!(topology.contains(expected), "topology missing {expected}");
+    }
+}
+
 fn resource() -> AgentOtelResource {
     AgentOtelResource::new("rakka-agent-workflow")
         .service_namespace("rakka")

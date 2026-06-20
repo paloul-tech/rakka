@@ -308,7 +308,7 @@ spec:
                   name: rakka-artifact-store-credentials
                   key: secret-access-key
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: service.name=rakka-agent-workflow,service.namespace=rakka-system,service.version=0.1.0,deployment.environment.name=local,k8s.namespace.name=$(RAKKA_NAMESPACE),k8s.pod.name=$(RAKKA_POD_NAME),k8s.pod.uid=$(RAKKA_POD_UID),k8s.node.name=$(RAKKA_NODE_NAME),k8s.deployment.name=rakka-agent-workflow,rakka.node.id=$(RAKKA_NODE_ID)
+              value: service.name=rakka-agent-workflow,service.namespace=rakka-system,service.version=0.1.0,deployment.environment.name=local,k8s.namespace.name=$(RAKKA_NAMESPACE),k8s.pod.name=$(RAKKA_POD_NAME),k8s.pod.uid=$(RAKKA_POD_UID),k8s.node.name=$(RAKKA_NODE_NAME),k8s.deployment.name=rakka-agent-workflow,container.name=rakka-agent-workflow,rakka.node.id=$(RAKKA_NODE_ID)
           readinessProbe:
             httpGet:
               path: /ready
