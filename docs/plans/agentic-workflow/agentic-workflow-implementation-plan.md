@@ -1558,6 +1558,8 @@ Implementation notes:
 
 ### Slice 7.4: Operational Runbooks and Dashboards
 
+Status: implemented.
+
 Scope:
 
 - Document how to inspect waiting runs, stuck dispatchers, overdue timers,
@@ -1574,6 +1576,20 @@ Acceptance:
 
 - An operator can diagnose a failed or stuck workflow using metrics, traces,
   logs, audit events, snapshots, and query indexes.
+
+Implementation notes:
+
+- Added `phase-7-4-operational-runbooks-dashboards.md` with backend-neutral
+  operator entry points, first-ten-minutes triage, runbooks for waiting runs,
+  stuck dispatchers, overdue timers, failed effects, duplicate callbacks,
+  human checkpoint age, and drain blockers.
+- Added dashboard panel recommendations, metric/span/log/audit field catalogs,
+  snapshot names, PostgreSQL query-index tables, alert recommendations, and
+  escalation boundaries.
+- Added `operational_runbooks` integration tests that keep the runbook tied to
+  real metric constants, snapshot names, structured log attributes, query API
+  names, Kubernetes commands, PostgreSQL table names, and required incident
+  sections.
 
 ### Slice 7.5: Production Candidate Gate
 
