@@ -19,8 +19,8 @@ pub use inbox::{
 pub use model::{
     DeduplicationKey, InboxEntry, InboxStatus, OutboxEntry, OutboxFailureTransition,
     OutboxMessageId, OutboxStatus, OutboxTarget, RetryAttempt, RetryJitter, RetryPolicy,
-    WorkflowId, WorkflowMessageId, WorkflowState, WorkflowStatus, WorkflowTelemetryEvent,
-    WorkflowTimestamp,
+    WorkflowId, WorkflowMessageId, WorkflowState, WorkflowStateCompactionPolicy,
+    WorkflowStateCompactionReport, WorkflowStatus, WorkflowTelemetryEvent, WorkflowTimestamp,
 };
 
 /// Crate name used in diagnostics.

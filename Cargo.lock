@@ -962,6 +962,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rakka"
 version = "0.1.0"
 dependencies = [
+ "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",
  "rakka-grpc",
@@ -974,6 +975,28 @@ dependencies = [
  "rakka-stream",
  "rakka-testkit",
  "rakka-workflow",
+]
+
+[[package]]
+name = "rakka-agent-workflow"
+version = "0.1.0"
+dependencies = [
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-grpc",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-persistence",
+ "rakka-persistence-postgres",
+ "rakka-process",
+ "rakka-sharding",
+ "rakka-sharding-postgres",
+ "rakka-testkit",
+ "rakka-workflow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -1126,6 +1149,18 @@ name = "rakka-example-local-receptionist-router"
 version = "0.1.0"
 dependencies = [
  "rakka",
+ "tokio",
+]
+
+[[package]]
+name = "rakka-example-minimal-local-agent-workflow"
+version = "0.1.0"
+dependencies = [
+ "rakka-agent-workflow",
+ "rakka-core",
+ "rakka-persistence",
+ "rakka-workflow",
+ "serde_json",
  "tokio",
 ]
 

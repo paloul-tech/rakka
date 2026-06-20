@@ -153,6 +153,12 @@ pub mod actor {
     pub use rakka_core::*;
 }
 
+#[cfg(feature = "agent-workflow")]
+/// Agentic workflow orchestration facade.
+pub mod agent_workflow {
+    pub use rakka_agent_workflow::*;
+}
+
 #[cfg(feature = "cluster")]
 /// Cluster membership and discovery primitives.
 pub mod cluster {

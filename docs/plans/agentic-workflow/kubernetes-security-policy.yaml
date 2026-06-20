@@ -1,0 +1,313 @@
+# Rakka agent workflow Kubernetes security policy envelope.
+#
+# This manifest is intentionally conservative guidance, not a complete
+# production security program. It assumes namespace rakka-system and starts
+# from default-deny ingress/egress, then opens only the reference topology
+# ports needed by Rakka pods, PostgreSQL, object storage, and the Collector.
+#
+# Notes:
+# - Docker Desktop may accept these NetworkPolicies without enforcing them.
+# - Native Kubernetes NetworkPolicy cannot match HTTP paths or DNS names.
+# - Production clusters should replace broad ipBlocks with private endpoint
+#   CIDRs, cloud security groups, service mesh policy, or CNI-specific FQDN
+#   policy where available.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-default-deny-ingress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/part-of: rakka
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-default-deny-egress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/part-of: rakka
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-allow-dns-egress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/part-of: rakka
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-public-api-ingress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: public-api
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              rakka.rs/ingress: public
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: ingress-controller
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: public-ingress
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 50051
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-agent-remoting
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: internal-remoting
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-agent-workflow
+              app.kubernetes.io/component: agent-runtime
+      ports:
+        - protocol: TCP
+          port: 2552
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-agent-workflow
+              app.kubernetes.io/component: agent-runtime
+      ports:
+        - protocol: TCP
+          port: 2552
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-agent-postgres-egress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: postgres
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-agent-artifact-egress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: artifact-store
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-object-store
+              app.kubernetes.io/component: artifact-store
+      ports:
+        - protocol: TCP
+          port: 9000
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-agent-otel-egress
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-agent-workflow
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-agent-workflow
+      app.kubernetes.io/component: agent-runtime
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-otel-gateway
+              app.kubernetes.io/component: observability-gateway
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-otel-gateway
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-gateway
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-gateway
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-otel-gateway
+      app.kubernetes.io/component: observability-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-agent-workflow
+              app.kubernetes.io/component: agent-runtime
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-otel-agent
+              app.kubernetes.io/component: observability-agent
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rakka-otel-agent
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-agent
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-agent
+    rakka.rs/policy: security-envelope
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-otel-agent
+      app.kubernetes.io/component: observability-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-agent-workflow
+              app.kubernetes.io/component: agent-runtime
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rakka-otel-gateway
+              app.kubernetes.io/component: observability-gateway
+      ports:
+        - protocol: TCP
+          port: 4317
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 10250

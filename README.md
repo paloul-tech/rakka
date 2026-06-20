@@ -25,6 +25,7 @@ The current repository state is a v1 release-candidate foundation: local typed a
 - `docs/rakka-akka-parity-phase-2-actor-facade.md` for the actor facade, context ergonomics, testkit probes, and async closure tradeoffs.
 - `docs/rakka-akka-parity-phase-5-cluster-receptionist-routers.md` for the Akka parity cluster extension, receptionist, router, and testkit guide.
 - `docs/rakka-akka-parity-phase-6-streams.md` for the Akka-shaped bounded stream facade, process IO migration, and stream testkit probes.
+- `docs/plans/agentic-workflow/` for the agent workflow spec, implementation plan, Kubernetes manifests, OpenTelemetry Collector topology, runbooks, dashboard guidance, and production-candidate support material.
 
 Historical implementation plans live in `docs/plans/`.
 

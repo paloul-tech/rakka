@@ -1,0 +1,527 @@
+# Rakka agent workflow OpenTelemetry Collector topology.
+#
+# Local defaults:
+# - namespace: rakka-system
+# - app pods export OTLP to: rakka-otel-collector.rakka-system.svc.cluster.local:4317
+# - DaemonSet collectors enrich node/pod/container telemetry and forward to gateway
+# - gateway collectors batch, redact/filter, sample, and route to local debug and backend OTLP
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rakka-system
+  labels:
+    app.kubernetes.io/part-of: rakka
+    rakka.rs/topology: agent-workflow-otel
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rakka-otel-collector
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-collector
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rakka-otel-collector
+  labels:
+    app.kubernetes.io/name: rakka-otel-collector
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/stats"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rakka-otel-collector
+  labels:
+    app.kubernetes.io/name: rakka-otel-collector
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rakka-otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: rakka-otel-collector
+    namespace: rakka-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-otel-agent-config
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-agent
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-agent
+data:
+  collector.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      kubeletstats:
+        collection_interval: 20s
+        auth_type: serviceAccount
+        endpoint: https://${env:K8S_NODE_IP}:10250
+        insecure_skip_verify: true
+        metric_groups: [node, pod, container]
+      hostmetrics:
+        collection_interval: 20s
+        scrapers:
+          cpu: {}
+          memory: {}
+          filesystem: {}
+          network: {}
+          load: {}
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.node.name
+            - k8s.deployment.name
+            - container.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: connection
+      resource/rakka:
+        attributes:
+          - key: service.namespace
+            value: rakka-system
+            action: upsert
+          - key: deployment.environment.name
+            value: local
+            action: upsert
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+
+    exporters:
+      otlp/gateway:
+        endpoint: rakka-otel-collector.rakka-system.svc.cluster.local:4317
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 2048
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 5s
+          max_elapsed_time: 30s
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, batch]
+          exporters: [otlp/gateway]
+        metrics:
+          receivers: [otlp, kubeletstats, hostmetrics]
+          processors: [memory_limiter, k8sattributes, resource/rakka, batch]
+          exporters: [otlp/gateway]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, batch]
+          exporters: [otlp/gateway]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-otel-gateway-config
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-gateway
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-gateway
+data:
+  collector.yaml: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 20
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.node.name
+            - k8s.deployment.name
+            - container.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.ip
+          - sources:
+              - from: connection
+      resource/rakka:
+        attributes:
+          - key: service.namespace
+            value: rakka-system
+            action: upsert
+          - key: deployment.environment.name
+            value: local
+            action: upsert
+      transform/redact:
+        error_mode: ignore
+        trace_statements:
+          - context: span
+            statements:
+              - delete_key(attributes, "prompt_text")
+              - delete_key(attributes, "completion_text")
+              - delete_key(attributes, "tool_arguments")
+              - delete_key(attributes, "tool_output")
+              - delete_key(attributes, "artifact_uri")
+        log_statements:
+          - context: log
+            statements:
+              - delete_key(attributes, "prompt_text")
+              - delete_key(attributes, "completion_text")
+              - delete_key(attributes, "tool_arguments")
+              - delete_key(attributes, "tool_output")
+              - delete_key(attributes, "authorization")
+        metric_statements:
+          - context: datapoint
+            statements:
+              - delete_key(attributes, "workflow_id")
+              - delete_key(attributes, "run_id")
+              - delete_key(attributes, "command_id")
+              - delete_key(attributes, "effect_id")
+              - delete_key(attributes, "correlation_id")
+      probabilistic_sampler:
+        sampling_percentage: 100
+      batch:
+        timeout: 5s
+        send_batch_size: 2048
+
+    exporters:
+      debug:
+        verbosity: basic
+      otlp/primary:
+        endpoint: ${env:RAKKA_OTEL_BACKEND_OTLP_ENDPOINT}
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          queue_size: 4096
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 10s
+          max_elapsed_time: 60s
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, transform/redact, probabilistic_sampler, batch]
+          exporters: [debug, otlp/primary]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, transform/redact, batch]
+          exporters: [debug, otlp/primary]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resource/rakka, transform/redact, batch]
+          exporters: [debug, otlp/primary]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-otel-agent
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-agent
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-agent
+spec:
+  selector:
+    app.kubernetes.io/name: rakka-otel-agent
+    app.kubernetes.io/component: observability-agent
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: health
+      port: 13133
+      targetPort: health
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-otel-collector
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-gateway
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rakka-otel-gateway
+    app.kubernetes.io/component: observability-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: health
+      port: 13133
+      targetPort: health
+    - name: metrics
+      port: 8888
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rakka-otel-agent
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-agent
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-otel-agent
+      app.kubernetes.io/component: observability-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-otel-agent
+        app.kubernetes.io/part-of: rakka
+        app.kubernetes.io/component: observability-agent
+      annotations:
+        rakka.rs/collector-role: node-agent
+    spec:
+      serviceAccountName: rakka-otel-collector
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.107.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --config=/conf/collector.yaml
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: K8S_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              hostPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+              hostPort: 4318
+            - name: health
+              containerPort: 13133
+            - name: metrics
+              containerPort: 8888
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: collector-config
+              mountPath: /conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: collector-config
+          configMap:
+            name: rakka-otel-agent-config
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rakka-otel-gateway
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-gateway
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-gateway
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-otel-gateway
+      app.kubernetes.io/component: observability-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-otel-gateway
+        app.kubernetes.io/part-of: rakka
+        app.kubernetes.io/component: observability-gateway
+      annotations:
+        rakka.rs/collector-role: gateway
+    spec:
+      serviceAccountName: rakka-otel-collector
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.107.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - --config=/conf/collector.yaml
+          env:
+            - name: RAKKA_OTEL_BACKEND_OTLP_ENDPOINT
+              value: otel-backend.rakka-system.svc.cluster.local:4317
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: health
+              containerPort: 13133
+            - name: metrics
+              containerPort: 8888
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: collector-config
+              mountPath: /conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: collector-config
+          configMap:
+            name: rakka-otel-gateway-config
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rakka-otel-gateway
+  namespace: rakka-system
+  labels:
+    app.kubernetes.io/name: rakka-otel-gateway
+    app.kubernetes.io/part-of: rakka
+    app.kubernetes.io/component: observability-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-otel-gateway
+      app.kubernetes.io/component: observability-gateway
