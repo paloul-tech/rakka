@@ -56,6 +56,9 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentCompiledNodeKindDescriptor`
 - `AgentCompiledNodeKindCatalog`
 - `AgentCompiledPlanRuntimeCapabilities`
+- `AgentCompiledIteratorPolicy`
+- `AgentCompiledPortPolicy`
+- `AgentCompiledPlanValidationError`
 - `AgentGraphRunState`
 - `AgentGraphNodeState`
 - `AgentGraphNodeStatus`
@@ -68,6 +71,8 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentCredentialResolver`
 - `AgentCredentialUse`
 - `AgentEphemeralCredential`
+- `validate_compiled_execution_plan`
+- `validate_compiled_execution_plan_with_catalog`
 
 The top-level `rakka` facade should re-export these through
 `rakka::agent_workflow` when the `agent-workflow` feature is enabled.
@@ -165,6 +170,8 @@ Implementation notes:
 
 ### Slice 1.2: Runtime Validation
 
+Status: implemented.
+
 Scope:
 
 - Add runtime node capability discovery with
@@ -205,10 +212,35 @@ Tests:
 - Invalid loop bounds.
 - Missing terminal reachability.
 - Raw secret-like field rejected.
-- Credential binding ref accepted in target metadata but rejected as a metric
-  label.
+- Credential binding ref accepted on the typed node field but rejected as a
+  metric label.
 - Runtime capability catalog lists all supported product-neutral node kinds.
 - Product-specific editor blocks are not represented in the runtime catalog.
+
+Implementation notes:
+
+- Added runtime node capability discovery APIs in
+  `crates/rakka-agent-workflow/src/compiled_plan.rs`:
+  `AgentCompiledNodeKindDescriptor`, `AgentCompiledNodeKindCatalog`,
+  `AgentCompiledPlanRuntimeCapabilities`, and `AgentCompiledPortPolicy`.
+- Added explicit iterator bounds with `AgentCompiledIteratorPolicy`.
+- Added `validate_compiled_execution_plan` and
+  `validate_compiled_execution_plan_with_catalog` with stable
+  `AgentCompiledPlanValidationError::code()` values.
+- Validation now covers required identity fields, duplicate node/edge/port ids,
+  catalog availability, target and credential-binding support, node policy
+  support, port policies, edge endpoint existence, output-to-input direction,
+  terminal reachability, cycle rejection, bounded iterator declarations,
+  branch connected-path declarations, join merge behavior declarations,
+  required input reachability, and bounded/sensitive attribute checks.
+- Re-exported the new validation and catalog APIs through
+  `rakka-agent-workflow`; the top-level `rakka::agent_workflow` facade receives
+  them through its existing wildcard re-export.
+- Expanded
+  `crates/rakka-agent-workflow/tests/compiled_plan_contract.rs` with runtime
+  catalog, validation success, duplicate id, missing node/port, direction
+  mismatch, cycle, iterator bound, unreachable terminal, branch/join
+  declaration, secret-like attribute, and credential-binding label tests.
 
 ### Slice 1.3: Plan Registration And Compatibility
 

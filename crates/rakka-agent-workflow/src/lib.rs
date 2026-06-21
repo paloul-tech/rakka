@@ -86,11 +86,15 @@ pub use checkpoints::{
     human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
 };
 pub use compiled_plan::{
+    validate_compiled_execution_plan, validate_compiled_execution_plan_with_catalog,
     AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior, AgentCompiledExecutionPlan,
-    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledNodeTarget,
+    AgentCompiledIteratorPolicy, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeKindCatalog, AgentCompiledNodeKindDescriptor, AgentCompiledNodeTarget,
     AgentCompiledPlanCompatibility, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
     AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort,
-    AgentCompiledPlanSchemaVersion, AgentCompiledPortDirection, AgentCompiledPortId,
+    AgentCompiledPlanRuntimeCapabilities, AgentCompiledPlanSchemaVersion,
+    AgentCompiledPlanValidationError, AgentCompiledPlanValidationResult,
+    AgentCompiledPortDirection, AgentCompiledPortId, AgentCompiledPortPolicy,
     AgentCredentialBindingRef,
 };
 pub use definition::{
