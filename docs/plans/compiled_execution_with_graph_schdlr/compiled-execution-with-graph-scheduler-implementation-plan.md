@@ -53,6 +53,9 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentCompiledPlanEdge`
 - `AgentCompiledPlanPort`
 - `AgentCompiledNodeKind`
+- `AgentCompiledNodeKindDescriptor`
+- `AgentCompiledNodeKindCatalog`
+- `AgentCompiledPlanRuntimeCapabilities`
 - `AgentGraphRunState`
 - `AgentGraphNodeState`
 - `AgentGraphNodeStatus`
@@ -164,7 +167,15 @@ Implementation notes:
 
 Scope:
 
+- Add runtime node capability discovery with
+  `AgentCompiledNodeKindDescriptor`, `AgentCompiledNodeKindCatalog`, and
+  `AgentCompiledPlanRuntimeCapabilities`.
+- Expose supported product-neutral compiled node kinds, required targets,
+  credential-binding support, policy artifact support, port policy, semantic
+  hints, required runtime features, and current availability.
 - Add `validate_compiled_execution_plan`.
+- Drive node-kind validation from the runtime capability catalog where
+  practical.
 - Validate unique node, edge, and port ids.
 - Validate all edge references.
 - Validate output-to-input port direction.
@@ -177,6 +188,8 @@ Scope:
 
 Acceptance:
 
+- Application backends can discover Rakka runtime node-kind capabilities without
+  treating Rakka as the product editor's node palette.
 - Invalid plans fail before run start.
 - Validation errors expose stable error codes.
 - Deterministic sorting produces a stable validation order.
@@ -194,6 +207,8 @@ Tests:
 - Raw secret-like field rejected.
 - Credential binding ref accepted in target metadata but rejected as a metric
   label.
+- Runtime capability catalog lists all supported product-neutral node kinds.
+- Product-specific editor blocks are not represented in the runtime catalog.
 
 ### Slice 1.3: Plan Registration And Compatibility
 

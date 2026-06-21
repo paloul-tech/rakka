@@ -176,6 +176,37 @@ The application compiler maps product-specific blocks into these runtime
 categories. Product-specific configuration belongs in artifact references or
 bounded attributes, not in custom Rakka enum variants.
 
+### Runtime node capability discovery
+
+Rakka should expose a runtime capability catalog that lets application backends
+discover which compiled node kinds this Rakka runtime understands. This is not
+the product editor's node palette.
+
+The public API should introduce:
+
+- `AgentCompiledNodeKindDescriptor`
+- `AgentCompiledNodeKindCatalog`
+- `AgentCompiledPlanRuntimeCapabilities`
+
+The catalog should describe product-neutral runtime capabilities:
+
+- supported `AgentCompiledNodeKind` values;
+- stable kind labels;
+- whether a node kind requires a logical target;
+- whether a node kind may use a credential binding ref;
+- whether a node kind supports config, retry, timeout, concurrency, approval,
+  or schema artifact refs;
+- expected input and output port policy;
+- whether branch, join, or iterator semantics apply;
+- required Rakka feature flag or runtime capability, when applicable;
+- whether the node kind is available in the current build/configuration.
+
+Application backends can use this catalog to validate compiler output and to
+decide which product nodes to expose. Rakka should not expose product-specific
+blocks such as "Send Slack Message" or "OpenAI Response"; those remain editor
+and compiler concerns that map onto product-neutral runtime node kinds such as
+`ToolCall` or `ModelCall`.
+
 ### Validation rules
 
 Rakka should validate compiled plans before registration or run start:
