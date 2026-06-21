@@ -63,6 +63,11 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphRunState`
 - `AgentGraphNodeState`
 - `AgentGraphNodeStatus`
+- `AgentGraphStateSchemaVersion`
+- `AgentGraphTerminalStatus`
+- `AgentGraphWaitReason`
+- `AgentGraphLoopInstanceState`
+- `AgentGraphBlockedReason`
 - `AgentGraphScheduler`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
@@ -297,10 +302,14 @@ Implementation notes:
 
 ## Phase 2: Durable Graph Run State
 
+Status: in progress.
+
 Goal: persist enough graph state for recovery, passivation, and deterministic
 scheduling.
 
 ### Slice 2.1: Graph State Types
+
+Status: implemented.
 
 Scope:
 
@@ -326,6 +335,28 @@ Tests:
 - Graph state JSON round trip.
 - Bounded inline state policy remains enforced.
 - High-cardinality fields remain out of metric label helpers.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/graph_state.rs` with serializable
+  durable graph state contracts.
+- Defined `AgentGraphRunState`, `AgentGraphNodeState`, and
+  `AgentGraphNodeStatus`, plus supporting schema, terminal status, wait reason,
+  loop instance, and blocked reason contracts.
+- Graph run state tracks compiled plan id/fingerprint, graph schema version,
+  per-node state, selected branch paths, skipped nodes, loop instances, blocked
+  reason, output artifact refs, scheduler revision, last event sequence, and
+  terminal status.
+- Node state tracks node kind, status, attempts, dependency readiness,
+  input/output artifact refs, scheduled effect ids, timer ids, checkpoint ids,
+  wait reason, error code, and timestamps.
+- Re-exported graph state contracts from `rakka-agent-workflow`; the top-level
+  `rakka::agent_workflow` facade receives them through its existing wildcard
+  re-export.
+- Added `crates/rakka-agent-workflow/tests/graph_state_contract.rs` covering
+  JSON round trip, stable status wire names, artifact-ref-only large value
+  surfaces, inline state policy enforcement, and metric-label cardinality
+  separation.
 
 ### Slice 2.2: Additive `AgentRunState` Integration
 

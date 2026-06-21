@@ -25,6 +25,7 @@ pub mod definition;
 pub mod dispatcher;
 pub mod domain;
 pub mod facade;
+pub mod graph_state;
 pub mod inbox;
 #[cfg(feature = "k8s")]
 pub mod kubernetes;
@@ -132,6 +133,11 @@ pub use facade::{
     validate_effect_schedule, AgentCommand, AgentCommandKind, AgentCommandMetadata,
     AgentDurabilityMetadata, AgentEffectMetadata, AgentEffectSchedule, AgentFacadeError,
     AgentFacadeResult,
+};
+pub use graph_state::{
+    AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeState,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphStateSchemaVersion,
+    AgentGraphTerminalStatus, AgentGraphWaitReason, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
