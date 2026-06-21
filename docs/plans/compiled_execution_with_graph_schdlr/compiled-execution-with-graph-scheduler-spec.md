@@ -59,6 +59,9 @@ compiled plan is a durable runtime contract, not an editor document.
 - Do not make Rakka own trigger registration, public webhook routing, cron
   management, or API gateway behavior.
 - Do not store raw credentials, provider tokens, or secret material in Rakka.
+- Do not persist resolved credential values in compiled plans, durable graph
+  state, durable outbox entries, runtime events, logs, metrics, snapshots, or
+  query indexes.
 - Do not promise exactly-once external side effects. Rakka provides durable
   intent, recovery, idempotency keys, and retry/compensation hooks.
 - Do not support arbitrary cyclic graphs in v1. Iteration must be represented
@@ -123,6 +126,8 @@ An `AgentCompiledPlanNode` should include:
 - optional config artifact reference;
 - timeout, retry, and concurrency policy references;
 - logical target information for effect-producing nodes;
+- optional logical credential binding reference for effect-producing nodes that
+  need third-party credentials;
 - bounded observability labels.
 
 An `AgentCompiledPlanEdge` should include:
@@ -188,6 +193,8 @@ Rakka should validate compiled plans before registration or run start:
 - branch nodes have declared branch outputs and skip propagation behavior;
 - join nodes declare wait-for-all or wait-for-any behavior;
 - effect-producing nodes declare logical targets without raw credentials;
+- credential-using nodes declare only logical credential binding refs, never
+  raw secret material;
 - config, schema, prompt, and payload data use `ArtifactRef` when large or
   sensitive;
 - metric labels are bounded and do not contain ids, prompts, completions,
@@ -369,6 +376,82 @@ The bridge should convert effect-producing nodes into:
 - child workflow start or signal commands for child workflow nodes;
 - audit events for audit nodes.
 
+## Credential References And Secret Resolution
+
+Third-party API credentials are application-owned secret material. They should
+be stored in an application credential service or external secret manager, not
+in the compiled execution plan, durable graph run state, durable outbox entries,
+runtime events, logs, metrics, snapshots, or query indexes.
+
+The public API should introduce:
+
+- `AgentCredentialBindingRef`
+- `AgentCredentialResolver`
+- `AgentCredentialUse`
+- `AgentEphemeralCredential`
+
+`AgentCredentialBindingRef` should be a stable logical reference supplied by
+the application backend. It may identify a tenant-scoped credential binding,
+provider account, OAuth connection, or secret alias, but it must not contain the
+credential value.
+
+Example runtime intent:
+
+```json
+{
+  "node_id": "send-slack-message",
+  "kind": "tool-call",
+  "target": {
+    "target_type": "tool",
+    "name": "slack.chat.postMessage",
+    "credential_binding_ref": "cred_binding_123"
+  }
+}
+```
+
+The application backend remains responsible for:
+
+- credential UX and OAuth flows;
+- encrypted secret storage;
+- tenant authorization checks;
+- credential scopes;
+- provider account policy;
+- rotation and revocation;
+- audit of secret access;
+- mapping credential bindings to secret-manager records.
+
+Rakka should only persist logical credential binding refs and bounded provider
+metadata. During dispatch, an application-provided `AgentCredentialResolver`
+can resolve a binding ref into an `AgentEphemeralCredential` for one dispatch
+attempt or a short-lived time window.
+
+Recommended resolver inputs:
+
+- tenant;
+- workflow id;
+- run id;
+- plan fingerprint;
+- node id;
+- target type and target name;
+- credential binding ref;
+- requested credential use;
+- causation id and correlation id;
+- trace context.
+
+Resolver outputs should be short-lived and in-memory only. Rakka must not:
+
+- serialize resolved secrets into durable state;
+- include credential values in `AgentEffect` payloads;
+- log credential values;
+- expose credential values in metrics, runtime events, snapshots, or query
+  indexes;
+- retain resolved credentials after the dispatch attempt finishes.
+
+Credential rotation and revocation should not require recompiling a workflow.
+A compiled plan can continue to reference the same binding ref while the
+application credential service decides which secret version is current and
+whether the run is still authorized to use it.
+
 ### Effect identity
 
 Effect ids, deduplication keys, and idempotency keys must be deterministic.
@@ -407,6 +490,7 @@ Rakka defines runtime contracts and dispatch boundaries. Application code owns:
 
 - concrete provider adapters;
 - credentials and account binding;
+- credential storage, resolution, rotation, revocation, and access audit;
 - model selection;
 - prompt policy;
 - tool authorization;
@@ -581,6 +665,10 @@ input until validated.
 Runtime validation should reject:
 
 - raw credentials;
+- resolved credential values in plans, graph state, outbox payloads, events,
+  logs, snapshots, or query projections;
+- credential binding refs that are blank, malformed, or placed in hot metric
+  labels;
 - raw webhook URLs intended for metric labels;
 - unbounded inline prompts or completions;
 - arbitrary command execution;
@@ -594,6 +682,8 @@ The application and platform remain responsible for:
 - identity provider integration;
 - authorization decisions;
 - secret management;
+- credential service or vault integration;
+- credential rotation and revocation;
 - provider account policy;
 - network egress controls;
 - object-store encryption and retention;
@@ -627,4 +717,3 @@ This effort is successful when Rakka can:
 - emit ordered runtime events after persisted transitions;
 - expose bounded metrics, snapshots, and query projections;
 - keep the editor DSL and product backend outside Rakka.
-

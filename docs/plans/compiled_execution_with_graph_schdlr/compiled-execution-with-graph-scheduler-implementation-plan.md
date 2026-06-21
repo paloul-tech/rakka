@@ -27,6 +27,10 @@ docs/plans/compiled_execution_with_graph_schdlr/
 - Keep `rakka-workflow` as the durable inbox/outbox substrate.
 - Do not store raw editor DSL, UI layout, credentials, or trigger registration
   records in Rakka runtime state.
+- Store only logical credential binding refs in compiled plans, graph state,
+  effects, runtime events, snapshots, and query indexes.
+- Resolve third-party credentials only at dispatch time through an
+  application-provided resolver, and do not persist resolved credential values.
 - Every external command must enter through durable inbox acceptance.
 - Every external side effect must be scheduled through durable outbox or an
   equivalent durable runtime boundary before execution.
@@ -57,6 +61,10 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventSink`
 - `AgentTriggerSource`
+- `AgentCredentialBindingRef`
+- `AgentCredentialResolver`
+- `AgentCredentialUse`
+- `AgentEphemeralCredential`
 
 The top-level `rakka` facade should re-export these through
 `rakka::agent_workflow` when the `agent-workflow` feature is enabled.
@@ -117,6 +125,8 @@ Scope:
 - Include plan id, workflow id, workflow type, definition version, plan schema
   version, plan fingerprint, entry nodes, nodes, edges, labels, and artifact
   references.
+- Include optional logical credential binding refs on effect-producing nodes
+  that need third-party credentials.
 - Keep product-specific block configuration behind artifact references or
   bounded attributes.
 
@@ -126,12 +136,14 @@ Acceptance:
 - The IR can represent linear, branch, join, effect, wait, human, child
   workflow, and terminal nodes.
 - No IR field stores raw editor DSL, UI layout, credentials, or secret values.
+- Credential-using nodes store only logical binding refs.
 
 Tests:
 
 - JSON round-trip for a representative plan.
 - Missing required identity fields are rejected by construction or validation.
 - Node kinds serialize with stable names.
+- Logical credential binding refs round trip without resolved secret material.
 
 ### Slice 1.2: Runtime Validation
 
@@ -146,12 +158,14 @@ Scope:
 - Require explicit bounds for loop/iterator nodes.
 - Validate branch and join declarations.
 - Reject high-cardinality or sensitive values in hot labels.
+- Reject raw credential-like fields or credential binding refs in hot labels.
 
 Acceptance:
 
 - Invalid plans fail before run start.
 - Validation errors expose stable error codes.
 - Deterministic sorting produces a stable validation order.
+- Nodes that need credentials use logical binding refs only.
 
 Tests:
 
@@ -162,6 +176,9 @@ Tests:
 - Forbidden cycles.
 - Invalid loop bounds.
 - Missing terminal reachability.
+- Raw secret-like field rejected.
+- Credential binding ref accepted in target metadata but rejected as a metric
+  label.
 
 ### Slice 1.3: Plan Registration And Compatibility
 
@@ -386,7 +403,42 @@ Tests:
 - Crash after effect scheduling recovers due effect.
 - Idempotency key is stable across recovery.
 
-### Slice 4.2: Completion And Failure Commands
+### Slice 4.2: Credential Binding Resolver Contract
+
+Scope:
+
+- Add `AgentCredentialBindingRef`, `AgentCredentialResolver`,
+  `AgentCredentialUse`, and `AgentEphemeralCredential`.
+- Keep the resolver trait application-implemented.
+- Pass tenant, workflow id, run id, plan fingerprint, node id, target
+  descriptor, credential binding ref, causation id, correlation id, and trace
+  context to the resolver.
+- Ensure resolved credentials are held in memory only for one dispatch attempt
+  or short-lived adapter call.
+- Ensure resolved credentials are never serialized into `AgentEffect`, graph
+  state, runtime events, logs, metrics, snapshots, or query indexes.
+- Surface resolver errors as stable effect dispatch failures.
+
+Acceptance:
+
+- A credential-using effect can be dispatched through a fake resolver.
+- Resolver failures produce retryable or terminal bounded error codes according
+  to effect policy.
+- Credential rotation can happen behind the same binding ref without changing
+  compiled plan fingerprints.
+- Rakka never persists resolved credential values.
+
+Tests:
+
+- Fake resolver returns an ephemeral credential for a tool effect.
+- Resolver missing binding maps to stable dispatch failure.
+- Resolver revoked binding maps to stable dispatch failure.
+- Resolved credential value is absent from serialized effect, graph state,
+  runtime event, logs, metrics, snapshots, and query projection fixtures.
+- Same compiled plan works after fake resolver changes the secret version for
+  an existing binding ref.
+
+### Slice 4.3: Completion And Failure Commands
 
 Scope:
 
@@ -408,7 +460,7 @@ Tests:
 - Exhausted retry budget.
 - Crash after completion command acceptance but before graph transition.
 
-### Slice 4.3: Timers, Human Checkpoints, And Child Workflows
+### Slice 4.4: Timers, Human Checkpoints, And Child Workflows
 
 Scope:
 
@@ -429,7 +481,7 @@ Tests:
 - Human decision resumes a waiting graph node.
 - Child workflow command uses stable deduplication metadata.
 
-### Slice 4.4: Dispatcher Fleet Integration
+### Slice 4.5: Dispatcher Fleet Integration
 
 Scope:
 
@@ -761,7 +813,8 @@ The implementation should add focused tests for:
 - Durability: crash after command acceptance, crash after node runnable, crash
   after effect scheduling, recovery after passivation.
 - Effect bridge: duplicate effect ids, duplicate callbacks, retry exhaustion,
-  idempotency key stability.
+  idempotency key stability, credential resolver success and failure, and no
+  resolved secret persistence.
 - Trigger normalization: API, webhook, schedule, and on-demand triggers all
   become durable commands with deduplication.
 - Runtime events: stable ordering, no high-cardinality hot metric labels,
@@ -782,4 +835,3 @@ plan indefinitely:
 - `phase-8-production-candidate-gate.md`
 
 These files should be added only as their implementation slices become active.
-
