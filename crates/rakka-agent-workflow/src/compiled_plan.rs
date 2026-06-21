@@ -20,6 +20,10 @@ const DEFAULT_COMPILED_PLAN_RUNTIME_VERSION: &str = "0.1.0";
 const COMPILED_GRAPH_V1_CAPABILITY: &str = "compiled-graph-v1";
 const VALIDATOR_LABEL_VALUE_MAX_BYTES: usize = 96;
 
+/// Current compiled execution plan schema version supported by registration.
+pub const CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION: AgentCompiledPlanSchemaVersion =
+    AgentCompiledPlanSchemaVersion::new(1);
+
 macro_rules! string_id {
     ($(#[$meta:meta])* $vis:vis $name:ident) => {
         $(#[$meta])*

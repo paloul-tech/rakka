@@ -59,6 +59,7 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentCompiledIteratorPolicy`
 - `AgentCompiledPortPolicy`
 - `AgentCompiledPlanValidationError`
+- `AgentCompiledWorkflowRegistration`
 - `AgentGraphRunState`
 - `AgentGraphNodeState`
 - `AgentGraphNodeStatus`
@@ -73,6 +74,7 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentEphemeralCredential`
 - `validate_compiled_execution_plan`
 - `validate_compiled_execution_plan_with_catalog`
+- `CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION`
 
 The top-level `rakka` facade should re-export these through
 `rakka::agent_workflow` when the `agent-workflow` feature is enabled.
@@ -120,6 +122,8 @@ Acceptance:
   DSL interpretation.
 
 ## Phase 1: Compiled Execution Plan IR
+
+Status: implemented.
 
 Goal: add the product-neutral runtime IR and validation surface.
 
@@ -244,6 +248,8 @@ Implementation notes:
 
 ### Slice 1.3: Plan Registration And Compatibility
 
+Status: implemented.
+
 Scope:
 
 - Extend or parallel `AgentWorkflowRegistry` with compiled plan registration.
@@ -263,6 +269,31 @@ Tests:
 - Same workflow with multiple versions accepted.
 - Incompatible plan schema version rejected.
 - Plan fingerprint preserved across serde round trip.
+
+Implementation notes:
+
+- Extended `AgentWorkflowRegistry` in
+  `crates/rakka-agent-workflow/src/definition.rs` with compiled registration
+  storage keyed by `workflow_type + definition_version`, without changing the
+  existing workflow-only registration behavior.
+- Added `AgentCompiledWorkflowRegistration` as a serializable pair of
+  `AgentWorkflow` metadata and `AgentCompiledExecutionPlan` runtime IR.
+- Added `register_compiled` for atomic workflow-plus-plan registration and
+  `register_compiled_plan` for attaching a compiled plan to an already
+  registered workflow definition.
+- Added lookup helpers: `get_compiled`, `contains_compiled`,
+  `compiled_registrations_for_type`, `compiled_registrations`, and
+  `compiled_len`.
+- Added registration compatibility checks for compiled plan validation,
+  supported compiled plan schema version, workflow id, workflow type, and
+  definition version agreement.
+- Added `CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION` for the current supported
+  registration schema boundary.
+- Expanded `crates/rakka-agent-workflow/tests/workflow_registry.rs` to cover
+  compiled pair registration, attaching a plan to an existing definition,
+  duplicate compiled registrations, multiple versions for rolling updates,
+  unsupported schema rejection, mismatched metadata rejection, and fingerprint
+  preservation across serde round trip.
 
 ## Phase 2: Durable Graph Run State
 

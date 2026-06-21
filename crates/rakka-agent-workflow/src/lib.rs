@@ -95,11 +95,11 @@ pub use compiled_plan::{
     AgentCompiledPlanRuntimeCapabilities, AgentCompiledPlanSchemaVersion,
     AgentCompiledPlanValidationError, AgentCompiledPlanValidationResult,
     AgentCompiledPortDirection, AgentCompiledPortId, AgentCompiledPortPolicy,
-    AgentCredentialBindingRef,
+    AgentCredentialBindingRef, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 pub use definition::{
-    AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
-    AgentWorkflowRegistryResult,
+    AgentCompiledWorkflowRegistration, AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry,
+    AgentWorkflowRegistryError, AgentWorkflowRegistryResult,
 };
 pub use dispatcher::{
     agent_dispatch_id, agent_dispatch_timestamp_from_workflow_timestamp,
