@@ -1,6 +1,6 @@
 # Rakka Compiled Execution With Graph Scheduler Implementation Plan
 
-Status: planning draft
+Status: approved
 Date: 2026-06-21
 Source spec:
 `docs/plans/compiled_execution_with_graph_schdlr/compiled-execution-with-graph-scheduler-spec.md`
@@ -92,6 +92,8 @@ The top-level `rakka` facade should re-export these through
 
 ## Phase 0: Documentation And Boundary Lock
 
+Status: implemented.
+
 Goal: establish the tracking home and prevent future scope drift into product
 backend concerns.
 
@@ -114,6 +116,8 @@ Acceptance:
 Goal: add the product-neutral runtime IR and validation surface.
 
 ### Slice 1.1: IR Types
+
+Status: implemented.
 
 Scope:
 
@@ -144,6 +148,17 @@ Tests:
 - Missing required identity fields are rejected by construction or validation.
 - Node kinds serialize with stable names.
 - Logical credential binding refs round trip without resolved secret material.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/compiled_plan.rs` with serializable
+  compiled execution plan, node, edge, port, target, compatibility, schema
+  version, fingerprint, and credential binding reference contracts.
+- Re-exported the new IR contracts through `rakka-agent-workflow` and the
+  top-level `rakka::agent_workflow` facade path.
+- Added `crates/rakka-agent-workflow/tests/compiled_plan_contract.rs` covering
+  representative plan JSON round-trip, stable node-kind wire names, and
+  credential binding references without resolved secret material.
 
 ### Slice 1.2: Runtime Validation
 

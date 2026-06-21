@@ -20,6 +20,7 @@ pub mod adapters;
 pub mod artifacts;
 pub mod audit;
 pub mod checkpoints;
+pub mod compiled_plan;
 pub mod definition;
 pub mod dispatcher;
 pub mod domain;
@@ -83,6 +84,14 @@ pub use checkpoints::{
 #[cfg(feature = "http")]
 pub use checkpoints::{
     human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
+};
+pub use compiled_plan::{
+    AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior, AgentCompiledExecutionPlan,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledNodeTarget,
+    AgentCompiledPlanCompatibility, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort,
+    AgentCompiledPlanSchemaVersion, AgentCompiledPortDirection, AgentCompiledPortId,
+    AgentCredentialBindingRef,
 };
 pub use definition::{
     AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
