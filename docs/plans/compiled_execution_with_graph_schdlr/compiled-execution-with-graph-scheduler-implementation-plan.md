@@ -74,6 +74,11 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphSchedulerError`
 - `AgentGraphSchedulerResult`
 - `AgentGraphSchedulerTransition`
+- `AgentGraphEffectBridge`
+- `AgentGraphEffectBridgeError`
+- `AgentGraphEffectBridgeResult`
+- `AgentGraphEffectScheduleRequest`
+- `AgentGraphEffectScheduleOutcome`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventSink`
@@ -629,6 +634,8 @@ workflow commands, and adapter dispatch.
 
 ### Slice 4.1: Effect Node Mapping
 
+Status: implemented.
+
 Scope:
 
 - Add conversion from effect-producing plan nodes to `AgentEffect`.
@@ -649,6 +656,27 @@ Tests:
 - Duplicate effect node scheduling deduplicates.
 - Crash after effect scheduling recovers due effect.
 - Idempotency key is stable across recovery.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/effect_bridge.rs` with
+  `AgentGraphEffectBridge`, `AgentGraphEffectScheduleRequest`,
+  `AgentGraphEffectScheduleOutcome`, `AgentGraphEffectBridgeError`, and
+  `AgentGraphEffectBridgeResult`.
+- Mapped effect-producing compiled node kinds to `AgentEffectKind` values for
+  durable outbox scheduling while leaving timer and human checkpoint nodes for
+  their dedicated Phase 4 slices.
+- Generated deterministic effect ids, deduplication keys, and idempotency keys
+  from run id, plan fingerprint, compiled node id, loop instance id, effect
+  kind, and target class.
+- Copied logical node target metadata into `AgentEffectTarget` and persisted
+  only logical credential binding refs, not resolved credentials.
+- Scheduled effects exclusively through `AgentRunInbox::schedule_effect`; graph
+  node state is marked waiting for an effect only after durable outbox
+  scheduling returns scheduled or duplicate acceptance.
+- Added `crates/rakka-agent-workflow/tests/effect_bridge.rs` covering
+  model/tool scheduling, duplicate scheduling deduplication, due-effect recovery
+  after a crash, and idempotency-key stability across recovery.
 
 ### Slice 4.2: Credential Binding Resolver Contract
 

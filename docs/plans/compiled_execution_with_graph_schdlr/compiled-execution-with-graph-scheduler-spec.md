@@ -341,6 +341,11 @@ The public API should introduce:
 - `AgentGraphSchedulerError`
 - `AgentGraphSchedulerResult`
 - `AgentGraphSchedulerTransition`
+- `AgentGraphEffectBridge`
+- `AgentGraphEffectBridgeError`
+- `AgentGraphEffectBridgeResult`
+- `AgentGraphEffectScheduleRequest`
+- `AgentGraphEffectScheduleOutcome`
 - `AgentGraphRuntime`
 
 The graph scheduler is a deterministic per-run component that evaluates a
@@ -432,6 +437,12 @@ but it does not execute compensation workflows in the Phase 3 scheduler core.
 ## Effect Bridge
 
 The effect bridge maps graph nodes to existing durable workflow mechanisms.
+
+For durable outbox effects, `AgentGraphEffectBridge` maps effect-producing
+compiled plan nodes to `AgentEffect` values and schedules them through
+`AgentRunInbox::schedule_effect`. The graph node should move to waiting for an
+effect only after the durable outbox boundary returns scheduled or duplicate
+acceptance.
 
 The bridge should convert effect-producing nodes into:
 

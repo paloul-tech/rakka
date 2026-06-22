@@ -24,6 +24,7 @@ pub mod compiled_plan;
 pub mod definition;
 pub mod dispatcher;
 pub mod domain;
+pub mod effect_bridge;
 pub mod facade;
 pub mod graph_scheduler;
 pub mod graph_state;
@@ -128,6 +129,10 @@ pub use domain::{
     HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InlineState, PrincipalRef,
     RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
     FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
+};
+pub use effect_bridge::{
+    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectBridgeResult,
+    AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
 };
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,
