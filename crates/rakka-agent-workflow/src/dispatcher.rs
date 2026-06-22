@@ -20,10 +20,17 @@ use rakka_workflow::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentAttributes, AgentDispatchId, AgentDispatcherWorkerId, AgentDueEffect, AgentEffect,
-    AgentEffectId, AgentEffectKind, AgentEffectTarget, AgentInboxError, AgentOutboxError,
-    AgentRunId, AgentRunInbox, AgentTimestampMillis, AgentWorkflowId,
+    AgentAttributes, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
+    AgentDispatchId, AgentDispatcherWorkerId, AgentDueEffect, AgentEffect, AgentEffectId,
+    AgentEffectKind, AgentEffectTarget, AgentInboxError, AgentOutboxError, AgentRunId,
+    AgentRunInbox, AgentTimestampMillis, AgentWorkflowId,
 };
+
+const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
+const ATTR_COMPILED_PLAN_FINGERPRINT: &str = "compiled_plan_fingerprint";
+const ATTR_LOOP_INSTANCE_ID: &str = "loop_instance_id";
+const ATTR_NODE_KIND: &str = "node_kind";
+const ATTR_TARGET_CLASS: &str = "target_class";
 
 /// Prefix used for durable dispatcher fleet state persistence ids.
 pub const AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX: &str = "agent-dispatcher-fleet";
@@ -385,6 +392,18 @@ pub struct AgentDispatchEntry {
     pub target: AgentEffectTarget,
     /// Target class used for fleet concurrency.
     pub target_class: AgentDispatchTargetClass,
+    /// Compiled plan fingerprint for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_plan_fingerprint: Option<AgentCompiledPlanFingerprint>,
+    /// Compiled graph node id for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node_id: Option<AgentCompiledNodeId>,
+    /// Compiled graph node kind for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node_kind: Option<AgentCompiledNodeKind>,
+    /// Loop instance id for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_loop_instance_id: Option<String>,
     /// Due timestamp for first dispatch or retry.
     pub due_at: AgentTimestampMillis,
     /// Dispatcher lifecycle status.
@@ -424,6 +443,7 @@ impl AgentDispatchEntry {
             agent_dispatch_timestamp_from_workflow_timestamp(due.entry.scheduled_at())
         });
         let target_class = AgentDispatchTargetClass::classify(effect.kind, &effect.target);
+        let graph_context = graph_dispatch_context_from_effect(effect);
         Self {
             dispatch_id,
             workflow_id,
@@ -432,6 +452,10 @@ impl AgentDispatchEntry {
             effect_kind: effect.kind,
             target: effect.target.clone(),
             target_class,
+            graph_plan_fingerprint: graph_context.plan_fingerprint,
+            graph_node_id: graph_context.node_id,
+            graph_node_kind: graph_context.node_kind,
+            graph_loop_instance_id: graph_context.loop_instance_id,
             due_at,
             status: AgentDispatchStatus::Pending,
             lease: None,
@@ -442,7 +466,7 @@ impl AgentDispatchEntry {
             updated_at: now,
             completed_at: None,
             exhausted_at: None,
-            attributes: AgentAttributes::new(),
+            attributes: graph_context.attributes,
         }
     }
 
@@ -502,6 +526,12 @@ impl AgentDispatchEntry {
         self.effect_kind = effect.kind;
         self.target = effect.target.clone();
         self.target_class = AgentDispatchTargetClass::classify(effect.kind, &effect.target);
+        let graph_context = graph_dispatch_context_from_effect(effect);
+        self.graph_plan_fingerprint = graph_context.plan_fingerprint;
+        self.graph_node_id = graph_context.node_id;
+        self.graph_node_kind = graph_context.node_kind;
+        self.graph_loop_instance_id = graph_context.loop_instance_id;
+        self.attributes = graph_context.attributes;
         self.due_at = effect.due_at.unwrap_or_else(|| {
             agent_dispatch_timestamp_from_workflow_timestamp(due.entry.scheduled_at())
         });
@@ -624,6 +654,15 @@ pub struct AgentDispatchClaim {
     pub target_class: AgentDispatchTargetClass,
     /// Effect kind.
     pub effect_kind: AgentEffectKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentDispatchGraphContext {
+    plan_fingerprint: Option<AgentCompiledPlanFingerprint>,
+    node_id: Option<AgentCompiledNodeId>,
+    node_kind: Option<AgentCompiledNodeKind>,
+    loop_instance_id: Option<String>,
+    attributes: AgentAttributes,
 }
 
 /// Target concurrency limits for dispatcher claims.
@@ -1563,6 +1602,18 @@ pub struct AgentDispatcherEntrySnapshot {
     pub status: AgentDispatchStatus,
     /// Target class.
     pub target_class: AgentDispatchTargetClass,
+    /// Compiled plan fingerprint for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_plan_fingerprint: Option<AgentCompiledPlanFingerprint>,
+    /// Compiled graph node id for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node_id: Option<AgentCompiledNodeId>,
+    /// Compiled graph node kind for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node_kind: Option<AgentCompiledNodeKind>,
+    /// Loop instance id for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_loop_instance_id: Option<String>,
     /// Due timestamp.
     pub due_at: AgentTimestampMillis,
     /// Worker holding the lease, when claimed.
@@ -1581,6 +1632,10 @@ impl AgentDispatcherEntrySnapshot {
             effect_id: entry.effect_id.clone(),
             status: entry.status,
             target_class: entry.target_class,
+            graph_plan_fingerprint: entry.graph_plan_fingerprint.clone(),
+            graph_node_id: entry.graph_node_id.clone(),
+            graph_node_kind: entry.graph_node_kind,
+            graph_loop_instance_id: entry.graph_loop_instance_id.clone(),
             due_at: entry.due_at,
             worker_id: entry.lease.as_ref().map(|lease| lease.worker_id.clone()),
             fencing_token: entry.lease.as_ref().map(|lease| lease.fencing_token),
@@ -1696,6 +1751,43 @@ fn current_agent_timestamp(clock: &impl WorkflowClock) -> AgentTimestampMillis {
 
 fn target_limit_key(class: AgentDispatchTargetClass, target_name: &str) -> String {
     format!("{}:{target_name}", class.as_label())
+}
+
+fn graph_dispatch_context_from_effect(effect: &AgentEffect) -> AgentDispatchGraphContext {
+    let mut context = AgentDispatchGraphContext::default();
+    let attrs = &effect.target.attributes;
+
+    context.plan_fingerprint = attrs
+        .get(ATTR_COMPILED_PLAN_FINGERPRINT)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .map(AgentCompiledPlanFingerprint::new);
+    context.node_id = attrs
+        .get(ATTR_COMPILED_NODE_ID)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .map(AgentCompiledNodeId::new);
+    context.node_kind = attrs
+        .get(ATTR_NODE_KIND)
+        .and_then(|value| AgentCompiledNodeKind::from_label(value));
+    context.loop_instance_id = attrs
+        .get(ATTR_LOOP_INSTANCE_ID)
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+
+    for key in [
+        ATTR_TARGET_CLASS,
+        ATTR_NODE_KIND,
+        ATTR_COMPILED_NODE_ID,
+        ATTR_COMPILED_PLAN_FINGERPRINT,
+        ATTR_LOOP_INSTANCE_ID,
+    ] {
+        if let Some(value) = attrs.get(key).filter(|value| !value.trim().is_empty()) {
+            context.attributes.insert(key.to_string(), value.clone());
+        }
+    }
+
+    context
 }
 
 fn in_flight_counts_by_class(

@@ -450,6 +450,19 @@ compiled plan nodes to `AgentEffect` values and schedules them through
 effect only after the durable outbox boundary returns scheduled or duplicate
 acceptance.
 
+Dispatcher fleet indexes should project graph-scheduled effects with bounded
+graph context copied from the durable effect metadata:
+
+- compiled plan fingerprint;
+- compiled node id;
+- compiled node kind;
+- loop instance id, when present;
+- coarse dispatch target class.
+
+These fields are operational query dimensions only. Dispatcher claim, fencing,
+retry, exhaustion, and completion correctness must remain based on durable
+outbox entries and fleet leases, not on mutable graph state.
+
 The bridge should convert effect-producing nodes into:
 
 - `AgentEffect` entries scheduled through durable outbox;

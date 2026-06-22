@@ -6,11 +6,12 @@ use std::sync::Arc;
 use tokio_postgres::{types::ToSql, Client, Row};
 
 use crate::{
-    AgentDispatchId, AgentDispatchIndexEntry, AgentDispatchQuery, AgentDispatchStatus,
-    AgentDispatchTargetClass, AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentRunId,
-    AgentRunIndexEntry, AgentRunQueryWaitingReason, AgentRunStatus, AgentStepId, AgentTenantId,
-    AgentTimerId, AgentTimerIndexEntry, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis,
-    AgentWorkflowId, AgentWorkflowQueryError, AgentWorkflowQueryFuture, AgentWorkflowQueryIndex,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentDispatchId,
+    AgentDispatchIndexEntry, AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass,
+    AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentRunId, AgentRunIndexEntry,
+    AgentRunQueryWaitingReason, AgentRunStatus, AgentStepId, AgentTenantId, AgentTimerId,
+    AgentTimerIndexEntry, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis, AgentWorkflowId,
+    AgentWorkflowQueryError, AgentWorkflowQueryFuture, AgentWorkflowQueryIndex,
     AgentWorkflowQueryResult, AgentWorkflowRunQuery, AgentWorkflowShardOwnership,
     HumanCheckpointId, WorkflowDefinitionVersion,
 };
@@ -137,6 +138,10 @@ CREATE TABLE IF NOT EXISTS rakka_agent_workflow_dispatch_index (
     effect_id TEXT NOT NULL,
     effect_kind TEXT NOT NULL,
     target_class TEXT NOT NULL,
+    graph_plan_fingerprint TEXT NULL,
+    graph_node_id TEXT NULL,
+    graph_node_kind TEXT NULL,
+    graph_loop_instance_id TEXT NULL,
     due_at_millis BIGINT NOT NULL CHECK (due_at_millis >= 0),
     status TEXT NOT NULL,
     worker_id TEXT NULL,
@@ -149,6 +154,15 @@ CREATE TABLE IF NOT EXISTS rakka_agent_workflow_dispatch_index (
     PRIMARY KEY (store_namespace, dispatch_id)
 );
 
+ALTER TABLE rakka_agent_workflow_dispatch_index
+    ADD COLUMN IF NOT EXISTS graph_plan_fingerprint TEXT NULL;
+ALTER TABLE rakka_agent_workflow_dispatch_index
+    ADD COLUMN IF NOT EXISTS graph_node_id TEXT NULL;
+ALTER TABLE rakka_agent_workflow_dispatch_index
+    ADD COLUMN IF NOT EXISTS graph_node_kind TEXT NULL;
+ALTER TABLE rakka_agent_workflow_dispatch_index
+    ADD COLUMN IF NOT EXISTS graph_loop_instance_id TEXT NULL;
+
 CREATE INDEX IF NOT EXISTS rakka_agent_workflow_dispatch_due_idx
     ON rakka_agent_workflow_dispatch_index (store_namespace, status, due_at_millis, dispatch_id);
 CREATE INDEX IF NOT EXISTS rakka_agent_workflow_dispatch_stuck_idx
@@ -160,6 +174,14 @@ CREATE INDEX IF NOT EXISTS rakka_agent_workflow_dispatch_run_idx
 CREATE INDEX IF NOT EXISTS rakka_agent_workflow_dispatch_target_idx
     ON rakka_agent_workflow_dispatch_index
     (store_namespace, target_class, status, due_at_millis, dispatch_id);
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_dispatch_graph_node_idx
+    ON rakka_agent_workflow_dispatch_index
+    (store_namespace, graph_node_kind, status, due_at_millis, dispatch_id)
+    WHERE graph_node_kind IS NOT NULL;
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_dispatch_graph_plan_idx
+    ON rakka_agent_workflow_dispatch_index
+    (store_namespace, graph_plan_fingerprint, status, due_at_millis, dispatch_id)
+    WHERE graph_plan_fingerprint IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS rakka_agent_workflow_audit_index (
     store_namespace TEXT NOT NULL,
@@ -698,6 +720,18 @@ async fn upsert_dispatch(
         .workflow_id
         .as_ref()
         .map(|workflow_id| workflow_id.as_str().to_string());
+    let graph_plan_fingerprint = entry
+        .graph_plan_fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.as_str().to_string());
+    let graph_node_id = entry
+        .graph_node_id
+        .as_ref()
+        .map(|node_id| node_id.as_str().to_string());
+    let graph_node_kind = entry
+        .graph_node_kind
+        .map(|kind| kind.as_label().to_string());
+    let graph_loop_instance_id = entry.graph_loop_instance_id.clone();
     let worker_id = entry
         .worker_id
         .as_ref()
@@ -719,6 +753,10 @@ INSERT INTO rakka_agent_workflow_dispatch_index (
     effect_id,
     effect_kind,
     target_class,
+    graph_plan_fingerprint,
+    graph_node_id,
+    graph_node_kind,
+    graph_loop_instance_id,
     due_at_millis,
     status,
     worker_id,
@@ -728,7 +766,7 @@ INSERT INTO rakka_agent_workflow_dispatch_index (
     updated_at_millis
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11, $12, $13, $14
+    $11, $12, $13, $14, $15, $16, $17, $18
 )
 ON CONFLICT (store_namespace, dispatch_id) DO UPDATE
 SET workflow_id = EXCLUDED.workflow_id,
@@ -736,6 +774,10 @@ SET workflow_id = EXCLUDED.workflow_id,
     effect_id = EXCLUDED.effect_id,
     effect_kind = EXCLUDED.effect_kind,
     target_class = EXCLUDED.target_class,
+    graph_plan_fingerprint = EXCLUDED.graph_plan_fingerprint,
+    graph_node_id = EXCLUDED.graph_node_id,
+    graph_node_kind = EXCLUDED.graph_node_kind,
+    graph_loop_instance_id = EXCLUDED.graph_loop_instance_id,
     due_at_millis = EXCLUDED.due_at_millis,
     status = EXCLUDED.status,
     worker_id = EXCLUDED.worker_id,
@@ -756,6 +798,10 @@ RETURNING revision
                 &entry.effect_id.as_str(),
                 &entry.effect_kind.as_label(),
                 &entry.target_class.as_label(),
+                &graph_plan_fingerprint,
+                &graph_node_id,
+                &graph_node_kind,
+                &graph_loop_instance_id,
                 &due_at,
                 &entry.status.as_label(),
                 &worker_id,
@@ -940,6 +986,17 @@ async fn query_dispatches(
         .map(|workflow_id| workflow_id.as_str().to_string());
     let statuses = optional_dispatch_status_labels(&query.statuses);
     let target_class = query.target_class.map(target_class_label);
+    let graph_plan_fingerprint = query
+        .graph_plan_fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.as_str().to_string());
+    let graph_node_id = query
+        .graph_node_id
+        .as_ref()
+        .map(|node_id| node_id.as_str().to_string());
+    let graph_node_kind = query
+        .graph_node_kind
+        .map(|kind| kind.as_label().to_string());
     let due_at = optional_millis(query.due_at_or_before)?;
     let stuck_at = optional_millis(query.stuck_at_or_before)?;
     let limit = limit_to_i64(query.limit)?;
@@ -954,10 +1011,13 @@ WHERE store_namespace = $1
   AND ($3::text IS NULL OR workflow_id = $3)
   AND ($4::text[] IS NULL OR status = ANY($4))
   AND ($5::text IS NULL OR target_class = $5)
-  AND ($6::bigint IS NULL OR due_at_millis <= $6)
-  AND ($7::bigint IS NULL OR (status = 'claimed' AND lease_expires_at_millis <= $7))
+  AND ($6::text IS NULL OR graph_plan_fingerprint = $6)
+  AND ($7::text IS NULL OR graph_node_id = $7)
+  AND ($8::text IS NULL OR graph_node_kind = $8)
+  AND ($9::bigint IS NULL OR due_at_millis <= $9)
+  AND ($10::bigint IS NULL OR (status = 'claimed' AND lease_expires_at_millis <= $10))
 ORDER BY due_at_millis, dispatch_id
-LIMIT $8::bigint
+LIMIT $11::bigint
 "#,
             &[
                 &namespace,
@@ -965,6 +1025,9 @@ LIMIT $8::bigint
                 &workflow_id,
                 &statuses,
                 &target_class,
+                &graph_plan_fingerprint,
+                &graph_node_id,
+                &graph_node_kind,
                 &due_at,
                 &stuck_at,
                 &limit,
@@ -1049,6 +1112,17 @@ fn decode_dispatch_row(row: Row) -> AgentWorkflowQueryResult<AgentDispatchIndexE
         effect_id: AgentEffectId::new(row.get::<_, String>("effect_id")),
         effect_kind: parse_effect_kind(&row.get::<_, String>("effect_kind"))?,
         target_class: parse_target_class(&row.get::<_, String>("target_class"))?,
+        graph_plan_fingerprint: row
+            .get::<_, Option<String>>("graph_plan_fingerprint")
+            .map(AgentCompiledPlanFingerprint::new),
+        graph_node_id: row
+            .get::<_, Option<String>>("graph_node_id")
+            .map(AgentCompiledNodeId::new),
+        graph_node_kind: row
+            .get::<_, Option<String>>("graph_node_kind")
+            .map(|value| parse_compiled_node_kind(&value))
+            .transpose()?,
+        graph_loop_instance_id: row.get("graph_loop_instance_id"),
         due_at: decode_millis(row.get("due_at_millis"))?,
         status: parse_dispatch_status(&row.get::<_, String>("status"))?,
         worker_id: row
@@ -1184,6 +1258,11 @@ fn parse_effect_kind(value: &str) -> AgentWorkflowQueryResult<AgentEffectKind> {
         "audit-event" => Ok(AgentEffectKind::AuditEvent),
         _ => Err(invalid_label("dispatch.effect_kind", value)),
     }
+}
+
+fn parse_compiled_node_kind(value: &str) -> AgentWorkflowQueryResult<AgentCompiledNodeKind> {
+    AgentCompiledNodeKind::from_label(value)
+        .ok_or_else(|| invalid_label("dispatch.graph_node_kind", value))
 }
 
 fn validate_limit(limit: Option<usize>) -> AgentWorkflowQueryResult<()> {

@@ -462,6 +462,15 @@ impl AgentCompiledNodeKind {
         }
     }
 
+    /// Parses a stable lowercase node-kind label.
+    #[must_use]
+    pub fn from_label(value: &str) -> Option<Self> {
+        Self::all()
+            .iter()
+            .copied()
+            .find(|kind| kind.as_label() == value)
+    }
+
     /// Returns a runtime descriptor for this node kind.
     #[must_use]
     pub fn descriptor(self) -> AgentCompiledNodeKindDescriptor {

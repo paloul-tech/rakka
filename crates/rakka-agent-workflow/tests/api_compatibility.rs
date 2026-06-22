@@ -490,6 +490,10 @@ fn dispatch_entry(dispatch_id: &str, run_id: &AgentRunId) -> AgentDispatchEntry 
         effect_kind: AgentEffectKind::ToolCall,
         target: target("tool", "api-review-tool"),
         target_class: AgentDispatchTargetClass::Tool,
+        graph_plan_fingerprint: None,
+        graph_node_id: None,
+        graph_node_kind: None,
+        graph_loop_instance_id: None,
         due_at: ts(1_100),
         status: AgentDispatchStatus::Claimed,
         lease: Some(AgentDispatchLease {

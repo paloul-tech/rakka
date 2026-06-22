@@ -640,6 +640,8 @@ Implementation notes:
 
 ## Phase 4: Effect Bridge
 
+Status: implemented.
+
 Goal: connect graph nodes to durable outbox, timers, human checkpoints, child
 workflow commands, and adapter dispatch.
 
@@ -853,6 +855,8 @@ Implementation notes:
 
 ### Slice 4.5: Dispatcher Fleet Integration
 
+Status: implemented.
+
 Scope:
 
 - Ensure graph-scheduled effects are discoverable by dispatcher fleet indexes.
@@ -871,6 +875,29 @@ Tests:
 - Claimed graph effect completes.
 - Expired claim is recovered by another worker.
 - Stuck dispatch query returns graph run/node context.
+
+Implementation notes:
+
+- Added optional graph dispatch context to `AgentDispatchEntry`,
+  `AgentDispatcherEntrySnapshot`, and `AgentDispatchIndexEntry`: compiled plan
+  fingerprint, compiled node id, compiled node kind, and loop instance id.
+- Dispatcher fleet registration now extracts only whitelisted bounded graph
+  metadata from `AgentEffectTarget.attributes`; it does not copy credential
+  binding refs or arbitrary product metadata into fleet/query projections.
+- Added `AgentDispatchQuery` filters for graph plan fingerprint, graph node id,
+  and graph node kind so stuck dispatches can be queried back to compiled graph
+  context.
+- Kept dispatcher claim/fence correctness independent from graph state. Expired
+  claims are recovered through durable outbox/fleet state, and graph node state
+  is not mutated by dispatcher claim failures.
+- Updated the optional PostgreSQL query index with nullable graph dispatch
+  columns, additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration
+  statements, and graph-node/graph-plan indexes.
+- Added `AgentCompiledNodeKind::from_label` for stable dispatch projection
+  decoding.
+- Expanded `crates/rakka-agent-workflow/tests/dispatcher_fleet.rs` with graph
+  effect claim/completion coverage plus expired graph claim recovery and stuck
+  dispatch query coverage.
 
 ## Phase 5: Trigger Normalization
 

@@ -497,6 +497,10 @@ fn dispatch(
             attributes: AgentAttributes::new(),
         },
         target_class: AgentDispatchTargetClass::Tool,
+        graph_plan_fingerprint: None,
+        graph_node_id: None,
+        graph_node_kind: None,
+        graph_loop_instance_id: None,
         due_at: ts(100),
         status: AgentDispatchStatus::Claimed,
         lease: Some(AgentDispatchLease {

@@ -18,12 +18,12 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentDispatchEntry, AgentDispatchId,
-    AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherWorkerId, AgentEffectId,
-    AgentEffectKind, AgentGraphNodeProjection, AgentGraphNodeStatus, AgentGraphRunProjection,
-    AgentGraphWaitReason, AgentRunId, AgentRunState, AgentRunStatus, AgentStepId, AgentTenantId,
-    AgentTimerEntry, AgentTimerId, AgentTimerStatus, AgentTimestampMillis, AgentWorkflowId,
-    HumanCheckpointId, WorkflowDefinitionVersion,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentDispatchEntry,
+    AgentDispatchId, AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherWorkerId,
+    AgentEffectId, AgentEffectKind, AgentGraphNodeProjection, AgentGraphNodeStatus,
+    AgentGraphRunProjection, AgentGraphWaitReason, AgentRunId, AgentRunState, AgentRunStatus,
+    AgentStepId, AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerStatus,
+    AgentTimestampMillis, AgentWorkflowId, HumanCheckpointId, WorkflowDefinitionVersion,
 };
 
 /// Shared result type for workflow query indexes.
@@ -311,6 +311,18 @@ pub struct AgentDispatchIndexEntry {
     pub effect_kind: AgentEffectKind,
     /// Target class used by dispatcher concurrency limits.
     pub target_class: AgentDispatchTargetClass,
+    /// Compiled plan fingerprint for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_plan_fingerprint: Option<AgentCompiledPlanFingerprint>,
+    /// Compiled graph node id for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node_id: Option<AgentCompiledNodeId>,
+    /// Compiled graph node kind for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node_kind: Option<AgentCompiledNodeKind>,
+    /// Loop instance id for graph-scheduled effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_loop_instance_id: Option<String>,
     /// Dispatch due timestamp.
     pub due_at: AgentTimestampMillis,
     /// Dispatcher lifecycle status.
@@ -338,6 +350,10 @@ impl AgentDispatchIndexEntry {
             effect_id: entry.effect_id.clone(),
             effect_kind: entry.effect_kind,
             target_class: entry.target_class,
+            graph_plan_fingerprint: entry.graph_plan_fingerprint.clone(),
+            graph_node_id: entry.graph_node_id.clone(),
+            graph_node_kind: entry.graph_node_kind,
+            graph_loop_instance_id: entry.graph_loop_instance_id.clone(),
             due_at: entry.due_at,
             status: entry.status,
             worker_id: entry.lease.as_ref().map(|lease| lease.worker_id.clone()),
@@ -626,6 +642,9 @@ pub struct AgentDispatchQuery {
     pub(crate) workflow_id: Option<AgentWorkflowId>,
     pub(crate) statuses: Vec<AgentDispatchStatus>,
     pub(crate) target_class: Option<AgentDispatchTargetClass>,
+    pub(crate) graph_plan_fingerprint: Option<AgentCompiledPlanFingerprint>,
+    pub(crate) graph_node_id: Option<AgentCompiledNodeId>,
+    pub(crate) graph_node_kind: Option<AgentCompiledNodeKind>,
     pub(crate) due_at_or_before: Option<AgentTimestampMillis>,
     pub(crate) stuck_at_or_before: Option<AgentTimestampMillis>,
     pub(crate) limit: Option<usize>,
@@ -663,6 +682,30 @@ impl AgentDispatchQuery {
     #[must_use]
     pub const fn target_class(mut self, target_class: AgentDispatchTargetClass) -> Self {
         self.target_class = Some(target_class);
+        self
+    }
+
+    /// Filters to dispatch entries for one compiled graph plan fingerprint.
+    #[must_use]
+    pub fn graph_plan_fingerprint(
+        mut self,
+        fingerprint: impl Into<AgentCompiledPlanFingerprint>,
+    ) -> Self {
+        self.graph_plan_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Filters to dispatch entries for one compiled graph node id.
+    #[must_use]
+    pub fn graph_node_id(mut self, node_id: impl Into<AgentCompiledNodeId>) -> Self {
+        self.graph_node_id = Some(node_id.into());
+        self
+    }
+
+    /// Filters to dispatch entries for one compiled graph node kind.
+    #[must_use]
+    pub fn graph_node_kind(mut self, kind: AgentCompiledNodeKind) -> Self {
+        self.graph_node_kind = Some(kind);
         self
     }
 
@@ -1123,6 +1166,26 @@ fn dispatch_matches_query(entry: &AgentDispatchIndexEntry, query: &AgentDispatch
     if query
         .target_class
         .is_some_and(|target_class| entry.target_class != target_class)
+    {
+        return false;
+    }
+    if query
+        .graph_plan_fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| entry.graph_plan_fingerprint.as_ref() != Some(fingerprint))
+    {
+        return false;
+    }
+    if query
+        .graph_node_id
+        .as_ref()
+        .is_some_and(|node_id| entry.graph_node_id.as_ref() != Some(node_id))
+    {
+        return false;
+    }
+    if query
+        .graph_node_kind
+        .is_some_and(|kind| entry.graph_node_kind != Some(kind))
     {
         return false;
     }
