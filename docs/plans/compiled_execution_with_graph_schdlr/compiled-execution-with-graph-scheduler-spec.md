@@ -348,6 +348,10 @@ The public API should introduce:
 - `AgentGraphEffectScheduleOutcome`
 - `AgentGraphEffectCommandOutcome`
 - `AgentGraphEffectFailureDisposition`
+- `AgentGraphTimerScheduleRequest`
+- `AgentGraphTimerScheduleOutcome`
+- `AgentGraphHumanCheckpointScheduleRequest`
+- `AgentGraphHumanCheckpointScheduleOutcome`
 - `AgentGraphRuntime`
 
 The graph scheduler is a deterministic per-run component that evaluates a
@@ -597,6 +601,26 @@ acceptance succeeded before a crash but graph state did not advance, recovery
 may see duplicate command acceptance and should still apply the transition.
 If graph state already advanced, duplicate callbacks should produce no graph
 state changes.
+
+For graph timer nodes, the bridge should map `TimerWait` nodes to deterministic
+`AgentTimerEntry` values. The node should move to waiting for
+`AgentGraphWaitReason::Timer` only after the durable timer store accepts the
+timer or reports an equivalent duplicate. Accepted `TimerFired` commands should
+complete the waiting timer node and may persist a command `payload_ref` to the
+node output if the product runtime supplies one.
+
+For graph human checkpoint nodes, the bridge should map `HumanCheckpoint`
+nodes to deterministic `HumanApprovalRequest` outbox effects and record the
+associated checkpoint id in graph state. The node should move to waiting for
+`AgentGraphWaitReason::Human` only after durable outbox acceptance. Accepted
+`HumanDecisionSubmitted` commands should complete the waiting human node and
+persist the decision `payload_ref` to the node output when provided.
+
+For child workflow command nodes, the bridge should schedule
+`AgentEffectKind::ChildWorkflowCommand` through the durable outbox with stable
+deduplication and idempotency metadata. The graph node should wait with
+`AgentGraphWaitReason::ChildWorkflow`, while completion can still return
+through the accepted effect completion command path.
 
 ### Adapter policy
 

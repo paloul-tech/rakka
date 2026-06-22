@@ -20,9 +20,12 @@ use crate::{
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentFacadeError,
     AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
     AgentGraphSchedulerTransition, AgentGraphTerminalStatus, AgentGraphWaitReason,
-    AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance,
-    AgentOutboxError, AgentRunId, AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis,
-    ArtifactRef, AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
+    AgentHumanApprovalRequest, AgentHumanCheckpointError, AgentIdempotencyKey,
+    AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance, AgentOutboxError, AgentRunId,
+    AgentRunInbox, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
+    AgentTimerId, AgentTimerPolicy, AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis,
+    ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
@@ -32,6 +35,7 @@ const ATTR_NODE_KIND: &str = "node_kind";
 const ATTR_TARGET_CLASS: &str = "target_class";
 const ROOT_LOOP_INSTANCE_ID: &str = "root";
 const ATTR_FAILURE_DISPOSITION: &str = "failure_disposition";
+const ATTR_DECISION_STATUS: &str = "decision_status";
 
 /// Result type for compiled graph effect bridge operations.
 pub type AgentGraphEffectBridgeResult<T> = Result<T, AgentGraphEffectBridgeError>;
@@ -133,10 +137,30 @@ pub enum AgentGraphEffectBridgeError {
         /// Unknown effect id.
         effect_id: AgentEffectId,
     },
+    /// No graph node has the referenced durable timer id.
+    UnknownTimer {
+        /// Unknown timer id.
+        timer_id: AgentTimerId,
+    },
+    /// No graph node has the referenced human checkpoint id.
+    UnknownCheckpoint {
+        /// Unknown checkpoint id.
+        checkpoint_id: HumanCheckpointId,
+    },
     /// Failure command did not carry a supported failure disposition.
     InvalidFailureDisposition {
         /// Unsupported disposition label.
         disposition: Option<String>,
+    },
+    /// Durable timer mapping or persistence failed.
+    Timer {
+        /// Timer failure.
+        error: AgentTimerError,
+    },
+    /// Human checkpoint mapping failed.
+    HumanCheckpoint {
+        /// Human checkpoint failure.
+        error: AgentHumanCheckpointError,
     },
 }
 
@@ -161,7 +185,11 @@ impl AgentGraphEffectBridgeError {
             Self::Scheduler { error } => error.code(),
             Self::UnexpectedCommandKind { .. } => "unexpected-graph-effect-command-kind",
             Self::UnknownEffect { .. } => "unknown-graph-effect",
+            Self::UnknownTimer { .. } => "unknown-graph-timer",
+            Self::UnknownCheckpoint { .. } => "unknown-graph-human-checkpoint",
             Self::InvalidFailureDisposition { .. } => "invalid-effect-failure-disposition",
+            Self::Timer { error } => error.code(),
+            Self::HumanCheckpoint { error } => error.code(),
         }
     }
 }
@@ -231,11 +259,22 @@ impl Display for AgentGraphEffectBridgeError {
             Self::UnknownEffect { effect_id } => {
                 write!(f, "graph state has no node waiting on effect `{effect_id}`")
             }
+            Self::UnknownTimer { timer_id } => {
+                write!(f, "graph state has no node waiting on timer `{timer_id}`")
+            }
+            Self::UnknownCheckpoint { checkpoint_id } => write!(
+                f,
+                "graph state has no node waiting on checkpoint `{checkpoint_id}`"
+            ),
             Self::InvalidFailureDisposition { disposition } => write!(
                 f,
                 "effect failure disposition `{}` is invalid",
                 disposition.as_deref().unwrap_or("<missing>")
             ),
+            Self::Timer { error } => write!(f, "graph timer operation failed: {error}"),
+            Self::HumanCheckpoint { error } => {
+                write!(f, "graph human checkpoint operation failed: {error}")
+            }
         }
     }
 }
@@ -247,6 +286,8 @@ impl Error for AgentGraphEffectBridgeError {
             Self::Inbox { error } => Some(error),
             Self::Outbox { error } => Some(error),
             Self::Scheduler { error } => Some(error),
+            Self::Timer { error } => Some(error),
+            Self::HumanCheckpoint { error } => Some(error),
             Self::InvalidCompiledPlan { .. }
             | Self::PlanStateMismatch { .. }
             | Self::RunInboxMismatch { .. }
@@ -258,6 +299,8 @@ impl Error for AgentGraphEffectBridgeError {
             | Self::InvalidNodeStatus { .. }
             | Self::UnexpectedCommandKind { .. }
             | Self::UnknownEffect { .. }
+            | Self::UnknownTimer { .. }
+            | Self::UnknownCheckpoint { .. }
             | Self::InvalidFailureDisposition { .. } => None,
         }
     }
@@ -284,6 +327,18 @@ impl From<AgentInboxError> for AgentGraphEffectBridgeError {
 impl From<AgentGraphSchedulerError> for AgentGraphEffectBridgeError {
     fn from(error: AgentGraphSchedulerError) -> Self {
         Self::Scheduler { error }
+    }
+}
+
+impl From<AgentTimerError> for AgentGraphEffectBridgeError {
+    fn from(error: AgentTimerError) -> Self {
+        Self::Timer { error }
+    }
+}
+
+impl From<AgentHumanCheckpointError> for AgentGraphEffectBridgeError {
+    fn from(error: AgentHumanCheckpointError) -> Self {
+        Self::HumanCheckpoint { error }
     }
 }
 
@@ -380,6 +435,196 @@ impl AgentGraphEffectScheduleRequest {
         self.telemetry_context = telemetry_context;
         self
     }
+}
+
+/// Request metadata used to map one running timer node to a durable timer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGraphTimerScheduleRequest {
+    /// Durable run id used in the timer identity.
+    pub run_id: AgentRunId,
+    /// Tenant or namespace that owns the timer.
+    pub tenant: AgentTenantId,
+    /// Compiled timer node id being scheduled.
+    pub node_id: AgentCompiledNodeId,
+    /// Optional deterministic loop instance id.
+    pub loop_instance_id: Option<String>,
+    /// Due timestamp for the durable timer.
+    pub due_at: AgentTimestampMillis,
+    /// Timer creation timestamp.
+    pub created_at: AgentTimestampMillis,
+    /// Command or event that caused this timer.
+    pub causation_id: AgentCausationId,
+    /// Correlation id shared across related commands, effects, logs, and audit events.
+    pub correlation_id: AgentCorrelationId,
+    /// Trace, baggage, and span-link context.
+    pub telemetry_context: AgentTelemetryContext,
+}
+
+impl AgentGraphTimerScheduleRequest {
+    /// Creates a graph timer schedule request.
+    #[must_use]
+    pub fn new(
+        run_id: AgentRunId,
+        tenant: AgentTenantId,
+        node_id: impl Into<AgentCompiledNodeId>,
+        due_at: AgentTimestampMillis,
+        created_at: AgentTimestampMillis,
+        causation_id: AgentCausationId,
+        correlation_id: AgentCorrelationId,
+    ) -> Self {
+        Self {
+            run_id,
+            tenant,
+            node_id: node_id.into(),
+            loop_instance_id: None,
+            due_at,
+            created_at,
+            causation_id,
+            correlation_id,
+            telemetry_context: AgentTelemetryContext::default(),
+        }
+    }
+
+    /// Sets a deterministic loop instance id.
+    #[must_use]
+    pub fn loop_instance_id(mut self, loop_instance_id: impl Into<String>) -> Self {
+        self.loop_instance_id = Some(loop_instance_id.into());
+        self
+    }
+
+    /// Sets trace, baggage, and span-link context.
+    #[must_use]
+    pub fn telemetry_context(mut self, telemetry_context: AgentTelemetryContext) -> Self {
+        self.telemetry_context = telemetry_context;
+        self
+    }
+}
+
+/// Result of scheduling one graph timer node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGraphTimerScheduleOutcome {
+    /// Durable timer entry.
+    pub timer: AgentTimerEntry,
+    /// True when the timer already existed with the same logical identity.
+    pub duplicate: bool,
+    /// Graph state transition after the durable timer boundary succeeded.
+    pub transition: AgentGraphSchedulerTransition,
+}
+
+/// Request metadata used to map one running human checkpoint node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGraphHumanCheckpointScheduleRequest {
+    /// Durable run id used in the checkpoint identity.
+    pub run_id: AgentRunId,
+    /// Compiled human checkpoint node id being opened.
+    pub node_id: AgentCompiledNodeId,
+    /// Optional deterministic loop instance id.
+    pub loop_instance_id: Option<String>,
+    /// Checkpoint record supplied by the application compiler/runtime.
+    pub checkpoint: HumanCheckpoint,
+    /// Target that should receive the human approval request.
+    pub target: AgentEffectTarget,
+    /// Optional approval payload artifact.
+    pub payload_ref: Option<ArtifactRef>,
+    /// First dispatch timestamp for the approval request.
+    pub dispatch_at: Option<AgentTimestampMillis>,
+    /// Target timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Expected decision result type.
+    pub expected_result_type: Option<String>,
+    /// Checkpoint opening timestamp.
+    pub created_at: AgentTimestampMillis,
+    /// Command or event that caused this checkpoint.
+    pub causation_id: AgentCausationId,
+    /// Correlation id shared across related commands, effects, logs, and audit events.
+    pub correlation_id: AgentCorrelationId,
+    /// Trace, baggage, and span-link context.
+    pub telemetry_context: AgentTelemetryContext,
+}
+
+impl AgentGraphHumanCheckpointScheduleRequest {
+    /// Creates a graph human checkpoint schedule request.
+    #[must_use]
+    pub fn new(
+        run_id: AgentRunId,
+        node_id: impl Into<AgentCompiledNodeId>,
+        checkpoint: HumanCheckpoint,
+        target: AgentEffectTarget,
+        created_at: AgentTimestampMillis,
+        causation_id: AgentCausationId,
+        correlation_id: AgentCorrelationId,
+    ) -> Self {
+        Self {
+            run_id,
+            node_id: node_id.into(),
+            loop_instance_id: None,
+            checkpoint,
+            target,
+            payload_ref: None,
+            dispatch_at: None,
+            timeout_ms: None,
+            expected_result_type: Some("HumanDecision".to_string()),
+            created_at,
+            causation_id,
+            correlation_id,
+            telemetry_context: AgentTelemetryContext::default(),
+        }
+    }
+
+    /// Sets a deterministic loop instance id.
+    #[must_use]
+    pub fn loop_instance_id(mut self, loop_instance_id: impl Into<String>) -> Self {
+        self.loop_instance_id = Some(loop_instance_id.into());
+        self
+    }
+
+    /// Sets an approval payload artifact.
+    #[must_use]
+    pub fn payload_ref(mut self, payload_ref: ArtifactRef) -> Self {
+        self.payload_ref = Some(payload_ref);
+        self
+    }
+
+    /// Sets first dispatch timestamp for the approval request.
+    #[must_use]
+    pub const fn dispatch_at(mut self, dispatch_at: AgentTimestampMillis) -> Self {
+        self.dispatch_at = Some(dispatch_at);
+        self
+    }
+
+    /// Sets target timeout in milliseconds.
+    #[must_use]
+    pub const fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Sets expected decision result type.
+    #[must_use]
+    pub fn expected_result_type(mut self, expected_result_type: impl Into<String>) -> Self {
+        self.expected_result_type = Some(expected_result_type.into());
+        self
+    }
+
+    /// Sets trace, baggage, and span-link context.
+    #[must_use]
+    pub fn telemetry_context(mut self, telemetry_context: AgentTelemetryContext) -> Self {
+        self.telemetry_context = telemetry_context;
+        self
+    }
+}
+
+/// Result of opening one graph human checkpoint node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGraphHumanCheckpointScheduleOutcome {
+    /// Checkpoint record supplied by the application runtime.
+    pub checkpoint: HumanCheckpoint,
+    /// Mapped human approval outbox effect.
+    pub approval_effect: AgentEffect,
+    /// Durable outbox acceptance result.
+    pub acceptance: AgentOutboxAcceptance,
+    /// Graph state transition after the durable outbox boundary succeeded.
+    pub transition: AgentGraphSchedulerTransition,
 }
 
 /// Result of scheduling one graph node effect.
@@ -482,13 +727,103 @@ impl AgentGraphEffectBridge {
         validate_plan_state(plan, &state)?;
         validate_inbox_matches_run(&request, inbox)?;
         let effect = self.effect_from_node(plan, &request)?;
-        ensure_node_can_schedule_effect(&state, &request.node_id, &effect.effect_id)?;
+        let wait_reason = wait_reason_for_effect_node(plan, &request.node_id)?;
+        ensure_node_can_schedule_effect(&state, &request.node_id, &effect.effect_id, wait_reason)?;
 
         let acceptance = inbox.schedule_effect(effect.clone()).await?;
-        let transition = record_scheduled_effect(state, &request, &effect.effect_id)?;
+        let transition = record_scheduled_effect(state, &request, &effect.effect_id, wait_reason)?;
 
         Ok(AgentGraphEffectScheduleOutcome {
             effect,
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Maps a compiled timer node to a durable timer entry.
+    pub fn timer_from_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        request: &AgentGraphTimerScheduleRequest,
+    ) -> AgentGraphEffectBridgeResult<AgentTimerEntry> {
+        validate_plan(plan)?;
+        let node = ensure_known_node(plan, &request.node_id)?;
+        timer_from_node(plan, node, request)
+    }
+
+    /// Schedules one running graph timer node through the durable timer store.
+    pub async fn schedule_node_timer<Store>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        request: AgentGraphTimerScheduleRequest,
+        timers: &mut AgentTimerStore<Store>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphTimerScheduleOutcome>
+    where
+        Store: DurableStateStore<AgentTimerStoreState>,
+    {
+        validate_plan_state(plan, &state)?;
+        let timer = self.timer_from_node(plan, &request)?;
+        ensure_node_can_schedule_timer(&state, &request.node_id, &timer.timer_id)?;
+
+        let (timer, duplicate) = schedule_timer_entry(timers, timer).await?;
+        let transition = record_scheduled_timer(state, &request, &timer.timer_id)?;
+
+        Ok(AgentGraphTimerScheduleOutcome {
+            timer,
+            duplicate,
+            transition,
+        })
+    }
+
+    /// Maps a compiled human checkpoint node to a durable approval request.
+    pub fn human_approval_request_from_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        request: &AgentGraphHumanCheckpointScheduleRequest,
+    ) -> AgentGraphEffectBridgeResult<AgentHumanApprovalRequest> {
+        validate_plan(plan)?;
+        let node = ensure_known_node(plan, &request.node_id)?;
+        human_approval_request_from_node(plan, node, request)
+    }
+
+    /// Opens one graph human checkpoint by scheduling its approval request.
+    ///
+    /// The graph node is marked waiting only after the durable outbox boundary
+    /// returns scheduled or duplicate acceptance.
+    pub async fn open_node_human_checkpoint<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        request: AgentGraphHumanCheckpointScheduleRequest,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphHumanCheckpointScheduleOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        validate_plan_state(plan, &state)?;
+        validate_human_inbox_matches_run(&request, inbox)?;
+        let approval_request = self.human_approval_request_from_node(plan, &request)?;
+        let approval_effect = approval_request.approval_effect()?;
+        ensure_node_can_open_checkpoint(
+            &state,
+            &request.node_id,
+            &request.checkpoint.checkpoint_id,
+            &approval_effect.effect_id,
+        )?;
+
+        let acceptance = inbox.schedule_effect(approval_effect.clone()).await?;
+        let transition = record_open_checkpoint(
+            state,
+            &request,
+            &request.checkpoint.checkpoint_id,
+            &approval_effect.effect_id,
+        )?;
+
+        Ok(AgentGraphHumanCheckpointScheduleOutcome {
+            checkpoint: request.checkpoint,
+            approval_effect,
             acceptance,
             transition,
         })
@@ -528,6 +863,48 @@ impl AgentGraphEffectBridge {
         .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })?
         .attribute(ATTR_FAILURE_DISPOSITION, disposition.as_label())
         .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
+    }
+
+    /// Builds a `TimerFired` command for a durable graph timer.
+    pub fn timer_fired_command(
+        &self,
+        metadata: AgentCommandMetadata,
+        timer_id: AgentTimerId,
+    ) -> AgentGraphEffectBridgeResult<AgentCommand> {
+        AgentCommand::new(
+            AgentCommandKind::TimerFired {
+                timer_id: timer_id.as_str().to_string(),
+            },
+            metadata,
+        )
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })?
+        .attribute("timer_id", timer_id.as_str())
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
+    }
+
+    /// Builds a `HumanDecisionSubmitted` command for a graph checkpoint.
+    pub fn human_decision_submitted_command(
+        &self,
+        metadata: AgentCommandMetadata,
+        checkpoint_id: HumanCheckpointId,
+        decision: impl Into<String>,
+        resolved_status: HumanCheckpointStatus,
+        payload_ref: Option<ArtifactRef>,
+    ) -> AgentGraphEffectBridgeResult<AgentCommand> {
+        let mut command = AgentCommand::new(
+            AgentCommandKind::HumanDecisionSubmitted {
+                checkpoint_id,
+                decision: decision.into(),
+            },
+            metadata,
+        )
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })?
+        .attribute(ATTR_DECISION_STATUS, resolved_status.as_label())
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })?;
+        if let Some(payload_ref) = payload_ref {
+            command = command.payload_ref(payload_ref);
+        }
+        Ok(command)
     }
 
     /// Accepts an effect completion command and applies it to graph state.
@@ -576,6 +953,56 @@ impl AgentGraphEffectBridge {
         validate_command_inbox_matches_run(&command, inbox)?;
         let acceptance = inbox.accept_command(command.clone()).await?;
         let transition = apply_effect_failed_command(plan, state, &command)?;
+        Ok(AgentGraphEffectCommandOutcome {
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Accepts a timer-fired command and applies it to graph state.
+    ///
+    /// Duplicate inbox acceptance is still apply-safe after a crash between
+    /// command acceptance and graph transition persistence.
+    pub async fn accept_and_apply_timer_fired<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        command: AgentCommand,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphEffectCommandOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        ensure_command_kind(&command, "TimerFired")?;
+        validate_command_inbox_matches_run(&command, inbox)?;
+        let acceptance = inbox.accept_command(command.clone()).await?;
+        let transition = apply_timer_fired_command(plan, state, &command)?;
+        Ok(AgentGraphEffectCommandOutcome {
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Accepts a human decision command and applies it to graph state.
+    ///
+    /// Duplicate inbox acceptance is still apply-safe after a crash between
+    /// command acceptance and graph transition persistence.
+    pub async fn accept_and_apply_human_decision<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        command: AgentCommand,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphEffectCommandOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        ensure_command_kind(&command, "HumanDecisionSubmitted")?;
+        validate_command_inbox_matches_run(&command, inbox)?;
+        let acceptance = inbox.accept_command(command.clone()).await?;
+        let transition = apply_human_decision_command(plan, state, &command)?;
         Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
@@ -657,6 +1084,24 @@ where
     Ok(())
 }
 
+fn validate_human_inbox_matches_run<Store, Clock>(
+    request: &AgentGraphHumanCheckpointScheduleRequest,
+    inbox: &AgentRunInbox<Store, Clock>,
+) -> AgentGraphEffectBridgeResult<()>
+where
+    Store: DurableStateStore<WorkflowState>,
+    Clock: WorkflowClock,
+{
+    let expected_workflow_id = agent_run_workflow_id(&request.run_id);
+    if inbox.workflow_id() != &expected_workflow_id {
+        return Err(AgentGraphEffectBridgeError::RunInboxMismatch {
+            expected_workflow_id: expected_workflow_id.as_str().to_string(),
+            actual_workflow_id: inbox.workflow_id().as_str().to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_command_inbox_matches_run<Store, Clock>(
     command: &AgentCommand,
     inbox: &AgentRunInbox<Store, Clock>,
@@ -675,6 +1120,51 @@ where
     Ok(())
 }
 
+async fn schedule_timer_entry<Store>(
+    timers: &mut AgentTimerStore<Store>,
+    entry: AgentTimerEntry,
+) -> AgentGraphEffectBridgeResult<(AgentTimerEntry, bool)>
+where
+    Store: DurableStateStore<AgentTimerStoreState>,
+{
+    match timers.schedule_timer(entry.clone()).await {
+        Ok(timer) => Ok((timer, false)),
+        Err(AgentTimerError::TimerAlreadyExists { timer_id }) => {
+            let existing = timers.state()?.timer(&timer_id).cloned().ok_or(
+                AgentGraphEffectBridgeError::UnknownTimer {
+                    timer_id: timer_id.clone(),
+                },
+            )?;
+            ensure_timer_entry_compatible(&existing, &entry)?;
+            Ok((existing, true))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_timer_entry_compatible(
+    existing: &AgentTimerEntry,
+    expected: &AgentTimerEntry,
+) -> AgentGraphEffectBridgeResult<()> {
+    if existing.workflow_id != expected.workflow_id
+        || existing.run_id != expected.run_id
+        || existing.tenant != expected.tenant
+        || existing.due_at != expected.due_at
+        || existing.deduplication_key != expected.deduplication_key
+        || existing.causation_id != expected.causation_id
+        || existing.correlation_id != expected.correlation_id
+    {
+        return Err(AgentGraphEffectBridgeError::PlanStateMismatch {
+            field: "timer_entry",
+            reason: format!(
+                "timer `{}` already exists with incompatible durable identity",
+                existing.timer_id
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_command_kind(
     command: &AgentCommand,
     expected: &'static str,
@@ -684,6 +1174,94 @@ fn ensure_command_kind(
         return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind { expected, actual });
     }
     Ok(())
+}
+
+fn apply_timer_fired_command(
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    validate_plan_state_for_command(plan, &state)?;
+    let timer_id = match &command.kind {
+        AgentCommandKind::TimerFired { timer_id } => AgentTimerId::new(timer_id.clone()),
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "TimerFired",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let node_id = node_id_for_timer(&state, &timer_id)?;
+    let node_state = state.node_states.get(&node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status == AgentGraphNodeStatus::Completed {
+        return Ok(noop_transition(state));
+    }
+    if node_state.status != AgentGraphNodeStatus::Waiting
+        || node_state.wait_reason != Some(AgentGraphWaitReason::Timer)
+    {
+        return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
+            node_id,
+            status: node_state.status,
+        });
+    }
+
+    let output_refs = first_output_ref(plan, &node_id, command.payload_ref.clone())?;
+    Ok(AgentGraphScheduler::new().complete_waiting_node(
+        plan,
+        state,
+        node_id,
+        AgentGraphWaitReason::Timer,
+        output_refs,
+        command.metadata.received_at,
+    )?)
+}
+
+fn apply_human_decision_command(
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    validate_plan_state_for_command(plan, &state)?;
+    let checkpoint_id = match &command.kind {
+        AgentCommandKind::HumanDecisionSubmitted { checkpoint_id, .. } => checkpoint_id,
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "HumanDecisionSubmitted",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let node_id = node_id_for_checkpoint(&state, checkpoint_id)?;
+    let node_state = state.node_states.get(&node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status == AgentGraphNodeStatus::Completed {
+        return Ok(noop_transition(state));
+    }
+    if node_state.status != AgentGraphNodeStatus::Waiting
+        || node_state.wait_reason != Some(AgentGraphWaitReason::Human)
+    {
+        return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
+            node_id,
+            status: node_state.status,
+        });
+    }
+
+    let output_refs = first_output_ref(plan, &node_id, command.payload_ref.clone())?;
+    Ok(AgentGraphScheduler::new().complete_waiting_node(
+        plan,
+        state,
+        node_id,
+        AgentGraphWaitReason::Human,
+        output_refs,
+        command.metadata.received_at,
+    )?)
 }
 
 fn apply_effect_completed_command(
@@ -710,8 +1288,9 @@ fn apply_effect_completed_command(
     if node_state.status == AgentGraphNodeStatus::Completed {
         return Ok(noop_transition(state));
     }
+    let wait_reason = wait_reason_for_effect_node(plan, &node_id)?;
     if node_state.status != AgentGraphNodeStatus::Waiting
-        || node_state.wait_reason != Some(AgentGraphWaitReason::Effect)
+        || node_state.wait_reason != Some(wait_reason)
     {
         return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
             node_id,
@@ -719,12 +1298,12 @@ fn apply_effect_completed_command(
         });
     }
 
-    let output_refs = effect_result_output_refs(plan, &node_id, command.payload_ref.clone())?;
+    let output_refs = first_output_ref(plan, &node_id, command.payload_ref.clone())?;
     Ok(AgentGraphScheduler::new().complete_waiting_node(
         plan,
         state,
         node_id,
-        AgentGraphWaitReason::Effect,
+        wait_reason,
         output_refs,
         command.metadata.received_at,
     )?)
@@ -760,8 +1339,9 @@ fn apply_effect_failed_command(
     ) {
         return Ok(noop_transition(state));
     }
+    let wait_reason = wait_reason_for_effect_node(plan, &node_id)?;
     if node_state.status != AgentGraphNodeStatus::Waiting
-        || node_state.wait_reason != Some(AgentGraphWaitReason::Effect)
+        || node_state.wait_reason != Some(wait_reason)
     {
         return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
             node_id,
@@ -795,7 +1375,7 @@ fn apply_effect_failed_command(
                 plan,
                 state,
                 node_id,
-                AgentGraphWaitReason::Effect,
+                wait_reason,
                 error_code,
                 command.metadata.received_at,
             )?),
@@ -843,7 +1423,39 @@ fn node_id_for_effect(
         })
 }
 
-fn effect_result_output_refs(
+fn node_id_for_timer(
+    state: &AgentGraphRunState,
+    timer_id: &AgentTimerId,
+) -> AgentGraphEffectBridgeResult<AgentCompiledNodeId> {
+    state
+        .node_states
+        .values()
+        .find(|node| node.timer_ids.iter().any(|scheduled| scheduled == timer_id))
+        .map(|node| node.node_id.clone())
+        .ok_or_else(|| AgentGraphEffectBridgeError::UnknownTimer {
+            timer_id: timer_id.clone(),
+        })
+}
+
+fn node_id_for_checkpoint(
+    state: &AgentGraphRunState,
+    checkpoint_id: &HumanCheckpointId,
+) -> AgentGraphEffectBridgeResult<AgentCompiledNodeId> {
+    state
+        .node_states
+        .values()
+        .find(|node| {
+            node.checkpoint_ids
+                .iter()
+                .any(|scheduled| scheduled == checkpoint_id)
+        })
+        .map(|node| node.node_id.clone())
+        .ok_or_else(|| AgentGraphEffectBridgeError::UnknownCheckpoint {
+            checkpoint_id: checkpoint_id.clone(),
+        })
+}
+
+fn first_output_ref(
     plan: &AgentCompiledExecutionPlan,
     node_id: &AgentCompiledNodeId,
     result_ref: Option<ArtifactRef>,
@@ -897,6 +1509,7 @@ fn ensure_node_can_schedule_effect(
     state: &AgentGraphRunState,
     node_id: &AgentCompiledNodeId,
     effect_id: &AgentEffectId,
+    wait_reason: AgentGraphWaitReason,
 ) -> AgentGraphEffectBridgeResult<()> {
     let node_state = state.node_states.get(node_id).ok_or_else(|| {
         AgentGraphEffectBridgeError::MissingNodeState {
@@ -907,7 +1520,70 @@ fn ensure_node_can_schedule_effect(
         return Ok(());
     }
     if node_state.status == AgentGraphNodeStatus::Waiting
-        && node_state.wait_reason == Some(AgentGraphWaitReason::Effect)
+        && node_state.wait_reason == Some(wait_reason)
+        && node_state
+            .scheduled_effect_ids
+            .iter()
+            .any(|scheduled| scheduled == effect_id)
+    {
+        return Ok(());
+    }
+
+    Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
+        node_id: node_id.clone(),
+        status: node_state.status,
+    })
+}
+
+fn ensure_node_can_schedule_timer(
+    state: &AgentGraphRunState,
+    node_id: &AgentCompiledNodeId,
+    timer_id: &AgentTimerId,
+) -> AgentGraphEffectBridgeResult<()> {
+    let node_state = state.node_states.get(node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status == AgentGraphNodeStatus::Running {
+        return Ok(());
+    }
+    if node_state.status == AgentGraphNodeStatus::Waiting
+        && node_state.wait_reason == Some(AgentGraphWaitReason::Timer)
+        && node_state
+            .timer_ids
+            .iter()
+            .any(|scheduled| scheduled == timer_id)
+    {
+        return Ok(());
+    }
+
+    Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
+        node_id: node_id.clone(),
+        status: node_state.status,
+    })
+}
+
+fn ensure_node_can_open_checkpoint(
+    state: &AgentGraphRunState,
+    node_id: &AgentCompiledNodeId,
+    checkpoint_id: &HumanCheckpointId,
+    effect_id: &AgentEffectId,
+) -> AgentGraphEffectBridgeResult<()> {
+    let node_state = state.node_states.get(node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status == AgentGraphNodeStatus::Running {
+        return Ok(());
+    }
+    if node_state.status == AgentGraphNodeStatus::Waiting
+        && node_state.wait_reason == Some(AgentGraphWaitReason::Human)
+        && node_state
+            .checkpoint_ids
+            .iter()
+            .any(|scheduled| scheduled == checkpoint_id)
         && node_state
             .scheduled_effect_ids
             .iter()
@@ -961,6 +1637,121 @@ fn effect_from_node(
     Ok(schedule.into_effect()?)
 }
 
+fn timer_from_node(
+    plan: &AgentCompiledExecutionPlan,
+    node: &AgentCompiledPlanNode,
+    request: &AgentGraphTimerScheduleRequest,
+) -> AgentGraphEffectBridgeResult<AgentTimerEntry> {
+    if node.kind != AgentCompiledNodeKind::TimerWait {
+        return Err(AgentGraphEffectBridgeError::UnsupportedNodeKind {
+            node_id: node.node_id.clone(),
+            kind: node.kind,
+        });
+    }
+    let identity = timer_identity(plan, node, request);
+    let durability = AgentDurabilityMetadata::new(
+        AgentDeduplicationKey::new(format!("graph-timer-dedupe:{identity}")),
+        request.causation_id.clone(),
+        request.correlation_id.clone(),
+    )
+    .telemetry_context(request.telemetry_context.clone());
+    let policy = AgentTimerPolicy::new()
+        .policy_name("graph-timer")
+        .attribute(ATTR_NODE_KIND, node.kind.as_label())
+        .attribute(ATTR_COMPILED_NODE_ID, node.node_id.as_str())
+        .attribute(
+            ATTR_COMPILED_PLAN_FINGERPRINT,
+            plan.plan_fingerprint.as_str(),
+        )
+        .attribute(ATTR_LOOP_INSTANCE_ID, timer_loop_instance_key(request));
+    Ok(AgentTimerEntry::new(
+        AgentTimerId::new(format!("graph-timer:{identity}")),
+        plan.workflow_id.clone(),
+        request.run_id.clone(),
+        request.tenant.clone(),
+        request.due_at,
+        durability,
+        request.created_at,
+    )?
+    .policy(policy)?)
+}
+
+fn human_approval_request_from_node(
+    plan: &AgentCompiledExecutionPlan,
+    node: &AgentCompiledPlanNode,
+    request: &AgentGraphHumanCheckpointScheduleRequest,
+) -> AgentGraphEffectBridgeResult<AgentHumanApprovalRequest> {
+    if node.kind != AgentCompiledNodeKind::HumanCheckpoint {
+        return Err(AgentGraphEffectBridgeError::UnsupportedNodeKind {
+            node_id: node.node_id.clone(),
+            kind: node.kind,
+        });
+    }
+    let target = human_target_for_node(plan, node, request);
+    let target_class = target_class_from_attributes(&target.attributes, node.kind);
+    let identity = human_checkpoint_identity(plan, node, request, &target_class);
+    let durability = AgentDurabilityMetadata::new(
+        AgentDeduplicationKey::new(format!("graph-human-dedupe:{identity}")),
+        request.causation_id.clone(),
+        request.correlation_id.clone(),
+    )
+    .telemetry_context(request.telemetry_context.clone());
+    let mut approval = AgentHumanApprovalRequest::new(
+        request.checkpoint.clone(),
+        AgentEffectId::new(format!("graph-human-approval:{identity}")),
+        durability,
+        AgentIdempotencyKey::new(format!("graph-human-idempotency:{identity}")),
+        target,
+    )?;
+    if let Some(payload_ref) = &request.payload_ref {
+        approval = approval.payload_ref(payload_ref.clone());
+    }
+    if let Some(expected_result_type) = &request.expected_result_type {
+        approval = approval.expected_result_type(expected_result_type.clone())?;
+    }
+    if let Some(dispatch_at) = request.dispatch_at {
+        approval = approval.dispatch_at(dispatch_at);
+    }
+    if let Some(timeout_ms) = request.timeout_ms {
+        approval = approval.timeout_ms(timeout_ms);
+    }
+    Ok(approval)
+}
+
+fn human_target_for_node(
+    plan: &AgentCompiledExecutionPlan,
+    node: &AgentCompiledPlanNode,
+    request: &AgentGraphHumanCheckpointScheduleRequest,
+) -> AgentEffectTarget {
+    let mut target = request.target.clone();
+    let target_class = target
+        .attributes
+        .get(ATTR_TARGET_CLASS)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "human-checkpoint".to_string());
+    target
+        .attributes
+        .entry(ATTR_TARGET_CLASS.to_string())
+        .or_insert(target_class);
+    target
+        .attributes
+        .insert(ATTR_NODE_KIND.to_string(), node.kind.as_label().to_string());
+    target.attributes.insert(
+        ATTR_COMPILED_NODE_ID.to_string(),
+        node.node_id.as_str().to_string(),
+    );
+    target.attributes.insert(
+        ATTR_COMPILED_PLAN_FINGERPRINT.to_string(),
+        plan.plan_fingerprint.as_str().to_string(),
+    );
+    target.attributes.insert(
+        ATTR_LOOP_INSTANCE_ID.to_string(),
+        human_loop_instance_key(request).to_string(),
+    );
+    target
+}
+
 fn effect_kind_for_node(
     node: &AgentCompiledPlanNode,
 ) -> AgentGraphEffectBridgeResult<AgentEffectKind> {
@@ -975,6 +1766,38 @@ fn effect_kind_for_node(
         AgentCompiledNodeKind::ChildWorkflowCommand => Ok(AgentEffectKind::ChildWorkflowCommand),
         AgentCompiledNodeKind::Notification => Ok(AgentEffectKind::Notification),
         AgentCompiledNodeKind::AuditEvent => Ok(AgentEffectKind::AuditEvent),
+        AgentCompiledNodeKind::Input
+        | AgentCompiledNodeKind::Transform
+        | AgentCompiledNodeKind::Branch
+        | AgentCompiledNodeKind::Join
+        | AgentCompiledNodeKind::Iterator
+        | AgentCompiledNodeKind::HumanCheckpoint
+        | AgentCompiledNodeKind::TimerWait
+        | AgentCompiledNodeKind::Terminal => {
+            Err(AgentGraphEffectBridgeError::UnsupportedNodeKind {
+                node_id: node.node_id.clone(),
+                kind: node.kind,
+            })
+        }
+    }
+}
+
+fn wait_reason_for_effect_node(
+    plan: &AgentCompiledExecutionPlan,
+    node_id: &AgentCompiledNodeId,
+) -> AgentGraphEffectBridgeResult<AgentGraphWaitReason> {
+    let node = ensure_known_node(plan, node_id)?;
+    match node.kind {
+        AgentCompiledNodeKind::ChildWorkflowCommand => Ok(AgentGraphWaitReason::ChildWorkflow),
+        AgentCompiledNodeKind::ModelCall
+        | AgentCompiledNodeKind::ToolCall
+        | AgentCompiledNodeKind::ProcessCall
+        | AgentCompiledNodeKind::HttpCall
+        | AgentCompiledNodeKind::GrpcCall
+        | AgentCompiledNodeKind::StreamPublish
+        | AgentCompiledNodeKind::ArtifactWrite
+        | AgentCompiledNodeKind::Notification
+        | AgentCompiledNodeKind::AuditEvent => Ok(AgentGraphWaitReason::Effect),
         AgentCompiledNodeKind::Input
         | AgentCompiledNodeKind::Transform
         | AgentCompiledNodeKind::Branch
@@ -1074,7 +1897,52 @@ fn effect_identity(
     )
 }
 
+fn timer_identity(
+    plan: &AgentCompiledExecutionPlan,
+    node: &AgentCompiledPlanNode,
+    request: &AgentGraphTimerScheduleRequest,
+) -> String {
+    format!(
+        "run={};plan={};node={};loop={}",
+        request.run_id.as_str(),
+        plan.plan_fingerprint.as_str(),
+        node.node_id.as_str(),
+        timer_loop_instance_key(request)
+    )
+}
+
+fn human_checkpoint_identity(
+    plan: &AgentCompiledExecutionPlan,
+    node: &AgentCompiledPlanNode,
+    request: &AgentGraphHumanCheckpointScheduleRequest,
+    target_class: &str,
+) -> String {
+    format!(
+        "run={};plan={};node={};loop={};checkpoint={};target_class={}",
+        request.run_id.as_str(),
+        plan.plan_fingerprint.as_str(),
+        node.node_id.as_str(),
+        human_loop_instance_key(request),
+        request.checkpoint.checkpoint_id.as_str(),
+        target_class
+    )
+}
+
 fn loop_instance_key(request: &AgentGraphEffectScheduleRequest) -> &str {
+    request
+        .loop_instance_id
+        .as_deref()
+        .unwrap_or(ROOT_LOOP_INSTANCE_ID)
+}
+
+fn timer_loop_instance_key(request: &AgentGraphTimerScheduleRequest) -> &str {
+    request
+        .loop_instance_id
+        .as_deref()
+        .unwrap_or(ROOT_LOOP_INSTANCE_ID)
+}
+
+fn human_loop_instance_key(request: &AgentGraphHumanCheckpointScheduleRequest) -> &str {
     request
         .loop_instance_id
         .as_deref()
@@ -1085,6 +1953,7 @@ fn record_scheduled_effect(
     mut state: AgentGraphRunState,
     request: &AgentGraphEffectScheduleRequest,
     effect_id: &AgentEffectId,
+    wait_reason: AgentGraphWaitReason,
 ) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
     let node_state = state.node_states.get_mut(&request.node_id).ok_or_else(|| {
         AgentGraphEffectBridgeError::MissingNodeState {
@@ -1101,10 +1970,107 @@ fn record_scheduled_effect(
         changed = true;
     }
     if node_state.status != AgentGraphNodeStatus::Waiting
-        || node_state.wait_reason != Some(AgentGraphWaitReason::Effect)
+        || node_state.wait_reason != Some(wait_reason)
     {
         node_state.status = AgentGraphNodeStatus::Waiting;
-        node_state.wait_reason = Some(AgentGraphWaitReason::Effect);
+        node_state.wait_reason = Some(wait_reason);
+        node_state.updated_at = request.created_at;
+        changed = true;
+    }
+
+    let changed_node_ids = if changed {
+        state.scheduler_revision += 1;
+        state.blocked_reason = None;
+        vec![request.node_id.clone()]
+    } else {
+        Vec::new()
+    };
+    let runnable_node_ids = AgentGraphScheduler::new().runnable_nodes(&state);
+
+    Ok(AgentGraphSchedulerTransition {
+        state,
+        changed_node_ids,
+        runnable_node_ids,
+    })
+}
+
+fn record_scheduled_timer(
+    mut state: AgentGraphRunState,
+    request: &AgentGraphTimerScheduleRequest,
+    timer_id: &AgentTimerId,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    let node_state = state.node_states.get_mut(&request.node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: request.node_id.clone(),
+        }
+    })?;
+    let mut changed = false;
+    if !node_state
+        .timer_ids
+        .iter()
+        .any(|scheduled| scheduled == timer_id)
+    {
+        node_state.timer_ids.push(timer_id.clone());
+        changed = true;
+    }
+    if node_state.status != AgentGraphNodeStatus::Waiting
+        || node_state.wait_reason != Some(AgentGraphWaitReason::Timer)
+    {
+        node_state.status = AgentGraphNodeStatus::Waiting;
+        node_state.wait_reason = Some(AgentGraphWaitReason::Timer);
+        node_state.updated_at = request.created_at;
+        changed = true;
+    }
+
+    let changed_node_ids = if changed {
+        state.scheduler_revision += 1;
+        state.blocked_reason = None;
+        vec![request.node_id.clone()]
+    } else {
+        Vec::new()
+    };
+    let runnable_node_ids = AgentGraphScheduler::new().runnable_nodes(&state);
+
+    Ok(AgentGraphSchedulerTransition {
+        state,
+        changed_node_ids,
+        runnable_node_ids,
+    })
+}
+
+fn record_open_checkpoint(
+    mut state: AgentGraphRunState,
+    request: &AgentGraphHumanCheckpointScheduleRequest,
+    checkpoint_id: &HumanCheckpointId,
+    effect_id: &AgentEffectId,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    let node_state = state.node_states.get_mut(&request.node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: request.node_id.clone(),
+        }
+    })?;
+    let mut changed = false;
+    if !node_state
+        .checkpoint_ids
+        .iter()
+        .any(|scheduled| scheduled == checkpoint_id)
+    {
+        node_state.checkpoint_ids.push(checkpoint_id.clone());
+        changed = true;
+    }
+    if !node_state
+        .scheduled_effect_ids
+        .iter()
+        .any(|scheduled| scheduled == effect_id)
+    {
+        node_state.scheduled_effect_ids.push(effect_id.clone());
+        changed = true;
+    }
+    if node_state.status != AgentGraphNodeStatus::Waiting
+        || node_state.wait_reason != Some(AgentGraphWaitReason::Human)
+    {
+        node_state.status = AgentGraphNodeStatus::Waiting;
+        node_state.wait_reason = Some(AgentGraphWaitReason::Human);
         node_state.updated_at = request.created_at;
         changed = true;
     }

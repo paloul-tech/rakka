@@ -8,17 +8,21 @@ use rakka_agent_workflow::{
     AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
     AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCompiledPortId, AgentCorrelationId,
     AgentCredentialBindingRef, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffectKind,
-    AgentGraphEffectBridge, AgentGraphEffectFailureDisposition, AgentGraphEffectScheduleRequest,
-    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler,
-    AgentGraphTerminalStatus, AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId,
-    AgentTimestampMillis, AgentWorkflowId, ArtifactEncryptionRef, ArtifactKind, ArtifactRef,
-    RedactionStatus, WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    AgentEffectTarget, AgentGraphEffectBridge, AgentGraphEffectFailureDisposition,
+    AgentGraphEffectScheduleRequest, AgentGraphHumanCheckpointScheduleRequest, AgentGraphNodeState,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphTerminalStatus,
+    AgentGraphTimerScheduleRequest, AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId,
+    AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis, AgentWorkflowId,
+    ArtifactEncryptionRef, ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, HumanDecisionOption, PrincipalRef, RedactionStatus,
+    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_workflow::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
 
 type TestStore = InMemoryDurableStateStore<WorkflowState>;
 type TestInbox = AgentRunInbox<TestStore, ManualWorkflowClock>;
+type TestTimerStore = InMemoryDurableStateStore<AgentTimerStoreState>;
 
 #[tokio::test]
 async fn model_and_tool_nodes_schedule_durable_effects() {
@@ -456,6 +460,224 @@ async fn crash_after_completion_command_acceptance_recovers_graph_transition() {
     );
 }
 
+#[tokio::test]
+async fn timer_node_resumes_once_after_timer_command_redelivery() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = wait_plan(AgentCompiledNodeKind::TimerWait);
+    let run_id = AgentRunId::new("run-graph-timer-redelivery");
+    let timer_store = TestTimerStore::new();
+    let mut timers = AgentTimerStore::new(timer_store.clone());
+    timers
+        .recover(ts(100))
+        .await
+        .expect("timers should recover");
+
+    let scheduled = bridge
+        .schedule_node_timer(
+            &plan,
+            running_effect_state(&plan),
+            timer_request(run_id.clone(), "effect", 500, 200),
+            &mut timers,
+        )
+        .await
+        .expect("timer node should schedule");
+    assert!(!scheduled.duplicate);
+    assert_eq!(
+        node_state(&scheduled.transition.state, "effect").status,
+        AgentGraphNodeStatus::Waiting
+    );
+    assert_eq!(
+        node_state(&scheduled.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Timer)
+    );
+    assert_eq!(
+        node_state(&scheduled.transition.state, "effect").timer_ids,
+        vec![scheduled.timer.timer_id.clone()]
+    );
+
+    let mut recovered_timers = AgentTimerStore::new(timer_store);
+    recovered_timers
+        .recover(ts(500))
+        .await
+        .expect("recovered timers should load");
+    let duplicate_schedule = bridge
+        .schedule_node_timer(
+            &plan,
+            scheduled.transition.state.clone(),
+            timer_request(run_id.clone(), "effect", 500, 200),
+            &mut recovered_timers,
+        )
+        .await
+        .expect("recovered timer scheduling should be idempotent");
+    assert!(duplicate_schedule.duplicate);
+    assert_eq!(duplicate_schedule.timer.timer_id, scheduled.timer.timer_id);
+
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(500));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+    let command = bridge
+        .timer_fired_command(
+            command_metadata(&plan, run_id, "cmd-timer-fired", 500),
+            scheduled.timer.timer_id,
+        )
+        .expect("timer command should build");
+
+    let first = bridge
+        .accept_and_apply_timer_fired(
+            &plan,
+            scheduled.transition.state,
+            command.clone(),
+            &mut inbox,
+        )
+        .await
+        .expect("timer fired should complete node");
+    assert!(first.acceptance.is_accepted());
+    assert_eq!(
+        node_state(&first.transition.state, "effect").status,
+        AgentGraphNodeStatus::Completed
+    );
+
+    let completed_revision = first.transition.state.scheduler_revision;
+    let duplicate = bridge
+        .accept_and_apply_timer_fired(&plan, first.transition.state, command, &mut inbox)
+        .await
+        .expect("duplicate timer fired command should be idempotent");
+    assert!(duplicate.acceptance.is_duplicate());
+    assert!(duplicate.transition.changed_node_ids.is_empty());
+    assert_eq!(
+        duplicate.transition.state.scheduler_revision,
+        completed_revision
+    );
+}
+
+#[tokio::test]
+async fn human_decision_resumes_waiting_graph_node() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = wait_plan(AgentCompiledNodeKind::HumanCheckpoint);
+    let run_id = AgentRunId::new("run-graph-human-decision");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+
+    let checkpoint = checkpoint("checkpoint-graph-review", 600);
+    let opened = bridge
+        .open_node_human_checkpoint(
+            &plan,
+            running_effect_state(&plan),
+            human_checkpoint_request(run_id.clone(), "effect", checkpoint.clone(), 200),
+            &mut inbox,
+        )
+        .await
+        .expect("human checkpoint should open");
+
+    assert!(opened.acceptance.is_scheduled());
+    assert_eq!(opened.checkpoint, checkpoint);
+    assert_eq!(
+        opened.approval_effect.kind,
+        AgentEffectKind::HumanApprovalRequest
+    );
+    assert_eq!(
+        node_state(&opened.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Human)
+    );
+    assert_eq!(
+        node_state(&opened.transition.state, "effect").checkpoint_ids,
+        vec![HumanCheckpointId::new("checkpoint-graph-review")]
+    );
+
+    let command = bridge
+        .human_decision_submitted_command(
+            command_metadata(&plan, run_id, "cmd-human-decision", 700).principal(PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "reviewer-1".to_string(),
+                display_name: Some("Reviewer One".to_string()),
+            }),
+            HumanCheckpointId::new("checkpoint-graph-review"),
+            "approve",
+            HumanCheckpointStatus::Approved,
+            Some(artifact("artifact:human-decision", ArtifactKind::State)),
+        )
+        .expect("human decision command should build");
+
+    let outcome = bridge
+        .accept_and_apply_human_decision(&plan, opened.transition.state, command, &mut inbox)
+        .await
+        .expect("human decision should complete node");
+    assert!(outcome.acceptance.is_accepted());
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").status,
+        AgentGraphNodeStatus::Completed
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect")
+            .output_refs
+            .get(&AgentCompiledPortId::new("result")),
+        Some(&artifact("artifact:human-decision", ArtifactKind::State))
+    );
+}
+
+#[tokio::test]
+async fn child_workflow_command_uses_stable_deduplication_metadata() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ChildWorkflowCommand,
+        "workflow",
+        "invoice.approval",
+        "child-workflow",
+    );
+    let running_state = running_effect_state(&plan);
+    let run_id = AgentRunId::new("run-graph-child-workflow");
+    let request = effect_request(run_id.clone(), "effect", 200);
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+
+    let first = bridge
+        .schedule_node_effect(&plan, running_state.clone(), request.clone(), &mut inbox)
+        .await
+        .expect("child workflow command should schedule");
+    assert!(first.acceptance.is_scheduled());
+    assert_eq!(first.effect.kind, AgentEffectKind::ChildWorkflowCommand);
+    assert_eq!(
+        node_state(&first.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::ChildWorkflow)
+    );
+
+    let duplicate = bridge
+        .schedule_node_effect(&plan, running_state, request, &mut inbox)
+        .await
+        .expect("child workflow command scheduling should be idempotent");
+    assert!(duplicate.acceptance.is_duplicate());
+    assert_eq!(duplicate.effect.effect_id, first.effect.effect_id);
+    assert_eq!(
+        duplicate.effect.deduplication_key,
+        first.effect.deduplication_key
+    );
+    assert_eq!(
+        duplicate.effect.idempotency_key,
+        first.effect.idempotency_key
+    );
+
+    let command = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id, "cmd-child-completed", 300),
+            first.effect.effect_id,
+            Some(artifact("artifact:child-result", ArtifactKind::State)),
+        )
+        .expect("child completion command should build");
+    let completed = bridge
+        .accept_and_apply_effect_completed(&plan, first.transition.state, command, &mut inbox)
+        .await
+        .expect("child workflow completion should apply");
+    assert_eq!(
+        node_state(&completed.transition.state, "effect").status,
+        AgentGraphNodeStatus::Completed
+    );
+}
+
 async fn schedule_kind(
     bridge: &AgentGraphEffectBridge,
     kind: AgentCompiledNodeKind,
@@ -508,6 +730,56 @@ fn running_effect_state(plan: &AgentCompiledExecutionPlan) -> AgentGraphRunState
         .start_node(plan, state, "effect", ts(150))
         .expect("effect should start")
         .state
+}
+
+fn wait_plan(kind: AgentCompiledNodeKind) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let wait = AgentCompiledPlanNode::new("effect", kind)
+        .input_port(AgentCompiledPlanPort::new(
+            "payload",
+            AgentCompiledPortDirection::Input,
+            "input",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Output,
+            "effect-result",
+        ));
+    let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
+        .input_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Input,
+            "effect-result",
+        ));
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new(format!("plan-wait-{}-v1", kind.as_label())),
+        AgentWorkflowId::new("workflow-effect"),
+        "wait-graph",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new(format!("sha256:wait-{}", kind.as_label())),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(wait)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-effect",
+        "input",
+        "payload",
+        "effect",
+        "payload",
+    ))
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-effect-terminal",
+        "effect",
+        "result",
+        "terminal",
+        "result",
+    ))
 }
 
 fn effect_plan(
@@ -589,6 +861,86 @@ fn effect_request(
     .payload_ref(artifact("artifact:effect-payload", ArtifactKind::Prompt))
     .timeout_ms(2_000)
     .expected_result_type("effect.result")
+}
+
+fn timer_request(
+    run_id: AgentRunId,
+    node_id: &str,
+    due_at_millis: u64,
+    created_at_millis: u64,
+) -> AgentGraphTimerScheduleRequest {
+    AgentGraphTimerScheduleRequest::new(
+        run_id,
+        AgentTenantId::new("tenant-a"),
+        node_id,
+        AgentTimestampMillis::new(due_at_millis),
+        AgentTimestampMillis::new(created_at_millis),
+        AgentCausationId::new("cause:start-run"),
+        AgentCorrelationId::new("correlation:workflow"),
+    )
+}
+
+fn human_checkpoint_request(
+    run_id: AgentRunId,
+    node_id: &str,
+    checkpoint: HumanCheckpoint,
+    created_at_millis: u64,
+) -> AgentGraphHumanCheckpointScheduleRequest {
+    AgentGraphHumanCheckpointScheduleRequest::new(
+        run_id,
+        node_id,
+        checkpoint,
+        AgentEffectTarget {
+            target_type: "human".to_string(),
+            name: "approval-ui".to_string(),
+            address: Some("https://approvals.local/queue".to_string()),
+            attributes: BTreeMap::from([(
+                "target_class".to_string(),
+                "human-approval".to_string(),
+            )]),
+        },
+        AgentTimestampMillis::new(created_at_millis),
+        AgentCausationId::new("cause:start-run"),
+        AgentCorrelationId::new("correlation:workflow"),
+    )
+    .payload_ref(artifact(
+        "artifact:human-approval-payload",
+        ArtifactKind::State,
+    ))
+    .timeout_ms(3_000)
+}
+
+fn checkpoint(checkpoint_id: &str, due_at_millis: u64) -> HumanCheckpoint {
+    HumanCheckpoint {
+        checkpoint_id: HumanCheckpointId::new(checkpoint_id),
+        status: HumanCheckpointStatus::Open,
+        summary: "Review generated workflow action".to_string(),
+        available_decisions: vec![
+            HumanDecisionOption {
+                value: "approve".to_string(),
+                label: "Approve".to_string(),
+                requires_comment: false,
+            },
+            HumanDecisionOption {
+                value: "reject".to_string(),
+                label: "Reject".to_string(),
+                requires_comment: false,
+            },
+        ],
+        required_roles: vec!["reviewer".to_string()],
+        due_at: Some(AgentTimestampMillis::new(due_at_millis)),
+        escalation_target: Some("workflow-ops".to_string()),
+        context_artifacts: Vec::new(),
+        created_by: Some(PrincipalRef {
+            principal_type: "service".to_string(),
+            principal_id: "workflow-runtime".to_string(),
+            display_name: Some("Workflow Runtime".to_string()),
+        }),
+        resolved_by: None,
+        created_at: AgentTimestampMillis::new(123),
+        resolved_at: None,
+        audit_event_ids: Vec::new(),
+    }
 }
 
 fn command_metadata(

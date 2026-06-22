@@ -141,6 +141,8 @@ pub use effect_bridge::{
     AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectBridgeResult,
     AgentGraphEffectCommandOutcome, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
+    AgentGraphHumanCheckpointScheduleOutcome, AgentGraphHumanCheckpointScheduleRequest,
+    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest,
 };
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,

@@ -81,6 +81,10 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphEffectScheduleOutcome`
 - `AgentGraphEffectCommandOutcome`
 - `AgentGraphEffectFailureDisposition`
+- `AgentGraphTimerScheduleRequest`
+- `AgentGraphTimerScheduleOutcome`
+- `AgentGraphHumanCheckpointScheduleRequest`
+- `AgentGraphHumanCheckpointScheduleOutcome`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventSink`
@@ -796,6 +800,8 @@ Implementation notes:
 
 ### Slice 4.4: Timers, Human Checkpoints, And Child Workflows
 
+Status: implemented.
+
 Scope:
 
 - Map timer wait nodes to durable timer entries.
@@ -814,6 +820,36 @@ Tests:
 - Timer node resumes once after scanner restart.
 - Human decision resumes a waiting graph node.
 - Child workflow command uses stable deduplication metadata.
+
+Implementation notes:
+
+- Added graph timer scheduling through `AgentGraphTimerScheduleRequest` and
+  `AgentGraphTimerScheduleOutcome`. Timer nodes map to deterministic
+  `AgentTimerEntry` values and move to `Waiting` with
+  `AgentGraphWaitReason::Timer` only after the durable timer store accepts the
+  timer or reports an equivalent duplicate.
+- Added `timer_fired_command` and `accept_and_apply_timer_fired` helpers on
+  `AgentGraphEffectBridge`. Accepted `TimerFired` commands complete the waiting
+  timer node, persist any command `payload_ref` onto the first output port, and
+  return no-op transitions for duplicate callbacks after the graph already
+  advanced.
+- Added graph human checkpoint opening through
+  `AgentGraphHumanCheckpointScheduleRequest` and
+  `AgentGraphHumanCheckpointScheduleOutcome`. Human checkpoint nodes schedule a
+  deterministic `HumanApprovalRequest` outbox effect, record the checkpoint id
+  and approval effect id in graph state, and move to `Waiting` with
+  `AgentGraphWaitReason::Human` only after durable outbox acceptance.
+- Added `human_decision_submitted_command` and
+  `accept_and_apply_human_decision` helpers. Accepted
+  `HumanDecisionSubmitted` commands complete the waiting human node and persist
+  the decision `payload_ref` to the first output port.
+- Child workflow nodes continue to use durable outbox scheduling as
+  `AgentEffectKind::ChildWorkflowCommand`, but now record
+  `AgentGraphWaitReason::ChildWorkflow` so query projections can distinguish
+  child workflow waits from ordinary effect waits.
+- Expanded `crates/rakka-agent-workflow/tests/effect_bridge.rs` with timer
+  redelivery/idempotency, human decision resume, and child workflow command
+  deduplication coverage.
 
 ### Slice 4.5: Dispatcher Fleet Integration
 
