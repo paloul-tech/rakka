@@ -499,6 +499,8 @@ Implementation notes:
 
 ### Slice 3.2: Branch, Fan-Out, Fan-In, And Skip Propagation
 
+Status: implemented.
+
 Scope:
 
 - Implement fan-out readiness for multiple downstream nodes.
@@ -518,6 +520,22 @@ Tests:
 - Fan-in waits for required upstream nodes.
 - Branch selects one path and skips the other.
 - Join after branch handles skipped upstream according to policy.
+
+Implementation notes:
+
+- Extended `AgentGraphScheduler` dependency evaluation so fan-out marks every
+  eligible downstream node runnable in stable node-id order.
+- Added durable branch completion through `complete_branch_node`, which records
+  selected outgoing edge ids before downstream nodes can run.
+- Added branch-selection validation with stable `invalid-branch-selection`
+  errors.
+- Added deterministic skip propagation for pending nodes that become
+  unreachable through unselected branch edges or skipped upstream nodes.
+- Added join readiness for `wait-for-all` and `wait-for-any` merge behavior;
+  skipped upstreams count as resolved for wait-for-all, while wait-for-any can
+  proceed after the first completed active upstream.
+- Added scheduler tests for fan-out, fan-in, wait-for-any joins, durable branch
+  selection, skip propagation, and invalid branch selections.
 
 ### Slice 3.3: Bounded Iteration
 

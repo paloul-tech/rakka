@@ -388,6 +388,9 @@ from corrupting dependency state.
 Branch nodes choose one or more outgoing branch edges. Downstream nodes on
 unselected branches should be marked skipped when they cannot otherwise become
 reachable. Joins must declare whether skipped upstreams count as satisfied.
+The branch condition interpreter remains outside the scheduler core; Rakka
+persists the selected outgoing edge ids supplied by the runtime before any
+selected downstream node is made runnable.
 
 ### Loops
 

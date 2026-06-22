@@ -4,15 +4,15 @@
 //! a compiled plan against durable graph state and returns updated state for
 //! the caller to persist before any node work is executed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use crate::{
-    validate_compiled_execution_plan, AgentCompiledExecutionPlan, AgentCompiledNodeId,
-    AgentCompiledNodeKind, AgentCompiledPlanEdge, AgentCompiledPlanNode, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphTerminalStatus, AgentGraphWaitReason,
-    AgentTimestampMillis,
+    validate_compiled_execution_plan, AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior,
+    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
+    AgentCompiledPlanNode, AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState,
+    AgentGraphTerminalStatus, AgentGraphWaitReason, AgentTimestampMillis,
 };
 
 /// Result type for graph scheduler operations.
@@ -54,6 +54,13 @@ pub enum AgentGraphSchedulerError {
         /// Requested durable status.
         to: AgentGraphNodeStatus,
     },
+    /// A branch node was completed without a valid branch selection.
+    InvalidBranchSelection {
+        /// Branch node id.
+        node_id: AgentCompiledNodeId,
+        /// Bounded diagnostic reason.
+        reason: String,
+    },
     /// Scheduler was asked to mutate a terminal graph.
     TerminalGraph {
         /// Terminal graph status.
@@ -71,6 +78,7 @@ impl AgentGraphSchedulerError {
             Self::MissingNodeState { .. } => "missing-graph-node-state",
             Self::UnknownNode { .. } => "unknown-graph-node",
             Self::InvalidNodeTransition { .. } => "invalid-graph-node-transition",
+            Self::InvalidBranchSelection { .. } => "invalid-branch-selection",
             Self::TerminalGraph { .. } => "terminal-graph",
         }
     }
@@ -104,6 +112,9 @@ impl Display for AgentGraphSchedulerError {
                 from.as_label(),
                 to.as_label()
             ),
+            Self::InvalidBranchSelection { node_id, reason } => {
+                write!(f, "branch node `{node_id}` has invalid selection: {reason}")
+            }
             Self::TerminalGraph { status } => {
                 write!(
                     f,
@@ -268,6 +279,12 @@ impl AgentGraphScheduler {
         let node_id = node_id.into();
         validate_plan_state(plan, &state)?;
         let node = ensure_known_node(plan, &node_id)?;
+        if node.kind == AgentCompiledNodeKind::Branch {
+            return Err(AgentGraphSchedulerError::InvalidBranchSelection {
+                node_id,
+                reason: "branch nodes must complete with selected outgoing edge ids".to_string(),
+            });
+        }
         let next_status = if node.kind == AgentCompiledNodeKind::Terminal {
             AgentGraphNodeStatus::Terminal
         } else {
@@ -289,6 +306,65 @@ impl AgentGraphScheduler {
             state.terminal_status = Some(AgentGraphTerminalStatus::Completed);
         }
         Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+    }
+
+    /// Transitions a running branch node to completed with durable selected paths.
+    pub fn complete_branch_node<I, E>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        selected_edge_ids: I,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition>
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<AgentCompiledEdgeId>,
+    {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        let node = ensure_known_node(plan, &node_id)?;
+        if node.kind != AgentCompiledNodeKind::Branch {
+            return Err(AgentGraphSchedulerError::InvalidBranchSelection {
+                node_id,
+                reason: "node is not a branch".to_string(),
+            });
+        }
+        ensure_node_status(
+            &state,
+            &node_id,
+            AgentGraphNodeStatus::Running,
+            AgentGraphNodeStatus::Completed,
+        )?;
+
+        let selected_edge_ids = validate_branch_selection(plan, &node_id, selected_edge_ids)?;
+
+        state
+            .selected_branch_paths
+            .insert(node_id.clone(), selected_edge_ids);
+        {
+            let node_state = state.node_states.get_mut(&node_id).ok_or_else(|| {
+                AgentGraphSchedulerError::MissingNodeState {
+                    node_id: node_id.clone(),
+                }
+            })?;
+            node_state.status = AgentGraphNodeStatus::Completed;
+            node_state.updated_at = now;
+            node_state.completed_at = Some(now);
+            node_state.wait_reason = None;
+            node_state.error_code = None;
+        }
+
+        let mut changed_node_ids = vec![node_id];
+        changed_node_ids.extend(propagate_skips(plan, &mut state, now)?);
+        changed_node_ids.sort();
+        changed_node_ids.dedup();
+
+        state.scheduler_revision += 1;
+        state.blocked_reason = None;
+
+        Ok(AgentGraphSchedulerTransition::new(state, changed_node_ids))
     }
 
     /// Transitions a running node to waiting.
@@ -445,6 +521,22 @@ fn incoming_edges_by_target(
     incoming
 }
 
+fn outgoing_edges_by_source(
+    plan: &AgentCompiledExecutionPlan,
+) -> BTreeMap<AgentCompiledNodeId, Vec<&AgentCompiledPlanEdge>> {
+    let mut outgoing = BTreeMap::<AgentCompiledNodeId, Vec<&AgentCompiledPlanEdge>>::new();
+    for edge in &plan.edges {
+        outgoing
+            .entry(edge.source_node_id.clone())
+            .or_default()
+            .push(edge);
+    }
+    for edges in outgoing.values_mut() {
+        edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+    }
+    outgoing
+}
+
 fn dependencies_satisfied(
     plan: &AgentCompiledExecutionPlan,
     state: &AgentGraphRunState,
@@ -455,13 +547,12 @@ fn dependencies_satisfied(
     if plan.entry_node_ids.contains(&node.node_id) {
         return Ok(true);
     }
-    let incoming_edges = incoming.get(&node.node_id).cloned().unwrap_or_default();
-    let required_edges: Vec<_> = incoming_edges
-        .into_iter()
-        .filter(|edge| target_port_required(node, edge))
-        .collect();
+    let required_edges = required_incoming_edges(node, incoming);
     if required_edges.is_empty() {
         return Ok(false);
+    }
+    if node.kind == AgentCompiledNodeKind::Join {
+        return join_dependencies_satisfied(state, &required_edges, nodes);
     }
     for edge in required_edges {
         let Some(source_node) = nodes.get(&edge.source_node_id) else {
@@ -474,11 +565,24 @@ fn dependencies_satisfied(
                 node_id: edge.source_node_id.clone(),
             });
         };
-        if !source_satisfies_dependency(source_node, source_state) {
+        if !source_satisfies_dependency(state, source_node, source_state, edge) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn required_incoming_edges<'a>(
+    node: &AgentCompiledPlanNode,
+    incoming: &'a BTreeMap<AgentCompiledNodeId, Vec<&'a AgentCompiledPlanEdge>>,
+) -> Vec<&'a AgentCompiledPlanEdge> {
+    incoming
+        .get(&node.node_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|edge| target_port_required(node, edge))
+        .collect()
 }
 
 fn target_port_required(node: &AgentCompiledPlanNode, edge: &AgentCompiledPlanEdge) -> bool {
@@ -488,15 +592,120 @@ fn target_port_required(node: &AgentCompiledPlanNode, edge: &AgentCompiledPlanEd
         .map_or(true, |port| port.required)
 }
 
+fn join_dependencies_satisfied(
+    state: &AgentGraphRunState,
+    required_edges: &[&AgentCompiledPlanEdge],
+    nodes: &BTreeMap<AgentCompiledNodeId, &AgentCompiledPlanNode>,
+) -> AgentGraphSchedulerResult<bool> {
+    let wait_for_any = required_edges
+        .iter()
+        .any(|edge| edge.merge_behavior == Some(AgentCompiledEdgeMergeBehavior::WaitForAny));
+    if wait_for_any {
+        return required_edges.iter().try_fold(false, |ready, edge| {
+            Ok(ready || edge_source_completed(state, edge, nodes)?)
+        });
+    }
+
+    let mut has_completed_source = false;
+    for edge in required_edges {
+        if edge_source_completed(state, edge, nodes)? {
+            has_completed_source = true;
+            continue;
+        }
+        if !edge_permanently_unsatisfied(state, edge, nodes)? {
+            return Ok(false);
+        }
+    }
+    Ok(has_completed_source)
+}
+
+fn edge_source_completed(
+    state: &AgentGraphRunState,
+    edge: &AgentCompiledPlanEdge,
+    nodes: &BTreeMap<AgentCompiledNodeId, &AgentCompiledPlanNode>,
+) -> AgentGraphSchedulerResult<bool> {
+    let Some(source_node) = nodes.get(&edge.source_node_id) else {
+        return Err(AgentGraphSchedulerError::UnknownNode {
+            node_id: edge.source_node_id.clone(),
+        });
+    };
+    let Some(source_state) = state.node_states.get(&edge.source_node_id) else {
+        return Err(AgentGraphSchedulerError::MissingNodeState {
+            node_id: edge.source_node_id.clone(),
+        });
+    };
+    Ok(source_satisfies_dependency(
+        state,
+        source_node,
+        source_state,
+        edge,
+    ))
+}
+
 fn source_satisfies_dependency(
+    state: &AgentGraphRunState,
     source_node: &AgentCompiledPlanNode,
     source_state: &AgentGraphNodeState,
+    edge: &AgentCompiledPlanEdge,
 ) -> bool {
+    if !edge_is_active(state, source_node, edge) {
+        return false;
+    }
     matches!(
         source_state.status,
         AgentGraphNodeStatus::Completed | AgentGraphNodeStatus::Terminal
     ) || (source_node.kind == AgentCompiledNodeKind::Terminal
         && source_state.status == AgentGraphNodeStatus::Completed)
+}
+
+fn edge_is_active(
+    state: &AgentGraphRunState,
+    source_node: &AgentCompiledPlanNode,
+    edge: &AgentCompiledPlanEdge,
+) -> bool {
+    if source_node.kind != AgentCompiledNodeKind::Branch {
+        return true;
+    }
+    state
+        .selected_branch_paths
+        .get(&source_node.node_id)
+        .is_some_and(|selected| selected.contains(&edge.edge_id))
+}
+
+fn edge_permanently_unsatisfied(
+    state: &AgentGraphRunState,
+    edge: &AgentCompiledPlanEdge,
+    nodes: &BTreeMap<AgentCompiledNodeId, &AgentCompiledPlanNode>,
+) -> AgentGraphSchedulerResult<bool> {
+    let Some(source_node) = nodes.get(&edge.source_node_id) else {
+        return Err(AgentGraphSchedulerError::UnknownNode {
+            node_id: edge.source_node_id.clone(),
+        });
+    };
+    let Some(source_state) = state.node_states.get(&edge.source_node_id) else {
+        return Err(AgentGraphSchedulerError::MissingNodeState {
+            node_id: edge.source_node_id.clone(),
+        });
+    };
+    if matches!(
+        source_state.status,
+        AgentGraphNodeStatus::Skipped | AgentGraphNodeStatus::Cancelled
+    ) {
+        return Ok(true);
+    }
+    if source_node.kind == AgentCompiledNodeKind::Branch {
+        return Ok(state
+            .selected_branch_paths
+            .get(&source_node.node_id)
+            .map_or(
+                matches!(
+                    source_state.status,
+                    AgentGraphNodeStatus::Completed | AgentGraphNodeStatus::Terminal
+                ),
+                |selected| !selected.contains(&edge.edge_id),
+            ));
+    }
+    Ok(false)
 }
 
 fn transition_node(
@@ -525,6 +734,146 @@ fn transition_node(
     state.scheduler_revision += 1;
     state.blocked_reason = None;
     Ok(())
+}
+
+fn ensure_node_status(
+    state: &AgentGraphRunState,
+    node_id: &AgentCompiledNodeId,
+    expected: AgentGraphNodeStatus,
+    next: AgentGraphNodeStatus,
+) -> AgentGraphSchedulerResult<()> {
+    let node_state = state.node_states.get(node_id).ok_or_else(|| {
+        AgentGraphSchedulerError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status != expected {
+        return Err(AgentGraphSchedulerError::InvalidNodeTransition {
+            node_id: node_id.clone(),
+            from: node_state.status,
+            to: next,
+        });
+    }
+    Ok(())
+}
+
+fn validate_branch_selection<I, E>(
+    plan: &AgentCompiledExecutionPlan,
+    branch_node_id: &AgentCompiledNodeId,
+    selected_edge_ids: I,
+) -> AgentGraphSchedulerResult<Vec<AgentCompiledEdgeId>>
+where
+    I: IntoIterator<Item = E>,
+    E: Into<AgentCompiledEdgeId>,
+{
+    let mut selected_edge_ids: Vec<_> = selected_edge_ids.into_iter().map(Into::into).collect();
+    selected_edge_ids.sort();
+    selected_edge_ids.dedup();
+    if selected_edge_ids.is_empty() {
+        return Err(AgentGraphSchedulerError::InvalidBranchSelection {
+            node_id: branch_node_id.clone(),
+            reason: "at least one outgoing edge must be selected".to_string(),
+        });
+    }
+
+    let outgoing = outgoing_edges_by_source(plan);
+    let valid_edge_ids: BTreeSet<_> = outgoing
+        .get(branch_node_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|edge| edge.edge_id.clone())
+        .collect();
+    for edge_id in &selected_edge_ids {
+        if !valid_edge_ids.contains(edge_id) {
+            return Err(AgentGraphSchedulerError::InvalidBranchSelection {
+                node_id: branch_node_id.clone(),
+                reason: format!("edge `{edge_id}` is not an outgoing branch edge"),
+            });
+        }
+    }
+    Ok(selected_edge_ids)
+}
+
+fn propagate_skips(
+    plan: &AgentCompiledExecutionPlan,
+    state: &mut AgentGraphRunState,
+    now: AgentTimestampMillis,
+) -> AgentGraphSchedulerResult<Vec<AgentCompiledNodeId>> {
+    let incoming = incoming_edges_by_target(plan);
+    let nodes = nodes_by_id(plan);
+    let mut changed_node_ids = Vec::new();
+
+    loop {
+        let mut skipped_this_pass = Vec::new();
+        for node in sorted_nodes(plan) {
+            let Some(node_state) = state.node_states.get(&node.node_id) else {
+                return Err(AgentGraphSchedulerError::MissingNodeState {
+                    node_id: node.node_id.clone(),
+                });
+            };
+            if node_state.status != AgentGraphNodeStatus::Pending
+                || plan.entry_node_ids.contains(&node.node_id)
+            {
+                continue;
+            }
+            if node_should_skip(state, node, &nodes, &incoming)? {
+                skipped_this_pass.push(node.node_id.clone());
+            }
+        }
+
+        if skipped_this_pass.is_empty() {
+            break;
+        }
+
+        for node_id in skipped_this_pass {
+            let Some(node_state) = state.node_states.get_mut(&node_id) else {
+                return Err(AgentGraphSchedulerError::MissingNodeState {
+                    node_id: node_id.clone(),
+                });
+            };
+            if node_state.status != AgentGraphNodeStatus::Pending {
+                continue;
+            }
+            node_state.status = AgentGraphNodeStatus::Skipped;
+            node_state.dependencies_ready = false;
+            node_state.updated_at = now;
+            node_state.completed_at = Some(now);
+            node_state.wait_reason = None;
+            node_state.error_code = None;
+            state.skipped_nodes.insert(node_id.clone());
+            changed_node_ids.push(node_id);
+        }
+    }
+
+    changed_node_ids.sort();
+    changed_node_ids.dedup();
+    Ok(changed_node_ids)
+}
+
+fn node_should_skip(
+    state: &AgentGraphRunState,
+    node: &AgentCompiledPlanNode,
+    nodes: &BTreeMap<AgentCompiledNodeId, &AgentCompiledPlanNode>,
+    incoming: &BTreeMap<AgentCompiledNodeId, Vec<&AgentCompiledPlanEdge>>,
+) -> AgentGraphSchedulerResult<bool> {
+    let required_edges = required_incoming_edges(node, incoming);
+    if required_edges.is_empty() {
+        return Ok(false);
+    }
+    if node.kind == AgentCompiledNodeKind::Join {
+        if required_edges.iter().try_fold(false, |completed, edge| {
+            Ok(completed || edge_source_completed(state, edge, nodes)?)
+        })? {
+            return Ok(false);
+        }
+        return required_edges.iter().try_fold(true, |all_blocked, edge| {
+            Ok(all_blocked && edge_permanently_unsatisfied(state, edge, nodes)?)
+        });
+    }
+    required_edges.iter().try_fold(false, |should_skip, edge| {
+        Ok(should_skip || edge_permanently_unsatisfied(state, edge, nodes)?)
+    })
 }
 
 fn runnable_nodes_from_state(state: &AgentGraphRunState) -> Vec<AgentCompiledNodeId> {
