@@ -360,6 +360,8 @@ Implementation notes:
 
 ### Slice 2.2: Additive `AgentRunState` Integration
 
+Status: implemented.
+
 Scope:
 
 - Add `graph_state: Option<AgentGraphRunState>` to `AgentRunState` with serde
@@ -380,6 +382,21 @@ Tests:
 - Existing fixture JSON with missing graph state deserializes.
 - New graph state serializes and deserializes.
 - N/N+1 compatibility test covers additive graph fields.
+
+Implementation notes:
+
+- Added `graph_state: Option<AgentGraphRunState>` to
+  `crates/rakka-agent-workflow/src/domain.rs` with serde defaulting and
+  skip-when-none serialization.
+- Updated existing non-graph `AgentRunState` fixture constructors to set
+  `graph_state: None`, preserving current step-cursor behavior for non-graph
+  runs.
+- Added API compatibility coverage in
+  `crates/rakka-agent-workflow/tests/api_compatibility.rs` proving a new run
+  state with graph state round-trips and old JSON without `graph_state`
+  deserializes with `None`.
+- Existing domain, migration, runtime, query, timer, actor, and failure
+  injection tests continue to pass with the additive field.
 
 ### Slice 2.3: Graph Snapshots And Query Shape
 

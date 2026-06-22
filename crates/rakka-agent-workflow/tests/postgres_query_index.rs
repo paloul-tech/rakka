@@ -516,6 +516,7 @@ fn run_state(
         tenant: Some(AgentTenantId::new("tenant-a")),
         definition_version: WorkflowDefinitionVersion::new("v1"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status,
         current_step_id: Some(AgentStepId::new(step_id)),
         current_attempt: 0,

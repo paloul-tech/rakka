@@ -902,6 +902,7 @@ impl MinimalAgentFixture {
             tenant: Some(AgentTenantId::new("tenant-test")),
             definition_version: workflow.definition_version.clone(),
             state_schema_version: workflow.state_schema_version,
+            graph_state: None,
             status: AgentRunStatus::Accepted,
             current_step_id: workflow.steps.first().map(|step| step.step_id.clone()),
             current_attempt: 0,

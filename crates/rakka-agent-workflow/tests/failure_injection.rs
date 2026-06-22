@@ -685,6 +685,7 @@ fn accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRun
         tenant: Some(AgentTenantId::new("tenant-phase7")),
         definition_version: workflow.definition_version.clone(),
         state_schema_version: workflow.state_schema_version,
+        graph_state: None,
         status: AgentRunStatus::Accepted,
         current_step_id: Some(AgentStepId::new("review")),
         current_attempt: 0,

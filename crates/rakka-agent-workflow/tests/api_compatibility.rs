@@ -6,11 +6,13 @@ use std::collections::BTreeMap;
 use rakka_agent_workflow::{
     validate_agent_telemetry_context, validate_command, validate_effect_schedule, AgentAuditEvent,
     AgentAuditEventId, AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind,
-    AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchEntry,
+    AgentCommandMetadata, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchEntry,
     AgentDispatchId, AgentDispatchIndexEntry, AgentDispatchLease, AgentDispatchQuery,
     AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherWorkerId, AgentDueEffect,
     AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
-    AgentEffectSchedule, AgentEffectTarget, AgentFacadeResult, AgentIdempotencyKey,
+    AgentEffectSchedule, AgentEffectTarget, AgentFacadeResult, AgentGraphNodeState,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphWaitReason, AgentIdempotencyKey,
     AgentMigrationDecision, AgentRunId, AgentRunIndexEntry, AgentRunQueryWaitingReason,
     AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStepId,
     AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerIndexEntry,
@@ -19,7 +21,7 @@ use rakka_agent_workflow::{
     AgentWorkflowRunQuery, AgentWorkflowShardOwnership, ArtifactKind, ArtifactRef, HumanCheckpoint,
     HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InMemoryAgentWorkflowQueryIndex,
     PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-    CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION, CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
 };
 use serde_json::json;
 
@@ -297,6 +299,38 @@ async fn query_index_compatibility_accepts_additive_projection_shapes() {
 }
 
 #[test]
+fn graph_state_field_is_additive_for_run_state_wire_contract() {
+    let mut run = run_state(
+        "run-api-compat-graph",
+        "v2",
+        2,
+        AgentRunStatus::WaitingForEffect,
+    );
+    run.graph_state = Some(graph_state());
+
+    let mut json = serde_json::to_value(&run).expect("run should serialize");
+    assert_eq!(
+        json["graph_state"]["graph_schema_version"],
+        json!(CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get())
+    );
+    assert_eq!(
+        json["graph_state"]["node_states"]["model"]["status"],
+        json!("waiting")
+    );
+
+    let decoded: AgentRunState =
+        serde_json::from_value(json.clone()).expect("graph run state should deserialize");
+    assert!(decoded.graph_state.is_some());
+
+    json.as_object_mut()
+        .expect("run state should serialize as an object")
+        .remove("graph_state");
+    let old_decoded: AgentRunState =
+        serde_json::from_value(json).expect("old run state without graph_state should deserialize");
+    assert!(old_decoded.graph_state.is_none());
+}
+
+#[test]
 fn feature_flags_are_additive_and_match_api_review_boundaries() {
     assert!(CARGO_TOML.contains("[features]\ndefault = []"));
     for expected in [
@@ -391,6 +425,7 @@ fn run_state(
         tenant: Some(tenant_id()),
         definition_version: WorkflowDefinitionVersion::new(definition_version),
         state_schema_version: StateSchemaVersion::new(state_schema_version),
+        graph_state: None,
         status,
         current_step_id: Some(AgentStepId::new("step-review")),
         current_attempt: 1,
@@ -411,6 +446,24 @@ fn run_state(
         )
         .then(|| ts(1_200)),
     }
+}
+
+fn graph_state() -> AgentGraphRunState {
+    AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-api-compat-graph"),
+        AgentCompiledPlanFingerprint::new("sha256:api-compat-graph"),
+    )
+    .node_state(
+        AgentGraphNodeState::new(
+            AgentCompiledNodeId::new("model"),
+            AgentCompiledNodeKind::ModelCall,
+            ts(1_050),
+        )
+        .status(AgentGraphNodeStatus::Waiting)
+        .dependencies_ready(true)
+        .scheduled_effect_id(AgentEffectId::new("effect-api-compat-graph"))
+        .wait_reason(AgentGraphWaitReason::Effect),
+    )
 }
 
 fn timer_entry(timer_id: &str, run_id: &AgentRunId) -> AgentTimerEntry {

@@ -114,6 +114,7 @@ fn sample_run_state() -> AgentRunState {
         tenant: Some(AgentTenantId::new("tenant-a")),
         definition_version: WorkflowDefinitionVersion::new("2026-06-18"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status: AgentRunStatus::WaitingForHuman,
         current_step_id: Some(AgentStepId::new("approval")),
         current_attempt: 1,
