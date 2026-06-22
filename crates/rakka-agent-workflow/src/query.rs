@@ -18,10 +18,12 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentDispatchEntry, AgentDispatchId, AgentDispatchStatus, AgentDispatchTargetClass,
-    AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentRunId, AgentRunState,
-    AgentRunStatus, AgentStepId, AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerStatus,
-    AgentTimestampMillis, AgentWorkflowId, HumanCheckpointId, WorkflowDefinitionVersion,
+    AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentDispatchEntry, AgentDispatchId,
+    AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherWorkerId, AgentEffectId,
+    AgentEffectKind, AgentGraphNodeProjection, AgentGraphNodeStatus, AgentGraphRunProjection,
+    AgentGraphWaitReason, AgentRunId, AgentRunState, AgentRunStatus, AgentStepId, AgentTenantId,
+    AgentTimerEntry, AgentTimerId, AgentTimerStatus, AgentTimestampMillis, AgentWorkflowId,
+    HumanCheckpointId, WorkflowDefinitionVersion,
 };
 
 /// Shared result type for workflow query indexes.
@@ -173,6 +175,9 @@ pub struct AgentRunIndexEntry {
     pub open_checkpoint_due_at: Option<AgentTimestampMillis>,
     /// Shard ownership metadata, when the run is sharded.
     pub shard_ownership: Option<AgentWorkflowShardOwnership>,
+    /// Graph execution projection, when the run uses compiled graph execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<AgentGraphRunProjection>,
     /// Run creation timestamp.
     pub created_at: AgentTimestampMillis,
     /// Last update timestamp.
@@ -208,6 +213,10 @@ impl AgentRunIndexEntry {
                 .map(|checkpoint| checkpoint.created_at),
             open_checkpoint_due_at: oldest_open_checkpoint.and_then(|checkpoint| checkpoint.due_at),
             shard_ownership: None,
+            graph: run
+                .graph_state
+                .as_ref()
+                .map(AgentGraphRunProjection::from_graph_state),
             created_at: run.created_at,
             updated_at: run.updated_at,
             completed_at: run.completed_at,
@@ -367,6 +376,11 @@ pub struct AgentWorkflowRunQuery {
     pub(crate) stuck_dispatcher_at_or_before: Option<AgentTimestampMillis>,
     pub(crate) shard_owner_node_id: Option<String>,
     pub(crate) shard_id: Option<String>,
+    pub(crate) graph_plan_fingerprint: Option<AgentCompiledPlanFingerprint>,
+    pub(crate) graph_node_statuses: Vec<AgentGraphNodeStatus>,
+    pub(crate) graph_node_kinds: Vec<AgentCompiledNodeKind>,
+    pub(crate) graph_wait_reasons: Vec<AgentGraphWaitReason>,
+    pub(crate) graph_error_code: Option<String>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -487,6 +501,44 @@ impl AgentWorkflowRunQuery {
     #[must_use]
     pub fn shard_id(mut self, shard_id: impl Into<String>) -> Self {
         self.shard_id = Some(shard_id.into());
+        self
+    }
+
+    /// Filters to runs using the given compiled graph plan fingerprint.
+    #[must_use]
+    pub fn graph_plan_fingerprint(
+        mut self,
+        fingerprint: impl Into<AgentCompiledPlanFingerprint>,
+    ) -> Self {
+        self.graph_plan_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Filters to runs with at least one graph node in the given status.
+    #[must_use]
+    pub fn graph_node_status(mut self, status: AgentGraphNodeStatus) -> Self {
+        push_unique(&mut self.graph_node_statuses, status);
+        self
+    }
+
+    /// Filters to runs with at least one graph node of the given kind.
+    #[must_use]
+    pub fn graph_node_kind(mut self, kind: AgentCompiledNodeKind) -> Self {
+        push_unique(&mut self.graph_node_kinds, kind);
+        self
+    }
+
+    /// Filters to runs with at least one graph node waiting for the given reason.
+    #[must_use]
+    pub fn graph_wait_reason(mut self, reason: AgentGraphWaitReason) -> Self {
+        push_unique(&mut self.graph_wait_reasons, reason);
+        self
+    }
+
+    /// Filters to runs with at least one graph node carrying the given stable error code.
+    #[must_use]
+    pub fn graph_error_code(mut self, error_code: impl Into<String>) -> Self {
+        self.graph_error_code = Some(error_code.into());
         self
     }
 
@@ -939,6 +991,28 @@ fn run_matches_query(
         return false;
     }
     if query
+        .graph_plan_fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| {
+            entry
+                .graph
+                .as_ref()
+                .map_or(true, |graph| &graph.plan_fingerprint != fingerprint)
+        })
+    {
+        return false;
+    }
+    if has_graph_node_filters(query)
+        && !entry.graph.as_ref().is_some_and(|graph| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| graph_node_matches_query(node, query))
+        })
+    {
+        return false;
+    }
+    if query
         .due_timer_at_or_before
         .is_some_and(|timestamp| !run_has_due_timer(&entry.run_id, timestamp, timers))
     {
@@ -947,6 +1021,40 @@ fn run_matches_query(
     if query
         .stuck_dispatcher_at_or_before
         .is_some_and(|timestamp| !run_has_stuck_dispatch(&entry.run_id, timestamp, dispatches))
+    {
+        return false;
+    }
+    true
+}
+
+fn has_graph_node_filters(query: &AgentWorkflowRunQuery) -> bool {
+    !query.graph_node_statuses.is_empty()
+        || !query.graph_node_kinds.is_empty()
+        || !query.graph_wait_reasons.is_empty()
+        || query.graph_error_code.is_some()
+}
+
+fn graph_node_matches_query(
+    node: &AgentGraphNodeProjection,
+    query: &AgentWorkflowRunQuery,
+) -> bool {
+    if !query.graph_node_statuses.is_empty() && !query.graph_node_statuses.contains(&node.status) {
+        return false;
+    }
+    if !query.graph_node_kinds.is_empty() && !query.graph_node_kinds.contains(&node.kind) {
+        return false;
+    }
+    if !query.graph_wait_reasons.is_empty()
+        && !node
+            .wait_reason
+            .is_some_and(|reason| query.graph_wait_reasons.contains(&reason))
+    {
+        return false;
+    }
+    if query
+        .graph_error_code
+        .as_ref()
+        .is_some_and(|error_code| node.error_code.as_ref() != Some(error_code))
     {
         return false;
     }

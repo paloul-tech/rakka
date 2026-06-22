@@ -135,9 +135,10 @@ pub use facade::{
     AgentFacadeResult,
 };
 pub use graph_state::{
-    AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphStateSchemaVersion,
-    AgentGraphTerminalStatus, AgentGraphWaitReason, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeProjection,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunProjection, AgentGraphRunState,
+    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,

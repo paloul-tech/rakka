@@ -145,6 +145,108 @@ impl AgentGraphRunState {
     }
 }
 
+/// Query/snapshot projection for one durable graph run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGraphRunProjection {
+    /// Compiled plan id selected when the run started.
+    pub plan_id: AgentCompiledPlanId,
+    /// Immutable compiled plan fingerprint selected when the run started.
+    pub plan_fingerprint: AgentCompiledPlanFingerprint,
+    /// Serialized graph state schema version.
+    pub graph_schema_version: AgentGraphStateSchemaVersion,
+    /// Monotonic scheduler revision for recovery-safe decisions.
+    pub scheduler_revision: u64,
+    /// Last emitted durable runtime event sequence observed by this graph state.
+    pub last_event_sequence: u64,
+    /// Terminal graph status after all nodes resolve or cancellation/failure wins.
+    pub terminal_status: Option<AgentGraphTerminalStatus>,
+    /// Stable blocked reason code when the graph cannot currently make progress.
+    pub blocked_reason_code: Option<String>,
+    /// Total node count.
+    pub node_count: usize,
+    /// Runnable node count.
+    pub runnable_node_count: usize,
+    /// Running node count.
+    pub running_node_count: usize,
+    /// Waiting node count.
+    pub waiting_node_count: usize,
+    /// Completed node count.
+    pub completed_node_count: usize,
+    /// Skipped node count.
+    pub skipped_node_count: usize,
+    /// Failed node count.
+    pub failed_node_count: usize,
+    /// Cancelled node count.
+    pub cancelled_node_count: usize,
+    /// Terminal node count.
+    pub terminal_node_count: usize,
+    /// Bounded per-node projections, sorted by compiled node id.
+    pub nodes: Vec<AgentGraphNodeProjection>,
+}
+
+impl AgentGraphRunProjection {
+    /// Builds a query/snapshot projection from durable graph state.
+    #[must_use]
+    pub fn from_graph_state(graph: &AgentGraphRunState) -> Self {
+        let nodes: Vec<_> = graph
+            .node_states
+            .values()
+            .map(AgentGraphNodeProjection::from_node_state)
+            .collect();
+        Self {
+            plan_id: graph.plan_id.clone(),
+            plan_fingerprint: graph.plan_fingerprint.clone(),
+            graph_schema_version: graph.graph_schema_version,
+            scheduler_revision: graph.scheduler_revision,
+            last_event_sequence: graph.last_event_sequence,
+            terminal_status: graph.terminal_status,
+            blocked_reason_code: graph
+                .blocked_reason
+                .as_ref()
+                .map(|reason| reason.code.clone()),
+            node_count: nodes.len(),
+            runnable_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Runnable),
+            running_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Running),
+            waiting_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Waiting),
+            completed_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Completed),
+            skipped_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Skipped),
+            failed_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Failed),
+            cancelled_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Cancelled),
+            terminal_node_count: count_nodes_by_status(&nodes, AgentGraphNodeStatus::Terminal),
+            nodes,
+        }
+    }
+}
+
+/// Query/snapshot projection for one durable graph node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGraphNodeProjection {
+    /// Compiled node id.
+    pub node_id: AgentCompiledNodeId,
+    /// Product-neutral node kind from the compiled plan.
+    pub kind: AgentCompiledNodeKind,
+    /// Durable graph-node status.
+    pub status: AgentGraphNodeStatus,
+    /// Waiting reason when status is waiting.
+    pub wait_reason: Option<AgentGraphWaitReason>,
+    /// Stable error code when status is failed.
+    pub error_code: Option<String>,
+}
+
+impl AgentGraphNodeProjection {
+    /// Builds a node projection from durable node state.
+    #[must_use]
+    pub fn from_node_state(node: &AgentGraphNodeState) -> Self {
+        Self {
+            node_id: node.node_id.clone(),
+            kind: node.kind,
+            status: node.status,
+            wait_reason: node.wait_reason,
+            error_code: node.error_code.clone(),
+        }
+    }
+}
+
 /// Durable state for one compiled graph node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentGraphNodeState {
@@ -458,4 +560,11 @@ impl AgentGraphBlockedReason {
         self.detail = Some(detail.into());
         self
     }
+}
+
+fn count_nodes_by_status(
+    nodes: &[AgentGraphNodeProjection],
+    status: AgentGraphNodeStatus,
+) -> usize {
+    nodes.iter().filter(|node| node.status == status).count()
 }

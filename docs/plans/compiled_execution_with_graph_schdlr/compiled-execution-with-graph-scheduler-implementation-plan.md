@@ -68,6 +68,8 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphWaitReason`
 - `AgentGraphLoopInstanceState`
 - `AgentGraphBlockedReason`
+- `AgentGraphRunProjection`
+- `AgentGraphNodeProjection`
 - `AgentGraphScheduler`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
@@ -302,7 +304,7 @@ Implementation notes:
 
 ## Phase 2: Durable Graph Run State
 
-Status: in progress.
+Status: implemented.
 
 Goal: persist enough graph state for recovery, passivation, and deterministic
 scheduling.
@@ -400,6 +402,8 @@ Implementation notes:
 
 ### Slice 2.3: Graph Snapshots And Query Shape
 
+Status: implemented.
+
 Scope:
 
 - Extend operational snapshots with graph-specific summaries.
@@ -418,6 +422,28 @@ Tests:
 - Snapshot reports graph node counts by status.
 - Query index lists failed nodes and waiting nodes.
 - Projection can rebuild from durable graph state.
+
+Implementation notes:
+
+- Added `AgentGraphRunProjection` and `AgentGraphNodeProjection` in
+  `crates/rakka-agent-workflow/src/graph_state.rs` as bounded derived
+  read-model records from durable graph state.
+- Extended `AgentRunIndexEntry` in
+  `crates/rakka-agent-workflow/src/query.rs` with optional graph projection
+  data using serde defaults for additive compatibility.
+- Added graph run query filters for compiled plan fingerprint, node status,
+  node kind, node wait reason, and stable node error code.
+- Extended process-local runtime snapshots in
+  `crates/rakka-agent-workflow/src/snapshots.rs` with graph run counts,
+  waiting/failed node counts, blocked graph run count, and sampled run graph
+  projections.
+- Kept `rakka-persistence-postgres` query decoding additive by projecting
+  `graph: None`; durable graph state remains the correctness source and
+  PostgreSQL graph projection columns remain a later optional storage follow-up.
+- Added tests in `crates/rakka-agent-workflow/tests/workflow_query_model.rs`
+  for graph projection/filter behavior and in
+  `crates/rakka-agent-workflow/tests/runtime_snapshots.rs` for graph snapshot
+  summaries.
 
 ## Phase 3: Graph Scheduler Core
 

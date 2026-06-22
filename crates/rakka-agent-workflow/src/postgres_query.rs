@@ -1018,6 +1018,7 @@ fn decode_run_row(row: Row) -> AgentWorkflowQueryResult<AgentRunIndexEntry> {
         )?,
         open_checkpoint_due_at: decode_optional_millis(row.get("open_checkpoint_due_at_millis"))?,
         shard_ownership,
+        graph: None,
         created_at: decode_millis(row.get("created_at_millis"))?,
         updated_at: decode_millis(row.get("updated_at_millis"))?,
         completed_at: decode_optional_millis(row.get("completed_at_millis"))?,
