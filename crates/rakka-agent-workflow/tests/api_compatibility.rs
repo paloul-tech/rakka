@@ -16,13 +16,13 @@ use rakka_agent_workflow::{
     AgentMigrationDecision, AgentRunId, AgentRunIndexEntry, AgentRunQueryWaitingReason,
     AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStepId,
     AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerIndexEntry,
-    AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis, AgentTriggerSource,
-    AgentWorkflowId, AgentWorkflowIndexSchemaVersion, AgentWorkflowMigrationPolicy,
-    AgentWorkflowQueryIndex, AgentWorkflowRunQuery, AgentWorkflowShardOwnership, ArtifactKind,
-    ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
-    InMemoryAgentWorkflowQueryIndex, PrincipalRef, RedactionStatus, StateSchemaVersion,
-    WorkflowDefinitionVersion, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
+    AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis,
+    AgentTriggerCommandBuilder, AgentTriggerSource, AgentWorkflowId,
+    AgentWorkflowIndexSchemaVersion, AgentWorkflowMigrationPolicy, AgentWorkflowQueryIndex,
+    AgentWorkflowRunQuery, AgentWorkflowShardOwnership, ArtifactKind, ArtifactRef, HumanCheckpoint,
+    HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InMemoryAgentWorkflowQueryIndex,
+    PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION, CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
 };
 use serde_json::json;
 
@@ -43,6 +43,7 @@ fn public_root_exports_cover_stable_default_api_surface() {
         type_name::<AgentTimerIndexEntry>(),
         type_name::<AgentDispatchIndexEntry>(),
         type_name::<AgentTriggerSource>(),
+        type_name::<AgentTriggerCommandBuilder>(),
         type_name::<AgentWorkflowMigrationPolicy>(),
         type_name::<InMemoryAgentWorkflowQueryIndex>(),
     ];

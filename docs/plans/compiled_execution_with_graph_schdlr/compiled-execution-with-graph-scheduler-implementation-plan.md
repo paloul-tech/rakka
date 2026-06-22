@@ -89,6 +89,8 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventSink`
 - `AgentTriggerSource`
+- `AgentTriggerSourceKind`
+- `AgentTriggerCommandBuilder`
 - `AgentCredentialBindingRef`
 - `AgentCredentialResolver`
 - `AgentCredentialResolverFuture`
@@ -901,6 +903,8 @@ Implementation notes:
 
 ## Phase 5: Trigger Normalization
 
+Status: implemented.
+
 Goal: define runtime command helpers for trigger executions without making
 Rakka own trigger registration.
 
@@ -955,6 +959,8 @@ Implementation notes:
 
 ### Slice 5.2: Command Builders
 
+Status: implemented.
+
 Scope:
 
 - Add helpers to construct `StartRun`, `SubmitSignal`,
@@ -975,6 +981,23 @@ Tests:
 - Schedule start command.
 - On-demand start command.
 - Duplicate trigger command deduplicates by key.
+
+Implementation notes:
+
+- Added `AgentTriggerCommandBuilder` and convenience helpers:
+  `trigger_start_run_command`, `trigger_submit_signal_command`,
+  `trigger_human_decision_command`, `trigger_cancel_run_command`, and
+  `trigger_retry_run_command`.
+- Builders require an `AgentCommandMetadata` value, so command id,
+  deduplication key, causation id, correlation id, tenant, principal,
+  telemetry context, and received timestamp stay explicit at the ingress
+  boundary.
+- Builders attach `AgentTriggerSource` attributes and optional payload artifact
+  refs, validate the resulting `AgentCommand`, and do not persist or accept the
+  command. Durable acceptance remains the responsibility of `AgentRunInbox`.
+- Added trigger tests for API start, webhook signal, schedule start, on-demand
+  start, human decision, cancellation, retry, invalid command shape, and
+  duplicate durable inbox deduplication by trigger key.
 
 ## Phase 6: Runtime Event Stream
 

@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     is_bounded_agent_metric_attribute, is_forbidden_agent_metric_attribute, AgentAttributes,
-    AgentCommand, AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES,
+    AgentCommand, AgentCommandKind, AgentCommandMetadata, ArtifactRef, HumanCheckpointId,
+    AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES,
 };
 
 /// Command attribute key containing the normalized trigger kind.
@@ -221,6 +222,182 @@ impl AgentTriggerSource {
         }
         Ok(())
     }
+}
+
+/// Builder for normalized trigger-derived commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTriggerCommandBuilder {
+    kind: AgentCommandKind,
+    metadata: AgentCommandMetadata,
+    trigger_source: AgentTriggerSource,
+    payload_ref: Option<ArtifactRef>,
+}
+
+impl AgentTriggerCommandBuilder {
+    fn new(
+        kind: AgentCommandKind,
+        metadata: AgentCommandMetadata,
+        trigger_source: AgentTriggerSource,
+    ) -> Self {
+        Self {
+            kind,
+            metadata,
+            trigger_source,
+            payload_ref: None,
+        }
+    }
+
+    /// Creates a builder for a normalized `StartRun` command.
+    #[must_use]
+    pub fn start_run(metadata: AgentCommandMetadata, trigger_source: AgentTriggerSource) -> Self {
+        Self::new(AgentCommandKind::StartRun, metadata, trigger_source)
+    }
+
+    /// Creates a builder for a normalized `SubmitSignal` command.
+    pub fn submit_signal(
+        metadata: AgentCommandMetadata,
+        trigger_source: AgentTriggerSource,
+        signal_type: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            AgentCommandKind::SubmitSignal {
+                signal_type: signal_type.into(),
+            },
+            metadata,
+            trigger_source,
+        )
+    }
+
+    /// Creates a builder for a normalized `HumanDecisionSubmitted` command.
+    pub fn human_decision_submitted(
+        metadata: AgentCommandMetadata,
+        trigger_source: AgentTriggerSource,
+        checkpoint_id: HumanCheckpointId,
+        decision: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            AgentCommandKind::HumanDecisionSubmitted {
+                checkpoint_id,
+                decision: decision.into(),
+            },
+            metadata,
+            trigger_source,
+        )
+    }
+
+    /// Creates a builder for a normalized `CancelRun` command.
+    #[must_use]
+    pub fn cancel_run(metadata: AgentCommandMetadata, trigger_source: AgentTriggerSource) -> Self {
+        Self::new(AgentCommandKind::CancelRun, metadata, trigger_source)
+    }
+
+    /// Creates a builder for a normalized `RetryRun` command.
+    #[must_use]
+    pub fn retry_run(metadata: AgentCommandMetadata, trigger_source: AgentTriggerSource) -> Self {
+        Self::new(AgentCommandKind::RetryRun, metadata, trigger_source)
+    }
+
+    /// Adds an out-of-line payload artifact reference for input, signal, or reason data.
+    #[must_use]
+    pub fn payload_ref(mut self, payload_ref: ArtifactRef) -> Self {
+        self.payload_ref = Some(payload_ref);
+        self
+    }
+
+    /// Adds an optional out-of-line payload artifact reference.
+    #[must_use]
+    pub fn optional_payload_ref(mut self, payload_ref: Option<ArtifactRef>) -> Self {
+        self.payload_ref = payload_ref;
+        self
+    }
+
+    /// Builds the validated command without accepting it into the durable inbox.
+    pub fn build(self) -> AgentTriggerSourceResult<AgentCommand> {
+        let mut command = AgentCommand::new(self.kind, self.metadata)
+            .map_err(AgentTriggerSourceError::Command)?;
+        if let Some(payload_ref) = self.payload_ref {
+            command = command.payload_ref(payload_ref);
+        }
+        self.trigger_source.attach_to_command(command)
+    }
+}
+
+/// Builds a trigger-derived `StartRun` command.
+///
+/// The returned command still must be accepted through [`crate::AgentRunInbox`]
+/// to cross the durable command boundary.
+pub fn trigger_start_run_command(
+    metadata: AgentCommandMetadata,
+    trigger_source: AgentTriggerSource,
+    payload_ref: Option<ArtifactRef>,
+) -> AgentTriggerSourceResult<AgentCommand> {
+    AgentTriggerCommandBuilder::start_run(metadata, trigger_source)
+        .optional_payload_ref(payload_ref)
+        .build()
+}
+
+/// Builds a trigger-derived `SubmitSignal` command.
+///
+/// The returned command still must be accepted through [`crate::AgentRunInbox`]
+/// to cross the durable command boundary.
+pub fn trigger_submit_signal_command(
+    metadata: AgentCommandMetadata,
+    trigger_source: AgentTriggerSource,
+    signal_type: impl Into<String>,
+    payload_ref: Option<ArtifactRef>,
+) -> AgentTriggerSourceResult<AgentCommand> {
+    AgentTriggerCommandBuilder::submit_signal(metadata, trigger_source, signal_type)
+        .optional_payload_ref(payload_ref)
+        .build()
+}
+
+/// Builds a trigger-derived `HumanDecisionSubmitted` command.
+///
+/// The returned command still must be accepted through [`crate::AgentRunInbox`]
+/// to cross the durable command boundary.
+pub fn trigger_human_decision_command(
+    metadata: AgentCommandMetadata,
+    trigger_source: AgentTriggerSource,
+    checkpoint_id: HumanCheckpointId,
+    decision: impl Into<String>,
+    payload_ref: Option<ArtifactRef>,
+) -> AgentTriggerSourceResult<AgentCommand> {
+    AgentTriggerCommandBuilder::human_decision_submitted(
+        metadata,
+        trigger_source,
+        checkpoint_id,
+        decision,
+    )
+    .optional_payload_ref(payload_ref)
+    .build()
+}
+
+/// Builds a trigger-derived `CancelRun` command.
+///
+/// The returned command still must be accepted through [`crate::AgentRunInbox`]
+/// to cross the durable command boundary.
+pub fn trigger_cancel_run_command(
+    metadata: AgentCommandMetadata,
+    trigger_source: AgentTriggerSource,
+    payload_ref: Option<ArtifactRef>,
+) -> AgentTriggerSourceResult<AgentCommand> {
+    AgentTriggerCommandBuilder::cancel_run(metadata, trigger_source)
+        .optional_payload_ref(payload_ref)
+        .build()
+}
+
+/// Builds a trigger-derived `RetryRun` command.
+///
+/// The returned command still must be accepted through [`crate::AgentRunInbox`]
+/// to cross the durable command boundary.
+pub fn trigger_retry_run_command(
+    metadata: AgentCommandMetadata,
+    trigger_source: AgentTriggerSource,
+    payload_ref: Option<ArtifactRef>,
+) -> AgentTriggerSourceResult<AgentCommand> {
+    AgentTriggerCommandBuilder::retry_run(metadata, trigger_source)
+        .optional_payload_ref(payload_ref)
+        .build()
 }
 
 /// Shared result type for trigger source validation.

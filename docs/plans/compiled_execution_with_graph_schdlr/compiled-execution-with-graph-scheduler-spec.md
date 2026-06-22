@@ -653,6 +653,12 @@ The public API should introduce:
 
 - `AgentTriggerSource`
 - `AgentTriggerSourceKind`
+- `AgentTriggerCommandBuilder`
+- `trigger_start_run_command`
+- `trigger_submit_signal_command`
+- `trigger_human_decision_command`
+- `trigger_cancel_run_command`
+- `trigger_retry_run_command`
 
 Rakka should not own trigger registration. Instead, application ingress code
 normalizes trigger executions into Rakka commands.
@@ -702,6 +708,13 @@ Every trigger-derived command needs:
 - principal, when known;
 - received timestamp;
 - optional payload artifact ref.
+
+Rakka command builders should require these durable fields through
+`AgentCommandMetadata`, attach `AgentTriggerSource` attributes, attach optional
+payload artifact refs, and return validated `AgentCommand` values. They must
+not register triggers, route webhooks, own cron schedules, persist commands, or
+start runs directly. The command crosses the durable boundary only when the
+application passes it to `AgentRunInbox`.
 
 ## Runtime Event Stream
 
