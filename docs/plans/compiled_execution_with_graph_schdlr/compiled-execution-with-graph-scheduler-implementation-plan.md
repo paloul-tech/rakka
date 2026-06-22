@@ -450,7 +450,7 @@ Implementation notes:
 
 ## Phase 3: Graph Scheduler Core
 
-Status: in progress.
+Status: implemented.
 
 Goal: implement deterministic ready-node evaluation and graph state
 transitions.
@@ -580,6 +580,8 @@ Implementation notes:
 
 ### Slice 3.4: Cancellation And Terminal Policy
 
+Status: implemented.
+
 Scope:
 
 - Add graph-aware cancellation transitions.
@@ -600,6 +602,25 @@ Tests:
 - Cancel while running.
 - Cancel while waiting for effect.
 - Terminal failure stops downstream scheduling.
+
+Implementation notes:
+
+- Added graph-level cancellation through `AgentGraphScheduler::cancel_graph_run`.
+- Cancellation is durable and idempotent for already-cancelled graph state.
+- Unresolved pending, runnable, running, and waiting nodes move to
+  `cancelled`; completed, skipped, failed, and terminal nodes keep their
+  terminal status.
+- Active unresolved loop instances also move to `cancelled`.
+- Terminal success and terminal failure now cancel remaining unresolved work so
+  no stale runnable nodes remain after graph terminal status is set.
+- Terminal failure marks the failing node `failed`, marks the graph `failed`,
+  and cancels the remaining unresolved graph work.
+- Compensation is left as an explicit later runtime concern; this slice only
+  preserves durable terminal/cancelled state where compensation hooks can attach.
+- Added scheduler tests for cancel before start, cancel while running, cancel
+  while waiting for an effect, terminal failure stopping downstream scheduling,
+  terminal success cancelling leftover parallel work, and idempotent repeated
+  cancellation.
 
 ## Phase 4: Effect Bridge
 

@@ -514,6 +514,205 @@ fn scheduler_recovers_active_iterator_iteration_after_crash() {
     );
 }
 
+#[test]
+fn scheduler_cancels_graph_before_start() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = linear_plan();
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let transition = scheduler
+        .cancel_graph_run(&plan, state, ts(110))
+        .expect("graph should cancel before start");
+    let cancelled = transition.state;
+
+    assert_eq!(
+        node_ids(&transition.changed_node_ids),
+        vec!["input", "terminal", "transform"]
+    );
+    assert_eq!(
+        cancelled.terminal_status,
+        Some(AgentGraphTerminalStatus::Cancelled)
+    );
+    assert!(cancelled
+        .node_states
+        .values()
+        .all(|node| node.status == AgentGraphNodeStatus::Cancelled));
+    assert!(scheduler.runnable_nodes(&cancelled).is_empty());
+    assert!(scheduler
+        .compute_ready_nodes(&plan, &cancelled)
+        .expect("terminal graph ready set should compute")
+        .is_empty());
+
+    let cancelled_revision = cancelled.scheduler_revision;
+    let idempotent = scheduler
+        .cancel_graph_run(&plan, cancelled, ts(120))
+        .expect("repeated cancellation should be idempotent");
+    assert!(idempotent.changed_node_ids.is_empty());
+    assert_eq!(idempotent.state.scheduler_revision, cancelled_revision);
+}
+
+#[test]
+fn scheduler_cancels_graph_while_node_is_running() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = linear_plan();
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect("input should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(&plan, state, "input", ts(120))
+        .expect("input should start")
+        .state;
+    let state = scheduler
+        .cancel_graph_run(&plan, state, ts(130))
+        .expect("graph should cancel while running")
+        .state;
+
+    assert_eq!(
+        node_state(&state, "input").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        node_state(&state, "transform").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        node_state(&state, "terminal").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        state.terminal_status,
+        Some(AgentGraphTerminalStatus::Cancelled)
+    );
+    assert!(scheduler.runnable_nodes(&state).is_empty());
+}
+
+#[test]
+fn scheduler_cancels_graph_while_waiting_for_effect() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = linear_plan();
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect("input should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(&plan, state, "input", ts(120))
+        .expect("input should start")
+        .state;
+    let state = scheduler
+        .wait_node(&plan, state, "input", AgentGraphWaitReason::Effect, ts(130))
+        .expect("input should wait for effect")
+        .state;
+    let state = scheduler
+        .cancel_graph_run(&plan, state, ts(140))
+        .expect("graph should cancel while waiting")
+        .state;
+
+    assert_eq!(
+        node_state(&state, "input").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(node_state(&state, "input").wait_reason, None);
+    assert_eq!(
+        state.terminal_status,
+        Some(AgentGraphTerminalStatus::Cancelled)
+    );
+}
+
+#[test]
+fn scheduler_terminal_failure_stops_downstream_scheduling() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = fan_out_join_plan(AgentCompiledEdgeMergeBehavior::WaitForAll);
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = run_node(&scheduler, &plan, state, "input", ts(110));
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(150))
+        .expect("fan-out nodes should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(&plan, state, "left", ts(160))
+        .expect("left should start")
+        .state;
+    let state = scheduler
+        .fail_node(&plan, state, "left", "left-failed", ts(170))
+        .expect("left failure should fail graph")
+        .state;
+
+    assert_eq!(
+        node_state(&state, "left").status,
+        AgentGraphNodeStatus::Failed
+    );
+    assert_eq!(
+        node_state(&state, "right").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        node_state(&state, "join").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        node_state(&state, "terminal").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    assert!(scheduler.runnable_nodes(&state).is_empty());
+    assert!(scheduler
+        .compute_ready_nodes(&plan, &state)
+        .expect("terminal graph ready set should compute")
+        .is_empty());
+}
+
+#[test]
+fn scheduler_terminal_success_cancels_unresolved_parallel_work() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = fan_out_join_plan(AgentCompiledEdgeMergeBehavior::WaitForAny);
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = run_node(&scheduler, &plan, state, "input", ts(110));
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(150))
+        .expect("fan-out nodes should become runnable")
+        .state;
+    let state = run_node(&scheduler, &plan, state, "left", ts(160));
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(200))
+        .expect("join should become runnable")
+        .state;
+    let state = run_node(&scheduler, &plan, state, "join", ts(210));
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(250))
+        .expect("terminal should become runnable")
+        .state;
+    let state = run_node(&scheduler, &plan, state, "terminal", ts(260));
+
+    assert_eq!(
+        node_state(&state, "terminal").status,
+        AgentGraphNodeStatus::Terminal
+    );
+    assert_eq!(
+        node_state(&state, "right").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        state.terminal_status,
+        Some(AgentGraphTerminalStatus::Completed)
+    );
+    assert!(scheduler.runnable_nodes(&state).is_empty());
+}
+
 fn linear_plan() -> AgentCompiledExecutionPlan {
     let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
         AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),

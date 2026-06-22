@@ -317,6 +317,11 @@ The persisted state should be sufficient to recover after:
 - cancelling;
 - cancelled.
 
+The current scheduler implementation models graph-node cancellation by moving
+unresolved graph nodes directly to `cancelled` when graph cancellation becomes
+terminal. Run-level cancellation request or cancelling intent may be represented
+outside graph-node status by the host run runtime.
+
 ### State principles
 
 - Durable graph state is the source of truth for scheduler recovery.
@@ -406,6 +411,23 @@ scoped durable loop state. The runtime that owns item discovery and loop body
 interpretation asks the scheduler to start or complete each iteration; the
 scheduler enforces the declared bound and recovers the active iteration from
 durable state.
+
+### Cancellation And Terminal Policy
+
+Graph cancellation should stop scheduling new nodes and durably mark unresolved
+pending, runnable, running, and waiting nodes as cancelled. Completed, skipped,
+failed, and terminal nodes keep their existing terminal status. Unresolved loop
+instances should also be cancelled.
+
+Once graph terminal status is set, the scheduler should report no runnable nodes.
+Terminal success cancels leftover unresolved parallel work. Terminal failure
+marks the failing node failed, marks the graph failed, and cancels the remaining
+unresolved work. Repeated cancellation of an already-cancelled graph is
+idempotent.
+
+Compensation hooks are a later runtime concern. The scheduler preserves durable
+terminal, failed, and cancelled state where compensation orchestration can attach,
+but it does not execute compensation workflows in the Phase 3 scheduler core.
 
 ## Effect Bridge
 

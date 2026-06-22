@@ -311,6 +311,7 @@ impl AgentGraphScheduler {
         } else {
             AgentGraphNodeStatus::Completed
         };
+        let mut changed_node_ids = vec![node_id.clone()];
         transition_node(
             &mut state,
             &node_id,
@@ -325,8 +326,14 @@ impl AgentGraphScheduler {
         )?;
         if next_status == AgentGraphNodeStatus::Terminal {
             state.terminal_status = Some(AgentGraphTerminalStatus::Completed);
+            let mut excluded_node_ids = BTreeSet::new();
+            excluded_node_ids.insert(node_id);
+            changed_node_ids.extend(cancel_unresolved_nodes(&mut state, now, &excluded_node_ids));
+            changed_node_ids.extend(cancel_unresolved_loop_instances(&mut state, now));
         }
-        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+        changed_node_ids.sort();
+        changed_node_ids.dedup();
+        Ok(AgentGraphSchedulerTransition::new(state, changed_node_ids))
     }
 
     /// Transitions a running branch node to completed with durable selected paths.
@@ -550,6 +557,34 @@ impl AgentGraphScheduler {
         Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
     }
 
+    /// Cancels a non-terminal graph run and all unresolved graph work.
+    pub fn cancel_graph_run(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        validate_plan_state(plan, &state)?;
+        if let Some(status) = state.terminal_status {
+            if status == AgentGraphTerminalStatus::Cancelled {
+                return Ok(AgentGraphSchedulerTransition::new(state, Vec::new()));
+            }
+            return Err(AgentGraphSchedulerError::TerminalGraph { status });
+        }
+
+        let excluded_node_ids = BTreeSet::new();
+        let mut changed_node_ids = cancel_unresolved_nodes(&mut state, now, &excluded_node_ids);
+        changed_node_ids.extend(cancel_unresolved_loop_instances(&mut state, now));
+        changed_node_ids.sort();
+        changed_node_ids.dedup();
+
+        state.terminal_status = Some(AgentGraphTerminalStatus::Cancelled);
+        state.blocked_reason = None;
+        state.scheduler_revision += 1;
+
+        Ok(AgentGraphSchedulerTransition::new(state, changed_node_ids))
+    }
+
     /// Transitions a running node to waiting.
     pub fn wait_node(
         &self,
@@ -590,6 +625,7 @@ impl AgentGraphScheduler {
         validate_plan_state(plan, &state)?;
         ensure_known_node(plan, &node_id)?;
         let error_code = error_code.into();
+        let mut changed_node_ids = vec![node_id.clone()];
         transition_node(
             &mut state,
             &node_id,
@@ -603,7 +639,13 @@ impl AgentGraphScheduler {
             },
         )?;
         state.terminal_status = Some(AgentGraphTerminalStatus::Failed);
-        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+        let mut excluded_node_ids = BTreeSet::new();
+        excluded_node_ids.insert(node_id);
+        changed_node_ids.extend(cancel_unresolved_nodes(&mut state, now, &excluded_node_ids));
+        changed_node_ids.extend(cancel_unresolved_loop_instances(&mut state, now));
+        changed_node_ids.sort();
+        changed_node_ids.dedup();
+        Ok(AgentGraphSchedulerTransition::new(state, changed_node_ids))
     }
 }
 
@@ -988,6 +1030,53 @@ fn next_iterator_iteration_index(state: &AgentGraphRunState, node_id: &AgentComp
         .map_or(0, |iteration_index| iteration_index.saturating_add(1))
 }
 
+fn cancel_unresolved_nodes(
+    state: &mut AgentGraphRunState,
+    now: AgentTimestampMillis,
+    excluded_node_ids: &BTreeSet<AgentCompiledNodeId>,
+) -> Vec<AgentCompiledNodeId> {
+    let mut changed_node_ids = Vec::new();
+    for (node_id, node_state) in &mut state.node_states {
+        if excluded_node_ids.contains(node_id) || !node_status_is_unresolved(node_state.status) {
+            continue;
+        }
+        node_state.status = AgentGraphNodeStatus::Cancelled;
+        node_state.dependencies_ready = false;
+        node_state.updated_at = now;
+        node_state.completed_at = Some(now);
+        node_state.wait_reason = None;
+        node_state.error_code = None;
+        changed_node_ids.push(node_id.clone());
+    }
+    changed_node_ids
+}
+
+fn cancel_unresolved_loop_instances(
+    state: &mut AgentGraphRunState,
+    now: AgentTimestampMillis,
+) -> Vec<AgentCompiledNodeId> {
+    let mut changed_node_ids = Vec::new();
+    for loop_instance in &mut state.loop_instances {
+        if !node_status_is_unresolved(loop_instance.status) {
+            continue;
+        }
+        loop_instance.status = AgentGraphNodeStatus::Cancelled;
+        loop_instance.completed_at = Some(now);
+        changed_node_ids.push(loop_instance.node_id.clone());
+    }
+    changed_node_ids
+}
+
+fn node_status_is_unresolved(status: AgentGraphNodeStatus) -> bool {
+    matches!(
+        status,
+        AgentGraphNodeStatus::Pending
+            | AgentGraphNodeStatus::Runnable
+            | AgentGraphNodeStatus::Running
+            | AgentGraphNodeStatus::Waiting
+    )
+}
+
 fn validate_branch_selection<I, E>(
     plan: &AgentCompiledExecutionPlan,
     branch_node_id: &AgentCompiledNodeId,
@@ -1108,6 +1197,9 @@ fn node_should_skip(
 }
 
 fn runnable_nodes_from_state(state: &AgentGraphRunState) -> Vec<AgentCompiledNodeId> {
+    if state.terminal_status.is_some() {
+        return Vec::new();
+    }
     state
         .node_states
         .iter()
