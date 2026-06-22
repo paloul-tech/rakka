@@ -181,9 +181,11 @@ impl AgentRunOperationalSnapshot {
             open_checkpoint_count: run_state.map_or(0, open_checkpoint_count),
             escalated_checkpoint_count: run_state.map_or(0, escalated_checkpoint_count),
             due_checkpoint_count: run_state.map_or(0, due_checkpoint_count),
-            graph: run_state
-                .and_then(|state| state.graph_state.as_ref())
-                .map(AgentGraphRunProjection::from_graph_state),
+            graph: snapshot.graph.clone().or_else(|| {
+                run_state
+                    .and_then(|state| state.graph_state.as_ref())
+                    .map(AgentGraphRunProjection::from_graph_state)
+            }),
             recovered: run_state.is_some(),
             terminal: run_state.is_some_and(is_terminal_run_state),
             updated_at_millis: run_state.map(|state| state.updated_at.as_millis()),

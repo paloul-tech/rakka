@@ -256,8 +256,8 @@ pub use runner::{
     AGENT_RUN_PERSISTENCE_PREFIX,
 };
 pub use runtime::{
-    AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunRuntimeError,
-    AgentRunRuntimeResult,
+    AgentGraphRuntime, AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition, AgentRunActor,
+    AgentRunActorCommand, AgentRunActorSnapshot, AgentRunRuntimeError, AgentRunRuntimeResult,
 };
 pub use runtime_events::{
     next_runtime_event_sequence, validate_runtime_event, validate_runtime_event_follows,
@@ -375,7 +375,8 @@ pub mod prelude {
         AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
         AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
         AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentFacadeError,
-        AgentFacadeResult, AgentHumanApprovalRequest, AgentHumanCheckpointError,
+        AgentFacadeResult, AgentGraphRuntime, AgentGraphRuntimeEffectOutcome,
+        AgentGraphRuntimeTransition, AgentHumanApprovalRequest, AgentHumanCheckpointError,
         AgentHumanCheckpointOpening, AgentHumanCheckpointResult, AgentHumanCheckpointRuntime,
         AgentHumanDecisionResult, AgentHumanDecisionSubmission, AgentIdempotencyKey,
         AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError, AgentInboxResult,

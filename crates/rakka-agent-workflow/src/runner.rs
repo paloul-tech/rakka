@@ -10,9 +10,9 @@ use std::fmt::{self, Display, Formatter};
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision, StateRecord};
 
 use crate::{
-    AgentCancellation, AgentRunId, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStep,
-    AgentStepId, AgentTimestampMillis, AgentWorkflow, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, PrincipalRef,
+    AgentCancellation, AgentGraphRunState, AgentGraphTerminalStatus, AgentRunId, AgentRunState,
+    AgentRunStatus, AgentStatePayload, AgentStep, AgentStepId, AgentTimestampMillis, AgentWorkflow,
+    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, PrincipalRef,
 };
 
 /// Prefix used for durable agent-run state persistence ids.
@@ -61,6 +61,8 @@ pub enum AgentRunTransitionKind {
     Cancel,
     /// Run entered compensation.
     BeginCompensation,
+    /// Compiled graph execution state changed.
+    GraphUpdated,
 }
 
 impl AgentRunTransitionKind {
@@ -82,6 +84,7 @@ impl AgentRunTransitionKind {
             Self::RequestCancellation => "request-cancellation",
             Self::Cancel => "cancel",
             Self::BeginCompensation => "begin-compensation",
+            Self::GraphUpdated => "graph-updated",
         }
     }
 }
@@ -873,6 +876,56 @@ where
         .await
     }
 
+    /// Persists an updated compiled graph state into the durable run state.
+    pub async fn update_graph_state(
+        &mut self,
+        graph_state: AgentGraphRunState,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEngineResult<AgentRunTransition> {
+        let record = self.current_record()?;
+        let previous_status = record.state.status;
+        if graph_state.terminal_status.is_none() {
+            self.reject_terminal(
+                previous_status,
+                AgentRunTransitionKind::GraphUpdated,
+                "terminal runs cannot apply non-terminal graph updates",
+            )?;
+        }
+
+        let mut next = record.state;
+        next.graph_state = Some(graph_state.clone());
+        next.updated_at = now;
+        match graph_state.terminal_status {
+            Some(AgentGraphTerminalStatus::Completed) => {
+                next.status = AgentRunStatus::Completed;
+                next.current_step_id = None;
+                next.completed_at = Some(now);
+            }
+            Some(AgentGraphTerminalStatus::Failed) => {
+                next.status = AgentRunStatus::Failed;
+                next.current_step_id = None;
+                next.completed_at = Some(now);
+            }
+            Some(AgentGraphTerminalStatus::Cancelled) => {
+                next.status = AgentRunStatus::Cancelled;
+                next.current_step_id = None;
+                next.completed_at = Some(now);
+            }
+            None => {
+                next.status = AgentRunStatus::Running;
+                next.completed_at = None;
+            }
+        }
+
+        self.persist_transition(
+            AgentRunTransitionKind::GraphUpdated,
+            Some(previous_status),
+            record.revision,
+            next,
+        )
+        .await
+    }
+
     fn ensure_recovered(&self) -> AgentRunEngineResult<()> {
         if self.recovered {
             Ok(())
@@ -900,7 +953,9 @@ where
                 reason: "initial run state must be accepted",
             });
         }
-        self.current_step(state)?;
+        if state.graph_state.is_none() {
+            self.current_step(state)?;
+        }
         Ok(())
     }
 

@@ -86,6 +86,8 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphHumanCheckpointScheduleRequest`
 - `AgentGraphHumanCheckpointScheduleOutcome`
 - `AgentGraphRuntime`
+- `AgentGraphRuntimeTransition`
+- `AgentGraphRuntimeEffectOutcome`
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventKind`
 - `AgentRuntimeEventDraft`
@@ -1151,6 +1153,8 @@ paths.
 
 ### Slice 7.1: Actor-Backed Runtime
 
+Status: implemented.
+
 Scope:
 
 - Extend `AgentRunActorCommand` or add graph-specific commands.
@@ -1169,6 +1173,27 @@ Tests:
 - Actor restart after node runnable.
 - Actor restart after effect scheduled.
 - Snapshot reports node status counts.
+
+Implementation notes:
+
+- Added `AgentGraphRuntime` as the actor-backed graph execution helper that
+  composes `AgentGraphScheduler`, `AgentGraphEffectBridge`,
+  `AgentStepRunner`, and `AgentRunInbox`.
+- Added `AgentGraphRuntimeTransition` and
+  `AgentGraphRuntimeEffectOutcome` to pair graph scheduler/effect outcomes
+  with the durable `AgentRunTransition` that persisted the graph state into
+  `AgentRunState`.
+- Extended `AgentRunTransitionKind` with `GraphUpdated` and added
+  `AgentStepRunner::update_graph_state` so graph scheduler transitions persist
+  through the same durable compare-and-set boundary as step transitions.
+- Extended `AgentRunActorCommand` with graph-specific commands:
+  `StartGraph`, `MarkGraphReady`, `StartGraphNode`, `CompleteGraphNode`, and
+  `ScheduleGraphNodeEffect`.
+- Extended `AgentRunActorSnapshot` with a bounded `AgentGraphRunProjection`
+  so actor snapshots directly expose graph node status counts.
+- Added actor-backed graph tests covering a local graph run, recovery after a
+  node is persisted as runnable, recovery after an effect node schedules durable
+  outbox work, and direct snapshot graph node count reporting.
 
 ### Slice 7.2: Sharded Runtime
 

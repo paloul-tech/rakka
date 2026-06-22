@@ -149,6 +149,7 @@ fn runtime_snapshot_reports_graph_summaries() {
     snapshots.record_run_actor_snapshot(&AgentRunActorSnapshot {
         run_id: run_id.clone(),
         run_state: Some(run),
+        graph: None,
         recoverable_command_count: 0,
         due_effect_count: 0,
     });

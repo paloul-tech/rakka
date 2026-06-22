@@ -353,6 +353,8 @@ The public API should introduce:
 - `AgentGraphHumanCheckpointScheduleRequest`
 - `AgentGraphHumanCheckpointScheduleOutcome`
 - `AgentGraphRuntime`
+- `AgentGraphRuntimeTransition`
+- `AgentGraphRuntimeEffectOutcome`
 
 The graph scheduler is a deterministic per-run component that evaluates a
 compiled execution plan against durable graph run state.

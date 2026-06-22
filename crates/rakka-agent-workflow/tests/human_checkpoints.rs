@@ -237,6 +237,7 @@ async fn human_checkpoint_snapshot_reports_waiting_runs() {
     registry.record_run_actor_snapshot(&AgentRunActorSnapshot {
         run_id: run_id.clone(),
         run_state: Some(opening.transition.state),
+        graph: None,
         recoverable_command_count: 0,
         due_effect_count: 1,
     });
