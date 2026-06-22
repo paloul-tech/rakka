@@ -539,6 +539,8 @@ Implementation notes:
 
 ### Slice 3.3: Bounded Iteration
 
+Status: implemented.
+
 Scope:
 
 - Implement explicit iterator or loop node semantics.
@@ -559,6 +561,22 @@ Tests:
 - Multi-iteration loop.
 - Max iteration exceeded failure.
 - Crash during loop body recovers current iteration.
+
+Implementation notes:
+
+- Added iterator-specific scheduler transitions on `AgentGraphScheduler` for
+  starting an iteration, completing an iteration, completing the iterator node,
+  and querying the active iteration index.
+- Kept iteration state scoped in durable `AgentGraphLoopInstanceState` records
+  keyed by iterator node id plus deterministic zero-based iteration index.
+- Required iterator nodes to complete through iterator-specific transitions so
+  generic node completion cannot bypass bounded iteration policy.
+- Enforced `max_iterations` at runtime; an attempt to start an iteration beyond
+  the declared bound durably fails the iterator node and graph with stable node
+  error code `iterator-bound-exceeded`.
+- Added scheduler tests for zero actual iterations, multiple bounded
+  iterations, bound-exceeded failure, and recovery of an active running
+  iteration after a crash.
 
 ### Slice 3.4: Cancellation And Terminal Policy
 

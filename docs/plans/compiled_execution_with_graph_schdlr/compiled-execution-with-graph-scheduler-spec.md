@@ -400,6 +400,12 @@ Iteration is represented with explicit bounded loop or iterator nodes. Each
 iteration should have a stable loop instance id and max iteration bound. The
 scheduler must persist the current iteration before scheduling work for that
 iteration.
+In the first scheduler implementation, loop instance identity is represented by
+the iterator node id plus deterministic zero-based iteration index, stored in
+scoped durable loop state. The runtime that owns item discovery and loop body
+interpretation asks the scheduler to start or complete each iteration; the
+scheduler enforces the declared bound and recovers the active iteration from
+durable state.
 
 ## Effect Bridge
 

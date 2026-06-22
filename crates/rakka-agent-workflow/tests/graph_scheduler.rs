@@ -2,11 +2,12 @@
 
 use rakka_agent_workflow::{
     AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior, AgentCompiledExecutionPlan,
-    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
+    AgentCompiledIteratorPolicy, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
     AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
     AgentCompiledPlanPort, AgentCompiledPortDirection, AgentGraphNodeState, AgentGraphNodeStatus,
-    AgentGraphRunState, AgentGraphScheduler, AgentGraphWaitReason, AgentTimestampMillis,
-    AgentWorkflowId, WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    AgentGraphRunState, AgentGraphScheduler, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    AgentTimestampMillis, AgentWorkflowId, WorkflowDefinitionVersion,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 
 #[test]
@@ -341,6 +342,178 @@ fn scheduler_rejects_branch_completion_without_selected_outgoing_edge() {
     assert_eq!(error.code(), "invalid-branch-selection");
 }
 
+#[test]
+fn scheduler_completes_zero_iteration_iterator() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = iterator_plan(3);
+    let state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+    let state = run_node(&scheduler, &plan, state, "input", ts(110));
+    let state = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(150))
+        .expect("iterator should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(&plan, state, "iterate", ts(160))
+        .expect("iterator should start")
+        .state;
+    let state = scheduler
+        .complete_iterator_node(&plan, state, "iterate", ts(170))
+        .expect("iterator can complete with zero actual iterations")
+        .state;
+
+    assert!(state.loop_instances.is_empty());
+    assert_eq!(
+        node_state(&state, "iterate").status,
+        AgentGraphNodeStatus::Completed
+    );
+    assert_eq!(
+        node_ids(
+            &scheduler
+                .compute_ready_nodes(&plan, &state)
+                .expect("ready set should compute")
+        ),
+        vec!["terminal"]
+    );
+}
+
+#[test]
+fn scheduler_runs_multiple_bounded_iterator_iterations() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = iterator_plan(3);
+    let state = start_iterator(&scheduler, &plan);
+    let state = scheduler
+        .start_iterator_iteration(&plan, state, "iterate", ts(170))
+        .expect("iteration 0 should start")
+        .state;
+    assert_eq!(
+        scheduler.current_iterator_iteration_index(&state, "iterate"),
+        Some(0)
+    );
+    let state = scheduler
+        .complete_iterator_iteration(&plan, state, "iterate", 0, ts(180))
+        .expect("iteration 0 should complete")
+        .state;
+    let state = scheduler
+        .start_iterator_iteration(&plan, state, "iterate", ts(190))
+        .expect("iteration 1 should start")
+        .state;
+    assert_eq!(
+        scheduler.current_iterator_iteration_index(&state, "iterate"),
+        Some(1)
+    );
+    let state = scheduler
+        .complete_iterator_iteration(&plan, state, "iterate", 1, ts(200))
+        .expect("iteration 1 should complete")
+        .state;
+    let state = scheduler
+        .complete_iterator_node(&plan, state, "iterate", ts(210))
+        .expect("iterator should complete after iterations")
+        .state;
+
+    let iterations: Vec<_> = state
+        .loop_instances
+        .iter()
+        .map(|instance| {
+            (
+                instance.node_id.as_str(),
+                instance.iteration_index,
+                instance.status,
+            )
+        })
+        .collect();
+    assert_eq!(
+        iterations,
+        vec![
+            ("iterate", 0, AgentGraphNodeStatus::Completed),
+            ("iterate", 1, AgentGraphNodeStatus::Completed),
+        ]
+    );
+    assert_eq!(
+        node_state(&state, "iterate").status,
+        AgentGraphNodeStatus::Completed
+    );
+}
+
+#[test]
+fn scheduler_fails_iterator_when_iteration_bound_is_exceeded() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = iterator_plan(2);
+    let state = start_iterator(&scheduler, &plan);
+    let state = scheduler
+        .start_iterator_iteration(&plan, state, "iterate", ts(170))
+        .expect("iteration 0 should start")
+        .state;
+    let state = scheduler
+        .complete_iterator_iteration(&plan, state, "iterate", 0, ts(180))
+        .expect("iteration 0 should complete")
+        .state;
+    let state = scheduler
+        .start_iterator_iteration(&plan, state, "iterate", ts(190))
+        .expect("iteration 1 should start")
+        .state;
+    let state = scheduler
+        .complete_iterator_iteration(&plan, state, "iterate", 1, ts(200))
+        .expect("iteration 1 should complete")
+        .state;
+    let state = scheduler
+        .start_iterator_iteration(&plan, state, "iterate", ts(210))
+        .expect("exceeding the bound should produce a durable failure")
+        .state;
+
+    assert_eq!(
+        node_state(&state, "iterate").status,
+        AgentGraphNodeStatus::Failed
+    );
+    assert_eq!(
+        node_state(&state, "iterate").error_code.as_deref(),
+        Some("iterator-bound-exceeded")
+    );
+    assert_eq!(
+        state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+    assert_eq!(state.loop_instances.len(), 2);
+}
+
+#[test]
+fn scheduler_recovers_active_iterator_iteration_after_crash() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = iterator_plan(2);
+    let state = start_iterator(&scheduler, &plan);
+    let persisted = scheduler
+        .start_iterator_iteration(&plan, state, "iterate", ts(170))
+        .expect("iteration 0 should start")
+        .state;
+
+    let recovered = persisted.clone();
+    assert_eq!(
+        scheduler.current_iterator_iteration_index(&recovered, "iterate"),
+        Some(0)
+    );
+    assert_eq!(recovered.loop_instances[0].node_id.as_str(), "iterate");
+    assert_eq!(recovered.loop_instances[0].iteration_index, 0);
+    assert_eq!(
+        recovered.loop_instances[0].status,
+        AgentGraphNodeStatus::Running
+    );
+
+    let error = scheduler
+        .start_iterator_iteration(&plan, recovered.clone(), "iterate", ts(180))
+        .expect_err("recovery should resume the active iteration");
+    assert_eq!(error.code(), "invalid-iterator-transition");
+
+    let state = scheduler
+        .complete_iterator_iteration(&plan, recovered, "iterate", 0, ts(190))
+        .expect("recovered iteration should complete")
+        .state;
+    assert_eq!(
+        scheduler.current_iterator_iteration_index(&state, "iterate"),
+        None
+    );
+}
+
 fn linear_plan() -> AgentCompiledExecutionPlan {
     let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
         AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
@@ -598,6 +771,73 @@ fn branch_join_plan() -> AgentCompiledExecutionPlan {
         "terminal",
         "result",
     ))
+}
+
+fn iterator_plan(max_iterations: u32) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "items"),
+    );
+    let iterator = AgentCompiledPlanNode::new("iterate", AgentCompiledNodeKind::Iterator)
+        .input_port(AgentCompiledPlanPort::new(
+            "items",
+            AgentCompiledPortDirection::Input,
+            "items",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "item",
+            AgentCompiledPortDirection::Output,
+            "item",
+        ))
+        .iterator_policy(AgentCompiledIteratorPolicy::new(max_iterations));
+    let terminal =
+        AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+            AgentCompiledPlanPort::new("result", AgentCompiledPortDirection::Input, "item"),
+        );
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new(format!("plan-iterator-{max_iterations}-v1")),
+        AgentWorkflowId::new("workflow-iterator"),
+        "iterator",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new(format!("sha256:iterator-{max_iterations}")),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(iterator)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-iterator",
+        "input",
+        "payload",
+        "iterate",
+        "items",
+    ))
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-iterator-terminal",
+        "iterate",
+        "item",
+        "terminal",
+        "result",
+    ))
+}
+
+fn start_iterator(
+    scheduler: &AgentGraphScheduler,
+    plan: &AgentCompiledExecutionPlan,
+) -> AgentGraphRunState {
+    let state = scheduler
+        .initialize_state(plan, ts(100))
+        .expect("graph state should initialize");
+    let state = run_node(scheduler, plan, state, "input", ts(110));
+    let state = scheduler
+        .mark_ready_nodes_runnable(plan, state, ts(150))
+        .expect("iterator should become runnable")
+        .state;
+    scheduler
+        .start_node(plan, state, "iterate", ts(160))
+        .expect("iterator should start")
+        .state
 }
 
 fn run_node(

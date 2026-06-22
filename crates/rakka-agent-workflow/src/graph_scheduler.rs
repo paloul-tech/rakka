@@ -11,8 +11,8 @@ use std::fmt::{self, Display, Formatter};
 use crate::{
     validate_compiled_execution_plan, AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior,
     AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
-    AgentCompiledPlanNode, AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState,
-    AgentGraphTerminalStatus, AgentGraphWaitReason, AgentTimestampMillis,
+    AgentCompiledPlanNode, AgentGraphLoopInstanceState, AgentGraphNodeState, AgentGraphNodeStatus,
+    AgentGraphRunState, AgentGraphTerminalStatus, AgentGraphWaitReason, AgentTimestampMillis,
 };
 
 /// Result type for graph scheduler operations.
@@ -61,6 +61,13 @@ pub enum AgentGraphSchedulerError {
         /// Bounded diagnostic reason.
         reason: String,
     },
+    /// An iterator node transition or iteration request was invalid.
+    InvalidIteratorTransition {
+        /// Iterator node id.
+        node_id: AgentCompiledNodeId,
+        /// Bounded diagnostic reason.
+        reason: String,
+    },
     /// Scheduler was asked to mutate a terminal graph.
     TerminalGraph {
         /// Terminal graph status.
@@ -79,6 +86,7 @@ impl AgentGraphSchedulerError {
             Self::UnknownNode { .. } => "unknown-graph-node",
             Self::InvalidNodeTransition { .. } => "invalid-graph-node-transition",
             Self::InvalidBranchSelection { .. } => "invalid-branch-selection",
+            Self::InvalidIteratorTransition { .. } => "invalid-iterator-transition",
             Self::TerminalGraph { .. } => "terminal-graph",
         }
     }
@@ -114,6 +122,12 @@ impl Display for AgentGraphSchedulerError {
             ),
             Self::InvalidBranchSelection { node_id, reason } => {
                 write!(f, "branch node `{node_id}` has invalid selection: {reason}")
+            }
+            Self::InvalidIteratorTransition { node_id, reason } => {
+                write!(
+                    f,
+                    "iterator node `{node_id}` has invalid transition: {reason}"
+                )
             }
             Self::TerminalGraph { status } => {
                 write!(
@@ -285,6 +299,13 @@ impl AgentGraphScheduler {
                 reason: "branch nodes must complete with selected outgoing edge ids".to_string(),
             });
         }
+        if node.kind == AgentCompiledNodeKind::Iterator {
+            return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+                node_id,
+                reason: "iterator nodes must complete through iterator-specific transitions"
+                    .to_string(),
+            });
+        }
         let next_status = if node.kind == AgentCompiledNodeKind::Terminal {
             AgentGraphNodeStatus::Terminal
         } else {
@@ -365,6 +386,168 @@ impl AgentGraphScheduler {
         state.blocked_reason = None;
 
         Ok(AgentGraphSchedulerTransition::new(state, changed_node_ids))
+    }
+
+    /// Returns the active iteration index for an iterator node, when one exists.
+    pub fn current_iterator_iteration_index(
+        &self,
+        state: &AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+    ) -> Option<u32> {
+        let node_id = node_id.into();
+        current_iterator_iteration_index(state, &node_id)
+    }
+
+    /// Starts the next deterministic iteration for a running iterator node.
+    pub fn start_iterator_iteration(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        let node = ensure_iterator_node(plan, &node_id)?;
+        ensure_node_status(
+            &state,
+            &node_id,
+            AgentGraphNodeStatus::Running,
+            AgentGraphNodeStatus::Running,
+        )?;
+        if current_iterator_iteration_index(&state, &node_id).is_some() {
+            return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+                node_id,
+                reason: "an iteration is already active".to_string(),
+            });
+        }
+
+        let max_iterations = node
+            .iterator_policy
+            .expect("validated iterator node should have policy")
+            .max_iterations;
+        let iteration_index = next_iterator_iteration_index(&state, &node_id);
+        if iteration_index >= max_iterations {
+            transition_node(
+                &mut state,
+                &node_id,
+                AgentGraphNodeStatus::Running,
+                AgentGraphNodeStatus::Failed,
+                now,
+                |node_state| {
+                    node_state.completed_at = Some(now);
+                    node_state.error_code = Some("iterator-bound-exceeded".to_string());
+                    node_state.wait_reason = None;
+                },
+            )?;
+            state.terminal_status = Some(AgentGraphTerminalStatus::Failed);
+            return Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]));
+        }
+
+        state.loop_instances.push(
+            AgentGraphLoopInstanceState::new(node_id.clone(), iteration_index, now)
+                .status(AgentGraphNodeStatus::Running),
+        );
+        state.scheduler_revision += 1;
+        state.blocked_reason = None;
+
+        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+    }
+
+    /// Completes one active iterator iteration.
+    pub fn complete_iterator_iteration(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        iteration_index: u32,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        ensure_iterator_node(plan, &node_id)?;
+        ensure_node_status(
+            &state,
+            &node_id,
+            AgentGraphNodeStatus::Running,
+            AgentGraphNodeStatus::Running,
+        )?;
+
+        let Some(loop_instance) = state.loop_instances.iter_mut().find(|instance| {
+            instance.node_id == node_id && instance.iteration_index == iteration_index
+        }) else {
+            return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+                node_id,
+                reason: format!("iteration `{iteration_index}` does not exist"),
+            });
+        };
+        if loop_instance.status != AgentGraphNodeStatus::Running {
+            return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+                node_id,
+                reason: format!(
+                    "iteration `{iteration_index}` is `{}`",
+                    loop_instance.status.as_label()
+                ),
+            });
+        }
+        loop_instance.status = AgentGraphNodeStatus::Completed;
+        loop_instance.completed_at = Some(now);
+        state.scheduler_revision += 1;
+        state.blocked_reason = None;
+
+        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+    }
+
+    /// Completes a running iterator node after zero or more iterations.
+    pub fn complete_iterator_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        let node = ensure_iterator_node(plan, &node_id)?;
+        ensure_node_status(
+            &state,
+            &node_id,
+            AgentGraphNodeStatus::Running,
+            AgentGraphNodeStatus::Completed,
+        )?;
+        if current_iterator_iteration_index(&state, &node_id).is_some() {
+            return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+                node_id,
+                reason: "cannot complete iterator while an iteration is active".to_string(),
+            });
+        }
+        let max_iterations = node
+            .iterator_policy
+            .expect("validated iterator node should have policy")
+            .max_iterations;
+        if next_iterator_iteration_index(&state, &node_id) > max_iterations {
+            return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+                node_id,
+                reason: "recorded iterations exceed iterator bound".to_string(),
+            });
+        }
+        transition_node(
+            &mut state,
+            &node_id,
+            AgentGraphNodeStatus::Running,
+            AgentGraphNodeStatus::Completed,
+            now,
+            |node_state| {
+                node_state.completed_at = Some(now);
+                node_state.wait_reason = None;
+                node_state.error_code = None;
+            },
+        )?;
+
+        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
     }
 
     /// Transitions a running node to waiting.
@@ -488,6 +671,26 @@ fn ensure_known_node<'a>(
         .ok_or_else(|| AgentGraphSchedulerError::UnknownNode {
             node_id: node_id.clone(),
         })
+}
+
+fn ensure_iterator_node<'a>(
+    plan: &'a AgentCompiledExecutionPlan,
+    node_id: &AgentCompiledNodeId,
+) -> AgentGraphSchedulerResult<&'a AgentCompiledPlanNode> {
+    let node = ensure_known_node(plan, node_id)?;
+    if node.kind != AgentCompiledNodeKind::Iterator {
+        return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+            node_id: node_id.clone(),
+            reason: "node is not an iterator".to_string(),
+        });
+    }
+    if node.iterator_policy.is_none() {
+        return Err(AgentGraphSchedulerError::InvalidIteratorTransition {
+            node_id: node_id.clone(),
+            reason: "iterator node is missing iterator policy".to_string(),
+        });
+    }
+    Ok(node)
 }
 
 fn sorted_nodes(plan: &AgentCompiledExecutionPlan) -> Vec<&AgentCompiledPlanNode> {
@@ -755,6 +958,34 @@ fn ensure_node_status(
         });
     }
     Ok(())
+}
+
+fn current_iterator_iteration_index(
+    state: &AgentGraphRunState,
+    node_id: &AgentCompiledNodeId,
+) -> Option<u32> {
+    state
+        .loop_instances
+        .iter()
+        .filter(|instance| {
+            instance.node_id == *node_id
+                && matches!(
+                    instance.status,
+                    AgentGraphNodeStatus::Pending | AgentGraphNodeStatus::Running
+                )
+        })
+        .map(|instance| instance.iteration_index)
+        .min()
+}
+
+fn next_iterator_iteration_index(state: &AgentGraphRunState, node_id: &AgentCompiledNodeId) -> u32 {
+    state
+        .loop_instances
+        .iter()
+        .filter(|instance| instance.node_id == *node_id)
+        .map(|instance| instance.iteration_index)
+        .max()
+        .map_or(0, |iteration_index| iteration_index.saturating_add(1))
 }
 
 fn validate_branch_selection<I, E>(
