@@ -721,7 +721,14 @@ application passes it to `AgentRunInbox`.
 The public API should introduce:
 
 - `AgentRuntimeEvent`
+- `AgentRuntimeEventKind`
+- `AgentRuntimeEventDraft`
+- `AgentRuntimeEventProjection`
+- `AgentRuntimeEventCorrelationFields`
 - `AgentRuntimeEventSink`
+- `AgentRuntimeEventAcceptance`
+- `AgentRuntimeEventWriteStatus`
+- `InMemoryAgentRuntimeEventSink`
 
 Runtime events are emitted after durable state transitions succeed. They help
 applications build run-history views, live execution streams, logs, audit
@@ -778,6 +785,34 @@ Each event should include:
 Events should be ordered by per-run event sequence. Cross-run global ordering is
 not required in v1.
 
+Rakka should provide event contract helpers that finalize an event only after a
+durable graph state transition has succeeded. The finalized event should take
+its plan fingerprint, scheduler revision, and next event sequence from the
+persisted graph state. If persistence fails, no success event should be
+produced.
+
+Runtime event attributes should be bounded hot-projection labels. Raw ids,
+credential refs, prompts, payloads, full error strings, and other
+high-cardinality data belong in typed fields, artifacts, logs, audit records,
+or traces rather than runtime event attributes.
+
+### Event projections and live streams
+
+`AgentRuntimeEventProjection` should rebuild a run-level projection from a full
+ordered event stream. Product backends can use it as a baseline shape for
+run-history views, then layer product-owned UI projections, authorization, and
+live stream delivery on top.
+
+Run-scoped live streams should use `(run_id, event_sequence)` as their resume
+cursor. Rakka may provide adapter helpers, but the product backend owns HTTP,
+SSE, WebSocket, GraphQL, authentication, authorization, and tenant-specific API
+behavior.
+
+`AgentRuntimeEvent::correlation_fields` should expose the stable field set used
+across runtime events, logs, audit records, and traces. The corresponding log
+attribute mapping may include ids because it is for logs/audit/traces, not for
+hot metric labels.
+
 ### Event sink behavior
 
 `AgentRuntimeEventSink` should support in-memory tests and application-provided
@@ -785,6 +820,13 @@ durable projections. A sink failure should be visible, but it must not be
 allowed to create a false state transition. The implementation plan should
 decide whether event sink writes are best-effort after persistence or part of a
 separate durable outbox/audit path for stronger projection guarantees.
+
+The v1 sink policy is post-persistence and best-effort: a persisted graph state
+transition remains authoritative even if an application-provided runtime event
+sink fails. Sink errors are returned to the caller as observable
+`runtime-event-sink` failures. Applications that need stronger projection
+guarantees can route events through a durable outbox or audit sink in a later
+integration layer without making runtime events the source of correctness.
 
 ## Observability And Query Model
 

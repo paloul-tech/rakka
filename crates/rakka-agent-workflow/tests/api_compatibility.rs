@@ -14,15 +14,17 @@ use rakka_agent_workflow::{
     AgentEffectSchedule, AgentEffectTarget, AgentFacadeResult, AgentGraphNodeState,
     AgentGraphNodeStatus, AgentGraphRunState, AgentGraphWaitReason, AgentIdempotencyKey,
     AgentMigrationDecision, AgentRunId, AgentRunIndexEntry, AgentRunQueryWaitingReason,
-    AgentRunState, AgentRunStatus, AgentSpanLink, AgentStatePayload, AgentStepId,
-    AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerIndexEntry,
-    AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis,
-    AgentTriggerCommandBuilder, AgentTriggerSource, AgentWorkflowId,
+    AgentRunState, AgentRunStatus, AgentRuntimeEvent, AgentRuntimeEventCorrelationFields,
+    AgentRuntimeEventDraft, AgentRuntimeEventProjection, AgentRuntimeEventSink, AgentSpanLink,
+    AgentStatePayload, AgentStepId, AgentTelemetryContext, AgentTenantId, AgentTimerEntry,
+    AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus,
+    AgentTimestampMillis, AgentTriggerCommandBuilder, AgentTriggerSource, AgentWorkflowId,
     AgentWorkflowIndexSchemaVersion, AgentWorkflowMigrationPolicy, AgentWorkflowQueryIndex,
     AgentWorkflowRunQuery, AgentWorkflowShardOwnership, ArtifactKind, ArtifactRef, HumanCheckpoint,
-    HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InMemoryAgentWorkflowQueryIndex,
-    PrincipalRef, RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION, CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
+    HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InMemoryAgentRuntimeEventSink,
+    InMemoryAgentWorkflowQueryIndex, PrincipalRef, RedactionStatus, StateSchemaVersion,
+    WorkflowDefinitionVersion, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
 };
 use serde_json::json;
 
@@ -44,6 +46,11 @@ fn public_root_exports_cover_stable_default_api_surface() {
         type_name::<AgentDispatchIndexEntry>(),
         type_name::<AgentTriggerSource>(),
         type_name::<AgentTriggerCommandBuilder>(),
+        type_name::<AgentRuntimeEvent>(),
+        type_name::<AgentRuntimeEventCorrelationFields>(),
+        type_name::<AgentRuntimeEventDraft>(),
+        type_name::<AgentRuntimeEventProjection>(),
+        type_name::<InMemoryAgentRuntimeEventSink>(),
         type_name::<AgentWorkflowMigrationPolicy>(),
         type_name::<InMemoryAgentWorkflowQueryIndex>(),
     ];
@@ -67,6 +74,7 @@ fn public_root_exports_cover_stable_default_api_surface() {
         .status(AgentDispatchStatus::Claimed)
         .limit(10);
     let _due_effect_type = type_name::<AgentDueEffect>();
+    let _sink_trait = type_name::<dyn AgentRuntimeEventSink>();
 }
 
 #[cfg(feature = "k8s")]

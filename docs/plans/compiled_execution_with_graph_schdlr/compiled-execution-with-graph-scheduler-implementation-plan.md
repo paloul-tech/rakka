@@ -87,6 +87,10 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphHumanCheckpointScheduleOutcome`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
+- `AgentRuntimeEventKind`
+- `AgentRuntimeEventDraft`
+- `AgentRuntimeEventProjection`
+- `AgentRuntimeEventCorrelationFields`
 - `AgentRuntimeEventSink`
 - `AgentTriggerSource`
 - `AgentTriggerSourceKind`
@@ -1001,10 +1005,14 @@ Implementation notes:
 
 ## Phase 6: Runtime Event Stream
 
+Status: implemented.
+
 Goal: emit ordered events after durable transitions for UI projections,
 auditing, logs, and live execution streams.
 
 ### Slice 6.1: Event Contracts
+
+Status: implemented.
 
 Scope:
 
@@ -1028,7 +1036,30 @@ Tests:
 - Stable event sequence.
 - Failed persistence does not emit success event.
 
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/runtime_events.rs` with
+  `AgentRuntimeEvent`, `AgentRuntimeEventKind`, `AgentRuntimeEventDraft`,
+  `AgentRuntimeEventError`, `next_runtime_event_sequence`,
+  `validate_runtime_event`, and `validate_runtime_event_follows`.
+- Runtime event kinds now cover run, node, effect, timer, human checkpoint,
+  branch, loop, wait/resume, cancellation, completion, and failure events with
+  stable kebab-case wire names.
+- `AgentRuntimeEventDraft::after_persistence` returns an event only when given
+  a persisted `AgentGraphRunState`; passing `None` represents failed
+  persistence and produces no success event.
+- Event sequences advance from `AgentGraphRunState.last_event_sequence`, while
+  scheduler revision and plan fingerprint are copied from the persisted graph
+  state.
+- Runtime event attributes are validated as bounded hot-projection labels and
+  reject raw ids and unbounded/high-cardinality fields.
+- Added `crates/rakka-agent-workflow/tests/runtime_events.rs` covering JSON
+  round-trip, stable kind names, monotonic event sequence, missing scoped ids,
+  failed persistence suppression, and high-cardinality attribute rejection.
+
 ### Slice 6.2: Event Sink Trait
+
+Status: implemented.
 
 Scope:
 
@@ -1050,7 +1081,27 @@ Tests:
 - Sink failure is reported.
 - State transition remains correct under sink failure policy.
 
+Implementation notes:
+
+- Added `AgentRuntimeEventSink`, `AgentRuntimeEventSinkFuture`,
+  `AgentRuntimeEventAcceptance`, `AgentRuntimeEventWriteStatus`, and
+  `InMemoryAgentRuntimeEventSink`.
+- The sink policy for this slice is post-persistence and best-effort:
+  applications may provide sinks for projections/live streams, sink failures
+  are returned as observable `runtime-event-sink` errors, and sink failures do
+  not mutate or roll back durable graph state.
+- `InMemoryAgentRuntimeEventSink` validates event contracts, enforces per-run
+  monotonic sequence order, reports exact duplicate writes as duplicates, and
+  returns events deterministically ordered by run id and event sequence.
+- Stronger durable projection guarantees through outbox or audit integration
+  remain follow-up work for later runtime integration slices.
+- Expanded `crates/rakka-agent-workflow/tests/runtime_events.rs` with ordered
+  in-memory sink recording, duplicate detection, sink failure reporting, and
+  state-transition isolation coverage.
+
 ### Slice 6.3: Projection And Live Stream Guidance
+
+Status: implemented.
 
 Scope:
 
@@ -1071,6 +1122,27 @@ Tests:
 - Projection rebuild from event stream.
 - Event-to-log/audit field consistency.
 - Metric cardinality guard.
+
+Implementation notes:
+
+- Added
+  `docs/plans/compiled_execution_with_graph_schdlr/runtime-event-projection-live-stream-guidance.md`
+  to document the projection pipeline, `(run_id, event_sequence)` live stream
+  cursor, product-owned HTTP/SSE/WebSocket boundary, log/audit/trace
+  correlation mapping, and metric cardinality rules.
+- Added `AgentRuntimeEventProjection` for rebuilding run-level projections from
+  ordered runtime event streams without polling raw durable graph state for
+  every transition.
+- Added `AgentRuntimeEventCorrelationFields` and
+  `AgentRuntimeEvent::correlation_fields` to expose stable correlation fields
+  for logs, audit records, and traces.
+- Added `AgentRuntimeEventCorrelationFields::log_attributes` using existing
+  Rakka log/audit attribute names for workflow id, run id, definition version,
+  causation id, correlation id, effect id, and checkpoint id, plus runtime
+  event kind and scoped node/timer ids.
+- Expanded `crates/rakka-agent-workflow/tests/runtime_events.rs` with
+  projection rebuild coverage, event-to-log/audit field consistency coverage,
+  and a metric cardinality guard for raw node ids.
 
 ## Phase 7: Runtime Integration
 
