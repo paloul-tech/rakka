@@ -906,6 +906,8 @@ Rakka own trigger registration.
 
 ### Slice 5.1: Trigger Source Metadata
 
+Status: implemented.
+
 Scope:
 
 - Add `AgentTriggerSource`.
@@ -925,6 +927,31 @@ Tests:
 - Trigger source JSON round trip.
 - Forbidden metadata rejection.
 - Bounded labels accepted.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/triggers.rs` with
+  `AgentTriggerSource`, `AgentTriggerSourceKind`,
+  `AgentTriggerSourceError`, and stable command attribute constants for
+  `trigger_kind`, `deployment_channel`, and `tenant_tier`.
+- Trigger source categories now cover API, webhook, schedule, on-demand,
+  system, child workflow, external callback, and human decision trigger
+  executions.
+- `AgentTriggerSource::attach_to_command` adds normalized trigger metadata to
+  `AgentCommand.attributes` without altering durable command ids, inbox
+  deduplication keys, causation ids, or correlation ids.
+- Trigger label validation reuses the hot-metric label boundary: labels must
+  be bounded, single-line, low-cardinality metric attributes and must not
+  contain raw webhook URLs, tokens, signatures, request bodies, user ids, or
+  other secret-like material.
+- Added `trigger_kind` and `deployment_channel` to the bounded metric label
+  catalog alongside the existing `tenant_tier` label.
+- Re-exported the trigger source API through `rakka-agent-workflow` and the
+  top-level `rakka::agent_workflow` facade path.
+- Added `crates/rakka-agent-workflow/tests/triggers.rs` covering JSON
+  round-trip, stable kind labels, command attachment, forbidden metadata
+  rejection, bounded metric-label acceptance, and command attribute conflict
+  rejection.
 
 ### Slice 5.2: Command Builders
 

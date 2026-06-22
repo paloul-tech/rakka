@@ -131,6 +131,12 @@ pub const AGENT_METRIC_ATTR_ERROR_CODE: &str = "error_code";
 /// Workflow metric attribute key for tenant tier labels.
 pub const AGENT_METRIC_ATTR_TENANT_TIER: &str = "tenant_tier";
 
+/// Workflow metric attribute key for normalized trigger source kind labels.
+pub const AGENT_METRIC_ATTR_TRIGGER_KIND: &str = "trigger_kind";
+
+/// Workflow metric attribute key for bounded deployment channel labels.
+pub const AGENT_METRIC_ATTR_DEPLOYMENT_CHANNEL: &str = "deployment_channel";
+
 /// Workflow metric attribute key for redaction status labels.
 pub const AGENT_METRIC_ATTR_REDACTION: &str = "redaction";
 
@@ -174,6 +180,8 @@ pub const AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES: &[&str] = &[
     AGENT_METRIC_ATTR_DETAIL,
     AGENT_METRIC_ATTR_ERROR_CODE,
     AGENT_METRIC_ATTR_TENANT_TIER,
+    AGENT_METRIC_ATTR_TRIGGER_KIND,
+    AGENT_METRIC_ATTR_DEPLOYMENT_CHANNEL,
     AGENT_METRIC_ATTR_REDACTION,
     AGENT_METRIC_ATTR_COMPONENT,
     AGENT_METRIC_ATTR_QUEUE,

@@ -219,6 +219,8 @@ pub const BOUNDED_METRIC_FIELDS: &[&str] = &[
     "error_code",
     "retry_attempt_bucket",
     "tenant_tier",
+    "trigger_kind",
+    "deployment_channel",
     "redaction",
 ];
 

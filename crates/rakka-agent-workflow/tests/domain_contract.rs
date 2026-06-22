@@ -63,6 +63,8 @@ fn high_cardinality_policy_separates_metrics_from_trace_log_audit_ids() {
     assert!(TRACE_LOG_AUDIT_ID_FIELDS.contains(&"deduplication_key"));
     assert!(BOUNDED_METRIC_FIELDS.contains(&"workflow_type"));
     assert!(BOUNDED_METRIC_FIELDS.contains(&"status"));
+    assert!(BOUNDED_METRIC_FIELDS.contains(&"trigger_kind"));
+    assert!(BOUNDED_METRIC_FIELDS.contains(&"deployment_channel"));
 }
 
 fn round_trip<T>(value: &T)

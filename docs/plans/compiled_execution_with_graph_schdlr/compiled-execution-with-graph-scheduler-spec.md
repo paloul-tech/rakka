@@ -652,6 +652,7 @@ Rakka defines runtime contracts and dispatch boundaries. Application code owns:
 The public API should introduce:
 
 - `AgentTriggerSource`
+- `AgentTriggerSourceKind`
 
 Rakka should not own trigger registration. Instead, application ingress code
 normalizes trigger executions into Rakka commands.
@@ -668,9 +669,15 @@ Trigger source categories:
 - human decision.
 
 `AgentTriggerSource` should be bounded metadata attached to `AgentCommand`
-attributes or command metadata. It should include stable low-cardinality labels
-such as trigger kind, deployment channel, and tenant tier, but not raw webhook
-URLs, signatures, tokens, request bodies, or user ids as metric labels.
+attributes. It includes an `AgentTriggerSourceKind` plus supplemental
+low-cardinality labels. Rakka derives the command attribute `trigger_kind`
+from the source kind and allows bounded labels such as `deployment_channel`
+and `tenant_tier`.
+
+Trigger labels must be safe for hot metrics: bounded, single-line,
+low-cardinality, and free of raw ids or secret-like material. Rakka must reject
+raw webhook URLs, signatures, tokens, request bodies, user ids, credential
+binding refs, and resolved credentials as trigger labels.
 
 ### Command mapping
 
