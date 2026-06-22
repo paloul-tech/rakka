@@ -85,8 +85,13 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentTriggerSource`
 - `AgentCredentialBindingRef`
 - `AgentCredentialResolver`
+- `AgentCredentialResolverFuture`
+- `AgentCredentialResolutionRequest`
+- `AgentCredentialResult`
+- `AgentCredentialError`
 - `AgentCredentialUse`
 - `AgentEphemeralCredential`
+- `AgentEphemeralCredentialMaterial`
 - `validate_compiled_execution_plan`
 - `validate_compiled_execution_plan_with_catalog`
 - `CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION`
@@ -680,6 +685,8 @@ Implementation notes:
 
 ### Slice 4.2: Credential Binding Resolver Contract
 
+Status: implemented.
+
 Scope:
 
 - Add `AgentCredentialBindingRef`, `AgentCredentialResolver`,
@@ -712,6 +719,30 @@ Tests:
   runtime event, logs, metrics, snapshots, and query projection fixtures.
 - Same compiled plan works after fake resolver changes the secret version for
   an existing binding ref.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/credentials.rs` with
+  `AgentCredentialResolver`, `AgentCredentialResolverFuture`,
+  `AgentCredentialResolutionRequest`, `AgentCredentialUse`,
+  `AgentEphemeralCredential`, `AgentEphemeralCredentialMaterial`,
+  `AgentCredentialError`, and `AgentCredentialResult`.
+- Added shared `AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE` plus
+  `credential_binding_ref_from_effect` so effect mapping, dispatch helpers, and
+  adapters agree on the logical binding-ref metadata key.
+- Kept resolved credential material non-serializable and gave ephemeral
+  credential types redacted debug output so they are safe for accidental
+  diagnostic formatting.
+- Added stable resolver error codes and mapped resolver failures to existing
+  `AgentAdapterFailureClass` plus durable `OutboxDispatchResult` failure
+  strings.
+- Updated `AgentGraphEffectBridge` to write credential binding refs using the
+  shared credential metadata key.
+- Added `crates/rakka-agent-workflow/tests/credentials.rs` covering fake
+  resolver success, missing/revoked resolver failures, retryable resolver
+  unavailability, credential rotation behind a stable binding ref, and absence
+  of resolved secrets from serialized durable effect, graph state, and graph
+  projection records.
 
 ### Slice 4.3: Completion And Failure Commands
 

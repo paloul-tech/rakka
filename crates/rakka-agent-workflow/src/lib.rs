@@ -21,6 +21,7 @@ pub mod artifacts;
 pub mod audit;
 pub mod checkpoints;
 pub mod compiled_plan;
+pub mod credentials;
 pub mod definition;
 pub mod dispatcher;
 pub mod domain;
@@ -99,6 +100,12 @@ pub use compiled_plan::{
     AgentCompiledPlanValidationError, AgentCompiledPlanValidationResult,
     AgentCompiledPortDirection, AgentCompiledPortId, AgentCompiledPortPolicy,
     AgentCredentialBindingRef, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+};
+pub use credentials::{
+    credential_binding_ref_from_effect, AgentCredentialError, AgentCredentialResolutionRequest,
+    AgentCredentialResolver, AgentCredentialResolverFuture, AgentCredentialResult,
+    AgentCredentialUse, AgentEphemeralCredential, AgentEphemeralCredentialMaterial,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
 pub use definition::{
     AgentCompiledWorkflowRegistration, AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry,

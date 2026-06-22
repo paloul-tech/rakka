@@ -21,12 +21,11 @@ use crate::{
     AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerTransition,
     AgentGraphTerminalStatus, AgentGraphWaitReason, AgentIdempotencyKey, AgentOutboxAcceptance,
     AgentOutboxError, AgentRunId, AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis,
-    ArtifactRef,
+    ArtifactRef, AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
 const ATTR_COMPILED_PLAN_FINGERPRINT: &str = "compiled_plan_fingerprint";
-const ATTR_CREDENTIAL_BINDING_REF: &str = "credential_binding_ref";
 const ATTR_LOOP_INSTANCE_ID: &str = "loop_instance_id";
 const ATTR_NODE_KIND: &str = "node_kind";
 const ATTR_TARGET_CLASS: &str = "target_class";
@@ -590,7 +589,7 @@ fn effect_target_for_node(
     );
     if let Some(binding_ref) = &node.credential_binding_ref {
         attributes.insert(
-            ATTR_CREDENTIAL_BINDING_REF.to_string(),
+            AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE.to_string(),
             binding_ref.as_str().to_string(),
         );
     }

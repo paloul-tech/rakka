@@ -463,8 +463,13 @@ The public API should introduce:
 
 - `AgentCredentialBindingRef`
 - `AgentCredentialResolver`
+- `AgentCredentialResolverFuture`
+- `AgentCredentialResolutionRequest`
+- `AgentCredentialResult`
+- `AgentCredentialError`
 - `AgentCredentialUse`
 - `AgentEphemeralCredential`
+- `AgentEphemeralCredentialMaterial`
 
 `AgentCredentialBindingRef` should be a stable logical reference supplied by
 the application backend. It may identify a tenant-scoped credential binding,
@@ -500,6 +505,21 @@ Rakka should only persist logical credential binding refs and bounded provider
 metadata. During dispatch, an application-provided `AgentCredentialResolver`
 can resolve a binding ref into an `AgentEphemeralCredential` for one dispatch
 attempt or a short-lived time window.
+
+`AgentCredentialResolutionRequest` should be bounded metadata only. It may
+carry tenant, workflow id, run id, compiled plan fingerprint, node id, logical
+target, credential binding ref, requested credential use, causation id,
+correlation id, and trace context. It must not carry credential values.
+
+`AgentEphemeralCredential` and `AgentEphemeralCredentialMaterial` should be
+in-memory dispatch values, not durable data contracts. They should not derive
+serde serialization, and diagnostic formatting should redact secret material.
+
+`AgentCredentialError` should expose stable bounded error codes and classify
+failures as retryable or permanent using the existing adapter failure
+classification language. Resolver unavailability is retryable; missing,
+revoked, unauthorized, invalid-use, and malformed requests are permanent unless
+a later explicit effect policy overrides handling.
 
 Recommended resolver inputs:
 
