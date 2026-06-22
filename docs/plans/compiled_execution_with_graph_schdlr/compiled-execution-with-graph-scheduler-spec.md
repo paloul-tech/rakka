@@ -346,6 +346,8 @@ The public API should introduce:
 - `AgentGraphEffectBridgeResult`
 - `AgentGraphEffectScheduleRequest`
 - `AgentGraphEffectScheduleOutcome`
+- `AgentGraphEffectCommandOutcome`
+- `AgentGraphEffectFailureDisposition`
 - `AgentGraphRuntime`
 
 The graph scheduler is a deterministic per-run component that evaluates a
@@ -579,6 +581,22 @@ to the run through durable inbox commands:
 
 The scheduler should only advance graph state after the completion command has
 been durably accepted and the resulting transition has been persisted.
+
+For graph effect nodes, the bridge should apply accepted `EffectCompleted`
+commands by moving the waiting node to completed. The completion command
+`payload_ref` is the result artifact reference for the effect node and should
+be persisted to the node output before downstream nodes become runnable.
+
+Accepted `EffectFailed` commands should carry a bounded failure disposition:
+retry-scheduled, exhausted, or terminal. Retry-scheduled failures keep the node
+waiting and record a bounded error code. Exhausted or terminal failures mark
+the node failed, fail the graph, and cancel unresolved downstream work.
+
+Duplicate completion or failure commands must be idempotent. If durable inbox
+acceptance succeeded before a crash but graph state did not advance, recovery
+may see duplicate command acceptance and should still apply the transition.
+If graph state already advanced, duplicate callbacks should produce no graph
+state changes.
 
 ### Adapter policy
 

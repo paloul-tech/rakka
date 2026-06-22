@@ -3,14 +3,16 @@
 use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCompiledExecutionPlan, AgentCompiledNodeKind, AgentCompiledNodeTarget,
-    AgentCompiledPlanEdge, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
-    AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId,
-    AgentCredentialBindingRef, AgentEffectKind, AgentGraphEffectBridge,
-    AgentGraphEffectScheduleRequest, AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState,
-    AgentGraphScheduler, AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTimestampMillis,
-    AgentWorkflowId, ArtifactEncryptionRef, ArtifactKind, ArtifactRef, RedactionStatus,
-    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    AgentCausationId, AgentCommandId, AgentCommandMetadata, AgentCompiledExecutionPlan,
+    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
+    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
+    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCompiledPortId, AgentCorrelationId,
+    AgentCredentialBindingRef, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffectKind,
+    AgentGraphEffectBridge, AgentGraphEffectFailureDisposition, AgentGraphEffectScheduleRequest,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler,
+    AgentGraphTerminalStatus, AgentGraphWaitReason, AgentRunId, AgentRunInbox, AgentTenantId,
+    AgentTimestampMillis, AgentWorkflowId, ArtifactEncryptionRef, ArtifactKind, ArtifactRef,
+    RedactionStatus, WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_workflow::{ManualWorkflowClock, WorkflowState, WorkflowTimestamp};
@@ -201,6 +203,259 @@ async fn idempotency_key_is_stable_across_recovery_duplicate() {
         .contains("loop=iterate:0"));
 }
 
+#[tokio::test]
+async fn duplicate_completion_callback_does_not_advance_graph_twice() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "slack.chat.postMessage",
+        "messaging",
+    );
+    let run_id = AgentRunId::new("run-graph-effect-complete-duplicate");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+    let command = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id, "cmd-effect-completed-1", 300),
+            scheduled.effect.effect_id.clone(),
+            Some(artifact("artifact:effect-result", ArtifactKind::ToolOutput)),
+        )
+        .expect("completion command should build");
+
+    let first = bridge
+        .accept_and_apply_effect_completed(
+            &plan,
+            scheduled.transition.state,
+            command.clone(),
+            &mut inbox,
+        )
+        .await
+        .expect("completion should apply");
+    assert!(first.acceptance.is_accepted());
+    assert_eq!(
+        node_state(&first.transition.state, "effect").status,
+        AgentGraphNodeStatus::Completed
+    );
+    assert_eq!(
+        node_state(&first.transition.state, "effect")
+            .output_refs
+            .get(&AgentCompiledPortId::new("result")),
+        Some(&artifact(
+            "artifact:effect-result",
+            ArtifactKind::ToolOutput
+        ))
+    );
+    let completed_revision = first.transition.state.scheduler_revision;
+
+    let duplicate = bridge
+        .accept_and_apply_effect_completed(&plan, first.transition.state, command, &mut inbox)
+        .await
+        .expect("duplicate completion should be idempotent");
+    assert!(duplicate.acceptance.is_duplicate());
+    assert!(duplicate.transition.changed_node_ids.is_empty());
+    assert_eq!(
+        duplicate.transition.state.scheduler_revision,
+        completed_revision
+    );
+}
+
+#[tokio::test]
+async fn retryable_failure_keeps_effect_node_waiting() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "github.issues.create",
+        "issue-tracker",
+    );
+    let run_id = AgentRunId::new("run-graph-effect-retryable-failure");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+    let command = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id, "cmd-effect-failed-retry", 300),
+            scheduled.effect.effect_id,
+            "rate-limited",
+            AgentGraphEffectFailureDisposition::RetryScheduled,
+        )
+        .expect("failure command should build");
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(
+            &plan,
+            scheduled.transition.state,
+            command.clone(),
+            &mut inbox,
+        )
+        .await
+        .expect("retryable failure should apply");
+    let effect_node = node_state(&outcome.transition.state, "effect");
+    assert_eq!(effect_node.status, AgentGraphNodeStatus::Waiting);
+    assert_eq!(effect_node.wait_reason, Some(AgentGraphWaitReason::Effect));
+    assert_eq!(effect_node.error_code.as_deref(), Some("rate-limited"));
+    assert_eq!(outcome.transition.state.terminal_status, None);
+
+    let retry_revision = outcome.transition.state.scheduler_revision;
+    let duplicate = bridge
+        .accept_and_apply_effect_failed(&plan, outcome.transition.state, command, &mut inbox)
+        .await
+        .expect("duplicate retryable failure should be idempotent");
+    assert!(duplicate.acceptance.is_duplicate());
+    assert!(duplicate.transition.changed_node_ids.is_empty());
+    assert_eq!(
+        duplicate.transition.state.scheduler_revision,
+        retry_revision
+    );
+}
+
+#[tokio::test]
+async fn exhausted_failure_marks_node_and_graph_failed() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ToolCall,
+        "tool",
+        "payments.charge",
+        "payments",
+    );
+    let run_id = AgentRunId::new("run-graph-effect-exhausted");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store, clock);
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+    let command = bridge
+        .effect_failed_command(
+            command_metadata(&plan, run_id, "cmd-effect-failed-exhausted", 300),
+            scheduled.effect.effect_id,
+            "retry-budget-exhausted",
+            AgentGraphEffectFailureDisposition::Exhausted,
+        )
+        .expect("failure command should build");
+
+    let outcome = bridge
+        .accept_and_apply_effect_failed(&plan, scheduled.transition.state, command, &mut inbox)
+        .await
+        .expect("exhausted failure should fail graph");
+
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").status,
+        AgentGraphNodeStatus::Failed
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect")
+            .error_code
+            .as_deref(),
+        Some("retry-budget-exhausted")
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "terminal").status,
+        AgentGraphNodeStatus::Cancelled
+    );
+    assert_eq!(
+        outcome.transition.state.terminal_status,
+        Some(AgentGraphTerminalStatus::Failed)
+    );
+}
+
+#[tokio::test]
+async fn crash_after_completion_command_acceptance_recovers_graph_transition() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = effect_plan(
+        AgentCompiledNodeKind::ModelCall,
+        "model",
+        "openai.responses",
+        "llm",
+    );
+    let run_id = AgentRunId::new("run-graph-effect-completion-recovery");
+    let store = TestStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox = agent_inbox(run_id.clone(), store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            running_effect_state(&plan),
+            effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should schedule");
+    let waiting_state = scheduled.transition.state;
+    let command = bridge
+        .effect_completed_command(
+            command_metadata(&plan, run_id.clone(), "cmd-effect-completed-recover", 300),
+            scheduled.effect.effect_id,
+            Some(artifact(
+                "artifact:model-completion",
+                ArtifactKind::Completion,
+            )),
+        )
+        .expect("completion command should build");
+
+    let accepted = inbox
+        .accept_command(command.clone())
+        .await
+        .expect("completion command should persist");
+    assert!(accepted.is_accepted());
+
+    let mut recovered = agent_inbox(run_id, store, clock);
+    recovered
+        .recover()
+        .await
+        .expect("fresh inbox should recover accepted command");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, waiting_state, command, &mut recovered)
+        .await
+        .expect("duplicate accepted command should still apply graph transition");
+
+    assert!(outcome.acceptance.is_duplicate());
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect").status,
+        AgentGraphNodeStatus::Completed
+    );
+    assert_eq!(
+        node_state(&outcome.transition.state, "effect")
+            .output_refs
+            .get(&AgentCompiledPortId::new("result")),
+        Some(&artifact(
+            "artifact:model-completion",
+            ArtifactKind::Completion
+        ))
+    );
+}
+
 async fn schedule_kind(
     bridge: &AgentGraphEffectBridge,
     kind: AgentCompiledNodeKind,
@@ -334,6 +589,28 @@ fn effect_request(
     .payload_ref(artifact("artifact:effect-payload", ArtifactKind::Prompt))
     .timeout_ms(2_000)
     .expected_result_type("effect.result")
+}
+
+fn command_metadata(
+    plan: &AgentCompiledExecutionPlan,
+    run_id: AgentRunId,
+    command_id: &str,
+    received_at_millis: u64,
+) -> AgentCommandMetadata {
+    let durability = AgentDurabilityMetadata::new(
+        AgentDeduplicationKey::new(format!("dedupe-{command_id}")),
+        AgentCausationId::new(format!("cause-{command_id}")),
+        AgentCorrelationId::new("correlation:workflow"),
+    );
+    AgentCommandMetadata::new(
+        plan.workflow_id.clone(),
+        run_id,
+        AgentCommandId::new(command_id),
+        durability,
+        AgentTenantId::new("tenant-a"),
+        AgentTimestampMillis::new(received_at_millis),
+    )
+    .expect("command metadata should validate")
 }
 
 fn agent_inbox(run_id: AgentRunId, store: TestStore, clock: ManualWorkflowClock) -> TestInbox {

@@ -11,8 +11,9 @@ use std::fmt::{self, Display, Formatter};
 use crate::{
     validate_compiled_execution_plan, AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior,
     AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
-    AgentCompiledPlanNode, AgentGraphLoopInstanceState, AgentGraphNodeState, AgentGraphNodeStatus,
-    AgentGraphRunState, AgentGraphTerminalStatus, AgentGraphWaitReason, AgentTimestampMillis,
+    AgentCompiledPlanNode, AgentCompiledPortId, AgentGraphLoopInstanceState, AgentGraphNodeState,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    AgentTimestampMillis, ArtifactRef,
 };
 
 /// Result type for graph scheduler operations.
@@ -611,6 +612,76 @@ impl AgentGraphScheduler {
         Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
     }
 
+    /// Transitions a waiting node to completed and records output artifact refs.
+    pub fn complete_waiting_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        reason: AgentGraphWaitReason,
+        output_refs: BTreeMap<AgentCompiledPortId, ArtifactRef>,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        ensure_known_node(plan, &node_id)?;
+        ensure_node_wait_reason(&state, &node_id, reason)?;
+        transition_node(
+            &mut state,
+            &node_id,
+            AgentGraphNodeStatus::Waiting,
+            AgentGraphNodeStatus::Completed,
+            now,
+            |node_state| {
+                node_state.output_refs.extend(output_refs);
+                node_state.completed_at = Some(now);
+                node_state.wait_reason = None;
+                node_state.error_code = None;
+            },
+        )?;
+        Ok(AgentGraphSchedulerTransition::new(state, vec![node_id]))
+    }
+
+    /// Transitions a waiting node to failed and marks the graph failed.
+    pub fn fail_waiting_node(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        mut state: AgentGraphRunState,
+        node_id: impl Into<AgentCompiledNodeId>,
+        reason: AgentGraphWaitReason,
+        error_code: impl Into<String>,
+        now: AgentTimestampMillis,
+    ) -> AgentGraphSchedulerResult<AgentGraphSchedulerTransition> {
+        ensure_not_terminal(&state)?;
+        let node_id = node_id.into();
+        validate_plan_state(plan, &state)?;
+        ensure_known_node(plan, &node_id)?;
+        ensure_node_wait_reason(&state, &node_id, reason)?;
+        let error_code = error_code.into();
+        let mut changed_node_ids = vec![node_id.clone()];
+        transition_node(
+            &mut state,
+            &node_id,
+            AgentGraphNodeStatus::Waiting,
+            AgentGraphNodeStatus::Failed,
+            now,
+            |node_state| {
+                node_state.completed_at = Some(now);
+                node_state.error_code = Some(error_code);
+                node_state.wait_reason = None;
+            },
+        )?;
+        state.terminal_status = Some(AgentGraphTerminalStatus::Failed);
+        let mut excluded_node_ids = BTreeSet::new();
+        excluded_node_ids.insert(node_id);
+        changed_node_ids.extend(cancel_unresolved_nodes(&mut state, now, &excluded_node_ids));
+        changed_node_ids.extend(cancel_unresolved_loop_instances(&mut state, now));
+        changed_node_ids.sort();
+        changed_node_ids.dedup();
+        Ok(AgentGraphSchedulerTransition::new(state, changed_node_ids))
+    }
+
     /// Transitions a running node to failed and marks the graph failed.
     pub fn fail_node(
         &self,
@@ -997,6 +1068,33 @@ fn ensure_node_status(
             node_id: node_id.clone(),
             from: node_state.status,
             to: next,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_node_wait_reason(
+    state: &AgentGraphRunState,
+    node_id: &AgentCompiledNodeId,
+    expected: AgentGraphWaitReason,
+) -> AgentGraphSchedulerResult<()> {
+    let node_state = state.node_states.get(node_id).ok_or_else(|| {
+        AgentGraphSchedulerError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status != AgentGraphNodeStatus::Waiting {
+        return Err(AgentGraphSchedulerError::InvalidNodeTransition {
+            node_id: node_id.clone(),
+            from: node_state.status,
+            to: AgentGraphNodeStatus::Completed,
+        });
+    }
+    if node_state.wait_reason != Some(expected) {
+        return Err(AgentGraphSchedulerError::InvalidNodeTransition {
+            node_id: node_id.clone(),
+            from: node_state.status,
+            to: AgentGraphNodeStatus::Completed,
         });
     }
     Ok(())

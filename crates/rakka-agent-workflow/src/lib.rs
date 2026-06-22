@@ -139,6 +139,7 @@ pub use domain::{
 };
 pub use effect_bridge::{
     AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectBridgeResult,
+    AgentGraphEffectCommandOutcome, AgentGraphEffectFailureDisposition,
     AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
 };
 pub use facade::{

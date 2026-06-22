@@ -13,13 +13,14 @@ use rakka_workflow::{WorkflowClock, WorkflowState};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent_run_workflow_id, validate_compiled_execution_plan, AgentCausationId,
-    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind,
-    AgentCompiledNodeTarget, AgentCompiledPlanNode, AgentCorrelationId, AgentDeduplicationKey,
-    AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
-    AgentEffectSchedule, AgentEffectTarget, AgentFacadeError, AgentGraphNodeStatus,
-    AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerTransition,
-    AgentGraphTerminalStatus, AgentGraphWaitReason, AgentIdempotencyKey, AgentOutboxAcceptance,
+    agent_run_workflow_id, validate_compiled_execution_plan, AgentCausationId, AgentCommand,
+    AgentCommandKind, AgentCommandMetadata, AgentCompiledExecutionPlan, AgentCompiledNodeId,
+    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanNode, AgentCompiledPortId,
+    AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
+    AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentFacadeError,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphScheduler, AgentGraphSchedulerError,
+    AgentGraphSchedulerTransition, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    AgentIdempotencyKey, AgentInboxAcceptance, AgentInboxError, AgentOutboxAcceptance,
     AgentOutboxError, AgentRunId, AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis,
     ArtifactRef, AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
@@ -30,6 +31,7 @@ const ATTR_LOOP_INSTANCE_ID: &str = "loop_instance_id";
 const ATTR_NODE_KIND: &str = "node_kind";
 const ATTR_TARGET_CLASS: &str = "target_class";
 const ROOT_LOOP_INSTANCE_ID: &str = "root";
+const ATTR_FAILURE_DISPOSITION: &str = "failure_disposition";
 
 /// Result type for compiled graph effect bridge operations.
 pub type AgentGraphEffectBridgeResult<T> = Result<T, AgentGraphEffectBridgeError>;
@@ -99,10 +101,42 @@ pub enum AgentGraphEffectBridgeError {
         /// Validation failure.
         error: AgentFacadeError,
     },
+    /// Agent command facade validation rejected the mapped command.
+    InvalidCommand {
+        /// Validation failure.
+        error: AgentFacadeError,
+    },
+    /// Durable inbox command acceptance failed.
+    Inbox {
+        /// Durable inbox failure.
+        error: AgentInboxError,
+    },
     /// Durable outbox scheduling failed.
     Outbox {
         /// Durable outbox failure.
         error: AgentOutboxError,
+    },
+    /// Scheduler rejected a graph transition.
+    Scheduler {
+        /// Scheduler failure.
+        error: AgentGraphSchedulerError,
+    },
+    /// Command kind did not match the requested graph effect operation.
+    UnexpectedCommandKind {
+        /// Expected command type name.
+        expected: &'static str,
+        /// Actual command type name.
+        actual: &'static str,
+    },
+    /// No graph node has the referenced scheduled effect id.
+    UnknownEffect {
+        /// Unknown effect id.
+        effect_id: AgentEffectId,
+    },
+    /// Failure command did not carry a supported failure disposition.
+    InvalidFailureDisposition {
+        /// Unsupported disposition label.
+        disposition: Option<String>,
     },
 }
 
@@ -121,7 +155,13 @@ impl AgentGraphEffectBridgeError {
             Self::MissingTarget { .. } => "missing-graph-effect-target",
             Self::InvalidNodeStatus { .. } => "invalid-graph-effect-node-status",
             Self::InvalidEffect { .. } => "invalid-graph-effect",
+            Self::InvalidCommand { .. } => "invalid-graph-effect-command",
+            Self::Inbox { error } => error.code(),
             Self::Outbox { error } => error.code(),
+            Self::Scheduler { error } => error.code(),
+            Self::UnexpectedCommandKind { .. } => "unexpected-graph-effect-command-kind",
+            Self::UnknownEffect { .. } => "unknown-graph-effect",
+            Self::InvalidFailureDisposition { .. } => "invalid-effect-failure-disposition",
         }
     }
 }
@@ -178,7 +218,24 @@ impl Display for AgentGraphEffectBridgeError {
                 status.as_label()
             ),
             Self::InvalidEffect { error } => write!(f, "mapped graph effect is invalid: {error}"),
+            Self::InvalidCommand { error } => {
+                write!(f, "graph effect command is invalid: {error}")
+            }
+            Self::Inbox { error } => write!(f, "graph effect command acceptance failed: {error}"),
             Self::Outbox { error } => write!(f, "graph effect outbox scheduling failed: {error}"),
+            Self::Scheduler { error } => write!(f, "graph effect transition failed: {error}"),
+            Self::UnexpectedCommandKind { expected, actual } => write!(
+                f,
+                "expected graph effect command `{expected}` but received `{actual}`"
+            ),
+            Self::UnknownEffect { effect_id } => {
+                write!(f, "graph state has no node waiting on effect `{effect_id}`")
+            }
+            Self::InvalidFailureDisposition { disposition } => write!(
+                f,
+                "effect failure disposition `{}` is invalid",
+                disposition.as_deref().unwrap_or("<missing>")
+            ),
         }
     }
 }
@@ -186,8 +243,10 @@ impl Display for AgentGraphEffectBridgeError {
 impl Error for AgentGraphEffectBridgeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidEffect { error } => Some(error),
+            Self::InvalidEffect { error } | Self::InvalidCommand { error } => Some(error),
+            Self::Inbox { error } => Some(error),
             Self::Outbox { error } => Some(error),
+            Self::Scheduler { error } => Some(error),
             Self::InvalidCompiledPlan { .. }
             | Self::PlanStateMismatch { .. }
             | Self::RunInboxMismatch { .. }
@@ -196,7 +255,10 @@ impl Error for AgentGraphEffectBridgeError {
             | Self::MissingNodeState { .. }
             | Self::UnsupportedNodeKind { .. }
             | Self::MissingTarget { .. }
-            | Self::InvalidNodeStatus { .. } => None,
+            | Self::InvalidNodeStatus { .. }
+            | Self::UnexpectedCommandKind { .. }
+            | Self::UnknownEffect { .. }
+            | Self::InvalidFailureDisposition { .. } => None,
         }
     }
 }
@@ -210,6 +272,18 @@ impl From<AgentFacadeError> for AgentGraphEffectBridgeError {
 impl From<AgentOutboxError> for AgentGraphEffectBridgeError {
     fn from(error: AgentOutboxError) -> Self {
         Self::Outbox { error }
+    }
+}
+
+impl From<AgentInboxError> for AgentGraphEffectBridgeError {
+    fn from(error: AgentInboxError) -> Self {
+        Self::Inbox { error }
+    }
+}
+
+impl From<AgentGraphSchedulerError> for AgentGraphEffectBridgeError {
+    fn from(error: AgentGraphSchedulerError) -> Self {
+        Self::Scheduler { error }
     }
 }
 
@@ -319,6 +393,54 @@ pub struct AgentGraphEffectScheduleOutcome {
     pub transition: AgentGraphSchedulerTransition,
 }
 
+/// Failure disposition carried by an effect failure command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentGraphEffectFailureDisposition {
+    /// Durable outbox retry policy scheduled another attempt.
+    RetryScheduled,
+    /// Durable outbox retry policy exhausted all attempts.
+    Exhausted,
+    /// Failure is terminal for graph scheduling policy.
+    Terminal,
+}
+
+impl AgentGraphEffectFailureDisposition {
+    /// Stable lowercase label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::RetryScheduled => "retry-scheduled",
+            Self::Exhausted => "exhausted",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl std::str::FromStr for AgentGraphEffectFailureDisposition {
+    type Err = AgentGraphEffectBridgeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "retry-scheduled" => Ok(Self::RetryScheduled),
+            "exhausted" => Ok(Self::Exhausted),
+            "terminal" => Ok(Self::Terminal),
+            _ => Err(AgentGraphEffectBridgeError::InvalidFailureDisposition {
+                disposition: Some(value.to_string()),
+            }),
+        }
+    }
+}
+
+/// Result of accepting and applying one effect callback command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGraphEffectCommandOutcome {
+    /// Durable inbox acceptance result.
+    pub acceptance: AgentInboxAcceptance,
+    /// Graph state transition after applying the accepted command.
+    pub transition: AgentGraphSchedulerTransition,
+}
+
 /// Bridge from compiled graph effect nodes to durable agent outbox effects.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AgentGraphEffectBridge;
@@ -367,6 +489,94 @@ impl AgentGraphEffectBridge {
 
         Ok(AgentGraphEffectScheduleOutcome {
             effect,
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Builds an `EffectCompleted` command with an optional result artifact ref.
+    pub fn effect_completed_command(
+        &self,
+        metadata: AgentCommandMetadata,
+        effect_id: AgentEffectId,
+        result_ref: Option<ArtifactRef>,
+    ) -> AgentGraphEffectBridgeResult<AgentCommand> {
+        let mut command =
+            AgentCommand::new(AgentCommandKind::EffectCompleted { effect_id }, metadata)
+                .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })?;
+        if let Some(result_ref) = result_ref {
+            command = command.payload_ref(result_ref);
+        }
+        Ok(command)
+    }
+
+    /// Builds an `EffectFailed` command with a graph failure disposition.
+    pub fn effect_failed_command(
+        &self,
+        metadata: AgentCommandMetadata,
+        effect_id: AgentEffectId,
+        error_code: impl Into<String>,
+        disposition: AgentGraphEffectFailureDisposition,
+    ) -> AgentGraphEffectBridgeResult<AgentCommand> {
+        AgentCommand::new(
+            AgentCommandKind::EffectFailed {
+                effect_id,
+                error_code: error_code.into(),
+            },
+            metadata,
+        )
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })?
+        .attribute(ATTR_FAILURE_DISPOSITION, disposition.as_label())
+        .map_err(|error| AgentGraphEffectBridgeError::InvalidCommand { error })
+    }
+
+    /// Accepts an effect completion command and applies it to graph state.
+    ///
+    /// Duplicate inbox acceptance is still applied if graph state has not yet
+    /// advanced, which covers recovery after a crash between command acceptance
+    /// and graph transition persistence. If the node is already completed, the
+    /// returned transition is a no-op.
+    pub async fn accept_and_apply_effect_completed<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        command: AgentCommand,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphEffectCommandOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        ensure_command_kind(&command, "EffectCompleted")?;
+        validate_command_inbox_matches_run(&command, inbox)?;
+        let acceptance = inbox.accept_command(command.clone()).await?;
+        let transition = apply_effect_completed_command(plan, state, &command)?;
+        Ok(AgentGraphEffectCommandOutcome {
+            acceptance,
+            transition,
+        })
+    }
+
+    /// Accepts an effect failure command and applies it to graph state.
+    ///
+    /// Retry-scheduled failures keep the graph node waiting. Exhausted or
+    /// terminal failures fail the node and the graph.
+    pub async fn accept_and_apply_effect_failed<Store, Clock>(
+        &self,
+        plan: &AgentCompiledExecutionPlan,
+        state: AgentGraphRunState,
+        command: AgentCommand,
+        inbox: &mut AgentRunInbox<Store, Clock>,
+    ) -> AgentGraphEffectBridgeResult<AgentGraphEffectCommandOutcome>
+    where
+        Store: DurableStateStore<WorkflowState>,
+        Clock: WorkflowClock,
+    {
+        ensure_command_kind(&command, "EffectFailed")?;
+        validate_command_inbox_matches_run(&command, inbox)?;
+        let acceptance = inbox.accept_command(command.clone()).await?;
+        let transition = apply_effect_failed_command(plan, state, &command)?;
+        Ok(AgentGraphEffectCommandOutcome {
             acceptance,
             transition,
         })
@@ -445,6 +655,230 @@ where
         });
     }
     Ok(())
+}
+
+fn validate_command_inbox_matches_run<Store, Clock>(
+    command: &AgentCommand,
+    inbox: &AgentRunInbox<Store, Clock>,
+) -> AgentGraphEffectBridgeResult<()>
+where
+    Store: DurableStateStore<WorkflowState>,
+    Clock: WorkflowClock,
+{
+    let expected_workflow_id = agent_run_workflow_id(&command.metadata.run_id);
+    if inbox.workflow_id() != &expected_workflow_id {
+        return Err(AgentGraphEffectBridgeError::RunInboxMismatch {
+            expected_workflow_id: expected_workflow_id.as_str().to_string(),
+            actual_workflow_id: inbox.workflow_id().as_str().to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_command_kind(
+    command: &AgentCommand,
+    expected: &'static str,
+) -> AgentGraphEffectBridgeResult<()> {
+    let actual = command.kind.type_name();
+    if actual != expected {
+        return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind { expected, actual });
+    }
+    Ok(())
+}
+
+fn apply_effect_completed_command(
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    validate_plan_state_for_command(plan, &state)?;
+    let effect_id = match &command.kind {
+        AgentCommandKind::EffectCompleted { effect_id } => effect_id,
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "EffectCompleted",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let node_id = node_id_for_effect(&state, effect_id)?;
+    let node_state = state.node_states.get(&node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if node_state.status == AgentGraphNodeStatus::Completed {
+        return Ok(noop_transition(state));
+    }
+    if node_state.status != AgentGraphNodeStatus::Waiting
+        || node_state.wait_reason != Some(AgentGraphWaitReason::Effect)
+    {
+        return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
+            node_id,
+            status: node_state.status,
+        });
+    }
+
+    let output_refs = effect_result_output_refs(plan, &node_id, command.payload_ref.clone())?;
+    Ok(AgentGraphScheduler::new().complete_waiting_node(
+        plan,
+        state,
+        node_id,
+        AgentGraphWaitReason::Effect,
+        output_refs,
+        command.metadata.received_at,
+    )?)
+}
+
+fn apply_effect_failed_command(
+    plan: &AgentCompiledExecutionPlan,
+    mut state: AgentGraphRunState,
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphSchedulerTransition> {
+    validate_plan_state_for_command(plan, &state)?;
+    let (effect_id, error_code) = match &command.kind {
+        AgentCommandKind::EffectFailed {
+            effect_id,
+            error_code,
+        } => (effect_id, error_code.as_str()),
+        _ => {
+            return Err(AgentGraphEffectBridgeError::UnexpectedCommandKind {
+                expected: "EffectFailed",
+                actual: command.kind.type_name(),
+            });
+        }
+    };
+    let node_id = node_id_for_effect(&state, effect_id)?;
+    let node_state = state.node_states.get(&node_id).ok_or_else(|| {
+        AgentGraphEffectBridgeError::MissingNodeState {
+            node_id: node_id.clone(),
+        }
+    })?;
+    if matches!(
+        node_state.status,
+        AgentGraphNodeStatus::Failed | AgentGraphNodeStatus::Cancelled
+    ) {
+        return Ok(noop_transition(state));
+    }
+    if node_state.status != AgentGraphNodeStatus::Waiting
+        || node_state.wait_reason != Some(AgentGraphWaitReason::Effect)
+    {
+        return Err(AgentGraphEffectBridgeError::InvalidNodeStatus {
+            node_id,
+            status: node_state.status,
+        });
+    }
+
+    match failure_disposition(command)? {
+        AgentGraphEffectFailureDisposition::RetryScheduled => {
+            let node_state = state.node_states.get_mut(&node_id).ok_or_else(|| {
+                AgentGraphEffectBridgeError::MissingNodeState {
+                    node_id: node_id.clone(),
+                }
+            })?;
+            if node_state.error_code.as_deref() == Some(error_code) {
+                return Ok(noop_transition(state));
+            }
+            node_state.error_code = Some(error_code.to_string());
+            node_state.updated_at = command.metadata.received_at;
+            state.scheduler_revision += 1;
+            state.blocked_reason = None;
+            Ok(AgentGraphSchedulerTransition {
+                state,
+                changed_node_ids: vec![node_id],
+                runnable_node_ids: Vec::new(),
+            })
+        }
+        AgentGraphEffectFailureDisposition::Exhausted
+        | AgentGraphEffectFailureDisposition::Terminal => Ok(AgentGraphScheduler::new()
+            .fail_waiting_node(
+                plan,
+                state,
+                node_id,
+                AgentGraphWaitReason::Effect,
+                error_code,
+                command.metadata.received_at,
+            )?),
+    }
+}
+
+fn validate_plan_state_for_command(
+    plan: &AgentCompiledExecutionPlan,
+    state: &AgentGraphRunState,
+) -> AgentGraphEffectBridgeResult<()> {
+    validate_plan(plan)?;
+    if state.plan_id != plan.plan_id {
+        return Err(AgentGraphEffectBridgeError::PlanStateMismatch {
+            field: "plan_id",
+            reason: format!("state has {}, plan has {}", state.plan_id, plan.plan_id),
+        });
+    }
+    if state.plan_fingerprint != plan.plan_fingerprint {
+        return Err(AgentGraphEffectBridgeError::PlanStateMismatch {
+            field: "plan_fingerprint",
+            reason: format!(
+                "state has {}, plan has {}",
+                state.plan_fingerprint, plan.plan_fingerprint
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn node_id_for_effect(
+    state: &AgentGraphRunState,
+    effect_id: &AgentEffectId,
+) -> AgentGraphEffectBridgeResult<AgentCompiledNodeId> {
+    state
+        .node_states
+        .values()
+        .find(|node| {
+            node.scheduled_effect_ids
+                .iter()
+                .any(|scheduled| scheduled == effect_id)
+        })
+        .map(|node| node.node_id.clone())
+        .ok_or_else(|| AgentGraphEffectBridgeError::UnknownEffect {
+            effect_id: effect_id.clone(),
+        })
+}
+
+fn effect_result_output_refs(
+    plan: &AgentCompiledExecutionPlan,
+    node_id: &AgentCompiledNodeId,
+    result_ref: Option<ArtifactRef>,
+) -> AgentGraphEffectBridgeResult<BTreeMap<AgentCompiledPortId, ArtifactRef>> {
+    let Some(result_ref) = result_ref else {
+        return Ok(BTreeMap::new());
+    };
+    let node = ensure_known_node(plan, node_id)?;
+    let Some(port) = node
+        .output_ports
+        .iter()
+        .min_by(|left, right| left.port_id.cmp(&right.port_id))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(BTreeMap::from([(port.port_id.clone(), result_ref)]))
+}
+
+fn failure_disposition(
+    command: &AgentCommand,
+) -> AgentGraphEffectBridgeResult<AgentGraphEffectFailureDisposition> {
+    command
+        .attributes
+        .get(ATTR_FAILURE_DISPOSITION)
+        .ok_or(AgentGraphEffectBridgeError::InvalidFailureDisposition { disposition: None })?
+        .parse()
+}
+
+fn noop_transition(state: AgentGraphRunState) -> AgentGraphSchedulerTransition {
+    let runnable_node_ids = AgentGraphScheduler::new().runnable_nodes(&state);
+    AgentGraphSchedulerTransition {
+        state,
+        changed_node_ids: Vec::new(),
+        runnable_node_ids,
+    }
 }
 
 fn ensure_known_node<'a>(

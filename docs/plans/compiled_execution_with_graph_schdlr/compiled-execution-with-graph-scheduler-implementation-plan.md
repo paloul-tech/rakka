@@ -79,6 +79,8 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphEffectBridgeResult`
 - `AgentGraphEffectScheduleRequest`
 - `AgentGraphEffectScheduleOutcome`
+- `AgentGraphEffectCommandOutcome`
+- `AgentGraphEffectFailureDisposition`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventSink`
@@ -746,6 +748,8 @@ Implementation notes:
 
 ### Slice 4.3: Completion And Failure Commands
 
+Status: implemented.
+
 Scope:
 
 - Route effect completions and failures through durable inbox commands.
@@ -765,6 +769,30 @@ Tests:
 - Retryable failure.
 - Exhausted retry budget.
 - Crash after completion command acceptance but before graph transition.
+
+Implementation notes:
+
+- Extended `AgentGraphScheduler` with waiting-node transitions for
+  `Waiting -> Completed` and `Waiting -> Failed` so effect callbacks can resume
+  graph nodes without pretending the node is still running.
+- Added `AgentGraphEffectBridge` command helpers for `EffectCompleted` and
+  `EffectFailed`, plus `accept_and_apply_effect_completed` and
+  `accept_and_apply_effect_failed`.
+- Added `AgentGraphEffectFailureDisposition` to carry whether a failed effect
+  was retry-scheduled, exhausted, or terminal after durable outbox retry policy
+  handling.
+- Completion commands use the command `payload_ref` as the result artifact ref
+  and persist it onto the effect node output before downstream scheduling can
+  observe completion.
+- Duplicate inbox acceptance remains apply-safe: if a command was accepted
+  before a crash but graph state did not advance, recovery applies it; if graph
+  state already advanced, duplicate callbacks return no-op transitions.
+- Retry-scheduled failures leave the graph node waiting with a bounded
+  `error_code`; exhausted or terminal failures mark the node failed, fail the
+  graph, and cancel unresolved downstream work.
+- Expanded `crates/rakka-agent-workflow/tests/effect_bridge.rs` with duplicate
+  completion, retryable failure, exhausted failure, and crash-after-command-
+  acceptance recovery coverage.
 
 ### Slice 4.4: Timers, Human Checkpoints, And Child Workflows
 
