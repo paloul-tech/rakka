@@ -71,6 +71,9 @@ The implementation should add these public API types in `rakka-agent-workflow`:
 - `AgentGraphRunProjection`
 - `AgentGraphNodeProjection`
 - `AgentGraphScheduler`
+- `AgentGraphSchedulerError`
+- `AgentGraphSchedulerResult`
+- `AgentGraphSchedulerTransition`
 - `AgentGraphRuntime`
 - `AgentRuntimeEvent`
 - `AgentRuntimeEventSink`
@@ -447,10 +450,14 @@ Implementation notes:
 
 ## Phase 3: Graph Scheduler Core
 
+Status: in progress.
+
 Goal: implement deterministic ready-node evaluation and graph state
 transitions.
 
 ### Slice 3.1: Scheduler Engine
+
+Status: implemented.
 
 Scope:
 
@@ -473,6 +480,22 @@ Tests:
 - Crash after command acceptance.
 - Crash after node becomes runnable.
 - Recovery recomputes ready nodes deterministically.
+
+Implementation notes:
+
+- Added `crates/rakka-agent-workflow/src/graph_scheduler.rs` with a pure,
+  deterministic `AgentGraphScheduler`.
+- Added public scheduler result, transition, and stable error types:
+  `AgentGraphSchedulerResult`, `AgentGraphSchedulerTransition`, and
+  `AgentGraphSchedulerError`.
+- Scheduler initialization validates the compiled plan and creates durable
+  graph node state sorted by stable node id.
+- Ready-node evaluation derives runnable work from durable graph state and
+  required incoming dependencies instead of trusting an in-memory queue.
+- State transitions now cover pending to runnable, runnable to running, running
+  to completed or terminal, running to waiting, and running to failed.
+- Added focused scheduler tests in
+  `crates/rakka-agent-workflow/tests/graph_scheduler.rs`.
 
 ### Slice 3.2: Branch, Fan-Out, Fan-In, And Skip Propagation
 

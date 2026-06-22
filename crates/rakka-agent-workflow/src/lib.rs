@@ -25,6 +25,7 @@ pub mod definition;
 pub mod dispatcher;
 pub mod domain;
 pub mod facade;
+pub mod graph_scheduler;
 pub mod graph_state;
 pub mod inbox;
 #[cfg(feature = "k8s")]
@@ -133,6 +134,10 @@ pub use facade::{
     validate_effect_schedule, AgentCommand, AgentCommandKind, AgentCommandMetadata,
     AgentDurabilityMetadata, AgentEffectMetadata, AgentEffectSchedule, AgentFacadeError,
     AgentFacadeResult,
+};
+pub use graph_scheduler::{
+    AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphSchedulerResult,
+    AgentGraphSchedulerTransition,
 };
 pub use graph_state::{
     AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeProjection,

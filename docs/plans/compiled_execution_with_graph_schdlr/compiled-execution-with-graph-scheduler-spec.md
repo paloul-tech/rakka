@@ -333,6 +333,9 @@ The persisted state should be sufficient to recover after:
 The public API should introduce:
 
 - `AgentGraphScheduler`
+- `AgentGraphSchedulerError`
+- `AgentGraphSchedulerResult`
+- `AgentGraphSchedulerTransition`
 - `AgentGraphRuntime`
 
 The graph scheduler is a deterministic per-run component that evaluates a
