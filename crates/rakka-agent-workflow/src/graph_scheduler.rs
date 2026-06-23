@@ -1259,7 +1259,6 @@ fn propagate_skips(
             node_state.completed_at = Some(now);
             node_state.wait_reason = None;
             node_state.error_code = None;
-            state.skipped_nodes.insert(node_id.clone());
             changed_node_ids.push(node_id);
         }
     }

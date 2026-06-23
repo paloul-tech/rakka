@@ -11,14 +11,14 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::label_value_contains_line_break;
 use crate::{
     AgentAttributes, AgentWorkflowId, ArtifactRef, WorkflowDefinitionVersion,
-    FORBIDDEN_HOT_METRIC_FIELDS,
+    AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES, FORBIDDEN_HOT_METRIC_FIELDS,
 };
 
 const DEFAULT_COMPILED_PLAN_RUNTIME_VERSION: &str = "0.1.0";
 const COMPILED_GRAPH_V1_CAPABILITY: &str = "compiled-graph-v1";
-const VALIDATOR_LABEL_VALUE_MAX_BYTES: usize = 96;
 
 /// Current compiled execution plan schema version supported by registration.
 pub const CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION: AgentCompiledPlanSchemaVersion =
@@ -1860,41 +1860,40 @@ fn empty_adjacency(
 fn detect_cycle(
     adjacency: &BTreeMap<AgentCompiledNodeId, Vec<AgentCompiledNodeId>>,
 ) -> Option<AgentCompiledNodeId> {
+    // Iterative depth-first search with an explicit work stack so deeply nested
+    // compiled plans cannot overflow the call stack during validation. `visiting`
+    // holds the nodes on the current DFS path; an edge back into that set is a
+    // cycle. This preserves the recursive version's result — the returned node is
+    // the first on-path node a back-edge targets, in deterministic (sorted root,
+    // edge-declaration) order — while running in heap-bounded space.
     let mut visiting = BTreeSet::new();
     let mut visited = BTreeSet::new();
-    for node_id in adjacency.keys() {
-        if let Some(cycle_node_id) =
-            detect_cycle_from(node_id, adjacency, &mut visiting, &mut visited)
-        {
-            return Some(cycle_node_id);
+    for root in adjacency.keys() {
+        if visited.contains(root) {
+            continue;
         }
-    }
-    None
-}
-
-fn detect_cycle_from(
-    node_id: &AgentCompiledNodeId,
-    adjacency: &BTreeMap<AgentCompiledNodeId, Vec<AgentCompiledNodeId>>,
-    visiting: &mut BTreeSet<AgentCompiledNodeId>,
-    visited: &mut BTreeSet<AgentCompiledNodeId>,
-) -> Option<AgentCompiledNodeId> {
-    if visited.contains(node_id) {
-        return None;
-    }
-    if !visiting.insert(node_id.clone()) {
-        return Some(node_id.clone());
-    }
-    if let Some(next_node_ids) = adjacency.get(node_id) {
-        for next_node_id in next_node_ids {
-            if let Some(cycle_node_id) =
-                detect_cycle_from(next_node_id, adjacency, visiting, visited)
-            {
-                return Some(cycle_node_id);
+        visiting.insert(root.clone());
+        let mut stack: Vec<(&AgentCompiledNodeId, usize)> = vec![(root, 0)];
+        while let Some((node_id, child_index)) = stack.last().copied() {
+            let children = adjacency.get(node_id).map(Vec::as_slice).unwrap_or(&[]);
+            if let Some(next) = children.get(child_index) {
+                if let Some(top) = stack.last_mut() {
+                    top.1 = child_index + 1;
+                }
+                if visiting.contains(next) {
+                    return Some(next.clone());
+                }
+                if !visited.contains(next) {
+                    visiting.insert(next.clone());
+                    stack.push((next, 0));
+                }
+            } else {
+                visiting.remove(node_id);
+                visited.insert(node_id.clone());
+                stack.pop();
             }
         }
     }
-    visiting.remove(node_id);
-    visited.insert(node_id.clone());
     None
 }
 
@@ -1999,21 +1998,21 @@ fn validate_attributes(
                 reason: "attribute keys must not be empty",
             });
         }
-        if key.len() > VALIDATOR_LABEL_VALUE_MAX_BYTES {
+        if key.len() > AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES {
             return Err(AgentCompiledPlanValidationError::UnsafeAttribute {
                 scope,
                 key: key.clone(),
                 reason: "attribute keys must be bounded",
             });
         }
-        if value.len() > VALIDATOR_LABEL_VALUE_MAX_BYTES {
+        if value.len() > AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES {
             return Err(AgentCompiledPlanValidationError::UnsafeAttribute {
                 scope,
                 key: key.clone(),
                 reason: "attribute values must be bounded",
             });
         }
-        if value.contains('\n') || value.contains('\r') {
+        if label_value_contains_line_break(value) {
             return Err(AgentCompiledPlanValidationError::UnsafeAttribute {
                 scope,
                 key: key.clone(),

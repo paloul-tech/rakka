@@ -130,7 +130,6 @@ fn sample_graph_state() -> AgentGraphRunState {
         AgentCompiledNodeId::new("branch"),
         vec![AgentCompiledEdgeId::new("edge-branch-yes")],
     )
-    .skipped_node(AgentCompiledNodeId::new("skipped-node"))
     .loop_instance(
         AgentGraphLoopInstanceState::new(
             AgentCompiledNodeId::new("iterate"),

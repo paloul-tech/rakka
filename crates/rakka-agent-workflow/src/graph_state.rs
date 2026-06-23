@@ -4,7 +4,7 @@
 //! recover deterministic execution state after passivation, restart, or
 //! dispatcher redelivery. Large values are represented by `ArtifactRef`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,9 +53,6 @@ pub struct AgentGraphRunState {
     /// Branch node selections keyed by branch node id.
     #[serde(default)]
     pub selected_branch_paths: BTreeMap<AgentCompiledNodeId, Vec<AgentCompiledEdgeId>>,
-    /// Nodes deterministically skipped by branch or cancellation propagation.
-    #[serde(default)]
-    pub skipped_nodes: BTreeSet<AgentCompiledNodeId>,
     /// Explicit bounded loop or iterator instances.
     #[serde(default)]
     pub loop_instances: Vec<AgentGraphLoopInstanceState>,
@@ -89,7 +86,6 @@ impl AgentGraphRunState {
             graph_schema_version: CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
             node_states: BTreeMap::new(),
             selected_branch_paths: BTreeMap::new(),
-            skipped_nodes: BTreeSet::new(),
             loop_instances: Vec::new(),
             blocked_reason: None,
             output_refs: BTreeMap::new(),
@@ -115,13 +111,6 @@ impl AgentGraphRunState {
         edge_ids: Vec<AgentCompiledEdgeId>,
     ) -> Self {
         self.selected_branch_paths.insert(node_id, edge_ids);
-        self
-    }
-
-    /// Records a skipped node.
-    #[must_use]
-    pub fn skipped_node(mut self, node_id: AgentCompiledNodeId) -> Self {
-        self.skipped_nodes.insert(node_id);
         self
     }
 

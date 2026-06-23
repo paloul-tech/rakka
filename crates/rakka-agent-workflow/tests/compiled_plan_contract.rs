@@ -127,6 +127,70 @@ fn validation_rejects_forbidden_cycles() {
 }
 
 #[test]
+fn validation_handles_deeply_nested_acyclic_plans() {
+    // Cycle detection is iterative, so a long acyclic chain validates in
+    // heap-bounded space rather than recursing once per node (which a deep
+    // enough plan could overflow). This also exercises the iterative DFS push/pop
+    // across many levels.
+    const DEPTH: usize = 2_000;
+
+    let mut plan = AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-deep-chain"),
+        AgentWorkflowId::new("workflow-deep-chain"),
+        "deep-chain",
+        WorkflowDefinitionVersion::new("v1"),
+        AgentCompiledPlanSchemaVersion::new(1),
+        AgentCompiledPlanFingerprint::new("sha256:deep-chain"),
+    )
+    .entry_node("node-0")
+    .node(
+        AgentCompiledPlanNode::new("node-0", AgentCompiledNodeKind::Input).output_port(
+            AgentCompiledPlanPort::new("out", AgentCompiledPortDirection::Output, "payload"),
+        ),
+    );
+
+    for index in 1..DEPTH - 1 {
+        plan = plan.node(
+            AgentCompiledPlanNode::new(format!("node-{index}"), AgentCompiledNodeKind::Transform)
+                .input_port(AgentCompiledPlanPort::new(
+                    "in",
+                    AgentCompiledPortDirection::Input,
+                    "payload",
+                ))
+                .output_port(AgentCompiledPlanPort::new(
+                    "out",
+                    AgentCompiledPortDirection::Output,
+                    "payload",
+                )),
+        );
+    }
+
+    plan = plan.node(
+        AgentCompiledPlanNode::new(
+            format!("node-{}", DEPTH - 1),
+            AgentCompiledNodeKind::Terminal,
+        )
+        .input_port(AgentCompiledPlanPort::new(
+            "in",
+            AgentCompiledPortDirection::Input,
+            "payload",
+        )),
+    );
+
+    for index in 0..DEPTH - 1 {
+        plan = plan.edge(AgentCompiledPlanEdge::new(
+            format!("edge-{index}"),
+            format!("node-{index}"),
+            "out",
+            format!("node-{}", index + 1),
+            "in",
+        ));
+    }
+
+    validate_compiled_execution_plan(&plan).expect("deep acyclic chain should validate");
+}
+
+#[test]
 fn validation_rejects_invalid_iterator_bounds() {
     let mut plan = iterator_plan();
     assert_validation_code(plan.clone(), "invalid_iterator_policy");

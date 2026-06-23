@@ -769,7 +769,7 @@ pub fn validate_agent_metric_attributes(attributes: MetricAttributes<'_>) -> Age
                 limit: AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES,
             });
         }
-        if value.contains('\n') || value.contains('\r') {
+        if label_value_contains_line_break(value) {
             return Err(AgentMetricError::UnboundedAttributeValue {
                 key: (*key).to_string(),
                 reason: "metric label values must be single-line bounded labels",
@@ -777,6 +777,14 @@ pub fn validate_agent_metric_attributes(attributes: MetricAttributes<'_>) -> Age
         }
     }
     Ok(())
+}
+
+/// Reports whether a bounded label value contains a line break, which would let
+/// it span multiple lines in logs or exporters. Shared by the metric, compiled
+/// plan, and runtime event attribute validators so the single-line rule stays
+/// consistent across them.
+pub(crate) fn label_value_contains_line_break(value: &str) -> bool {
+    value.contains('\n') || value.contains('\r')
 }
 
 /// Records a counter after validating attributes.

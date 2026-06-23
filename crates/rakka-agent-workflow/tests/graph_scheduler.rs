@@ -344,9 +344,6 @@ fn scheduler_branch_selection_skips_unselected_path_and_unblocks_join() {
         node_state(&state, "right").status,
         AgentGraphNodeStatus::Skipped
     );
-    assert!(state
-        .skipped_nodes
-        .contains(&AgentCompiledNodeId::new("right")));
 
     let ready = scheduler
         .compute_ready_nodes(&plan, &state)

@@ -449,7 +449,6 @@ fn graph_state_json_accepts_current_previous_and_missing_additive_defaults() {
 
     for field in [
         "selected_branch_paths",
-        "skipped_nodes",
         "loop_instances",
         "blocked_reason",
         "output_refs",
@@ -484,7 +483,6 @@ fn graph_state_json_accepts_current_previous_and_missing_additive_defaults() {
     let decoded: AgentGraphRunState =
         serde_json::from_value(current).expect("missing additive graph fields should default");
     assert!(decoded.selected_branch_paths.is_empty());
-    assert!(decoded.skipped_nodes.is_empty());
     assert_eq!(decoded.scheduler_revision, 0);
     assert_eq!(decoded.last_event_sequence, 0);
     let node = decoded

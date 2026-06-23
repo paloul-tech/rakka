@@ -16,6 +16,7 @@ use crate::audit::{
     AGENT_LOG_ATTR_DEFINITION_VERSION, AGENT_LOG_ATTR_EFFECT_ID, AGENT_LOG_ATTR_RUN_ID,
     AGENT_LOG_ATTR_WORKFLOW_ID,
 };
+use crate::metrics::label_value_contains_line_break;
 use crate::{
     is_bounded_agent_metric_attribute, is_forbidden_agent_metric_attribute, AgentAttributes,
     AgentCausationId, AgentCompiledNodeId, AgentCompiledPlanFingerprint, AgentCorrelationId,
@@ -992,7 +993,7 @@ fn validate_runtime_event_attributes(attributes: &AgentAttributes) -> AgentRunti
         if value.len() > AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES {
             return Err(unsafe_attribute(key, "attribute values must be bounded"));
         }
-        if value.contains('\n') || value.contains('\r') {
+        if label_value_contains_line_break(value) {
             return Err(unsafe_attribute(
                 key,
                 "attribute values must be single-line bounded labels",
