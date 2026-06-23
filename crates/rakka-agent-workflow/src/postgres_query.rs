@@ -8,12 +8,13 @@ use tokio_postgres::{types::ToSql, Client, Row};
 use crate::{
     AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentDispatchId,
     AgentDispatchIndexEntry, AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass,
-    AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentRunId, AgentRunIndexEntry,
-    AgentRunQueryWaitingReason, AgentRunStatus, AgentStepId, AgentTenantId, AgentTimerId,
-    AgentTimerIndexEntry, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis, AgentWorkflowId,
-    AgentWorkflowQueryError, AgentWorkflowQueryFuture, AgentWorkflowQueryIndex,
-    AgentWorkflowQueryResult, AgentWorkflowRunQuery, AgentWorkflowShardOwnership,
-    HumanCheckpointId, WorkflowDefinitionVersion,
+    AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentGraphNodeStatus,
+    AgentGraphRunProjection, AgentGraphWaitReason, AgentRunId, AgentRunIndexEntry,
+    AgentRunQueryWaitingReason, AgentRunStatus, AgentRuntimeEventProjection, AgentStepId,
+    AgentTenantId, AgentTimerId, AgentTimerIndexEntry, AgentTimerQuery, AgentTimerStatus,
+    AgentTimestampMillis, AgentWorkflowId, AgentWorkflowQueryError, AgentWorkflowQueryFuture,
+    AgentWorkflowQueryIndex, AgentWorkflowQueryResult, AgentWorkflowRunQuery,
+    AgentWorkflowShardOwnership, HumanCheckpointId, WorkflowDefinitionVersion,
 };
 
 /// Default namespace for PostgreSQL workflow query projections.
@@ -24,6 +25,9 @@ pub const AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID: i64 = 982_451_659;
 
 /// Default workflow run index table name.
 pub const AGENT_WORKFLOW_RUN_INDEX_TABLE: &str = "rakka_agent_workflow_run_index";
+
+/// Default workflow graph-node projection table name.
+pub const AGENT_WORKFLOW_GRAPH_NODE_INDEX_TABLE: &str = "rakka_agent_workflow_graph_node_index";
 
 /// Default workflow timer index table name.
 pub const AGENT_WORKFLOW_TIMER_INDEX_TABLE: &str = "rakka_agent_workflow_timer_index";
@@ -36,6 +40,10 @@ pub const AGENT_WORKFLOW_DISPATCH_INDEX_TABLE: &str = "rakka_agent_workflow_disp
 
 /// Default workflow audit index table name.
 pub const AGENT_WORKFLOW_AUDIT_INDEX_TABLE: &str = "rakka_agent_workflow_audit_index";
+
+/// Default runtime event projection index table name.
+pub const AGENT_WORKFLOW_RUNTIME_EVENT_PROJECTION_TABLE: &str =
+    "rakka_agent_workflow_runtime_event_projection";
 
 /// SQL migration for PostgreSQL agent workflow query indexes.
 pub const AGENT_WORKFLOW_QUERY_MIGRATION_SQL: &str = r#"
@@ -57,6 +65,12 @@ CREATE TABLE IF NOT EXISTS rakka_agent_workflow_run_index (
     shard_entity_type TEXT NULL,
     shard_id TEXT NULL,
     shard_owner_node_id TEXT NULL,
+    graph_plan_id TEXT NULL,
+    graph_plan_fingerprint TEXT NULL,
+    graph_scheduler_revision BIGINT NULL CHECK (graph_scheduler_revision >= 0),
+    graph_last_event_sequence BIGINT NULL CHECK (graph_last_event_sequence >= 0),
+    graph_terminal_status TEXT NULL,
+    graph_projection_json TEXT NULL,
     created_at_millis BIGINT NOT NULL CHECK (created_at_millis >= 0),
     updated_at_millis BIGINT NOT NULL CHECK (updated_at_millis >= 0),
     completed_at_millis BIGINT NULL CHECK (completed_at_millis >= 0),
@@ -64,6 +78,19 @@ CREATE TABLE IF NOT EXISTS rakka_agent_workflow_run_index (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (store_namespace, run_id)
 );
+
+ALTER TABLE rakka_agent_workflow_run_index
+    ADD COLUMN IF NOT EXISTS graph_plan_id TEXT NULL;
+ALTER TABLE rakka_agent_workflow_run_index
+    ADD COLUMN IF NOT EXISTS graph_plan_fingerprint TEXT NULL;
+ALTER TABLE rakka_agent_workflow_run_index
+    ADD COLUMN IF NOT EXISTS graph_scheduler_revision BIGINT NULL CHECK (graph_scheduler_revision >= 0);
+ALTER TABLE rakka_agent_workflow_run_index
+    ADD COLUMN IF NOT EXISTS graph_last_event_sequence BIGINT NULL CHECK (graph_last_event_sequence >= 0);
+ALTER TABLE rakka_agent_workflow_run_index
+    ADD COLUMN IF NOT EXISTS graph_terminal_status TEXT NULL;
+ALTER TABLE rakka_agent_workflow_run_index
+    ADD COLUMN IF NOT EXISTS graph_projection_json TEXT NULL;
 
 CREATE INDEX IF NOT EXISTS rakka_agent_workflow_run_status_idx
     ON rakka_agent_workflow_run_index (store_namespace, status, updated_at_millis, run_id);
@@ -86,6 +113,39 @@ CREATE INDEX IF NOT EXISTS rakka_agent_workflow_run_checkpoint_age_idx
 CREATE INDEX IF NOT EXISTS rakka_agent_workflow_run_shard_owner_idx
     ON rakka_agent_workflow_run_index (store_namespace, shard_owner_node_id, shard_id, run_id)
     WHERE shard_owner_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_run_graph_plan_idx
+    ON rakka_agent_workflow_run_index (store_namespace, graph_plan_fingerprint, updated_at_millis, run_id)
+    WHERE graph_plan_fingerprint IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS rakka_agent_workflow_graph_node_index (
+    store_namespace TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    graph_plan_fingerprint TEXT NOT NULL,
+    node_kind TEXT NOT NULL,
+    node_status TEXT NOT NULL,
+    wait_reason TEXT NULL,
+    error_code TEXT NULL,
+    updated_at_millis BIGINT NOT NULL CHECK (updated_at_millis >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (store_namespace, run_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_graph_node_plan_idx
+    ON rakka_agent_workflow_graph_node_index
+    (store_namespace, graph_plan_fingerprint, run_id);
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_graph_node_status_kind_idx
+    ON rakka_agent_workflow_graph_node_index
+    (store_namespace, node_status, node_kind, run_id);
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_graph_node_wait_idx
+    ON rakka_agent_workflow_graph_node_index
+    (store_namespace, wait_reason, run_id)
+    WHERE wait_reason IS NOT NULL;
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_graph_node_error_idx
+    ON rakka_agent_workflow_graph_node_index
+    (store_namespace, error_code, run_id)
+    WHERE error_code IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS rakka_agent_workflow_timer_index (
     store_namespace TEXT NOT NULL,
@@ -203,6 +263,32 @@ CREATE INDEX IF NOT EXISTS rakka_agent_workflow_audit_run_idx
     ON rakka_agent_workflow_audit_index (store_namespace, run_id, occurred_at_millis);
 CREATE INDEX IF NOT EXISTS rakka_agent_workflow_audit_correlation_idx
     ON rakka_agent_workflow_audit_index (store_namespace, correlation_id, occurred_at_millis);
+
+CREATE TABLE IF NOT EXISTS rakka_agent_workflow_runtime_event_projection (
+    store_namespace TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    definition_version TEXT NOT NULL,
+    graph_plan_fingerprint TEXT NOT NULL,
+    last_scheduler_revision BIGINT NOT NULL CHECK (last_scheduler_revision >= 0),
+    last_event_sequence BIGINT NOT NULL CHECK (last_event_sequence >= 0),
+    last_event_at_millis BIGINT NULL CHECK (last_event_at_millis >= 0),
+    last_event_kind TEXT NULL,
+    event_count BIGINT NOT NULL CHECK (event_count >= 0),
+    node_event_count BIGINT NOT NULL CHECK (node_event_count >= 0),
+    effect_event_count BIGINT NOT NULL CHECK (effect_event_count >= 0),
+    timer_event_count BIGINT NOT NULL CHECK (timer_event_count >= 0),
+    human_event_count BIGINT NOT NULL CHECK (human_event_count >= 0),
+    terminal_event_kind TEXT NULL,
+    projection_json TEXT NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (store_namespace, run_id)
+);
+
+CREATE INDEX IF NOT EXISTS rakka_agent_workflow_runtime_event_projection_plan_idx
+    ON rakka_agent_workflow_runtime_event_projection
+    (store_namespace, graph_plan_fingerprint, last_event_sequence, run_id);
 "#;
 
 /// Builder for [`PostgresAgentWorkflowQueryIndex`].
@@ -291,8 +377,10 @@ impl PostgresAgentWorkflowQueryIndex {
     /// Deletes all projections for this store namespace.
     pub async fn delete_namespace(&self) -> AgentWorkflowQueryResult<()> {
         for table in [
+            AGENT_WORKFLOW_RUNTIME_EVENT_PROJECTION_TABLE,
             AGENT_WORKFLOW_AUDIT_INDEX_TABLE,
             AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE,
+            AGENT_WORKFLOW_GRAPH_NODE_INDEX_TABLE,
             AGENT_WORKFLOW_DISPATCH_INDEX_TABLE,
             AGENT_WORKFLOW_TIMER_INDEX_TABLE,
             AGENT_WORKFLOW_RUN_INDEX_TABLE,
@@ -304,6 +392,25 @@ impl PostgresAgentWorkflowQueryIndex {
                 .map_err(map_postgres_error)?;
         }
         Ok(())
+    }
+
+    /// Inserts or replaces one run-level runtime event projection.
+    ///
+    /// The projection is fenced by `last_event_sequence`, so stale rebuilds
+    /// cannot overwrite a newer event stream view.
+    pub async fn upsert_runtime_event_projection(
+        &self,
+        projection: AgentRuntimeEventProjection,
+    ) -> AgentWorkflowQueryResult<()> {
+        upsert_runtime_event_projection(&self.client, self.namespace.as_ref(), projection).await
+    }
+
+    /// Returns one run-level runtime event projection, when indexed.
+    pub async fn runtime_event_projection(
+        &self,
+        run_id: AgentRunId,
+    ) -> AgentWorkflowQueryResult<Option<AgentRuntimeEventProjection>> {
+        runtime_event_projection(&self.client, self.namespace.as_ref(), run_id).await
     }
 }
 
@@ -336,6 +443,13 @@ impl AgentWorkflowQueryIndex for PostgresAgentWorkflowQueryIndex {
             client
                 .execute(
                     "DELETE FROM rakka_agent_workflow_checkpoint_index WHERE store_namespace = $1 AND run_id = $2",
+                    &[&namespace.as_ref(), &run_id.as_str()],
+                )
+                .await
+                .map_err(map_postgres_error)?;
+            client
+                .execute(
+                    "DELETE FROM rakka_agent_workflow_graph_node_index WHERE store_namespace = $1 AND run_id = $2",
                     &[&namespace.as_ref(), &run_id.as_str()],
                 )
                 .await
@@ -454,6 +568,31 @@ async fn upsert_run(
     let shard_owner = ownership
         .as_ref()
         .map(|ownership| ownership.owner_node_id.clone());
+    let graph = entry.graph.clone();
+    let graph_plan_id = graph
+        .as_ref()
+        .map(|graph| graph.plan_id.as_str().to_string());
+    let graph_plan_fingerprint = graph
+        .as_ref()
+        .map(|graph| graph.plan_fingerprint.as_str().to_string());
+    let graph_scheduler_revision = graph
+        .as_ref()
+        .map(|graph| u64_to_i64(graph.scheduler_revision, "graph scheduler revision"))
+        .transpose()?;
+    let graph_last_event_sequence = graph
+        .as_ref()
+        .map(|graph| u64_to_i64(graph.last_event_sequence, "graph last event sequence"))
+        .transpose()?;
+    let graph_terminal_status = graph.as_ref().and_then(|graph| {
+        graph
+            .terminal_status
+            .map(|status| status.as_label().to_string())
+    });
+    let graph_projection_json = graph
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(map_json_error)?;
     let waiting_reason = entry.waiting_reason.map(waiting_reason_label);
     let open_checkpoint_created_at = optional_millis(entry.open_checkpoint_created_at)?;
     let open_checkpoint_due_at = optional_millis(entry.open_checkpoint_due_at)?;
@@ -482,12 +621,19 @@ INSERT INTO rakka_agent_workflow_run_index (
     shard_entity_type,
     shard_id,
     shard_owner_node_id,
+    graph_plan_id,
+    graph_plan_fingerprint,
+    graph_scheduler_revision,
+    graph_last_event_sequence,
+    graph_terminal_status,
+    graph_projection_json,
     created_at_millis,
     updated_at_millis,
     completed_at_millis
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    $21, $22, $23, $24, $25, $26
 )
 ON CONFLICT (store_namespace, run_id) DO UPDATE
 SET workflow_id = EXCLUDED.workflow_id,
@@ -505,6 +651,12 @@ SET workflow_id = EXCLUDED.workflow_id,
     shard_entity_type = EXCLUDED.shard_entity_type,
     shard_id = EXCLUDED.shard_id,
     shard_owner_node_id = EXCLUDED.shard_owner_node_id,
+    graph_plan_id = EXCLUDED.graph_plan_id,
+    graph_plan_fingerprint = EXCLUDED.graph_plan_fingerprint,
+    graph_scheduler_revision = EXCLUDED.graph_scheduler_revision,
+    graph_last_event_sequence = EXCLUDED.graph_last_event_sequence,
+    graph_terminal_status = EXCLUDED.graph_terminal_status,
+    graph_projection_json = EXCLUDED.graph_projection_json,
     created_at_millis = EXCLUDED.created_at_millis,
     updated_at_millis = EXCLUDED.updated_at_millis,
     completed_at_millis = EXCLUDED.completed_at_millis,
@@ -531,6 +683,12 @@ RETURNING revision
                 &shard_entity_type,
                 &shard_id,
                 &shard_owner,
+                &graph_plan_id,
+                &graph_plan_fingerprint,
+                &graph_scheduler_revision,
+                &graph_last_event_sequence,
+                &graph_terminal_status,
+                &graph_projection_json,
                 &created_at,
                 &updated_at,
                 &completed_at,
@@ -546,6 +704,68 @@ RETURNING revision
     }
 
     upsert_open_checkpoint(client, namespace, &entry).await?;
+    upsert_graph_nodes(client, namespace, &entry).await?;
+    Ok(())
+}
+
+async fn upsert_graph_nodes(
+    client: &Client,
+    namespace: &str,
+    entry: &AgentRunIndexEntry,
+) -> AgentWorkflowQueryResult<()> {
+    client
+        .execute(
+            r#"
+DELETE FROM rakka_agent_workflow_graph_node_index
+WHERE store_namespace = $1
+  AND run_id = $2
+"#,
+            &[&namespace, &entry.run_id.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    let Some(graph) = &entry.graph else {
+        return Ok(());
+    };
+
+    let updated_at = millis_to_i64(entry.updated_at)?;
+    for node in &graph.nodes {
+        let wait_reason = node.wait_reason.map(graph_wait_reason_label);
+        client
+            .execute(
+                r#"
+INSERT INTO rakka_agent_workflow_graph_node_index (
+    store_namespace,
+    run_id,
+    node_id,
+    workflow_id,
+    graph_plan_fingerprint,
+    node_kind,
+    node_status,
+    wait_reason,
+    error_code,
+    updated_at_millis
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+)
+"#,
+                &[
+                    &namespace,
+                    &entry.run_id.as_str(),
+                    &node.node_id.as_str(),
+                    &entry.workflow_id.as_str(),
+                    &graph.plan_fingerprint.as_str(),
+                    &node.kind.as_label(),
+                    &node.status.as_label(),
+                    &wait_reason,
+                    &node.error_code,
+                    &updated_at,
+                ],
+            )
+            .await
+            .map_err(map_postgres_error)?;
+    }
     Ok(())
 }
 
@@ -822,6 +1042,130 @@ RETURNING revision
     Ok(())
 }
 
+async fn upsert_runtime_event_projection(
+    client: &Client,
+    namespace: &str,
+    projection: AgentRuntimeEventProjection,
+) -> AgentWorkflowQueryResult<()> {
+    let last_scheduler_revision = u64_to_i64(
+        projection.last_scheduler_revision,
+        "runtime event last scheduler revision",
+    )?;
+    let last_event_sequence = u64_to_i64(
+        projection.last_event_sequence,
+        "runtime event last event sequence",
+    )?;
+    let last_event_at = optional_millis(projection.last_event_at)?;
+    let last_event_kind = projection
+        .last_event_kind
+        .map(|kind| kind.as_label().to_string());
+    let event_count = u64_to_i64(projection.event_count, "runtime event count")?;
+    let node_event_count = u64_to_i64(projection.node_event_count, "runtime node event count")?;
+    let effect_event_count =
+        u64_to_i64(projection.effect_event_count, "runtime effect event count")?;
+    let timer_event_count = u64_to_i64(projection.timer_event_count, "runtime timer event count")?;
+    let human_event_count = u64_to_i64(projection.human_event_count, "runtime human event count")?;
+    let terminal_event_kind = projection
+        .terminal_event_kind
+        .map(|kind| kind.as_label().to_string());
+    let projection_json = serde_json::to_string(&projection).map_err(map_json_error)?;
+
+    let row = client
+        .query_opt(
+            r#"
+INSERT INTO rakka_agent_workflow_runtime_event_projection (
+    store_namespace,
+    run_id,
+    workflow_id,
+    definition_version,
+    graph_plan_fingerprint,
+    last_scheduler_revision,
+    last_event_sequence,
+    last_event_at_millis,
+    last_event_kind,
+    event_count,
+    node_event_count,
+    effect_event_count,
+    timer_event_count,
+    human_event_count,
+    terminal_event_kind,
+    projection_json
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    $9, $10, $11, $12, $13, $14, $15, $16
+)
+ON CONFLICT (store_namespace, run_id) DO UPDATE
+SET workflow_id = EXCLUDED.workflow_id,
+    definition_version = EXCLUDED.definition_version,
+    graph_plan_fingerprint = EXCLUDED.graph_plan_fingerprint,
+    last_scheduler_revision = EXCLUDED.last_scheduler_revision,
+    last_event_sequence = EXCLUDED.last_event_sequence,
+    last_event_at_millis = EXCLUDED.last_event_at_millis,
+    last_event_kind = EXCLUDED.last_event_kind,
+    event_count = EXCLUDED.event_count,
+    node_event_count = EXCLUDED.node_event_count,
+    effect_event_count = EXCLUDED.effect_event_count,
+    timer_event_count = EXCLUDED.timer_event_count,
+    human_event_count = EXCLUDED.human_event_count,
+    terminal_event_kind = EXCLUDED.terminal_event_kind,
+    projection_json = EXCLUDED.projection_json,
+    revision = rakka_agent_workflow_runtime_event_projection.revision + 1,
+    updated_at = now()
+WHERE rakka_agent_workflow_runtime_event_projection.last_event_sequence <= EXCLUDED.last_event_sequence
+RETURNING revision
+"#,
+            &[
+                &namespace,
+                &projection.run_id.as_str(),
+                &projection.workflow_id.as_str(),
+                &projection.definition_version.as_str(),
+                &projection.plan_fingerprint.as_str(),
+                &last_scheduler_revision,
+                &last_event_sequence,
+                &last_event_at,
+                &last_event_kind,
+                &event_count,
+                &node_event_count,
+                &effect_event_count,
+                &timer_event_count,
+                &human_event_count,
+                &terminal_event_kind,
+                &projection_json,
+            ],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    if row.is_none() {
+        return Err(stale_write(
+            "runtime event projection update was older than the current projection",
+        ));
+    }
+    Ok(())
+}
+
+async fn runtime_event_projection(
+    client: &Client,
+    namespace: &str,
+    run_id: AgentRunId,
+) -> AgentWorkflowQueryResult<Option<AgentRuntimeEventProjection>> {
+    let row = client
+        .query_opt(
+            r#"
+SELECT projection_json
+FROM rakka_agent_workflow_runtime_event_projection
+WHERE store_namespace = $1
+  AND run_id = $2
+"#,
+            &[&namespace, &run_id.as_str()],
+        )
+        .await
+        .map_err(map_postgres_error)?;
+
+    row.map(|row| decode_runtime_event_projection(row.get("projection_json")))
+        .transpose()
+}
+
 async fn query_runs(
     client: &Client,
     namespace: &str,
@@ -847,6 +1191,13 @@ async fn query_runs(
         .map(|step_id| step_id.as_str().to_string());
     let due_timer_at = optional_millis(query.due_timer_at_or_before)?;
     let stuck_dispatcher_at = optional_millis(query.stuck_dispatcher_at_or_before)?;
+    let graph_plan_fingerprint = query
+        .graph_plan_fingerprint
+        .as_ref()
+        .map(|fingerprint| fingerprint.as_str().to_string());
+    let graph_node_statuses = optional_graph_node_status_labels(&query.graph_node_statuses);
+    let graph_node_kinds = optional_graph_node_kind_labels(&query.graph_node_kinds);
+    let graph_wait_reasons = optional_graph_wait_reason_labels(&query.graph_wait_reasons);
     let limit = limit_to_i64(query.limit)?;
 
     let params: &[&(dyn ToSql + Sync)] = &[
@@ -865,6 +1216,11 @@ async fn query_runs(
         &stuck_dispatcher_at,
         &query.shard_owner_node_id,
         &query.shard_id,
+        &graph_plan_fingerprint,
+        &graph_node_statuses,
+        &graph_node_kinds,
+        &graph_wait_reasons,
+        &query.graph_error_code,
         &limit,
     ];
     let rows = client
@@ -907,8 +1263,22 @@ WHERE run.store_namespace = $1
   )
   AND ($14::text IS NULL OR run.shard_owner_node_id = $14)
   AND ($15::text IS NULL OR run.shard_id = $15)
+  AND ($16::text IS NULL OR run.graph_plan_fingerprint = $16)
+  AND (
+      ($17::text[] IS NULL AND $18::text[] IS NULL AND $19::text[] IS NULL AND $20::text IS NULL)
+      OR EXISTS (
+          SELECT 1
+          FROM rakka_agent_workflow_graph_node_index AS node
+          WHERE node.store_namespace = run.store_namespace
+            AND node.run_id = run.run_id
+            AND ($17::text[] IS NULL OR node.node_status = ANY($17))
+            AND ($18::text[] IS NULL OR node.node_kind = ANY($18))
+            AND ($19::text[] IS NULL OR node.wait_reason = ANY($19))
+            AND ($20::text IS NULL OR node.error_code = $20)
+      )
+  )
 ORDER BY run.updated_at_millis, run.run_id
-LIMIT $16::bigint
+LIMIT $21::bigint
 "#,
             params,
         )
@@ -1081,7 +1451,7 @@ fn decode_run_row(row: Row) -> AgentWorkflowQueryResult<AgentRunIndexEntry> {
         )?,
         open_checkpoint_due_at: decode_optional_millis(row.get("open_checkpoint_due_at_millis"))?,
         shard_ownership,
-        graph: None,
+        graph: decode_graph_projection(row.get("graph_projection_json"))?,
         created_at: decode_millis(row.get("created_at_millis"))?,
         updated_at: decode_millis(row.get("updated_at_millis"))?,
         completed_at: decode_optional_millis(row.get("completed_at_millis"))?,
@@ -1162,6 +1532,33 @@ fn optional_dispatch_status_labels(statuses: &[AgentDispatchStatus]) -> Option<V
     })
 }
 
+fn optional_graph_node_status_labels(statuses: &[AgentGraphNodeStatus]) -> Option<Vec<String>> {
+    (!statuses.is_empty()).then(|| {
+        statuses
+            .iter()
+            .map(|status| status.as_label().to_string())
+            .collect()
+    })
+}
+
+fn optional_graph_node_kind_labels(kinds: &[AgentCompiledNodeKind]) -> Option<Vec<String>> {
+    (!kinds.is_empty()).then(|| {
+        kinds
+            .iter()
+            .map(|kind| kind.as_label().to_string())
+            .collect()
+    })
+}
+
+fn optional_graph_wait_reason_labels(reasons: &[AgentGraphWaitReason]) -> Option<Vec<String>> {
+    (!reasons.is_empty()).then(|| {
+        reasons
+            .iter()
+            .map(|reason| graph_wait_reason_label(*reason))
+            .collect()
+    })
+}
+
 fn optional_waiting_reason_labels(reasons: &[AgentRunQueryWaitingReason]) -> Option<Vec<String>> {
     (!reasons.is_empty()).then(|| {
         reasons
@@ -1172,6 +1569,10 @@ fn optional_waiting_reason_labels(reasons: &[AgentRunQueryWaitingReason]) -> Opt
 }
 
 fn waiting_reason_label(reason: AgentRunQueryWaitingReason) -> String {
+    reason.as_label().to_string()
+}
+
+fn graph_wait_reason_label(reason: AgentGraphWaitReason) -> String {
     reason.as_label().to_string()
 }
 
@@ -1263,6 +1664,20 @@ fn parse_effect_kind(value: &str) -> AgentWorkflowQueryResult<AgentEffectKind> {
 fn parse_compiled_node_kind(value: &str) -> AgentWorkflowQueryResult<AgentCompiledNodeKind> {
     AgentCompiledNodeKind::from_label(value)
         .ok_or_else(|| invalid_label("dispatch.graph_node_kind", value))
+}
+
+fn decode_graph_projection(
+    value: Option<String>,
+) -> AgentWorkflowQueryResult<Option<AgentGraphRunProjection>> {
+    value
+        .map(|value| serde_json::from_str(&value).map_err(map_json_error))
+        .transpose()
+}
+
+fn decode_runtime_event_projection(
+    value: String,
+) -> AgentWorkflowQueryResult<AgentRuntimeEventProjection> {
+    serde_json::from_str(&value).map_err(map_json_error)
 }
 
 fn validate_limit(limit: Option<usize>) -> AgentWorkflowQueryResult<()> {
@@ -1359,4 +1774,10 @@ fn map_postgres_error(error: tokio_postgres::Error) -> AgentWorkflowQueryError {
         source = error.source();
     }
     AgentWorkflowQueryError::Store { message }
+}
+
+fn map_json_error(error: serde_json::Error) -> AgentWorkflowQueryError {
+    AgentWorkflowQueryError::Store {
+        message: format!("invalid PostgreSQL projection JSON: {error}"),
+    }
 }

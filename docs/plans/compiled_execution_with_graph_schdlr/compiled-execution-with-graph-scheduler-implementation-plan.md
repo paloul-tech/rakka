@@ -1400,6 +1400,8 @@ Implementation notes:
 
 ### Slice 8.4: Optional PostgreSQL Gate
 
+Status: implemented.
+
 Scope:
 
 - Add PostgreSQL query-index integration tests for graph run projections.
@@ -1419,6 +1421,21 @@ Tests:
 - Failed node query.
 - Runtime event projection query.
 - Stale write rejection.
+
+Implementation notes:
+
+- Extended the PostgreSQL workflow query index with additive nullable graph
+  run projection columns, a graph-node projection table, and a run-level runtime
+  event projection table.
+- Graph run queries now honor compiled plan fingerprint, graph node status,
+  graph node kind, graph wait reason, and graph error-code filters through the
+  existing `AgentWorkflowRunQuery` surface.
+- Added Postgres-only runtime event projection upsert/query helpers fenced by
+  per-run event sequence.
+- Extended the gated `postgres_query_index` integration suite to cover graph
+  projection round trip, waiting node query, failed node query, graph-aware
+  dispatch/effect query, timer and human checkpoint queries, runtime event
+  projection query, migration table creation, and stale run/event writes.
 
 ### Slice 8.5: Operational Docs
 
