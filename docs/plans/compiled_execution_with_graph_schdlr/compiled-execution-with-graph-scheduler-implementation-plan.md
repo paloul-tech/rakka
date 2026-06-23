@@ -1439,6 +1439,8 @@ Implementation notes:
 
 ### Slice 8.5: Operational Docs
 
+Status: implemented.
+
 Scope:
 
 - Add follow-up operational docs under
@@ -1454,6 +1456,30 @@ Acceptance:
   human checkpoints, event sink failures, and drain blockers.
 - Documentation distinguishes product backend incidents from Rakka runtime
   incidents.
+
+Implementation notes:
+
+- Added
+  `docs/plans/compiled_execution_with_graph_schdlr/compiled-graph-operational-runbooks.md`
+  as the graph-runtime companion to the existing agent workflow operational
+  runbook.
+- Documented incident ownership between the product backend and Rakka runtime,
+  graph-specific query surfaces, PostgreSQL graph/event projection tables,
+  stuck-node, failed-effect, late-timer, human-checkpoint, runtime-event-sink,
+  and graph-drain runbooks.
+- Added graph-focused dashboard panels, alert recommendations, autoscaling
+  guidance, cardinality rules, and release/compatibility gates while linking
+  back to the existing Kubernetes drain, autoscaling, OpenTelemetry, and
+  production-candidate docs.
+- Extended `operational_runbooks` coverage so the graph runbook names real
+  query APIs, runtime event surfaces, metrics, PostgreSQL tables, operational
+  commands, and compatibility gates.
+
+Phase 8 status:
+
+Complete. Hardening now covers compatibility, failure injection, load and
+cardinality, optional PostgreSQL graph query/event projection gates, and
+graph-specific operational documentation.
 
 ## Test Matrix
 
