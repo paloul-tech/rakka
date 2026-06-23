@@ -701,11 +701,58 @@ where
         let result = async {
             self.runner.recover().await?;
             self.inbox.recover().await?;
+            self.reconcile_recovered_graph_effects().await?;
             self.snapshot()
         }
         .await;
         self.record_snapshot_result("recover", &result);
         result
+    }
+
+    /// Re-links durable outbox effects to their graph nodes after recovery.
+    ///
+    /// An effect is committed to the durable outbox before the graph transition
+    /// that records it is persisted (see
+    /// [`AgentGraphEffectBridge::schedule_node_effect`]). A crash in that window
+    /// leaves the effect enqueued with no node link, which would orphan its
+    /// completion (`node_id_for_effect` would fail with `UnknownEffect`). The
+    /// run actor never re-drives in-flight nodes, so recovery restores the link
+    /// here from the self-describing recovered effects. The pass is idempotent:
+    /// a run with no graph state, no in-flight effects, or nothing to relink
+    /// persists nothing.
+    async fn reconcile_recovered_graph_effects(&mut self) -> AgentRunRuntimeResult<()> {
+        let Some(graph) = self
+            .runner
+            .state()?
+            .and_then(|state| state.graph_state.clone())
+        else {
+            return Ok(());
+        };
+        let effects: Vec<AgentEffect> = self
+            .inbox
+            .due_effects()?
+            .into_iter()
+            .map(|due| due.effect)
+            .collect();
+        if effects.is_empty() {
+            return Ok(());
+        }
+        let transition = self
+            .graph_runtime
+            .effect_bridge()
+            .reconcile_recovered_effects(graph, &effects);
+        if transition.changed_node_ids.is_empty() {
+            return Ok(());
+        }
+        let now = effects
+            .iter()
+            .map(|effect| effect.created_at)
+            .max()
+            .unwrap_or_default();
+        self.runner
+            .update_graph_state(transition.state, now)
+            .await?;
+        Ok(())
     }
 
     fn snapshot(&self) -> AgentRunRuntimeResult<AgentRunActorSnapshot> {

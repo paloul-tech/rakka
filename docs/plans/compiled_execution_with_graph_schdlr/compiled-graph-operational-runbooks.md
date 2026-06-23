@@ -104,6 +104,36 @@ late or incomplete.
    Pivot with `correlation_id`, `causation_id`, `effect_id`, `timer_id`,
    `checkpoint_id`, and runtime `event_sequence`.
 
+## Recovery: In-Flight Effect Re-Linking
+
+When a run actor starts or restarts it reloads durable run state and the durable
+inbox/outbox, then reconciles the two: every recovered in-flight outbox effect is
+re-linked to its graph node, restoring the node's `Waiting` status and
+`scheduled_effect_ids`.
+
+Why this exists: `schedule_node_effect` commits the effect to the durable outbox
+*before* the graph transition that records it is persisted, so a node is only
+marked `Waiting` once its effect is durably enqueued. If a crash lands in that
+window the effect is enqueued but the node link is not yet persisted. The run
+actor does not re-drive in-flight nodes after recovery, so without this step the
+effect's eventual `EffectCompleted`/`EffectFailed` could not resolve its node
+(`UnknownEffect`) and the result would be orphaned while the node stayed stuck.
+
+Operator implications:
+
+- No manual action is required. After a crash a node may briefly appear in
+  `Running` with a corresponding due outbox effect; once its owning actor
+  recovers, the node returns to `Waiting` and the effect completes normally.
+- The pass is idempotent and safe across repeated restarts: a node already
+  linked to its effect, or already resolved (`Completed`, `Failed`, `Skipped`,
+  `Cancelled`, `Terminal`), is left untouched.
+- Scope: this covers durable outbox effects (effect nodes, including
+  `ChildWorkflowCommand`). Human approval requests share the outbox but link
+  through `checkpoint_ids` and are owned by the human-checkpoint path; durable
+  timers use a separate store. A node stuck after a crash that does *not* return
+  to `Waiting` despite a due effect is a bug worth escalating, not expected
+  behavior.
+
 ## Runbook: Stuck Graph Nodes
 
 Symptoms:
@@ -138,6 +168,9 @@ Actions:
   PostgreSQL latency, and shard ownership.
 - If the node is waiting for dependencies, verify upstream nodes are terminal
   as completed or skipped, not still running after a crash.
+- If a node sits in `Running` with a due outbox effect right after a restart, it
+  should self-heal back to `Waiting`; see "Recovery: In-Flight Effect
+  Re-Linking" above before intervening.
 
 ## Runbook: Failed Graph Effects
 

@@ -452,6 +452,18 @@ compiled plan nodes to `AgentEffect` values and schedules them through
 effect only after the durable outbox boundary returns scheduled or duplicate
 acceptance.
 
+Because that ordering writes the durable outbox entry before the run store
+persists the node's waiting status and `scheduled_effect_ids`, a crash in that
+window leaves an effect durably enqueued with no node link. The run actor does
+not re-drive in-flight nodes on recovery, so on start/restart the runtime
+reconciles recovered in-flight outbox effects against graph state and re-links
+each one to its node (every durable effect is self-describing: it carries its
+compiled node id and a deterministic effect id). This guarantees an enqueued
+effect's eventual completion is never orphaned. The reconciliation is
+idempotent and skips already-linked or already-resolved nodes. Human approval
+requests share the outbox but link through `checkpoint_ids`, not
+`scheduled_effect_ids`, and remain owned by the human-checkpoint path.
+
 Dispatcher fleet indexes should project graph-scheduled effects with bounded
 graph context copied from the durable effect metadata:
 

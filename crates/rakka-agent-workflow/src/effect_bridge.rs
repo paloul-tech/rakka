@@ -740,6 +740,86 @@ impl AgentGraphEffectBridge {
         })
     }
 
+    /// Re-links recovered durable outbox effects to their graph nodes.
+    ///
+    /// [`AgentGraphEffectBridge::schedule_node_effect`] commits the durable
+    /// outbox effect before the caller persists the graph transition that
+    /// records the node's `scheduled_effect_ids` and `Waiting` status (the
+    /// ordering documented above). A crash in that window leaves the effect
+    /// durably enqueued while the node is still persisted in a pre-waiting
+    /// status, so a later `EffectCompleted`/`EffectFailed` cannot resolve its
+    /// node — [`node_id_for_effect`] returns
+    /// [`AgentGraphEffectBridgeError::UnknownEffect`] and the result is
+    /// orphaned. The run actor does not re-drive in-flight nodes on recovery,
+    /// so recovery must heal the link itself.
+    ///
+    /// Given the durable run's graph state and the recovered in-flight outbox
+    /// effects (each effect is self-describing: it carries its
+    /// `compiled_node_id` and a deterministic `effect_id`), this restores
+    /// `scheduled_effect_ids` and the `Waiting` status for every node that is
+    /// not already waiting on its effect. It is idempotent: a node already
+    /// linked to its effect, or already resolved, is left untouched, so the
+    /// returned transition only carries genuine changes. The caller persists
+    /// the returned state through the durable run store.
+    ///
+    /// Human approval requests ([`AgentEffectKind::HumanApprovalRequest`]) share
+    /// the same outbox but link through `checkpoint_ids` rather than
+    /// `scheduled_effect_ids`; they are owned by the human-checkpoint path and
+    /// skipped here.
+    #[must_use = "the reconciled transition must be persisted to the durable run store"]
+    pub fn reconcile_recovered_effects(
+        &self,
+        mut state: AgentGraphRunState,
+        effects: &[AgentEffect],
+    ) -> AgentGraphSchedulerTransition {
+        let mut changed_node_ids = Vec::new();
+        for effect in effects {
+            if effect.kind == AgentEffectKind::HumanApprovalRequest {
+                continue;
+            }
+            let Some(node_id) = effect
+                .target
+                .attributes
+                .get(ATTR_COMPILED_NODE_ID)
+                .map(|value| AgentCompiledNodeId::new(value.clone()))
+            else {
+                continue;
+            };
+            let Some(node_state) = state.node_states.get_mut(&node_id) else {
+                continue;
+            };
+            if is_resolved_node_status(node_state.status) {
+                continue;
+            }
+            if node_state
+                .scheduled_effect_ids
+                .iter()
+                .any(|scheduled| scheduled == &effect.effect_id)
+            {
+                continue;
+            }
+            node_state
+                .scheduled_effect_ids
+                .push(effect.effect_id.clone());
+            node_state.status = AgentGraphNodeStatus::Waiting;
+            node_state.wait_reason = Some(effect_wait_reason(effect.kind));
+            node_state.updated_at = effect.created_at;
+            changed_node_ids.push(node_id);
+        }
+        if !changed_node_ids.is_empty() {
+            state.scheduler_revision += 1;
+            state.blocked_reason = None;
+            changed_node_ids.sort();
+            changed_node_ids.dedup();
+        }
+        let runnable_node_ids = AgentGraphScheduler::new().runnable_nodes(&state);
+        AgentGraphSchedulerTransition {
+            state,
+            changed_node_ids,
+            runnable_node_ids,
+        }
+    }
+
     /// Maps a compiled timer node to a durable timer entry.
     pub fn timer_from_node(
         &self,
@@ -1812,6 +1892,33 @@ fn wait_reason_for_effect_node(
             })
         }
     }
+}
+
+/// Maps a recovered effect kind to the wait reason its graph node should carry.
+///
+/// This mirrors [`wait_reason_for_effect_node`] but keys off the effect kind
+/// (available at recovery without the plan) instead of the node kind; the two
+/// stay consistent because [`effect_kind_for_node`] derives the effect kind from
+/// the node kind.
+fn effect_wait_reason(kind: AgentEffectKind) -> AgentGraphWaitReason {
+    match kind {
+        AgentEffectKind::ChildWorkflowCommand => AgentGraphWaitReason::ChildWorkflow,
+        _ => AgentGraphWaitReason::Effect,
+    }
+}
+
+/// Reports whether a node has reached a status that recovery must not resurrect
+/// into `Waiting` (a stale outbox effect for such a node is a no-op on
+/// completion).
+const fn is_resolved_node_status(status: AgentGraphNodeStatus) -> bool {
+    matches!(
+        status,
+        AgentGraphNodeStatus::Completed
+            | AgentGraphNodeStatus::Skipped
+            | AgentGraphNodeStatus::Failed
+            | AgentGraphNodeStatus::Cancelled
+            | AgentGraphNodeStatus::Terminal
+    )
 }
 
 fn effect_target_for_node(

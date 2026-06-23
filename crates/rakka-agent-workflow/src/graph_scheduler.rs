@@ -864,11 +864,11 @@ fn dependencies_satisfied(
         return Ok(true);
     }
     let required_edges = required_incoming_edges(node, incoming);
-    if required_edges.is_empty() {
-        return Ok(false);
-    }
     if node.kind == AgentCompiledNodeKind::Join {
         return join_dependencies_satisfied(state, &required_edges, nodes);
+    }
+    if required_edges.is_empty() {
+        return optional_dependencies_satisfied(state, node, nodes, incoming);
     }
     for edge in required_edges {
         let Some(source_node) = nodes.get(&edge.source_node_id) else {
@@ -1276,10 +1276,10 @@ fn node_should_skip(
     incoming: &BTreeMap<AgentCompiledNodeId, Vec<&AgentCompiledPlanEdge>>,
 ) -> AgentGraphSchedulerResult<bool> {
     let required_edges = required_incoming_edges(node, incoming);
-    if required_edges.is_empty() {
-        return Ok(false);
-    }
     if node.kind == AgentCompiledNodeKind::Join {
+        if required_edges.is_empty() {
+            return Ok(false);
+        }
         if required_edges.iter().try_fold(false, |completed, edge| {
             Ok(completed || edge_source_completed(state, edge, nodes)?)
         })? {
@@ -1289,9 +1289,66 @@ fn node_should_skip(
             Ok(all_blocked && edge_permanently_unsatisfied(state, edge, nodes)?)
         });
     }
+    if required_edges.is_empty() {
+        return optional_dependencies_blocked(state, node, nodes, incoming);
+    }
     required_edges.iter().try_fold(false, |should_skip, edge| {
         Ok(should_skip || edge_permanently_unsatisfied(state, edge, nodes)?)
     })
+}
+
+/// Evaluates readiness for a non-entry, non-join node that has no *required*
+/// incoming edges (its incoming edges, if any, all target optional ports).
+///
+/// Such a node becomes ready once every incoming edge has settled — each source
+/// either completed or is permanently unsatisfied — and at least one incoming
+/// edge produced a usable result. A node with no incoming edges at all (an
+/// unreachable non-entry node) is never ready; [`node_should_skip`] skips it
+/// instead. This keeps an optional-only-input node (including a `Terminal` node
+/// reached through an optional port) from stalling forever in `Pending`.
+fn optional_dependencies_satisfied(
+    state: &AgentGraphRunState,
+    node: &AgentCompiledPlanNode,
+    nodes: &BTreeMap<AgentCompiledNodeId, &AgentCompiledPlanNode>,
+    incoming: &BTreeMap<AgentCompiledNodeId, Vec<&AgentCompiledPlanEdge>>,
+) -> AgentGraphSchedulerResult<bool> {
+    let edges = incoming
+        .get(&node.node_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut any_satisfied = false;
+    for edge in edges {
+        if edge_source_completed(state, edge, nodes)? {
+            any_satisfied = true;
+        } else if !edge_permanently_unsatisfied(state, edge, nodes)? {
+            return Ok(false);
+        }
+    }
+    Ok(any_satisfied)
+}
+
+/// Decides whether a non-entry, non-join node with no *required* incoming edges
+/// should be skipped: it is skipped when every incoming edge is permanently
+/// unsatisfied (vacuously true when the node has no incoming edges at all, i.e.
+/// it is unreachable). This is the skip counterpart of
+/// [`optional_dependencies_satisfied`]; together they guarantee such a node
+/// always resolves to runnable or skipped rather than stalling in `Pending`.
+fn optional_dependencies_blocked(
+    state: &AgentGraphRunState,
+    node: &AgentCompiledPlanNode,
+    nodes: &BTreeMap<AgentCompiledNodeId, &AgentCompiledPlanNode>,
+    incoming: &BTreeMap<AgentCompiledNodeId, Vec<&AgentCompiledPlanEdge>>,
+) -> AgentGraphSchedulerResult<bool> {
+    let edges = incoming
+        .get(&node.node_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for edge in edges {
+        if !edge_permanently_unsatisfied(state, edge, nodes)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn runnable_nodes_from_state(state: &AgentGraphRunState) -> Vec<AgentCompiledNodeId> {

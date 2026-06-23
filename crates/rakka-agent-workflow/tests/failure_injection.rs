@@ -524,6 +524,93 @@ async fn crash_after_effect_callback_acceptance_applies_graph_transition_once() 
 }
 
 #[tokio::test]
+async fn crash_between_effect_outbox_write_and_graph_persist_relinks_on_recovery() {
+    // Reproduces the non-atomic schedule window: the effect is committed to the
+    // durable outbox, but the graph transition that records the node's
+    // scheduled_effect_ids + Waiting status is never persisted (crash before the
+    // run-state write). Recovery must re-link the node so the in-flight effect's
+    // completion is not orphaned with an UnknownEffect error.
+    let workflow = workflow();
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-effect-relink-on-recovery");
+    let workflow_store = WorkflowStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(200));
+
+    // Durably-persisted graph state at the moment of the crash: the effect node
+    // is Running with no scheduled effect recorded yet.
+    let persisted_state = graph_running_effect_state(&plan);
+
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            persisted_state.clone(),
+            graph_effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should commit to the durable outbox");
+    let effect_id = scheduled.effect.effect_id.clone();
+    // Crash: drop the in-memory waiting transition without persisting it.
+    drop(scheduled);
+    drop(inbox);
+
+    // Recover: the outbox effect survives; the graph state is still the running
+    // (unlinked) snapshot.
+    let mut recovered = AgentRunInbox::with_clock(run_id.clone(), workflow_store, clock);
+    recovered
+        .recover()
+        .await
+        .expect("recovered inbox should reload the durable outbox effect");
+    let effects: Vec<AgentEffect> = recovered
+        .due_effects()
+        .expect("due effects should decode after restart")
+        .into_iter()
+        .map(|due| due.effect)
+        .collect();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].effect_id, effect_id);
+
+    // Reconciliation re-links the node to its in-flight effect.
+    let reconciled = bridge.reconcile_recovered_effects(persisted_state, &effects);
+    assert_eq!(
+        reconciled.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    let effect_node = reconciled
+        .state
+        .node_states
+        .get(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist");
+    assert_eq!(effect_node.status, AgentGraphNodeStatus::Waiting);
+    assert!(effect_node.scheduled_effect_ids.contains(&effect_id));
+
+    // Idempotent: a second reconciliation pass over the same effects is a no-op.
+    let again = bridge.reconcile_recovered_effects(reconciled.state.clone(), &effects);
+    assert!(again.changed_node_ids.is_empty());
+
+    // The effect completion now applies instead of failing with UnknownEffect.
+    let command = bridge
+        .effect_completed_command(
+            graph_command_metadata(&plan, run_id, "cmd-effect-relinked-completed", 300),
+            effect_id,
+            None,
+        )
+        .expect("effect completion command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, reconciled.state, command, &mut recovered)
+        .await
+        .expect("relinked effect completion should apply");
+    assert_eq!(
+        graph_node_status(&outcome.transition.state, "effect"),
+        AgentGraphNodeStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn crash_during_event_sink_write_preserves_persisted_graph_state() {
     let workflow = workflow();
     let run_store = RunStore::new();

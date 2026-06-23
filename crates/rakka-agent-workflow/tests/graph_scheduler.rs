@@ -78,6 +78,59 @@ fn scheduler_runs_linear_graph_in_deterministic_order() {
 }
 
 #[test]
+fn scheduler_runs_node_reachable_only_through_optional_input() {
+    // Regression: a non-entry node whose only incoming edge targets an optional
+    // input port has no *required* incoming edges. It must still become runnable
+    // once that optional upstream settles, rather than stalling forever in
+    // Pending (which previously left the graph with no runnable nodes and no
+    // terminal status).
+    let scheduler = AgentGraphScheduler::new();
+    let plan = optional_input_terminal_plan();
+    let mut state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("graph state should initialize");
+
+    let transition = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(110))
+        .expect("input should become runnable");
+    assert_eq!(node_ids(&transition.runnable_node_ids), vec!["input"]);
+    state = transition.state;
+    state = scheduler
+        .start_node(&plan, state, "input", ts(120))
+        .expect("input should start")
+        .state;
+    state = scheduler
+        .complete_node(&plan, state, "input", ts(130))
+        .expect("input should complete")
+        .state;
+
+    let ready = scheduler
+        .compute_ready_nodes(&plan, &state)
+        .expect("ready set should compute");
+    assert_eq!(node_ids(&ready), vec!["terminal"]);
+
+    let transition = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(140))
+        .expect("terminal should become runnable through its optional input");
+    assert_eq!(node_ids(&transition.runnable_node_ids), vec!["terminal"]);
+    state = transition.state;
+    state = scheduler
+        .start_node(&plan, state, "terminal", ts(150))
+        .expect("terminal should start")
+        .state;
+    state = scheduler
+        .complete_node(&plan, state, "terminal", ts(160))
+        .expect("terminal should complete graph")
+        .state;
+
+    assert_eq!(
+        node_state(&state, "terminal").status,
+        AgentGraphNodeStatus::Terminal
+    );
+    assert!(state.terminal_status.is_some());
+}
+
+#[test]
 fn scheduler_recomputes_ready_set_after_command_acceptance_crash() {
     let scheduler = AgentGraphScheduler::new();
     let plan = linear_plan();
@@ -756,6 +809,36 @@ fn linear_plan() -> AgentCompiledExecutionPlan {
         "edge-transform-terminal",
         "transform",
         "result",
+        "terminal",
+        "result",
+    ))
+}
+
+fn optional_input_terminal_plan() -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
+        .input_port(
+            AgentCompiledPlanPort::new("result", AgentCompiledPortDirection::Input, "input")
+                .optional(),
+        );
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-optional-terminal-v1"),
+        AgentWorkflowId::new("workflow-optional-terminal"),
+        "optional-terminal",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:optional-terminal"),
+    )
+    .entry_node("input")
+    .node(terminal)
+    .node(input)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-terminal",
+        "input",
+        "payload",
         "terminal",
         "result",
     ))
