@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use crate::{AgentRunActorSnapshot, AgentRunId, AgentRunRuntimeError, AgentRunState};
+use crate::{
+    AgentGraphNodeStatus, AgentGraphRunProjection, AgentGraphWaitReason, AgentRunActorSnapshot,
+    AgentRunId, AgentRunRuntimeError, AgentRunState,
+};
 
 /// Operational snapshot name for aggregate runtime status.
 pub const SNAPSHOT_AGENT_WORKFLOW_RUNTIME: &str = "agent_workflow_runtime";
@@ -154,6 +157,7 @@ pub struct AgentRunOperationalSnapshot {
     open_checkpoint_count: usize,
     escalated_checkpoint_count: usize,
     due_checkpoint_count: usize,
+    graph: Option<AgentGraphRunProjection>,
     recovered: bool,
     terminal: bool,
     updated_at_millis: Option<u64>,
@@ -178,6 +182,11 @@ impl AgentRunOperationalSnapshot {
             open_checkpoint_count: run_state.map_or(0, open_checkpoint_count),
             escalated_checkpoint_count: run_state.map_or(0, escalated_checkpoint_count),
             due_checkpoint_count: run_state.map_or(0, due_checkpoint_count),
+            graph: snapshot.graph.clone().or_else(|| {
+                run_state
+                    .and_then(|state| state.graph_state.as_ref())
+                    .map(AgentGraphRunProjection::from_graph_state)
+            }),
             recovered: run_state.is_some(),
             terminal: run_state.is_some_and(is_terminal_run_state),
             updated_at_millis: run_state.map(|state| state.updated_at.as_millis()),
@@ -250,6 +259,12 @@ impl AgentRunOperationalSnapshot {
         self.due_checkpoint_count
     }
 
+    /// Graph execution projection, when this run uses compiled graph execution.
+    #[must_use]
+    pub fn graph(&self) -> Option<&AgentGraphRunProjection> {
+        self.graph.as_ref()
+    }
+
     /// Returns true when durable run state has recovered.
     #[must_use]
     pub const fn recovered(&self) -> bool {
@@ -307,6 +322,17 @@ pub struct AgentWorkflowRuntimeSnapshot {
     terminal_run_count: usize,
     pending_command_count: usize,
     due_effect_count: usize,
+    graph_run_count: usize,
+    graph_drain_blocker_count: usize,
+    graph_runnable_node_count: usize,
+    graph_running_node_count: usize,
+    graph_waiting_node_count: usize,
+    graph_effect_waiting_node_count: usize,
+    graph_timer_waiting_node_count: usize,
+    graph_human_waiting_node_count: usize,
+    graph_child_workflow_waiting_node_count: usize,
+    graph_failed_node_count: usize,
+    graph_blocked_run_count: usize,
     status_counts: Vec<AgentRunStatusCount>,
     max_sampled_runs: usize,
     truncated_runs: usize,
@@ -320,6 +346,17 @@ impl AgentWorkflowRuntimeSnapshot {
         let mut terminal_run_count = 0;
         let mut pending_command_count = 0;
         let mut due_effect_count = 0;
+        let mut graph_run_count = 0;
+        let mut graph_drain_blocker_count = 0;
+        let mut graph_runnable_node_count = 0;
+        let mut graph_running_node_count = 0;
+        let mut graph_waiting_node_count = 0;
+        let mut graph_effect_waiting_node_count = 0;
+        let mut graph_timer_waiting_node_count = 0;
+        let mut graph_human_waiting_node_count = 0;
+        let mut graph_child_workflow_waiting_node_count = 0;
+        let mut graph_failed_node_count = 0;
+        let mut graph_blocked_run_count = 0;
         for run in state.runs.values() {
             if let Some(status) = &run.status {
                 *status_counts.entry(status.clone()).or_default() += 1;
@@ -331,6 +368,26 @@ impl AgentWorkflowRuntimeSnapshot {
             }
             pending_command_count += run.pending_command_count;
             due_effect_count += run.due_effect_count;
+            if let Some(graph) = &run.graph {
+                graph_run_count += 1;
+                graph_drain_blocker_count +=
+                    graph.runnable_node_count + graph.running_node_count + graph.waiting_node_count;
+                graph_runnable_node_count += graph.runnable_node_count;
+                graph_running_node_count += graph.running_node_count;
+                graph_waiting_node_count += graph.waiting_node_count;
+                graph_effect_waiting_node_count +=
+                    graph_wait_reason_count(graph, AgentGraphWaitReason::Effect);
+                graph_timer_waiting_node_count +=
+                    graph_wait_reason_count(graph, AgentGraphWaitReason::Timer);
+                graph_human_waiting_node_count +=
+                    graph_wait_reason_count(graph, AgentGraphWaitReason::Human);
+                graph_child_workflow_waiting_node_count +=
+                    graph_wait_reason_count(graph, AgentGraphWaitReason::ChildWorkflow);
+                graph_failed_node_count += graph.failed_node_count;
+                if graph.blocked_reason_code.is_some() {
+                    graph_blocked_run_count += 1;
+                }
+            }
         }
 
         let sampled_runs = sample_runs(&state.runs, state.max_sampled_runs);
@@ -340,6 +397,17 @@ impl AgentWorkflowRuntimeSnapshot {
             terminal_run_count,
             pending_command_count,
             due_effect_count,
+            graph_run_count,
+            graph_drain_blocker_count,
+            graph_runnable_node_count,
+            graph_running_node_count,
+            graph_waiting_node_count,
+            graph_effect_waiting_node_count,
+            graph_timer_waiting_node_count,
+            graph_human_waiting_node_count,
+            graph_child_workflow_waiting_node_count,
+            graph_failed_node_count,
+            graph_blocked_run_count,
             status_counts: status_counts
                 .into_iter()
                 .map(|(status, count)| AgentRunStatusCount::new(status, count))
@@ -378,6 +446,72 @@ impl AgentWorkflowRuntimeSnapshot {
     #[must_use]
     pub const fn due_effect_count(&self) -> usize {
         self.due_effect_count
+    }
+
+    /// Number of observed runs with compiled graph state.
+    #[must_use]
+    pub const fn graph_run_count(&self) -> usize {
+        self.graph_run_count
+    }
+
+    /// Total graph nodes that can block drain across observed runs.
+    #[must_use]
+    pub const fn graph_drain_blocker_count(&self) -> usize {
+        self.graph_drain_blocker_count
+    }
+
+    /// Total runnable graph-node count across observed runs.
+    #[must_use]
+    pub const fn graph_runnable_node_count(&self) -> usize {
+        self.graph_runnable_node_count
+    }
+
+    /// Total running graph-node count across observed runs.
+    #[must_use]
+    pub const fn graph_running_node_count(&self) -> usize {
+        self.graph_running_node_count
+    }
+
+    /// Total waiting graph-node count across observed runs.
+    #[must_use]
+    pub const fn graph_waiting_node_count(&self) -> usize {
+        self.graph_waiting_node_count
+    }
+
+    /// Total graph-node count waiting for durable outbox effect completion.
+    #[must_use]
+    pub const fn graph_effect_waiting_node_count(&self) -> usize {
+        self.graph_effect_waiting_node_count
+    }
+
+    /// Total graph-node count waiting for durable timer completion.
+    #[must_use]
+    pub const fn graph_timer_waiting_node_count(&self) -> usize {
+        self.graph_timer_waiting_node_count
+    }
+
+    /// Total graph-node count waiting for human checkpoint decisions.
+    #[must_use]
+    pub const fn graph_human_waiting_node_count(&self) -> usize {
+        self.graph_human_waiting_node_count
+    }
+
+    /// Total graph-node count waiting for child workflow completion.
+    #[must_use]
+    pub const fn graph_child_workflow_waiting_node_count(&self) -> usize {
+        self.graph_child_workflow_waiting_node_count
+    }
+
+    /// Total failed graph-node count across observed runs.
+    #[must_use]
+    pub const fn graph_failed_node_count(&self) -> usize {
+        self.graph_failed_node_count
+    }
+
+    /// Number of observed graph runs with a blocked reason.
+    #[must_use]
+    pub const fn graph_blocked_run_count(&self) -> usize {
+        self.graph_blocked_run_count
     }
 
     /// Counts by run status label.
@@ -1017,6 +1151,16 @@ const fn is_terminal_run_state(state: &AgentRunState) -> bool {
             | crate::AgentRunStatus::Failed
             | crate::AgentRunStatus::Cancelled
     )
+}
+
+fn graph_wait_reason_count(graph: &AgentGraphRunProjection, reason: AgentGraphWaitReason) -> usize {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.status == AgentGraphNodeStatus::Waiting && node.wait_reason == Some(reason)
+        })
+        .count()
 }
 
 fn open_checkpoint_count(state: &AgentRunState) -> usize {

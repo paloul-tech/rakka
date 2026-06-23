@@ -4,13 +4,19 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchConcurrencyLimits,
-    AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherError,
+    AgentCausationId, AgentCompiledExecutionPlan, AgentCompiledNodeKind, AgentCompiledNodeTarget,
+    AgentCompiledPlanEdge, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
+    AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId,
+    AgentDeduplicationKey, AgentDispatchConcurrencyLimits, AgentDispatchIndexEntry,
+    AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherError,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorker,
     AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
     AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
-    AgentEffectSchedule, AgentEffectTarget, AgentIdempotencyKey, AgentRunId, AgentRunInbox,
-    AgentTimestampMillis,
+    AgentEffectSchedule, AgentEffectTarget, AgentGraphEffectBridge,
+    AgentGraphEffectScheduleRequest, AgentGraphNodeState, AgentGraphRunState, AgentGraphScheduler,
+    AgentGraphWaitReason, AgentIdempotencyKey, AgentRunId, AgentRunInbox, AgentTimestampMillis,
+    AgentWorkflowId, AgentWorkflowQueryIndex, InMemoryAgentWorkflowQueryIndex,
+    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
@@ -102,6 +108,100 @@ async fn multiple_workers_do_not_claim_same_effect_concurrently() {
         &clock,
         run_id,
         effect_id,
+        OutboxStatus::Dispatched,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dispatcher_worker_claims_graph_scheduled_effect_with_node_context() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan();
+    let graph_state = running_graph_effect_state(&plan);
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-dispatch-graph-claim");
+
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            graph_state,
+            graph_effect_request(run_id.clone(), "effect", 100),
+            &mut inbox,
+        )
+        .await
+        .expect("graph effect should schedule");
+    assert_eq!(
+        node_state(&scheduled.transition.state, "effect").wait_reason,
+        Some(AgentGraphWaitReason::Effect)
+    );
+
+    let mut worker = worker(
+        "dispatcher-graph",
+        fleet_store,
+        workflow_store.clone(),
+        clock.clone(),
+        metrics,
+        AgentDispatcherFleetSettings::new(8, 1_000),
+    );
+    worker.recover().await.expect("fleet should recover");
+    worker
+        .refresh_run(run_id.clone(), Some(plan.workflow_id.clone()))
+        .await
+        .expect("graph effect should index");
+    let batch = worker
+        .claim_due()
+        .await
+        .expect("graph effect should be claimable");
+    assert_eq!(batch.claims.len(), 1);
+
+    let claim = batch.claims[0].clone();
+    let entry = worker
+        .fleet()
+        .state()
+        .expect("fleet state should be readable")
+        .entry(&claim.dispatch_id)
+        .expect("dispatch entry should exist");
+    assert_eq!(
+        entry.graph_plan_fingerprint,
+        Some(plan.plan_fingerprint.clone())
+    );
+    assert_eq!(
+        entry.graph_node_id.as_ref().map(|id| id.as_str()),
+        Some("effect")
+    );
+    assert_eq!(entry.graph_node_kind, Some(AgentCompiledNodeKind::ToolCall));
+    assert_eq!(
+        entry.attributes.get("node_kind").map(String::as_str),
+        Some("tool-call")
+    );
+
+    let snapshot = worker.fleet().snapshot(8);
+    assert_eq!(
+        snapshot.sampled_entries[0].graph_node_kind,
+        Some(AgentCompiledNodeKind::ToolCall)
+    );
+
+    let mut dispatcher = RecordingDispatcher::new([OutboxDispatchResult::Success]);
+    let completion = worker
+        .dispatch_claim(claim, &mut dispatcher)
+        .await
+        .expect("graph effect claim should dispatch");
+    assert_eq!(completion.entry.status, AgentDispatchStatus::Completed);
+    assert_eq!(
+        completion.entry.graph_node_kind,
+        Some(AgentCompiledNodeKind::ToolCall)
+    );
+    assert_outbox_status(
+        &workflow_store,
+        &clock,
+        run_id,
+        scheduled.effect.effect_id.as_str(),
         OutboxStatus::Dispatched,
     )
     .await;
@@ -209,6 +309,135 @@ async fn expired_claim_after_dispatching_is_recoverable_by_another_worker() {
         OutboxStatus::Dispatched,
     )
     .await;
+}
+
+#[tokio::test]
+async fn expired_graph_claim_is_recoverable_and_queryable_without_node_mutation() {
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan();
+    let graph_state = running_graph_effect_state(&plan);
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-dispatch-graph-expired");
+
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            graph_state,
+            graph_effect_request(run_id.clone(), "effect", 100),
+            &mut inbox,
+        )
+        .await
+        .expect("graph effect should schedule");
+    let waiting_graph_state = scheduled.transition.state;
+    let waiting_node = node_state(&waiting_graph_state, "effect").clone();
+
+    let settings = AgentDispatcherFleetSettings::new(8, 10);
+    let mut worker_a = worker(
+        "dispatcher-graph-expired-a",
+        fleet_store.clone(),
+        workflow_store.clone(),
+        clock.clone(),
+        metrics.clone(),
+        settings.clone(),
+    );
+    worker_a.recover().await.expect("fleet should recover");
+    worker_a
+        .refresh_run(run_id.clone(), Some(plan.workflow_id.clone()))
+        .await
+        .expect("graph effect should index");
+    let first_claim = worker_a
+        .claim_due()
+        .await
+        .expect("graph effect should claim")
+        .claims
+        .pop()
+        .expect("one graph claim should be issued");
+
+    let mut expiring_dispatcher = ExpiringDispatcher {
+        clock: clock.clone(),
+        advance_ms: 20,
+    };
+    let error = worker_a
+        .dispatch_claim(first_claim.clone(), &mut expiring_dispatcher)
+        .await
+        .expect_err("expired graph claim should be fenced");
+    assert!(matches!(error, AgentDispatcherError::ClaimFenced { .. }));
+    assert_eq!(node_state(&waiting_graph_state, "effect"), &waiting_node);
+
+    let stuck_entry = worker_a
+        .fleet()
+        .state()
+        .expect("fleet state should be readable")
+        .entry(&first_claim.dispatch_id)
+        .expect("stuck graph dispatch should be indexed")
+        .clone();
+    let mut query_index = InMemoryAgentWorkflowQueryIndex::new();
+    query_index
+        .upsert_dispatch(AgentDispatchIndexEntry::from_dispatch_entry(&stuck_entry))
+        .await
+        .expect("stuck graph dispatch should project");
+    let stuck = query_index
+        .query_dispatches(
+            AgentDispatchQuery::new()
+                .stuck_at_or_before(AgentTimestampMillis::new(120))
+                .graph_plan_fingerprint(plan.plan_fingerprint.clone())
+                .graph_node_id("effect")
+                .graph_node_kind(AgentCompiledNodeKind::ToolCall),
+        )
+        .await
+        .expect("stuck graph dispatch query should succeed");
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0].run_id, run_id);
+    assert_eq!(
+        stuck[0].graph_node_id.as_ref().map(|id| id.as_str()),
+        Some("effect")
+    );
+    assert_eq!(
+        stuck[0].graph_node_kind,
+        Some(AgentCompiledNodeKind::ToolCall)
+    );
+
+    let mut worker_b = worker(
+        "dispatcher-graph-expired-b",
+        fleet_store,
+        workflow_store.clone(),
+        clock.clone(),
+        metrics,
+        settings,
+    );
+    worker_b
+        .recover()
+        .await
+        .expect("second worker should recover fleet");
+    worker_b
+        .refresh_run(run_id, Some(plan.workflow_id.clone()))
+        .await
+        .expect("dispatching graph outbox entry should be rediscovered");
+    let second_claim = worker_b
+        .claim_due()
+        .await
+        .expect("expired graph claim should be claimable")
+        .claims
+        .pop()
+        .expect("one recovered graph claim should be issued");
+    assert!(second_claim.fencing_token > first_claim.fencing_token);
+    let recovered_entry = worker_b
+        .fleet()
+        .state()
+        .expect("fleet state should be readable")
+        .entry(&second_claim.dispatch_id)
+        .expect("recovered graph dispatch should exist");
+    assert_eq!(
+        recovered_entry.graph_node_kind,
+        Some(AgentCompiledNodeKind::ToolCall)
+    );
+    assert_eq!(node_state(&waiting_graph_state, "effect"), &waiting_node);
 }
 
 #[tokio::test]
@@ -383,6 +612,103 @@ async fn schedule_effect(
         .expect("effect should schedule");
 }
 
+fn running_graph_effect_state(plan: &AgentCompiledExecutionPlan) -> AgentGraphRunState {
+    let scheduler = AgentGraphScheduler::new();
+    let state = scheduler
+        .initialize_state(plan, AgentTimestampMillis::new(10))
+        .expect("graph state should initialize");
+    let state = scheduler
+        .mark_ready_nodes_runnable(plan, state, AgentTimestampMillis::new(20))
+        .expect("input should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(plan, state, "input", AgentTimestampMillis::new(30))
+        .expect("input should start")
+        .state;
+    let state = scheduler
+        .complete_node(plan, state, "input", AgentTimestampMillis::new(40))
+        .expect("input should complete")
+        .state;
+    let state = scheduler
+        .mark_ready_nodes_runnable(plan, state, AgentTimestampMillis::new(50))
+        .expect("effect should become runnable")
+        .state;
+    scheduler
+        .start_node(plan, state, "effect", AgentTimestampMillis::new(60))
+        .expect("effect should start")
+        .state
+}
+
+fn graph_effect_plan() -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let effect = AgentCompiledPlanNode::new("effect", AgentCompiledNodeKind::ToolCall)
+        .input_port(AgentCompiledPlanPort::new(
+            "payload",
+            AgentCompiledPortDirection::Input,
+            "input",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Output,
+            "effect-result",
+        ))
+        .target(
+            AgentCompiledNodeTarget::new("tool", "graph-search")
+                .address("tool://graph-search")
+                .attribute("target_class", "research"),
+        );
+    let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
+        .input_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Input,
+            "effect-result",
+        ));
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-dispatch-graph-v1"),
+        AgentWorkflowId::new("workflow-dispatch-graph"),
+        "dispatch-graph",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:dispatch-graph-v1"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(effect)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-effect",
+        "input",
+        "payload",
+        "effect",
+        "payload",
+    ))
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-effect-terminal",
+        "effect",
+        "result",
+        "terminal",
+        "result",
+    ))
+}
+
+fn graph_effect_request(
+    run_id: AgentRunId,
+    node_id: &str,
+    created_at_millis: u64,
+) -> AgentGraphEffectScheduleRequest {
+    AgentGraphEffectScheduleRequest::new(
+        run_id,
+        node_id,
+        AgentTimestampMillis::new(created_at_millis),
+        AgentCausationId::new("cause:graph-start"),
+        AgentCorrelationId::new("correlation:graph-dispatch"),
+    )
+    .expected_result_type("graph.effect.result")
+}
+
 async fn assert_outbox_status(
     store: &WorkflowStore,
     clock: &ManualWorkflowClock,
@@ -400,6 +726,13 @@ async fn assert_outbox_status(
         .outbox_entry(&message_id)
         .expect("outbox entry should exist");
     assert_eq!(entry.status(), expected);
+}
+
+fn node_state<'a>(state: &'a AgentGraphRunState, node_id: &str) -> &'a AgentGraphNodeState {
+    state
+        .node_states
+        .get(&rakka_agent_workflow::AgentCompiledNodeId::new(node_id))
+        .expect("node state should exist")
 }
 
 fn effect(

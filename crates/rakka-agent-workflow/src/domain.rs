@@ -8,6 +8,8 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+use crate::graph_state::AgentGraphRunState;
+
 macro_rules! string_id {
     ($(#[$meta:meta])* $vis:vis $name:ident) => {
         $(#[$meta])*
@@ -217,6 +219,8 @@ pub const BOUNDED_METRIC_FIELDS: &[&str] = &[
     "error_code",
     "retry_attempt_bucket",
     "tenant_tier",
+    "trigger_kind",
+    "deployment_channel",
     "redaction",
 ];
 
@@ -337,6 +341,9 @@ pub struct AgentRunState {
     pub definition_version: WorkflowDefinitionVersion,
     /// Serialized state schema version for this run state.
     pub state_schema_version: StateSchemaVersion,
+    /// Optional durable compiled-graph execution state for graph-backed runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_state: Option<AgentGraphRunState>,
     /// Current lifecycle status.
     pub status: AgentRunStatus,
     /// Current step cursor.

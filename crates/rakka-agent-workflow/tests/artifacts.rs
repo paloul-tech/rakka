@@ -125,6 +125,7 @@ fn run_state_with_references() -> AgentRunState {
         tenant: Some(AgentTenantId::new("tenant-a")),
         definition_version: WorkflowDefinitionVersion::new("v1"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status: AgentRunStatus::WaitingForEffect,
         current_step_id: Some(AgentStepId::new("model-step")),
         current_attempt: 1,

@@ -6,13 +6,19 @@ use std::time::Duration;
 
 use rakka_agent_workflow::{
     AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata,
+    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeTarget, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget,
+    AgentGraphEffectScheduleRequest, AgentGraphNodeStatus, AgentGraphRunProjection,
+    AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition, AgentGraphWaitReason,
     AgentIdempotencyKey, AgentInboxDuplicateReason, AgentPayloadDescriptor, AgentRunActor,
     AgentRunActorCommand, AgentRunActorSnapshot, AgentRunId, AgentRunState, AgentRunStatus,
     AgentRunTransition, AgentRunTransitionKind, AgentStatePayload, AgentStep, AgentStepId,
     AgentStepKind, AgentStepSuccess, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
     AgentWorkflowId, InlineState, StateSchemaVersion, WorkflowDefinitionVersion,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::{ActorRef, ActorSystem, InMemoryMetricsRecorder, Message};
 use rakka_persistence::InMemoryDurableStateStore;
@@ -190,6 +196,228 @@ async fn actor_recovers_due_effects_after_process_local_restart() {
     system.terminate().await.expect("system should terminate");
 }
 
+#[tokio::test]
+async fn local_actor_graph_run_completes_and_snapshots_node_counts() {
+    let system = ActorSystem::new("agent-runtime-graph-local");
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-runtime-graph-local");
+    let plan = Arc::new(local_graph_plan(&fixture.workflow));
+    let actor = spawn_actor(&system, "runtime-graph-local", &fixture, run_id.clone());
+
+    let started = start_graph(
+        &actor,
+        graph_accepted_run_state(&fixture.workflow, &run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    assert_eq!(started.kind, AgentRunTransitionKind::Start);
+    assert!(started.state.graph_state.is_some());
+
+    let ready = mark_graph_ready(&actor, plan.clone(), AgentTimestampMillis::new(110)).await;
+    assert_eq!(
+        ready.run_transition.kind,
+        AgentRunTransitionKind::GraphUpdated
+    );
+    assert_eq!(
+        ready.graph_transition.runnable_node_ids,
+        vec![node_id("input")]
+    );
+
+    let ready_snapshot = snapshot(&actor).await;
+    let graph = ready_snapshot
+        .graph
+        .as_ref()
+        .expect("actor snapshot should include graph summary");
+    assert_eq!(graph.node_count, 2);
+    assert_eq!(graph.runnable_node_count, 1);
+
+    start_graph_node(
+        &actor,
+        plan.clone(),
+        "input",
+        AgentTimestampMillis::new(120),
+    )
+    .await;
+    complete_graph_node(
+        &actor,
+        plan.clone(),
+        "input",
+        AgentTimestampMillis::new(130),
+    )
+    .await;
+    mark_graph_ready(&actor, plan.clone(), AgentTimestampMillis::new(140)).await;
+    start_graph_node(
+        &actor,
+        plan.clone(),
+        "terminal",
+        AgentTimestampMillis::new(150),
+    )
+    .await;
+    let completed =
+        complete_graph_node(&actor, plan, "terminal", AgentTimestampMillis::new(160)).await;
+
+    assert_eq!(
+        completed.run_transition.next_status,
+        AgentRunStatus::Completed
+    );
+    let final_snapshot = snapshot(&actor).await;
+    assert_eq!(
+        final_snapshot
+            .run_state
+            .as_ref()
+            .expect("run should remain durable")
+            .status,
+        AgentRunStatus::Completed
+    );
+    assert_eq!(
+        final_snapshot
+            .graph
+            .as_ref()
+            .expect("completed graph summary should remain visible")
+            .terminal_node_count,
+        1
+    );
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn actor_restart_after_graph_node_runnable_recovers_graph_state() {
+    let system = ActorSystem::new("agent-runtime-graph-runnable-restart");
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-runtime-graph-runnable");
+    let plan = Arc::new(local_graph_plan(&fixture.workflow));
+    let first = spawn_actor(
+        &system,
+        "runtime-graph-runnable-a",
+        &fixture,
+        run_id.clone(),
+    );
+
+    start_graph(
+        &first,
+        graph_accepted_run_state(&fixture.workflow, &run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    mark_graph_ready(&first, plan, AgentTimestampMillis::new(110)).await;
+
+    first.stop().expect("first actor should stop");
+    wait_until_terminated(&first).await;
+
+    let restarted = spawn_actor(
+        &system,
+        "runtime-graph-runnable-b",
+        &fixture,
+        run_id.clone(),
+    );
+    let recovered = snapshot(&restarted).await;
+    let graph = recovered
+        .graph
+        .as_ref()
+        .expect("graph summary should recover");
+
+    assert_eq!(graph.runnable_node_count, 1);
+    assert_eq!(node_status(graph, "input"), AgentGraphNodeStatus::Runnable);
+    assert_eq!(
+        recovered
+            .run_state
+            .expect("run state should recover")
+            .status,
+        AgentRunStatus::Running
+    );
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn actor_restart_after_graph_effect_scheduled_recovers_graph_and_due_effect() {
+    let system = ActorSystem::new("agent-runtime-graph-effect-restart");
+    let fixture = RuntimeFixture::new(workflow());
+    let run_id = AgentRunId::new("run-runtime-graph-effect");
+    let plan = Arc::new(effect_graph_plan(&fixture.workflow));
+    let first = spawn_actor(&system, "runtime-graph-effect-a", &fixture, run_id.clone());
+
+    start_graph(
+        &first,
+        graph_accepted_run_state(&fixture.workflow, &run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    mark_graph_ready(&first, plan.clone(), AgentTimestampMillis::new(110)).await;
+    start_graph_node(
+        &first,
+        plan.clone(),
+        "input",
+        AgentTimestampMillis::new(120),
+    )
+    .await;
+    complete_graph_node(
+        &first,
+        plan.clone(),
+        "input",
+        AgentTimestampMillis::new(130),
+    )
+    .await;
+    mark_graph_ready(&first, plan.clone(), AgentTimestampMillis::new(140)).await;
+    start_graph_node(
+        &first,
+        plan.clone(),
+        "effect",
+        AgentTimestampMillis::new(150),
+    )
+    .await;
+
+    let scheduled =
+        schedule_graph_effect(&first, plan, effect_request(run_id.clone(), "effect", 160)).await;
+    assert!(scheduled.effect_outcome.acceptance.is_scheduled());
+    assert_eq!(
+        scheduled
+            .effect_outcome
+            .transition
+            .state
+            .node_states
+            .get(&node_id("effect"))
+            .expect("effect node state should exist")
+            .wait_reason,
+        Some(AgentGraphWaitReason::Effect)
+    );
+
+    first.stop().expect("first actor should stop");
+    wait_until_terminated(&first).await;
+
+    let restarted = spawn_actor(&system, "runtime-graph-effect-b", &fixture, run_id.clone());
+    let due = restarted
+        .ask(
+            |reply_to| AgentRunActorCommand::DueEffects { reply_to },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("due effects ask should reply")
+        .expect("due effects should decode");
+    assert_eq!(due.len(), 1);
+    assert_eq!(
+        due[0].effect.effect_id,
+        AgentEffectId::new(
+            "graph-effect:run=run-runtime-graph-effect;plan=sha256:runtime-effect-graph;node=effect;loop=root;kind=tool-call;target_class=tool"
+        )
+    );
+
+    let recovered = snapshot(&restarted).await;
+    assert_eq!(recovered.due_effect_count, 1);
+    let graph = recovered
+        .graph
+        .as_ref()
+        .expect("graph summary should recover");
+    assert_eq!(graph.waiting_node_count, 1);
+    assert_eq!(node_status(graph, "effect"), AgentGraphNodeStatus::Waiting);
+
+    system.terminate().await.expect("system should terminate");
+}
+
 fn spawn_actor(
     system: &ActorSystem,
     name: &str,
@@ -234,6 +462,107 @@ async fn start(actor: &TestActorRef, initial_state: AgentRunState) -> AgentRunTr
         .await
         .expect("start ask should reply")
         .expect("start should succeed")
+}
+
+async fn start_graph(
+    actor: &TestActorRef,
+    initial_state: AgentRunState,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    now: AgentTimestampMillis,
+) -> AgentRunTransition {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::StartGraph {
+                initial_state,
+                plan,
+                now,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("start graph ask should reply")
+        .expect("start graph should succeed")
+}
+
+async fn mark_graph_ready(
+    actor: &TestActorRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    now: AgentTimestampMillis,
+) -> AgentGraphRuntimeTransition {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::MarkGraphReady {
+                plan,
+                now,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("mark graph ready ask should reply")
+        .expect("mark graph ready should succeed")
+}
+
+async fn start_graph_node(
+    actor: &TestActorRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    node_id_value: &str,
+    now: AgentTimestampMillis,
+) -> AgentGraphRuntimeTransition {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::StartGraphNode {
+                plan,
+                node_id: node_id(node_id_value),
+                now,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("start graph node ask should reply")
+        .expect("start graph node should succeed")
+}
+
+async fn complete_graph_node(
+    actor: &TestActorRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    node_id_value: &str,
+    now: AgentTimestampMillis,
+) -> AgentGraphRuntimeTransition {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::CompleteGraphNode {
+                plan,
+                node_id: node_id(node_id_value),
+                now,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("complete graph node ask should reply")
+        .expect("complete graph node should succeed")
+}
+
+async fn schedule_graph_effect(
+    actor: &TestActorRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    request: AgentGraphEffectScheduleRequest,
+) -> AgentGraphRuntimeEffectOutcome {
+    actor
+        .ask(
+            |reply_to| AgentRunActorCommand::ScheduleGraphNodeEffect {
+                plan,
+                request,
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("schedule graph effect ask should reply")
+        .expect("schedule graph effect should succeed")
 }
 
 async fn begin_step(actor: &TestActorRef, now: AgentTimestampMillis) -> AgentRunTransition {
@@ -324,6 +653,7 @@ fn accepted_run_state(
         tenant: Some(AgentTenantId::new("tenant-runtime")),
         definition_version: workflow.definition_version.clone(),
         state_schema_version: workflow.state_schema_version,
+        graph_state: None,
         status: AgentRunStatus::Accepted,
         current_step_id: Some(first_step_id),
         current_attempt: 0,
@@ -337,6 +667,143 @@ fn accepted_run_state(
         updated_at: AgentTimestampMillis::new(100),
         completed_at: None,
     }
+}
+
+fn graph_accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRunState {
+    AgentRunState {
+        run_id: run_id.clone(),
+        workflow_id: workflow.workflow_id.clone(),
+        tenant: Some(AgentTenantId::new("tenant-runtime")),
+        definition_version: workflow.definition_version.clone(),
+        state_schema_version: workflow.state_schema_version,
+        graph_state: None,
+        status: AgentRunStatus::Accepted,
+        current_step_id: None,
+        current_attempt: 0,
+        inputs_ref: None,
+        state_payload: AgentStatePayload::Empty,
+        checkpoints: Vec::new(),
+        pending_effects: Vec::new(),
+        pending_human_checkpoint: None,
+        cancellation: None,
+        created_at: AgentTimestampMillis::new(100),
+        updated_at: AgentTimestampMillis::new(100),
+        completed_at: None,
+    }
+}
+
+fn local_graph_plan(workflow: &AgentWorkflow) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "payload"),
+    );
+    let terminal =
+        AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+            AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Input, "payload"),
+        );
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-runtime-local-graph"),
+        workflow.workflow_id.clone(),
+        workflow.workflow_type.clone(),
+        workflow.definition_version.clone(),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:runtime-local-graph"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-terminal",
+        "input",
+        "payload",
+        "terminal",
+        "payload",
+    ))
+}
+
+fn effect_graph_plan(workflow: &AgentWorkflow) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let effect = AgentCompiledPlanNode::new("effect", AgentCompiledNodeKind::ToolCall)
+        .input_port(AgentCompiledPlanPort::new(
+            "payload",
+            AgentCompiledPortDirection::Input,
+            "input",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Output,
+            "effect-result",
+        ))
+        .target(
+            AgentCompiledNodeTarget::new("tool", "runtime-tool")
+                .address("tool://runtime-tool")
+                .attribute("target_class", "tool"),
+        );
+    let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
+        .input_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Input,
+            "effect-result",
+        ));
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-runtime-effect-graph"),
+        workflow.workflow_id.clone(),
+        workflow.workflow_type.clone(),
+        workflow.definition_version.clone(),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:runtime-effect-graph"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(effect)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-effect",
+        "input",
+        "payload",
+        "effect",
+        "payload",
+    ))
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-effect-terminal",
+        "effect",
+        "result",
+        "terminal",
+        "result",
+    ))
+}
+
+fn effect_request(
+    run_id: AgentRunId,
+    node_id_value: &str,
+    created_at_millis: u64,
+) -> AgentGraphEffectScheduleRequest {
+    AgentGraphEffectScheduleRequest::new(
+        run_id,
+        node_id_value,
+        AgentTimestampMillis::new(created_at_millis),
+        AgentCausationId::new("cause:runtime-graph"),
+        AgentCorrelationId::new("corr:runtime-graph"),
+    )
+    .due_at(AgentTimestampMillis::new(100))
+    .timeout_ms(1_000)
+    .expected_result_type("runtime.effect.result")
+}
+
+fn node_id(value: &str) -> AgentCompiledNodeId {
+    AgentCompiledNodeId::new(value)
+}
+
+fn node_status(graph: &AgentGraphRunProjection, node_id_value: &str) -> AgentGraphNodeStatus {
+    graph
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id(node_id_value))
+        .expect("graph node projection should exist")
+        .status
 }
 
 fn start_command(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentCommand {

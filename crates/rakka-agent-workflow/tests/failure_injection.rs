@@ -6,18 +6,28 @@ use std::sync::Arc;
 use rakka_agent_workflow::{
     timer_fired_command, AgentAdapterOutcome, AgentAdapterReceipt, AgentCausationId, AgentCommand,
     AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCorrelationId,
-    AgentDeduplicationKey, AgentDispatcherError, AgentDispatcherFleetSettings,
-    AgentDispatcherFleetState, AgentDispatcherWorker, AgentDispatcherWorkerId,
-    AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture, AgentEffectDispatcher,
-    AgentEffectId, AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget,
+    AgentCredentialBindingRef, AgentDeduplicationKey, AgentDispatcherError,
+    AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorker,
+    AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
+    AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
+    AgentEffectSchedule, AgentEffectTarget, AgentGraphEffectBridge,
+    AgentGraphEffectScheduleRequest, AgentGraphNodeStatus, AgentGraphRuntime, AgentGraphScheduler,
     AgentHumanApprovalRequest, AgentHumanCheckpointRuntime, AgentHumanDecisionSubmission,
     AgentIdempotencyKey, AgentInboxDuplicateReason, AgentRunId, AgentRunInbox, AgentRunState,
-    AgentRunStatus, AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload, AgentStep,
-    AgentStepId, AgentStepKind, AgentStepRunner, AgentTenantId, AgentTimerEntry, AgentTimerId,
-    AgentTimerPolicy, AgentTimerScanner, AgentTimerScannerSettings, AgentTimerStatus,
+    AgentRunStatus, AgentRunTransitionKind, AgentRunWaitReason, AgentRuntimeEventDraft,
+    AgentRuntimeEventKind, AgentRuntimeEventSink, AgentStatePayload, AgentStep, AgentStepId,
+    AgentStepKind, AgentStepRunner, AgentTelemetryContext, AgentTenantId, AgentTimerEntry,
+    AgentTimerId, AgentTimerPolicy, AgentTimerScanner, AgentTimerScannerSettings, AgentTimerStatus,
     AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
-    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, PrincipalRef,
-    RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
+    HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
+    InMemoryAgentRuntimeEventSink, PrincipalRef, RedactionStatus, StateSchemaVersion,
+    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+};
+use rakka_agent_workflow::{
+    AgentCompiledExecutionPlan, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeTarget, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort, AgentCompiledPortDirection,
+    AgentGraphRunState,
 };
 use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
@@ -354,6 +364,309 @@ async fn timer_firing_after_scanner_restart_does_not_resume_twice() {
     );
 }
 
+#[tokio::test]
+async fn crash_after_graph_initialization_recovers_initialized_state() {
+    let workflow = workflow();
+    let run_store = RunStore::new();
+    let runtime = AgentGraphRuntime::new();
+    let plan = graph_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-initialization-crash");
+
+    let mut first = AgentStepRunner::new(workflow.clone(), run_id.clone(), run_store.clone());
+    first.recover().await.expect("runner should recover");
+    runtime
+        .start_graph_run(
+            &mut first,
+            graph_accepted_run_state(&workflow, &run_id),
+            &plan,
+            ts(100),
+        )
+        .await
+        .expect("graph initialization should persist");
+    drop(first);
+
+    let recovered = recover_run(&workflow, &run_store, &run_id).await;
+    let graph = recovered
+        .graph_state
+        .as_ref()
+        .expect("graph state should recover after crash");
+    assert_eq!(graph.plan_id, plan.plan_id);
+    assert_eq!(graph.scheduler_revision, 0);
+    assert_eq!(graph.node_states.len(), 2);
+    assert_eq!(
+        graph_node_status(graph, "input"),
+        AgentGraphNodeStatus::Pending
+    );
+
+    let mut restarted = AgentStepRunner::new(workflow, run_id, run_store);
+    restarted.recover().await.expect("runner should recover");
+    let ready = runtime
+        .mark_ready_nodes(&mut restarted, &plan, ts(110))
+        .await
+        .expect("recovered graph should continue scheduling");
+    assert_eq!(
+        ready.graph_transition.runnable_node_ids,
+        vec![AgentCompiledNodeId::new("input")]
+    );
+    assert_eq!(
+        graph_node_status(&ready.graph_transition.state, "input"),
+        AgentGraphNodeStatus::Runnable
+    );
+}
+
+#[tokio::test]
+async fn crash_after_graph_runnable_mark_replays_without_duplicate_advancement() {
+    let workflow = workflow();
+    let run_store = RunStore::new();
+    let runtime = AgentGraphRuntime::new();
+    let plan = graph_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-runnable-crash");
+
+    let mut first = AgentStepRunner::new(workflow.clone(), run_id.clone(), run_store.clone());
+    first.recover().await.expect("runner should recover");
+    runtime
+        .start_graph_run(
+            &mut first,
+            graph_accepted_run_state(&workflow, &run_id),
+            &plan,
+            ts(100),
+        )
+        .await
+        .expect("graph initialization should persist");
+    let ready = runtime
+        .mark_ready_nodes(&mut first, &plan, ts(110))
+        .await
+        .expect("ready nodes should persist before crash");
+    assert_eq!(ready.graph_transition.state.scheduler_revision, 1);
+    assert_eq!(
+        ready.graph_transition.changed_node_ids,
+        vec![AgentCompiledNodeId::new("input")]
+    );
+    drop(first);
+
+    let mut restarted = AgentStepRunner::new(workflow, run_id, run_store);
+    restarted.recover().await.expect("runner should recover");
+    let replayed = runtime
+        .mark_ready_nodes(&mut restarted, &plan, ts(120))
+        .await
+        .expect("replayed ready evaluation should be idempotent");
+    assert!(replayed.graph_transition.changed_node_ids.is_empty());
+    assert_eq!(replayed.graph_transition.state.scheduler_revision, 1);
+    assert_eq!(
+        graph_node_status(&replayed.graph_transition.state, "input"),
+        AgentGraphNodeStatus::Runnable
+    );
+}
+
+#[tokio::test]
+async fn crash_after_effect_callback_acceptance_applies_graph_transition_once() {
+    let workflow = workflow();
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-callback-acceptance-crash");
+    let workflow_store = WorkflowStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            graph_running_effect_state(&plan),
+            graph_effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect node should schedule durable work");
+    let waiting_state = scheduled.transition.state;
+    let command = bridge
+        .effect_completed_command(
+            graph_command_metadata(&plan, run_id.clone(), "cmd-graph-effect-completed", 300),
+            scheduled.effect.effect_id,
+            None,
+        )
+        .expect("effect completion command should build");
+
+    let accepted = inbox
+        .accept_command(command.clone())
+        .await
+        .expect("callback command should persist before graph transition");
+    assert!(accepted.is_accepted());
+    drop(inbox);
+
+    let mut recovered = AgentRunInbox::with_clock(run_id, workflow_store, clock);
+    recovered
+        .recover()
+        .await
+        .expect("accepted callback should recover");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, waiting_state, command.clone(), &mut recovered)
+        .await
+        .expect("duplicate accepted callback should still apply graph transition");
+    assert!(outcome.acceptance.is_duplicate());
+    assert_eq!(
+        graph_node_status(&outcome.transition.state, "effect"),
+        AgentGraphNodeStatus::Completed
+    );
+    let completed_revision = outcome.transition.state.scheduler_revision;
+
+    let duplicate = bridge
+        .accept_and_apply_effect_completed(&plan, outcome.transition.state, command, &mut recovered)
+        .await
+        .expect("already completed node should not advance twice");
+    assert!(duplicate.acceptance.is_duplicate());
+    assert!(duplicate.transition.changed_node_ids.is_empty());
+    assert_eq!(
+        duplicate.transition.state.scheduler_revision,
+        completed_revision
+    );
+}
+
+#[tokio::test]
+async fn crash_between_effect_outbox_write_and_graph_persist_relinks_on_recovery() {
+    // Reproduces the non-atomic schedule window: the effect is committed to the
+    // durable outbox, but the graph transition that records the node's
+    // scheduled_effect_ids + Waiting status is never persisted (crash before the
+    // run-state write). Recovery must re-link the node so the in-flight effect's
+    // completion is not orphaned with an UnknownEffect error.
+    let workflow = workflow();
+    let bridge = AgentGraphEffectBridge::new();
+    let plan = graph_effect_plan(&workflow);
+    let run_id = AgentRunId::new("run-graph-effect-relink-on-recovery");
+    let workflow_store = WorkflowStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(200));
+
+    // Durably-persisted graph state at the moment of the crash: the effect node
+    // is Running with no scheduled effect recorded yet.
+    let persisted_state = graph_running_effect_state(&plan);
+
+    let mut inbox =
+        AgentRunInbox::with_clock(run_id.clone(), workflow_store.clone(), clock.clone());
+    inbox.recover().await.expect("inbox should recover");
+    let scheduled = bridge
+        .schedule_node_effect(
+            &plan,
+            persisted_state.clone(),
+            graph_effect_request(run_id.clone(), "effect", 200),
+            &mut inbox,
+        )
+        .await
+        .expect("effect should commit to the durable outbox");
+    let effect_id = scheduled.effect.effect_id.clone();
+    // Crash: drop the in-memory waiting transition without persisting it.
+    drop(scheduled);
+    drop(inbox);
+
+    // Recover: the outbox effect survives; the graph state is still the running
+    // (unlinked) snapshot.
+    let mut recovered = AgentRunInbox::with_clock(run_id.clone(), workflow_store, clock);
+    recovered
+        .recover()
+        .await
+        .expect("recovered inbox should reload the durable outbox effect");
+    let effects: Vec<AgentEffect> = recovered
+        .due_effects()
+        .expect("due effects should decode after restart")
+        .into_iter()
+        .map(|due| due.effect)
+        .collect();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].effect_id, effect_id);
+
+    // Reconciliation re-links the node to its in-flight effect.
+    let reconciled = bridge.reconcile_recovered_effects(persisted_state, &effects);
+    assert_eq!(
+        reconciled.changed_node_ids,
+        vec![AgentCompiledNodeId::new("effect")]
+    );
+    let effect_node = reconciled
+        .state
+        .node_states
+        .get(&AgentCompiledNodeId::new("effect"))
+        .expect("effect node should exist");
+    assert_eq!(effect_node.status, AgentGraphNodeStatus::Waiting);
+    assert!(effect_node.scheduled_effect_ids.contains(&effect_id));
+
+    // Idempotent: a second reconciliation pass over the same effects is a no-op.
+    let again = bridge.reconcile_recovered_effects(reconciled.state.clone(), &effects);
+    assert!(again.changed_node_ids.is_empty());
+
+    // The effect completion now applies instead of failing with UnknownEffect.
+    let command = bridge
+        .effect_completed_command(
+            graph_command_metadata(&plan, run_id, "cmd-effect-relinked-completed", 300),
+            effect_id,
+            None,
+        )
+        .expect("effect completion command should build");
+    let outcome = bridge
+        .accept_and_apply_effect_completed(&plan, reconciled.state, command, &mut recovered)
+        .await
+        .expect("relinked effect completion should apply");
+    assert_eq!(
+        graph_node_status(&outcome.transition.state, "effect"),
+        AgentGraphNodeStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn crash_during_event_sink_write_preserves_persisted_graph_state() {
+    let workflow = workflow();
+    let run_store = RunStore::new();
+    let runtime = AgentGraphRuntime::new();
+    let plan = graph_plan(&workflow);
+    let run_id = AgentRunId::new("run-event-sink-write-crash");
+
+    let mut runner = AgentStepRunner::new(workflow.clone(), run_id.clone(), run_store.clone());
+    runner.recover().await.expect("runner should recover");
+    runtime
+        .start_graph_run(
+            &mut runner,
+            graph_accepted_run_state(&workflow, &run_id),
+            &plan,
+            ts(100),
+        )
+        .await
+        .expect("graph should initialize");
+    let ready = runtime
+        .mark_ready_nodes(&mut runner, &plan, ts(110))
+        .await
+        .expect("graph transition should persist before event emission");
+    let persisted_graph = ready.graph_transition.state.clone();
+
+    let event = AgentRuntimeEventDraft::new(
+        workflow.workflow_id.clone(),
+        run_id.clone(),
+        workflow.definition_version.clone(),
+        ts(115),
+        AgentRuntimeEventKind::NodeRunnable,
+        AgentCausationId::new("cause:event-sink-write"),
+        AgentCorrelationId::new("corr:event-sink-write"),
+        AgentTelemetryContext::default(),
+    )
+    .node_id(AgentCompiledNodeId::new("input"))
+    .after_persistence(Some(&persisted_graph))
+    .expect("event draft should finalize")
+    .expect("persisted graph should produce runtime event");
+
+    let mut sink = InMemoryAgentRuntimeEventSink::new().fail_next_write("projection offline");
+    let error = sink
+        .record_runtime_event(event)
+        .await
+        .expect_err("sink write failure should be observable");
+    assert_eq!(error.code(), "runtime-event-sink");
+    assert!(sink.events().is_empty());
+    drop(runner);
+
+    let recovered = recover_run(&workflow, &run_store, &run_id).await;
+    assert_eq!(
+        recovered.graph_state.as_ref(),
+        Some(&persisted_graph),
+        "event sink failure must not roll back durable graph state"
+    );
+}
+
 #[test]
 fn model_provider_timeout_maps_to_retryable_durable_outbox_timeout() {
     let outcome = AgentAdapterOutcome::timed_out(
@@ -685,6 +998,7 @@ fn accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRun
         tenant: Some(AgentTenantId::new("tenant-phase7")),
         definition_version: workflow.definition_version.clone(),
         state_schema_version: workflow.state_schema_version,
+        graph_state: None,
         status: AgentRunStatus::Accepted,
         current_step_id: Some(AgentStepId::new("review")),
         current_attempt: 0,
@@ -698,6 +1012,170 @@ fn accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRun
         updated_at: ts(100),
         completed_at: None,
     }
+}
+
+fn graph_accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRunState {
+    let mut state = accepted_run_state(workflow, run_id);
+    state.current_step_id = None;
+    state
+}
+
+fn graph_plan(workflow: &AgentWorkflow) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let terminal =
+        AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+            AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Input, "input"),
+        );
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-failure-injection-linear"),
+        workflow.workflow_id.clone(),
+        workflow.workflow_type.clone(),
+        workflow.definition_version.clone(),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:failure-injection-linear"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-terminal",
+        "input",
+        "payload",
+        "terminal",
+        "payload",
+    ))
+}
+
+fn graph_effect_plan(workflow: &AgentWorkflow) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let effect_node = AgentCompiledPlanNode::new("effect", AgentCompiledNodeKind::ToolCall)
+        .input_port(AgentCompiledPlanPort::new(
+            "payload",
+            AgentCompiledPortDirection::Input,
+            "input",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Output,
+            "effect-result",
+        ))
+        .target(
+            AgentCompiledNodeTarget::new("tool", "failure-injection-tool")
+                .address("tool://failure-injection-tool")
+                .attribute("target_class", "tool"),
+        )
+        .credential_binding_ref(AgentCredentialBindingRef::new(
+            "credential:failure-injection-tool",
+        ));
+    let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
+        .input_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Input,
+            "effect-result",
+        ));
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-failure-injection-effect"),
+        workflow.workflow_id.clone(),
+        workflow.workflow_type.clone(),
+        workflow.definition_version.clone(),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:failure-injection-effect"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(effect_node)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-effect",
+        "input",
+        "payload",
+        "effect",
+        "payload",
+    ))
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-effect-terminal",
+        "effect",
+        "result",
+        "terminal",
+        "result",
+    ))
+}
+
+fn graph_running_effect_state(plan: &AgentCompiledExecutionPlan) -> AgentGraphRunState {
+    let scheduler = AgentGraphScheduler::new();
+    let state = scheduler
+        .initialize_state(plan, ts(100))
+        .expect("graph state should initialize");
+    let state = scheduler
+        .mark_ready_nodes_runnable(plan, state, ts(110))
+        .expect("input should become runnable")
+        .state;
+    let state = scheduler
+        .start_node(plan, state, "input", ts(120))
+        .expect("input should start")
+        .state;
+    let state = scheduler
+        .complete_node(plan, state, "input", ts(130))
+        .expect("input should complete")
+        .state;
+    let state = scheduler
+        .mark_ready_nodes_runnable(plan, state, ts(140))
+        .expect("effect should become runnable")
+        .state;
+    scheduler
+        .start_node(plan, state, "effect", ts(150))
+        .expect("effect should start")
+        .state
+}
+
+fn graph_effect_request(
+    run_id: AgentRunId,
+    node_id: &str,
+    created_at_millis: u64,
+) -> AgentGraphEffectScheduleRequest {
+    AgentGraphEffectScheduleRequest::new(
+        run_id,
+        node_id,
+        ts(created_at_millis),
+        AgentCausationId::new("cause:graph-effect"),
+        AgentCorrelationId::new("corr:graph-effect"),
+    )
+    .expected_result_type("effect.result")
+}
+
+fn graph_command_metadata(
+    plan: &AgentCompiledExecutionPlan,
+    run_id: AgentRunId,
+    command_id: &str,
+    received_at_millis: u64,
+) -> AgentCommandMetadata {
+    AgentCommandMetadata::new(
+        plan.workflow_id.clone(),
+        run_id,
+        AgentCommandId::new(command_id),
+        AgentDurabilityMetadata::new(
+            AgentDeduplicationKey::new(format!("dedupe-{command_id}")),
+            AgentCausationId::new(format!("cause-{command_id}")),
+            AgentCorrelationId::new("corr:graph-command"),
+        ),
+        AgentTenantId::new("tenant-phase7"),
+        ts(received_at_millis),
+    )
+    .expect("graph command metadata should validate")
+}
+
+fn graph_node_status(state: &AgentGraphRunState, node_id: &str) -> AgentGraphNodeStatus {
+    state
+        .node_states
+        .get(&AgentCompiledNodeId::new(node_id))
+        .expect("graph node should exist")
+        .status
 }
 
 fn target(target_type: &str, target_name: &str) -> AgentEffectTarget {

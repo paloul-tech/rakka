@@ -313,6 +313,7 @@ fn accepted_run_state(
         tenant: Some(AgentTenantId::new("tenant-timer")),
         definition_version: workflow.definition_version.clone(),
         state_schema_version: workflow.state_schema_version,
+        graph_state: None,
         status: AgentRunStatus::Accepted,
         current_step_id: Some(first_step_id),
         current_attempt: 0,

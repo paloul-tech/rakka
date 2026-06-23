@@ -20,10 +20,15 @@ pub mod adapters;
 pub mod artifacts;
 pub mod audit;
 pub mod checkpoints;
+pub mod compiled_plan;
+pub mod credentials;
 pub mod definition;
 pub mod dispatcher;
 pub mod domain;
+pub mod effect_bridge;
 pub mod facade;
+pub mod graph_scheduler;
+pub mod graph_state;
 pub mod inbox;
 #[cfg(feature = "k8s")]
 pub mod kubernetes;
@@ -37,6 +42,7 @@ pub mod query;
 pub mod retention;
 pub mod runner;
 pub mod runtime;
+pub mod runtime_events;
 #[cfg(feature = "sharding")]
 pub mod sharding;
 pub mod snapshots;
@@ -44,6 +50,7 @@ pub mod snapshots;
 pub mod testkit;
 pub mod timers;
 pub mod trace_context;
+pub mod triggers;
 
 #[cfg(feature = "process-tools")]
 pub use adapters::ProcessFileWatchToolAdapter;
@@ -84,9 +91,27 @@ pub use checkpoints::{
 pub use checkpoints::{
     human_decision_http_route, AgentHumanDecisionHttpResponse, DEFAULT_HUMAN_DECISION_HTTP_PATH,
 };
+pub use compiled_plan::{
+    validate_compiled_execution_plan, validate_compiled_execution_plan_with_catalog,
+    AgentCompiledEdgeId, AgentCompiledEdgeMergeBehavior, AgentCompiledExecutionPlan,
+    AgentCompiledIteratorPolicy, AgentCompiledNodeId, AgentCompiledNodeKind,
+    AgentCompiledNodeKindCatalog, AgentCompiledNodeKindDescriptor, AgentCompiledNodeTarget,
+    AgentCompiledPlanCompatibility, AgentCompiledPlanEdge, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCompiledPlanNode, AgentCompiledPlanPort,
+    AgentCompiledPlanRuntimeCapabilities, AgentCompiledPlanSchemaVersion,
+    AgentCompiledPlanValidationError, AgentCompiledPlanValidationResult,
+    AgentCompiledPortDirection, AgentCompiledPortId, AgentCompiledPortPolicy,
+    AgentCredentialBindingRef, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+};
+pub use credentials::{
+    credential_binding_ref_from_effect, AgentCredentialError, AgentCredentialResolutionRequest,
+    AgentCredentialResolver, AgentCredentialResolverFuture, AgentCredentialResult,
+    AgentCredentialUse, AgentEphemeralCredential, AgentEphemeralCredentialMaterial,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
+};
 pub use definition::{
-    AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry, AgentWorkflowRegistryError,
-    AgentWorkflowRegistryResult,
+    AgentCompiledWorkflowRegistration, AgentPayload, AgentWorkflowKey, AgentWorkflowRegistry,
+    AgentWorkflowRegistryError, AgentWorkflowRegistryResult,
 };
 pub use dispatcher::{
     agent_dispatch_id, agent_dispatch_timestamp_from_workflow_timestamp,
@@ -114,11 +139,28 @@ pub use domain::{
     RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion, BOUNDED_METRIC_FIELDS,
     FORBIDDEN_HOT_METRIC_FIELDS, TRACE_LOG_AUDIT_ID_FIELDS,
 };
+pub use effect_bridge::{
+    AgentGraphEffectBridge, AgentGraphEffectBridgeError, AgentGraphEffectBridgeResult,
+    AgentGraphEffectCommandOutcome, AgentGraphEffectFailureDisposition,
+    AgentGraphEffectScheduleOutcome, AgentGraphEffectScheduleRequest,
+    AgentGraphHumanCheckpointScheduleOutcome, AgentGraphHumanCheckpointScheduleRequest,
+    AgentGraphTimerScheduleOutcome, AgentGraphTimerScheduleRequest,
+};
 pub use facade::{
     validate_command, validate_command_metadata, validate_effect_metadata,
     validate_effect_schedule, AgentCommand, AgentCommandKind, AgentCommandMetadata,
     AgentDurabilityMetadata, AgentEffectMetadata, AgentEffectSchedule, AgentFacadeError,
     AgentFacadeResult,
+};
+pub use graph_scheduler::{
+    AgentGraphScheduler, AgentGraphSchedulerError, AgentGraphSchedulerResult,
+    AgentGraphSchedulerTransition,
+};
+pub use graph_state::{
+    AgentGraphBlockedReason, AgentGraphLoopInstanceState, AgentGraphNodeProjection,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunProjection, AgentGraphRunState,
+    AgentGraphStateSchemaVersion, AgentGraphTerminalStatus, AgentGraphWaitReason,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
 };
 pub use inbox::{
     agent_run_workflow_id, AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError,
@@ -149,16 +191,16 @@ pub use metrics::{
     AGENT_METRIC_ATTR_ARTIFACT_KIND, AGENT_METRIC_ATTR_CHECKPOINT_STATUS,
     AGENT_METRIC_ATTR_COMMAND_TYPE, AGENT_METRIC_ATTR_COMPONENT,
     AGENT_METRIC_ATTR_DATABASE_OPERATION, AGENT_METRIC_ATTR_DEFINITION_VERSION,
-    AGENT_METRIC_ATTR_DETAIL, AGENT_METRIC_ATTR_DIRECTION, AGENT_METRIC_ATTR_EFFECT_KIND,
-    AGENT_METRIC_ATTR_ENTITY_TYPE, AGENT_METRIC_ATTR_ERROR_CODE, AGENT_METRIC_ATTR_MESSAGE_TYPE,
-    AGENT_METRIC_ATTR_OPERATION, AGENT_METRIC_ATTR_OUTCOME, AGENT_METRIC_ATTR_QUEUE,
-    AGENT_METRIC_ATTR_REDACTION, AGENT_METRIC_ATTR_RETRY_ATTEMPT_BUCKET, AGENT_METRIC_ATTR_SIGNAL,
-    AGENT_METRIC_ATTR_STATUS, AGENT_METRIC_ATTR_STEP_KIND, AGENT_METRIC_ATTR_TARGET_CLASS,
-    AGENT_METRIC_ATTR_TENANT_TIER, AGENT_METRIC_ATTR_TIMER_STATUS, AGENT_METRIC_ATTR_TRANSITION,
-    AGENT_METRIC_ATTR_WORKFLOW_TYPE, AGENT_WORKFLOW_AUTOSCALING_SIGNALS,
-    AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES, AGENT_WORKFLOW_METRIC_INSTRUMENTS,
-    METRIC_AGENT_ACTIVE_RUNS, METRIC_AGENT_DISPATCH_LATENCY_MS, METRIC_AGENT_DUE_OUTBOX_EFFECTS,
-    METRIC_AGENT_HUMAN_WAITING_RUNS, METRIC_AGENT_MAILBOX_DEPTH,
+    AGENT_METRIC_ATTR_DEPLOYMENT_CHANNEL, AGENT_METRIC_ATTR_DETAIL, AGENT_METRIC_ATTR_DIRECTION,
+    AGENT_METRIC_ATTR_EFFECT_KIND, AGENT_METRIC_ATTR_ENTITY_TYPE, AGENT_METRIC_ATTR_ERROR_CODE,
+    AGENT_METRIC_ATTR_MESSAGE_TYPE, AGENT_METRIC_ATTR_OPERATION, AGENT_METRIC_ATTR_OUTCOME,
+    AGENT_METRIC_ATTR_QUEUE, AGENT_METRIC_ATTR_REDACTION, AGENT_METRIC_ATTR_RETRY_ATTEMPT_BUCKET,
+    AGENT_METRIC_ATTR_SIGNAL, AGENT_METRIC_ATTR_STATUS, AGENT_METRIC_ATTR_STEP_KIND,
+    AGENT_METRIC_ATTR_TARGET_CLASS, AGENT_METRIC_ATTR_TENANT_TIER, AGENT_METRIC_ATTR_TIMER_STATUS,
+    AGENT_METRIC_ATTR_TRANSITION, AGENT_METRIC_ATTR_TRIGGER_KIND, AGENT_METRIC_ATTR_WORKFLOW_TYPE,
+    AGENT_WORKFLOW_AUTOSCALING_SIGNALS, AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES,
+    AGENT_WORKFLOW_METRIC_INSTRUMENTS, METRIC_AGENT_ACTIVE_RUNS, METRIC_AGENT_DISPATCH_LATENCY_MS,
+    METRIC_AGENT_DUE_OUTBOX_EFFECTS, METRIC_AGENT_HUMAN_WAITING_RUNS, METRIC_AGENT_MAILBOX_DEPTH,
     METRIC_AGENT_PENDING_INBOX_COMMANDS, METRIC_AGENT_POSTGRES_LATENCY_MS,
     METRIC_AGENT_PROCESS_RUNNING, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RECOVERY_LATENCY_MS,
     METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_SHARD_OWNERSHIP_COUNT,
@@ -193,8 +235,9 @@ pub use outbox::{
 pub use postgres_query::{
     PostgresAgentWorkflowQueryIndex, PostgresAgentWorkflowQueryIndexBuilder,
     AGENT_WORKFLOW_AUDIT_INDEX_TABLE, AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE,
-    AGENT_WORKFLOW_DISPATCH_INDEX_TABLE, AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID,
-    AGENT_WORKFLOW_QUERY_MIGRATION_SQL, AGENT_WORKFLOW_RUN_INDEX_TABLE,
+    AGENT_WORKFLOW_DISPATCH_INDEX_TABLE, AGENT_WORKFLOW_GRAPH_NODE_INDEX_TABLE,
+    AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID, AGENT_WORKFLOW_QUERY_MIGRATION_SQL,
+    AGENT_WORKFLOW_RUNTIME_EVENT_PROJECTION_TABLE, AGENT_WORKFLOW_RUN_INDEX_TABLE,
     AGENT_WORKFLOW_TIMER_INDEX_TABLE, DEFAULT_AGENT_WORKFLOW_QUERY_NAMESPACE,
 };
 pub use query::{
@@ -214,8 +257,15 @@ pub use runner::{
     AGENT_RUN_PERSISTENCE_PREFIX,
 };
 pub use runtime::{
-    AgentRunActor, AgentRunActorCommand, AgentRunActorSnapshot, AgentRunRuntimeError,
-    AgentRunRuntimeResult,
+    AgentGraphRuntime, AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition, AgentRunActor,
+    AgentRunActorCommand, AgentRunActorSnapshot, AgentRunRuntimeError, AgentRunRuntimeResult,
+};
+pub use runtime_events::{
+    next_runtime_event_sequence, validate_runtime_event, validate_runtime_event_follows,
+    AgentRuntimeEvent, AgentRuntimeEventAcceptance, AgentRuntimeEventCorrelationFields,
+    AgentRuntimeEventDraft, AgentRuntimeEventError, AgentRuntimeEventKind,
+    AgentRuntimeEventProjection, AgentRuntimeEventResult, AgentRuntimeEventSink,
+    AgentRuntimeEventSinkFuture, AgentRuntimeEventWriteStatus, InMemoryAgentRuntimeEventSink,
 };
 #[cfg(feature = "sharding")]
 pub use sharding::{
@@ -254,6 +304,13 @@ pub use trace_context::{
     require_agent_trace_context, validate_agent_span_link, validate_agent_telemetry_context,
     AgentTraceContext, AgentTraceError, AgentTraceResult, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
+pub use triggers::{
+    trigger_cancel_run_command, trigger_human_decision_command, trigger_retry_run_command,
+    trigger_start_run_command, trigger_submit_signal_command, AgentTriggerCommandBuilder,
+    AgentTriggerSource, AgentTriggerSourceError, AgentTriggerSourceKind, AgentTriggerSourceResult,
+    AGENT_TRIGGER_DEPLOYMENT_CHANNEL_ATTRIBUTE, AGENT_TRIGGER_KIND_ATTRIBUTE,
+    AGENT_TRIGGER_TENANT_TIER_ATTRIBUTE,
+};
 
 /// Crate name used in diagnostics, docs, and feature-boundary notes.
 pub const CRATE_NAME: &str = "rakka-agent-workflow";
@@ -290,20 +347,22 @@ pub mod prelude {
         agent_timer_store_persistence_id, compact_agent_audit_events, compact_agent_run_state,
         extract_agent_trace_context, human_decision_command, inject_agent_trace_context,
         is_agent_autoscaling_metric, is_bounded_agent_metric_attribute,
-        is_forbidden_agent_metric_attribute, parse_agent_trace_context,
-        plan_agent_workflow_index_backfill, record_agent_counter, record_agent_gauge,
-        record_agent_histogram, repair_agent_workflow_index, require_agent_trace_context,
-        timer_fired_command, validate_agent_audit_event, validate_agent_log_event,
+        is_forbidden_agent_metric_attribute, next_runtime_event_sequence,
+        parse_agent_trace_context, plan_agent_workflow_index_backfill, record_agent_counter,
+        record_agent_gauge, record_agent_histogram, repair_agent_workflow_index,
+        require_agent_trace_context, timer_fired_command, trigger_cancel_run_command,
+        trigger_human_decision_command, trigger_retry_run_command, trigger_start_run_command,
+        trigger_submit_signal_command, validate_agent_audit_event, validate_agent_log_event,
         validate_agent_metric_attributes, validate_agent_span_link,
         validate_agent_telemetry_context, validate_artifact_ref, validate_effect_artifact_policy,
-        validate_inline_state, validate_run_state_artifact_policy, AgentAdapterError,
-        AgentAdapterFailureClass, AgentAdapterFuture, AgentAdapterOutcome, AgentAdapterReceipt,
-        AgentAdapterRequestMetadata, AgentAdapterResult, AgentAdapterUsage, AgentArtifactError,
-        AgentArtifactPolicy, AgentArtifactRead, AgentArtifactResult, AgentArtifactStore,
-        AgentArtifactStoreFuture, AgentArtifactWriteRequest, AgentAuditAcceptance,
-        AgentAuditCompaction, AgentAuditError, AgentAuditEvent, AgentAuditEventId,
-        AgentAuditEventKind, AgentAuditQuery, AgentAuditResult, AgentAuditSink,
-        AgentAuditSinkFuture, AgentAuditWriteStatus, AgentAutoscalingSignal,
+        validate_inline_state, validate_run_state_artifact_policy, validate_runtime_event,
+        validate_runtime_event_follows, AgentAdapterError, AgentAdapterFailureClass,
+        AgentAdapterFuture, AgentAdapterOutcome, AgentAdapterReceipt, AgentAdapterRequestMetadata,
+        AgentAdapterResult, AgentAdapterUsage, AgentArtifactError, AgentArtifactPolicy,
+        AgentArtifactRead, AgentArtifactResult, AgentArtifactStore, AgentArtifactStoreFuture,
+        AgentArtifactWriteRequest, AgentAuditAcceptance, AgentAuditCompaction, AgentAuditError,
+        AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentAuditQuery, AgentAuditResult,
+        AgentAuditSink, AgentAuditSinkFuture, AgentAuditWriteStatus, AgentAutoscalingSignal,
         AgentAutoscalingSignalRole, AgentCausationId, AgentCommand, AgentCommandId,
         AgentCommandKind, AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey,
         AgentDispatchClaim, AgentDispatchClaimBatch, AgentDispatchCompletion,
@@ -317,7 +376,8 @@ pub mod prelude {
         AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectDispatchFuture,
         AgentEffectDispatcher, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
         AgentEffectSchedule, AgentEffectStatus, AgentEffectTarget, AgentFacadeError,
-        AgentFacadeResult, AgentHumanApprovalRequest, AgentHumanCheckpointError,
+        AgentFacadeResult, AgentGraphRuntime, AgentGraphRuntimeEffectOutcome,
+        AgentGraphRuntimeTransition, AgentHumanApprovalRequest, AgentHumanCheckpointError,
         AgentHumanCheckpointOpening, AgentHumanCheckpointResult, AgentHumanCheckpointRuntime,
         AgentHumanDecisionResult, AgentHumanDecisionSubmission, AgentIdempotencyKey,
         AgentInboxAcceptance, AgentInboxDuplicateReason, AgentInboxError, AgentInboxResult,
@@ -334,26 +394,31 @@ pub mod prelude {
         AgentRunHumanCheckpointSnapshot, AgentRunId, AgentRunInbox, AgentRunIndexEntry,
         AgentRunQueryWaitingReason, AgentRunRuntimeError, AgentRunRuntimeResult, AgentRunState,
         AgentRunStateCompaction, AgentRunStatus, AgentRunTransition, AgentRunTransitionKind,
-        AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
-        AgentStepRunner, AgentStepSuccess, AgentTelemetryContext, AgentTenantId, AgentTimerEntry,
-        AgentTimerError, AgentTimerFiring, AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy,
-        AgentTimerQuery, AgentTimerResult, AgentTimerScan, AgentTimerScanner,
-        AgentTimerScannerSettings, AgentTimerStatus, AgentTimerStore, AgentTimerStoreState,
-        AgentToolAdapter, AgentToolRequest, AgentTraceContext, AgentTraceError, AgentTraceResult,
-        AgentWorkflow, AgentWorkflowBackfillAction, AgentWorkflowBackfillItem,
-        AgentWorkflowBackfillPlan, AgentWorkflowBackfillSource,
-        AgentWorkflowHumanCheckpointSnapshot, AgentWorkflowId, AgentWorkflowIndexSchemaVersion,
-        AgentWorkflowMigrationPolicy, AgentWorkflowOutboxSnapshot, AgentWorkflowQueryError,
-        AgentWorkflowQueryFuture, AgentWorkflowQueryIndex, AgentWorkflowQueryResult,
-        AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry, AgentWorkflowRegistryError,
-        AgentWorkflowRunQuery, AgentWorkflowRuntimeSnapshot, AgentWorkflowShardOwnership,
-        AgentWorkflowSnapshotRegistry, ArtifactEncryptionRef, ArtifactKind, ArtifactRef,
-        HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption,
-        InMemoryAgentAuditSink, InMemoryAgentOtlpReceiver, InMemoryAgentWorkflowQueryIndex,
-        RedactionStatus, StateSchemaVersion, WorkflowDefinitionVersion,
-        AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX, AGENT_LOG_ATTR_AUDIT_EVENT_ID,
-        AGENT_LOG_ATTR_AUDIT_KIND, AGENT_LOG_ATTR_CAUSATION_ID, AGENT_LOG_ATTR_CHECKPOINT_ID,
-        AGENT_LOG_ATTR_COMMAND_ID, AGENT_LOG_ATTR_CORRELATION_ID,
+        AgentRunWaitReason, AgentRuntimeEvent, AgentRuntimeEventAcceptance,
+        AgentRuntimeEventCorrelationFields, AgentRuntimeEventDraft, AgentRuntimeEventError,
+        AgentRuntimeEventKind, AgentRuntimeEventProjection, AgentRuntimeEventResult,
+        AgentRuntimeEventSink, AgentRuntimeEventSinkFuture, AgentRuntimeEventWriteStatus,
+        AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner,
+        AgentStepSuccess, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerError,
+        AgentTimerFiring, AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery,
+        AgentTimerResult, AgentTimerScan, AgentTimerScanner, AgentTimerScannerSettings,
+        AgentTimerStatus, AgentTimerStore, AgentTimerStoreState, AgentToolAdapter,
+        AgentToolRequest, AgentTraceContext, AgentTraceError, AgentTraceResult,
+        AgentTriggerCommandBuilder, AgentTriggerSource, AgentTriggerSourceError,
+        AgentTriggerSourceKind, AgentTriggerSourceResult, AgentWorkflow,
+        AgentWorkflowBackfillAction, AgentWorkflowBackfillItem, AgentWorkflowBackfillPlan,
+        AgentWorkflowBackfillSource, AgentWorkflowHumanCheckpointSnapshot, AgentWorkflowId,
+        AgentWorkflowIndexSchemaVersion, AgentWorkflowMigrationPolicy, AgentWorkflowOutboxSnapshot,
+        AgentWorkflowQueryError, AgentWorkflowQueryFuture, AgentWorkflowQueryIndex,
+        AgentWorkflowQueryResult, AgentWorkflowRecoverySnapshot, AgentWorkflowRegistry,
+        AgentWorkflowRegistryError, AgentWorkflowRunQuery, AgentWorkflowRuntimeSnapshot,
+        AgentWorkflowShardOwnership, AgentWorkflowSnapshotRegistry, ArtifactEncryptionRef,
+        ArtifactKind, ArtifactRef, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+        HumanDecisionOption, InMemoryAgentAuditSink, InMemoryAgentOtlpReceiver,
+        InMemoryAgentRuntimeEventSink, InMemoryAgentWorkflowQueryIndex, RedactionStatus,
+        StateSchemaVersion, WorkflowDefinitionVersion, AGENT_DISPATCHER_FLEET_PERSISTENCE_PREFIX,
+        AGENT_LOG_ATTR_AUDIT_EVENT_ID, AGENT_LOG_ATTR_AUDIT_KIND, AGENT_LOG_ATTR_CAUSATION_ID,
+        AGENT_LOG_ATTR_CHECKPOINT_ID, AGENT_LOG_ATTR_COMMAND_ID, AGENT_LOG_ATTR_CORRELATION_ID,
         AGENT_LOG_ATTR_DEFINITION_VERSION, AGENT_LOG_ATTR_EFFECT_ID, AGENT_LOG_ATTR_REDACTION,
         AGENT_LOG_ATTR_RUN_ID, AGENT_LOG_ATTR_STEP_ID, AGENT_LOG_ATTR_TENANT_ID,
         AGENT_LOG_ATTR_WORKFLOW_ID, AGENT_LOG_ATTR_WORKFLOW_TYPE, AGENT_LOG_INSTRUMENTATION_SCOPE,
@@ -361,14 +426,16 @@ pub mod prelude {
         AGENT_METRIC_ATTR_ARTIFACT_KIND, AGENT_METRIC_ATTR_CHECKPOINT_STATUS,
         AGENT_METRIC_ATTR_COMMAND_TYPE, AGENT_METRIC_ATTR_COMPONENT,
         AGENT_METRIC_ATTR_DATABASE_OPERATION, AGENT_METRIC_ATTR_DEFINITION_VERSION,
-        AGENT_METRIC_ATTR_DETAIL, AGENT_METRIC_ATTR_DIRECTION, AGENT_METRIC_ATTR_EFFECT_KIND,
-        AGENT_METRIC_ATTR_ENTITY_TYPE, AGENT_METRIC_ATTR_ERROR_CODE,
-        AGENT_METRIC_ATTR_MESSAGE_TYPE, AGENT_METRIC_ATTR_OPERATION, AGENT_METRIC_ATTR_OUTCOME,
-        AGENT_METRIC_ATTR_QUEUE, AGENT_METRIC_ATTR_REDACTION,
+        AGENT_METRIC_ATTR_DEPLOYMENT_CHANNEL, AGENT_METRIC_ATTR_DETAIL,
+        AGENT_METRIC_ATTR_DIRECTION, AGENT_METRIC_ATTR_EFFECT_KIND, AGENT_METRIC_ATTR_ENTITY_TYPE,
+        AGENT_METRIC_ATTR_ERROR_CODE, AGENT_METRIC_ATTR_MESSAGE_TYPE, AGENT_METRIC_ATTR_OPERATION,
+        AGENT_METRIC_ATTR_OUTCOME, AGENT_METRIC_ATTR_QUEUE, AGENT_METRIC_ATTR_REDACTION,
         AGENT_METRIC_ATTR_RETRY_ATTEMPT_BUCKET, AGENT_METRIC_ATTR_SIGNAL, AGENT_METRIC_ATTR_STATUS,
         AGENT_METRIC_ATTR_STEP_KIND, AGENT_METRIC_ATTR_TARGET_CLASS, AGENT_METRIC_ATTR_TENANT_TIER,
         AGENT_METRIC_ATTR_TIMER_STATUS, AGENT_METRIC_ATTR_TRANSITION,
-        AGENT_METRIC_ATTR_WORKFLOW_TYPE, AGENT_TIMER_PERSISTENCE_PREFIX,
+        AGENT_METRIC_ATTR_TRIGGER_KIND, AGENT_METRIC_ATTR_WORKFLOW_TYPE,
+        AGENT_TIMER_PERSISTENCE_PREFIX, AGENT_TRIGGER_DEPLOYMENT_CHANNEL_ATTRIBUTE,
+        AGENT_TRIGGER_KIND_ATTRIBUTE, AGENT_TRIGGER_TENANT_TIER_ATTRIBUTE,
         AGENT_WORKFLOW_AUTOSCALING_SIGNALS, AGENT_WORKFLOW_BOUNDED_METRIC_ATTRIBUTES,
         AGENT_WORKFLOW_METRIC_INSTRUMENTS, CRATE_NAME, CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
         DEFAULT_AGENT_ARTIFACT_RETENTION_CLASS, DEFAULT_AGENT_DISPATCHER_FLEET_ID,
@@ -429,8 +496,9 @@ pub mod prelude {
     pub use crate::{
         PostgresAgentWorkflowQueryIndex, PostgresAgentWorkflowQueryIndexBuilder,
         AGENT_WORKFLOW_AUDIT_INDEX_TABLE, AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE,
-        AGENT_WORKFLOW_DISPATCH_INDEX_TABLE, AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID,
-        AGENT_WORKFLOW_QUERY_MIGRATION_SQL, AGENT_WORKFLOW_RUN_INDEX_TABLE,
+        AGENT_WORKFLOW_DISPATCH_INDEX_TABLE, AGENT_WORKFLOW_GRAPH_NODE_INDEX_TABLE,
+        AGENT_WORKFLOW_QUERY_MIGRATION_LOCK_ID, AGENT_WORKFLOW_QUERY_MIGRATION_SQL,
+        AGENT_WORKFLOW_RUNTIME_EVENT_PROJECTION_TABLE, AGENT_WORKFLOW_RUN_INDEX_TABLE,
         AGENT_WORKFLOW_TIMER_INDEX_TABLE, DEFAULT_AGENT_WORKFLOW_QUERY_NAMESPACE,
     };
 

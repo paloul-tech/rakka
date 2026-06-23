@@ -204,6 +204,7 @@ fn run_state(run_id: &str, definition_version: &str, state_schema_version: u32) 
         tenant: None,
         definition_version: WorkflowDefinitionVersion::new(definition_version),
         state_schema_version: StateSchemaVersion::new(state_schema_version),
+        graph_state: None,
         status: AgentRunStatus::Running,
         current_step_id: Some(AgentStepId::new("step-plan")),
         current_attempt: 0,

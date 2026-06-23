@@ -63,6 +63,8 @@ fn high_cardinality_policy_separates_metrics_from_trace_log_audit_ids() {
     assert!(TRACE_LOG_AUDIT_ID_FIELDS.contains(&"deduplication_key"));
     assert!(BOUNDED_METRIC_FIELDS.contains(&"workflow_type"));
     assert!(BOUNDED_METRIC_FIELDS.contains(&"status"));
+    assert!(BOUNDED_METRIC_FIELDS.contains(&"trigger_kind"));
+    assert!(BOUNDED_METRIC_FIELDS.contains(&"deployment_channel"));
 }
 
 fn round_trip<T>(value: &T)
@@ -114,6 +116,7 @@ fn sample_run_state() -> AgentRunState {
         tenant: Some(AgentTenantId::new("tenant-a")),
         definition_version: WorkflowDefinitionVersion::new("2026-06-18"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status: AgentRunStatus::WaitingForHuman,
         current_step_id: Some(AgentStepId::new("approval")),
         current_attempt: 1,

@@ -1,16 +1,18 @@
 //! Workflow query model tests.
 
 use rakka_agent_workflow::{
-    AgentAttributes, AgentDeduplicationKey, AgentDispatchEntry, AgentDispatchId,
+    AgentAttributes, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentDeduplicationKey, AgentDispatchEntry, AgentDispatchId,
     AgentDispatchIndexEntry, AgentDispatchLease, AgentDispatchQuery, AgentDispatchStatus,
     AgentDispatchTargetClass, AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind,
-    AgentEffectTarget, AgentRunId, AgentRunIndexEntry, AgentRunQueryWaitingReason, AgentRunState,
-    AgentRunStatus, AgentStatePayload, AgentStepId, AgentTelemetryContext, AgentTenantId,
-    AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus,
-    AgentTimestampMillis, AgentWorkflowId, AgentWorkflowQueryIndex, AgentWorkflowRunQuery,
-    AgentWorkflowShardOwnership, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
-    InMemoryAgentWorkflowQueryIndex, PrincipalRef, RedactionStatus, StateSchemaVersion,
-    WorkflowDefinitionVersion,
+    AgentEffectTarget, AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState,
+    AgentGraphWaitReason, AgentRunId, AgentRunIndexEntry, AgentRunQueryWaitingReason,
+    AgentRunState, AgentRunStatus, AgentStatePayload, AgentStepId, AgentTelemetryContext,
+    AgentTenantId, AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery,
+    AgentTimerStatus, AgentTimestampMillis, AgentWorkflowId, AgentWorkflowQueryIndex,
+    AgentWorkflowRunQuery, AgentWorkflowShardOwnership, HumanCheckpoint, HumanCheckpointId,
+    HumanCheckpointStatus, InMemoryAgentWorkflowQueryIndex, PrincipalRef, RedactionStatus,
+    StateSchemaVersion, WorkflowDefinitionVersion,
 };
 use rakka_agent_workflow::{AgentCausationId, AgentCorrelationId, AgentTimerEntry};
 
@@ -245,6 +247,91 @@ async fn query_index_finds_due_timers_stuck_dispatchers_and_shard_owners() {
     assert!(recovered.is_empty());
 }
 
+#[tokio::test]
+async fn query_index_projects_and_filters_graph_state() {
+    let mut index = InMemoryAgentWorkflowQueryIndex::new();
+    let mut waiting = run_state(
+        "run-graph-waiting",
+        AgentRunStatus::WaitingForEffect,
+        "graph",
+        150,
+        None,
+    );
+    waiting.graph_state = Some(graph_state(
+        "plan-graph-v1",
+        "sha256:graph-v1",
+        "model",
+        AgentCompiledNodeKind::ModelCall,
+        AgentGraphNodeStatus::Waiting,
+        Some(AgentGraphWaitReason::Effect),
+        None,
+    ));
+    let mut failed = run_state(
+        "run-graph-failed",
+        AgentRunStatus::Failed,
+        "graph",
+        160,
+        None,
+    );
+    failed.graph_state = Some(graph_state(
+        "plan-graph-v2",
+        "sha256:graph-v2",
+        "tool",
+        AgentCompiledNodeKind::ToolCall,
+        AgentGraphNodeStatus::Failed,
+        None,
+        Some("tool-timeout"),
+    ));
+
+    upsert_run(&mut index, waiting).await;
+    upsert_run(&mut index, failed).await;
+
+    let waiting_projection = index
+        .runs()
+        .get(&AgentRunId::new("run-graph-waiting"))
+        .expect("waiting graph run should be indexed");
+    let graph = waiting_projection
+        .graph
+        .as_ref()
+        .expect("graph projection should exist");
+    assert_eq!(
+        graph.plan_fingerprint,
+        AgentCompiledPlanFingerprint::new("sha256:graph-v1")
+    );
+    assert_eq!(graph.waiting_node_count, 1);
+    assert_eq!(graph.nodes[0].kind, AgentCompiledNodeKind::ModelCall);
+
+    let by_fingerprint = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_plan_fingerprint(AgentCompiledPlanFingerprint::new("sha256:graph-v1")),
+        )
+        .await
+        .expect("graph fingerprint query should succeed");
+    assert_eq!(run_ids(&by_fingerprint), vec!["run-graph-waiting"]);
+
+    let waiting_model = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_node_status(AgentGraphNodeStatus::Waiting)
+                .graph_node_kind(AgentCompiledNodeKind::ModelCall)
+                .graph_wait_reason(AgentGraphWaitReason::Effect),
+        )
+        .await
+        .expect("graph node query should succeed");
+    assert_eq!(run_ids(&waiting_model), vec!["run-graph-waiting"]);
+
+    let failed_tool = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_node_kind(AgentCompiledNodeKind::ToolCall)
+                .graph_error_code("tool-timeout"),
+        )
+        .await
+        .expect("graph error query should succeed");
+    assert_eq!(run_ids(&failed_tool), vec!["run-graph-failed"]);
+}
+
 #[test]
 fn dispatch_projection_preserves_last_fencing_token_after_lease_clears() {
     let mut entry = dispatch("dispatch-completed", "run-completed", ts(120), ts(150));
@@ -300,6 +387,7 @@ fn run_state(
         tenant: Some(AgentTenantId::new("tenant-a")),
         definition_version: WorkflowDefinitionVersion::new("v1"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status,
         current_step_id: Some(AgentStepId::new(step_id)),
         current_attempt: 0,
@@ -318,6 +406,35 @@ fn run_state(
         )
         .then(|| ts(updated_at)),
     }
+}
+
+fn graph_state(
+    plan_id: &str,
+    fingerprint: &str,
+    node_id: &str,
+    kind: AgentCompiledNodeKind,
+    status: AgentGraphNodeStatus,
+    wait_reason: Option<AgentGraphWaitReason>,
+    error_code: Option<&str>,
+) -> AgentGraphRunState {
+    let mut node = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new(node_id),
+        kind,
+        AgentTimestampMillis::new(120),
+    )
+    .status(status)
+    .dependencies_ready(true);
+    if let Some(wait_reason) = wait_reason {
+        node = node.wait_reason(wait_reason);
+    }
+    if let Some(error_code) = error_code {
+        node = node.error_code(error_code);
+    }
+    AgentGraphRunState::new(
+        AgentCompiledPlanId::new(plan_id),
+        AgentCompiledPlanFingerprint::new(fingerprint),
+    )
+    .node_state(node)
 }
 
 fn checkpoint(checkpoint_id: &str, created_at: u64, due_at: Option<u64>) -> HumanCheckpoint {
@@ -380,6 +497,10 @@ fn dispatch(
             attributes: AgentAttributes::new(),
         },
         target_class: AgentDispatchTargetClass::Tool,
+        graph_plan_fingerprint: None,
+        graph_node_id: None,
+        graph_node_kind: None,
+        graph_loop_instance_id: None,
         due_at: ts(100),
         status: AgentDispatchStatus::Claimed,
         lease: Some(AgentDispatchLease {

@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use rakka_agent_workflow::{
     AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentEffect, AgentEffectId,
     AgentEffectKind, AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget,
-    AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunActor, AgentRunActorCommand, AgentRunId,
-    AgentRunState, AgentRunStatus, AgentRunTransition, AgentRunWaitReason, AgentStatePayload,
-    AgentStep, AgentStepId, AgentStepKind, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowId, AgentWorkflowSnapshotRegistry, StateSchemaVersion, WorkflowDefinitionVersion,
+    AgentGraphBlockedReason, AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState,
+    AgentGraphWaitReason, AgentIdempotencyKey, AgentPayloadDescriptor, AgentRunActor,
+    AgentRunActorCommand, AgentRunActorSnapshot, AgentRunId, AgentRunState, AgentRunStatus,
+    AgentRunTransition, AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId,
+    AgentStepKind, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
+    AgentWorkflowSnapshotRegistry, StateSchemaVersion, WorkflowDefinitionVersion,
 };
 use rakka_core::{ActorRef, ActorSystem};
 use rakka_persistence::InMemoryDurableStateStore;
@@ -135,6 +138,43 @@ async fn runtime_snapshots_report_status_pending_commands_due_effects_and_recove
     assert_eq!(recovery.sampled_runs()[0].run_id(), run_id.as_str());
 
     system.terminate().await.expect("system should terminate");
+}
+
+#[test]
+fn runtime_snapshot_reports_graph_summaries() {
+    let snapshots = AgentWorkflowSnapshotRegistry::new();
+    let run_id = AgentRunId::new("run-graph-snapshot");
+    let mut run = accepted_run_state(&workflow(), &run_id, AgentStepId::new("graph"));
+    run.graph_state = Some(graph_state());
+    snapshots.record_run_actor_snapshot(&AgentRunActorSnapshot {
+        run_id: run_id.clone(),
+        run_state: Some(run),
+        graph: None,
+        recoverable_command_count: 0,
+        due_effect_count: 0,
+    });
+
+    let runtime = snapshots.runtime_snapshot();
+
+    assert_eq!(runtime.graph_run_count(), 1);
+    assert_eq!(runtime.graph_drain_blocker_count(), 6);
+    assert_eq!(runtime.graph_runnable_node_count(), 1);
+    assert_eq!(runtime.graph_running_node_count(), 1);
+    assert_eq!(runtime.graph_waiting_node_count(), 4);
+    assert_eq!(runtime.graph_effect_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_timer_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_human_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_child_workflow_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_failed_node_count(), 1);
+    assert_eq!(runtime.graph_blocked_run_count(), 1);
+    let graph = runtime.sampled_runs()[0]
+        .graph()
+        .expect("sampled run should include graph summary");
+    assert_eq!(
+        graph.plan_fingerprint,
+        AgentCompiledPlanFingerprint::new("sha256:graph-snapshot")
+    );
+    assert_eq!(graph.nodes.len(), 7);
 }
 
 #[cfg(feature = "http")]
@@ -306,6 +346,7 @@ fn accepted_run_state(
         tenant: Some(AgentTenantId::new("tenant-runtime-snapshot")),
         definition_version: workflow.definition_version.clone(),
         state_schema_version: workflow.state_schema_version,
+        graph_state: None,
         status: AgentRunStatus::Accepted,
         current_step_id: Some(first_step_id),
         current_attempt: 0,
@@ -319,6 +360,76 @@ fn accepted_run_state(
         updated_at: AgentTimestampMillis::new(100),
         completed_at: None,
     }
+}
+
+fn graph_state() -> AgentGraphRunState {
+    let runnable = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("input"),
+        AgentCompiledNodeKind::Input,
+        AgentTimestampMillis::new(110),
+    )
+    .status(AgentGraphNodeStatus::Runnable)
+    .dependencies_ready(true);
+    let running = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("transform"),
+        AgentCompiledNodeKind::Transform,
+        AgentTimestampMillis::new(115),
+    )
+    .status(AgentGraphNodeStatus::Running)
+    .dependencies_ready(true);
+    let waiting = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("model"),
+        AgentCompiledNodeKind::ModelCall,
+        AgentTimestampMillis::new(120),
+    )
+    .status(AgentGraphNodeStatus::Waiting)
+    .dependencies_ready(true)
+    .wait_reason(AgentGraphWaitReason::Effect);
+    let waiting_timer = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("delay"),
+        AgentCompiledNodeKind::TimerWait,
+        AgentTimestampMillis::new(122),
+    )
+    .status(AgentGraphNodeStatus::Waiting)
+    .dependencies_ready(true)
+    .wait_reason(AgentGraphWaitReason::Timer);
+    let waiting_human = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("approval"),
+        AgentCompiledNodeKind::HumanCheckpoint,
+        AgentTimestampMillis::new(124),
+    )
+    .status(AgentGraphNodeStatus::Waiting)
+    .dependencies_ready(true)
+    .wait_reason(AgentGraphWaitReason::Human);
+    let waiting_child = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("child"),
+        AgentCompiledNodeKind::ChildWorkflowCommand,
+        AgentTimestampMillis::new(126),
+    )
+    .status(AgentGraphNodeStatus::Waiting)
+    .dependencies_ready(true)
+    .wait_reason(AgentGraphWaitReason::ChildWorkflow);
+    let failed = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new("tool"),
+        AgentCompiledNodeKind::ToolCall,
+        AgentTimestampMillis::new(130),
+    )
+    .status(AgentGraphNodeStatus::Failed)
+    .dependencies_ready(true)
+    .error_code("tool-timeout");
+
+    AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-graph-snapshot"),
+        AgentCompiledPlanFingerprint::new("sha256:graph-snapshot"),
+    )
+    .node_state(runnable)
+    .node_state(running)
+    .node_state(waiting)
+    .node_state(waiting_timer)
+    .node_state(waiting_human)
+    .node_state(waiting_child)
+    .node_state(failed)
+    .blocked_reason(AgentGraphBlockedReason::new("waiting-effect"))
 }
 
 fn start_command(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentCommand {

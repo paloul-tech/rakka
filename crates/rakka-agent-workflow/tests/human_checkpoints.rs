@@ -237,6 +237,7 @@ async fn human_checkpoint_snapshot_reports_waiting_runs() {
     registry.record_run_actor_snapshot(&AgentRunActorSnapshot {
         run_id: run_id.clone(),
         run_state: Some(opening.transition.state),
+        graph: None,
         recoverable_command_count: 0,
         due_effect_count: 1,
     });
@@ -433,6 +434,7 @@ fn accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRun
         tenant: Some(AgentTenantId::new("tenant-human")),
         definition_version: workflow.definition_version.clone(),
         state_schema_version: workflow.state_schema_version,
+        graph_state: None,
         status: AgentRunStatus::Accepted,
         current_step_id: Some(AgentStepId::new("review")),
         current_attempt: 0,

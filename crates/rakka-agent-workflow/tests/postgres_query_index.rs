@@ -5,16 +5,20 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchId,
+    AgentCausationId, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
+    AgentCompiledPlanId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchId,
     AgentDispatchIndexEntry, AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass,
-    AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentRunId, AgentRunIndexEntry,
-    AgentRunQueryWaitingReason, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStepId,
+    AgentDispatcherWorkerId, AgentEffectId, AgentEffectKind, AgentGraphNodeState,
+    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphWaitReason, AgentRunId, AgentRunIndexEntry,
+    AgentRunQueryWaitingReason, AgentRunState, AgentRunStatus, AgentRuntimeEventDraft,
+    AgentRuntimeEventKind, AgentRuntimeEventProjection, AgentStatePayload, AgentStepId,
     AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerIndexEntry,
     AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus, AgentTimestampMillis, AgentWorkflowId,
     AgentWorkflowQueryIndex, AgentWorkflowRunQuery, AgentWorkflowShardOwnership, HumanCheckpoint,
     HumanCheckpointId, HumanCheckpointStatus, PostgresAgentWorkflowQueryIndex, PrincipalRef,
     StateSchemaVersion, WorkflowDefinitionVersion, AGENT_WORKFLOW_AUDIT_INDEX_TABLE,
     AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE, AGENT_WORKFLOW_DISPATCH_INDEX_TABLE,
+    AGENT_WORKFLOW_GRAPH_NODE_INDEX_TABLE, AGENT_WORKFLOW_RUNTIME_EVENT_PROJECTION_TABLE,
     AGENT_WORKFLOW_RUN_INDEX_TABLE, AGENT_WORKFLOW_TIMER_INDEX_TABLE,
 };
 use tokio_postgres::{Client, NoTls};
@@ -221,6 +225,261 @@ async fn postgres_query_index_round_trips_bounded_operational_queries() {
 }
 
 #[tokio::test]
+async fn postgres_query_index_round_trips_graph_projections_and_runtime_events() {
+    let Some(mut index) = test_index("graph_projection").await else {
+        return;
+    };
+    let namespace = index.namespace().to_string();
+    let fingerprint = AgentCompiledPlanFingerprint::new("sha256:pg-graph-v1");
+
+    let mut waiting = run_state(
+        "pg-run-graph-waiting",
+        AgentRunStatus::WaitingForEffect,
+        "graph",
+        200,
+        None,
+    );
+    waiting.graph_state = Some(graph_state(
+        "plan-graph-v1",
+        fingerprint.as_str(),
+        "model",
+        AgentCompiledNodeKind::ModelCall,
+        AgentGraphNodeStatus::Waiting,
+        Some(AgentGraphWaitReason::Effect),
+        None,
+    ));
+    upsert_run(&mut index, run_index(waiting)).await;
+
+    let mut failed = run_state(
+        "pg-run-graph-failed",
+        AgentRunStatus::Failed,
+        "graph",
+        210,
+        None,
+    );
+    failed.graph_state = Some(graph_state(
+        "plan-graph-v1",
+        fingerprint.as_str(),
+        "tool",
+        AgentCompiledNodeKind::ToolCall,
+        AgentGraphNodeStatus::Failed,
+        None,
+        Some("tool-timeout"),
+    ));
+    upsert_run(&mut index, run_index(failed)).await;
+
+    let mut timer_wait = run_state(
+        "pg-run-graph-timer",
+        AgentRunStatus::WaitingForTimer,
+        "graph",
+        220,
+        None,
+    );
+    timer_wait.graph_state = Some(graph_state(
+        "plan-graph-v1",
+        fingerprint.as_str(),
+        "timer",
+        AgentCompiledNodeKind::TimerWait,
+        AgentGraphNodeStatus::Waiting,
+        Some(AgentGraphWaitReason::Timer),
+        None,
+    ));
+    upsert_run(&mut index, run_index(timer_wait)).await;
+    index
+        .upsert_timer(timer_index(
+            "pg-graph-timer-due",
+            "pg-run-graph-timer",
+            190,
+            AgentTimerStatus::Pending,
+            225,
+        ))
+        .await
+        .expect("graph timer should index");
+
+    let mut human_wait = run_state(
+        "pg-run-graph-human",
+        AgentRunStatus::WaitingForHuman,
+        "graph",
+        230,
+        Some(checkpoint("pg-graph-human-review", 120, Some(400))),
+    );
+    human_wait.graph_state = Some(graph_state(
+        "plan-graph-v1",
+        fingerprint.as_str(),
+        "review",
+        AgentCompiledNodeKind::HumanCheckpoint,
+        AgentGraphNodeStatus::Waiting,
+        Some(AgentGraphWaitReason::Human),
+        None,
+    ));
+    upsert_run(&mut index, run_index(human_wait)).await;
+
+    let graph_runs = index
+        .query_runs(AgentWorkflowRunQuery::new().graph_plan_fingerprint(fingerprint.clone()))
+        .await
+        .expect("graph fingerprint query should succeed");
+    assert_eq!(
+        run_ids(&graph_runs),
+        vec![
+            "pg-run-graph-waiting",
+            "pg-run-graph-failed",
+            "pg-run-graph-timer",
+            "pg-run-graph-human"
+        ]
+    );
+    let graph = graph_runs[0]
+        .graph
+        .as_ref()
+        .expect("graph projection should round trip from PostgreSQL");
+    assert_eq!(graph.plan_fingerprint, fingerprint);
+    assert_eq!(graph.waiting_node_count, 1);
+    assert_eq!(graph.nodes[0].kind, AgentCompiledNodeKind::ModelCall);
+
+    let waiting_model = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_node_status(AgentGraphNodeStatus::Waiting)
+                .graph_node_kind(AgentCompiledNodeKind::ModelCall)
+                .graph_wait_reason(AgentGraphWaitReason::Effect),
+        )
+        .await
+        .expect("waiting graph node query should succeed");
+    assert_eq!(run_ids(&waiting_model), vec!["pg-run-graph-waiting"]);
+
+    let failed_tool = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_node_kind(AgentCompiledNodeKind::ToolCall)
+                .graph_error_code("tool-timeout"),
+        )
+        .await
+        .expect("failed graph node query should succeed");
+    assert_eq!(run_ids(&failed_tool), vec!["pg-run-graph-failed"]);
+
+    let due_graph_timer = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_node_kind(AgentCompiledNodeKind::TimerWait)
+                .due_timer_at_or_before(ts(200)),
+        )
+        .await
+        .expect("due graph timer query should succeed");
+    assert_eq!(run_ids(&due_graph_timer), vec!["pg-run-graph-timer"]);
+
+    let human_graph_wait = index
+        .query_runs(
+            AgentWorkflowRunQuery::new()
+                .graph_node_kind(AgentCompiledNodeKind::HumanCheckpoint)
+                .checkpoint_created_at_or_before(ts(150)),
+        )
+        .await
+        .expect("human graph checkpoint query should succeed");
+    assert_eq!(run_ids(&human_graph_wait), vec!["pg-run-graph-human"]);
+    assert_eq!(
+        open_checkpoint_count(&namespace, "pg-run-graph-human").await,
+        1,
+        "graph human wait should maintain an open checkpoint projection",
+    );
+
+    let mut graph_dispatch = dispatch_index(
+        "pg-graph-dispatch",
+        "pg-run-graph-waiting",
+        "worker-graph",
+        1,
+        240,
+        260,
+        245,
+    );
+    graph_dispatch.graph_plan_fingerprint = Some(fingerprint.clone());
+    graph_dispatch.graph_node_id = Some(AgentCompiledNodeId::new("model"));
+    graph_dispatch.graph_node_kind = Some(AgentCompiledNodeKind::ModelCall);
+    index
+        .upsert_dispatch(graph_dispatch)
+        .await
+        .expect("graph dispatch should index");
+
+    let graph_dispatches = index
+        .query_dispatches(
+            AgentDispatchQuery::new()
+                .graph_plan_fingerprint(fingerprint.clone())
+                .graph_node_id("model")
+                .graph_node_kind(AgentCompiledNodeKind::ModelCall),
+        )
+        .await
+        .expect("graph dispatch query should succeed");
+    assert_eq!(dispatch_ids(&graph_dispatches), vec!["pg-graph-dispatch"]);
+
+    let mut event_graph = graph_state(
+        "plan-graph-v1",
+        fingerprint.as_str(),
+        "model",
+        AgentCompiledNodeKind::ModelCall,
+        AgentGraphNodeStatus::Completed,
+        None,
+        None,
+    );
+    event_graph.scheduler_revision = 1;
+    let run_started = runtime_event_draft(
+        "pg-run-graph-waiting",
+        AgentRuntimeEventKind::RunStarted,
+        ts(250),
+    )
+    .after_persistence(Some(&event_graph))
+    .expect("run started event should finalize")
+    .expect("persisted graph should produce an event");
+    event_graph.last_event_sequence = run_started.event_sequence;
+    event_graph.scheduler_revision = 2;
+    let node_completed = runtime_event_draft(
+        "pg-run-graph-waiting",
+        AgentRuntimeEventKind::NodeCompleted,
+        ts(260),
+    )
+    .node_id(AgentCompiledNodeId::new("model"))
+    .after_persistence(Some(&event_graph))
+    .expect("node completed event should finalize")
+    .expect("persisted graph should produce an event");
+    let projection = AgentRuntimeEventProjection::from_events(&[run_started, node_completed])
+        .expect("runtime event projection should rebuild");
+    index
+        .upsert_runtime_event_projection(projection.clone())
+        .await
+        .expect("runtime event projection should index");
+    let stored_projection = index
+        .runtime_event_projection(AgentRunId::new("pg-run-graph-waiting"))
+        .await
+        .expect("runtime event projection query should succeed")
+        .expect("runtime event projection should exist");
+    assert_eq!(stored_projection, projection);
+
+    let mut stale_projection = projection;
+    stale_projection.last_event_sequence = 1;
+    let stale_error = index
+        .upsert_runtime_event_projection(stale_projection)
+        .await
+        .expect_err("stale runtime event projection should be rejected");
+    assert_eq!(stale_error.code(), "workflow-query-store");
+
+    let mut stale_run = run_index(run_state(
+        "pg-run-graph-waiting",
+        AgentRunStatus::Running,
+        "graph",
+        100,
+        None,
+    ));
+    stale_run.graph = None;
+    let stale_run_error = index
+        .upsert_run(stale_run)
+        .await
+        .expect_err("stale run projection should be rejected");
+    assert_eq!(stale_run_error.code(), "workflow-query-store");
+
+    index
+        .delete_namespace()
+        .await
+        .expect("test namespace should clean up");
+}
+
+#[tokio::test]
 async fn postgres_query_index_rejects_stale_timer_and_dispatch_writes() {
     let Some(mut index) = test_index("stale_writes").await else {
         return;
@@ -352,10 +611,12 @@ async fn postgres_query_index_migration_creates_expected_tables() {
     };
     for table in [
         AGENT_WORKFLOW_RUN_INDEX_TABLE,
+        AGENT_WORKFLOW_GRAPH_NODE_INDEX_TABLE,
         AGENT_WORKFLOW_TIMER_INDEX_TABLE,
         AGENT_WORKFLOW_CHECKPOINT_INDEX_TABLE,
         AGENT_WORKFLOW_DISPATCH_INDEX_TABLE,
         AGENT_WORKFLOW_AUDIT_INDEX_TABLE,
+        AGENT_WORKFLOW_RUNTIME_EVENT_PROJECTION_TABLE,
     ] {
         let qualified_table = format!("public.{table}");
         let regclass: Option<String> = client
@@ -471,6 +732,10 @@ fn dispatch_index(
         effect_id: AgentEffectId::new(format!("effect:{dispatch_id}")),
         effect_kind: AgentEffectKind::ToolCall,
         target_class: AgentDispatchTargetClass::Tool,
+        graph_plan_fingerprint: None,
+        graph_node_id: None,
+        graph_node_kind: None,
+        graph_loop_instance_id: None,
         due_at: ts(100),
         status: AgentDispatchStatus::Claimed,
         worker_id: Some(AgentDispatcherWorkerId::new(worker_id)),
@@ -516,6 +781,7 @@ fn run_state(
         tenant: Some(AgentTenantId::new("tenant-a")),
         definition_version: WorkflowDefinitionVersion::new("v1"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status,
         current_step_id: Some(AgentStepId::new(step_id)),
         current_attempt: 0,
@@ -533,6 +799,35 @@ fn run_state(
         )
         .then(|| ts(updated_at)),
     }
+}
+
+fn graph_state(
+    plan_id: &str,
+    fingerprint: &str,
+    node_id: &str,
+    kind: AgentCompiledNodeKind,
+    status: AgentGraphNodeStatus,
+    wait_reason: Option<AgentGraphWaitReason>,
+    error_code: Option<&str>,
+) -> AgentGraphRunState {
+    let mut node = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new(node_id),
+        kind,
+        AgentTimestampMillis::new(120),
+    )
+    .status(status)
+    .dependencies_ready(true);
+    if let Some(wait_reason) = wait_reason {
+        node = node.wait_reason(wait_reason);
+    }
+    if let Some(error_code) = error_code {
+        node = node.error_code(error_code);
+    }
+    AgentGraphRunState::new(
+        AgentCompiledPlanId::new(plan_id),
+        AgentCompiledPlanFingerprint::new(fingerprint),
+    )
+    .node_state(node)
 }
 
 fn checkpoint(checkpoint_id: &str, created_at: u64, due_at: Option<u64>) -> HumanCheckpoint {
@@ -555,6 +850,23 @@ fn checkpoint(checkpoint_id: &str, created_at: u64, due_at: Option<u64>) -> Huma
         resolved_at: None,
         audit_event_ids: Vec::new(),
     }
+}
+
+fn runtime_event_draft(
+    run_id: &str,
+    kind: AgentRuntimeEventKind,
+    occurred_at: AgentTimestampMillis,
+) -> AgentRuntimeEventDraft {
+    AgentRuntimeEventDraft::new(
+        workflow_id(),
+        AgentRunId::new(run_id),
+        WorkflowDefinitionVersion::new("v1"),
+        occurred_at,
+        kind,
+        AgentCausationId::new(format!("cause:{run_id}:{}", kind.as_label())),
+        AgentCorrelationId::new(format!("corr:{run_id}")),
+        AgentTelemetryContext::default(),
+    )
 }
 
 fn timer(timer_id: &str, run_id: &str, due_at: u64, status: AgentTimerStatus) -> AgentTimerEntry {

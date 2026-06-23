@@ -133,6 +133,7 @@ fn run_state() -> AgentRunState {
         tenant: Some(AgentTenantId::new("tenant-retention")),
         definition_version: WorkflowDefinitionVersion::new("v1"),
         state_schema_version: StateSchemaVersion::new(1),
+        graph_state: None,
         status: AgentRunStatus::Completed,
         current_step_id: Some(AgentStepId::new("step-final")),
         current_attempt: 2,
