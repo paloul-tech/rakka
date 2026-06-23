@@ -9,12 +9,17 @@ use std::time::Duration;
 use rakka_agent_workflow::{
     agent_run_entity_ref, init_agent_run_sharding_with_clock_and_metrics, passivate_agent_run,
     registered_agent_run_entity_ref, AgentCausationId, AgentCommand, AgentCommandId,
-    AgentCommandKind, AgentCommandMetadata, AgentCorrelationId, AgentDeduplicationKey,
-    AgentDurabilityMetadata, AgentPayloadDescriptor, AgentRunActorCommand, AgentRunActorSnapshot,
+    AgentCommandKind, AgentCommandMetadata, AgentCompiledExecutionPlan, AgentCompiledNodeId,
+    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
+    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
+    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId, AgentDeduplicationKey,
+    AgentDurabilityMetadata, AgentGraphEffectScheduleRequest, AgentGraphNodeStatus,
+    AgentGraphRunProjection, AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition,
+    AgentGraphWaitReason, AgentPayloadDescriptor, AgentRunActorCommand, AgentRunActorSnapshot,
     AgentRunId, AgentRunShardingSettings, AgentRunState, AgentRunStatus, AgentRunTransition,
     AgentRunTransitionKind, AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId,
     AgentStepKind, AgentTenantId, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
-    StateSchemaVersion, WorkflowDefinitionVersion,
+    StateSchemaVersion, WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::{ActorSystem, InMemoryMetricsRecorder};
 use rakka_persistence::InMemoryDurableStateStore;
@@ -176,6 +181,199 @@ async fn remembered_entities_are_opt_in_for_agent_run_registrations() {
     system.terminate().await.expect("system should terminate");
 }
 
+#[tokio::test]
+async fn sharded_graph_run_routes_by_stable_run_id() {
+    let system = ActorSystem::new("agent-sharded-graph-route");
+    let sharding = ClusterSharding::get(&system);
+    let workflow = workflow();
+    let key = EntityTypeKey::new("AgentGraphRunRouteTest")
+        .with_number_of_shards(4)
+        .expect("entity type key should be valid");
+    let registration = init_agent_run_sharding_with_clock_and_metrics(
+        &sharding,
+        workflow.clone(),
+        RunStore::new(),
+        WorkflowStore::new(),
+        ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100)),
+        graph_sharding_settings(key.clone()),
+        Arc::new(InMemoryMetricsRecorder::new()),
+    )
+    .expect("agent run sharding should initialize");
+    let run_id = AgentRunId::new("run-sharded-graph-route");
+    let run = registered_agent_run_entity_ref(&registration, &run_id);
+    let routed_run =
+        agent_run_entity_ref(&sharding, registration.key(), &run_id).expect("run ref should route");
+    assert_eq!(run.entity_id().as_str(), run_id.as_str());
+    assert_eq!(routed_run.entity_id(), run.entity_id());
+
+    let plan = Arc::new(local_graph_plan(&workflow));
+    let started = start_graph(
+        &routed_run,
+        graph_accepted_run_state(&workflow, &run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    assert_eq!(started.kind, AgentRunTransitionKind::Start);
+
+    let ready = mark_graph_ready(&run, plan, AgentTimestampMillis::new(110)).await;
+    assert_eq!(
+        ready.graph_transition.runnable_node_ids,
+        vec![node_id("input")]
+    );
+    let snapshot = snapshot(&routed_run).await;
+    let graph = snapshot
+        .graph
+        .expect("graph summary should route by run id");
+    assert_eq!(graph.runnable_node_count, 1);
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn sharded_graph_passivation_preserves_runnable_and_waiting_nodes() {
+    let system = ActorSystem::new("agent-sharded-graph-passivation");
+    let sharding = ClusterSharding::get(&system);
+    let workflow = workflow();
+    let run_store = RunStore::new();
+    let workflow_store = WorkflowStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let key = EntityTypeKey::new("AgentGraphRunPassivationTest")
+        .with_number_of_shards(4)
+        .expect("entity type key should be valid");
+    let registration = init_agent_run_sharding_with_clock_and_metrics(
+        &sharding,
+        workflow.clone(),
+        run_store,
+        workflow_store,
+        clock,
+        graph_sharding_settings(key.clone()),
+        Arc::new(InMemoryMetricsRecorder::new()),
+    )
+    .expect("agent run sharding should initialize");
+
+    let runnable_run_id = AgentRunId::new("run-sharded-graph-runnable");
+    let runnable_run = registered_agent_run_entity_ref(&registration, &runnable_run_id);
+    let local_plan = Arc::new(local_graph_plan(&workflow));
+    start_graph(
+        &runnable_run,
+        graph_accepted_run_state(&workflow, &runnable_run_id),
+        local_plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    mark_graph_ready(&runnable_run, local_plan, AgentTimestampMillis::new(110)).await;
+    assert!(
+        passivate_agent_run(&sharding, registration.key(), &runnable_run_id)
+            .expect("runnable graph passivation should route")
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let recovered_runnable = snapshot(&runnable_run).await;
+    let runnable_graph = recovered_runnable
+        .graph
+        .as_ref()
+        .expect("runnable graph summary should recover");
+    assert_eq!(runnable_graph.runnable_node_count, 1);
+    assert_eq!(
+        node_status(runnable_graph, "input"),
+        AgentGraphNodeStatus::Runnable
+    );
+
+    let waiting_run_id = AgentRunId::new("run-sharded-graph-waiting");
+    let waiting_run = registered_agent_run_entity_ref(&registration, &waiting_run_id);
+    let effect_plan = Arc::new(effect_graph_plan(&workflow));
+    drive_graph_effect_node_to_waiting(&waiting_run, &workflow, &waiting_run_id, effect_plan).await;
+    assert!(
+        passivate_agent_run(&sharding, registration.key(), &waiting_run_id)
+            .expect("waiting graph passivation should route")
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let recovered_waiting = snapshot(&waiting_run).await;
+    assert_eq!(recovered_waiting.due_effect_count, 1);
+    let waiting_graph = recovered_waiting
+        .graph
+        .as_ref()
+        .expect("waiting graph summary should recover");
+    assert_eq!(waiting_graph.waiting_node_count, 1);
+    assert_eq!(
+        node_status(waiting_graph, "effect"),
+        AgentGraphNodeStatus::Waiting
+    );
+
+    system.terminate().await.expect("system should terminate");
+}
+
+#[tokio::test]
+async fn sharded_graph_state_and_due_effect_recover_after_local_shard_movement() {
+    let run_store = RunStore::new();
+    let workflow_store = WorkflowStore::new();
+    let workflow = workflow();
+    let key = EntityTypeKey::new("AgentGraphRunMovementTest")
+        .with_number_of_shards(4)
+        .expect("entity type key should be valid");
+    let run_id = AgentRunId::new("run-sharded-graph-movement");
+
+    let system_a = ActorSystem::new("agent-sharded-graph-movement-a");
+    let sharding_a = ClusterSharding::get(&system_a);
+    let registration_a = init_agent_run_sharding_with_clock_and_metrics(
+        &sharding_a,
+        workflow.clone(),
+        run_store.clone(),
+        workflow_store.clone(),
+        ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100)),
+        graph_sharding_settings(key.clone()),
+        Arc::new(InMemoryMetricsRecorder::new()),
+    )
+    .expect("first sharding region should initialize");
+    let run_a = registered_agent_run_entity_ref(&registration_a, &run_id);
+    let effect_plan = Arc::new(effect_graph_plan(&workflow));
+    drive_graph_effect_node_to_waiting(&run_a, &workflow, &run_id, effect_plan).await;
+    assert_eq!(snapshot(&run_a).await.due_effect_count, 1);
+    system_a
+        .terminate()
+        .await
+        .expect("first system should terminate");
+
+    let system_b = ActorSystem::new("agent-sharded-graph-movement-b");
+    let sharding_b = ClusterSharding::get(&system_b);
+    let registration_b = init_agent_run_sharding_with_clock_and_metrics(
+        &sharding_b,
+        workflow,
+        run_store,
+        workflow_store,
+        ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100)),
+        graph_sharding_settings(key),
+        Arc::new(InMemoryMetricsRecorder::new()),
+    )
+    .expect("second sharding region should initialize");
+    let run_b = registered_agent_run_entity_ref(&registration_b, &run_id);
+
+    let recovered = snapshot(&run_b).await;
+    assert_eq!(run_b.entity_id().as_str(), run_id.as_str());
+    assert_eq!(recovered.due_effect_count, 1);
+    let graph = recovered
+        .graph
+        .as_ref()
+        .expect("moved graph summary should recover");
+    assert_eq!(graph.waiting_node_count, 1);
+    assert_eq!(node_status(graph, "effect"), AgentGraphNodeStatus::Waiting);
+
+    let due = run_b
+        .ask(
+            |reply_to| AgentRunActorCommand::DueEffects { reply_to },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("due effects ask should reply after movement")
+        .expect("due effects should recover after movement");
+    assert_eq!(due.len(), 1);
+
+    system_b
+        .terminate()
+        .await
+        .expect("second system should terminate");
+}
+
 async fn accept_start_command(
     run: &rakka_agent_workflow::AgentRunEntityRef,
     workflow: &AgentWorkflow,
@@ -217,6 +415,136 @@ async fn start(
     .await
     .expect("start ask should reply")
     .expect("start should succeed")
+}
+
+async fn start_graph(
+    run: &rakka_agent_workflow::AgentRunEntityRef,
+    initial_state: AgentRunState,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    now: AgentTimestampMillis,
+) -> AgentRunTransition {
+    run.ask(
+        |reply_to| AgentRunActorCommand::StartGraph {
+            initial_state,
+            plan,
+            now,
+            reply_to,
+        },
+        ASK_TIMEOUT,
+    )
+    .await
+    .expect("start graph ask should reply")
+    .expect("start graph should succeed")
+}
+
+async fn mark_graph_ready(
+    run: &rakka_agent_workflow::AgentRunEntityRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    now: AgentTimestampMillis,
+) -> AgentGraphRuntimeTransition {
+    run.ask(
+        |reply_to| AgentRunActorCommand::MarkGraphReady {
+            plan,
+            now,
+            reply_to,
+        },
+        ASK_TIMEOUT,
+    )
+    .await
+    .expect("mark graph ready ask should reply")
+    .expect("mark graph ready should succeed")
+}
+
+async fn start_graph_node(
+    run: &rakka_agent_workflow::AgentRunEntityRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    node_id_value: &str,
+    now: AgentTimestampMillis,
+) -> AgentGraphRuntimeTransition {
+    run.ask(
+        |reply_to| AgentRunActorCommand::StartGraphNode {
+            plan,
+            node_id: node_id(node_id_value),
+            now,
+            reply_to,
+        },
+        ASK_TIMEOUT,
+    )
+    .await
+    .expect("start graph node ask should reply")
+    .expect("start graph node should succeed")
+}
+
+async fn complete_graph_node(
+    run: &rakka_agent_workflow::AgentRunEntityRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    node_id_value: &str,
+    now: AgentTimestampMillis,
+) -> AgentGraphRuntimeTransition {
+    run.ask(
+        |reply_to| AgentRunActorCommand::CompleteGraphNode {
+            plan,
+            node_id: node_id(node_id_value),
+            now,
+            reply_to,
+        },
+        ASK_TIMEOUT,
+    )
+    .await
+    .expect("complete graph node ask should reply")
+    .expect("complete graph node should succeed")
+}
+
+async fn schedule_graph_effect(
+    run: &rakka_agent_workflow::AgentRunEntityRef,
+    plan: Arc<AgentCompiledExecutionPlan>,
+    request: AgentGraphEffectScheduleRequest,
+) -> AgentGraphRuntimeEffectOutcome {
+    run.ask(
+        |reply_to| AgentRunActorCommand::ScheduleGraphNodeEffect {
+            plan,
+            request,
+            reply_to,
+        },
+        ASK_TIMEOUT,
+    )
+    .await
+    .expect("schedule graph effect ask should reply")
+    .expect("schedule graph effect should succeed")
+}
+
+async fn drive_graph_effect_node_to_waiting(
+    run: &rakka_agent_workflow::AgentRunEntityRef,
+    workflow: &AgentWorkflow,
+    run_id: &AgentRunId,
+    plan: Arc<AgentCompiledExecutionPlan>,
+) {
+    start_graph(
+        run,
+        graph_accepted_run_state(workflow, run_id),
+        plan.clone(),
+        AgentTimestampMillis::new(100),
+    )
+    .await;
+    mark_graph_ready(run, plan.clone(), AgentTimestampMillis::new(110)).await;
+    start_graph_node(run, plan.clone(), "input", AgentTimestampMillis::new(120)).await;
+    complete_graph_node(run, plan.clone(), "input", AgentTimestampMillis::new(130)).await;
+    mark_graph_ready(run, plan.clone(), AgentTimestampMillis::new(140)).await;
+    start_graph_node(run, plan.clone(), "effect", AgentTimestampMillis::new(150)).await;
+    let scheduled =
+        schedule_graph_effect(run, plan, effect_request(run_id.clone(), "effect", 160)).await;
+    assert!(scheduled.effect_outcome.acceptance.is_scheduled());
+    assert_eq!(
+        scheduled
+            .effect_outcome
+            .transition
+            .state
+            .node_states
+            .get(&node_id("effect"))
+            .expect("effect node state should exist")
+            .wait_reason,
+        Some(AgentGraphWaitReason::Effect)
+    );
 }
 
 async fn begin_step(
@@ -322,6 +650,150 @@ fn accepted_run_state(
         updated_at: AgentTimestampMillis::new(100),
         completed_at: None,
     }
+}
+
+fn graph_accepted_run_state(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentRunState {
+    AgentRunState {
+        run_id: run_id.clone(),
+        workflow_id: workflow.workflow_id.clone(),
+        tenant: Some(AgentTenantId::new("tenant-sharded-run")),
+        definition_version: workflow.definition_version.clone(),
+        state_schema_version: workflow.state_schema_version,
+        graph_state: None,
+        status: AgentRunStatus::Accepted,
+        current_step_id: None,
+        current_attempt: 0,
+        inputs_ref: None,
+        state_payload: AgentStatePayload::Empty,
+        checkpoints: Vec::new(),
+        pending_effects: Vec::new(),
+        pending_human_checkpoint: None,
+        cancellation: None,
+        created_at: AgentTimestampMillis::new(100),
+        updated_at: AgentTimestampMillis::new(100),
+        completed_at: None,
+    }
+}
+
+fn local_graph_plan(workflow: &AgentWorkflow) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "payload"),
+    );
+    let terminal =
+        AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+            AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Input, "payload"),
+        );
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-sharded-local-graph"),
+        workflow.workflow_id.clone(),
+        workflow.workflow_type.clone(),
+        workflow.definition_version.clone(),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:sharded-local-graph"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-terminal",
+        "input",
+        "payload",
+        "terminal",
+        "payload",
+    ))
+}
+
+fn effect_graph_plan(workflow: &AgentWorkflow) -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let effect = AgentCompiledPlanNode::new("effect", AgentCompiledNodeKind::ToolCall)
+        .input_port(AgentCompiledPlanPort::new(
+            "payload",
+            AgentCompiledPortDirection::Input,
+            "input",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Output,
+            "effect-result",
+        ))
+        .target(
+            AgentCompiledNodeTarget::new("tool", "sharded-tool")
+                .address("tool://sharded-tool")
+                .attribute("target_class", "tool"),
+        );
+    let terminal = AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal)
+        .input_port(AgentCompiledPlanPort::new(
+            "result",
+            AgentCompiledPortDirection::Input,
+            "effect-result",
+        ));
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-sharded-effect-graph"),
+        workflow.workflow_id.clone(),
+        workflow.workflow_type.clone(),
+        workflow.definition_version.clone(),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:sharded-effect-graph"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(effect)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-effect",
+        "input",
+        "payload",
+        "effect",
+        "payload",
+    ))
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-effect-terminal",
+        "effect",
+        "result",
+        "terminal",
+        "result",
+    ))
+}
+
+fn effect_request(
+    run_id: AgentRunId,
+    node_id_value: &str,
+    created_at_millis: u64,
+) -> AgentGraphEffectScheduleRequest {
+    AgentGraphEffectScheduleRequest::new(
+        run_id,
+        node_id_value,
+        AgentTimestampMillis::new(created_at_millis),
+        AgentCausationId::new("cause:sharded-graph"),
+        AgentCorrelationId::new("corr:sharded-graph"),
+    )
+    .due_at(AgentTimestampMillis::new(100))
+    .timeout_ms(1_000)
+    .expected_result_type("sharded.effect.result")
+}
+
+fn node_id(value: &str) -> AgentCompiledNodeId {
+    AgentCompiledNodeId::new(value)
+}
+
+fn node_status(graph: &AgentGraphRunProjection, node_id_value: &str) -> AgentGraphNodeStatus {
+    graph
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id(node_id_value))
+        .expect("graph node projection should exist")
+        .status
+}
+
+fn graph_sharding_settings(key: EntityTypeKey<AgentRunActorCommand>) -> AgentRunShardingSettings {
+    AgentRunShardingSettings::new(key)
+        .with_idle_passivation(Duration::from_secs(60))
+        .with_passivation_buffer_duration(Duration::ZERO)
+        .with_buffering(ShardBufferConfig::new(8, Duration::from_millis(250)))
 }
 
 fn start_command(workflow: &AgentWorkflow, run_id: &AgentRunId) -> AgentCommand {

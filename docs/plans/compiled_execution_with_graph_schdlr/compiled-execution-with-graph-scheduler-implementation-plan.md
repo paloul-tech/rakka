@@ -1197,6 +1197,8 @@ Implementation notes:
 
 ### Slice 7.2: Sharded Runtime
 
+Status: implemented.
+
 Scope:
 
 - Integrate graph runtime with `init_agent_run_sharding`.
@@ -1215,6 +1217,21 @@ Tests:
 - Sharded graph run routes by stable run id.
 - Recovery after passivation.
 - Recovery after shard movement in deterministic local test.
+
+Implementation notes:
+
+- `init_agent_run_sharding` did not need a separate graph-specific entity type:
+  graph runtime commands route through the existing `AgentRunActorCommand`
+  protocol, so stable `AgentRunId` to `EntityId` mapping also applies to
+  compiled graph runs.
+- Added sharded graph tests under the existing `sharding` feature gate covering
+  stable run-id routing for `StartGraph`/`MarkGraphReady`, passivation recovery
+  for runnable graph nodes, passivation recovery for waiting effect nodes, and
+  deterministic local shard-movement recovery using a fresh sharding region
+  over the same durable run and workflow stores.
+- Verified that due graph effects remain recoverable after movement because the
+  sharded actor recovers the same durable inbox/outbox state and persisted
+  `AgentRunState.graph_state`.
 
 ### Slice 7.3: Drain And Shutdown
 
