@@ -206,12 +206,16 @@ pub struct AgentRuntimeEvent {
     /// Runtime event kind.
     pub kind: AgentRuntimeEventKind,
     /// Compiled graph node id, when the event is node-scoped.
+    #[serde(default)]
     pub node_id: Option<AgentCompiledNodeId>,
     /// Durable effect id, when the event is effect-scoped.
+    #[serde(default)]
     pub effect_id: Option<AgentEffectId>,
     /// Durable timer id, when the event is timer-scoped.
+    #[serde(default)]
     pub timer_id: Option<AgentTimerId>,
     /// Human checkpoint id, when the event is human-scoped.
+    #[serde(default)]
     pub checkpoint_id: Option<HumanCheckpointId>,
     /// Command or event that caused this runtime event.
     pub causation_id: AgentCausationId,
@@ -220,6 +224,7 @@ pub struct AgentRuntimeEvent {
     /// Trace, baggage, and span-link context.
     pub telemetry_context: AgentTelemetryContext,
     /// Bounded attributes safe for hot projection labels.
+    #[serde(default)]
     pub attributes: AgentAttributes,
 }
 
@@ -335,12 +340,16 @@ pub struct AgentRuntimeEventCorrelationFields {
     /// Runtime event kind.
     pub event_kind: AgentRuntimeEventKind,
     /// Compiled graph node id, when the event is node-scoped.
+    #[serde(default)]
     pub node_id: Option<AgentCompiledNodeId>,
     /// Durable effect id, when the event is effect-scoped.
+    #[serde(default)]
     pub effect_id: Option<AgentEffectId>,
     /// Durable timer id, when the event is timer-scoped.
+    #[serde(default)]
     pub timer_id: Option<AgentTimerId>,
     /// Human checkpoint id, when the event is human-scoped.
+    #[serde(default)]
     pub checkpoint_id: Option<HumanCheckpointId>,
     /// Command or event that caused this runtime event.
     pub causation_id: AgentCausationId,
@@ -420,20 +429,27 @@ pub struct AgentRuntimeEventProjection {
     /// Last per-run event sequence applied to this projection.
     pub last_event_sequence: u64,
     /// Timestamp of the last applied runtime event.
+    #[serde(default)]
     pub last_event_at: Option<AgentTimestampMillis>,
     /// Kind of the last applied runtime event.
+    #[serde(default)]
     pub last_event_kind: Option<AgentRuntimeEventKind>,
     /// Number of events applied to this projection.
     pub event_count: u64,
     /// Number of node-scoped events applied to this projection.
+    #[serde(default)]
     pub node_event_count: u64,
     /// Number of effect-scoped events applied to this projection.
+    #[serde(default)]
     pub effect_event_count: u64,
     /// Number of timer-scoped events applied to this projection.
+    #[serde(default)]
     pub timer_event_count: u64,
     /// Number of human checkpoint-scoped events applied to this projection.
+    #[serde(default)]
     pub human_event_count: u64,
     /// Terminal run event kind, when the stream has reached one.
+    #[serde(default)]
     pub terminal_event_kind: Option<AgentRuntimeEventKind>,
 }
 

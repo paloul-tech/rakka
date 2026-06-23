@@ -143,22 +143,31 @@ pub struct AgentCompiledExecutionPlan {
     /// Directed edges between output and input ports.
     pub edges: Vec<AgentCompiledPlanEdge>,
     /// Optional source graph digest or artifact supplied by the application compiler.
+    #[serde(default)]
     pub source_graph_ref: Option<ArtifactRef>,
     /// Optional compiled metadata artifact supplied by the application compiler.
+    #[serde(default)]
     pub compiled_metadata_ref: Option<ArtifactRef>,
     /// Optional payload or schema artifacts used by this plan.
+    #[serde(default)]
     pub payload_schema_refs: Vec<ArtifactRef>,
     /// Optional default retry policy artifact.
+    #[serde(default)]
     pub default_retry_policy_ref: Option<ArtifactRef>,
     /// Optional default timeout policy artifact.
+    #[serde(default)]
     pub default_timeout_policy_ref: Option<ArtifactRef>,
     /// Optional default approval policy artifact.
+    #[serde(default)]
     pub default_approval_policy_ref: Option<ArtifactRef>,
     /// Optional default concurrency policy artifact.
+    #[serde(default)]
     pub default_concurrency_policy_ref: Option<ArtifactRef>,
     /// Compatibility metadata used during rolling updates.
+    #[serde(default)]
     pub compatibility: AgentCompiledPlanCompatibility,
     /// Bounded labels suitable for metrics when values are controlled.
+    #[serde(default)]
     pub observability_labels: AgentAttributes,
 }
 
@@ -228,12 +237,16 @@ impl AgentCompiledExecutionPlan {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCompiledPlanCompatibility {
     /// Minimum Rakka agent workflow runtime version expected by this plan.
+    #[serde(default)]
     pub min_runtime_version: Option<String>,
     /// Maximum Rakka agent workflow runtime version expected by this plan.
+    #[serde(default)]
     pub max_runtime_version: Option<String>,
     /// Optional named runtime capabilities required by this plan.
+    #[serde(default)]
     pub required_capabilities: Vec<String>,
     /// Bounded compatibility metadata.
+    #[serde(default)]
     pub attributes: AgentAttributes,
 }
 
@@ -267,26 +280,37 @@ pub struct AgentCompiledPlanNode {
     /// Product-neutral runtime node kind.
     pub kind: AgentCompiledNodeKind,
     /// Declared input ports.
+    #[serde(default)]
     pub input_ports: Vec<AgentCompiledPlanPort>,
     /// Declared output ports.
+    #[serde(default)]
     pub output_ports: Vec<AgentCompiledPlanPort>,
     /// Optional diagnostic display name.
+    #[serde(default)]
     pub display_name: Option<String>,
     /// Optional artifact reference for node configuration.
+    #[serde(default)]
     pub config_ref: Option<ArtifactRef>,
     /// Optional node-specific retry policy artifact.
+    #[serde(default)]
     pub retry_policy_ref: Option<ArtifactRef>,
     /// Optional node-specific timeout policy artifact.
+    #[serde(default)]
     pub timeout_policy_ref: Option<ArtifactRef>,
     /// Optional node-specific concurrency policy artifact.
+    #[serde(default)]
     pub concurrency_policy_ref: Option<ArtifactRef>,
     /// Optional bounded iterator policy for iterator nodes.
+    #[serde(default)]
     pub iterator_policy: Option<AgentCompiledIteratorPolicy>,
     /// Optional logical runtime target for effect-producing nodes.
+    #[serde(default)]
     pub target: Option<AgentCompiledNodeTarget>,
     /// Optional logical credential binding reference for effect-producing nodes.
+    #[serde(default)]
     pub credential_binding_ref: Option<AgentCredentialBindingRef>,
     /// Bounded labels suitable for metrics when values are controlled.
+    #[serde(default)]
     pub observability_labels: AgentAttributes,
 }
 
@@ -778,8 +802,10 @@ pub struct AgentCompiledNodeTarget {
     /// Stable logical target name.
     pub name: String,
     /// Optional route or logical endpoint.
+    #[serde(default)]
     pub address: Option<String>,
     /// Bounded target metadata.
+    #[serde(default)]
     pub attributes: AgentAttributes,
 }
 
@@ -820,10 +846,13 @@ pub struct AgentCompiledPlanPort {
     /// Application-owned payload type name.
     pub payload_type: String,
     /// Whether this input must be satisfied before the node can run.
+    #[serde(default = "default_true")]
     pub required: bool,
     /// Optional payload schema artifact reference.
+    #[serde(default)]
     pub schema_ref: Option<ArtifactRef>,
     /// Bounded port metadata.
+    #[serde(default)]
     pub attributes: AgentAttributes,
 }
 
@@ -895,10 +924,13 @@ pub struct AgentCompiledPlanEdge {
     /// Target input port id.
     pub target_port_id: AgentCompiledPortId,
     /// Optional artifact reference for branch condition metadata.
+    #[serde(default)]
     pub condition_ref: Option<ArtifactRef>,
     /// Optional merge behavior hint for joins.
+    #[serde(default)]
     pub merge_behavior: Option<AgentCompiledEdgeMergeBehavior>,
     /// Bounded edge metadata.
+    #[serde(default)]
     pub attributes: AgentAttributes,
 }
 
@@ -958,6 +990,10 @@ impl AgentCompiledEdgeMergeBehavior {
             Self::WaitForAny => "wait-for-any",
         }
     }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Result type for compiled execution plan validation.

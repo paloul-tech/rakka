@@ -1282,6 +1282,8 @@ Goal: make the feature production-candidate quality.
 
 ### Slice 8.1: Compatibility Suite
 
+Status: implemented.
+
 Scope:
 
 - Extend API compatibility tests for compiled plan and graph state JSON.
@@ -1299,6 +1301,30 @@ Tests:
 - Current and previous graph schema versions.
 - Missing graph state default.
 - Additive event fields accepted.
+
+Compatibility and migration rules:
+
+- Serialized compiled plan, graph state, runtime event, query projection, and
+  run-state fields may be added only when old readers can ignore them or new
+  readers can default them safely.
+- Required identity, version, ordering, durability, and reference fields remain
+  breaking if removed or renamed.
+- `AgentRunState.graph_state` remains additive and optional so old non-graph
+  runs continue to recover without graph state.
+- Current readers accept current graph schema version values and previous
+  version values for N/N+1 rolling upgrades; semantic migration remains a
+  future explicit upgrade path.
+- Additive graph runtime bookkeeping fields default to empty collections,
+  `None`, or zero when absent from older JSON.
+
+Implementation notes:
+
+- Added serde defaults to additive compiled plan fields, graph state fields,
+  graph projections, runtime event scoped ids/attributes, and runtime event
+  projection counters.
+- Extended `api_compatibility` with compiled plan JSON compatibility coverage,
+  graph state current/previous schema compatibility, missing graph-state
+  default coverage, and additive runtime event compatibility coverage.
 
 ### Slice 8.2: Failure Injection Suite
 

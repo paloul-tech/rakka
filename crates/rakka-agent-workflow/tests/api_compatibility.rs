@@ -4,28 +4,31 @@ use std::any::type_name;
 use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
-    validate_agent_telemetry_context, validate_command, validate_effect_schedule, AgentAuditEvent,
-    AgentAuditEventId, AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind,
-    AgentCommandMetadata, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
-    AgentCompiledPlanId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchEntry,
-    AgentDispatchId, AgentDispatchIndexEntry, AgentDispatchLease, AgentDispatchQuery,
-    AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherWorkerId, AgentDueEffect,
-    AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
-    AgentEffectSchedule, AgentEffectTarget, AgentFacadeResult, AgentGraphNodeState,
-    AgentGraphNodeStatus, AgentGraphRunState, AgentGraphRuntime, AgentGraphRuntimeEffectOutcome,
-    AgentGraphRuntimeTransition, AgentGraphWaitReason, AgentIdempotencyKey, AgentMigrationDecision,
-    AgentRunId, AgentRunIndexEntry, AgentRunQueryWaitingReason, AgentRunState, AgentRunStatus,
+    validate_agent_telemetry_context, validate_command, validate_compiled_execution_plan,
+    validate_effect_schedule, AgentAuditEvent, AgentAuditEventId, AgentCausationId, AgentCommand,
+    AgentCommandId, AgentCommandKind, AgentCommandMetadata, AgentCompiledExecutionPlan,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanEdge,
+    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
+    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentCorrelationId, AgentDeduplicationKey,
+    AgentDispatchEntry, AgentDispatchId, AgentDispatchIndexEntry, AgentDispatchLease,
+    AgentDispatchQuery, AgentDispatchStatus, AgentDispatchTargetClass, AgentDispatcherWorkerId,
+    AgentDueEffect, AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind,
+    AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentFacadeResult,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState, AgentGraphRuntime,
+    AgentGraphRuntimeEffectOutcome, AgentGraphRuntimeTransition, AgentGraphStateSchemaVersion,
+    AgentGraphWaitReason, AgentIdempotencyKey, AgentMigrationDecision, AgentRunId,
+    AgentRunIndexEntry, AgentRunQueryWaitingReason, AgentRunState, AgentRunStatus,
     AgentRuntimeEvent, AgentRuntimeEventCorrelationFields, AgentRuntimeEventDraft,
-    AgentRuntimeEventProjection, AgentRuntimeEventSink, AgentSpanLink, AgentStatePayload,
-    AgentStepId, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerId,
-    AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus,
+    AgentRuntimeEventKind, AgentRuntimeEventProjection, AgentRuntimeEventSink, AgentSpanLink,
+    AgentStatePayload, AgentStepId, AgentTelemetryContext, AgentTenantId, AgentTimerEntry,
+    AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery, AgentTimerStatus,
     AgentTimestampMillis, AgentTriggerCommandBuilder, AgentTriggerSource, AgentWorkflowId,
     AgentWorkflowIndexSchemaVersion, AgentWorkflowMigrationPolicy, AgentWorkflowQueryIndex,
     AgentWorkflowRunQuery, AgentWorkflowShardOwnership, ArtifactKind, ArtifactRef, HumanCheckpoint,
     HumanCheckpointId, HumanCheckpointStatus, HumanDecisionOption, InMemoryAgentRuntimeEventSink,
     InMemoryAgentWorkflowQueryIndex, PrincipalRef, RedactionStatus, StateSchemaVersion,
-    WorkflowDefinitionVersion, CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
+    WorkflowDefinitionVersion, CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+    CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION, CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
 };
 use serde_json::json;
 
@@ -346,6 +349,201 @@ fn graph_state_field_is_additive_for_run_state_wire_contract() {
 }
 
 #[test]
+fn compiled_plan_json_accepts_additive_fields_and_missing_additive_defaults() {
+    let plan = compiled_plan();
+    validate_compiled_execution_plan(&plan).expect("compat plan should validate");
+
+    let mut json = serde_json::to_value(&plan).expect("compiled plan should serialize");
+    json["future_compiled_plan_field"] = json!({"reader": "n"});
+    json["nodes"][0]["future_node_field"] = json!("ignored");
+    json["nodes"][0]["output_ports"][0]["future_port_field"] = json!("ignored");
+    json["edges"][0]["future_edge_field"] = json!("ignored");
+
+    let decoded: AgentCompiledExecutionPlan =
+        serde_json::from_value(json.clone()).expect("additive plan fields should deserialize");
+    assert_eq!(decoded.plan_id, AgentCompiledPlanId::new("plan-api-compat"));
+    validate_compiled_execution_plan(&decoded).expect("additive plan should validate");
+
+    for field in [
+        "source_graph_ref",
+        "compiled_metadata_ref",
+        "payload_schema_refs",
+        "default_retry_policy_ref",
+        "default_timeout_policy_ref",
+        "default_approval_policy_ref",
+        "default_concurrency_policy_ref",
+        "compatibility",
+        "observability_labels",
+    ] {
+        json.as_object_mut()
+            .expect("compiled plan should be object")
+            .remove(field);
+    }
+    let input = &mut json["nodes"][0];
+    for field in [
+        "display_name",
+        "config_ref",
+        "retry_policy_ref",
+        "timeout_policy_ref",
+        "concurrency_policy_ref",
+        "iterator_policy",
+        "target",
+        "credential_binding_ref",
+        "observability_labels",
+    ] {
+        input
+            .as_object_mut()
+            .expect("node should be object")
+            .remove(field);
+    }
+    let port = &mut input["output_ports"][0];
+    for field in ["required", "schema_ref", "attributes"] {
+        port.as_object_mut()
+            .expect("port should be object")
+            .remove(field);
+    }
+    for field in ["condition_ref", "merge_behavior", "attributes"] {
+        json["edges"][0]
+            .as_object_mut()
+            .expect("edge should be object")
+            .remove(field);
+    }
+
+    let decoded: AgentCompiledExecutionPlan =
+        serde_json::from_value(json).expect("missing additive plan fields should default");
+    assert!(decoded.source_graph_ref.is_none());
+    assert!(decoded.payload_schema_refs.is_empty());
+    assert!(decoded.compatibility.required_capabilities.is_empty());
+    assert!(decoded.nodes[0].observability_labels.is_empty());
+    assert!(decoded.nodes[0].output_ports[0].required);
+    validate_compiled_execution_plan(&decoded).expect("defaulted plan should validate");
+}
+
+#[test]
+fn graph_state_json_accepts_current_previous_and_missing_additive_defaults() {
+    let state = graph_state();
+    let mut current = serde_json::to_value(&state).expect("graph state should serialize");
+    assert_eq!(
+        current["graph_schema_version"],
+        json!(CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION.get())
+    );
+
+    current["future_graph_state_field"] = json!({"reader": "n"});
+    current["node_states"]["model"]["future_node_state_field"] = json!("ignored");
+    let decoded: AgentGraphRunState =
+        serde_json::from_value(current.clone()).expect("additive graph state should deserialize");
+    assert_eq!(
+        decoded.graph_schema_version,
+        CURRENT_AGENT_GRAPH_STATE_SCHEMA_VERSION
+    );
+    assert_eq!(decoded.node_states.len(), 1);
+
+    let mut previous = current.clone();
+    previous["graph_schema_version"] = json!(0);
+    let previous_decoded: AgentGraphRunState =
+        serde_json::from_value(previous).expect("previous graph schema value should deserialize");
+    assert_eq!(
+        previous_decoded.graph_schema_version,
+        AgentGraphStateSchemaVersion::new(0)
+    );
+
+    for field in [
+        "selected_branch_paths",
+        "skipped_nodes",
+        "loop_instances",
+        "blocked_reason",
+        "output_refs",
+        "scheduler_revision",
+        "last_event_sequence",
+        "terminal_status",
+    ] {
+        current
+            .as_object_mut()
+            .expect("graph state should be object")
+            .remove(field);
+    }
+    let node = &mut current["node_states"]["model"];
+    for field in [
+        "attempt",
+        "dependencies_ready",
+        "input_refs",
+        "output_refs",
+        "scheduled_effect_ids",
+        "timer_ids",
+        "checkpoint_ids",
+        "wait_reason",
+        "error_code",
+        "started_at",
+        "completed_at",
+    ] {
+        node.as_object_mut()
+            .expect("node state should be object")
+            .remove(field);
+    }
+
+    let decoded: AgentGraphRunState =
+        serde_json::from_value(current).expect("missing additive graph fields should default");
+    assert!(decoded.selected_branch_paths.is_empty());
+    assert!(decoded.skipped_nodes.is_empty());
+    assert_eq!(decoded.scheduler_revision, 0);
+    assert_eq!(decoded.last_event_sequence, 0);
+    let node = decoded
+        .node_states
+        .get(&AgentCompiledNodeId::new("model"))
+        .expect("node should remain present");
+    assert_eq!(node.attempt, 0);
+    assert!(!node.dependencies_ready);
+    assert!(node.scheduled_effect_ids.is_empty());
+    assert_eq!(node.wait_reason, None);
+}
+
+#[test]
+fn runtime_event_json_accepts_additive_fields_and_missing_additive_defaults() {
+    let event = AgentRuntimeEvent::new(
+        workflow_id(),
+        run_id("run-event-api-compat"),
+        WorkflowDefinitionVersion::new("v2"),
+        AgentCompiledPlanFingerprint::new("sha256:event-api-compat"),
+        3,
+        1,
+        ts(1_300),
+        AgentRuntimeEventKind::RunStarted,
+        AgentCausationId::new("event-api-compat:cause"),
+        AgentCorrelationId::new("corr-api-compat"),
+        telemetry_context(),
+    )
+    .expect("event should validate");
+
+    let mut json = serde_json::to_value(&event).expect("event should serialize");
+    json["future_event_field"] = json!({"reader": "n"});
+    json["telemetry_context"]["future_trace_field"] = json!("ignored");
+    let decoded: AgentRuntimeEvent =
+        serde_json::from_value(json.clone()).expect("additive event should deserialize");
+    assert_eq!(decoded.kind, AgentRuntimeEventKind::RunStarted);
+    assert!(decoded.attributes.is_empty());
+
+    for field in [
+        "node_id",
+        "effect_id",
+        "timer_id",
+        "checkpoint_id",
+        "attributes",
+    ] {
+        json.as_object_mut()
+            .expect("event should be object")
+            .remove(field);
+    }
+
+    let decoded: AgentRuntimeEvent =
+        serde_json::from_value(json).expect("missing additive event fields should default");
+    assert_eq!(decoded.node_id, None);
+    assert_eq!(decoded.effect_id, None);
+    assert_eq!(decoded.timer_id, None);
+    assert_eq!(decoded.checkpoint_id, None);
+    assert!(decoded.attributes.is_empty());
+}
+
+#[test]
 fn feature_flags_are_additive_and_match_api_review_boundaries() {
     assert!(CARGO_TOML.contains("[features]\ndefault = []"));
     for expected in [
@@ -479,6 +677,35 @@ fn graph_state() -> AgentGraphRunState {
         .scheduled_effect_id(AgentEffectId::new("effect-api-compat-graph"))
         .wait_reason(AgentGraphWaitReason::Effect),
     )
+}
+
+fn compiled_plan() -> AgentCompiledExecutionPlan {
+    let input = AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Output, "input"),
+    );
+    let terminal =
+        AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+            AgentCompiledPlanPort::new("payload", AgentCompiledPortDirection::Input, "input"),
+        );
+
+    AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-api-compat"),
+        workflow_id(),
+        "compat-workflow",
+        WorkflowDefinitionVersion::new("v2"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:api-compat-plan"),
+    )
+    .entry_node("input")
+    .node(input)
+    .node(terminal)
+    .edge(AgentCompiledPlanEdge::new(
+        "edge-input-terminal",
+        "input",
+        "payload",
+        "terminal",
+        "payload",
+    ))
 }
 
 fn timer_entry(timer_id: &str, run_id: &AgentRunId) -> AgentTimerEntry {

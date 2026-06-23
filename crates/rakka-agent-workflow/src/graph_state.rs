@@ -48,22 +48,31 @@ pub struct AgentGraphRunState {
     /// Serialized graph state schema version.
     pub graph_schema_version: AgentGraphStateSchemaVersion,
     /// Per-node durable state keyed by compiled node id.
+    #[serde(default)]
     pub node_states: BTreeMap<AgentCompiledNodeId, AgentGraphNodeState>,
     /// Branch node selections keyed by branch node id.
+    #[serde(default)]
     pub selected_branch_paths: BTreeMap<AgentCompiledNodeId, Vec<AgentCompiledEdgeId>>,
     /// Nodes deterministically skipped by branch or cancellation propagation.
+    #[serde(default)]
     pub skipped_nodes: BTreeSet<AgentCompiledNodeId>,
     /// Explicit bounded loop or iterator instances.
+    #[serde(default)]
     pub loop_instances: Vec<AgentGraphLoopInstanceState>,
     /// Current scheduler blocked reason, when no node can be made runnable.
+    #[serde(default)]
     pub blocked_reason: Option<AgentGraphBlockedReason>,
     /// Graph-level output artifact refs keyed by output port id.
+    #[serde(default)]
     pub output_refs: BTreeMap<AgentCompiledPortId, ArtifactRef>,
     /// Monotonic scheduler revision for recovery-safe decisions.
+    #[serde(default)]
     pub scheduler_revision: u64,
     /// Last emitted durable runtime event sequence observed by this graph state.
+    #[serde(default)]
     pub last_event_sequence: u64,
     /// Terminal graph status after all nodes resolve or cancellation/failure wins.
+    #[serde(default)]
     pub terminal_status: Option<AgentGraphTerminalStatus>,
 }
 
@@ -157,10 +166,13 @@ pub struct AgentGraphRunProjection {
     /// Monotonic scheduler revision for recovery-safe decisions.
     pub scheduler_revision: u64,
     /// Last emitted durable runtime event sequence observed by this graph state.
+    #[serde(default)]
     pub last_event_sequence: u64,
     /// Terminal graph status after all nodes resolve or cancellation/failure wins.
+    #[serde(default)]
     pub terminal_status: Option<AgentGraphTerminalStatus>,
     /// Stable blocked reason code when the graph cannot currently make progress.
+    #[serde(default)]
     pub blocked_reason_code: Option<String>,
     /// Total node count.
     pub node_count: usize,
@@ -181,6 +193,7 @@ pub struct AgentGraphRunProjection {
     /// Terminal node count.
     pub terminal_node_count: usize,
     /// Bounded per-node projections, sorted by compiled node id.
+    #[serde(default)]
     pub nodes: Vec<AgentGraphNodeProjection>,
 }
 
@@ -228,8 +241,10 @@ pub struct AgentGraphNodeProjection {
     /// Durable graph-node status.
     pub status: AgentGraphNodeStatus,
     /// Waiting reason when status is waiting.
+    #[serde(default)]
     pub wait_reason: Option<AgentGraphWaitReason>,
     /// Stable error code when status is failed.
+    #[serde(default)]
     pub error_code: Option<String>,
 }
 
@@ -257,30 +272,41 @@ pub struct AgentGraphNodeState {
     /// Durable graph-node status.
     pub status: AgentGraphNodeStatus,
     /// Attempt count for this node.
+    #[serde(default)]
     pub attempt: u32,
     /// Whether required dependencies are satisfied.
+    #[serde(default)]
     pub dependencies_ready: bool,
     /// Input artifact refs keyed by input port id.
+    #[serde(default)]
     pub input_refs: BTreeMap<AgentCompiledPortId, ArtifactRef>,
     /// Output artifact refs keyed by output port id.
+    #[serde(default)]
     pub output_refs: BTreeMap<AgentCompiledPortId, ArtifactRef>,
     /// Durable outbox effect ids scheduled by this node.
+    #[serde(default)]
     pub scheduled_effect_ids: Vec<AgentEffectId>,
     /// Durable timer ids associated with this node.
+    #[serde(default)]
     pub timer_ids: Vec<AgentTimerId>,
     /// Human checkpoint ids associated with this node.
+    #[serde(default)]
     pub checkpoint_ids: Vec<HumanCheckpointId>,
     /// Waiting reason when status is waiting.
+    #[serde(default)]
     pub wait_reason: Option<AgentGraphWaitReason>,
     /// Stable error code when status is failed.
+    #[serde(default)]
     pub error_code: Option<String>,
     /// Node creation timestamp in the graph state.
     pub created_at: AgentTimestampMillis,
     /// Last node-state update timestamp.
     pub updated_at: AgentTimestampMillis,
     /// Node start timestamp.
+    #[serde(default)]
     pub started_at: Option<AgentTimestampMillis>,
     /// Node terminal timestamp.
+    #[serde(default)]
     pub completed_at: Option<AgentTimestampMillis>,
 }
 
@@ -485,12 +511,15 @@ pub struct AgentGraphLoopInstanceState {
     /// Status of this loop iteration.
     pub status: AgentGraphNodeStatus,
     /// Optional item artifact ref for this iteration.
+    #[serde(default)]
     pub item_ref: Option<ArtifactRef>,
     /// Iteration output artifact refs keyed by output port id.
+    #[serde(default)]
     pub output_refs: BTreeMap<AgentCompiledPortId, ArtifactRef>,
     /// Iteration creation timestamp.
     pub created_at: AgentTimestampMillis,
     /// Iteration terminal timestamp.
+    #[serde(default)]
     pub completed_at: Option<AgentTimestampMillis>,
 }
 
@@ -541,6 +570,7 @@ pub struct AgentGraphBlockedReason {
     /// Stable bounded reason code.
     pub code: String,
     /// Optional bounded detail label, not full error text.
+    #[serde(default)]
     pub detail: Option<String>,
 }
 
