@@ -139,6 +139,12 @@ impl From<AgentInboxError> for AgentWorkflowDrainError {
 }
 
 /// Gate for public workflow command ingress during Kubernetes drain.
+///
+/// Compiled graph runs use the same public durable command boundary as
+/// step-based runs. Application ingress should put graph starts, graph signals,
+/// callbacks, and human decisions through this gate before durable inbox
+/// acceptance; actor-level graph scheduler messages remain internal recovery
+/// work and should not be exposed as public ingress.
 #[derive(Debug, Clone)]
 pub struct AgentWorkflowIngressGate {
     health: KubernetesNodeHealth,

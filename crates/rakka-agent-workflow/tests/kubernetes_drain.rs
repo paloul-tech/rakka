@@ -9,11 +9,16 @@ use std::time::Duration;
 use rakka_agent_workflow::{
     register_agent_workflow_ingress_stop_task, register_agent_workflow_telemetry_flush_task,
     AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata,
-    AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentInboxAcceptance,
-    AgentRunId, AgentRunInbox, AgentTenantId, AgentTimestampMillis, AgentWorkflowDrainError,
-    AgentWorkflowId, AgentWorkflowIngressGate, AGENT_WORKFLOW_FLUSH_TELEMETRY_OPERATION,
-    AGENT_WORKFLOW_FLUSH_TELEMETRY_TASK, AGENT_WORKFLOW_SHUTDOWN_OPERATION_ATTR,
-    AGENT_WORKFLOW_STOP_INGRESS_OPERATION, AGENT_WORKFLOW_STOP_INGRESS_TASK,
+    AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentCompiledPlanId,
+    AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentGraphBlockedReason,
+    AgentGraphNodeState, AgentGraphNodeStatus, AgentGraphRunState, AgentGraphWaitReason,
+    AgentInboxAcceptance, AgentRunActorSnapshot, AgentRunId, AgentRunInbox, AgentRunState,
+    AgentRunStatus, AgentStatePayload, AgentTenantId, AgentTimestampMillis,
+    AgentWorkflowDrainError, AgentWorkflowId, AgentWorkflowIngressGate,
+    AgentWorkflowSnapshotRegistry, StateSchemaVersion, WorkflowDefinitionVersion,
+    AGENT_WORKFLOW_FLUSH_TELEMETRY_OPERATION, AGENT_WORKFLOW_FLUSH_TELEMETRY_TASK,
+    AGENT_WORKFLOW_SHUTDOWN_OPERATION_ATTR, AGENT_WORKFLOW_STOP_INGRESS_OPERATION,
+    AGENT_WORKFLOW_STOP_INGRESS_TASK,
 };
 use rakka_cluster::{ClusterMembership, ClusterNode, MembershipConfig, NodeAddress, NodeId};
 use rakka_core::{CoordinatedShutdown, ShutdownPhase, ShutdownTask};
@@ -118,6 +123,76 @@ async fn coordinated_kubernetes_drain_stops_ingress_and_preserves_durable_work()
     assert_eq!(recoverable[0].message_id().as_str(), "command-1");
 }
 
+#[tokio::test]
+async fn kubernetes_drain_before_graph_start_rejects_public_graph_ingress() {
+    let health = ready_health();
+    let gate = AgentWorkflowIngressGate::new(health);
+    let store = TestStore::new();
+    let run_id = AgentRunId::new("run-graph-drain-before-start");
+    let mut inbox = test_inbox_for_run(store.clone(), run_id.clone());
+    inbox.recover().await.expect("inbox should recover");
+
+    gate.begin_drain();
+
+    let error = gate
+        .accept_command(
+            &mut inbox,
+            start_command_for_run(
+                &run_id,
+                "command-graph-drain-start",
+                "graph-command:run-graph-drain-before-start:start",
+            ),
+        )
+        .await
+        .expect_err("graph start should be rejected after drain starts");
+    assert_eq!(error.code(), "agent-workflow-draining");
+
+    let mut recovered = test_inbox_for_run(store, run_id);
+    recovered
+        .recover()
+        .await
+        .expect("recovered inbox should load");
+    let recoverable = recovered
+        .inner()
+        .recoverable_inbox()
+        .expect("recovered inbox should be available");
+    assert!(recoverable.is_empty());
+}
+
+#[test]
+fn runtime_snapshot_reports_graph_drain_blockers_during_kubernetes_drain() {
+    let health = ready_health();
+    let gate = AgentWorkflowIngressGate::new(health);
+    let snapshots = AgentWorkflowSnapshotRegistry::new();
+
+    gate.begin_drain();
+    assert!(!gate.accepts_public_commands());
+
+    record_graph_waiting_run(
+        &snapshots,
+        "run-graph-effect-drain",
+        "effect",
+        AgentCompiledNodeKind::ToolCall,
+        AgentGraphWaitReason::Effect,
+    );
+    record_graph_waiting_run(
+        &snapshots,
+        "run-graph-human-drain",
+        "approval",
+        AgentCompiledNodeKind::HumanCheckpoint,
+        AgentGraphWaitReason::Human,
+    );
+
+    let runtime = snapshots.runtime_snapshot();
+    assert_eq!(runtime.graph_run_count(), 2);
+    assert_eq!(runtime.graph_drain_blocker_count(), 2);
+    assert_eq!(runtime.graph_waiting_node_count(), 2);
+    assert_eq!(runtime.graph_effect_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_human_waiting_node_count(), 1);
+    assert_eq!(runtime.graph_runnable_node_count(), 0);
+    assert_eq!(runtime.graph_running_node_count(), 0);
+}
+
 fn assert_registered_task(
     tasks: &[ShutdownTask],
     name: &str,
@@ -140,19 +215,34 @@ fn assert_registered_task(
 }
 
 fn test_inbox(store: TestStore) -> AgentRunInbox<TestStore, ManualWorkflowClock> {
+    test_inbox_for_run(store, AgentRunId::new("run-1"))
+}
+
+fn test_inbox_for_run(
+    store: TestStore,
+    run_id: AgentRunId,
+) -> AgentRunInbox<TestStore, ManualWorkflowClock> {
     AgentRunInbox::with_clock(
-        AgentRunId::new("run-1"),
+        run_id,
         store,
         ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100)),
     )
 }
 
 fn start_command(command_id: &str, deduplication_key: &str) -> AgentCommand {
+    start_command_for_run(&AgentRunId::new("run-1"), command_id, deduplication_key)
+}
+
+fn start_command_for_run(
+    run_id: &AgentRunId,
+    command_id: &str,
+    deduplication_key: &str,
+) -> AgentCommand {
     AgentCommand::new(
         AgentCommandKind::StartRun,
         AgentCommandMetadata::new(
             AgentWorkflowId::new("workflow-1"),
-            AgentRunId::new("run-1"),
+            run_id.clone(),
             AgentCommandId::new(command_id),
             AgentDurabilityMetadata::new(
                 AgentDeduplicationKey::new(deduplication_key),
@@ -165,6 +255,75 @@ fn start_command(command_id: &str, deduplication_key: &str) -> AgentCommand {
         .expect("metadata should be valid"),
     )
     .expect("command should be valid")
+}
+
+fn record_graph_waiting_run(
+    snapshots: &AgentWorkflowSnapshotRegistry,
+    run_id_value: &str,
+    node_id_value: &str,
+    node_kind: AgentCompiledNodeKind,
+    wait_reason: AgentGraphWaitReason,
+) {
+    let run_id = AgentRunId::new(run_id_value);
+    snapshots.record_run_actor_snapshot(&AgentRunActorSnapshot {
+        run_id: run_id.clone(),
+        run_state: Some(graph_waiting_run_state(
+            &run_id,
+            node_id_value,
+            node_kind,
+            wait_reason,
+        )),
+        graph: None,
+        recoverable_command_count: 0,
+        due_effect_count: 0,
+    });
+}
+
+fn graph_waiting_run_state(
+    run_id: &AgentRunId,
+    node_id_value: &str,
+    node_kind: AgentCompiledNodeKind,
+    wait_reason: AgentGraphWaitReason,
+) -> AgentRunState {
+    let node = AgentGraphNodeState::new(
+        AgentCompiledNodeId::new(node_id_value),
+        node_kind,
+        AgentTimestampMillis::new(120),
+    )
+    .status(AgentGraphNodeStatus::Waiting)
+    .dependencies_ready(true)
+    .wait_reason(wait_reason);
+
+    let graph_state = AgentGraphRunState::new(
+        AgentCompiledPlanId::new(format!("plan-{node_id_value}-drain")),
+        AgentCompiledPlanFingerprint::new(format!("sha256:{node_id_value}-drain")),
+    )
+    .node_state(node)
+    .blocked_reason(AgentGraphBlockedReason::new(format!(
+        "waiting-{}",
+        wait_reason.as_label()
+    )));
+
+    AgentRunState {
+        run_id: run_id.clone(),
+        workflow_id: AgentWorkflowId::new("workflow-graph-drain"),
+        tenant: Some(AgentTenantId::new("tenant-a")),
+        definition_version: WorkflowDefinitionVersion::new("v1"),
+        state_schema_version: StateSchemaVersion::new(1),
+        graph_state: Some(graph_state),
+        status: AgentRunStatus::Running,
+        current_step_id: None,
+        current_attempt: 0,
+        inputs_ref: None,
+        state_payload: AgentStatePayload::Empty,
+        checkpoints: Vec::new(),
+        pending_effects: Vec::new(),
+        pending_human_checkpoint: None,
+        cancellation: None,
+        created_at: AgentTimestampMillis::new(100),
+        updated_at: AgentTimestampMillis::new(120),
+        completed_at: None,
+    }
 }
 
 fn ready_health() -> KubernetesNodeHealth {

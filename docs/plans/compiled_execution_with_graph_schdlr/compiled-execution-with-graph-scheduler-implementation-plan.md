@@ -1148,6 +1148,8 @@ Implementation notes:
 
 ## Phase 7: Runtime Integration
 
+Status: implemented.
+
 Goal: make graph execution work in local, actor-backed, and sharded runtime
 paths.
 
@@ -1235,6 +1237,8 @@ Implementation notes:
 
 ### Slice 7.3: Drain And Shutdown
 
+Status: implemented.
+
 Scope:
 
 - Register graph runtime drain blockers and shutdown tasks where needed.
@@ -1254,6 +1258,23 @@ Tests:
 - Drain while waiting for effect.
 - Drain while waiting for human checkpoint.
 - Abrupt shutdown recovery.
+
+Implementation notes:
+
+- Confirmed graph execution uses the existing public durable command ingress
+  gate for graph starts, signals, callbacks, and human decisions; actor-level
+  graph scheduler commands remain internal recovery work.
+- Clarified `AgentWorkflowIngressGate` documentation so product backends route
+  compiled graph public ingress through the same drain gate as step-based runs.
+- Extended `AgentWorkflowRuntimeSnapshot` with bounded graph drain blocker
+  counters for runnable nodes, running nodes, waiting nodes by effect/timer/
+  human/child-workflow reason, and total graph drain blockers.
+- Added Kubernetes drain tests covering rejection of a public graph start after
+  drain begins and graph drain blocker reporting while runs wait on effect and
+  human checkpoint boundaries.
+- Abrupt shutdown recovery remains covered by the actor-backed and sharded
+  graph recovery tests added in Slices 7.1 and 7.2, which recover runnable
+  graph nodes and scheduled durable effects from persisted run/outbox state.
 
 ## Phase 8: Hardening, Compatibility, And Operations
 
