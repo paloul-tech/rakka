@@ -1366,6 +1366,8 @@ Implementation notes:
 
 ### Slice 8.3: Load And Cardinality
 
+Status: implemented.
+
 Scope:
 
 - Add deterministic load tests for large node counts, fan-out/fan-in graphs,
@@ -1385,6 +1387,16 @@ Tests:
 - Many joins.
 - Many waiting nodes.
 - Cardinality validation.
+
+Implementation notes:
+
+- Extended `load_backpressure_cardinality` with compiled graph scheduler load
+  tests for a large linear graph, wide fan-out into multiple fan-in joins, and
+  many waiting graph nodes with bounded serialized projections.
+- Added runtime event stream load coverage that records 128 ordered events,
+  rebuilds a projection, and asserts hot metric labels reject raw run/node ids.
+- Existing load tests continue to cover dispatcher target backpressure, timer
+  backlog batch limits, bounded query projections, and bounded metric series.
 
 ### Slice 8.4: Optional PostgreSQL Gate
 

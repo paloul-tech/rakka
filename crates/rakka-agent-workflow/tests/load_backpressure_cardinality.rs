@@ -10,16 +10,26 @@ use rakka_agent_workflow::{
     AgentDispatcherWorkerId, AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind,
     AgentEffectMetadata, AgentEffectSchedule, AgentEffectTarget, AgentIdempotencyKey, AgentRunId,
     AgentRunInbox, AgentRunIndexEntry, AgentRunState, AgentRunStatus, AgentRunTransitionKind,
-    AgentRunWaitReason, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind, AgentStepRunner,
-    AgentTenantId, AgentTimerEntry, AgentTimerId, AgentTimerIndexEntry, AgentTimerPolicy,
-    AgentTimerQuery, AgentTimerScanner, AgentTimerScannerSettings, AgentTimerStatus,
-    AgentTimerStore, AgentTimerStoreState, AgentTimestampMillis, AgentWorkflow, AgentWorkflowId,
-    AgentWorkflowQueryIndex, AgentWorkflowRunQuery, HumanCheckpoint, HumanCheckpointId,
-    HumanCheckpointStatus, HumanDecisionOption, InMemoryAgentWorkflowQueryIndex, PrincipalRef,
-    StateSchemaVersion, WorkflowDefinitionVersion, FORBIDDEN_HOT_METRIC_FIELDS,
+    AgentRunWaitReason, AgentRuntimeEventDraft, AgentRuntimeEventKind, AgentRuntimeEventProjection,
+    AgentRuntimeEventSink, AgentStatePayload, AgentStep, AgentStepId, AgentStepKind,
+    AgentStepRunner, AgentTelemetryContext, AgentTenantId, AgentTimerEntry, AgentTimerId,
+    AgentTimerIndexEntry, AgentTimerPolicy, AgentTimerQuery, AgentTimerScanner,
+    AgentTimerScannerSettings, AgentTimerStatus, AgentTimerStore, AgentTimerStoreState,
+    AgentTimestampMillis, AgentWorkflow, AgentWorkflowId, AgentWorkflowQueryIndex,
+    AgentWorkflowRunQuery, HumanCheckpoint, HumanCheckpointId, HumanCheckpointStatus,
+    HumanDecisionOption, InMemoryAgentRuntimeEventSink, InMemoryAgentWorkflowQueryIndex,
+    PrincipalRef, StateSchemaVersion, WorkflowDefinitionVersion, FORBIDDEN_HOT_METRIC_FIELDS,
     METRIC_AGENT_DISPATCHER_BACKLOG, METRIC_AGENT_DISPATCHER_FLEET,
     METRIC_AGENT_DISPATCHER_IN_FLIGHT, METRIC_AGENT_INBOX_COMMANDS, METRIC_AGENT_TIMERS,
     METRIC_AGENT_TIMERS_LATE_BY_MS,
+};
+use rakka_agent_workflow::{
+    AgentCompiledEdgeMergeBehavior, AgentCompiledExecutionPlan, AgentCompiledNodeId,
+    AgentCompiledNodeKind, AgentCompiledNodeTarget, AgentCompiledPlanEdge,
+    AgentCompiledPlanFingerprint, AgentCompiledPlanId, AgentCompiledPlanNode,
+    AgentCompiledPlanPort, AgentCompiledPortDirection, AgentGraphNodeStatus,
+    AgentGraphRunProjection, AgentGraphRunState, AgentGraphScheduler, AgentGraphWaitReason,
+    CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
 };
 use rakka_core::{InMemoryMetricsRecorder, MetricKind, MetricsSnapshot};
 use rakka_persistence::InMemoryDurableStateStore;
@@ -36,6 +46,11 @@ const DISPATCH_TARGET_LIMIT: usize = 5;
 const TIMER_RUN_COUNT: usize = 36;
 const TIMER_BATCH_SIZE: usize = 7;
 const QUERY_RUN_COUNT: usize = 128;
+const LARGE_LINEAR_GRAPH_STEPS: usize = 80;
+const WIDE_GRAPH_LEAF_COUNT: usize = 48;
+const WIDE_GRAPH_JOIN_WIDTH: usize = 6;
+const WAITING_GRAPH_NODE_COUNT: usize = 72;
+const RUNTIME_EVENT_COUNT: usize = 128;
 
 #[tokio::test]
 async fn dispatcher_load_claims_bounded_work_and_keeps_metric_series_bounded() {
@@ -277,6 +292,526 @@ async fn query_views_stay_bounded_under_large_run_counts() {
         .await
         .expect_err("zero limit should be rejected");
     assert_eq!(too_wide.code(), "invalid-workflow-query");
+}
+
+#[test]
+fn graph_scheduler_load_runs_large_linear_graph_deterministically() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = large_linear_graph_plan(LARGE_LINEAR_GRAPH_STEPS);
+    let mut state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("large linear graph should initialize");
+
+    let mut expected_order = Vec::with_capacity(LARGE_LINEAR_GRAPH_STEPS + 2);
+    expected_order.push("input".to_string());
+    for index in 0..LARGE_LINEAR_GRAPH_STEPS {
+        expected_order.push(format!("step-{index:03}"));
+    }
+    expected_order.push("terminal".to_string());
+
+    for (index, node_id) in expected_order.iter().enumerate() {
+        let transition = scheduler
+            .mark_ready_nodes_runnable(&plan, state, ts(1_000 + index as u64 * 10))
+            .expect("next linear node should become runnable");
+        assert_eq!(
+            compiled_node_ids(&transition.changed_node_ids),
+            vec![node_id.clone()]
+        );
+        assert_eq!(
+            compiled_node_ids(&transition.runnable_node_ids),
+            vec![node_id.clone()]
+        );
+        state = start_and_complete_graph_node(
+            &scheduler,
+            &plan,
+            transition.state,
+            node_id,
+            ts(1_001 + index as u64 * 10),
+        );
+    }
+
+    assert_eq!(state.node_states.len(), LARGE_LINEAR_GRAPH_STEPS + 2);
+    assert!(state.terminal_status.is_some());
+    assert_eq!(
+        graph_node_status(&state, "terminal"),
+        AgentGraphNodeStatus::Terminal
+    );
+}
+
+#[test]
+fn graph_scheduler_load_handles_wide_fan_out_and_many_joins_deterministically() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = wide_join_graph_plan(WIDE_GRAPH_LEAF_COUNT, WIDE_GRAPH_JOIN_WIDTH);
+    let mut state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("wide join graph should initialize");
+
+    state = run_next_single_ready_node(&scheduler, &plan, state, "input", 110);
+
+    let leaves = numbered_ids("leaf", WIDE_GRAPH_LEAF_COUNT);
+    let transition = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(200))
+        .expect("fan-out leaves should become runnable");
+    assert_eq!(compiled_node_ids(&transition.changed_node_ids), leaves);
+    state = transition.state;
+
+    for index in 0..WIDE_GRAPH_LEAF_COUNT {
+        state = start_and_complete_graph_node(
+            &scheduler,
+            &plan,
+            state,
+            &format!("leaf-{index:03}"),
+            ts(210 + index as u64),
+        );
+    }
+
+    let join_count = WIDE_GRAPH_LEAF_COUNT / WIDE_GRAPH_JOIN_WIDTH;
+    let joins = numbered_ids("join", join_count);
+    let transition = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(300))
+        .expect("group joins should become runnable");
+    assert_eq!(compiled_node_ids(&transition.changed_node_ids), joins);
+    state = transition.state;
+
+    for index in 0..join_count {
+        state = start_and_complete_graph_node(
+            &scheduler,
+            &plan,
+            state,
+            &format!("join-{index:03}"),
+            ts(310 + index as u64),
+        );
+    }
+
+    state = run_next_single_ready_node(&scheduler, &plan, state, "join-final", 400);
+    state = run_next_single_ready_node(&scheduler, &plan, state, "terminal", 500);
+
+    let projection = AgentGraphRunProjection::from_graph_state(&state);
+    assert_eq!(
+        projection.node_count,
+        WIDE_GRAPH_LEAF_COUNT + join_count + 3
+    );
+    assert_eq!(projection.failed_node_count, 0);
+    assert_eq!(projection.waiting_node_count, 0);
+    assert!(state.terminal_status.is_some());
+}
+
+#[test]
+fn graph_scheduler_load_tracks_many_waiting_nodes() {
+    let scheduler = AgentGraphScheduler::new();
+    let plan = wide_waiting_graph_plan(WAITING_GRAPH_NODE_COUNT);
+    let mut state = scheduler
+        .initialize_state(&plan, ts(100))
+        .expect("waiting graph should initialize");
+
+    state = run_next_single_ready_node(&scheduler, &plan, state, "input", 110);
+    let waiting_nodes = numbered_ids("wait", WAITING_GRAPH_NODE_COUNT);
+    let transition = scheduler
+        .mark_ready_nodes_runnable(&plan, state, ts(200))
+        .expect("waiting nodes should become runnable");
+    assert_eq!(
+        compiled_node_ids(&transition.changed_node_ids),
+        waiting_nodes
+    );
+    state = transition.state;
+
+    for index in 0..WAITING_GRAPH_NODE_COUNT {
+        let node_id = format!("wait-{index:03}");
+        state = scheduler
+            .start_node(&plan, state, node_id.as_str(), ts(210 + index as u64 * 2))
+            .expect("waiting node should start")
+            .state;
+        let reason = match index % 3 {
+            0 => AgentGraphWaitReason::Effect,
+            1 => AgentGraphWaitReason::Timer,
+            _ => AgentGraphWaitReason::Human,
+        };
+        state = scheduler
+            .wait_node(&plan, state, node_id, reason, ts(211 + index as u64 * 2))
+            .expect("running node should enter durable wait")
+            .state;
+    }
+
+    let projection = AgentGraphRunProjection::from_graph_state(&state);
+    assert_eq!(projection.waiting_node_count, WAITING_GRAPH_NODE_COUNT);
+    assert_eq!(projection.runnable_node_count, 0);
+    assert_eq!(projection.running_node_count, 0);
+    assert_eq!(projection.failed_node_count, 0);
+    assert_eq!(
+        projection
+            .nodes
+            .iter()
+            .filter(|node| node.wait_reason == Some(AgentGraphWaitReason::Effect))
+            .count(),
+        WAITING_GRAPH_NODE_COUNT / 3
+    );
+    let encoded = serde_json::to_vec(&projection).expect("projection should serialize");
+    assert!(
+        encoded.len() < 32_768,
+        "bounded graph projection should stay compact under waiting-node load: {} bytes",
+        encoded.len()
+    );
+}
+
+#[tokio::test]
+async fn runtime_event_load_preserves_order_and_rejects_cardinality_leaks() {
+    let mut sink = InMemoryAgentRuntimeEventSink::new();
+    let mut graph = AgentGraphRunState::new(
+        AgentCompiledPlanId::new("plan-runtime-event-load"),
+        AgentCompiledPlanFingerprint::new("sha256:runtime-event-load"),
+    );
+    let mut recorded_events = Vec::with_capacity(RUNTIME_EVENT_COUNT);
+
+    for index in 0..RUNTIME_EVENT_COUNT {
+        graph.scheduler_revision = index as u64 + 1;
+        let kind = if index == 0 {
+            AgentRuntimeEventKind::RunStarted
+        } else if index == RUNTIME_EVENT_COUNT - 1 {
+            AgentRuntimeEventKind::RunCompleted
+        } else {
+            AgentRuntimeEventKind::NodeCompleted
+        };
+        let mut draft = AgentRuntimeEventDraft::new(
+            AgentWorkflowId::new("workflow-runtime-event-load"),
+            AgentRunId::new("run-runtime-event-load"),
+            WorkflowDefinitionVersion::new("v1"),
+            ts(1_000 + index as u64),
+            kind,
+            AgentCausationId::new("cause:runtime-event-load"),
+            AgentCorrelationId::new("corr:runtime-event-load"),
+            AgentTelemetryContext::default(),
+        );
+        if kind == AgentRuntimeEventKind::NodeCompleted {
+            draft = draft
+                .node_id(AgentCompiledNodeId::new(format!("node-{index:03}")))
+                .attribute("status", "completed");
+        }
+        let event = draft
+            .after_persistence(Some(&graph))
+            .expect("event draft should validate")
+            .expect("persisted graph should produce event");
+        graph.last_event_sequence = event.event_sequence;
+        sink.record_runtime_event(event.clone())
+            .await
+            .expect("event should record");
+        recorded_events.push(event);
+    }
+
+    let stored = sink
+        .runtime_events_for_run(AgentRunId::new("run-runtime-event-load"))
+        .await
+        .expect("events should query in sequence order");
+    assert_eq!(stored, recorded_events);
+    assert!(stored
+        .windows(2)
+        .all(|window| window[0].event_sequence + 1 == window[1].event_sequence));
+
+    let projection =
+        AgentRuntimeEventProjection::from_events(&stored).expect("event projection should rebuild");
+    assert_eq!(projection.event_count, RUNTIME_EVENT_COUNT as u64);
+    assert_eq!(
+        projection.node_event_count,
+        (RUNTIME_EVENT_COUNT - 2) as u64
+    );
+    assert_eq!(
+        projection.terminal_event_kind,
+        Some(AgentRuntimeEventKind::RunCompleted)
+    );
+
+    assert!(validate_agent_metric_attributes(&[("status", "completed")]).is_ok());
+    assert!(validate_agent_metric_attributes(&[("node_id", "node-001")]).is_err());
+    assert!(validate_agent_metric_attributes(&[("run_id", "run-runtime-event-load")]).is_err());
+}
+
+fn large_linear_graph_plan(step_count: usize) -> AgentCompiledExecutionPlan {
+    let mut plan = AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-load-large-linear"),
+        AgentWorkflowId::new("workflow-load-graph"),
+        "load-graph",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:load-large-linear"),
+    )
+    .entry_node("input")
+    .node(input_node());
+
+    let mut previous_node = "input".to_string();
+    let mut previous_port = "out".to_string();
+    for index in 0..step_count {
+        let node_id = format!("step-{index:03}");
+        plan = plan.node(transform_node(&node_id));
+        plan = plan.edge(AgentCompiledPlanEdge::new(
+            format!("edge-{previous_node}-{node_id}"),
+            previous_node.as_str(),
+            previous_port.as_str(),
+            node_id.as_str(),
+            "in",
+        ));
+        previous_node = node_id;
+        previous_port = "out".to_string();
+    }
+
+    plan.node(terminal_node()).edge(AgentCompiledPlanEdge::new(
+        "edge-last-terminal",
+        previous_node,
+        previous_port,
+        "terminal",
+        "in",
+    ))
+}
+
+fn wide_join_graph_plan(leaf_count: usize, join_width: usize) -> AgentCompiledExecutionPlan {
+    assert_eq!(leaf_count % join_width, 0);
+    let join_count = leaf_count / join_width;
+    let mut plan = AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-load-wide-joins"),
+        AgentWorkflowId::new("workflow-load-graph"),
+        "load-graph",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:load-wide-joins"),
+    )
+    .entry_node("input")
+    .node(input_node());
+
+    for index in 0..leaf_count {
+        let leaf_id = format!("leaf-{index:03}");
+        plan = plan.node(transform_node(&leaf_id));
+        plan = plan.edge(AgentCompiledPlanEdge::new(
+            format!("edge-input-{leaf_id}"),
+            "input",
+            "out",
+            leaf_id.as_str(),
+            "in",
+        ));
+    }
+
+    for join_index in 0..join_count {
+        let join_id = format!("join-{join_index:03}");
+        let mut join =
+            AgentCompiledPlanNode::new(join_id.as_str(), AgentCompiledNodeKind::Join).output_port(
+                AgentCompiledPlanPort::new("out", AgentCompiledPortDirection::Output, "payload"),
+            );
+        for offset in 0..join_width {
+            let leaf_index = join_index * join_width + offset;
+            let port_id = format!("in-{offset:03}");
+            join = join.input_port(AgentCompiledPlanPort::new(
+                port_id.as_str(),
+                AgentCompiledPortDirection::Input,
+                "payload",
+            ));
+            plan = plan.edge(
+                AgentCompiledPlanEdge::new(
+                    format!("edge-leaf-{leaf_index:03}-{join_id}"),
+                    format!("leaf-{leaf_index:03}"),
+                    "out",
+                    join_id.as_str(),
+                    port_id,
+                )
+                .merge_behavior(AgentCompiledEdgeMergeBehavior::WaitForAll),
+            );
+        }
+        plan = plan.node(join);
+    }
+
+    let mut final_join =
+        AgentCompiledPlanNode::new("join-final", AgentCompiledNodeKind::Join).output_port(
+            AgentCompiledPlanPort::new("out", AgentCompiledPortDirection::Output, "payload"),
+        );
+    for index in 0..join_count {
+        let input_port = format!("group-{index:03}");
+        final_join = final_join.input_port(AgentCompiledPlanPort::new(
+            input_port.as_str(),
+            AgentCompiledPortDirection::Input,
+            "payload",
+        ));
+        plan = plan.edge(
+            AgentCompiledPlanEdge::new(
+                format!("edge-join-{index:03}-final"),
+                format!("join-{index:03}"),
+                "out",
+                "join-final",
+                input_port,
+            )
+            .merge_behavior(AgentCompiledEdgeMergeBehavior::WaitForAll),
+        );
+    }
+
+    plan.node(final_join)
+        .node(terminal_node())
+        .edge(AgentCompiledPlanEdge::new(
+            "edge-final-terminal",
+            "join-final",
+            "out",
+            "terminal",
+            "in",
+        ))
+}
+
+fn wide_waiting_graph_plan(waiting_count: usize) -> AgentCompiledExecutionPlan {
+    let mut plan = AgentCompiledExecutionPlan::new(
+        AgentCompiledPlanId::new("plan-load-many-waiting"),
+        AgentWorkflowId::new("workflow-load-graph"),
+        "load-graph",
+        WorkflowDefinitionVersion::new("v1"),
+        CURRENT_AGENT_COMPILED_PLAN_SCHEMA_VERSION,
+        AgentCompiledPlanFingerprint::new("sha256:load-many-waiting"),
+    )
+    .entry_node("input")
+    .node(input_node());
+
+    let mut join =
+        AgentCompiledPlanNode::new("join-waits", AgentCompiledNodeKind::Join).output_port(
+            AgentCompiledPlanPort::new("out", AgentCompiledPortDirection::Output, "payload"),
+        );
+    for index in 0..waiting_count {
+        let wait_id = format!("wait-{index:03}");
+        plan = plan.node(waiting_effect_node(&wait_id));
+        plan = plan.edge(AgentCompiledPlanEdge::new(
+            format!("edge-input-{wait_id}"),
+            "input",
+            "out",
+            wait_id.as_str(),
+            "in",
+        ));
+        let join_port = format!("in-{index:03}");
+        join = join.input_port(AgentCompiledPlanPort::new(
+            join_port.as_str(),
+            AgentCompiledPortDirection::Input,
+            "payload",
+        ));
+        plan = plan.edge(
+            AgentCompiledPlanEdge::new(
+                format!("edge-{wait_id}-join"),
+                wait_id,
+                "out",
+                "join-waits",
+                join_port,
+            )
+            .merge_behavior(AgentCompiledEdgeMergeBehavior::WaitForAll),
+        );
+    }
+
+    plan.node(join)
+        .node(terminal_node())
+        .edge(AgentCompiledPlanEdge::new(
+            "edge-wait-join-terminal",
+            "join-waits",
+            "out",
+            "terminal",
+            "in",
+        ))
+}
+
+fn input_node() -> AgentCompiledPlanNode {
+    AgentCompiledPlanNode::new("input", AgentCompiledNodeKind::Input).output_port(
+        AgentCompiledPlanPort::new("out", AgentCompiledPortDirection::Output, "payload"),
+    )
+}
+
+fn transform_node(node_id: &str) -> AgentCompiledPlanNode {
+    AgentCompiledPlanNode::new(node_id, AgentCompiledNodeKind::Transform)
+        .input_port(AgentCompiledPlanPort::new(
+            "in",
+            AgentCompiledPortDirection::Input,
+            "payload",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "out",
+            AgentCompiledPortDirection::Output,
+            "payload",
+        ))
+}
+
+fn waiting_effect_node(node_id: &str) -> AgentCompiledPlanNode {
+    AgentCompiledPlanNode::new(node_id, AgentCompiledNodeKind::ToolCall)
+        .input_port(AgentCompiledPlanPort::new(
+            "in",
+            AgentCompiledPortDirection::Input,
+            "payload",
+        ))
+        .output_port(AgentCompiledPlanPort::new(
+            "out",
+            AgentCompiledPortDirection::Output,
+            "payload",
+        ))
+        .target(
+            AgentCompiledNodeTarget::new("tool", "load-waiting-tool")
+                .address("tool://load-waiting-tool")
+                .attribute("target_class", "tool"),
+        )
+}
+
+fn terminal_node() -> AgentCompiledPlanNode {
+    AgentCompiledPlanNode::new("terminal", AgentCompiledNodeKind::Terminal).input_port(
+        AgentCompiledPlanPort::new("in", AgentCompiledPortDirection::Input, "payload"),
+    )
+}
+
+fn run_next_single_ready_node(
+    scheduler: &AgentGraphScheduler,
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    expected_node_id: &str,
+    timestamp_millis: u64,
+) -> AgentGraphRunState {
+    let transition = scheduler
+        .mark_ready_nodes_runnable(plan, state, ts(timestamp_millis))
+        .expect("exactly one node should become runnable");
+    assert_eq!(
+        compiled_node_ids(&transition.changed_node_ids),
+        vec![expected_node_id.to_string()]
+    );
+    start_and_complete_graph_node(
+        scheduler,
+        plan,
+        transition.state,
+        expected_node_id,
+        ts(timestamp_millis + 1),
+    )
+}
+
+fn start_and_complete_graph_node(
+    scheduler: &AgentGraphScheduler,
+    plan: &AgentCompiledExecutionPlan,
+    state: AgentGraphRunState,
+    node_id: &str,
+    timestamp: AgentTimestampMillis,
+) -> AgentGraphRunState {
+    let state = scheduler
+        .start_node(plan, state, node_id, timestamp)
+        .expect("graph node should start")
+        .state;
+    scheduler
+        .complete_node(
+            plan,
+            state,
+            node_id,
+            AgentTimestampMillis::new(timestamp.as_millis() + 1),
+        )
+        .expect("graph node should complete")
+        .state
+}
+
+fn compiled_node_ids(node_ids: &[AgentCompiledNodeId]) -> Vec<String> {
+    node_ids
+        .iter()
+        .map(|node_id| node_id.as_str().to_string())
+        .collect()
+}
+
+fn numbered_ids(prefix: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("{prefix}-{index:03}"))
+        .collect()
+}
+
+fn graph_node_status(state: &AgentGraphRunState, node_id: &str) -> AgentGraphNodeStatus {
+    state
+        .node_states
+        .get(&AgentCompiledNodeId::new(node_id))
+        .expect("graph node should exist")
+        .status
 }
 
 fn worker(
