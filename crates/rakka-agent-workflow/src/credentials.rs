@@ -162,13 +162,12 @@ impl AgentCredentialResolutionRequest {
         credential_use: AgentCredentialUse,
         effect: &AgentEffect,
     ) -> AgentCredentialResult<Self> {
-        let credential_binding_ref =
-            credential_binding_ref_from_effect(effect).ok_or_else(|| {
-                AgentCredentialError::InvalidRequest {
-                    field: "credential_binding_ref",
-                    reason: "effect target is missing logical credential binding ref",
-                }
-            })?;
+        let credential_binding_ref = credential_binding_ref_from_effect(effect).ok_or(
+            AgentCredentialError::InvalidRequest {
+                field: "credential_binding_ref",
+                reason: "effect target is missing logical credential binding ref",
+            },
+        )?;
         Ok(Self::new(
             tenant,
             workflow_id,
