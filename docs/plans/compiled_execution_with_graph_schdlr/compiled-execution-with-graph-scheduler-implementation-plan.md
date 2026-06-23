@@ -1328,6 +1328,8 @@ Implementation notes:
 
 ### Slice 8.2: Failure Injection Suite
 
+Status: implemented.
+
 Scope:
 
 - Add failure tests for every durable boundary.
@@ -1347,6 +1349,20 @@ Tests:
 - Crash after effect scheduling.
 - Crash after callback acceptance.
 - Crash during event sink write.
+
+Implementation notes:
+
+- Extended `failure_injection` with graph-specific durable boundary coverage
+  for crash after graph initialization, crash after ready-node runnable marking,
+  crash after effect callback command acceptance before graph transition
+  persistence, and crash during runtime event sink write after graph state
+  persistence.
+- Existing failure-injection coverage already exercised crash after public
+  inbox acceptance, durable outbox effect scheduling, dispatcher side-effect
+  result before success persistence, timer firing after scanner restart, and
+  human decision replay after checkpoint runtime restart.
+- Existing sharded runtime tests cover passivation and shard movement recovery
+  for runnable graph nodes, waiting graph nodes, and due graph effects.
 
 ### Slice 8.3: Load And Cardinality
 
