@@ -1020,6 +1020,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-clustered-agent-workflow-http-grpc"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "prost",
+ "rakka",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "rakka-example-clustered-counter-grpc"
 version = "0.1.0"
 dependencies = [

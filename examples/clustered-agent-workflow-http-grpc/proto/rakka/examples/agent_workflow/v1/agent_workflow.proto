@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package rakka.examples.agent_workflow.v1;
+
+// One node in a submitted graph.
+message NodeSpec {
+  string id = 1;
+  // Optional kind label ("input", "transform", "terminal"); empty means infer.
+  string kind = 2;
+}
+
+// One directed edge in a submitted graph.
+message EdgeSpec {
+  string from = 1;
+  string to = 2;
+}
+
+// A compiled workflow definition: nodes and directed edges between them.
+message SubmitWorkflowRequest {
+  // Optional stable run id (and sharded entity id). Generated when empty.
+  string run_id = 1;
+  // Optional plan id. Generated when empty.
+  string plan_id = 2;
+  repeated NodeSpec nodes = 3;
+  repeated EdgeSpec edges = 4;
+  // Optional entry nodes; defaults to nodes with no incoming edge.
+  repeated string entry_nodes = 5;
+}
+
+message GetWorkflowRequest {
+  string run_id = 1;
+}
+
+message GetClusterRequest {}
+
+// Per-node execution summary.
+message NodeView {
+  string node_id = 1;
+  string kind = 2;
+  string status = 3;
+}
+
+// View of a workflow run.
+message WorkflowRunView {
+  string run_id = 1;
+  string owner_node = 2;
+  bool executed_locally = 3;
+  string served_by = 4;
+  string status = 5;
+  string plan_id = 6;
+  string plan_fingerprint = 7;
+  uint64 node_count = 8;
+  uint64 completed_node_count = 9;
+  uint64 terminal_node_count = 10;
+  repeated NodeView nodes = 11;
+}
+
+// View of this node's cluster membership.
+message ClusterView {
+  string this_node = 1;
+  repeated string up_nodes = 2;
+  uint64 member_count = 3;
+  uint32 number_of_shards = 4;
+}
+
+// Public gRPC ingress mirroring the HTTP ingress. Requests route to the run's
+// owning node over rakka-remote, the same as the HTTP ingress.
+service AgentWorkflowIngress {
+  rpc SubmitWorkflow(SubmitWorkflowRequest) returns (WorkflowRunView);
+  rpc GetWorkflow(GetWorkflowRequest) returns (WorkflowRunView);
+  rpc GetCluster(GetClusterRequest) returns (ClusterView);
+}

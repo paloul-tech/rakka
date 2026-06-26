@@ -28,6 +28,7 @@ members = [
     "examples/minimal-system",
     "examples/pool-router",
     "examples/clustered-receptionist",
+    "examples/clustered-agent-workflow-http-grpc",
     "examples/clustered-counter-grpc",
     "examples/clustered-counter-http",
     "examples/coordinated-shutdown",
