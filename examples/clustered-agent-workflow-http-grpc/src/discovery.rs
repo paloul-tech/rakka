@@ -1,17 +1,18 @@
-//! File-based discovery for running several local cluster processes.
+//! File-based discovery and the shared membership view.
 //!
-//! Each process writes a JSON record describing its Rakka cluster identity. Peers
-//! read the directory and feed the node set into the `ClusterNodeRuntime`, which
-//! drives membership and shard ownership. Production code should replace this
-//! with a real discovery provider (Kubernetes DNS, Consul, a control plane).
+//! File discovery is the local-development provider: each process writes a JSON
+//! record to a shared directory and reads the directory to learn peers. The
+//! `MembershipView` is a small shared snapshot of up-node ids that whichever
+//! discovery loop maintains, so the ingress `/cluster` view is provider-agnostic.
+//! See `etcd_discovery.rs` for the dynamic (Kubernetes) provider.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rakka::cluster::{ClusterNode, DiscoverySnapshot};
 use rakka::sharding::ClusterNodeRuntime;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::config::ExampleConfig;
 use crate::support::{
@@ -19,58 +20,97 @@ use crate::support::{
     DEFAULT_DISCOVERY_TTL,
 };
 
+/// Shared snapshot of up-member node ids, kept current by the discovery loop.
+pub type MembershipView = Arc<Mutex<Vec<String>>>;
+
+/// Creates an empty membership view.
+#[must_use]
+pub fn new_membership_view() -> MembershipView {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// Reads the current up-member node ids.
+#[must_use]
+pub fn membership_snapshot(view: &MembershipView) -> Vec<String> {
+    view.lock().expect("membership view mutex").clone()
+}
+
+/// Replaces the membership view with the (sorted, de-duplicated) node ids.
+pub fn set_membership(view: &MembershipView, nodes: &[ClusterNode]) {
+    let mut ids: Vec<String> = nodes.iter().map(|node| node.id().to_string()).collect();
+    ids.sort();
+    ids.dedup();
+    *view.lock().expect("membership view mutex") = ids;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiscoveryRecord {
     node: ClusterNode,
     updated_at_millis: u64,
 }
 
-/// Periodically republishes this node and refreshes cluster membership.
-pub async fn discovery_loop(
-    runtime: Arc<AsyncMutex<ClusterNodeRuntime>>,
-    config: ExampleConfig,
-    local_node: ClusterNode,
-) {
-    let mut interval = tokio::time::interval(DEFAULT_DISCOVERY_POLL);
-    loop {
-        interval.tick().await;
-        if let Err(error) = publish_discovery_record(&config.discovery_dir, &local_node) {
-            eprintln!("discovery publish failed: {error}");
-            continue;
-        }
-        let nodes = match read_discovery_nodes(&config.discovery_dir, &local_node) {
-            Ok(nodes) => nodes,
-            Err(error) => {
-                eprintln!("discovery read failed: {error}");
-                continue;
-            }
-        };
-        let now = current_timestamp_millis();
-        let snapshot = DiscoverySnapshot::new("agent-workflow-file-discovery", now, nodes);
-        let mut runtime = runtime.lock().await;
-        if let Err(error) = runtime.apply_discovery(snapshot) {
-            eprintln!("discovery apply failed: {error}");
-        }
-        if let Err(error) = runtime.tick(now) {
-            eprintln!("membership tick failed: {error}");
-        }
-    }
-}
-
-/// Publishes and applies the initial discovery snapshot before serving.
-pub fn publish_and_apply_discovery(
+/// Publishes and applies the initial file-discovery snapshot before serving.
+pub fn seed_file_discovery(
     config: &ExampleConfig,
     local_node: &ClusterNode,
     runtime: &mut ClusterNodeRuntime,
+    membership: &MembershipView,
 ) -> ExampleResult<()> {
     publish_discovery_record(&config.discovery_dir, local_node)?;
     let nodes = read_discovery_nodes(&config.discovery_dir, local_node)?;
+    set_membership(membership, &nodes);
     runtime.apply_discovery(DiscoverySnapshot::new(
         "agent-workflow-file-discovery",
         current_timestamp_millis(),
         nodes,
     ))?;
     Ok(())
+}
+
+/// Runs the file-discovery loop until `shutdown` is signalled, then removes the
+/// local record so peers drop this node promptly.
+pub async fn run_file_discovery(
+    runtime: Arc<AsyncMutex<ClusterNodeRuntime>>,
+    config: ExampleConfig,
+    local_node: ClusterNode,
+    membership: MembershipView,
+    shutdown: Arc<Notify>,
+) {
+    let mut interval = tokio::time::interval(DEFAULT_DISCOVERY_POLL);
+    loop {
+        tokio::select! {
+            () = shutdown.notified() => {
+                let _ = remove_discovery_record(&config.discovery_dir, local_node.id().logical_id());
+                break;
+            }
+            _ = interval.tick() => {
+                if let Err(error) = publish_discovery_record(&config.discovery_dir, &local_node) {
+                    eprintln!("discovery publish failed: {error}");
+                    continue;
+                }
+                let nodes = match read_discovery_nodes(&config.discovery_dir, &local_node) {
+                    Ok(nodes) => nodes,
+                    Err(error) => {
+                        eprintln!("discovery read failed: {error}");
+                        continue;
+                    }
+                };
+                let now = current_timestamp_millis();
+                set_membership(&membership, &nodes);
+                let mut runtime = runtime.lock().await;
+                if let Err(error) = runtime.apply_discovery(DiscoverySnapshot::new(
+                    "agent-workflow-file-discovery",
+                    now,
+                    nodes,
+                )) {
+                    eprintln!("discovery apply failed: {error}");
+                }
+                if let Err(error) = runtime.tick(now) {
+                    eprintln!("membership tick failed: {error}");
+                }
+            }
+        }
+    }
 }
 
 fn publish_discovery_record(dir: &Path, node: &ClusterNode) -> ExampleResult<()> {
@@ -87,11 +127,7 @@ fn publish_discovery_record(dir: &Path, node: &ClusterNode) -> ExampleResult<()>
     Ok(())
 }
 
-/// Reads the live cluster nodes from the discovery directory, including self.
-pub fn read_discovery_nodes(
-    dir: &Path,
-    local_node: &ClusterNode,
-) -> ExampleResult<Vec<ClusterNode>> {
+fn read_discovery_nodes(dir: &Path, local_node: &ClusterNode) -> ExampleResult<Vec<ClusterNode>> {
     let now = current_timestamp_millis();
     let ttl = millis(DEFAULT_DISCOVERY_TTL);
     let entries = match std::fs::read_dir(dir) {
@@ -121,8 +157,7 @@ pub fn read_discovery_nodes(
     Ok(nodes)
 }
 
-/// Removes this node's discovery record on shutdown.
-pub fn remove_discovery_record(dir: &Path, logical_id: &str) -> ExampleResult<()> {
+fn remove_discovery_record(dir: &Path, logical_id: &str) -> ExampleResult<()> {
     match std::fs::remove_file(discovery_record_path(dir, logical_id)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

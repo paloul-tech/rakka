@@ -19,11 +19,13 @@
 mod codec;
 mod config;
 mod discovery;
+mod etcd_discovery;
 mod generated;
 mod grpc;
 mod http;
 mod ingress;
 mod model;
+mod persistence;
 mod run_entity;
 mod server;
 mod store;

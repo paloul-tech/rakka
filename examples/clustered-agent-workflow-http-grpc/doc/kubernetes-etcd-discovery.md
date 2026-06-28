@@ -1,10 +1,15 @@
 # Kubernetes Deployment with etcd Service Discovery
 
-> **Status: design analysis, not yet implemented.** This document describes how
-> the `clustered-agent-workflow-http-grpc` example could run as a container in a
-> Kubernetes cluster with cluster membership discovery backed by etcd. It
-> references APIs that exist today in Rakka and calls out what the example would
-> need to add. No code in the example has been changed for this.
+> **Status: implemented.** This document is the design rationale; the example now
+> ships the etcd discovery provider (`src/etcd_discovery.rs`), provider selection
+> (`RAKKA_DISCOVERY_PROVIDER`), the file/PostgreSQL durable-store seam
+> (`src/persistence.rs`, `postgres` feature), Kubernetes-friendly config
+> (downward-API pod identity, `0.0.0.0` bind), SIGTERM-aware graceful shutdown
+> with etcd lease revoke, a `Dockerfile`, and `k8s/` manifests (etcd, PostgreSQL,
+> a StatefulSet, headless + public Services, a PodDisruptionBudget, and a
+> HorizontalPodAutoscaler). See the example README for usage. The remaining
+> production hardening called out below — a shared, fenced shard coordinator
+> store/lease — is documented but not wired.
 
 ## Requirement: dynamic autoscaling and downscaling
 

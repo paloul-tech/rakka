@@ -1,0 +1,66 @@
+# Single-node PostgreSQL for the shared durable run/workflow store.
+#
+# A shared durable store is required so a run recovers on a new owner pod after
+# shard movement, scale-in, or a crash. The application self-migrates its tables
+# on startup. Demo-grade: one replica, ephemeral storage. Production should use a
+# managed/HA PostgreSQL with persistent volumes and backups.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rakka-postgres
+  namespace: rakka-agent-workflow
+  labels:
+    app.kubernetes.io/name: rakka-postgres
+    app.kubernetes.io/part-of: rakka-agent-workflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-postgres
+        app.kubernetes.io/part-of: rakka-agent-workflow
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-postgres
+  namespace: rakka-agent-workflow
+  labels:
+    app.kubernetes.io/name: rakka-postgres
+    app.kubernetes.io/part-of: rakka-agent-workflow
+spec:
+  selector:
+    app.kubernetes.io/name: rakka-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

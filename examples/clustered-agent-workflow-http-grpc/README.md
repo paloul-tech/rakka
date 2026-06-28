@@ -125,6 +125,101 @@ When `kind` is omitted it is inferred from the node's position: no incoming edge
 - **Single writer**: only the owner ever drives a given run, so there is exactly one active run actor for a run id across the cluster.
 - **Failover**: run and workflow state live in the shared `RAKKA_STATE_DIR`. If the owner exits, its discovery record expires (after the discovery TTL) and ownership moves to a live node, which recovers the run from the shared store on first reference. During the detection window, requests for runs owned by the exited node may be unavailable.
 
+## Discovery providers
+
+Cluster membership discovery is pluggable via `RAKKA_DISCOVERY_PROVIDER`:
+
+- `file` (default): a shared directory; good for local multi-terminal runs.
+- `etcd`: dynamic register/lease/watch; pods join and leave at runtime, so it fits Kubernetes autoscaling. Each node registers `<RAKKA_ETCD_PREFIX><node-id>` under a lease, renews it every poll, and lists the prefix to learn peers; a crashed or scaled-in node's key disappears when its lease lapses (or is revoked on graceful shutdown). Both providers feed the same `apply_discovery`/`tick` path, so routing and execution are unchanged.
+
+Run two nodes against a local etcd (Docker):
+
+```sh
+docker run -d --name etcd -p 2379:2379 \
+  -e ALLOW_NONE_AUTHENTICATION=yes \
+  -e ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379 \
+  -e ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379 \
+  quay.io/coreos/etcd:v3.5.17
+
+RAKKA_DISCOVERY_PROVIDER=etcd RAKKA_ETCD_ENDPOINTS=http://127.0.0.1:2379 \
+  RAKKA_STATE_DIR=/tmp/rakka-agent-demo/state RAKKA_PORT=25530 \
+  cargo run -p rakka-example-clustered-agent-workflow-http-grpc -- http
+
+RAKKA_DISCOVERY_PROVIDER=etcd RAKKA_ETCD_ENDPOINTS=http://127.0.0.1:2379 \
+  RAKKA_STATE_DIR=/tmp/rakka-agent-demo/state RAKKA_PORT=25531 \
+  cargo run -p rakka-example-clustered-agent-workflow-http-grpc -- grpc
+```
+
+Nodes serving different ingresses still form one cluster (clustering is over `rakka-remote`, independent of the ingress).
+
+## Durable persistence
+
+`RAKKA_PERSISTENCE` selects the durable store: `file` (default, single host) or `postgres` (shared, required for multi-pod run recovery). The PostgreSQL store is behind the `postgres` build feature and self-migrates its tables on startup:
+
+```sh
+RAKKA_PERSISTENCE=postgres \
+  RAKKA_POSTGRES_DSN="host=127.0.0.1 user=postgres password=postgres dbname=postgres" \
+  cargo run -p rakka-example-clustered-agent-workflow-http-grpc --features postgres -- http
+```
+
+## Kubernetes deployment (with etcd + PostgreSQL)
+
+The manifests in [`k8s/`](k8s/) deploy the full stack: a single-node **etcd** for dynamic membership discovery, a single-node **PostgreSQL** for the shared durable store, and a horizontally autoscaled **StatefulSet** of app nodes wired to both. (etcd and Postgres are deployed as demo-grade single replicas with ephemeral storage; production should use an HA etcd and a managed/HA PostgreSQL.)
+
+**1. Build the image** from the workspace root (the builder stage needs `protoc`; the `postgres` feature is compiled in). On Docker Desktop or a registry-less local cluster the local image is used directly:
+
+```sh
+docker build -f examples/clustered-agent-workflow-http-grpc/Dockerfile \
+  -t rakka-agent-workflow-http-grpc:0.1.0 .
+```
+
+**2. Apply the manifests** (creates the `rakka-agent-workflow` namespace with etcd, PostgreSQL, the app StatefulSet, Services, a PodDisruptionBudget, and a HorizontalPodAutoscaler) and wait for the pods:
+
+```sh
+kubectl apply -f examples/clustered-agent-workflow-http-grpc/k8s/
+kubectl -n rakka-agent-workflow rollout status statefulset/agent-workflow --timeout=180s
+kubectl -n rakka-agent-workflow get pods
+```
+
+**3. Submit a workflow and inspect the cluster** through the public HTTP service:
+
+```sh
+kubectl -n rakka-agent-workflow port-forward svc/agent-workflow-http 18080:80 &
+curl -s http://127.0.0.1:18080/cluster
+curl -s -X POST http://127.0.0.1:18080/workflows -H 'content-type: application/json' \
+  --data-binary @examples/clustered-agent-workflow-http-grpc/sample-workflow.json
+curl -s http://127.0.0.1:18080/workflows/sample-research-1
+```
+
+**4. Watch dynamic membership** as you scale — etcd registers new members at runtime and drops them on scale-in (their lease is revoked on the preStop drain):
+
+```sh
+ETCD=$(kubectl -n rakka-agent-workflow get pod -l app.kubernetes.io/name=rakka-etcd -o jsonpath='{.items[0].metadata.name}')
+kubectl -n rakka-agent-workflow scale statefulset agent-workflow --replicas=4
+kubectl -n rakka-agent-workflow exec "$ETCD" -- etcdctl get --prefix /rakka/agent-workflow/members/ --keys-only
+kubectl -n rakka-agent-workflow scale statefulset agent-workflow --replicas=2
+```
+
+Verify durable state landed in PostgreSQL:
+
+```sh
+PG=$(kubectl -n rakka-agent-workflow get pod -l app.kubernetes.io/name=rakka-postgres -o jsonpath='{.items[0].metadata.name}')
+kubectl -n rakka-agent-workflow exec "$PG" -- psql -U postgres -d postgres \
+  -c "select persistence_id, revision from rakka_durable_state order by 1;"
+```
+
+Tear down with `kubectl delete namespace rakka-agent-workflow`.
+
+The app nodes:
+
+- discover each other dynamically through etcd (`RAKKA_DISCOVERY_PROVIDER=etcd`),
+- share durable state in PostgreSQL (`RAKKA_PERSISTENCE=postgres`) so runs recover on a new owner during scale-in or pod failure,
+- talk pod-to-pod over `rakka-remote` via a headless Service,
+- derive identity/address from the downward API (`RAKKA_POD_NAME` / `RAKKA_POD_UID` / `RAKKA_POD_IP`), and
+- scale via a `HorizontalPodAutoscaler` (CPU metrics require a metrics-server), with a `PodDisruptionBudget` and a preStop drain that revokes the etcd lease and leaves the cluster cleanly.
+
+Switch a node to the gRPC ingress by setting its container `args` to `["grpc"]` and exposing the gRPC port. The full design rationale is in [`doc/kubernetes-etcd-discovery.md`](doc/kubernetes-etcd-discovery.md).
+
 ## Environment variables
 
 - `RAKKA_PORT`: Rakka TCP remoting port for inter-node communication; also the source of the stable logical node id. Defaults to `25530`.
@@ -134,8 +229,15 @@ When `kind` is omitted it is inferred from the node's position: no incoming edge
 - `RAKKA_STATE_DIR`: shared base directory for durable run and workflow state. Share it so runs recover across owners.
 - `RAKKA_BIND_HOST`: local IP to bind. Defaults to `127.0.0.1`.
 - `RAKKA_ADVERTISE_HOST`: host written into discovery records. Defaults to `RAKKA_BIND_HOST`.
-- `RAKKA_NODE_LOGICAL_ID`: override the stable logical node id. Defaults to `agent-node-<RAKKA_PORT>`.
-- `RAKKA_NODE_INCARNATION`: override the per-process incarnation. Defaults to a fresh value each start.
+- `RAKKA_NODE_LOGICAL_ID`: override the stable logical node id. Defaults to `RAKKA_POD_NAME`, else `agent-node-<RAKKA_PORT>`.
+- `RAKKA_NODE_INCARNATION`: override the per-process incarnation. Defaults to `RAKKA_POD_UID`, else a fresh value each start.
+- `RAKKA_POD_NAME` / `RAKKA_POD_UID` / `RAKKA_POD_IP`: Kubernetes downward-API pod identity/address; used as the logical id / incarnation / advertise host when the explicit overrides above are unset.
+- `RAKKA_DISCOVERY_PROVIDER`: `file` (default) or `etcd`.
+- `RAKKA_ETCD_ENDPOINTS`: comma-separated etcd endpoints (etcd mode). Defaults to `http://127.0.0.1:2379`.
+- `RAKKA_ETCD_PREFIX`: etcd key prefix for member registration. Defaults to `/rakka/agent-workflow/members/`.
+- `RAKKA_ETCD_LEASE_TTL_SECONDS`: member lease TTL. Defaults to `10`.
+- `RAKKA_PERSISTENCE`: `file` (default) or `postgres` (requires the `postgres` build feature).
+- `RAKKA_POSTGRES_DSN`: PostgreSQL connection string (required when `RAKKA_PERSISTENCE=postgres`).
 
 ## Scope and simplifications
 
@@ -143,6 +245,6 @@ This example focuses on the cluster, sharding, durable run, inter-node remoting,
 
 - Nodes are executed as deterministic local work (`input`, `transform`, `terminal`). Effect-producing kinds (`model-call`, `tool-call`, ...), branches, joins-with-conditions, iterators, timers, and human checkpoints are part of `rakka-agent-workflow` but are out of scope here; see that crate's tests and `docs/plans/compiled_execution_with_graph_schdlr/` for those.
 - HTTP and gRPC are public ingress only; inter-node communication uses `rakka-remote`. The rich `AgentRunActorCommand` protocol carries an `Arc<plan>` and reply channels, so it is process-local and not directly sendable over the wire. The example therefore wraps the (serializable) compiled plan in a small `RunRequest` and registers a `RunEntity` with `init_remote_with_ask`; Rakka serializes the request to the owner, which maps it to a local command and drives a child `AgentRunActor`.
-- File-based discovery and a file-based durable store keep the demo dependency-free on one host. Production deployments should use a real discovery provider (Kubernetes DNS, Consul, a control plane), a shared durable shard coordinator store/lease, and a shared `DurableStateStore` such as the PostgreSQL plugin.
+- File discovery and the file store are the local-dev defaults; for Kubernetes use the `etcd` discovery provider and the `postgres` durable store (above). A shared, fenced shard coordinator store/lease (the PostgreSQL sharding plugin) is a recommended production hardening that is documented but not wired here.
 - Ownership is eventually consistent during membership changes; a request that arrives mid-change may briefly route to the previous owner.
 - `protoc` (the Protocol Buffers compiler) must be installed to build the example, because the gRPC contract is generated at build time.

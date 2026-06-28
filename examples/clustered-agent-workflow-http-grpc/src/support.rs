@@ -42,6 +42,15 @@ pub const RUN_ASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Workflow type label shared by the demo workflow definition and every plan.
 pub const WORKFLOW_TYPE: &str = "compiled-graph-demo";
 
+/// Default etcd key prefix under which members register themselves.
+pub const DEFAULT_ETCD_PREFIX: &str = "/rakka/agent-workflow/members/";
+
+/// Default etcd lease TTL (seconds) for a member's registration key.
+///
+/// A member renews its lease every poll interval; if it dies, etcd deletes the
+/// key after the lease lapses, which is how scale-in/crashes leave membership.
+pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
+
 /// Reads an environment variable as a `u16`, falling back to `default`.
 pub fn env_u16(name: &str, default: u16) -> ExampleResult<u16> {
     env::var(name)

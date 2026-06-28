@@ -1,0 +1,174 @@
+# Clustered agent-workflow nodes with etcd discovery, shared PostgreSQL state,
+# and horizontal autoscaling. Each pod serves the HTTP ingress (set container
+# args to ["grpc"] and expose the gRPC port for the gRPC ingress instead).
+#
+# Build and load the image first (from the workspace root):
+#   docker build -f examples/clustered-agent-workflow-http-grpc/Dockerfile \
+#     -t rakka-agent-workflow-http-grpc:0.1.0 .
+#
+# Then: kubectl apply -f examples/clustered-agent-workflow-http-grpc/k8s/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rakka-agent-workflow
+  labels:
+    app.kubernetes.io/part-of: rakka-agent-workflow
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-agent-workflow-config
+  namespace: rakka-agent-workflow
+data:
+  RAKKA_DISCOVERY_PROVIDER: etcd
+  RAKKA_ETCD_ENDPOINTS: http://rakka-etcd:2379
+  RAKKA_ETCD_PREFIX: /rakka/agent-workflow/members/
+  RAKKA_PERSISTENCE: postgres
+  RAKKA_POSTGRES_DSN: host=rakka-postgres port=5432 user=postgres password=postgres dbname=postgres
+  RAKKA_BIND_HOST: 0.0.0.0
+  RAKKA_PORT: "25530"
+  RAKKA_HTTP_PORT: "35530"
+  RAKKA_GRPC_PORT: "45530"
+---
+# Headless service for stable pod DNS and pod-to-pod rakka-remote TCP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-workflow-internal
+  namespace: rakka-agent-workflow
+  labels:
+    app.kubernetes.io/name: agent-workflow
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: agent-workflow
+  ports:
+    - name: remoting
+      port: 25530
+      targetPort: remoting
+---
+# Public HTTP ingress service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-workflow-http
+  namespace: rakka-agent-workflow
+  labels:
+    app.kubernetes.io/name: agent-workflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agent-workflow
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent-workflow
+  namespace: rakka-agent-workflow
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-workflow
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent-workflow
+  namespace: rakka-agent-workflow
+  labels:
+    app.kubernetes.io/name: agent-workflow
+spec:
+  serviceName: agent-workflow-internal
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-workflow
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-workflow
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent-workflow
+          image: rakka-agent-workflow-http-grpc:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["http"]
+          envFrom:
+            - configMapRef:
+                name: rakka-agent-workflow-config
+          env:
+            # Pod identity drives the stable logical id, fresh incarnation, and
+            # routable advertise address (see config.rs).
+            - name: RAKKA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RAKKA_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: RAKKA_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: remoting
+              containerPort: 25530
+            - name: http
+              containerPort: 35530
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              # Give kube-proxy time to drop this pod from Service endpoints
+              # before SIGTERM triggers graceful shutdown (etcd lease revoke +
+              # cluster leave).
+              exec:
+                command: ["/bin/sleep", "3"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+# Horizontal autoscaling. CPU is a simple starting signal; prefer Rakka's bounded
+# autoscaling-signal metrics (active runs, dispatcher backlog, ...) via a
+# custom-metrics adapter or KEDA for workload-aware scaling.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-workflow
+  namespace: rakka-agent-workflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: agent-workflow
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60

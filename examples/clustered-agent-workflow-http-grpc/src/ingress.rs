@@ -5,16 +5,14 @@
 //! receiving node resolves the run's owner through the sharding region and either
 //! asks the local run entity or routes to the owner over `rakka-remote` TCP.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use rakka::agent_workflow::AgentWorkflow;
-use rakka::cluster::ClusterNode;
 use rakka::prelude::{ClusterSharding, EntityTypeKey};
 use rakka::remote::{RemoteRequestError, TcpRemoteTransport};
 use rakka::sharding::{EntityAskError, RemoteEntityAskClient, RemoteEntityAskError};
 
-use crate::discovery::read_discovery_nodes;
+use crate::discovery::{membership_snapshot, MembershipView};
 use crate::model::{ClusterView, RunRequest, SubmitWorkflowRequest, WorkflowRunView};
 use crate::run_entity::RunEntityCommand;
 use crate::support::{NUMBER_OF_SHARDS, RUN_ASK_TIMEOUT};
@@ -28,8 +26,7 @@ pub struct AppState {
     pub ask_client: RemoteEntityAskClient<TcpRemoteTransport>,
     pub workflow: AgentWorkflow,
     pub node_label: String,
-    pub discovery_dir: PathBuf,
-    pub local_node: ClusterNode,
+    pub membership: MembershipView,
 }
 
 /// Protocol-neutral ingress failure, mapped to HTTP/gRPC status by each adapter.
@@ -99,16 +96,12 @@ pub async fn get_run(state: &AppState, run_id: String) -> Result<WorkflowRunView
     Ok(view)
 }
 
-/// Builds this node's view of the cluster.
+/// Builds this node's view of the cluster from the shared membership snapshot.
 #[must_use]
 pub fn cluster(state: &AppState) -> ClusterView {
-    let nodes = read_discovery_nodes(&state.discovery_dir, &state.local_node)
-        .unwrap_or_else(|_| vec![state.local_node.clone()]);
-    let mut up_nodes: Vec<String> = nodes.iter().map(|node| node.id().to_string()).collect();
-    up_nodes.sort();
-    up_nodes.dedup();
+    let up_nodes = membership_snapshot(&state.membership);
     ClusterView {
-        this_node: state.local_node.id().to_string(),
+        this_node: state.node_label.clone(),
         member_count: up_nodes.len(),
         up_nodes,
         number_of_shards: NUMBER_OF_SHARDS,
