@@ -7,9 +7,10 @@
 > (downward-API pod identity, `0.0.0.0` bind), SIGTERM-aware graceful shutdown
 > with etcd lease revoke, a `Dockerfile`, and `k8s/` manifests (etcd, PostgreSQL,
 > a StatefulSet, headless + public Services, a PodDisruptionBudget, and a
-> HorizontalPodAutoscaler). See the example README for usage. The remaining
-> production hardening called out below — a shared, fenced shard coordinator
-> store/lease — is documented but not wired.
+> HorizontalPodAutoscaler). See the example README for usage. A shared, fenced
+> shard coordinator store/lease was **evaluated and is intentionally not used**;
+> it is incompatible with this example's symmetric topology (see "Shard
+> coordination" below).
 
 ## Requirement: dynamic autoscaling and downscaling
 
@@ -180,10 +181,22 @@ addressing them would break run recovery:
   `DurableStateStore` — the **PostgreSQL persistence plugin** (`rakka-*-postgres`,
   via the facade `postgres` feature). A `PersistentVolume` does not help because a
   *different* pod becomes the owner. This is the single most important change.
-- **Shard coordination under churn.** The example resolves ownership from the
-  region/coordinator fed by discovery. For production rolling updates and
-  failover, use a **shared, fenced shard coordinator store + lease** (the Postgres
-  sharding plugin) so there is one ownership authority during membership changes.
+- **Shard coordination.** This example uses a per-node deterministic-modulo
+  coordinator: every node independently computes identical ownership from the same
+  up-set, so they agree without a shared authority — the right fit for this
+  symmetric "every node hosts a slice" topology. A shared, fenced PostgreSQL shard
+  coordinator (store + lease) was **evaluated and is intentionally not used**: in
+  Rakka, registering a shard region calls `ensure_coordinator`, which requires
+  holding the coordinator lease, so a *non-leader* node cannot register a region
+  and therefore cannot host or route any shard. The fenced lease thus collapses
+  the cluster onto a single coordinator node (verified: the non-holder is rejected
+  with `CoordinatorLeaseRejected`), which is incompatible with symmetric
+  distribution. A shared coordinator store *without* the lease is not a fix either
+  — the per-node coordinators then race and disagree on ownership during writes,
+  producing cross-node routing timeouts (`entity-no-route: remote ask timed out`).
+  A fenced singleton coordinator would require a different topology — a dedicated
+  coordinator deployment with proxy regions on the hosting nodes — which is out of
+  scope for this example.
 - **Advertise address** must be the pod's cluster-routable host (not
   `127.0.0.1`), and **bind** `0.0.0.0`.
 - **Probe port** for gRPC-only pods (see Part 2).
