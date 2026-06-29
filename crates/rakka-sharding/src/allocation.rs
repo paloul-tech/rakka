@@ -222,8 +222,56 @@ impl ShardReassignment {
 }
 
 /// Deterministic modulo allocation strategy used by default.
+///
+/// Maps each shard to `sorted_routable_nodes[shard_index % len]`, so every node
+/// computes identical ownership from the same membership without any shared
+/// coordinator. `rebalance` returns the shards whose current owner differs from
+/// that deterministic owner.
+///
+/// By default the rebalance is **unbounded** — every mis-placed shard moves in a
+/// single pass. Large clusters can cap the moves per pass with
+/// [`with_max_simultaneous_rebalance`](Self::with_max_simultaneous_rebalance) so a
+/// scale event recovers over several reconcile passes instead of all at once
+/// ("thundering" recovery). The cap is applied in ascending shard-id order, which
+/// is identical on every node, so a capped rebalance stays deterministic across
+/// per-node coordinators and still converges to the full deterministic placement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DeterministicModuloShardAllocationStrategy;
+pub struct DeterministicModuloShardAllocationStrategy {
+    max_simultaneous_rebalance: usize,
+}
+
+impl DeterministicModuloShardAllocationStrategy {
+    /// Creates a deterministic modulo strategy with unbounded rebalancing.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            max_simultaneous_rebalance: 0,
+        }
+    }
+
+    /// Caps the number of shard moves returned by one rebalance pass.
+    ///
+    /// `0` (the default) restores unbounded rebalancing. A non-zero cap bounds how
+    /// many shards move per reconcile so a large scale event recovers over several
+    /// passes; convergence still reaches the full deterministic placement because
+    /// each pass moves the next lowest-id mis-placed shards. Initial allocation of
+    /// unowned shards and reassignment of orphaned shards (owner no longer
+    /// routable) are never capped — only moves of healthy shards.
+    #[must_use]
+    pub const fn with_max_simultaneous_rebalance(
+        mut self,
+        max_simultaneous_rebalance: usize,
+    ) -> Self {
+        self.max_simultaneous_rebalance = max_simultaneous_rebalance;
+        self
+    }
+
+    /// Maximum shard moves returned by one rebalance pass; `0` means unbounded.
+    #[must_use]
+    pub const fn max_simultaneous_rebalance(&self) -> usize {
+        self.max_simultaneous_rebalance
+    }
+}
 
 impl ShardAllocationStrategy for DeterministicModuloShardAllocationStrategy {
     fn allocate_shard(
@@ -235,13 +283,15 @@ impl ShardAllocationStrategy for DeterministicModuloShardAllocationStrategy {
     }
 
     fn rebalance(&self, context: &ShardRebalanceContext<'_>) -> Vec<ShardReassignment> {
-        context
-            .assignments()
-            .filter_map(|(shard_id, owner)| {
-                let desired = desired_owner(context.routable_nodes(), shard_id)?;
-                (owner != desired).then(|| ShardReassignment::new(shard_id, desired.clone()))
-            })
-            .collect()
+        let moves = context.assignments().filter_map(|(shard_id, owner)| {
+            let desired = desired_owner(context.routable_nodes(), shard_id)?;
+            (owner != desired).then(|| ShardReassignment::new(shard_id, desired.clone()))
+        });
+        if self.max_simultaneous_rebalance == 0 {
+            moves.collect()
+        } else {
+            moves.take(self.max_simultaneous_rebalance).collect()
+        }
     }
 }
 

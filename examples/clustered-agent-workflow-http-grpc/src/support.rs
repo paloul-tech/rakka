@@ -60,6 +60,15 @@ pub fn env_u16(name: &str, default: u16) -> ExampleResult<u16> {
         .map(|value| value.unwrap_or(default))
 }
 
+/// Reads an environment variable as a `u64`, falling back to `default` on an
+/// unset or unparseable value.
+pub fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// Parses a `u16` with a contextual error message.
 pub fn parse_u16(name: &str, value: &str) -> ExampleResult<u16> {
     value

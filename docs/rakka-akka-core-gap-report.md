@@ -215,7 +215,9 @@ Recommended surface:
 - `cluster.self_member()`.
 - Integration with Kubernetes discovery and node runtime.
 - Clear split-brain/downing policy hooks, even if only one conservative policy
-  exists initially.
+  exists initially. See `rakka-cluster-coordination-strategy.md` for the
+  recommended direction: lean on an external etcd/Kubernetes arbiter instead of an
+  internal split-brain resolver, and add peer-reachability self-fencing.
 
 ### P1: Integrate Coordinated Shutdown
 

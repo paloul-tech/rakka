@@ -26,6 +26,7 @@ mod http;
 mod ingress;
 mod model;
 mod persistence;
+mod reachability;
 mod run_entity;
 mod server;
 mod store;

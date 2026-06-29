@@ -3,11 +3,12 @@
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rakka::cluster::{ClusterNode, NodeAddress, NodeId};
 
 use crate::support::{
-    default_node_incarnation, default_node_logical_id, env_u16, parse_u16, ExampleError,
+    default_node_incarnation, default_node_logical_id, env_u16, env_u64, parse_u16, ExampleError,
     ExampleResult, DEFAULT_ETCD_LEASE_TTL_SECONDS, DEFAULT_ETCD_PREFIX, DEFAULT_RAKKA_PORT,
 };
 
@@ -50,6 +51,14 @@ pub struct ExampleConfig {
     pub postgres_dsn: Option<String>,
     pub run_state_dir: PathBuf,
     pub workflow_state_dir: PathBuf,
+    /// Whether a node fences itself out of the cluster when it cannot reach peers
+    /// (etcd discovery only; the actuator revokes the etcd lease).
+    pub self_fence: bool,
+    /// Sustained peer-unreachability before self-fencing.
+    pub self_fence_after: Duration,
+    /// Sustained peer-reachability before clearing a self-fence (informational;
+    /// the example shuts down on fence rather than rejoining in place).
+    pub self_fence_rejoin_after: Duration,
 }
 
 impl ExampleConfig {
@@ -132,6 +141,18 @@ impl ExampleConfig {
         };
         let postgres_dsn = env::var("RAKKA_POSTGRES_DSN").ok();
 
+        let self_fence = env::var("RAKKA_SELF_FENCE")
+            .map(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false" | "no"
+                )
+            })
+            .unwrap_or(true);
+        let self_fence_after = Duration::from_secs(env_u64("RAKKA_SELF_FENCE_AFTER_SECONDS", 15));
+        let self_fence_rejoin_after =
+            Duration::from_secs(env_u64("RAKKA_SELF_FENCE_REJOIN_SECONDS", 10));
+
         let base_dir = env::temp_dir().join("rakka-clustered-agent-workflow-http");
         let discovery_dir = env::var_os("RAKKA_DISCOVERY_DIR")
             .map(PathBuf::from)
@@ -157,6 +178,9 @@ impl ExampleConfig {
             postgres_dsn,
             run_state_dir: state_base.join("runs"),
             workflow_state_dir: state_base.join("workflow"),
+            self_fence,
+            self_fence_after,
+            self_fence_rejoin_after,
         })
     }
 

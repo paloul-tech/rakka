@@ -36,7 +36,7 @@ Historical implementation plans live in `docs/plans/`.
 | `rakka` | Top-level facade crate and curated prelude for application code. |
 | `rakka-core` | Typed actors, actor refs, supervision, paths, shared metrics, and framework errors. |
 | `rakka-persistence`, `rakka-persistence-postgres` | Durable state APIs, typed event/snapshot stores, event-sourced and durable-state behavior facades, query helpers, in-memory stores, and PostgreSQL persistence plugins. |
-| `rakka-cluster`, `rakka-remote`, `rakka-sharding`, `rakka-sharding-postgres` | Membership, remoting, protocol compatibility, sharded entity routing, and the PostgreSQL shard coordinator, leadership lease, and remembered-entity store. |
+| `rakka-cluster`, `rakka-remote`, `rakka-sharding`, `rakka-sharding-postgres`, `rakka-discovery-etcd` | Membership, remoting, protocol compatibility, sharded entity routing, the PostgreSQL shard coordinator, leadership lease, and remembered-entity store, and the etcd external-arbiter discovery provider. |
 | `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
 | `rakka-agent-workflow` | Durable agent-workflow execution kernel: product-neutral compiled execution IR, durable graph run state, deterministic graph scheduler, and the durable outbox effect bridge. |
 | `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |
@@ -85,6 +85,12 @@ The optional PostgreSQL persistence check expects a local PostgreSQL database:
 
 ```sh
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres
+```
+
+The optional etcd discovery check expects a reachable etcd:
+
+```sh
+RAKKA_ETCD_TEST_ENDPOINTS=http://127.0.0.1:2379 cargo test -p rakka-discovery-etcd --test etcd_discovery -- --nocapture
 ```
 
 The optional Kubernetes local-cluster scenario expects `kubectl`, a current context, and an application image that satisfies the manifest contract:

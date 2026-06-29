@@ -1448,6 +1448,67 @@ fn least_shard_strategy_rebalances_existing_ownership_with_limit() {
 }
 
 #[test]
+fn deterministic_modulo_rebalance_respects_cap_and_converges() {
+    let one_node = membership_with_up_nodes(vec![node("rakka-0", "uid-a")]);
+    let three_nodes = membership_with_up_nodes(vec![
+        node("rakka-0", "uid-a"),
+        node("rakka-1", "uid-b"),
+        node("rakka-2", "uid-c"),
+    ]);
+    let mut coordinator = ShardCoordinator::with_allocation_strategy(
+        EntityType::new("Cart"),
+        ShardingConfig::new(6).unwrap(),
+        rakka_sharding::DeterministicModuloShardAllocationStrategy::new()
+            .with_max_simultaneous_rebalance(2),
+    );
+
+    coordinator.reconcile(&one_node);
+    // Four of six shards are mis-placed after scale-out, but the cap moves only two.
+    let plan = coordinator.reconcile(&three_nodes);
+    let rebalance_moves = plan
+        .decisions()
+        .iter()
+        .filter(|decision| {
+            matches!(
+                decision,
+                ShardDecision::Move {
+                    reason: ShardMoveReason::Rebalance,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(rebalance_moves, 2);
+
+    // Successive passes move the remaining mis-placed shards until the placement
+    // converges to the full deterministic distribution (6 shards / 3 nodes).
+    for _ in 0..5 {
+        coordinator.reconcile(&three_nodes);
+    }
+    let snapshot = coordinator.snapshot();
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-0", "uid-a")),
+        2
+    );
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-1", "uid-b")),
+        2
+    );
+    assert_eq!(
+        snapshot.owned_shard_count(&NodeId::new("rakka-2", "uid-c")),
+        2
+    );
+
+    // The converged placement equals an unbounded deterministic coordinator's,
+    // confirming the cap only throttles the pace, not the final result.
+    let mut unbounded =
+        ShardCoordinator::new(EntityType::new("Cart"), ShardingConfig::new(6).unwrap());
+    unbounded.reconcile(&one_node);
+    unbounded.reconcile(&three_nodes);
+    assert_eq!(snapshot.assignments(), unbounded.snapshot().assignments());
+}
+
+#[test]
 fn leaving_member_triggers_graceful_handoff_decisions() {
     let mut membership =
         membership_with_up_nodes(vec![node("rakka-0", "uid-a"), node("rakka-1", "uid-b")]);

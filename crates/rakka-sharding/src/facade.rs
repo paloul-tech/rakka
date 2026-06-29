@@ -242,7 +242,7 @@ where
             stop_message_factory: None,
             buffer_config: Some(ShardBufferConfig::default()),
             passivation_buffer_duration: DEFAULT_PASSIVATION_BUFFER_DURATION,
-            allocation_strategy: Arc::new(crate::DeterministicModuloShardAllocationStrategy),
+            allocation_strategy: Arc::new(crate::DeterministicModuloShardAllocationStrategy::new()),
             remembered_entities: None,
         }
     }
@@ -1298,7 +1298,7 @@ impl ClusterSharding {
     {
         self.init_proxy_with_allocation_strategy_ref(
             key,
-            Arc::new(crate::DeterministicModuloShardAllocationStrategy),
+            Arc::new(crate::DeterministicModuloShardAllocationStrategy::new()),
         )
     }
 
@@ -1312,7 +1312,7 @@ impl ClusterSharding {
     {
         self.init_proxy_with_allocation_strategy_ref_async(
             key,
-            Arc::new(crate::DeterministicModuloShardAllocationStrategy),
+            Arc::new(crate::DeterministicModuloShardAllocationStrategy::new()),
         )
         .await
     }

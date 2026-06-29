@@ -1116,6 +1116,7 @@ dependencies = [
  "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",
+ "rakka-discovery-etcd",
  "rakka-grpc",
  "rakka-http",
  "rakka-k8s",
@@ -1171,11 +1172,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-discovery-etcd"
+version = "0.1.0"
+dependencies = [
+ "etcd-client",
+ "rakka-cluster",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-clustered-agent-workflow-http-grpc"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
- "etcd-client",
  "prost 0.13.5",
  "rakka",
  "rakka-persistence-postgres",

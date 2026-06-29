@@ -130,7 +130,7 @@ When `kind` is omitted it is inferred from the node's position: no incoming edge
 Cluster membership discovery is pluggable via `RAKKA_DISCOVERY_PROVIDER`:
 
 - `file` (default): a shared directory; good for local multi-terminal runs.
-- `etcd`: dynamic register/lease/watch; pods join and leave at runtime, so it fits Kubernetes autoscaling. Each node registers `<RAKKA_ETCD_PREFIX><node-id>` under a lease, renews it every poll, and lists the prefix to learn peers; a crashed or scaled-in node's key disappears when its lease lapses (or is revoked on graceful shutdown). Both providers feed the same `apply_discovery`/`tick` path, so routing and execution are unchanged.
+- `etcd`: dynamic register/lease/watch through the supported `rakka-discovery-etcd` provider (enabled via the `rakka` facade's `discovery-etcd` feature); pods join and leave at runtime, so it fits Kubernetes autoscaling. Each node registers `<RAKKA_ETCD_PREFIX><node-id>` under a lease, renews it every poll, and lists the prefix to learn peers; a crashed or scaled-in node's key disappears when its lease lapses (or is revoked on graceful shutdown). Both providers feed the same `apply_discovery`/`tick` path, so routing and execution are unchanged.
 
 Run two nodes against a local etcd (Docker):
 
@@ -151,6 +151,10 @@ RAKKA_DISCOVERY_PROVIDER=etcd RAKKA_ETCD_ENDPOINTS=http://127.0.0.1:2379 \
 ```
 
 Nodes serving different ingresses still form one cluster (clustering is over `rakka-remote`, independent of the ingress).
+
+### Self-fencing (etcd)
+
+etcd liveness is not the same as peer reachability: a node can keep renewing its etcd lease yet be unable to reach peers over `rakka-remote` (a partial partition), so ownership keeps routing runs to it and the asks time out (`entity-no-route`). With `RAKKA_SELF_FENCE=on` (the default; etcd mode only) such a node fences *itself*. The ingress records each cross-node ask outcome into a `PeerReachability` window; the discovery loop feeds it to `rakka::cluster::SelfFenceDetector` (hysteresis: fence after sustained unreachability, never on a single failure or an idle window), and on a fence the node revokes its etcd lease and shuts down. The arbiter then drops it from membership — turning a reachability fault into a *consistent* membership change. Reachability never edits the ownership up-set directly. Tune with `RAKKA_SELF_FENCE_AFTER_SECONDS` (default 15) and `RAKKA_SELF_FENCE_REJOIN_SECONDS` (default 10).
 
 ## Durable persistence
 
@@ -218,7 +222,7 @@ The app nodes:
 - derive identity/address from the downward API (`RAKKA_POD_NAME` / `RAKKA_POD_UID` / `RAKKA_POD_IP`), and
 - scale via a `HorizontalPodAutoscaler` (CPU metrics require a metrics-server), with a `PodDisruptionBudget` and a preStop drain that revokes the etcd lease and leaves the cluster cleanly.
 
-Switch a node to the gRPC ingress by setting its container `args` to `["grpc"]` and exposing the gRPC port. The full design rationale is in [`doc/kubernetes-etcd-discovery.md`](doc/kubernetes-etcd-discovery.md).
+Switch a node to the gRPC ingress by setting its container `args` to `["grpc"]` and exposing the gRPC port. The full design rationale is in [`doc/kubernetes-etcd-discovery.md`](doc/kubernetes-etcd-discovery.md), and an Akka↔Rakka review of the sharding/coordination/rebalancing/split‑brain model is in [`doc/akka-comparison.md`](doc/akka-comparison.md).
 
 ## Environment variables
 
@@ -238,6 +242,9 @@ Switch a node to the gRPC ingress by setting its container `args` to `["grpc"]` 
 - `RAKKA_ETCD_LEASE_TTL_SECONDS`: member lease TTL. Defaults to `10`.
 - `RAKKA_PERSISTENCE`: `file` (default) or `postgres` (requires the `postgres` build feature).
 - `RAKKA_POSTGRES_DSN`: PostgreSQL connection string (required when `RAKKA_PERSISTENCE=postgres`).
+- `RAKKA_SELF_FENCE`: self-fence on sustained peer-unreachability (etcd mode). `on` (default) / `off`.
+- `RAKKA_SELF_FENCE_AFTER_SECONDS`: sustained unreachability before fencing. Defaults to `15`.
+- `RAKKA_SELF_FENCE_REJOIN_SECONDS`: sustained reachability before clearing a fence. Defaults to `10`.
 
 ## Scope and simplifications
 

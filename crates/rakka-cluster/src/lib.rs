@@ -9,6 +9,7 @@ pub mod facade;
 pub mod membership;
 pub mod node;
 pub mod receptionist;
+pub mod self_fence;
 pub mod shutdown;
 
 use rakka_core::Subsystem;
@@ -32,6 +33,7 @@ pub use node::{
 pub use receptionist::{
     ClusteredReceptionist, ClusteredReceptionistListing, ClusteredReceptionistSettings,
 };
+pub use self_fence::{SelfFenceConfig, SelfFenceDetector, SelfHealth};
 pub use shutdown::{
     register_cluster_down_self_task, register_cluster_leave_task,
     register_clustered_receptionist_prune_task,
