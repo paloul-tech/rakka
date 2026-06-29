@@ -95,6 +95,61 @@ Non-guarantees:
 
 Use the compatibility policy and rolling-update upgrade note for safe mixed-version deployments.
 
+### External-arbiter membership contract
+
+Symmetric clusters (every node hosts a slice of entities) determine shard
+ownership from a **consistent external membership arbiter** rather than internal
+gossip or consensus. A discovery/membership provider used this way must satisfy:
+
+- Membership is whatever the external arbiter reports; a node is a member only
+  while its registration there is live (for example an etcd lease that the node
+  renews).
+- The arbiter must be strongly consistent, so every node converges on the same
+  up-set and therefore — with `DeterministicModuloShardAllocationStrategy`, which
+  makes ownership a pure function of the up-set — the same shard ownership. No
+  shared coordinator state is required.
+- A node that cannot reach the arbiter loses its registration and is removed
+  (fail-stop). If the arbiter is globally unavailable, no new ownership decisions
+  are made and existing durable state is untouched.
+
+Guarantees (under this contract):
+
+- With a strongly-consistent arbiter, a network partition cannot produce two
+  independent membership views, so an internal split-brain resolver is
+  unnecessary and is intentionally omitted.
+
+Non-guarantees:
+
+- Arbiter liveness is not peer reachability. A node can hold a live registration
+  yet be unreachable from peers; routed asks then fail with `entity-no-route`
+  until the node is removed. Peer-reachability **self-fencing** (a node that
+  cannot reach peers drops its own registration) closes this gap; reachability
+  signals must never directly edit the ownership up-set, or independent nodes
+  would disagree on owners.
+- Without a consistent external arbiter (for example membership from internal
+  gossip), partition safety is not guaranteed; Rakka does not ship an internal
+  split-brain resolver.
+
+See `rakka-cluster-coordination-strategy.md` for the rationale and direction.
+
+### Single-writer for sharded durable entities
+
+Core, remote, and sharded delivery are at-most-once, so single-writer is not a
+property of topology. For a sharded entity backed by a durable state store,
+single-writer is provided by **revision compare-and-set (CAS)** plus idempotent
+inbox/outbox effects:
+
+- Every durable write is conditioned on the expected revision; a stale or
+  concurrent second writer's CAS fails (`CoordinatorRevisionConflict` for
+  coordinator state, the store's revision-conflict error for entity state)
+  instead of overwriting newer state.
+- During a shard move or a transient membership disagreement two nodes may
+  briefly drive the same entity; the durable CAS rejects the loser and idempotent
+  effects dedupe, so the outcome is wasted or retried work, not corruption.
+- This is the single-writer guarantee Rakka relies on instead of an Akka-style
+  stop-the-world hand-off barrier. It holds only while every durable and outbox
+  write stays CAS-guarded and idempotent; applications must preserve that.
+
 ## Process Actors
 
 `rakka-process` lets a Rakka node own supervised child processes inside the same node container.

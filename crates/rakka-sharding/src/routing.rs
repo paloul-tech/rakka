@@ -660,7 +660,7 @@ where
             config,
             route: Arc::new(route),
             buffer: Arc::new(Mutex::new(None)),
-            allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy),
+            allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy::new()),
             remembered_entities: None,
         }
     }
@@ -682,7 +682,7 @@ where
             config,
             route: Arc::new(route),
             buffer: Arc::new(Mutex::new(None)),
-            allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy),
+            allocation_strategy: Arc::new(DeterministicModuloShardAllocationStrategy::new()),
             remembered_entities: None,
         })
     }

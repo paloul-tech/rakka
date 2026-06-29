@@ -269,7 +269,7 @@ impl ShardCoordinator {
         Self::with_allocation_strategy(
             entity_type,
             config,
-            DeterministicModuloShardAllocationStrategy,
+            DeterministicModuloShardAllocationStrategy::new(),
         )
     }
 
@@ -309,7 +309,7 @@ impl ShardCoordinator {
             entity_type,
             config,
             snapshot,
-            DeterministicModuloShardAllocationStrategy,
+            DeterministicModuloShardAllocationStrategy::new(),
         )
     }
 
