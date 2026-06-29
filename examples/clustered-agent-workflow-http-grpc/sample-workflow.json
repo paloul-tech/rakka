@@ -1,0 +1,21 @@
+{
+  "run_id": "sample-research-1",
+  "plan_id": "sample-research-plan",
+  "nodes": [
+    { "id": "intake", "kind": "input" },
+    { "id": "gather-web", "kind": "transform" },
+    { "id": "gather-docs", "kind": "transform" },
+    { "id": "synthesize", "kind": "transform" },
+    { "id": "review", "kind": "transform" },
+    { "id": "publish", "kind": "terminal" }
+  ],
+  "edges": [
+    { "from": "intake", "to": "gather-web" },
+    { "from": "intake", "to": "gather-docs" },
+    { "from": "gather-web", "to": "synthesize" },
+    { "from": "gather-docs", "to": "synthesize" },
+    { "from": "synthesize", "to": "review" },
+    { "from": "review", "to": "publish" }
+  ],
+  "entry_nodes": ["intake"]
+}

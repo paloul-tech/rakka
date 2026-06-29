@@ -1,0 +1,4 @@
+# Keep the Docker build context small: never ship build artifacts or VCS data.
+target/
+.git/
+**/*.log

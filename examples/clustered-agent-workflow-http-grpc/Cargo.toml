@@ -1,0 +1,49 @@
+[package]
+name = "rakka-example-clustered-agent-workflow-http-grpc"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+publish = false
+
+[[bin]]
+name = "rakka-example-clustered-agent-workflow-http-grpc"
+path = "src/main.rs"
+doc = false
+
+[features]
+default = []
+# Optional shared PostgreSQL durable store, required for correct multi-pod
+# (Kubernetes) run recovery. Off by default so local/file mode needs no DB.
+postgres = ["dep:rakka-persistence-postgres", "dep:tokio-postgres", "rakka/postgres"]
+
+[dependencies]
+axum.workspace = true
+etcd-client = { version = "0.19", default-features = false }
+prost.workspace = true
+rakka = { path = "../../crates/rakka", default-features = false, features = [
+    "agent-workflow",
+    "cluster",
+    "grpc",
+    "http",
+    "persistence",
+    "remote",
+    "sharding",
+] }
+rakka-persistence-postgres = { path = "../../crates/rakka-persistence-postgres", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres = { workspace = true, optional = true }
+tonic.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[lints]
+workspace = true
