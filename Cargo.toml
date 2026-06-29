@@ -7,6 +7,7 @@ members = [
     "crates/rakka-persistence-postgres",
     "crates/rakka-remote",
     "crates/rakka-cluster",
+    "crates/rakka-discovery-etcd",
     "crates/rakka-sharding",
     "crates/rakka-sharding-postgres",
     "crates/rakka-workflow",
@@ -49,6 +50,7 @@ license-file = "LICENSE"
 
 [workspace.dependencies]
 axum = { version = "0.7.9", features = ["ws"] }
+etcd-client = { version = "0.19", default-features = false }
 futures-util = "0.3"
 http-body-util = "0.1"
 prost = "0.13"

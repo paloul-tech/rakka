@@ -165,6 +165,12 @@ pub mod cluster {
     pub use rakka_cluster::*;
 }
 
+#[cfg(feature = "discovery-etcd")]
+/// etcd-backed external-arbiter discovery provider.
+pub mod discovery_etcd {
+    pub use rakka_discovery_etcd::*;
+}
+
 #[cfg(feature = "grpc")]
 /// gRPC integration adapters.
 pub mod grpc {
