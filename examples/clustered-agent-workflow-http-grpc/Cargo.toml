@@ -24,11 +24,11 @@ postgres = ["dep:rakka-persistence-postgres", "dep:tokio-postgres", "rakka/postg
 
 [dependencies]
 axum.workspace = true
-etcd-client = { version = "0.19", default-features = false }
 prost.workspace = true
 rakka = { path = "../../crates/rakka", default-features = false, features = [
     "agent-workflow",
     "cluster",
+    "discovery-etcd",
     "grpc",
     "http",
     "persistence",

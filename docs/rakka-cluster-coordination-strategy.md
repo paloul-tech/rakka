@@ -70,10 +70,13 @@ All four agreed actions have landed (branch `rakka-vs-akka-sharding-review`):
   facade behind the opt-in `discovery-etcd` feature. Kubernetes reuses the existing
   `rakka-k8s` DNS discovery and downward-API identity helpers.
 
-Remaining integration (application glue, not framework): feed the
-`SelfFenceDetector` from a peer-reachability signal (for example repeated
-remote-ask timeouts) and call `EtcdDiscoverySession::leave` when it fences. The
-framework pieces for that wiring are all in place.
+The self-fence glue is demonstrated end-to-end in
+`examples/clustered-agent-workflow-http-grpc`: the ingress records cross-node
+remote-ask outcomes into a `PeerReachability` window, the etcd discovery loop
+feeds it to `SelfFenceDetector`, and on a fence the node calls
+`EtcdDiscoverySession::leave` (revoking its etcd lease) and shuts down. Verified
+by partitioning a peer at the `rakka-remote` layer while it keeps its etcd lease:
+the unreachable-from node self-fenced and left the arbiter's membership.
 
 ## Background: the three deltas from Akka
 

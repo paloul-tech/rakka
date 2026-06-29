@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rakka::cluster::MembershipConfig;
+use rakka::cluster::{MembershipConfig, SelfFenceConfig};
 use rakka::http::{serve_with_graceful_shutdown, HttpServerConfig};
 use rakka::prelude::{ActorSystem, ClusterSharding, EntityTypeKey};
 use rakka::remote::{SerializationRegistry, TcpRemoteTransportConfig};
@@ -17,13 +17,14 @@ use tonic::transport::Server;
 use crate::codec::JsonPayloadCodec;
 use crate::config::{DiscoveryProviderKind, ExampleConfig, PersistenceKind};
 use crate::discovery::{new_membership_view, run_file_discovery, seed_file_discovery};
-use crate::etcd_discovery::{connect_register, run_etcd_discovery};
+use crate::etcd_discovery::{connect, run_etcd_discovery};
 use crate::generated::agent_api::agent_workflow_ingress_server::AgentWorkflowIngressServer;
 use crate::grpc::AgentWorkflowGrpc;
 use crate::http;
 use crate::ingress::AppState;
 use crate::model::{RunRequest, WorkflowRunView};
 use crate::persistence;
+use crate::reachability::PeerReachability;
 use crate::run_entity::{init_run_sharding, RunHost};
 use crate::support::{
     current_timestamp_millis, ExampleResult, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
@@ -48,10 +49,11 @@ pub async fn run_http() -> ExampleResult<()> {
     print_banner(&booted, "HTTP", http_addr);
     println!("Submit a compiled workflow with: POST http://{http_addr}/workflows");
 
+    let stop = booted.shutdown.clone();
     serve_with_graceful_shutdown(
         http::router(booted.state.clone()),
         HttpServerConfig::new(http_addr),
-        shutdown_signal(),
+        shutdown_signal(stop),
     )
     .await?;
 
@@ -67,10 +69,11 @@ pub async fn run_grpc() -> ExampleResult<()> {
         "Submit a compiled workflow with: grpc://{grpc_addr} AgentWorkflowIngress/SubmitWorkflow"
     );
 
+    let stop = booted.shutdown.clone();
     let service = AgentWorkflowIngressServer::new(AgentWorkflowGrpc::new(booted.state.clone()));
     Server::builder()
         .add_service(service)
-        .serve_with_shutdown(grpc_addr, shutdown_signal())
+        .serve_with_shutdown(grpc_addr, shutdown_signal(stop))
         .await?;
 
     shutdown(booted).await
@@ -134,19 +137,24 @@ async fn boot() -> ExampleResult<Booted> {
     // Seed the selected discovery provider (needs `&mut runtime`), then move the
     // runtime behind a shared lock and spawn the discovery loop.
     let membership = new_membership_view();
+    let reachability = PeerReachability::new();
     let shutdown = Arc::new(Notify::new());
-    let etcd_session = match config.discovery_provider {
+    let etcd_handle = match config.discovery_provider {
         DiscoveryProviderKind::File => {
             seed_file_discovery(&config, &local_node, &mut runtime, &membership)?;
             None
         }
         DiscoveryProviderKind::Etcd => {
-            Some(connect_register(&config, &local_node, &mut runtime, &membership).await?)
+            Some(connect(&config, &local_node, &mut runtime, &membership).await?)
         }
     };
 
     let runtime = Arc::new(AsyncMutex::new(runtime));
-    let discovery_task = match etcd_session {
+    // Self-fencing applies to etcd discovery only (it revokes the etcd lease).
+    let self_fence = config
+        .self_fence
+        .then(|| SelfFenceConfig::new(config.self_fence_after, config.self_fence_rejoin_after));
+    let discovery_task = match etcd_handle {
         None => tokio::spawn(run_file_discovery(
             runtime.clone(),
             config.clone(),
@@ -154,10 +162,13 @@ async fn boot() -> ExampleResult<Booted> {
             membership.clone(),
             shutdown.clone(),
         )),
-        Some(session) => tokio::spawn(run_etcd_discovery(
-            session,
+        Some(handle) => tokio::spawn(run_etcd_discovery(
+            handle.session,
+            handle.discovery,
             runtime.clone(),
             membership.clone(),
+            reachability.clone(),
+            self_fence,
             shutdown.clone(),
         )),
     };
@@ -169,6 +180,7 @@ async fn boot() -> ExampleResult<Booted> {
         workflow,
         node_label: local_node.id().to_string(),
         membership,
+        reachability,
     };
 
     Ok(Booted {
@@ -193,8 +205,9 @@ async fn shutdown(booted: Booted) -> ExampleResult<()> {
     Ok(())
 }
 
-/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM (Kubernetes).
-async fn shutdown_signal() {
+/// Resolves when the process receives SIGINT (Ctrl-C) or SIGTERM (Kubernetes),
+/// or when `stop` is signalled (self-fencing decided this node must leave).
+async fn shutdown_signal(stop: Arc<Notify>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -202,11 +215,15 @@ async fn shutdown_signal() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
+            () = stop.notified() => {}
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = stop.notified() => {}
+        }
     }
 }
 

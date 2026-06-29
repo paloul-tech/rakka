@@ -14,6 +14,7 @@ use rakka::sharding::{EntityAskError, RemoteEntityAskClient, RemoteEntityAskErro
 
 use crate::discovery::{membership_snapshot, MembershipView};
 use crate::model::{ClusterView, RunRequest, SubmitWorkflowRequest, WorkflowRunView};
+use crate::reachability::PeerReachability;
 use crate::run_entity::RunEntityCommand;
 use crate::support::{NUMBER_OF_SHARDS, RUN_ASK_TIMEOUT};
 use crate::workflow::{self, CompiledSubmission};
@@ -27,6 +28,7 @@ pub struct AppState {
     pub workflow: AgentWorkflow,
     pub node_label: String,
     pub membership: MembershipView,
+    pub reachability: PeerReachability,
 }
 
 /// Protocol-neutral ingress failure, mapped to HTTP/gRPC status by each adapter.
@@ -86,10 +88,11 @@ pub async fn get_run(state: &AppState, run_id: String) -> Result<WorkflowRunView
             .await
             .map_err(entity_ask_error)?
     } else {
-        entity
+        let outcome = entity
             .remote_ask(&state.ask_client, RunRequest::Query, RUN_ASK_TIMEOUT)
-            .await
-            .map_err(remote_ask_error)?
+            .await;
+        record_remote_outcome(&state.reachability, &outcome);
+        outcome.map_err(remote_ask_error)?
     };
     view.served_by = state.node_label.clone();
     view.executed_locally = is_local;
@@ -145,7 +148,7 @@ async fn drive_on_owner(
             .await
             .map_err(entity_ask_error)?
     } else {
-        entity
+        let outcome = entity
             .remote_ask(
                 &state.ask_client,
                 RunRequest::Drive {
@@ -153,12 +156,37 @@ async fn drive_on_owner(
                 },
                 RUN_ASK_TIMEOUT,
             )
-            .await
-            .map_err(remote_ask_error)?
+            .await;
+        record_remote_outcome(&state.reachability, &outcome);
+        outcome.map_err(remote_ask_error)?
     };
     view.served_by = state.node_label.clone();
     view.executed_locally = is_local;
     Ok(view)
+}
+
+/// Feeds the self-fence detector: a cross-node ask that fails to reach the peer
+/// (send failure or reply timeout) is evidence of peer-unreachability; success is
+/// evidence of reachability. Resolution/encode errors are not reachability signals.
+fn record_remote_outcome(
+    reachability: &PeerReachability,
+    outcome: &Result<WorkflowRunView, RemoteEntityAskError>,
+) {
+    match outcome {
+        Ok(_) => reachability.record(true),
+        Err(error) if is_peer_unreachable(error) => reachability.record(false),
+        Err(_) => {}
+    }
+}
+
+fn is_peer_unreachable(error: &RemoteEntityAskError) -> bool {
+    matches!(error, RemoteEntityAskError::Send { .. })
+        || matches!(
+            error,
+            RemoteEntityAskError::Reply {
+                error: RemoteRequestError::Timeout
+            }
+        )
 }
 
 fn entity_ask_error(error: EntityAskError) -> IngressError {
