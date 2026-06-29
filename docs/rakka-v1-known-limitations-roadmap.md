@@ -9,7 +9,7 @@ This document records the important limits of the v1 release candidate and the m
 - Exactly-once external side effects are not guaranteed.
 - Rakka internal remoting is trusted-cluster traffic, not a public API.
 - v1 does not include built-in TLS/mTLS, certificate lifecycle management, or service-mesh policy.
-- v1 does not include a durable distributed consensus backend for shard coordination.
+- v1 does not include a durable distributed consensus backend for shard coordination. The intended direction is an external arbiter (etcd/Kubernetes), not in-process consensus; see `rakka-cluster-coordination-strategy.md`.
 - Kubernetes examples are reviewable manifests and scripts, not a full operator or Helm lifecycle.
 - Process actors run child processes inside Rakka node containers; per-actor sidecars are future work.
 - Rakka is not an OS sandbox for child processes.
@@ -24,7 +24,7 @@ This document records the important limits of the v1 release candidate and the m
 Likely post-v1 work:
 
 - Public API stabilization pass after user review.
-- Durable shard coordinator backend or consensus integration.
+- Durable shard coordinator backend or consensus integration. See `rakka-cluster-coordination-strategy.md` for the recommended direction: lean on an external etcd/Kubernetes arbiter rather than an in-process consensus backend, plus peer-reachability self-fencing.
 - TLS/mTLS integration guidance for internal remoting.
 - Operator or Helm-style packaging for Kubernetes.
 - Generated application templates for HTTP/gRPC/actor/entity/workflow/process services.
