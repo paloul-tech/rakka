@@ -1,6 +1,6 @@
 //! Durable outbox facade for agent workflow effects.
 //!
-//! This module maps first-class [`AgentEffect`](crate::AgentEffect) values to
+//! This module maps first-class [`AgentEffect`] values to
 //! the lower-level `rakka-workflow` durable outbox. Scheduled effects are
 //! visible through [`AgentRunInbox::due_effects`] only after the substrate has
 //! persisted the outbox entry.

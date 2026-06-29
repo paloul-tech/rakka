@@ -1,6 +1,6 @@
 //! Model and tool adapter traits for durable agent effects.
 //!
-//! Adapters translate durable [`AgentEffect`](crate::AgentEffect) records into
+//! Adapters translate durable [`AgentEffect`] records into
 //! provider or tool calls. The traits keep large prompts, completions, arguments,
 //! and tool outputs behind [`ArtifactRef`] values while preserving timeout,
 //! idempotency, telemetry, receipt, retry, token, cost, and redaction metadata.

@@ -1,6 +1,6 @@
 //! Durable inbox facade for agent workflow commands.
 //!
-//! This module maps first-class [`AgentCommand`](crate::AgentCommand) values to
+//! This module maps first-class [`AgentCommand`] values to
 //! the lower-level `rakka-workflow` durable inbox. The acceptance boundary stays
 //! in the substrate: a command is reported as accepted only after the durable
 //! inbox has persisted it.

@@ -1,6 +1,6 @@
 //! Durable human checkpoint facade for agent workflow runs.
 //!
-//! Human checkpoints are persisted in [`AgentRunState`](crate::AgentRunState).
+//! Human checkpoints are persisted in [`AgentRunState`].
 //! This facade composes the run state machine, durable outbox approval request,
 //! and durable inbox decision command so a run can wait without keeping a live
 //! task, actor, or pod-local worker active.
