@@ -54,6 +54,27 @@ This is one real engineering item (self-fencing), one documentation/packaging
 item (the external-arbiter contract), and a deliberate decision **not** to build
 the rest.
 
+## Implementation status
+
+All four agreed actions have landed (branch `rakka-vs-akka-sharding-review`):
+
+- **Bounded rebalance** — `DeterministicModuloShardAllocationStrategy::with_max_simultaneous_rebalance`
+  in `rakka-sharding` (deterministic, converges; default unbounded).
+- **Self-fencing** — `SelfFenceDetector` / `SelfFenceConfig` / `SelfHealth` in
+  `rakka-cluster` (hysteretic policy core). Actuator is
+  `rakka_discovery_etcd::EtcdDiscoverySession::leave`.
+- **External-arbiter contract + CAS single-writer guarantee** — documented in
+  `rakka-v1-reliability-boundaries.md`.
+- **External-arbiter provider** — new `rakka-discovery-etcd` adapter crate
+  (cache-backed `DiscoveryProvider` + leased registration), wired into the `rakka`
+  facade behind the opt-in `discovery-etcd` feature. Kubernetes reuses the existing
+  `rakka-k8s` DNS discovery and downward-API identity helpers.
+
+Remaining integration (application glue, not framework): feed the
+`SelfFenceDetector` from a peer-reachability signal (for example repeated
+remote-ask timeouts) and call `EtcdDiscoverySession::leave` when it fences. The
+framework pieces for that wiring are all in place.
+
 ## Background: the three deltas from Akka
 
 Akka Cluster Sharding provides, and Rakka does not:
