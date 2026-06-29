@@ -218,7 +218,7 @@ The app nodes:
 - derive identity/address from the downward API (`RAKKA_POD_NAME` / `RAKKA_POD_UID` / `RAKKA_POD_IP`), and
 - scale via a `HorizontalPodAutoscaler` (CPU metrics require a metrics-server), with a `PodDisruptionBudget` and a preStop drain that revokes the etcd lease and leaves the cluster cleanly.
 
-Switch a node to the gRPC ingress by setting its container `args` to `["grpc"]` and exposing the gRPC port. The full design rationale is in [`doc/kubernetes-etcd-discovery.md`](doc/kubernetes-etcd-discovery.md).
+Switch a node to the gRPC ingress by setting its container `args` to `["grpc"]` and exposing the gRPC port. The full design rationale is in [`doc/kubernetes-etcd-discovery.md`](doc/kubernetes-etcd-discovery.md), and an Akka↔Rakka review of the sharding/coordination/rebalancing/split‑brain model is in [`doc/akka-comparison.md`](doc/akka-comparison.md).
 
 ## Environment variables
 

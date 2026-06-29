@@ -196,7 +196,8 @@ addressing them would break run recovery:
   producing cross-node routing timeouts (`entity-no-route: remote ask timed out`).
   A fenced singleton coordinator would require a different topology — a dedicated
   coordinator deployment with proxy regions on the hosting nodes — which is out of
-  scope for this example.
+  scope for this example. See [`akka-comparison.md`](akka-comparison.md) for a full
+  Akka↔Rakka review of sharding, coordination, rebalancing, and split‑brain.
 - **Advertise address** must be the pod's cluster-routable host (not
   `127.0.0.1`), and **bind** `0.0.0.0`.
 - **Probe port** for gRPC-only pods (see Part 2).
