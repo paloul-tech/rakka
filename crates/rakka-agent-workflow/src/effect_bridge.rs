@@ -748,7 +748,7 @@ impl AgentGraphEffectBridge {
     /// ordering documented above). A crash in that window leaves the effect
     /// durably enqueued while the node is still persisted in a pre-waiting
     /// status, so a later `EffectCompleted`/`EffectFailed` cannot resolve its
-    /// node — [`node_id_for_effect`] returns
+    /// node — `node_id_for_effect` returns
     /// [`AgentGraphEffectBridgeError::UnknownEffect`] and the result is
     /// orphaned. The run actor does not re-drive in-flight nodes on recovery,
     /// so recovery must heal the link itself.
