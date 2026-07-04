@@ -32,7 +32,7 @@ Crates with unpublished internal Rakka dependencies are package-list checked off
 Required CI jobs are safe for normal pull requests and pushes:
 
 - `Required Validation`: calls `scripts/validate.sh` on stable Rust.
-- `MSRV Check`: runs `cargo check --workspace --all-targets` on Rust `1.80.0`.
+- `MSRV Check`: runs `cargo check --workspace --all-targets` on Rust `1.85.0`.
 - `Offline Package Check`: calls `scripts/package-check.sh`.
 - `Kubernetes Scenario Dry Run`: runs the Kubernetes scenario in dry-run mode without cluster access.
 

@@ -482,7 +482,7 @@ impl AgentDispatchEntry {
                     && self
                         .lease
                         .as_ref()
-                        .map_or(true, |lease| !lease.is_active_at(now))
+                        .is_none_or(|lease| !lease.is_active_at(now))
             }
             AgentDispatchStatus::Completed
             | AgentDispatchStatus::Exhausted

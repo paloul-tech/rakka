@@ -17,7 +17,7 @@ straightforward by keeping A2A-specific code in clear modules.
 
 ### Slice 0.1: Dependency And Feature Spike
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -37,9 +37,27 @@ Acceptance:
 - No reusable Rakka public API is committed before the example proves the
   shape.
 
+Notes:
+
+- The Phase 0 example uses `a2a-lf = 0.3.0` (`a2a`) and
+  `a2a-server-lf = 0.4.0` (`a2a_server`) with
+  `default-features = false`.
+- The server SDK default TLS feature is disabled. A2A gRPC and SLIMRPC crates
+  are not enabled in this example.
+- `a2a-server-lf` still pulls `a2a-pb` and `tonic` transitively for ProtoJSON
+  conversion; this example does not mount A2A gRPC routes or depend on the
+  `a2a-grpc` crate.
+- The published A2A SDK crates currently require Rust 1.85, so the Rakka
+  workspace MSRV is bumped to Rust 1.85 and the example remains a normal
+  workspace member. Check it with:
+
+```sh
+cargo check -p rakka-example-clustered-sharded-entity-a2a-agents
+```
+
 ### Slice 0.2: Example Skeleton And Module Boundary
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -62,7 +80,7 @@ Acceptance:
 
 ### Slice 0.3: Runtime Boot Without Public A2A Commands
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -81,7 +99,7 @@ Acceptance:
 
 ### Slice 0.4: Agent Card Router
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -101,7 +119,7 @@ Acceptance:
 
 ### Slice 0.5: Router Composition Spike
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -121,7 +139,7 @@ Acceptance:
 
 ### Slice 0.6: API Boundary Note
 
-Status: planned
+Status: implemented
 
 Work:
 

@@ -30,6 +30,7 @@ members = [
     "examples/pool-router",
     "examples/clustered-receptionist",
     "examples/clustered-agent-workflow-http-grpc",
+    "examples/clustered-sharded-entity-a2a-agents",
     "examples/clustered-counter-grpc",
     "examples/clustered-counter-http",
     "examples/coordinated-shutdown",
@@ -40,7 +41,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "A Rust actor framework foundation with typed actors, sharding, remoting, process ownership, and Kubernetes operation."
 repository = "https://github.com/rakka-rs/rakka"
 homepage = "https://github.com/rakka-rs/rakka"
@@ -49,7 +50,7 @@ readme = "README.md"
 license-file = "LICENSE"
 
 [workspace.dependencies]
-axum = { version = "0.7.9", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 etcd-client = { version = "0.19", default-features = false }
 futures-util = "0.3"
 http-body-util = "0.1"
