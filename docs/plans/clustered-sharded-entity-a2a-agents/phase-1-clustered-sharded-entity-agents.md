@@ -1,6 +1,6 @@
 # Phase 1 Clustered Sharded Entity A2A Agents
 
-Status: planning draft
+Status: implemented
 Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
 
 ## Goal
@@ -14,7 +14,7 @@ that Phase 2 uses.
 
 ### Slice 1.1: Identity And Metadata Normalization
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -38,7 +38,7 @@ Acceptance:
 
 ### Slice 1.2: Message And Part Conversion
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -62,7 +62,7 @@ Acceptance:
 
 ### Slice 1.3: Agent Command Construction
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -83,7 +83,7 @@ Acceptance:
 
 ### Slice 1.4: A2A Task Projection Model
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -104,7 +104,7 @@ Acceptance:
 
 ### Slice 1.5: A2A Task Event Projection
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -124,7 +124,7 @@ Acceptance:
 
 ### Slice 1.6: Query Index Integration
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -143,7 +143,7 @@ Acceptance:
 
 ### Slice 1.7: Conversion Test Matrix
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -165,6 +165,34 @@ Acceptance:
 - Rakka run state can be projected into A2A tasks.
 - A public A2A task event projection is specified and test-covered.
 - No public command is acknowledged before Phase 2 durable acceptance exists.
+
+## Implementation Notes
+
+- `examples/clustered-sharded-entity-a2a-agents/src/a2a_mapping.rs` owns
+  identity normalization, `io.rakka.*` metadata parsing, tenant-source
+  selection, trace extraction, part conversion, and `AgentCommand` draft
+  construction. Command drafts are built through `AgentTriggerCommandBuilder`
+  with the `api` trigger source, so A2A commands carry the same normalized
+  trigger-source attributes as other trigger paths.
+- `examples/clustered-sharded-entity-a2a-agents/src/task_projection.rs` owns
+  the A2A task projection, public task events, runtime-event projection mapping,
+  replay cursors, and the local in-memory projection store.
+- The `Phase1A2AHandler` validates `send_message`,
+  `send_streaming_message`, and `cancel_task` into command drafts before
+  returning unsupported-operation errors. Durable inbox acceptance remains a
+  Phase 2 boundary.
+- `get_task` and `list_tasks` are projection-backed and do not enumerate live
+  actors. Local mode uses the in-memory projection store; the module also
+  exposes tenant-scoped behavior that requires tenant filters. Read paths
+  resolve their tenant scope through the same header-first precedence and
+  conflict policy as command paths.
+- Oversized message parts convert to artifact drafts that pair each reference
+  with its source content. Phase 2 must persist that content behind the
+  synthetic `a2a-message://` URIs (computing real checksums at that point)
+  before accepting the command durably; only the reference may reach durable
+  state.
+- Conversion fixtures live under
+  `examples/clustered-sharded-entity-a2a-agents/tests/fixtures/`.
 
 ## References
 

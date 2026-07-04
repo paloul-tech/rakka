@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Phase 0 A2A agent example: clustered Rakka boot plus A2A router mounting.
+//! Phase 1 A2A agent example: clustered Rakka boot plus A2A conversion mapping.
 //!
 //! This example is intentionally an incubator, not a reusable `rakka-a2a`
-//! crate. Phase 0 proves the A2A SDK can share one HTTP server with Rakka
-//! runtime health routes while durable A2A commands remain unimplemented.
+//! crate. Phase 1 adds command-draft conversion and task projection boundaries
+//! while durable A2A command acceptance remains unimplemented.
 
 mod a2a_handler;
+mod a2a_mapping;
 mod agent_card;
 mod codec;
 mod config;

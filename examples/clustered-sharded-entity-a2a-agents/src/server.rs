@@ -19,7 +19,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::a2a_handler::{HeaderObserver, Phase0A2AHandler};
+use crate::a2a_handler::{HeaderObserver, Phase1A2AHandler};
 use crate::agent_card::build_agent_card;
 use crate::codec::serialization_registry;
 use crate::config::ExampleConfig;
@@ -33,6 +33,7 @@ use crate::support::{
     current_timestamp_millis, ExampleResult, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
     DEFAULT_RECONNECT_BACKOFF,
 };
+use crate::task_projection::InMemoryA2ATaskProjectionStore;
 use crate::workflow::demo_workflow;
 
 struct Booted {
@@ -50,6 +51,8 @@ struct AppState {
     node_id: String,
     membership: MembershipView,
     agent_card: a2a::AgentCard,
+    workflow: rakka::agent_workflow::AgentWorkflow,
+    task_store: InMemoryA2ATaskProjectionStore,
     header_observer: HeaderObserver,
 }
 
@@ -90,8 +93,10 @@ pub async fn run() -> ExampleResult<()> {
 
 fn router(state: AppState) -> Router {
     let agent_card = state.agent_card.clone();
-    let handler = Arc::new(Phase0A2AHandler::new(
+    let handler = Arc::new(Phase1A2AHandler::new(
         agent_card.clone(),
+        state.workflow.clone(),
+        state.task_store.clone(),
         state.header_observer.clone(),
     ));
 
@@ -123,7 +128,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn readiness() -> Json<ReadinessResponse> {
     Json(ReadinessResponse {
         ready: true,
-        reason: "phase-0-runtime-booted",
+        reason: "phase-1-runtime-booted",
     })
 }
 
@@ -172,7 +177,7 @@ async fn boot() -> ExampleResult<Booted> {
 
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
     let (run_store, workflow_store) = build_stores();
-    init_demo_run_sharding(&sharding, workflow, run_store, workflow_store)?;
+    init_demo_run_sharding(&sharding, workflow.clone(), run_store, workflow_store)?;
 
     let membership = new_membership_view();
     let shutdown = Arc::new(Notify::new());
@@ -191,6 +196,8 @@ async fn boot() -> ExampleResult<Booted> {
         node_id: local_node.id().to_string(),
         membership,
         agent_card: build_agent_card(&config),
+        workflow,
+        task_store: InMemoryA2ATaskProjectionStore::local(),
         header_observer: HeaderObserver::default(),
     };
 
@@ -237,7 +244,7 @@ async fn shutdown_signal(stop: Arc<Notify>) {
 fn print_banner(booted: &Booted) {
     let addr = booted.config.http_bind_addr();
     println!(
-        "Rakka A2A Phase 0 node {} | remoting {} | HTTP/A2A {}",
+        "Rakka A2A Phase 1 node {} | remoting {} | HTTP/A2A {}",
         booted.config.node_logical_id, booted.config.rakka_port, addr,
     );
     println!("agent card: http://{}/.well-known/agent-card.json", addr);
@@ -316,10 +323,53 @@ mod tests {
         );
         assert!(payload["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("Phase 0")));
+            .is_some_and(|message| message.contains("Phase 2")));
 
         let params = observer.last().expect("handler should capture params");
         assert_eq!(params.get("x-rakka-phase"), Some(&vec!["0".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn rest_reads_are_scoped_by_tenant_header() {
+        use crate::task_projection::A2ATaskProjection;
+        use rakka::agent_workflow::AgentTimestampMillis;
+
+        let state = test_state();
+        state.task_store.upsert(A2ATaskProjection::accepted(
+            "task-tenant-a",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        ));
+        let app = router(state);
+
+        let cross_tenant = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/tasks/task-tenant-a")
+                    .header("x-rakka-tenant", "tenant-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+        let same_tenant = app
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/tasks/task-tenant-a")
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_tenant.status(), StatusCode::OK);
     }
 
     fn test_state() -> AppState {
@@ -336,6 +386,8 @@ mod tests {
                 discovery_dir: std::env::temp_dir(),
                 public_url: None,
             }),
+            workflow: demo_workflow(),
+            task_store: InMemoryA2ATaskProjectionStore::local(),
             header_observer: HeaderObserver::default(),
         }
     }

@@ -1,4 +1,4 @@
-//! Demo workflow definition advertised by the Phase 0 agent card.
+//! Demo workflow definition advertised by the Phase 1 agent card.
 
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ use rakka::agent_workflow::{
 
 use crate::support::WORKFLOW_TYPE;
 
-const WORKFLOW_ID: &str = "workflow-a2a-phase-0-demo";
+const WORKFLOW_ID: &str = "workflow-a2a-phase-1-demo";
 const DEFINITION_VERSION: &str = "v1";
 
 /// The single demo workflow definition hosted by this example.
@@ -20,13 +20,21 @@ pub fn demo_workflow() -> AgentWorkflow {
         workflow_type: WORKFLOW_TYPE.to_string(),
         definition_version: WorkflowDefinitionVersion::new(DEFINITION_VERSION),
         state_schema_version: StateSchemaVersion::new(1),
-        display_name: Some("A2A Phase 0 demo workflow".to_string()),
+        display_name: Some("A2A Phase 1 demo workflow".to_string()),
         status_labels: vec![
             AgentRunStatus::Accepted.as_label().to_string(),
             AgentRunStatus::Running.as_label().to_string(),
             AgentRunStatus::Completed.as_label().to_string(),
         ],
-        command_types: vec![AgentCommandKind::StartRun.type_name().to_string()],
+        command_types: vec![
+            AgentCommandKind::StartRun.type_name().to_string(),
+            AgentCommandKind::SubmitSignal {
+                signal_type: "a2a.message".to_string(),
+            }
+            .type_name()
+            .to_string(),
+            AgentCommandKind::CancelRun.type_name().to_string(),
+        ],
         steps: vec![AgentStep {
             step_id: AgentStepId::new("receive-a2a-message"),
             kind: AgentStepKind::Planner,

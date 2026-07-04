@@ -1,7 +1,7 @@
-//! Durable-store selection for Phase 0.
+//! Durable-store selection for the Phase 1 example.
 //!
-//! Phase 0 intentionally uses in-memory stores. They are enough to boot the
-//! sharded run entity type without creating any public durable mutation path.
+//! Phase 1 still uses in-memory stores. They are enough to boot the sharded run
+//! entity type without creating any public durable mutation path.
 
 use rakka::agent_workflow::substrate::WorkflowState;
 use rakka::agent_workflow::AgentRunState;
@@ -13,7 +13,7 @@ pub type RunStore = InMemoryDurableStateStore<AgentRunState>;
 /// In-memory durable store for workflow inbox/outbox state.
 pub type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
 
-/// Builds the local Phase 0 stores.
+/// Builds the local Phase 1 stores.
 #[must_use]
 pub fn build_stores() -> (RunStore, WorkflowStore) {
     (

@@ -1715,6 +1715,7 @@ dependencies = [
  "a2a-server-lf",
  "async-trait",
  "axum 0.8.9",
+ "chrono",
  "futures-util",
  "http-body-util",
  "rakka",
