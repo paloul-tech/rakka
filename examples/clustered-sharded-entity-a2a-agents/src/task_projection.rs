@@ -1,4 +1,4 @@
-//! A2A task read model and public task-event projection for Phase 1.
+//! A2A task read model and public task-event projection.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
@@ -401,6 +401,63 @@ impl InMemoryA2ATaskProjectionStore {
                 (projection.tenant.clone(), projection.task_id.clone()),
                 projection,
             );
+    }
+
+    /// Reads one raw projection record.
+    pub fn projection(
+        &self,
+        tenant: Option<&str>,
+        task_id: &str,
+    ) -> TaskProjectionResult<A2ATaskProjection> {
+        if self.require_tenant_filter && tenant.is_none() {
+            return Err(TaskProjectionError::TenantRequired);
+        }
+        let state = self.inner.lock().expect("projection store mutex");
+        state
+            .projections
+            .values()
+            .find(|projection| {
+                projection.task_id == task_id
+                    && tenant.is_none_or(|tenant| projection.tenant == tenant)
+            })
+            .cloned()
+            .ok_or_else(|| TaskProjectionError::TaskNotFound {
+                task_id: task_id.to_string(),
+            })
+    }
+
+    /// Appends a payload as the next event for the task and returns the event.
+    pub fn append_event_payload(
+        &self,
+        tenant: impl Into<String>,
+        task_id: impl Into<String>,
+        context_id: impl Into<String>,
+        occurred_at: AgentTimestampMillis,
+        payload: A2ATaskEventPayload,
+    ) -> TaskProjectionResult<A2ATaskEvent> {
+        let mut state = self.inner.lock().expect("projection store mutex");
+        let tenant = tenant.into();
+        let task_id = task_id.into();
+        let context_id = context_id.into();
+        let key = (tenant.clone(), task_id.clone());
+        let sequence = state.projections.get(&key).map_or(1, |projection| {
+            projection.projection_revision.saturating_add(1)
+        });
+        let event = A2ATaskEvent::new(tenant, task_id, context_id, sequence, occurred_at, payload);
+
+        if let Some(projection) = state.projections.get_mut(&key) {
+            projection.apply_event(&event)?;
+        } else if let A2ATaskEventPayload::Snapshot(snapshot) = &event.payload {
+            state
+                .projections
+                .insert(key.clone(), adopted_snapshot(snapshot, &event));
+        } else {
+            return Err(TaskProjectionError::TaskNotFound {
+                task_id: event.task_id,
+            });
+        }
+        state.events.entry(key).or_default().push(event.clone());
+        Ok(event)
     }
 
     /// Appends a public event, updating or bootstrapping the current projection.

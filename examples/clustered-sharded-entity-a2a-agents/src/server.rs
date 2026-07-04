@@ -19,7 +19,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::a2a_handler::{HeaderObserver, Phase1A2AHandler};
+use crate::a2a_handler::{HeaderObserver, RakkaA2ARequestHandler};
 use crate::agent_card::build_agent_card;
 use crate::codec::serialization_registry;
 use crate::config::ExampleConfig;
@@ -27,7 +27,7 @@ use crate::discovery::{
     membership_snapshot, new_membership_view, run_file_discovery, seed_file_discovery,
     MembershipView,
 };
-use crate::durable_stores::build_stores;
+use crate::durable_stores::{build_stores, RunStore, WorkflowStore};
 use crate::sharded_run_entity::init_demo_run_sharding;
 use crate::support::{
     current_timestamp_millis, ExampleResult, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
@@ -53,6 +53,8 @@ struct AppState {
     agent_card: a2a::AgentCard,
     workflow: rakka::agent_workflow::AgentWorkflow,
     task_store: InMemoryA2ATaskProjectionStore,
+    run_store: RunStore,
+    workflow_store: WorkflowStore,
     header_observer: HeaderObserver,
 }
 
@@ -93,10 +95,12 @@ pub async fn run() -> ExampleResult<()> {
 
 fn router(state: AppState) -> Router {
     let agent_card = state.agent_card.clone();
-    let handler = Arc::new(Phase1A2AHandler::new(
+    let handler = Arc::new(RakkaA2ARequestHandler::new(
         agent_card.clone(),
         state.workflow.clone(),
         state.task_store.clone(),
+        state.run_store.clone(),
+        state.workflow_store.clone(),
         state.header_observer.clone(),
     ));
 
@@ -128,7 +132,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn readiness() -> Json<ReadinessResponse> {
     Json(ReadinessResponse {
         ready: true,
-        reason: "phase-1-runtime-booted",
+        reason: "phase-2-durable-a2a-handler-ready",
     })
 }
 
@@ -177,7 +181,12 @@ async fn boot() -> ExampleResult<Booted> {
 
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
     let (run_store, workflow_store) = build_stores();
-    init_demo_run_sharding(&sharding, workflow.clone(), run_store, workflow_store)?;
+    init_demo_run_sharding(
+        &sharding,
+        workflow.clone(),
+        run_store.clone(),
+        workflow_store.clone(),
+    )?;
 
     let membership = new_membership_view();
     let shutdown = Arc::new(Notify::new());
@@ -198,8 +207,20 @@ async fn boot() -> ExampleResult<Booted> {
         agent_card: build_agent_card(&config),
         workflow,
         task_store: InMemoryA2ATaskProjectionStore::local(),
+        run_store,
+        workflow_store,
         header_observer: HeaderObserver::default(),
     };
+    RakkaA2ARequestHandler::new(
+        state.agent_card.clone(),
+        state.workflow.clone(),
+        state.task_store.clone(),
+        state.run_store.clone(),
+        state.workflow_store.clone(),
+        state.header_observer.clone(),
+    )
+    .recover_task_projections()
+    .await?;
 
     Ok(Booted {
         config,
@@ -244,7 +265,7 @@ async fn shutdown_signal(stop: Arc<Notify>) {
 fn print_banner(booted: &Booted) {
     let addr = booted.config.http_bind_addr();
     println!(
-        "Rakka A2A Phase 1 node {} | remoting {} | HTTP/A2A {}",
+        "Rakka A2A Phase 2 node {} | remoting {} | HTTP/A2A {}",
         booted.config.node_logical_id, booted.config.rakka_port, addr,
     );
     println!("agent card: http://{}/.well-known/agent-card.json", addr);
@@ -314,19 +335,118 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            payload["error"]["status"],
-            serde_json::Value::String("FAILED_PRECONDITION".to_string())
+            payload["task"]["status"]["state"],
+            serde_json::Value::String("TASK_STATE_WORKING".to_string())
         );
-        assert!(payload["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Phase 2")));
 
         let params = observer.last().expect("handler should capture params");
         assert_eq!(params.get("x-rakka-phase"), Some(&vec!["0".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn rest_send_message_is_durable_and_deduplicated() {
+        let state = test_state();
+        let app = router(state);
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "dedupe-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": {
+                "returnImmediately": true
+            },
+            "tenant": "tenant-a"
+        });
+
+        let first = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
+        assert_eq!(first["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
+        let task_id = first["task"]["id"].as_str().expect("task id").to_string();
+
+        let retry = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
+        assert_eq!(retry["task"]["id"], task_id);
+
+        let list = app
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/tasks")
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let bytes = list.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["tasks"].as_array().expect("tasks").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rest_cancel_accepts_durable_command_and_updates_run_state() {
+        use rakka::agent_workflow::{AgentRunId, AgentRunStatus, AgentStepRunner};
+
+        let state = test_state();
+        let run_store = state.run_store.clone();
+        let workflow = state.workflow.clone();
+        let app = router(state);
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "cancel-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "cancel me"}]
+            },
+            "configuration": {
+                "returnImmediately": true
+            },
+            "tenant": "tenant-a"
+        });
+        let sent = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
+        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+        let cancel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/a2a/tasks/{task_id}:cancel"))
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::OK);
+        let bytes = cancel.into_body().collect().await.unwrap().to_bytes();
+        let canceled: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let mut runner =
+            AgentStepRunner::new(workflow, AgentRunId::new(task_id.clone()), run_store);
+        let state = runner.recover().await.unwrap().expect("run state");
+        assert_eq!(state.status, AgentRunStatus::Cancelling);
+
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/a2a/tasks/{task_id}:cancel"))
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let bytes = retry.into_body().collect().await.unwrap().to_bytes();
+        let retry: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            retry["metadata"]["io.rakka.projection.revision"],
+            canceled["metadata"]["io.rakka.projection.revision"]
+        );
     }
 
     #[tokio::test]
@@ -388,7 +508,32 @@ mod tests {
             }),
             workflow: demo_workflow(),
             task_store: InMemoryA2ATaskProjectionStore::local(),
+            run_store: RunStore::new(),
+            workflow_store: WorkflowStore::new(),
             header_observer: HeaderObserver::default(),
         }
+    }
+
+    async fn post_json(
+        app: Router,
+        uri: &str,
+        body: &serde_json::Value,
+        tenant: &str,
+    ) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-rakka-tenant", tenant)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
     }
 }

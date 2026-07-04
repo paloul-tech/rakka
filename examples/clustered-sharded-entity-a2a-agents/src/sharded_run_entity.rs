@@ -1,7 +1,7 @@
 //! Sharded agent-run registration.
 //!
-//! Phase 1 registers the entity type so the runtime shape is real, but the A2A
-//! request handler does not durably accept commands into these actors yet.
+//! Phase 2 registers the entity type so the runtime shape is real, while A2A
+//! requests are still accepted through the local durable handler.
 
 use rakka::agent_workflow::{
     init_agent_run_sharding, AgentRunEntityRegistration, AgentRunShardingSettings, AgentWorkflow,

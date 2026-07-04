@@ -1,7 +1,7 @@
 # Clustered Sharded Entity A2A Agents
 
-Phase 1 runnable skeleton for exposing durable Rakka agent runs through the A2A
-Rust SDK. This example is the incubator for a future `rakka-a2a` crate; no
+Phase 2 runnable example for exposing durable local Rakka agent runs through the
+A2A Rust SDK. This example is the incubator for a future `rakka-a2a` crate; no
 reusable public Rakka A2A API is introduced here.
 
 ## SDK Choice
@@ -44,31 +44,33 @@ Set `RAKKA_A2A_PUBLIC_URL=https://example.com/agents/demo` when the agent card
 should advertise a load-balanced public URL. Without it, developer mode
 advertises the local HTTP address.
 
-## Phase 1 Boundary
+## Phase 2 Boundary
 
 Implemented:
 
 - A real `ActorSystem`, `ClusterNodeRuntime`, `ClusterSharding`, demo
   `AgentWorkflow`, and sharded agent-run entity registration.
 - Local file discovery for one or more developer-mode nodes.
-- In-memory stores for local boot only.
+- Shared in-memory durable stores for local command acceptance, run state, and
+  task projection recovery.
 - A static A2A agent card with REST/HTTP+JSON and JSON-RPC interfaces.
 - A2A REST and JSON-RPC routers mounted beside Rakka health/cluster routes.
 - A2A identity and `io.rakka.*` metadata normalization into Rakka command
   drafts.
 - A2A message/part conversion into bounded inline payloads or artifact
   references.
-- `AgentCommand` construction for start, submit-signal, and cancellation
-  drafts without requiring a live actor or cluster.
+- Durable `AgentRunInbox` acceptance for `message:send` and `cancel_task`.
+- Idempotent duplicate handling for repeated A2A `messageId`/deduplication keys.
+- Local `AgentRunState` creation for new tasks and cancellation requests for
+  active tasks.
 - A task projection model, public task-event model, replay cursors, and a local
   in-memory task projection store.
-- Projection-backed `get_task` and `list_tasks`; command paths still validate
-  then return protocol-shaped unsupported-operation errors.
+- Projection-backed `send_message`, `get_task`, `list_tasks`, and `cancel_task`.
 
-Not implemented in Phase 1:
+Not implemented in Phase 2:
 
-- Durable A2A command acceptance.
-- Streaming, push notification delivery, cancellation, or peer A2A calls.
+- Cluster-routed A2A command delivery to remote shard owners.
+- Streaming, push notification delivery, terminal execution, or peer A2A calls.
 - A reusable `rakka-a2a` crate or top-level `rakka` facade feature.
 
 ## Future Extraction Map
