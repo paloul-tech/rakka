@@ -22,7 +22,7 @@ use crate::a2a_mapping::{
     build_cancel_task_command_draft, build_send_message_command_draft, canonical_read_tenant,
     now_agent_timestamp, A2AMappingError, A2APayloadPolicy,
 };
-use crate::task_projection::{empty_list, InMemoryA2ATaskProjectionStore, TaskProjectionError};
+use crate::task_projection::{InMemoryA2ATaskProjectionStore, TaskProjectionError};
 
 const PHASE1_UNIMPLEMENTED: &str =
     "A2A durable request handling is intentionally not implemented until Phase 2";
@@ -139,11 +139,7 @@ impl RequestHandler for Phase1A2AHandler {
         self.record(params);
         let tenant = canonical_read_tenant(params, req.tenant.as_deref()).map_err(mapping_error)?;
         let req = ListTasksRequest { tenant, ..req };
-        match self.task_store.list(&req) {
-            Ok(response) => Ok(response),
-            Err(TaskProjectionError::TaskNotFound { .. }) => Ok(empty_list(req.page_size)),
-            Err(error) => Err(projection_error(error)),
-        }
+        self.task_store.list(&req).map_err(projection_error)
     }
 
     async fn cancel_task(

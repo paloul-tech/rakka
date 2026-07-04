@@ -18,6 +18,8 @@ use rakka::agent_workflow::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::a2a_mapping::DEFAULT_TENANT;
+
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 100;
 const DEFAULT_HISTORY_LIMIT: usize = 20;
@@ -135,7 +137,7 @@ impl A2ATaskProjection {
                 .tenant
                 .as_ref()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| "public".to_string()),
+                .unwrap_or_else(|| DEFAULT_TENANT.to_string()),
             workflow_id: run_state.workflow_id.as_str().to_string(),
             status: task_state_from_run_status(run_state.status),
             status_timestamp: run_state.updated_at,
@@ -646,17 +648,6 @@ pub fn a2a_artifact_from_ref(reference: &ArtifactRef) -> Artifact {
         )],
         metadata: Some(metadata),
         extensions: None,
-    }
-}
-
-/// Converts an A2A list request into an empty response.
-#[must_use]
-pub fn empty_list(page_size: Option<i32>) -> ListTasksResponse {
-    ListTasksResponse {
-        tasks: Vec::new(),
-        next_page_token: String::new(),
-        page_size: page_size.unwrap_or(0),
-        total_size: 0,
     }
 }
 

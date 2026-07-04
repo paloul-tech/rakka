@@ -14,9 +14,9 @@ use rakka::agent_workflow::{
     extract_agent_trace_context, parse_agent_trace_context, validate_command, AgentAttributes,
     AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentFacadeError,
-    AgentRunId, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflow,
-    AgentWorkflowId, ArtifactKind, ArtifactRef, InlineState, PrincipalRef, RedactionStatus,
-    TRACEPARENT_HEADER, TRACESTATE_HEADER,
+    AgentRunId, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis,
+    AgentTriggerCommandBuilder, AgentTriggerSource, AgentWorkflow, AgentWorkflowId, ArtifactKind,
+    ArtifactRef, InlineState, PrincipalRef, RedactionStatus, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -518,7 +518,30 @@ fn build_command_draft(
         metadata = metadata.principal(principal);
     }
 
-    let mut command = AgentCommand::new(kind, metadata)?
+    // A2A commands enter through the application's API boundary, so they carry
+    // the crate's normalized trigger-source attributes like other trigger paths.
+    let trigger_source = AgentTriggerSource::api();
+    let builder = match kind {
+        AgentCommandKind::StartRun => {
+            AgentTriggerCommandBuilder::start_run(metadata, trigger_source)
+        }
+        AgentCommandKind::SubmitSignal { signal_type } => {
+            AgentTriggerCommandBuilder::submit_signal(metadata, trigger_source, signal_type)
+        }
+        AgentCommandKind::CancelRun => {
+            AgentTriggerCommandBuilder::cancel_run(metadata, trigger_source)
+        }
+        other => {
+            return Err(A2AMappingError::CommandValidation {
+                message: format!("A2A mapping cannot produce command kind {other:?}"),
+            })
+        }
+    };
+    let mut command = builder
+        .build()
+        .map_err(|error| A2AMappingError::CommandValidation {
+            message: error.to_string(),
+        })?
         .attribute("workflow_type", normalized.workflow_type.clone())?
         .attribute("definition_version", normalized.definition_version.clone())?
         .attribute("a2a_role", role_label)?
@@ -966,7 +989,9 @@ pub fn now_agent_timestamp() -> AgentTimestampMillis {
 mod tests {
     use super::*;
     use a2a::{Part, Role};
-    use rakka::agent_workflow::is_forbidden_agent_metric_attribute;
+    use rakka::agent_workflow::{
+        is_forbidden_agent_metric_attribute, AGENT_TRIGGER_KIND_ATTRIBUTE,
+    };
     use serde_json::json;
 
     use crate::workflow::demo_workflow;
@@ -1106,6 +1131,14 @@ mod tests {
         assert!(matches!(draft.payload, A2ACommandPayload::Inline(_)));
         assert_eq!(draft.command.metadata.command_id.as_str(), "msg-fixture-1");
         assert_eq!(draft.command.metadata.tenant.as_str(), "tenant-fixture");
+        assert_eq!(
+            draft
+                .command
+                .attributes
+                .get(AGENT_TRIGGER_KIND_ATTRIBUTE)
+                .map(String::as_str),
+            Some("api")
+        );
     }
 
     #[test]
@@ -1292,6 +1325,14 @@ mod tests {
         .expect("draft");
         assert!(matches!(draft.command.kind, AgentCommandKind::CancelRun));
         assert_eq!(draft.command.metadata.run_id.as_str(), "task-10");
+        assert_eq!(
+            draft
+                .command
+                .attributes
+                .get(AGENT_TRIGGER_KIND_ATTRIBUTE)
+                .map(String::as_str),
+            Some("api")
+        );
     }
 
     #[test]

@@ -171,7 +171,9 @@ Acceptance:
 - `examples/clustered-sharded-entity-a2a-agents/src/a2a_mapping.rs` owns
   identity normalization, `io.rakka.*` metadata parsing, tenant-source
   selection, trace extraction, part conversion, and `AgentCommand` draft
-  construction.
+  construction. Command drafts are built through `AgentTriggerCommandBuilder`
+  with the `api` trigger source, so A2A commands carry the same normalized
+  trigger-source attributes as other trigger paths.
 - `examples/clustered-sharded-entity-a2a-agents/src/task_projection.rs` owns
   the A2A task projection, public task events, runtime-event projection mapping,
   replay cursors, and the local in-memory projection store.
