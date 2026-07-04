@@ -15,6 +15,8 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 
 ### Changed
 
+- Workspace MSRV is raised from Rust 1.80 to Rust 1.85, required by the published A2A SDK crates used by the Phase 0 clustered sharded A2A agents example.
+- The workspace `axum` dependency is upgraded from 0.7 to 0.8. `axum` types appear in the `rakka-http` public API, and axum 0.8 replaces the `/:param` route syntax with `/{param}` and changes websocket text/close payloads to `Utf8Bytes`.
 - Workspace crates now share release metadata and internal path dependencies include explicit versions for packaging.
 - CI separates required validation from optional PostgreSQL and local Kubernetes integration jobs.
 - Historical implementation plans now live under `docs/plans/` instead of the product-doc root.

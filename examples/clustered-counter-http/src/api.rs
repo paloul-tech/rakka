@@ -80,10 +80,10 @@ impl CounterHttp {
 
 pub fn counter_router(app: CounterHttp) -> rakka::http::Router {
     rakka::http::Router::new()
-        .route("/counters/:name", get(get_counter))
-        .route("/counters/:name/initiate", post(initiate_counter))
-        .route("/counters/:name/increase", post(increase_counter))
-        .route("/counters/:name/decrease", post(decrease_counter))
+        .route("/counters/{name}", get(get_counter))
+        .route("/counters/{name}/initiate", post(initiate_counter))
+        .route("/counters/{name}/increase", post(increase_counter))
+        .route("/counters/{name}/decrease", post(decrease_counter))
         .with_state(app)
 }
 

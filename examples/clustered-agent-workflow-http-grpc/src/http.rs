@@ -20,7 +20,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/cluster", get(cluster_view))
         .route("/workflows", post(submit_workflow))
-        .route("/workflows/:run_id", get(get_workflow))
+        .route("/workflows/{run_id}", get(get_workflow))
         .with_state(state)
 }
 

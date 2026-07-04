@@ -21,7 +21,9 @@ pub fn build_agent_card(config: &ExampleConfig) -> AgentCard {
         description: "A Phase 0 Rakka A2A skeleton with clustered sharded run hosting.".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         supported_interfaces: vec![
-            AgentInterface::new(base_url.clone(), TRANSPORT_PROTOCOL_HTTP_JSON),
+            // Interface URLs are the base the SDK's transport-relative paths
+            // are appended to, so both must include their server.rs nest prefix.
+            AgentInterface::new(format!("{base_url}/a2a"), TRANSPORT_PROTOCOL_HTTP_JSON),
             AgentInterface::new(format!("{base_url}/a2a/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC),
         ],
         capabilities: AgentCapabilities {

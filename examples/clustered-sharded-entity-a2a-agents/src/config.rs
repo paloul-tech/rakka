@@ -90,8 +90,12 @@ impl ExampleConfig {
     }
 
     /// Public base URL used by local developer-mode agent cards.
+    ///
+    /// Uses `advertise_host` rather than `bind_host` so a node bound to a
+    /// wildcard address (`RAKKA_BIND_HOST=0.0.0.0`) still advertises a
+    /// dialable per-node URL.
     pub fn local_public_url(&self) -> String {
-        format!("http://{}", self.http_bind_addr())
+        format!("http://{}:{}", self.advertise_host, self.http_port)
     }
 }
 

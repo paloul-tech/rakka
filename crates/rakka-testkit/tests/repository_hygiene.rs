@@ -52,12 +52,44 @@ fn ci_uses_repository_validation_entrypoints() {
     for expected in [
         "scripts/validate.sh",
         "scripts/package-check.sh",
-        "dtolnay/rust-toolchain@1.85.0",
+        "dtolnay/rust-toolchain@",
         "RAKKA_POSTGRES_TEST_DSN",
         "RAKKA_K8S_RUN_LOCAL_CLUSTER",
         "workflow_dispatch",
     ] {
         assert!(ci.contains(expected), "CI missing {expected}");
+    }
+}
+
+#[test]
+fn msrv_references_stay_in_sync_with_workspace_manifest() {
+    let manifest = read("Cargo.toml");
+    let msrv = manifest
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("rust-version = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .expect("workspace manifest should declare rust-version");
+
+    // Historical plan documents are point-in-time records and intentionally
+    // excluded; everything here describes the current toolchain requirement.
+    for (file, reference) in [
+        (
+            ".github/workflows/ci.yml",
+            format!("dtolnay/rust-toolchain@{msrv}.0"),
+        ),
+        ("AGENTS.md", format!("MSRV is Rust `{msrv}`")),
+        ("CLAUDE.md", format!("MSRV is Rust {msrv}")),
+        (
+            "docs/rakka-v1-release-packaging.md",
+            format!("on Rust `{msrv}.0`"),
+        ),
+    ] {
+        assert!(
+            read(file).contains(&reference),
+            "{file} should reference the workspace MSRV as {reference:?}"
+        );
     }
 }
 
@@ -252,7 +284,7 @@ fn release_docs_and_ignore_rules_are_present() {
     }
 
     let root_manifest = read("Cargo.toml");
-    assert!(root_manifest.contains("rust-version = \"1.85\""));
+    assert!(root_manifest.contains("rust-version = "));
     assert!(root_manifest.contains("description = "));
 
     let release_docs = read("docs/rakka-v1-release-packaging.md");
