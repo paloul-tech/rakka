@@ -19,8 +19,8 @@ use futures_util::stream::{self, BoxStream};
 use rakka::agent_workflow::AgentWorkflow;
 
 use crate::a2a_mapping::{
-    build_cancel_task_command_draft, build_send_message_command_draft, now_agent_timestamp,
-    A2AMappingError, A2APayloadPolicy,
+    build_cancel_task_command_draft, build_send_message_command_draft, canonical_read_tenant,
+    now_agent_timestamp, A2AMappingError, A2APayloadPolicy,
 };
 use crate::task_projection::{empty_list, InMemoryA2ATaskProjectionStore, TaskProjectionError};
 
@@ -125,8 +125,9 @@ impl RequestHandler for Phase1A2AHandler {
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
         self.record(params);
+        let tenant = canonical_read_tenant(params, req.tenant.as_deref()).map_err(mapping_error)?;
         self.task_store
-            .get(req.tenant.as_deref(), &req.id, req.history_length)
+            .get(tenant.as_deref(), &req.id, req.history_length)
             .map_err(projection_error)
     }
 
@@ -136,6 +137,8 @@ impl RequestHandler for Phase1A2AHandler {
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
         self.record(params);
+        let tenant = canonical_read_tenant(params, req.tenant.as_deref()).map_err(mapping_error)?;
+        let req = ListTasksRequest { tenant, ..req };
         match self.task_store.list(&req) {
             Ok(response) => Ok(response),
             Err(TaskProjectionError::TaskNotFound { .. }) => Ok(empty_list(req.page_size)),

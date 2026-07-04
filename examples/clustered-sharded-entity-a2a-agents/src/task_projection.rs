@@ -36,6 +36,11 @@ pub enum TaskProjectionError {
         /// Token supplied by the client.
         token: String,
     },
+    /// Replay cursor is malformed or refers to a different task.
+    InvalidReplayCursor {
+        /// Cursor supplied by the client.
+        cursor: String,
+    },
     /// Task was not found.
     TaskNotFound {
         /// Missing task id.
@@ -57,6 +62,7 @@ impl TaskProjectionError {
         match self {
             Self::TenantRequired => "tenant-required",
             Self::InvalidPageToken { .. } => "invalid-page-token",
+            Self::InvalidReplayCursor { .. } => "invalid-replay-cursor",
             Self::TaskNotFound { .. } => "task-not-found",
             Self::EventOrder { .. } => "event-order",
         }
@@ -68,6 +74,9 @@ impl Display for TaskProjectionError {
         match self {
             Self::TenantRequired => f.write_str("tenant filter is required"),
             Self::InvalidPageToken { token } => write!(f, "invalid page token `{token}`"),
+            Self::InvalidReplayCursor { cursor } => {
+                write!(f, "invalid replay cursor `{cursor}`")
+            }
             Self::TaskNotFound { task_id } => write!(f, "task not found: {task_id}"),
             Self::EventOrder { expected, actual } => {
                 write!(
@@ -115,9 +124,8 @@ impl A2ATaskProjection {
         artifact_refs: Vec<ArtifactRef>,
         projection_revision: u64,
     ) -> Self {
-        let artifacts = artifact_refs
+        let artifacts = bounded_tail(artifact_refs, DEFAULT_ARTIFACT_LIMIT)
             .iter()
-            .take(DEFAULT_ARTIFACT_LIMIT)
             .map(a2a_artifact_from_ref)
             .collect::<Vec<_>>();
         Self {
@@ -212,14 +220,7 @@ impl A2ATaskProjection {
         );
         match &event.payload {
             A2ATaskEventPayload::Snapshot(task) => {
-                let mut snapshot = task.clone();
-                snapshot.status_timestamp = event.occurred_at;
-                snapshot.projection_revision = event.sequence;
-                snapshot.metadata.insert(
-                    "io.rakka.projection.revision".to_string(),
-                    Value::Number(event.sequence.into()),
-                );
-                *self = snapshot;
+                *self = adopted_snapshot(task, event);
             }
             A2ATaskEventPayload::StatusUpdate { state } => {
                 self.status = state.clone();
@@ -400,21 +401,23 @@ impl InMemoryA2ATaskProjectionStore {
             );
     }
 
-    /// Appends a public event and updates the current projection when present.
+    /// Appends a public event, updating or bootstrapping the current projection.
+    ///
+    /// Events for unknown tasks are rejected unless they carry a snapshot, so
+    /// the replay log never records an event that no projection accepted.
     pub fn append_event(&self, event: A2ATaskEvent) -> TaskProjectionResult<()> {
         let mut state = self.inner.lock().expect("projection store mutex");
         let key = (event.tenant.clone(), event.task_id.clone());
         if let Some(projection) = state.projections.get_mut(&key) {
             projection.apply_event(&event)?;
-        } else if let A2ATaskEventPayload::Snapshot(projection) = &event.payload {
-            let mut snapshot = projection.clone();
-            snapshot.status_timestamp = event.occurred_at;
-            snapshot.projection_revision = event.sequence;
-            snapshot.metadata.insert(
-                "io.rakka.projection.revision".to_string(),
-                Value::Number(event.sequence.into()),
-            );
-            state.projections.insert(key.clone(), snapshot);
+        } else if let A2ATaskEventPayload::Snapshot(snapshot) = &event.payload {
+            state
+                .projections
+                .insert(key.clone(), adopted_snapshot(snapshot, &event));
+        } else {
+            return Err(TaskProjectionError::TaskNotFound {
+                task_id: event.task_id,
+            });
         }
         state.events.entry(key).or_default().push(event);
         Ok(())
@@ -509,17 +512,27 @@ impl InMemoryA2ATaskProjectionStore {
     }
 
     /// Replays public task events after an optional cursor.
+    ///
+    /// Cursors are only valid for the task that minted them; a cursor from a
+    /// different task is rejected instead of silently skipping events.
     pub fn replay_events(
         &self,
         tenant: &str,
         task_id: &str,
         after_cursor: Option<&str>,
     ) -> TaskProjectionResult<Vec<A2ATaskEvent>> {
-        let after_sequence = after_cursor
-            .map(parse_cursor)
-            .transpose()?
-            .map(|(_task_id, sequence)| sequence)
-            .unwrap_or(0);
+        let after_sequence = match after_cursor {
+            None => 0,
+            Some(cursor) => {
+                let (cursor_task_id, sequence) = parse_cursor(cursor)?;
+                if cursor_task_id != task_id {
+                    return Err(TaskProjectionError::InvalidReplayCursor {
+                        cursor: cursor.to_string(),
+                    });
+                }
+                sequence
+            }
+        };
         let state = self.inner.lock().expect("projection store mutex");
         Ok(state
             .events
@@ -722,16 +735,28 @@ fn page_offset(page_token: Option<&str>) -> TaskProjectionResult<usize> {
 
 fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
     let Some((task_id, sequence)) = cursor.rsplit_once(':') else {
-        return Err(TaskProjectionError::InvalidPageToken {
-            token: cursor.to_string(),
+        return Err(TaskProjectionError::InvalidReplayCursor {
+            cursor: cursor.to_string(),
         });
     };
-    let sequence = sequence
-        .parse::<u64>()
-        .map_err(|_| TaskProjectionError::InvalidPageToken {
-            token: cursor.to_string(),
-        })?;
+    let sequence =
+        sequence
+            .parse::<u64>()
+            .map_err(|_| TaskProjectionError::InvalidReplayCursor {
+                cursor: cursor.to_string(),
+            })?;
     Ok((task_id.to_string(), sequence))
+}
+
+fn adopted_snapshot(snapshot: &A2ATaskProjection, event: &A2ATaskEvent) -> A2ATaskProjection {
+    let mut adopted = snapshot.clone();
+    adopted.status_timestamp = event.occurred_at;
+    adopted.projection_revision = event.sequence;
+    adopted.metadata.insert(
+        "io.rakka.projection.revision".to_string(),
+        Value::Number(event.sequence.into()),
+    );
+    adopted
 }
 
 #[cfg(test)]
@@ -995,6 +1020,111 @@ mod tests {
             .replay_events("tenant-a", "task-1", None)
             .expect("replay")
             .is_empty());
+    }
+
+    #[test]
+    fn orphan_event_for_unknown_task_is_rejected_and_not_recorded() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        let event = A2ATaskEvent::new(
+            "tenant-a",
+            "task-unknown",
+            "ctx",
+            5,
+            AgentTimestampMillis::new(20),
+            A2ATaskEventPayload::StatusUpdate {
+                state: TaskState::Working,
+            },
+        );
+
+        let error = store.append_event(event).expect_err("orphan event");
+
+        assert_eq!(error.code(), "task-not-found");
+        assert!(store
+            .replay_events("tenant-a", "task-unknown", None)
+            .expect("replay")
+            .is_empty());
+    }
+
+    #[test]
+    fn snapshot_event_bootstraps_unknown_task() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        let snapshot = A2ATaskProjection::accepted(
+            "task-boot",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        );
+        let event = A2ATaskEvent::new(
+            "tenant-a",
+            "task-boot",
+            "ctx",
+            1,
+            AgentTimestampMillis::new(20),
+            A2ATaskEventPayload::Snapshot(snapshot),
+        );
+
+        store.append_event(event).expect("bootstrap snapshot");
+
+        let task = store.get(Some("tenant-a"), "task-boot", None).expect("get");
+        assert_eq!(task.id, "task-boot");
+        assert_eq!(
+            store
+                .replay_events("tenant-a", "task-boot", None)
+                .expect("replay")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn replay_cursor_from_another_task_is_rejected() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        let error = store
+            .replay_events("tenant-a", "task-1", Some("task-2:5"))
+            .expect_err("cursor task mismatch");
+        assert_eq!(error.code(), "invalid-replay-cursor");
+
+        let error = store
+            .replay_events("tenant-a", "task-1", Some("not-a-cursor"))
+            .expect_err("malformed cursor");
+        assert_eq!(error.code(), "invalid-replay-cursor");
+    }
+
+    #[test]
+    fn run_state_projection_keeps_newest_artifacts() {
+        let refs = (0..DEFAULT_ARTIFACT_LIMIT + 5)
+            .map(|index| ArtifactRef {
+                artifact_id: format!("artifact-{index}"),
+                kind: rakka::agent_workflow::ArtifactKind::Input,
+                uri: format!("s3://bucket/{index}"),
+                checksum: None,
+                content_type: Some("text/plain".to_string()),
+                byte_len: Some(1),
+                retention_class: Some("standard".to_string()),
+                encryption: None,
+                redaction: rakka::agent_workflow::RedactionStatus::ReferenceOnly,
+                created_at: AgentTimestampMillis::new(10),
+                metadata: AgentAttributes::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let projection = A2ATaskProjection::from_run_state(
+            &run_state(AgentRunStatus::Running),
+            "ctx",
+            Vec::new(),
+            refs,
+            1,
+        );
+
+        assert_eq!(projection.artifacts.len(), DEFAULT_ARTIFACT_LIMIT);
+        assert_eq!(projection.artifacts[0].artifact_id, "artifact-5");
+        assert_eq!(
+            projection.artifacts[DEFAULT_ARTIFACT_LIMIT - 1].artifact_id,
+            format!("artifact-{}", DEFAULT_ARTIFACT_LIMIT + 4)
+        );
     }
 
     #[test]

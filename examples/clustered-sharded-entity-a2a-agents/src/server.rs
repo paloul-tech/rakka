@@ -329,6 +329,49 @@ mod tests {
         assert_eq!(params.get("x-rakka-phase"), Some(&vec!["0".to_string()]));
     }
 
+    #[tokio::test]
+    async fn rest_reads_are_scoped_by_tenant_header() {
+        use crate::task_projection::A2ATaskProjection;
+        use rakka::agent_workflow::AgentTimestampMillis;
+
+        let state = test_state();
+        state.task_store.upsert(A2ATaskProjection::accepted(
+            "task-tenant-a",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        ));
+        let app = router(state);
+
+        let cross_tenant = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/tasks/task-tenant-a")
+                    .header("x-rakka-tenant", "tenant-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+
+        let same_tenant = app
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/tasks/task-tenant-a")
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_tenant.status(), StatusCode::OK);
+    }
+
     fn test_state() -> AppState {
         AppState {
             node_id: "test-node#uid".to_string(),

@@ -181,7 +181,14 @@ Acceptance:
   Phase 2 boundary.
 - `get_task` and `list_tasks` are projection-backed and do not enumerate live
   actors. Local mode uses the in-memory projection store; the module also
-  exposes tenant-scoped behavior that requires tenant filters.
+  exposes tenant-scoped behavior that requires tenant filters. Read paths
+  resolve their tenant scope through the same header-first precedence and
+  conflict policy as command paths.
+- Oversized message parts convert to artifact drafts that pair each reference
+  with its source content. Phase 2 must persist that content behind the
+  synthetic `a2a-message://` URIs (computing real checksums at that point)
+  before accepting the command durably; only the reference may reach durable
+  state.
 - Conversion fixtures live under
   `examples/clustered-sharded-entity-a2a-agents/tests/fixtures/`.
 

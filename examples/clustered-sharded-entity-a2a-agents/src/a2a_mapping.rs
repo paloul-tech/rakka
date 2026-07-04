@@ -284,21 +284,36 @@ impl Default for A2APayloadPolicy {
 pub enum A2ACommandPayload {
     /// The complete bounded message can be persisted inline by a later phase.
     Inline(InlineState),
-    /// Message parts are represented by artifact references.
-    ArtifactRefs(Vec<ArtifactRef>),
+    /// Message parts are represented by artifact drafts pairing each reference
+    /// with the source content that must be persisted behind it.
+    ArtifactDrafts(Vec<A2AArtifactDraft>),
     /// The message had no parts.
     Empty,
 }
 
 impl A2ACommandPayload {
-    /// Returns artifact references carried by this payload.
+    /// Returns artifact drafts carried by this payload.
     #[must_use]
-    pub fn artifact_refs(&self) -> &[ArtifactRef] {
+    pub fn artifact_drafts(&self) -> &[A2AArtifactDraft] {
         match self {
-            Self::ArtifactRefs(refs) => refs,
+            Self::ArtifactDrafts(drafts) => drafts,
             Self::Inline(_) | Self::Empty => &[],
         }
     }
+}
+
+/// Artifact reference plus the source content it stands for.
+///
+/// Only `reference` may reach durable state. A later phase must persist
+/// `content` behind `reference.uri` (computing a real checksum at that point)
+/// before durable inbox acceptance; `content` is `None` when the part already
+/// lives at an external URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AArtifactDraft {
+    /// Bounded, reference-only artifact metadata safe for durable state.
+    pub reference: ArtifactRef,
+    /// Source part content backing a synthetic `a2a-message://` uri.
+    pub content: Option<InlineState>,
 }
 
 /// Validated Rakka command plus its still-unpersisted Phase 1 payload draft.
@@ -437,10 +452,10 @@ fn normalize_message(
     let metadata_command_id = metadata_string(metadata, META_COMMAND_ID)?;
     if let Some(metadata_command_id) = &metadata_command_id {
         reject_conflict(
-            META_COMMAND_ID,
+            "message.message_id",
             &message.message_id,
             metadata_command_id,
-            "message.message_id",
+            META_COMMAND_ID,
         )?;
     }
     let command_id = AgentCommandId::new(message.message_id.clone());
@@ -515,7 +530,7 @@ fn build_command_draft(
                 "continue"
             },
         )?;
-    if !payload.artifact_refs().is_empty() {
+    if !payload.artifact_drafts().is_empty() {
         command = command.attribute("a2a_payload", "artifact-ref")?;
     }
     validate_command(&command)?;
@@ -587,40 +602,40 @@ fn convert_message_payload(
         });
     }
 
-    let refs = message
+    let drafts = message
         .parts
         .iter()
         .enumerate()
-        .map(|(index, part)| artifact_ref_for_part(normalized, part, index, received_at))
+        .map(|(index, part)| artifact_draft_for_part(normalized, part, index, received_at))
         .collect::<A2AMappingResult<Vec<_>>>()?;
-    Ok(A2ACommandPayload::ArtifactRefs(refs))
+    Ok(A2ACommandPayload::ArtifactDrafts(drafts))
 }
 
-fn artifact_ref_for_part(
+fn artifact_draft_for_part(
     normalized: &NormalizedA2ACommand,
     part: &Part,
     index: usize,
     created_at: AgentTimestampMillis,
-) -> A2AMappingResult<ArtifactRef> {
+) -> A2AMappingResult<A2AArtifactDraft> {
     let media_type = part
         .media_type
         .clone()
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let (uri, byte_len, source_kind) = match &part.content {
+    let (uri, content_bytes, source_kind) = match &part.content {
         PartContent::Text(text) => (
             format!("a2a-message://{}/part/{index}", normalized.task_id),
-            Some(text.len() as u64),
+            Some(text.clone().into_bytes()),
             "text",
         ),
         PartContent::Raw(bytes) => (
             format!("a2a-message://{}/part/{index}/raw", normalized.task_id),
-            Some(bytes.len() as u64),
+            Some(bytes.clone()),
             "raw",
         ),
         PartContent::Url(url) => (url.clone(), None, "url"),
         PartContent::Data(value) => (
             format!("a2a-message://{}/part/{index}/data", normalized.task_id),
-            Some(value.to_string().len() as u64),
+            Some(value.to_string().into_bytes()),
             "data",
         ),
     };
@@ -638,18 +653,28 @@ fn artifact_ref_for_part(
         metadata.insert("filename".to_string(), bounded_value(filename));
     }
 
-    Ok(ArtifactRef {
-        artifact_id: format!("{}-part-{index}", normalized.command_id),
-        kind: ArtifactKind::Input,
-        uri,
-        checksum: Some("phase1-reference-only".to_string()),
-        content_type: Some(media_type),
-        byte_len,
-        retention_class: Some("standard".to_string()),
-        encryption: None,
-        redaction: RedactionStatus::ReferenceOnly,
-        created_at,
-        metadata,
+    let byte_len = content_bytes.as_ref().map(|bytes| bytes.len() as u64);
+    let content = content_bytes.map(|bytes| InlineState {
+        content_type: media_type.clone(),
+        size_bytes: bytes.len() as u64,
+        bytes,
+    });
+
+    Ok(A2AArtifactDraft {
+        reference: ArtifactRef {
+            artifact_id: format!("{}-part-{index}", normalized.command_id),
+            kind: ArtifactKind::Input,
+            uri,
+            checksum: None,
+            content_type: Some(media_type),
+            byte_len,
+            retention_class: Some("standard".to_string()),
+            encryption: None,
+            redaction: RedactionStatus::ReferenceOnly,
+            created_at,
+            metadata,
+        },
+        content,
     })
 }
 
@@ -711,21 +736,42 @@ fn canonical_tenant(
     params: &ServiceParams,
     request_tenant: Option<&str>,
 ) -> A2AMappingResult<(AgentTenantId, A2ATenantSource)> {
+    let (tenant, source) = resolved_tenant(params, request_tenant)?
+        .unwrap_or_else(|| (DEFAULT_TENANT.to_string(), A2ATenantSource::Default));
+    Ok((AgentTenantId::new(tenant), source))
+}
+
+/// Resolves the tenant scope shared by A2A read paths.
+///
+/// Reads use the command paths' header-first precedence and conflict
+/// rejection, but do not apply the local development default: with no tenant
+/// input the result is `None` and the projection store mode decides whether
+/// unscoped reads are permitted.
+pub fn canonical_read_tenant(
+    params: &ServiceParams,
+    request_tenant: Option<&str>,
+) -> A2AMappingResult<Option<String>> {
+    Ok(resolved_tenant(params, request_tenant)?.map(|(tenant, _)| tenant))
+}
+
+fn resolved_tenant(
+    params: &ServiceParams,
+    request_tenant: Option<&str>,
+) -> A2AMappingResult<Option<(String, A2ATenantSource)>> {
     let service_tenant = first_service_param(params, "x-rakka-tenant")
         .or_else(|| first_service_param(params, "x-tenant-id"));
     if let (Some(service), Some(request)) = (service_tenant.as_deref(), request_tenant) {
         reject_conflict("tenant", service, request, "request.tenant")?;
     }
 
-    let (tenant, source) = if let Some(tenant) = service_tenant {
-        (tenant, A2ATenantSource::ServiceParams)
-    } else if let Some(tenant) = request_tenant {
-        (tenant.to_string(), A2ATenantSource::Request)
-    } else {
-        (DEFAULT_TENANT.to_string(), A2ATenantSource::Default)
+    if let Some(tenant) = service_tenant {
+        return Ok(Some((tenant, A2ATenantSource::ServiceParams)));
+    }
+    let Some(tenant) = request_tenant else {
+        return Ok(None);
     };
-    require_non_blank(&tenant, "tenant")?;
-    Ok((AgentTenantId::new(tenant), source))
+    require_non_blank(tenant, "tenant")?;
+    Ok(Some((tenant.to_string(), A2ATenantSource::Request)))
 }
 
 fn telemetry_context(
@@ -739,12 +785,9 @@ fn telemetry_context(
     if let Some(tracestate) = first_service_param(params, TRACESTATE_HEADER) {
         carrier.insert(TRACESTATE_HEADER.to_string(), tracestate);
     }
-    if let Some(context) =
-        extract_agent_trace_context(&carrier).map_err(|_| A2AMappingError::InvalidMetadata {
-            field: TRACEPARENT_HEADER.to_string(),
-            reason: "invalid W3C trace context",
-        })?
-    {
+    // Per W3C trace-context guidance, an unparseable transport traceparent is
+    // treated as absent (the trace restarts) instead of failing the request.
+    if let Ok(Some(context)) = extract_agent_trace_context(&carrier) {
         return Ok(context);
     }
 
@@ -846,14 +889,15 @@ fn bounded_metadata_from_values(metadata: &HashMap<String, Value>) -> AgentAttri
 }
 
 fn bounded_value(value: &str) -> String {
-    let mut output = value
-        .chars()
-        .take(MAX_BOUNDED_METADATA_VALUE_BYTES)
-        .collect::<String>();
-    if output.len() < value.len() {
-        output.push_str("...");
+    const ELLIPSIS: &str = "...";
+    if value.len() <= MAX_BOUNDED_METADATA_VALUE_BYTES {
+        return value.to_string();
     }
-    output
+    let mut end = MAX_BOUNDED_METADATA_VALUE_BYTES - ELLIPSIS.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &value[..end])
 }
 
 fn first_service_param(params: &ServiceParams, key: &str) -> Option<String> {
@@ -1124,11 +1168,12 @@ mod tests {
             AgentTimestampMillis::new(10),
         )
         .expect("draft");
-        assert_eq!(draft.payload.artifact_refs().len(), 1);
+        assert_eq!(draft.payload.artifact_drafts().len(), 1);
         assert_eq!(
-            draft.payload.artifact_refs()[0].uri,
+            draft.payload.artifact_drafts()[0].reference.uri,
             "https://example.test/input.json"
         );
+        assert!(draft.payload.artifact_drafts()[0].content.is_none());
     }
 
     #[test]
@@ -1154,12 +1199,43 @@ mod tests {
         )
         .expect("draft");
 
-        let refs = draft.payload.artifact_refs();
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].artifact_id, "msg-multipart-part-0");
-        assert_eq!(refs[0].uri, "a2a-message://task-multipart/part/0");
-        assert_eq!(refs[1].artifact_id, "msg-multipart-part-1");
-        assert_eq!(refs[1].uri, "https://example.test/second.json");
+        let drafts = draft.payload.artifact_drafts();
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].reference.artifact_id, "msg-multipart-part-0");
+        assert_eq!(
+            drafts[0].reference.uri,
+            "a2a-message://task-multipart/part/0"
+        );
+        assert_eq!(drafts[1].reference.artifact_id, "msg-multipart-part-1");
+        assert_eq!(drafts[1].reference.uri, "https://example.test/second.json");
+    }
+
+    #[test]
+    fn oversized_part_content_is_retained_for_later_persistence() {
+        let mut message = Message::new(Role::User, vec![Part::text("keep these bytes")]);
+        message.message_id = "msg-content".to_string();
+        message.task_id = Some("task-content".to_string());
+        let draft = build_send_message_command_draft(
+            &params(),
+            &request(message),
+            &demo_workflow(),
+            A2APayloadPolicy {
+                inline_limit_bytes: 1,
+                allow_artifact_references: true,
+            },
+            AgentTimestampMillis::new(10),
+        )
+        .expect("draft");
+
+        let drafts = draft.payload.artifact_drafts();
+        assert_eq!(drafts.len(), 1);
+        let content = drafts[0].content.as_ref().expect("content");
+        assert_eq!(content.bytes, b"keep these bytes");
+        assert_eq!(
+            content.size_bytes,
+            drafts[0].reference.byte_len.expect("len")
+        );
+        assert_eq!(drafts[0].reference.checksum, None);
     }
 
     #[test]
@@ -1266,5 +1342,87 @@ mod tests {
         )
         .expect_err("conflict");
         assert_eq!(error.code(), "metadata-conflict");
+    }
+
+    #[test]
+    fn command_id_conflict_error_attributes_values_to_their_sources() {
+        let mut message = Message::new(Role::User, vec![Part::text("hello")]);
+        message.message_id = "msg-canonical".to_string();
+        message.metadata = Some(HashMap::from([(
+            META_COMMAND_ID.to_string(),
+            Value::String("different".to_string()),
+        )]));
+        let error = normalize_send_message_request(
+            &params(),
+            &request(message),
+            &demo_workflow(),
+            AgentTimestampMillis::new(10),
+        )
+        .expect_err("command id conflict");
+        let rendered = error.to_string();
+        assert!(rendered.contains("canonical `msg-canonical`"));
+        assert!(rendered.contains(&format!("{META_COMMAND_ID}=different")));
+    }
+
+    #[test]
+    fn read_tenant_uses_header_first_and_rejects_conflicts() {
+        let mut params = ServiceParams::new();
+        params.insert("x-rakka-tenant".to_string(), vec!["tenant-hdr".to_string()]);
+
+        assert_eq!(
+            canonical_read_tenant(&params, None).expect("header tenant"),
+            Some("tenant-hdr".to_string())
+        );
+        assert_eq!(
+            canonical_read_tenant(&ServiceParams::new(), Some("tenant-body")).expect("body"),
+            Some("tenant-body".to_string())
+        );
+        assert_eq!(
+            canonical_read_tenant(&ServiceParams::new(), None).expect("unscoped"),
+            None
+        );
+        let error = canonical_read_tenant(&params, Some("tenant-body")).expect_err("conflict");
+        assert_eq!(error.code(), "metadata-conflict");
+    }
+
+    #[test]
+    fn malformed_transport_traceparent_is_ignored_not_rejected() {
+        let params =
+            ServiceParams::from([(TRACEPARENT_HEADER.to_string(), vec!["00-bad".to_string()])]);
+        let mut message = Message::new(Role::User, vec![Part::text("hello")]);
+        message.message_id = "msg-bad-trace".to_string();
+        message.metadata = Some(HashMap::from([(
+            META_TRACEPARENT.to_string(),
+            Value::String("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string()),
+        )]));
+
+        let normalized = normalize_send_message_request(
+            &params,
+            &request(message),
+            &demo_workflow(),
+            AgentTimestampMillis::new(10),
+        )
+        .expect("malformed transport trace context must not fail the request");
+
+        assert_eq!(
+            normalized.telemetry_context.trace_parent.as_deref(),
+            Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+        );
+    }
+
+    #[test]
+    fn bounded_metadata_values_are_byte_bounded() {
+        let multibyte = "🦀".repeat(300);
+        let bounded = bounded_value(&multibyte);
+        assert!(bounded.len() <= MAX_BOUNDED_METADATA_VALUE_BYTES);
+        assert!(bounded.ends_with("..."));
+
+        let ascii = "a".repeat(300);
+        let bounded = bounded_value(&ascii);
+        assert!(bounded.len() <= MAX_BOUNDED_METADATA_VALUE_BYTES);
+        assert!(bounded.ends_with("..."));
+
+        let short = "unchanged";
+        assert_eq!(bounded_value(short), short);
     }
 }
