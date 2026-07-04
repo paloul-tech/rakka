@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Rakka is a Rust actor framework (Akka-inspired) shipped as a Cargo workspace. It provides typed local actors, durable state / event sourcing, cluster membership, Protobuf remoting, sharding, supervised child-process actors, durable workflow inbox/outbox reliability, bounded streams, HTTP/gRPC edge adapters, and Kubernetes operation. The repository is a v1 release-candidate foundation plus active work on `rakka-agent-workflow` (a durable execution kernel for compiled agent workflows).
 
-MSRV is Rust 1.80 (`rust-toolchain.toml` pins stable + clippy + rustfmt). gRPC crates/examples require `protoc` (`protobuf-compiler`) on the build host.
+MSRV is Rust 1.85 (`rust-toolchain.toml` pins stable + clippy + rustfmt). gRPC crates/examples require `protoc` (`protobuf-compiler`) on the build host.
 
 ## Essential Commands
 

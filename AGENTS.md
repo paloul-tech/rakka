@@ -4,7 +4,7 @@
 
 - Rakka is a Rust 2021 Cargo workspace for an Akka-inspired actor framework: typed actors, actor refs/paths, supervision, cluster membership, remoting, sharding, durable state/event sourcing, durable workflow inbox/outbox, bounded streams, process actors, HTTP/gRPC adapters, Kubernetes health/drain hooks, metrics, and operational snapshots. See `README.md`, `CLAUDE.md`, and `docs/rakka-actor-framework-spec.md`.
 - The repo is a v1 release-candidate foundation plus active `rakka-agent-workflow` work for durable agent/compiled-workflow execution. Agent workflow plans live under `docs/plans/agentic-workflow/` and `docs/plans/compiled_execution_with_graph_schdlr/`.
-- MSRV is Rust `1.80` from the workspace manifest; `rust-toolchain.toml` uses stable with `clippy` and `rustfmt`. gRPC/protobuf crates and examples require `protoc`.
+- MSRV is Rust `1.85` from the workspace manifest; `rust-toolchain.toml` uses stable with `clippy` and `rustfmt`. gRPC/protobuf crates and examples require `protoc`.
 - Main dependencies by surface: Tokio runtime, `prost`/`tonic` for Protobuf/gRPC, `axum` for HTTP, `tokio-postgres` for PostgreSQL adapters, `etcd-client` for etcd discovery, `serde`/`serde_json`, and `tracing`.
 - Application code should prefer the top-level `rakka` crate and `rakka::prelude`; component crates remain public for foundations, adapters, advanced wiring, and tests. See `docs/rakka-api-boundary-inventory.md` and `docs/rakka-v1-api-review.md`.
 

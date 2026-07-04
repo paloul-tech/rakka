@@ -52,7 +52,7 @@ fn ci_uses_repository_validation_entrypoints() {
     for expected in [
         "scripts/validate.sh",
         "scripts/package-check.sh",
-        "dtolnay/rust-toolchain@1.80.0",
+        "dtolnay/rust-toolchain@1.85.0",
         "RAKKA_POSTGRES_TEST_DSN",
         "RAKKA_K8S_RUN_LOCAL_CLUSTER",
         "workflow_dispatch",
@@ -252,7 +252,7 @@ fn release_docs_and_ignore_rules_are_present() {
     }
 
     let root_manifest = read("Cargo.toml");
-    assert!(root_manifest.contains("rust-version = \"1.80\""));
+    assert!(root_manifest.contains("rust-version = \"1.85\""));
     assert!(root_manifest.contains("description = "));
 
     let release_docs = read("docs/rakka-v1-release-packaging.md");

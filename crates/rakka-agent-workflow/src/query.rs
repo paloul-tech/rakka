@@ -1001,7 +1001,7 @@ fn run_matches_query(
         .is_some_and(|timestamp| {
             entry
                 .open_checkpoint_created_at
-                .map_or(true, |created_at| created_at > timestamp)
+                .is_none_or(|created_at| created_at > timestamp)
         })
     {
         return false;
@@ -1020,7 +1020,7 @@ fn run_matches_query(
             entry
                 .shard_ownership
                 .as_ref()
-                .map_or(true, |ownership| &ownership.owner_node_id != owner_node_id)
+                .is_none_or(|ownership| &ownership.owner_node_id != owner_node_id)
         })
     {
         return false;
@@ -1029,7 +1029,7 @@ fn run_matches_query(
         entry
             .shard_ownership
             .as_ref()
-            .map_or(true, |ownership| &ownership.shard_id != shard_id)
+            .is_none_or(|ownership| &ownership.shard_id != shard_id)
     }) {
         return false;
     }
@@ -1040,7 +1040,7 @@ fn run_matches_query(
             entry
                 .graph
                 .as_ref()
-                .map_or(true, |graph| &graph.plan_fingerprint != fingerprint)
+                .is_none_or(|graph| &graph.plan_fingerprint != fingerprint)
         })
     {
         return false;
