@@ -79,12 +79,17 @@ impl CounterHttp {
 }
 
 pub fn counter_router(app: CounterHttp) -> rakka::http::Router {
+    counter_routes().with_state(app)
+}
+
+// Kept state-free so tests can construct the route table without booting the
+// cluster; axum validates path syntax inside `route()`.
+fn counter_routes() -> rakka::http::Router<CounterHttp> {
     rakka::http::Router::new()
         .route("/counters/{name}", get(get_counter))
         .route("/counters/{name}/initiate", post(initiate_counter))
         .route("/counters/{name}/increase", post(increase_counter))
         .route("/counters/{name}/decrease", post(decrease_counter))
-        .with_state(app)
 }
 
 async fn get_counter(
@@ -234,5 +239,18 @@ fn remote_ask_http_error(error: RemoteEntityAskError) -> HttpError {
             },
             other => HttpError::service(other.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counter_routes;
+
+    /// Route paths must satisfy the axum syntax rules (`{param}` captures);
+    /// axum only enforces them at router construction, so build the table in
+    /// CI instead of discovering a panic at example startup.
+    #[test]
+    fn counter_routes_construct_under_current_axum() {
+        let _ = counter_routes();
     }
 }
