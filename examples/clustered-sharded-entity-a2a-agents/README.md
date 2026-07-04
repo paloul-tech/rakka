@@ -1,6 +1,6 @@
 # Clustered Sharded Entity A2A Agents
 
-Phase 0 runnable skeleton for exposing durable Rakka agent runs through the A2A
+Phase 1 runnable skeleton for exposing durable Rakka agent runs through the A2A
 Rust SDK. This example is the incubator for a future `rakka-a2a` crate; no
 reusable public Rakka A2A API is introduced here.
 
@@ -44,7 +44,7 @@ Set `RAKKA_A2A_PUBLIC_URL=https://example.com/agents/demo` when the agent card
 should advertise a load-balanced public URL. Without it, developer mode
 advertises the local HTTP address.
 
-## Phase 0 Boundary
+## Phase 1 Boundary
 
 Implemented:
 
@@ -54,13 +54,20 @@ Implemented:
 - In-memory stores for local boot only.
 - A static A2A agent card with REST/HTTP+JSON and JSON-RPC interfaces.
 - A2A REST and JSON-RPC routers mounted beside Rakka health/cluster routes.
-- A placeholder A2A `RequestHandler` that returns protocol-shaped
-  unsupported-operation errors for command paths.
+- A2A identity and `io.rakka.*` metadata normalization into Rakka command
+  drafts.
+- A2A message/part conversion into bounded inline payloads or artifact
+  references.
+- `AgentCommand` construction for start, submit-signal, and cancellation
+  drafts without requiring a live actor or cluster.
+- A task projection model, public task-event model, replay cursors, and a local
+  in-memory task projection store.
+- Projection-backed `get_task` and `list_tasks`; command paths still validate
+  then return protocol-shaped unsupported-operation errors.
 
-Not implemented in Phase 0:
+Not implemented in Phase 1:
 
 - Durable A2A command acceptance.
-- A2A task reads from durable projections.
 - Streaming, push notification delivery, cancellation, or peer A2A calls.
 - A reusable `rakka-a2a` crate or top-level `rakka` facade feature.
 
@@ -81,4 +88,4 @@ Example-owned pieces that should stay local:
 - Local environment configuration.
 - Local file discovery mode.
 - In-memory persistence mode.
-- Route/debug helpers used only to prove Phase 0 wiring.
+- Route/debug helpers used only to prove example wiring.

@@ -1,0 +1,15 @@
+{
+  "message": {
+    "messageId": "msg-fixture-conflict",
+    "role": "ROLE_USER",
+    "parts": [
+      {
+        "text": "this conflicts"
+      }
+    ],
+    "metadata": {
+      "io.rakka.command.id": "different-command-id"
+    }
+  },
+  "tenant": "tenant-fixture"
+}

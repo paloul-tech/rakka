@@ -1,8 +1,8 @@
-//! Placeholder A2A request handler.
+//! Phase 1 A2A request handler.
 //!
-//! The handler is intentionally protocol-shaped but non-mutating: every public
-//! A2A command returns a stable unsupported-operation error until later phases
-//! add durable inbox acceptance, task projection, streaming, and push handling.
+//! Public command paths validate and normalize into Rakka command drafts, but
+//! still return an unsupported-operation error until Phase 2 adds durable inbox
+//! acceptance. Read paths are backed by the Phase 1 task projection store.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,11 +16,16 @@ use a2a::{
 use a2a_server::{RequestHandler, ServiceParams};
 use async_trait::async_trait;
 use futures_util::stream::{self, BoxStream};
+use rakka::agent_workflow::AgentWorkflow;
 
-use crate::task_projection::Phase0TaskProjection;
+use crate::a2a_mapping::{
+    build_cancel_task_command_draft, build_send_message_command_draft, now_agent_timestamp,
+    A2AMappingError, A2APayloadPolicy,
+};
+use crate::task_projection::{empty_list, InMemoryA2ATaskProjectionStore, TaskProjectionError};
 
-const PHASE0_UNIMPLEMENTED: &str =
-    "A2A durable request handling is intentionally not implemented in Phase 0";
+const PHASE1_UNIMPLEMENTED: &str =
+    "A2A durable request handling is intentionally not implemented until Phase 2";
 
 /// Shared observer used by tests to prove headers reach `ServiceParams`.
 #[derive(Debug, Clone, Default)]
@@ -44,18 +49,27 @@ impl HeaderObserver {
     }
 }
 
-/// Phase 0 A2A handler implementation.
-pub struct Phase0A2AHandler {
+/// Phase 1 A2A handler implementation.
+pub struct Phase1A2AHandler {
     agent_card: AgentCard,
+    workflow: AgentWorkflow,
+    task_store: InMemoryA2ATaskProjectionStore,
     header_observer: HeaderObserver,
 }
 
-impl Phase0A2AHandler {
+impl Phase1A2AHandler {
     /// Creates a handler with a shared agent card and header observer.
     #[must_use]
-    pub fn new(agent_card: AgentCard, header_observer: HeaderObserver) -> Self {
+    pub fn new(
+        agent_card: AgentCard,
+        workflow: AgentWorkflow,
+        task_store: InMemoryA2ATaskProjectionStore,
+        header_observer: HeaderObserver,
+    ) -> Self {
         Self {
             agent_card,
+            workflow,
+            task_store,
             header_observer,
         }
     }
@@ -65,37 +79,55 @@ impl Phase0A2AHandler {
     }
 
     fn unsupported() -> A2AError {
-        A2AError::unsupported_operation(PHASE0_UNIMPLEMENTED)
+        A2AError::unsupported_operation(PHASE1_UNIMPLEMENTED)
     }
 }
 
 #[async_trait]
-impl RequestHandler for Phase0A2AHandler {
+impl RequestHandler for Phase1A2AHandler {
     async fn send_message(
         &self,
         params: &ServiceParams,
-        _req: SendMessageRequest,
+        req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
         self.record(params);
+        build_send_message_command_draft(
+            params,
+            &req,
+            &self.workflow,
+            A2APayloadPolicy::default(),
+            now_agent_timestamp(),
+        )
+        .map_err(mapping_error)?;
         Err(Self::unsupported())
     }
 
     async fn send_streaming_message(
         &self,
         params: &ServiceParams,
-        _req: SendMessageRequest,
+        req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
         self.record(params);
+        build_send_message_command_draft(
+            params,
+            &req,
+            &self.workflow,
+            A2APayloadPolicy::default(),
+            now_agent_timestamp(),
+        )
+        .map_err(mapping_error)?;
         Err(Self::unsupported())
     }
 
     async fn get_task(
         &self,
         params: &ServiceParams,
-        _req: GetTaskRequest,
+        req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
         self.record(params);
-        Err(Self::unsupported())
+        self.task_store
+            .get(req.tenant.as_deref(), &req.id, req.history_length)
+            .map_err(projection_error)
     }
 
     async fn list_tasks(
@@ -104,15 +136,21 @@ impl RequestHandler for Phase0A2AHandler {
         req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
         self.record(params);
-        Ok(Phase0TaskProjection::empty_list(req.page_size))
+        match self.task_store.list(&req) {
+            Ok(response) => Ok(response),
+            Err(TaskProjectionError::TaskNotFound { .. }) => Ok(empty_list(req.page_size)),
+            Err(error) => Err(projection_error(error)),
+        }
     }
 
     async fn cancel_task(
         &self,
         params: &ServiceParams,
-        _req: CancelTaskRequest,
+        req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
         self.record(params);
+        build_cancel_task_command_draft(params, &req, &self.workflow, now_agent_timestamp())
+            .map_err(mapping_error)?;
         Err(Self::unsupported())
     }
 
@@ -171,5 +209,16 @@ impl RequestHandler for Phase0A2AHandler {
             "extended agent card is not configured; use the public card for {}",
             self.agent_card.name
         )))
+    }
+}
+
+fn mapping_error(error: A2AMappingError) -> A2AError {
+    A2AError::invalid_params(format!("{}: {error}", error.code()))
+}
+
+fn projection_error(error: TaskProjectionError) -> A2AError {
+    match error {
+        TaskProjectionError::TaskNotFound { task_id } => A2AError::task_not_found(&task_id),
+        error => A2AError::invalid_params(format!("{}: {error}", error.code())),
     }
 }
