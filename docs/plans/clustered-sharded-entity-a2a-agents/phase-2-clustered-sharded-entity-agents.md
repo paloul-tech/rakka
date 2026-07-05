@@ -13,7 +13,7 @@ acknowledged only after durable inbox acceptance succeeds.
 
 ### Slice 2.1: Handler State And Error Model
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -34,7 +34,7 @@ Acceptance:
 
 ### Slice 2.2: `send_message` Durable Acceptance
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -58,7 +58,7 @@ Acceptance:
 
 ### Slice 2.3: `get_task` From Durable Projection
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -78,7 +78,7 @@ Acceptance:
 
 ### Slice 2.4: `list_tasks` From Durable Projection
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -97,7 +97,7 @@ Acceptance:
 
 ### Slice 2.5: `cancel_task` Durable Command
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -117,7 +117,7 @@ Acceptance:
 
 ### Slice 2.6: Projection Writes And Runtime Events
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -136,7 +136,7 @@ Acceptance:
 
 ### Slice 2.7: A2A CLI Smoke Tests
 
-Status: planned
+Status: implemented
 
 Work:
 
