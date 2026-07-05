@@ -81,7 +81,7 @@ Application code should depend on `rakka` and import from `rakka::prelude`; comp
 
 Core actor, remote, and sharded message delivery is **at-most-once**. Any stronger guarantee (dedup, retry, exactly-once *intent*) must be built from durable state + durable inbox acceptance + durable outbox effects + idempotency keys + recovery — this is what `rakka-workflow` provides and `rakka-agent-workflow` builds on. Do not assume delivery reliability that the layer below does not promise. See `docs/rakka-v1-reliability-boundaries.md`.
 
-### `rakka-agent-workflow` (active development)
+### `rakka-agent-workflow`
 
 This crate is the durable execution kernel for **compiled workflow execution plans with a deterministic graph scheduler** (active branch work; spec/plan in `docs/plans/compiled_execution_with_graph_schdlr/`). Key boundary, which must be preserved:
 

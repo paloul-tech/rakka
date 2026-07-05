@@ -82,3 +82,4 @@
 - Keep examples unpublished (`publish = false`) and keep generated contract code out of the repository.
 - Confirm no secrets, unbounded labels, raw high-cardinality ids, or resolved credential values were added to state, logs, metrics, snapshots, indexes, or tests.
 - Leave the repo with clear validation results and no accidental publishing, registry upload, or unrelated file churn.
+- When working off of a plan document, always mark the plan or slice as implemented when complete.
