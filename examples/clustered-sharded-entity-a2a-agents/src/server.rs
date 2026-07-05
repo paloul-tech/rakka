@@ -440,7 +440,10 @@ mod tests {
         let state = runner.recover().await.unwrap().expect("run state");
         assert_eq!(state.status, AgentRunStatus::Cancelled);
 
+        // A repeat cancel of the now-terminal task gets the protocol's
+        // canonical TaskNotCancelable rejection instead of a silent 200.
         let retry = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -451,11 +454,26 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(retry.status(), StatusCode::OK);
-        let bytes = retry.into_body().collect().await.unwrap().to_bytes();
-        let retry: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
+
+        // The rejection changed nothing: the task still reads terminal at
+        // the same projection revision.
+        let read_back = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/a2a/tasks/{task_id}"))
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_back.status(), StatusCode::OK);
+        let bytes = read_back.into_body().collect().await.unwrap().to_bytes();
+        let read_back: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read_back["status"]["state"], "TASK_STATE_CANCELED");
         assert_eq!(
-            retry["metadata"]["io.rakka.projection.revision"],
+            read_back["metadata"]["io.rakka.projection.revision"],
             canceled["metadata"]["io.rakka.projection.revision"]
         );
     }

@@ -22,8 +22,8 @@ use rakka::agent_workflow::substrate::{
 };
 use rakka::agent_workflow::{
     AgentCommand, AgentCommandKind, AgentInboxAcceptance, AgentInboxError, AgentRunEngineError,
-    AgentRunId, AgentRunInbox, AgentRunState, AgentRunStatus, AgentStatePayload, AgentStepRunner,
-    AgentTimestampMillis, AgentWorkflow, ArtifactRef,
+    AgentRunId, AgentRunInbox, AgentRunState, AgentRunStatus, AgentRunTransition,
+    AgentStatePayload, AgentStepRunner, AgentTimestampMillis, AgentWorkflow, ArtifactRef,
 };
 use rakka::persistence::{DurableError, DurableStateStore};
 
@@ -34,13 +34,18 @@ use crate::a2a_mapping::{
 };
 use crate::durable_stores::{RunStore, WorkflowStore};
 use crate::task_projection::{
-    A2ATaskEventPayload, A2ATaskProjection, InMemoryA2ATaskProjectionStore, TaskProjectionError,
+    status_transition_allowed, A2ATaskEventPayload, A2ATaskProjection,
+    InMemoryA2ATaskProjectionStore, TaskProjectionError,
 };
 
 const STREAMING_UNIMPLEMENTED: &str =
     "A2A streaming is intentionally deferred until the streaming phase";
 const PUSH_UNIMPLEMENTED: &str =
     "A2A push notifications are intentionally deferred until the push phase";
+/// Bound on optimistic-concurrency re-drives for inbox accepts and run
+/// transitions; each attempt requires a distinct concurrent writer, so the
+/// bound is a livelock guard rather than a functional limit.
+const MAX_CONFLICT_ATTEMPTS: usize = 3;
 
 /// Shared observer used by tests to prove headers reach `ServiceParams`.
 #[derive(Debug, Clone, Default)]
@@ -82,6 +87,11 @@ pub enum RakkaA2AHandlerError {
         /// Missing public task id.
         task_id: String,
     },
+    /// The task is already in a terminal state and cannot be cancelled.
+    TaskNotCancelable {
+        /// Public task id.
+        task_id: String,
+    },
     /// The command kind is not valid for the normalized task lifecycle intent.
     InvalidLifecycle {
         /// Public task id.
@@ -102,6 +112,7 @@ impl RakkaA2AHandlerError {
             Self::RunEngine(error) => error.code(),
             Self::Persistence(error) => error.code(),
             Self::MissingRun { .. } => "task-not-found",
+            Self::TaskNotCancelable { .. } => "task-not-cancelable",
             Self::InvalidLifecycle { .. } => "invalid-command-lifecycle",
         }
     }
@@ -111,6 +122,7 @@ impl RakkaA2AHandlerError {
         match self {
             Self::Projection(TaskProjectionError::TaskNotFound { task_id })
             | Self::MissingRun { task_id } => A2AError::task_not_found(&task_id),
+            Self::TaskNotCancelable { task_id } => A2AError::task_not_cancelable(&task_id),
             Self::Mapping(error) => A2AError::invalid_params(format!("{code}: {error}")),
             Self::Projection(error) => A2AError::invalid_params(format!("{code}: {error}")),
             Self::InvalidLifecycle { reason, .. } => {
@@ -135,6 +147,9 @@ impl Display for RakkaA2AHandlerError {
             Self::RunEngine(error) => Display::fmt(error, f),
             Self::Persistence(error) => Display::fmt(error, f),
             Self::MissingRun { task_id } => write!(f, "task not found: {task_id}"),
+            Self::TaskNotCancelable { task_id } => {
+                write!(f, "task {task_id} is terminal and cannot be cancelled")
+            }
             Self::InvalidLifecycle { task_id, reason } => {
                 write!(f, "task {task_id} has invalid command lifecycle: {reason}")
             }
@@ -150,7 +165,9 @@ impl Error for RakkaA2AHandlerError {
             Self::Inbox(error) => Some(error),
             Self::RunEngine(error) => Some(error),
             Self::Persistence(error) => Some(error),
-            Self::MissingRun { .. } | Self::InvalidLifecycle { .. } => None,
+            Self::MissingRun { .. }
+            | Self::TaskNotCancelable { .. }
+            | Self::InvalidLifecycle { .. } => None,
         }
     }
 }
@@ -250,21 +267,7 @@ impl RakkaA2ARequestHandler {
             None => {
                 let (state, adopted) = self.start_run(&mut runner, &draft, received_at).await?;
                 if adopted {
-                    // A run appeared concurrently under this generated id. A
-                    // retry of the same message adopts a run identical to the
-                    // one this request would have created; anything else means
-                    // the hashed id collided with an unrelated task.
-                    if run_tenant(&state) != draft.normalized.tenant.as_str() {
-                        return Err(RakkaA2AHandlerError::MissingRun {
-                            task_id: draft.normalized.task_id.clone(),
-                        });
-                    }
-                    if state.state_payload != state_payload(&draft.payload) {
-                        return Err(RakkaA2AHandlerError::InvalidLifecycle {
-                            task_id: draft.normalized.task_id.clone(),
-                            reason: "generated task id collides with an existing task",
-                        });
-                    }
+                    validate_adopted_run(&state, &draft)?;
                 }
                 state
             }
@@ -305,28 +308,37 @@ impl RakkaA2ARequestHandler {
         let received_at = now_agent_timestamp();
         let draft = build_cancel_task_command_draft(params, &req, &self.workflow, received_at)?;
         let mut runner = self.recovered_runner(draft.normalized.run_id()).await?;
-        let mut run_state =
-            runner
-                .state()?
-                .cloned()
-                .ok_or_else(|| RakkaA2AHandlerError::MissingRun {
-                    task_id: draft.normalized.task_id.clone(),
-                })?;
+        let mut run_state = runner
+            .state()?
+            .cloned()
+            .ok_or_else(|| missing_run(&draft.normalized.task_id))?;
         // A run owned by another tenant must be indistinguishable from a
         // missing task, and must never be cancelled by this request.
         if run_tenant(&run_state) != draft.normalized.tenant.as_str() {
-            return Err(RakkaA2AHandlerError::MissingRun {
+            return Err(missing_run(&draft.normalized.task_id));
+        }
+        if run_is_terminal(run_state.status) {
+            // Converge the projection to the terminal truth before rejecting
+            // so a follow-up read observes the final state, then answer with
+            // the protocol's canonical error for terminal cancels.
+            self.sync_status_projection(
+                &run_state,
+                &draft.normalized.context_id,
+                received_at,
+                None,
+            )?;
+            return Err(RakkaA2AHandlerError::TaskNotCancelable {
                 task_id: draft.normalized.task_id.clone(),
             });
         }
-        if !run_is_terminal(run_state.status) {
-            self.accept_draft(&draft, true).await?;
-            // State-driven like the send path: whether this acceptance was
-            // fresh or a duplicate retry, drive the run through Cancelling to
-            // the durable terminal Cancelled state so a retry can complete a
-            // partially applied cancellation.
-            run_state = self.apply_cancellation(&mut runner, received_at).await?;
-        }
+        self.accept_draft(&draft, true).await?;
+        // State-driven like the send path: whether this acceptance was fresh
+        // or a duplicate retry, drive the run through Cancelling to the
+        // durable terminal Cancelled state so a retry can complete a
+        // partially applied cancellation.
+        run_state = self
+            .apply_cancellation(&mut runner, run_state, received_at)
+            .await?;
         self.sync_status_projection(&run_state, &draft.normalized.context_id, received_at, None)?;
         self.task_store
             .get(
@@ -433,21 +445,22 @@ impl RakkaA2ARequestHandler {
                 reason: "generated task id collides with an existing task",
             });
         }
-        match inbox.accept_command(draft.command.clone()).await {
-            Ok(acceptance) => Ok(acceptance),
-            // A concurrent request won the inbox write; re-recover and retry
-            // once — the retry dedupes against the winner's entry or accepts
-            // cleanly at the new revision, mirroring the run-store transitions.
-            Err(AgentInboxError::Workflow {
-                error: WorkflowError::RevisionConflict { .. },
-            }) => {
-                inbox.recover().await?;
-                inbox
-                    .accept_command(draft.command.clone())
-                    .await
-                    .map_err(Into::into)
+        // A concurrent request can win the inbox write; re-recover and retry
+        // a bounded number of times — each retry dedupes against the winner's
+        // entry or accepts cleanly at the new revision, mirroring the
+        // run-store transitions.
+        let mut attempts = 0;
+        loop {
+            match inbox.accept_command(draft.command.clone()).await {
+                Ok(acceptance) => return Ok(acceptance),
+                Err(AgentInboxError::Workflow {
+                    error: WorkflowError::RevisionConflict { .. },
+                }) if attempts + 1 < MAX_CONFLICT_ATTEMPTS => {
+                    attempts += 1;
+                    inbox.recover().await?;
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -481,62 +494,47 @@ impl RakkaA2ARequestHandler {
         now: AgentTimestampMillis,
     ) -> Result<AgentRunState, RakkaA2AHandlerError> {
         let begin_at = AgentTimestampMillis::new(now.as_millis().saturating_add(1));
-        match runner.begin_step(begin_at).await {
-            Ok(transition) => Ok(transition.state),
-            // A concurrent request advanced the run first; use its state.
-            Err(AgentRunEngineError::Persistence {
-                error: DurableError::RevisionConflict { .. },
-                ..
-            }) => refreshed_state(runner).await,
-            Err(error) => Err(error.into()),
-        }
+        let result = runner.begin_step(begin_at).await;
+        adopt_on_conflict(runner, result).await
     }
 
+    /// Drives the run to the durable terminal `Cancelled` state.
+    ///
+    /// Nothing is in flight in this phase, so a durably accepted cancellation
+    /// completes immediately: `Cancelling` is transient and the public task
+    /// state becomes the terminal `Canceled` instead of reading as `Working`
+    /// forever. This is phase-local lifecycle policy — once step execution
+    /// and in-flight effects exist, completion must move to the executor,
+    /// which has to drain outstanding work before calling `cancel`.
+    ///
+    /// The loop re-drives the cancellation when a concurrent transition (for
+    /// example a racing send's first `begin_step`) wins the revision race
+    /// mid-way; only `Accepted`, `Running`, `Cancelling`, and `Cancelled` are
+    /// reachable in this phase, so it converges within the bound.
     async fn apply_cancellation(
         &self,
         runner: &mut AgentStepRunner<RunStore>,
+        run_state: AgentRunState,
         now: AgentTimestampMillis,
     ) -> Result<AgentRunState, RakkaA2AHandlerError> {
-        let mut state =
-            runner
-                .state()?
-                .cloned()
-                .ok_or_else(|| RakkaA2AHandlerError::MissingRun {
-                    task_id: runner.run_id().as_str().to_string(),
-                })?;
-        if !run_is_terminal(state.status) && state.status != AgentRunStatus::Cancelling {
-            state = match runner
-                .request_cancellation(
-                    "a2a-cancel",
-                    Some("A2A client requested cancellation".to_string()),
-                    now,
-                )
-                .await
-            {
-                Ok(transition) => transition.state,
-                // A concurrent request already moved the run; use its state.
-                Err(AgentRunEngineError::Persistence {
-                    error: DurableError::RevisionConflict { .. },
-                    ..
-                }) => refreshed_state(runner).await?,
-                Err(error) => return Err(error.into()),
+        let mut state = run_state;
+        for _ in 0..MAX_CONFLICT_ATTEMPTS {
+            if run_is_terminal(state.status) {
+                return Ok(state);
+            }
+            let result = if state.status == AgentRunStatus::Cancelling {
+                let completed_at = AgentTimestampMillis::new(now.as_millis().saturating_add(1));
+                runner.cancel(completed_at).await
+            } else {
+                runner
+                    .request_cancellation(
+                        "a2a-cancel",
+                        Some("A2A client requested cancellation".to_string()),
+                        now,
+                    )
+                    .await
             };
-        }
-        if state.status == AgentRunStatus::Cancelling {
-            // Nothing is in flight in this phase, so a durably accepted
-            // cancellation completes immediately: `Cancelling` is transient
-            // and the public task state becomes the terminal `Canceled`
-            // instead of reading as `Working` forever.
-            let completed_at = AgentTimestampMillis::new(now.as_millis().saturating_add(1));
-            state = match runner.cancel(completed_at).await {
-                Ok(transition) => transition.state,
-                // A concurrent request completed the cancellation first.
-                Err(AgentRunEngineError::Persistence {
-                    error: DurableError::RevisionConflict { .. },
-                    ..
-                }) => refreshed_state(runner).await?,
-                Err(error) => return Err(error.into()),
-            };
+            state = adopt_on_conflict(runner, result).await?;
         }
         Ok(state)
     }
@@ -676,10 +674,10 @@ impl RakkaA2ARequestHandler {
         if current == state {
             return Ok(());
         }
-        // A stale run-state snapshot must not regress the public status:
-        // nothing legitimately steps back to `Submitted`, and a terminal
-        // public state is never overwritten by a non-terminal one.
-        if state == TaskState::Submitted || (current.is_terminal() && !state.is_terminal()) {
+        // The shared no-regression rule (also enforced inside apply_event)
+        // is checked here first so a disallowed transition — e.g. from a
+        // stale run-state snapshot — appends no event at all.
+        if !status_transition_allowed(&current, &state) {
             return Ok(());
         }
         let payload = if state.is_terminal() {
@@ -762,6 +760,53 @@ fn validate_send_lifecycle(
     }
 }
 
+/// Re-validates a run adopted from a concurrent winner on the start path.
+///
+/// A retry of the same message adopts a run identical to the one this request
+/// would have created; anything else means the hashed id collided with an
+/// unrelated task. On rejection the command accepted just before the start
+/// race remains in the adopted run's inbox — unreachable garbage that only a
+/// hash collision plus a concurrent create can produce.
+fn validate_adopted_run(
+    state: &AgentRunState,
+    draft: &A2ACommandDraft,
+) -> Result<(), RakkaA2AHandlerError> {
+    if run_tenant(state) != draft.normalized.tenant.as_str() {
+        return Err(missing_run(&draft.normalized.task_id));
+    }
+    if !same_state_payload(&state.state_payload, &state_payload(&draft.payload)) {
+        return Err(RakkaA2AHandlerError::InvalidLifecycle {
+            task_id: draft.normalized.task_id.clone(),
+            reason: "generated task id collides with an existing task",
+        });
+    }
+    Ok(())
+}
+
+/// Compares run payloads semantically rather than byte-for-byte.
+///
+/// Inline payloads hold a serialized A2A message whose map fields (`Message`
+/// and `Part` metadata) have no deterministic wire ordering, so identical
+/// messages can serialize to different bytes; deserialize and compare the
+/// messages instead, falling back to byte equality for non-message payloads.
+fn same_state_payload(existing: &AgentStatePayload, candidate: &AgentStatePayload) -> bool {
+    match (existing, candidate) {
+        (AgentStatePayload::Inline(existing), AgentStatePayload::Inline(candidate)) => {
+            if existing.content_type != candidate.content_type {
+                return false;
+            }
+            match (
+                serde_json::from_slice::<Message>(&existing.bytes),
+                serde_json::from_slice::<Message>(&candidate.bytes),
+            ) {
+                (Ok(existing), Ok(candidate)) => existing == candidate,
+                _ => existing.bytes == candidate.bytes,
+            }
+        }
+        (existing, candidate) => existing == candidate,
+    }
+}
+
 /// Returns true when the run's durable inbox already holds this command,
 /// using the inbox's own keyed lookups so the match cannot drift from the
 /// acceptance-time duplicate detection.
@@ -775,18 +820,36 @@ fn known_command(state: &WorkflowState, draft: &A2ACommandDraft) -> bool {
             .is_some()
 }
 
+/// Resolves a run transition, adopting the concurrent winner's state when the
+/// optimistic write lost a revision race.
+async fn adopt_on_conflict(
+    runner: &mut AgentStepRunner<RunStore>,
+    result: Result<AgentRunTransition, AgentRunEngineError>,
+) -> Result<AgentRunState, RakkaA2AHandlerError> {
+    match result {
+        Ok(transition) => Ok(transition.state),
+        Err(AgentRunEngineError::Persistence {
+            error: DurableError::RevisionConflict { .. },
+            ..
+        }) => refreshed_state(runner).await,
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Re-recovers the runner and returns the current durable run state.
 async fn refreshed_state(
     runner: &mut AgentStepRunner<RunStore>,
 ) -> Result<AgentRunState, RakkaA2AHandlerError> {
     runner.recover().await?;
-    let run_id = runner.run_id().clone();
-    runner
-        .state()?
-        .cloned()
-        .ok_or_else(|| RakkaA2AHandlerError::MissingRun {
-            task_id: run_id.as_str().to_string(),
-        })
+    let run_id = runner.run_id().as_str().to_string();
+    runner.state()?.cloned().ok_or_else(|| missing_run(&run_id))
+}
+
+/// Constructs the task-not-found error used for missing and foreign-tenant runs.
+fn missing_run(task_id: &str) -> RakkaA2AHandlerError {
+    RakkaA2AHandlerError::MissingRun {
+        task_id: task_id.to_string(),
+    }
 }
 
 #[async_trait]

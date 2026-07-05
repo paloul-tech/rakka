@@ -43,6 +43,13 @@ pub enum TaskProjectionError {
         /// Cursor supplied by the client.
         cursor: String,
     },
+    /// The requested replay window precedes the retained event log.
+    ReplayWindowExpired {
+        /// Task whose events were requested.
+        task_id: TaskId,
+        /// Earliest sequence still retained.
+        earliest_sequence: u64,
+    },
     /// Task was not found.
     TaskNotFound {
         /// Missing task id.
@@ -65,6 +72,7 @@ impl TaskProjectionError {
             Self::TenantRequired => "tenant-required",
             Self::InvalidPageToken { .. } => "invalid-page-token",
             Self::InvalidReplayCursor { .. } => "invalid-replay-cursor",
+            Self::ReplayWindowExpired { .. } => "replay-window-expired",
             Self::TaskNotFound { .. } => "task-not-found",
             Self::EventOrder { .. } => "event-order",
         }
@@ -78,6 +86,15 @@ impl Display for TaskProjectionError {
             Self::InvalidPageToken { token } => write!(f, "invalid page token `{token}`"),
             Self::InvalidReplayCursor { cursor } => {
                 write!(f, "invalid replay cursor `{cursor}`")
+            }
+            Self::ReplayWindowExpired {
+                task_id,
+                earliest_sequence,
+            } => {
+                write!(
+                    f,
+                    "replay window for task {task_id} starts at sequence {earliest_sequence}"
+                )
             }
             Self::TaskNotFound { task_id } => write!(f, "task not found: {task_id}"),
             Self::EventOrder { expected, actual } => {
@@ -224,21 +241,27 @@ impl A2ATaskProjection {
         );
         match &event.payload {
             A2ATaskEventPayload::Snapshot(task) => {
+                // The adopted snapshot inherits the clamped status time so a
+                // re-snapshot cannot move it backward either.
+                let status_timestamp = self.status_timestamp;
                 *self = adopted_snapshot(task, event);
+                self.status_timestamp = self.status_timestamp.max(status_timestamp);
             }
-            A2ATaskEventPayload::StatusUpdate { state } => {
-                self.status = state.clone();
+            A2ATaskEventPayload::StatusUpdate { state }
+            | A2ATaskEventPayload::Terminal { state } => {
+                // Enforced at this chokepoint so every writer inherits the
+                // no-regression rule, not just the request handler's sync.
+                if status_transition_allowed(&self.status, state) {
+                    self.status = state.clone();
+                }
             }
             A2ATaskEventPayload::ArtifactUpdate { artifact } => {
                 self.artifacts.push(artifact.clone());
-                self.artifacts = bounded_tail(self.artifacts.clone(), DEFAULT_ARTIFACT_LIMIT);
+                cap_front(&mut self.artifacts, DEFAULT_ARTIFACT_LIMIT);
             }
             A2ATaskEventPayload::MessageUpdate { message } => {
                 self.history.push(message.clone());
-                self.history = bounded_tail(self.history.clone(), DEFAULT_HISTORY_LIMIT);
-            }
-            A2ATaskEventPayload::Terminal { state } => {
-                self.status = state.clone();
+                cap_front(&mut self.history, DEFAULT_HISTORY_LIMIT);
             }
         }
         Ok(())
@@ -415,18 +438,7 @@ impl InMemoryA2ATaskProjectionStore {
             return Err(TaskProjectionError::TenantRequired);
         }
         let state = self.inner.lock().expect("projection store mutex");
-        let projection = match tenant {
-            // The map is keyed by (tenant, task id); a known tenant is a
-            // direct lookup rather than a scan of every task.
-            Some(tenant) => state
-                .projections
-                .get(&(tenant.to_string(), task_id.to_string())),
-            None => state
-                .projections
-                .values()
-                .find(|projection| projection.task_id == task_id),
-        };
-        projection
+        find_projection(&state, tenant, task_id)
             .cloned()
             .ok_or_else(|| TaskProjectionError::TaskNotFound {
                 task_id: task_id.to_string(),
@@ -475,17 +487,10 @@ impl InMemoryA2ATaskProjectionStore {
             return Err(TaskProjectionError::TenantRequired);
         }
         let state = self.inner.lock().expect("projection store mutex");
-        let projection = match tenant {
-            Some(tenant) => state
-                .projections
-                .get(&(tenant.to_string(), task_id.to_string())),
-            None => state
-                .projections
-                .values()
-                .find(|projection| projection.task_id == task_id),
-        };
-        let projection = projection.ok_or_else(|| TaskProjectionError::TaskNotFound {
-            task_id: task_id.to_string(),
+        let projection = find_projection(&state, tenant, task_id).ok_or_else(|| {
+            TaskProjectionError::TaskNotFound {
+                task_id: task_id.to_string(),
+            }
         })?;
         Ok(projection.to_task(history_length, true))
     }
@@ -526,7 +531,7 @@ impl InMemoryA2ATaskProjectionStore {
                         .is_some_and(|timestamp| timestamp > after)
                 })
             })
-            .cloned()
+            // References only: the non-page remainder is never materialized.
             .collect::<Vec<_>>();
         let total_size = i32::try_from(filtered.len()).unwrap_or(i32::MAX);
         let tasks = filtered
@@ -577,13 +582,24 @@ impl InMemoryA2ATaskProjectionStore {
             }
         };
         let state = self.inner.lock().expect("projection store mutex");
-        Ok(state
-            .events
-            .get(&(tenant.to_string(), task_id.to_string()))
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
+        let Some(events) = state.events.get(&(tenant.to_string(), task_id.to_string())) else {
+            return Ok(Vec::new());
+        };
+        // The retained log is bounded; a request that starts before the
+        // retained window would silently skip dropped events, so signal the
+        // truncation and let the caller re-bootstrap from the current task.
+        if let Some(first) = events.first() {
+            if first.sequence > after_sequence.saturating_add(1) {
+                return Err(TaskProjectionError::ReplayWindowExpired {
+                    task_id: task_id.to_string(),
+                    earliest_sequence: first.sequence,
+                });
+            }
+        }
+        Ok(events
+            .iter()
             .filter(|event| event.sequence > after_sequence)
+            .cloned()
             .collect())
     }
 }
@@ -731,11 +747,36 @@ fn timestamp_to_datetime(timestamp: AgentTimestampMillis) -> Option<DateTime<Utc
 }
 
 fn bounded_tail<T: Clone>(mut values: Vec<T>, limit: usize) -> Vec<T> {
-    if values.len() <= limit {
-        return values;
-    }
-    values.drain(0..values.len() - limit);
+    cap_front(&mut values, limit);
     values
+}
+
+/// Keeps the newest `limit` entries in place, dropping the oldest first.
+///
+/// The single definition of the drop-oldest rule shared by the projection
+/// history/artifact bounds and the replay event log.
+fn cap_front<T>(values: &mut Vec<T>, limit: usize) {
+    if values.len() > limit {
+        let excess = values.len() - limit;
+        values.drain(0..excess);
+    }
+}
+
+/// Returns true when the public task status may move from `current` to `next`.
+///
+/// The public status never regresses: `Submitted` is the floor once a task
+/// has progressed, and a terminal state is never overwritten by a
+/// non-terminal one. Shared by `apply_event` (so every writer inherits the
+/// rule) and the request handler's status sync (so no-op events are skipped
+/// before they are appended).
+pub(crate) fn status_transition_allowed(current: &TaskState, next: &TaskState) -> bool {
+    if next == current {
+        return true;
+    }
+    if *next == TaskState::Submitted && *current != TaskState::Submitted {
+        return false;
+    }
+    !current.is_terminal() || next.is_terminal()
 }
 
 fn history_limit(history_length: Option<i32>) -> usize {
@@ -783,6 +824,24 @@ fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
 /// Maximum retained replay events per task; older events are dropped first.
 const EVENT_LOG_LIMIT: usize = 256;
 
+/// Resolves one projection, keyed when the tenant is known and by scan for
+/// unscoped local-mode reads.
+fn find_projection<'a>(
+    state: &'a ProjectionStoreState,
+    tenant: Option<&str>,
+    task_id: &str,
+) -> Option<&'a A2ATaskProjection> {
+    match tenant {
+        Some(tenant) => state
+            .projections
+            .get(&(tenant.to_string(), task_id.to_string())),
+        None => state
+            .projections
+            .values()
+            .find(|projection| projection.task_id == task_id),
+    }
+}
+
 /// Applies one event under the store lock, bootstrapping only from snapshots.
 ///
 /// Events for unknown tasks are rejected unless they carry a snapshot, so the
@@ -807,10 +866,7 @@ fn apply_event_locked(
     }
     let events = state.events.entry(key).or_default();
     events.push(event);
-    if events.len() > EVENT_LOG_LIMIT {
-        let excess = events.len() - EVENT_LOG_LIMIT;
-        events.drain(0..excess);
-    }
+    cap_front(events, EVENT_LOG_LIMIT);
     Ok(())
 }
 
@@ -1147,9 +1203,24 @@ mod tests {
                 .expect("append message");
         }
 
-        let events = store
+        // Sequences run 1..=LIMIT+11; only the newest LIMIT survive, so the
+        // earliest retained sequence is 12.
+        let earliest_retained = 12;
+        let expired = store
             .replay_events("tenant-a", "task-log", None)
-            .expect("replay");
+            .expect_err("replay from before the retained window must fail");
+        assert!(matches!(
+            expired,
+            TaskProjectionError::ReplayWindowExpired {
+                earliest_sequence,
+                ..
+            } if earliest_sequence == earliest_retained
+        ));
+
+        let boundary_cursor = format!("task-log:{}", earliest_retained - 1);
+        let events = store
+            .replay_events("tenant-a", "task-log", Some(&boundary_cursor))
+            .expect("replay from the window boundary");
         assert_eq!(events.len(), EVENT_LOG_LIMIT);
     }
 
