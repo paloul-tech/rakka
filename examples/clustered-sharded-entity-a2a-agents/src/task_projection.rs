@@ -444,19 +444,7 @@ impl InMemoryA2ATaskProjectionStore {
             projection.projection_revision.saturating_add(1)
         });
         let event = A2ATaskEvent::new(tenant, task_id, context_id, sequence, occurred_at, payload);
-
-        if let Some(projection) = state.projections.get_mut(&key) {
-            projection.apply_event(&event)?;
-        } else if let A2ATaskEventPayload::Snapshot(snapshot) = &event.payload {
-            state
-                .projections
-                .insert(key.clone(), adopted_snapshot(snapshot, &event));
-        } else {
-            return Err(TaskProjectionError::TaskNotFound {
-                task_id: event.task_id,
-            });
-        }
-        state.events.entry(key).or_default().push(event.clone());
+        apply_event_locked(&mut state, event.clone())?;
         Ok(event)
     }
 
@@ -466,20 +454,7 @@ impl InMemoryA2ATaskProjectionStore {
     /// the replay log never records an event that no projection accepted.
     pub fn append_event(&self, event: A2ATaskEvent) -> TaskProjectionResult<()> {
         let mut state = self.inner.lock().expect("projection store mutex");
-        let key = (event.tenant.clone(), event.task_id.clone());
-        if let Some(projection) = state.projections.get_mut(&key) {
-            projection.apply_event(&event)?;
-        } else if let A2ATaskEventPayload::Snapshot(snapshot) = &event.payload {
-            state
-                .projections
-                .insert(key.clone(), adopted_snapshot(snapshot, &event));
-        } else {
-            return Err(TaskProjectionError::TaskNotFound {
-                task_id: event.task_id,
-            });
-        }
-        state.events.entry(key).or_default().push(event);
-        Ok(())
+        apply_event_locked(&mut state, event)
     }
 
     /// Reads one task projection.
@@ -794,6 +769,30 @@ fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
                 cursor: cursor.to_string(),
             })?;
     Ok((task_id.to_string(), sequence))
+}
+
+/// Applies one event under the store lock, bootstrapping only from snapshots.
+///
+/// Events for unknown tasks are rejected unless they carry a snapshot, so the
+/// replay log never records an event that no projection accepted.
+fn apply_event_locked(
+    state: &mut ProjectionStoreState,
+    event: A2ATaskEvent,
+) -> TaskProjectionResult<()> {
+    let key = (event.tenant.clone(), event.task_id.clone());
+    if let Some(projection) = state.projections.get_mut(&key) {
+        projection.apply_event(&event)?;
+    } else if let A2ATaskEventPayload::Snapshot(snapshot) = &event.payload {
+        state
+            .projections
+            .insert(key.clone(), adopted_snapshot(snapshot, &event));
+    } else {
+        return Err(TaskProjectionError::TaskNotFound {
+            task_id: event.task_id,
+        });
+    }
+    state.events.entry(key).or_default().push(event);
+    Ok(())
 }
 
 fn adopted_snapshot(snapshot: &A2ATaskProjection, event: &A2ATaskEvent) -> A2ATaskProjection {

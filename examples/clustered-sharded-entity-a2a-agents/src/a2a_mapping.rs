@@ -54,6 +54,9 @@ pub const META_TRACESTATE: &str = "io.rakka.trace.tracestate";
 pub const DEFAULT_TENANT: &str = "public";
 /// Default signal type for A2A continuation messages.
 pub const DEFAULT_SIGNAL_TYPE: &str = "a2a.message";
+/// Command attribute carrying the normalized A2A context id so projection
+/// recovery can rebuild tasks with the client's original context.
+pub const ATTR_CONTEXT_ID: &str = "a2a_context_id";
 const COMMAND_PAYLOAD_CONTENT_TYPE: &str = "application/vnd.rakka.a2a.message+json";
 const MAX_BOUNDED_METADATA_VALUE_BYTES: usize = 256;
 
@@ -554,7 +557,10 @@ fn build_command_draft(
             } else {
                 "continue"
             },
-        )?;
+        )?
+        // Persisted with the command in the durable inbox so projection
+        // recovery can restore the client's original context id.
+        .attribute(ATTR_CONTEXT_ID, normalized.context_id.clone())?;
     if !payload.artifact_drafts().is_empty() {
         command = command.attribute("a2a_payload", "artifact-ref")?;
     }
