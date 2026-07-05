@@ -33,7 +33,7 @@ pub const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_millis(25);
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded workflow type label used by the demo workflow.
-pub const WORKFLOW_TYPE: &str = "a2a-phase-1-demo";
+pub const WORKFLOW_TYPE: &str = "a2a-phase-2-demo";
 
 /// Bounded entity type name for sharded agent runs in this example.
 pub const ENTITY_TYPE: &str = "A2AAgentRun";

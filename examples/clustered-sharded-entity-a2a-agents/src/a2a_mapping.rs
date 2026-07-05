@@ -1,14 +1,13 @@
-//! A2A wire-to-Rakka workflow conversion boundary for Phase 1.
+//! A2A wire-to-Rakka workflow conversion boundary.
 //!
-//! This module intentionally builds command drafts only. Public A2A requests
-//! are not acknowledged as durable until later phases persist through the
-//! Rakka inbox boundary.
+//! This module normalizes public A2A identity and metadata before the request
+//! handler crosses the durable Rakka inbox boundary.
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use a2a::{new_task_id, CancelTaskRequest, Message, Part, PartContent, SendMessageRequest};
+use a2a::{CancelTaskRequest, Message, Part, PartContent, SendMessageRequest};
 use a2a_server::ServiceParams;
 use rakka::agent_workflow::{
     extract_agent_trace_context, parse_agent_trace_context, validate_command, AgentAttributes,
@@ -55,13 +54,16 @@ pub const META_TRACESTATE: &str = "io.rakka.trace.tracestate";
 pub const DEFAULT_TENANT: &str = "public";
 /// Default signal type for A2A continuation messages.
 pub const DEFAULT_SIGNAL_TYPE: &str = "a2a.message";
+/// Command attribute carrying the normalized A2A context id so projection
+/// recovery can rebuild tasks with the client's original context.
+pub const ATTR_CONTEXT_ID: &str = "a2a_context_id";
 const COMMAND_PAYLOAD_CONTENT_TYPE: &str = "application/vnd.rakka.a2a.message+json";
 const MAX_BOUNDED_METADATA_VALUE_BYTES: usize = 256;
 
-/// Shared result type for Phase 1 A2A mapping.
+/// Shared result type for A2A mapping.
 pub type A2AMappingResult<T> = Result<T, A2AMappingError>;
 
-/// Stable Phase 1 mapping failures.
+/// Stable A2A mapping failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A2AMappingError {
     /// A required field was absent or blank.
@@ -244,7 +246,7 @@ impl NormalizedA2ACommand {
     }
 }
 
-/// Payload policy used while building Phase 1 command drafts.
+/// Payload policy used while building command drafts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct A2APayloadPolicy {
     /// Maximum inline payload bytes.
@@ -254,7 +256,7 @@ pub struct A2APayloadPolicy {
 }
 
 impl A2APayloadPolicy {
-    /// Default Phase 1 policy.
+    /// Default local example policy.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -316,7 +318,7 @@ pub struct A2AArtifactDraft {
     pub content: Option<InlineState>,
 }
 
-/// Validated Rakka command plus its still-unpersisted Phase 1 payload draft.
+/// Validated Rakka command plus its payload placement draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct A2ACommandDraft {
     /// Normalized A2A metadata.
@@ -440,7 +442,10 @@ fn normalize_message(
                 field: "message.task_id",
             })
         }
-        None => (new_task_id(), A2ATaskIntent::NewTask),
+        None => (
+            generated_task_id(tenant.as_str(), &message.message_id),
+            A2ATaskIntent::NewTask,
+        ),
     };
     let context_id = message
         .context_id
@@ -552,7 +557,10 @@ fn build_command_draft(
             } else {
                 "continue"
             },
-        )?;
+        )?
+        // Persisted with the command in the durable inbox so projection
+        // recovery can restore the client's original context id.
+        .attribute(ATTR_CONTEXT_ID, normalized.context_id.clone())?;
     if !payload.artifact_drafts().is_empty() {
         command = command.attribute("a2a_payload", "artifact-ref")?;
     }
@@ -582,7 +590,7 @@ fn command_kind_for_message(
             reason: if other.is_empty() {
                 "command kind must not be empty"
             } else {
-                "unsupported command kind for Phase 1"
+                "unsupported command kind for this A2A adapter"
             },
         }),
         None if normalized.intent.is_new() => Ok(AgentCommandKind::StartRun),
@@ -935,6 +943,21 @@ fn derived_deduplication_key(tenant: &str, task_id: &str, command_id: &str) -> S
     format!("a2a:{tenant}:{task_id}:{command_id}")
 }
 
+fn generated_task_id(tenant: &str, message_id: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in tenant
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain([0xff])
+        .chain(message_id.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("task-{hash:016x}")
+}
+
 fn reject_conflict(
     field: impl Into<String>,
     canonical: &str,
@@ -1020,16 +1043,25 @@ mod tests {
     fn new_message_generates_canonical_run_id_and_default_command_id() {
         let mut message = Message::new(Role::User, vec![Part::text("hello")]);
         message.message_id = "msg-1".to_string();
+        let request = request(message.clone());
         let normalized = normalize_send_message_request(
             &params(),
-            &request(message),
+            &request,
             &demo_workflow(),
             AgentTimestampMillis::new(10),
         )
         .expect("normalize");
+        let retry = normalize_send_message_request(
+            &params(),
+            &request,
+            &demo_workflow(),
+            AgentTimestampMillis::new(11),
+        )
+        .expect("retry normalize");
 
         assert_eq!(normalized.intent, A2ATaskIntent::NewTask);
-        assert!(!normalized.task_id.is_empty());
+        assert_eq!(normalized.task_id, "task-fa4457a412484d2b");
+        assert_eq!(retry.task_id, normalized.task_id);
         assert_eq!(normalized.run_id().as_str(), normalized.task_id);
         assert_eq!(normalized.command_id.as_str(), "msg-1");
         assert_eq!(normalized.tenant.as_str(), "tenant-a");

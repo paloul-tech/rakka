@@ -9,7 +9,7 @@
       }
     ],
     "metadata": {
-      "io.rakka.workflow.type": "a2a-phase-1-demo",
+      "io.rakka.workflow.type": "a2a-phase-2-demo",
       "io.rakka.principal.ref": {
         "type": "user",
         "id": "fixture-user",
@@ -18,7 +18,7 @@
     }
   },
   "metadata": {
-    "io.rakka.workflow.id": "workflow-a2a-phase-1-demo",
+    "io.rakka.workflow.id": "workflow-a2a-phase-2-demo",
     "io.rakka.workflow.definition_version": "v1",
     "io.rakka.correlation_id": "ctx-fixture-1"
   },

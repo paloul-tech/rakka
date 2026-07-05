@@ -1,4 +1,4 @@
-//! File-based local discovery for Phase 1 developer mode.
+//! File-based local discovery for Phase 2 developer mode.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

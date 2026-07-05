@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! Phase 1 A2A agent example: clustered Rakka boot plus A2A conversion mapping.
+//! Phase 2 A2A agent example: clustered Rakka boot plus durable A2A handling.
 //!
 //! This example is intentionally an incubator, not a reusable `rakka-a2a`
-//! crate. Phase 1 adds command-draft conversion and task projection boundaries
-//! while durable A2A command acceptance remains unimplemented.
+//! crate. Phase 2 adds local durable A2A command acceptance and projection
+//! recovery while clustered A2A routing remains deferred.
 
 mod a2a_handler;
 mod a2a_mapping;

@@ -11,7 +11,7 @@ use crate::support::{
     DEFAULT_RAKKA_PORT,
 };
 
-/// Resolved configuration for one Phase 1 example process.
+/// Resolved configuration for one Phase 2 example process.
 #[derive(Debug, Clone)]
 pub struct ExampleConfig {
     /// Local bind host for HTTP and remoting.
