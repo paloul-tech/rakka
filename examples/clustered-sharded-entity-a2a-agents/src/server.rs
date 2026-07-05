@@ -10,7 +10,7 @@ use a2a_server::StaticAgentCard;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use rakka::cluster::MembershipConfig;
+use rakka::cluster::{MembershipConfig, SelfFenceConfig};
 use rakka::http::{serve_with_graceful_shutdown, HttpServerConfig};
 use rakka::prelude::{ActorSystem, ClusterSharding};
 use rakka::remote::TcpRemoteTransportConfig;
@@ -19,16 +19,18 @@ use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::a2a_handler::{HeaderObserver, RakkaA2ARequestHandler};
+use crate::a2a_handler::{A2ARunRouter, HeaderObserver, RakkaA2ARequestHandler};
 use crate::agent_card::build_agent_card;
 use crate::codec::serialization_registry;
-use crate::config::ExampleConfig;
+use crate::config::{DiscoveryProviderKind, ExampleConfig};
 use crate::discovery::{
     membership_snapshot, new_membership_view, run_file_discovery, seed_file_discovery,
     MembershipView,
 };
 use crate::durable_stores::build_stores;
-use crate::sharded_run_entity::init_demo_run_sharding;
+use crate::etcd_discovery::{connect, run_etcd_discovery};
+use crate::reachability::PeerReachability;
+use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
 use crate::support::{
     current_timestamp_millis, ExampleResult, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
     DEFAULT_RECONNECT_BACKOFF,
@@ -122,7 +124,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn readiness() -> Json<ReadinessResponse> {
     Json(ReadinessResponse {
         ready: true,
-        reason: "phase-2-durable-a2a-handler-ready",
+        reason: "phase-3-clustered-a2a-handler-ready",
     })
 }
 
@@ -165,41 +167,75 @@ async fn boot() -> ExampleResult<Booted> {
                 .reconnect_backoff(DEFAULT_RECONNECT_BACKOFF)
                 .idle_timeout(DEFAULT_IDLE_TIMEOUT),
         )
-        .with_registry(serialization_registry())
+        .with_registry(serialization_registry()?)
         .build()
         .await?;
 
+    let ask_client = runtime.ask_client();
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
-    let (run_store, workflow_store) = build_stores();
-    init_demo_run_sharding(
+    let key = a2a_run_entity_key()?;
+    let (run_store, workflow_store) = build_stores(&config);
+    let task_store = InMemoryA2ATaskProjectionStore::local();
+    init_a2a_run_sharding(
+        &system,
+        &mut runtime,
         &sharding,
-        workflow.clone(),
-        run_store.clone(),
-        workflow_store.clone(),
+        key.clone(),
+        A2ARunHost {
+            workflow: workflow.clone(),
+            run_store: run_store.clone(),
+            workflow_store: workflow_store.clone(),
+            task_store: task_store.clone(),
+        },
     )?;
 
     let membership = new_membership_view();
     let shutdown = Arc::new(Notify::new());
-    seed_file_discovery(&config, &local_node, &mut runtime, &membership)?;
+    let reachability = PeerReachability::new();
+    let etcd_handle = match config.discovery_provider {
+        DiscoveryProviderKind::File => {
+            seed_file_discovery(&config, &local_node, &mut runtime, &membership)?;
+            None
+        }
+        DiscoveryProviderKind::Etcd => {
+            Some(connect(&config, &local_node, &mut runtime, &membership).await?)
+        }
+    };
 
     let runtime = Arc::new(AsyncMutex::new(runtime));
-    let discovery_task = tokio::spawn(run_file_discovery(
-        runtime.clone(),
-        config.clone(),
-        local_node.clone(),
-        membership.clone(),
-        shutdown.clone(),
-    ));
+    let self_fence = config
+        .self_fence
+        .then(|| SelfFenceConfig::new(config.self_fence_after, config.self_fence_rejoin_after));
+    let discovery_task = match etcd_handle {
+        None => tokio::spawn(run_file_discovery(
+            runtime.clone(),
+            config.clone(),
+            local_node.clone(),
+            membership.clone(),
+            shutdown.clone(),
+        )),
+        Some(handle) => tokio::spawn(run_etcd_discovery(
+            handle.session,
+            handle.discovery,
+            runtime.clone(),
+            membership.clone(),
+            reachability.clone(),
+            self_fence,
+            shutdown.clone(),
+        )),
+    };
 
     let agent_card = build_agent_card(&config);
     let header_observer = HeaderObserver::default();
-    let handler = Arc::new(RakkaA2ARequestHandler::new(
+    let router = A2ARunRouter::new(sharding, key, ask_client, reachability);
+    let handler = Arc::new(RakkaA2ARequestHandler::new_clustered(
         agent_card.clone(),
         workflow,
-        InMemoryA2ATaskProjectionStore::local(),
+        task_store,
         run_store,
         workflow_store,
         header_observer.clone(),
+        router,
     ));
     handler.recover_task_projections().await?;
 
@@ -253,9 +289,17 @@ async fn shutdown_signal(stop: Arc<Notify>) {
 
 fn print_banner(booted: &Booted) {
     let addr = booted.config.http_bind_addr();
+    let discovery = match booted.config.discovery_provider {
+        DiscoveryProviderKind::File => "file",
+        DiscoveryProviderKind::Etcd => "etcd",
+    };
     println!(
-        "Rakka A2A Phase 2 node {} | remoting {} | HTTP/A2A {}",
+        "Rakka A2A Phase 3 node {} | remoting {} | HTTP/A2A {}",
         booted.config.node_logical_id, booted.config.rakka_port, addr,
+    );
+    println!(
+        "discovery: {discovery}; state dir: {}",
+        booted.config.state_dir.display()
     );
     println!("agent card: http://{}/.well-known/agent-card.json", addr);
     println!("REST base: http://{addr}/a2a");
@@ -265,7 +309,7 @@ fn print_banner(booted: &Booted) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_stores::{RunStore, WorkflowStore};
+    use crate::durable_stores::{build_in_memory_stores, RunStore, WorkflowStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -741,6 +785,121 @@ mod tests {
         assert_eq!(same_tenant.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn clustered_handler_routes_send_through_sharded_owner() {
+        use crate::codec::serialization_registry;
+        use crate::reachability::PeerReachability;
+        use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
+        use rakka::cluster::{
+            ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
+        };
+        use rakka::remote::TcpRemoteTransportConfig;
+        use rakka::sharding::ClusterNodeRuntime;
+
+        let agent_card = build_agent_card(&ExampleConfig {
+            bind_host: "127.0.0.1".parse().expect("loopback address"),
+            advertise_host: "127.0.0.1".to_string(),
+            rakka_port: 0,
+            http_port: 0,
+            node_logical_id: "clustered-test-node".to_string(),
+            node_incarnation: "test".to_string(),
+            discovery_provider: DiscoveryProviderKind::File,
+            discovery_dir: std::env::temp_dir(),
+            etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
+            etcd_prefix: crate::support::DEFAULT_ETCD_PREFIX.to_string(),
+            etcd_lease_ttl_seconds: crate::support::DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            state_dir: std::env::temp_dir(),
+            self_fence: false,
+            self_fence_after: Duration::from_secs(15),
+            self_fence_rejoin_after: Duration::from_secs(10),
+            public_url: None,
+        });
+        let workflow = demo_workflow();
+        let task_store = InMemoryA2ATaskProjectionStore::local();
+        let (run_store, workflow_store) = build_in_memory_stores();
+        let system = ActorSystem::new("clustered-a2a-handler-test");
+        let local_node = ClusterNode::new(
+            NodeId::new("clustered-test-node", "test"),
+            NodeAddress::new("127.0.0.1", 0),
+        );
+        let runtime = ClusterNodeRuntime::builder(local_node)
+            .with_membership_config(MembershipConfig::new(
+                1,
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+            ))
+            .with_transport_config(
+                TcpRemoteTransportConfig::new().bind_addr("127.0.0.1:0".parse().unwrap()),
+            )
+            .advertise_bound_addr(true)
+            .with_registry(serialization_registry().unwrap())
+            .build()
+            .await;
+        let Ok(mut runtime) = runtime else {
+            eprintln!("skipping clustered handler route test; loopback bind unavailable");
+            system.terminate().await.unwrap();
+            return;
+        };
+        let ask_client = runtime.ask_client();
+        let sharding = ClusterSharding::for_node_runtime(&system, &runtime).unwrap();
+        let key = a2a_run_entity_key().unwrap();
+        init_a2a_run_sharding(
+            &system,
+            &mut runtime,
+            &sharding,
+            key.clone(),
+            A2ARunHost {
+                workflow: workflow.clone(),
+                run_store: run_store.clone(),
+                workflow_store: workflow_store.clone(),
+                task_store: task_store.clone(),
+            },
+        )
+        .unwrap();
+        runtime
+            .apply_discovery(DiscoverySnapshot::new(
+                "clustered-handler-test",
+                1,
+                vec![runtime.local_node().clone()],
+            ))
+            .unwrap();
+        let route_helper = A2ARunRouter::new(sharding, key, ask_client, PeerReachability::new());
+        let handler = Arc::new(RakkaA2ARequestHandler::new_clustered(
+            agent_card.clone(),
+            workflow,
+            task_store,
+            run_store,
+            workflow_store,
+            HeaderObserver::default(),
+            route_helper,
+        ));
+        let app = router(AppState {
+            node_id: "clustered-test-node#test".to_string(),
+            membership: Arc::new(std::sync::Mutex::new(vec![
+                "clustered-test-node#test".to_string()
+            ])),
+            agent_card,
+            header_observer: HeaderObserver::default(),
+            handler,
+        });
+
+        let body = serde_json::json!({
+            "message": {
+                "messageId": "clustered-route-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello clustered owner"}]
+            },
+            "configuration": {
+                "returnImmediately": true
+            },
+            "tenant": "tenant-a"
+        });
+        let sent = post_json(app, "/a2a/message:send", &body, "tenant-a").await;
+        assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
+
+        system.terminate().await.unwrap();
+    }
+
     fn test_state() -> TestContext {
         let agent_card = build_agent_card(&ExampleConfig {
             bind_host: "127.0.0.1".parse().expect("loopback address"),
@@ -749,13 +908,20 @@ mod tests {
             http_port: crate::support::DEFAULT_RAKKA_PORT.saturating_add(10_000),
             node_logical_id: "test-node".to_string(),
             node_incarnation: "test".to_string(),
+            discovery_provider: DiscoveryProviderKind::File,
             discovery_dir: std::env::temp_dir(),
+            etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
+            etcd_prefix: crate::support::DEFAULT_ETCD_PREFIX.to_string(),
+            etcd_lease_ttl_seconds: crate::support::DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            state_dir: std::env::temp_dir(),
+            self_fence: false,
+            self_fence_after: Duration::from_secs(15),
+            self_fence_rejoin_after: Duration::from_secs(10),
             public_url: None,
         });
         let workflow = demo_workflow();
         let task_store = InMemoryA2ATaskProjectionStore::local();
-        let run_store = RunStore::new();
-        let workflow_store = WorkflowStore::new();
+        let (run_store, workflow_store) = build_in_memory_stores();
         let header_observer = HeaderObserver::default();
         let handler = Arc::new(RakkaA2ARequestHandler::new(
             agent_card.clone(),
@@ -798,8 +964,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "response body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         serde_json::from_slice(&bytes).unwrap()
     }
 }

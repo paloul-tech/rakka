@@ -1,4 +1,4 @@
-//! Durable A2A request handler for the local Phase 2 example.
+//! Durable A2A request handler for the clustered Phase 3 example.
 //!
 //! Public command paths acknowledge work only after `AgentRunInbox` accepts the
 //! command durably. Public read paths are served from the task projection store.
@@ -22,10 +22,14 @@ use rakka::agent_workflow::substrate::{
 };
 use rakka::agent_workflow::{
     AgentCommand, AgentCommandKind, AgentInboxAcceptance, AgentInboxError, AgentRunEngineError,
-    AgentRunId, AgentRunInbox, AgentRunState, AgentRunStatus, AgentRunTransition,
-    AgentStatePayload, AgentStepRunner, AgentTimestampMillis, AgentWorkflow, ArtifactRef,
+    AgentRunId, AgentRunInbox, AgentRunRuntimeError, AgentRunState, AgentRunStatus,
+    AgentRunTransition, AgentStatePayload, AgentStepRunner, AgentTimestampMillis, AgentWorkflow,
+    ArtifactRef,
 };
 use rakka::persistence::{DurableError, DurableStateStore};
+use rakka::prelude::{ClusterSharding, EntityTypeKey};
+use rakka::remote::{RemoteRequestError, TcpRemoteTransport};
+use rakka::sharding::{EntityAskError, RemoteEntityAskClient, RemoteEntityAskError};
 
 use crate::a2a_mapping::{
     build_cancel_task_command_draft, build_send_message_command_draft, canonical_read_tenant,
@@ -33,6 +37,13 @@ use crate::a2a_mapping::{
     A2ATaskIntent, ATTR_CONTEXT_ID, DEFAULT_TENANT,
 };
 use crate::durable_stores::{RunStore, WorkflowStore};
+use crate::protocol::{
+    A2AProjectionHints, A2ARunCommandMetadata, A2ARunFailureKind, A2ARunRequest, A2ARunRequestKind,
+    A2ARunResponse, A2ARunResponseKind, A2ATimeoutPolicy, A2A_RUN_PROTOCOL_VERSION,
+};
+use crate::reachability::PeerReachability;
+use crate::sharded_run_entity::A2ARunEntityCommand;
+use crate::support::RUN_ASK_TIMEOUT;
 use crate::task_projection::{
     status_transition_allowed, A2ATaskEventPayload, A2ATaskProjection,
     InMemoryA2ATaskProjectionStore, TaskProjectionError,
@@ -69,6 +80,68 @@ impl HeaderObserver {
     }
 }
 
+/// Cluster routing helper for owner-only A2A run requests.
+#[derive(Clone)]
+pub struct A2ARunRouter {
+    sharding: ClusterSharding,
+    key: EntityTypeKey<A2ARunEntityCommand>,
+    ask_client: RemoteEntityAskClient<TcpRemoteTransport>,
+    reachability: PeerReachability,
+}
+
+impl A2ARunRouter {
+    /// Creates a router over the shared cluster sharding facade.
+    #[must_use]
+    pub fn new(
+        sharding: ClusterSharding,
+        key: EntityTypeKey<A2ARunEntityCommand>,
+        ask_client: RemoteEntityAskClient<TcpRemoteTransport>,
+        reachability: PeerReachability,
+    ) -> Self {
+        Self {
+            sharding,
+            key,
+            ask_client,
+            reachability,
+        }
+    }
+
+    async fn route(&self, request: A2ARunRequest) -> Result<A2ARunResponse, RakkaA2AHandlerError> {
+        let entity = self
+            .sharding
+            .entity_ref_for(&self.key, request.task_id.clone())
+            .map_err(|error| RakkaA2AHandlerError::Unavailable {
+                message: error.to_string(),
+            })?;
+        let (owner, _shard) = entity
+            .region()
+            .resolve(entity.entity_ref())
+            .map_err(|error| RakkaA2AHandlerError::Unavailable {
+                message: error.to_string(),
+            })?;
+        let is_local = entity
+            .region()
+            .local_node_id()
+            .is_some_and(|local| local == &owner);
+
+        if is_local {
+            entity
+                .ask(
+                    |reply_to| A2ARunEntityCommand::Handle { request, reply_to },
+                    RUN_ASK_TIMEOUT,
+                )
+                .await
+                .map_err(entity_ask_error)
+        } else {
+            let outcome = entity
+                .remote_ask(&self.ask_client, request, RUN_ASK_TIMEOUT)
+                .await;
+            record_remote_outcome(&self.reachability, &outcome);
+            outcome.map_err(remote_ask_error)
+        }
+    }
+}
+
 /// Stable adapter-local failures mapped to A2A protocol errors.
 #[derive(Debug, Clone)]
 pub enum RakkaA2AHandlerError {
@@ -80,8 +153,20 @@ pub enum RakkaA2AHandlerError {
     Inbox(AgentInboxError),
     /// Durable run-state transition failed.
     RunEngine(AgentRunEngineError),
+    /// Actor-backed owner runtime failed.
+    RunActor(AgentRunRuntimeError),
     /// Durable-state store query failed.
     Persistence(DurableError),
+    /// The owning entity or peer was temporarily unavailable.
+    Unavailable {
+        /// Stable retryable summary.
+        message: String,
+    },
+    /// Local owner actor ask failed before the command reached durable state.
+    OwnerAsk {
+        /// Stable failure summary.
+        message: String,
+    },
     /// The requested run was not found before accepting a continuation command.
     MissingRun {
         /// Missing public task id.
@@ -110,14 +195,17 @@ impl RakkaA2AHandlerError {
             Self::Projection(error) => error.code(),
             Self::Inbox(error) => error.code(),
             Self::RunEngine(error) => error.code(),
+            Self::RunActor(error) => error.code(),
             Self::Persistence(error) => error.code(),
+            Self::Unavailable { .. } => "a2a-run-owner-unavailable",
+            Self::OwnerAsk { .. } => "a2a-run-owner-ask",
             Self::MissingRun { .. } => "task-not-found",
             Self::TaskNotCancelable { .. } => "task-not-cancelable",
             Self::InvalidLifecycle { .. } => "invalid-command-lifecycle",
         }
     }
 
-    fn into_a2a_error(self) -> A2AError {
+    pub(crate) fn into_a2a_error(self) -> A2AError {
         let code = self.code();
         match self {
             Self::Projection(TaskProjectionError::TaskNotFound { task_id })
@@ -131,9 +219,15 @@ impl RakkaA2AHandlerError {
             Self::RunEngine(AgentRunEngineError::MissingRunState { run_id }) => {
                 A2AError::task_not_found(run_id.as_str())
             }
+            Self::RunActor(AgentRunRuntimeError::RunEngine {
+                error: AgentRunEngineError::MissingRunState { run_id },
+            }) => A2AError::task_not_found(run_id.as_str()),
             Self::Inbox(error) => A2AError::internal(format!("{code}: {error}")),
             Self::RunEngine(error) => A2AError::internal(format!("{code}: {error}")),
+            Self::RunActor(error) => A2AError::internal(format!("{code}: {error}")),
             Self::Persistence(error) => A2AError::internal(format!("{code}: {error}")),
+            Self::Unavailable { message } => A2AError::internal(format!("{code}: {message}")),
+            Self::OwnerAsk { message } => A2AError::internal(format!("{code}: {message}")),
         }
     }
 }
@@ -145,7 +239,9 @@ impl Display for RakkaA2AHandlerError {
             Self::Projection(error) => Display::fmt(error, f),
             Self::Inbox(error) => Display::fmt(error, f),
             Self::RunEngine(error) => Display::fmt(error, f),
+            Self::RunActor(error) => Display::fmt(error, f),
             Self::Persistence(error) => Display::fmt(error, f),
+            Self::Unavailable { message } | Self::OwnerAsk { message } => f.write_str(message),
             Self::MissingRun { task_id } => write!(f, "task not found: {task_id}"),
             Self::TaskNotCancelable { task_id } => {
                 write!(f, "task {task_id} is terminal and cannot be cancelled")
@@ -164,7 +260,9 @@ impl Error for RakkaA2AHandlerError {
             Self::Projection(error) => Some(error),
             Self::Inbox(error) => Some(error),
             Self::RunEngine(error) => Some(error),
+            Self::RunActor(error) => Some(error),
             Self::Persistence(error) => Some(error),
+            Self::Unavailable { .. } | Self::OwnerAsk { .. } => None,
             Self::MissingRun { .. }
             | Self::TaskNotCancelable { .. }
             | Self::InvalidLifecycle { .. } => None,
@@ -196,13 +294,19 @@ impl From<AgentRunEngineError> for RakkaA2AHandlerError {
     }
 }
 
+impl From<AgentRunRuntimeError> for RakkaA2AHandlerError {
+    fn from(error: AgentRunRuntimeError) -> Self {
+        Self::RunActor(error)
+    }
+}
+
 impl From<DurableError> for RakkaA2AHandlerError {
     fn from(error: DurableError) -> Self {
         Self::Persistence(error)
     }
 }
 
-/// Phase 2 A2A handler implementation backed by durable Rakka stores.
+/// A2A handler implementation backed by durable Rakka stores and optional sharded routing.
 pub struct RakkaA2ARequestHandler {
     agent_card: AgentCard,
     workflow: AgentWorkflow,
@@ -210,6 +314,7 @@ pub struct RakkaA2ARequestHandler {
     run_store: RunStore,
     workflow_store: WorkflowStore,
     header_observer: HeaderObserver,
+    router: Option<A2ARunRouter>,
 }
 
 impl RakkaA2ARequestHandler {
@@ -230,7 +335,31 @@ impl RakkaA2ARequestHandler {
             run_store,
             workflow_store,
             header_observer,
+            router: None,
         }
+    }
+
+    /// Creates a durable handler that routes owner-only work through sharding.
+    #[must_use]
+    pub fn new_clustered(
+        agent_card: AgentCard,
+        workflow: AgentWorkflow,
+        task_store: InMemoryA2ATaskProjectionStore,
+        run_store: RunStore,
+        workflow_store: WorkflowStore,
+        header_observer: HeaderObserver,
+        router: A2ARunRouter,
+    ) -> Self {
+        let mut handler = Self::new(
+            agent_card,
+            workflow,
+            task_store,
+            run_store,
+            workflow_store,
+            header_observer,
+        );
+        handler.router = Some(router);
+        handler
     }
 
     /// Rebuilds any missing local task projections from durable run state.
@@ -240,6 +369,17 @@ impl RakkaA2ARequestHandler {
 
     fn record(&self, params: &ServiceParams) {
         self.header_observer.record(params);
+    }
+
+    async fn route_for_projection(
+        &self,
+        router: &A2ARunRouter,
+        request: A2ARunRequest,
+    ) -> Result<A2ATaskProjection, RakkaA2AHandlerError> {
+        let response = router.route(request).await?;
+        projection_from_response(response).inspect(|projection| {
+            self.task_store.upsert(projection.clone());
+        })
     }
 
     async fn send_message_impl(
@@ -255,6 +395,35 @@ impl RakkaA2ARequestHandler {
             A2APayloadPolicy::default().without_artifact_strategy(),
             received_at,
         )?;
+        if let Some(router) = &self.router {
+            let tenant = draft.normalized.tenant.as_str().to_string();
+            let request = A2ARunRequest::new(
+                draft.normalized.task_id.clone(),
+                tenant,
+                A2ARunCommandMetadata::from_draft(&draft),
+                projection_hints(
+                    req.configuration
+                        .as_ref()
+                        .and_then(|config| config.history_length),
+                ),
+                A2ATimeoutPolicy::from_duration(RUN_ASK_TIMEOUT),
+                A2ARunRequestKind::AcceptMessage {
+                    projected_message: Box::new(projected_message(&req.message, &draft)),
+                    artifacts: artifact_refs(&draft.payload),
+                    return_immediately: return_immediately(&req),
+                    received_at,
+                    draft: Box::new(draft),
+                },
+            );
+            let projection = self.route_for_projection(router, request).await?;
+            let task = projection.to_task(
+                req.configuration
+                    .as_ref()
+                    .and_then(|config| config.history_length),
+                true,
+            );
+            return Ok(SendMessageResponse::Task(task));
+        }
         // One durable recovery serves the whole request: lifecycle validation
         // and every run transition below reuse this runner instead of
         // re-loading run state per step.
@@ -307,6 +476,22 @@ impl RakkaA2ARequestHandler {
     ) -> Result<Task, RakkaA2AHandlerError> {
         let received_at = now_agent_timestamp();
         let draft = build_cancel_task_command_draft(params, &req, &self.workflow, received_at)?;
+        if let Some(router) = &self.router {
+            let tenant = draft.normalized.tenant.as_str().to_string();
+            let request = A2ARunRequest::new(
+                draft.normalized.task_id.clone(),
+                tenant,
+                A2ARunCommandMetadata::from_draft(&draft),
+                A2AProjectionHints::default(),
+                A2ATimeoutPolicy::from_duration(RUN_ASK_TIMEOUT),
+                A2ARunRequestKind::CancelTask {
+                    draft: Box::new(draft),
+                    received_at,
+                },
+            );
+            let projection = self.route_for_projection(router, request).await?;
+            return Ok(projection.to_task(None, true));
+        }
         let mut runner = self.recovered_runner(draft.normalized.run_id()).await?;
         let mut run_state = runner
             .state()?
@@ -720,7 +905,7 @@ impl RakkaA2ARequestHandler {
 }
 
 /// Validates a send request's lifecycle intent against recovered run state.
-fn validate_send_lifecycle(
+pub(crate) fn validate_send_lifecycle(
     draft: &A2ACommandDraft,
     run_state: Option<&AgentRunState>,
 ) -> Result<(), RakkaA2AHandlerError> {
@@ -767,7 +952,7 @@ fn validate_send_lifecycle(
 /// unrelated task. On rejection the command accepted just before the start
 /// race remains in the adopted run's inbox — unreachable garbage that only a
 /// hash collision plus a concurrent create can produce.
-fn validate_adopted_run(
+pub(crate) fn validate_adopted_run(
     state: &AgentRunState,
     draft: &A2ACommandDraft,
 ) -> Result<(), RakkaA2AHandlerError> {
@@ -789,7 +974,10 @@ fn validate_adopted_run(
 /// and `Part` metadata) have no deterministic wire ordering, so identical
 /// messages can serialize to different bytes; deserialize and compare the
 /// messages instead, falling back to byte equality for non-message payloads.
-fn same_state_payload(existing: &AgentStatePayload, candidate: &AgentStatePayload) -> bool {
+pub(crate) fn same_state_payload(
+    existing: &AgentStatePayload,
+    candidate: &AgentStatePayload,
+) -> bool {
     match (existing, candidate) {
         (AgentStatePayload::Inline(existing), AgentStatePayload::Inline(candidate)) => {
             if existing.content_type != candidate.content_type {
@@ -810,7 +998,7 @@ fn same_state_payload(existing: &AgentStatePayload, candidate: &AgentStatePayloa
 /// Returns true when the run's durable inbox already holds this command,
 /// using the inbox's own keyed lookups so the match cannot drift from the
 /// acceptance-time duplicate detection.
-fn known_command(state: &WorkflowState, draft: &A2ACommandDraft) -> bool {
+pub(crate) fn known_command(state: &WorkflowState, draft: &A2ACommandDraft) -> bool {
     let command_id = WorkflowMessageId::new(draft.command.metadata.command_id.as_str());
     let deduplication_key =
         DeduplicationKey::new(draft.command.metadata.deduplication_key.as_str());
@@ -846,7 +1034,7 @@ async fn refreshed_state(
 }
 
 /// Constructs the task-not-found error used for missing and foreign-tenant runs.
-fn missing_run(task_id: &str) -> RakkaA2AHandlerError {
+pub(crate) fn missing_run(task_id: &str) -> RakkaA2AHandlerError {
     RakkaA2AHandlerError::MissingRun {
         task_id: task_id.to_string(),
     }
@@ -892,6 +1080,22 @@ impl RequestHandler for RakkaA2ARequestHandler {
         let tenant = canonical_read_tenant(params, req.tenant.as_deref())
             .map_err(RakkaA2AHandlerError::Mapping)
             .map_err(RakkaA2AHandlerError::into_a2a_error)?;
+        if let Some(router) = &self.router {
+            let tenant = tenant.unwrap_or_else(|| DEFAULT_TENANT.to_string());
+            let request = A2ARunRequest::new(
+                req.id.clone(),
+                tenant,
+                A2ARunCommandMetadata::query(),
+                projection_hints(req.history_length),
+                A2ATimeoutPolicy::from_duration(RUN_ASK_TIMEOUT),
+                A2ARunRequestKind::QueryTaskSnapshot,
+            );
+            let projection = self
+                .route_for_projection(router, request)
+                .await
+                .map_err(RakkaA2AHandlerError::into_a2a_error)?;
+            return Ok(projection.to_task(req.history_length, true));
+        }
         self.task_store
             .get(tenant.as_deref(), &req.id, req.history_length)
             .map_err(RakkaA2AHandlerError::Projection)
@@ -985,11 +1189,61 @@ impl RequestHandler for RakkaA2ARequestHandler {
     }
 }
 
-fn projected_message(message: &Message, draft: &A2ACommandDraft) -> Message {
+pub(crate) fn projected_message(message: &Message, draft: &A2ACommandDraft) -> Message {
     let mut message = message.clone();
     message.task_id = Some(draft.normalized.task_id.clone());
     message.context_id = Some(draft.normalized.context_id.clone());
     message
+}
+
+fn projection_hints(history_length: Option<i32>) -> A2AProjectionHints {
+    A2AProjectionHints::new(history_length, true)
+}
+
+fn projection_from_response(
+    response: A2ARunResponse,
+) -> Result<A2ATaskProjection, RakkaA2AHandlerError> {
+    if response.version != A2A_RUN_PROTOCOL_VERSION {
+        return Err(RakkaA2AHandlerError::InvalidLifecycle {
+            task_id: response.task_id,
+            reason: "owner response protocol version mismatch",
+        });
+    }
+    match response.outcome {
+        A2ARunResponseKind::TaskSnapshot { projection } => Ok(projection),
+        A2ARunResponseKind::Failure { failure } => Err(owner_failure_error(
+            &response.task_id,
+            failure.kind,
+            failure.message,
+        )),
+        A2ARunResponseKind::StreamCursor { .. }
+        | A2ARunResponseKind::PushConfigRecorded { .. }
+        | A2ARunResponseKind::PushConfigDeleted => Err(RakkaA2AHandlerError::InvalidLifecycle {
+            task_id: response.task_id,
+            reason: "owner returned an unexpected response kind",
+        }),
+    }
+}
+
+fn owner_failure_error(
+    task_id: &str,
+    kind: A2ARunFailureKind,
+    message: String,
+) -> RakkaA2AHandlerError {
+    match kind {
+        A2ARunFailureKind::TaskNotFound => missing_run(task_id),
+        A2ARunFailureKind::TaskNotCancelable => RakkaA2AHandlerError::TaskNotCancelable {
+            task_id: task_id.to_string(),
+        },
+        A2ARunFailureKind::InvalidRequest
+        | A2ARunFailureKind::VersionMismatch
+        | A2ARunFailureKind::Unsupported => RakkaA2AHandlerError::InvalidLifecycle {
+            task_id: task_id.to_string(),
+            reason: "owner rejected the request",
+        },
+        A2ARunFailureKind::Unavailable => RakkaA2AHandlerError::Unavailable { message },
+        A2ARunFailureKind::Internal => RakkaA2AHandlerError::OwnerAsk { message },
+    }
 }
 
 fn artifact_refs(payload: &A2ACommandPayload) -> Vec<ArtifactRef> {
@@ -1000,7 +1254,7 @@ fn artifact_refs(payload: &A2ACommandPayload) -> Vec<ArtifactRef> {
         .collect()
 }
 
-fn state_payload(payload: &A2ACommandPayload) -> AgentStatePayload {
+pub(crate) fn state_payload(payload: &A2ACommandPayload) -> AgentStatePayload {
     match payload {
         A2ACommandPayload::Inline(inline) => AgentStatePayload::Inline(inline.clone()),
         A2ACommandPayload::ArtifactDrafts(drafts) => drafts
@@ -1011,14 +1265,14 @@ fn state_payload(payload: &A2ACommandPayload) -> AgentStatePayload {
     }
 }
 
-fn return_immediately(req: &SendMessageRequest) -> bool {
+pub(crate) fn return_immediately(req: &SendMessageRequest) -> bool {
     req.configuration
         .as_ref()
         .and_then(|config| config.return_immediately)
         .unwrap_or(false)
 }
 
-fn run_tenant(run_state: &AgentRunState) -> String {
+pub(crate) fn run_tenant(run_state: &AgentRunState) -> String {
     run_state
         .tenant
         .as_ref()
@@ -1026,13 +1280,93 @@ fn run_tenant(run_state: &AgentRunState) -> String {
         .unwrap_or_else(|| DEFAULT_TENANT.to_string())
 }
 
-fn run_is_terminal(status: AgentRunStatus) -> bool {
+pub(crate) fn run_is_terminal(status: AgentRunStatus) -> bool {
     matches!(
         status,
         AgentRunStatus::Completed | AgentRunStatus::Failed | AgentRunStatus::Cancelled
     )
 }
 
-fn task_state(status: AgentRunStatus) -> TaskState {
+pub(crate) fn task_state(status: AgentRunStatus) -> TaskState {
     crate::task_projection::task_state_from_run_status(status)
+}
+
+fn record_remote_outcome(
+    reachability: &PeerReachability,
+    outcome: &Result<A2ARunResponse, RemoteEntityAskError>,
+) {
+    match outcome {
+        Ok(_) => reachability.record(true),
+        Err(error) if is_peer_unreachable(error) => reachability.record(false),
+        Err(_) => {}
+    }
+}
+
+fn is_peer_unreachable(error: &RemoteEntityAskError) -> bool {
+    matches!(error, RemoteEntityAskError::Send { .. })
+        || matches!(
+            error,
+            RemoteEntityAskError::Reply {
+                error: RemoteRequestError::Timeout
+            }
+        )
+}
+
+fn entity_ask_error(error: EntityAskError) -> RakkaA2AHandlerError {
+    match error {
+        EntityAskError::NoRoute(error) => RakkaA2AHandlerError::Unavailable {
+            message: error.to_string(),
+        },
+        EntityAskError::NotLocal { owner } => RakkaA2AHandlerError::Unavailable {
+            message: format!("entity owned by {owner}"),
+        },
+        EntityAskError::MailboxFull => RakkaA2AHandlerError::Unavailable {
+            message: "entity mailbox full".to_string(),
+        },
+        EntityAskError::MailboxClosed => RakkaA2AHandlerError::Unavailable {
+            message: "entity mailbox closed".to_string(),
+        },
+        EntityAskError::ShardHandoff { shard_id, state } => RakkaA2AHandlerError::Unavailable {
+            message: format!("shard {shard_id} is {state}"),
+        },
+        EntityAskError::ShardBufferFull { shard_id, .. } => RakkaA2AHandlerError::Unavailable {
+            message: format!("shard {shard_id} buffer full"),
+        },
+        EntityAskError::Timeout => RakkaA2AHandlerError::Unavailable {
+            message: "entity ask timed out".to_string(),
+        },
+        EntityAskError::ReplyDropped => RakkaA2AHandlerError::OwnerAsk {
+            message: "entity reply dropped".to_string(),
+        },
+        EntityAskError::SpawnFailed(message)
+        | EntityAskError::RemoteEncode(message)
+        | EntityAskError::RemoteSend(message)
+        | EntityAskError::Rejected(message) => RakkaA2AHandlerError::OwnerAsk { message },
+    }
+}
+
+fn remote_ask_error(error: RemoteEntityAskError) -> RakkaA2AHandlerError {
+    match error {
+        RemoteEntityAskError::NoRoute { error } => RakkaA2AHandlerError::Unavailable {
+            message: error.to_string(),
+        },
+        RemoteEntityAskError::Send { message } => RakkaA2AHandlerError::Unavailable { message },
+        RemoteEntityAskError::Encode { error } => RakkaA2AHandlerError::OwnerAsk {
+            message: error.to_string(),
+        },
+        RemoteEntityAskError::Register { error } => RakkaA2AHandlerError::OwnerAsk {
+            message: error.to_string(),
+        },
+        RemoteEntityAskError::Reply { error } => match error {
+            RemoteRequestError::Timeout => RakkaA2AHandlerError::Unavailable {
+                message: "remote ask timed out".to_string(),
+            },
+            RemoteRequestError::ReplyDropped => RakkaA2AHandlerError::OwnerAsk {
+                message: "remote reply dropped".to_string(),
+            },
+            other => RakkaA2AHandlerError::OwnerAsk {
+                message: other.to_string(),
+            },
+        },
+    }
 }
