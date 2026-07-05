@@ -214,7 +214,9 @@ impl A2ATaskProjection {
                 actual: event.sequence,
             });
         }
-        self.status_timestamp = event.occurred_at;
+        // Monotonic: an event carrying a stale occurred_at (e.g. derived from
+        // an older run-state snapshot) must not move the status time backward.
+        self.status_timestamp = self.status_timestamp.max(event.occurred_at);
         self.projection_revision = event.sequence;
         self.metadata.insert(
             "io.rakka.projection.revision".to_string(),
@@ -413,13 +415,18 @@ impl InMemoryA2ATaskProjectionStore {
             return Err(TaskProjectionError::TenantRequired);
         }
         let state = self.inner.lock().expect("projection store mutex");
-        state
-            .projections
-            .values()
-            .find(|projection| {
-                projection.task_id == task_id
-                    && tenant.is_none_or(|tenant| projection.tenant == tenant)
-            })
+        let projection = match tenant {
+            // The map is keyed by (tenant, task id); a known tenant is a
+            // direct lookup rather than a scan of every task.
+            Some(tenant) => state
+                .projections
+                .get(&(tenant.to_string(), task_id.to_string())),
+            None => state
+                .projections
+                .values()
+                .find(|projection| projection.task_id == task_id),
+        };
+        projection
             .cloned()
             .ok_or_else(|| TaskProjectionError::TaskNotFound {
                 task_id: task_id.to_string(),
@@ -468,16 +475,18 @@ impl InMemoryA2ATaskProjectionStore {
             return Err(TaskProjectionError::TenantRequired);
         }
         let state = self.inner.lock().expect("projection store mutex");
-        let projection = state
-            .projections
-            .values()
-            .find(|projection| {
-                projection.task_id == task_id
-                    && tenant.is_none_or(|tenant| projection.tenant == tenant)
-            })
-            .ok_or_else(|| TaskProjectionError::TaskNotFound {
-                task_id: task_id.to_string(),
-            })?;
+        let projection = match tenant {
+            Some(tenant) => state
+                .projections
+                .get(&(tenant.to_string(), task_id.to_string())),
+            None => state
+                .projections
+                .values()
+                .find(|projection| projection.task_id == task_id),
+        };
+        let projection = projection.ok_or_else(|| TaskProjectionError::TaskNotFound {
+            task_id: task_id.to_string(),
+        })?;
         Ok(projection.to_task(history_length, true))
     }
 
@@ -771,10 +780,15 @@ fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
     Ok((task_id.to_string(), sequence))
 }
 
+/// Maximum retained replay events per task; older events are dropped first.
+const EVENT_LOG_LIMIT: usize = 256;
+
 /// Applies one event under the store lock, bootstrapping only from snapshots.
 ///
 /// Events for unknown tasks are rejected unless they carry a snapshot, so the
-/// replay log never records an event that no projection accepted.
+/// replay log never records an event that no projection accepted. The retained
+/// log is bounded to [`EVENT_LOG_LIMIT`] events per task, so replay from a
+/// cursor older than the retained window returns only the surviving events.
 fn apply_event_locked(
     state: &mut ProjectionStoreState,
     event: A2ATaskEvent,
@@ -791,7 +805,12 @@ fn apply_event_locked(
             task_id: event.task_id,
         });
     }
-    state.events.entry(key).or_default().push(event);
+    let events = state.events.entry(key).or_default();
+    events.push(event);
+    if events.len() > EVENT_LOG_LIMIT {
+        let excess = events.len() - EVENT_LOG_LIMIT;
+        events.drain(0..excess);
+    }
     Ok(())
 }
 
@@ -1090,6 +1109,48 @@ mod tests {
             .replay_events("tenant-a", "task-unknown", None)
             .expect("replay")
             .is_empty());
+    }
+
+    #[test]
+    fn event_log_is_bounded_per_task() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        let snapshot = A2ATaskProjection::accepted(
+            "task-log",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        );
+        store
+            .append_event_payload(
+                "tenant-a",
+                "task-log",
+                "ctx",
+                AgentTimestampMillis::new(10),
+                A2ATaskEventPayload::Snapshot(snapshot),
+            )
+            .expect("bootstrap snapshot");
+
+        for index in 0..EVENT_LOG_LIMIT + 10 {
+            let mut message = Message::new(Role::User, vec![Part::text("hello")]);
+            message.message_id = format!("msg-{index}");
+            store
+                .append_event_payload(
+                    "tenant-a",
+                    "task-log",
+                    "ctx",
+                    AgentTimestampMillis::new(20 + index as u64),
+                    A2ATaskEventPayload::MessageUpdate { message },
+                )
+                .expect("append message");
+        }
+
+        let events = store
+            .replay_events("tenant-a", "task-log", None)
+            .expect("replay");
+        assert_eq!(events.len(), EVENT_LOG_LIMIT);
     }
 
     #[test]

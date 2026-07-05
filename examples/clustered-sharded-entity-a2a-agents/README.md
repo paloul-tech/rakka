@@ -61,8 +61,9 @@ Implemented:
   references.
 - Durable `AgentRunInbox` acceptance for `message:send` and `cancel_task`.
 - Idempotent duplicate handling for repeated A2A `messageId`/deduplication keys.
-- Local `AgentRunState` creation for new tasks and cancellation requests for
-  active tasks.
+- Local `AgentRunState` creation for new tasks, and durable cancellation that
+  completes accepted cancels to the terminal `Cancelled` state (nothing is in
+  flight in this phase, so `Cancelling` is transient).
 - A task projection model, public task-event model, replay cursors, and a local
   in-memory task projection store.
 - Projection-backed `send_message`, `get_task`, `list_tasks`, and `cancel_task`.
@@ -70,7 +71,8 @@ Implemented:
 Not implemented in Phase 2:
 
 - Cluster-routed A2A command delivery to remote shard owners.
-- Streaming, push notification delivery, terminal execution, or peer A2A calls.
+- Streaming, push notification delivery, step execution to completion, or peer
+  A2A calls.
 - A reusable `rakka-a2a` crate or top-level `rakka` facade feature.
 
 ## Future Extraction Map

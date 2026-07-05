@@ -366,6 +366,17 @@ mod tests {
 
         let retry = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
         assert_eq!(retry["task"]["id"], task_id);
+        // The task id and list length would match even if dedup broke (the id
+        // is hash-derived and projections are keyed by it); the revision and
+        // history length are the signals that prove the retry was a no-op.
+        assert_eq!(
+            retry["task"]["metadata"]["io.rakka.projection.revision"],
+            first["task"]["metadata"]["io.rakka.projection.revision"]
+        );
+        assert_eq!(
+            retry["task"]["history"].as_array().expect("history").len(),
+            1
+        );
 
         let list = app
             .oneshot(
@@ -420,11 +431,14 @@ mod tests {
         assert_eq!(cancel.status(), StatusCode::OK);
         let bytes = cancel.into_body().collect().await.unwrap().to_bytes();
         let canceled: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // An accepted cancellation completes durably and reports the terminal
+        // public state, not a Working-forever cancelling limbo.
+        assert_eq!(canceled["status"]["state"], "TASK_STATE_CANCELED");
 
         let mut runner =
             AgentStepRunner::new(workflow, AgentRunId::new(task_id.clone()), run_store);
         let state = runner.recover().await.unwrap().expect("run state");
-        assert_eq!(state.status, AgentRunStatus::Cancelling);
+        assert_eq!(state.status, AgentRunStatus::Cancelled);
 
         let retry = app
             .oneshot(
