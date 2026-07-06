@@ -21,7 +21,16 @@ pub enum DiscoveryProviderKind {
     Etcd,
 }
 
-/// Resolved configuration for one Phase 3 example process.
+/// Which durable state backend the process uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceKind {
+    /// File store for one-host local development.
+    File,
+    /// Shared PostgreSQL store for multi-pod recovery.
+    Postgres,
+}
+
+/// Resolved configuration for one example process.
 #[derive(Debug, Clone)]
 pub struct ExampleConfig {
     /// Local bind host for HTTP and remoting.
@@ -46,6 +55,11 @@ pub struct ExampleConfig {
     pub etcd_prefix: String,
     /// etcd lease TTL in seconds.
     pub etcd_lease_ttl_seconds: i64,
+    /// Durable state backend selected for this node.
+    pub persistence: PersistenceKind,
+    /// PostgreSQL DSN used when `persistence` is `Postgres`.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub postgres_dsn: Option<String>,
     /// Shared directory used by example file-backed durable stores.
     pub state_dir: PathBuf,
     /// Whether etcd mode self-fences after sustained peer unreachability.
@@ -108,6 +122,20 @@ impl ExampleConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_ETCD_LEASE_TTL_SECONDS);
+        let persistence = match env::var("RAKKA_PERSISTENCE")
+            .unwrap_or_else(|_| "file".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "file" => PersistenceKind::File,
+            "postgres" => PersistenceKind::Postgres,
+            other => {
+                return Err(ExampleError::from(crate::support::example_error(format!(
+                    "RAKKA_PERSISTENCE must be 'file' or 'postgres', got '{other}'"
+                ))));
+            }
+        };
+        let postgres_dsn = env::var("RAKKA_POSTGRES_DSN").ok();
         let self_fence = env::var("RAKKA_SELF_FENCE")
             .map(|value| {
                 !matches!(
@@ -142,6 +170,8 @@ impl ExampleConfig {
             etcd_endpoints,
             etcd_prefix,
             etcd_lease_ttl_seconds,
+            persistence,
+            postgres_dsn,
             state_dir,
             self_fence,
             self_fence_after,

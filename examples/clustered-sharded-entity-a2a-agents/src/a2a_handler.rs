@@ -1,4 +1,4 @@
-//! Durable A2A request handler for the clustered Phase 3 example.
+//! Durable A2A request handler for the clustered A2A example.
 //!
 //! Public command paths acknowledge work only after `AgentRunInbox` accepts the
 //! command durably. Public read paths are served from the task projection store.
@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -217,6 +218,8 @@ pub enum RakkaA2AHandlerError {
         /// Public task id.
         task_id: String,
     },
+    /// The node is draining and no longer accepts new public commands.
+    Draining,
     /// The command kind is not valid for the normalized task lifecycle intent.
     InvalidLifecycle {
         /// Public task id.
@@ -243,6 +246,7 @@ impl RakkaA2AHandlerError {
             Self::OwnerAsk { .. } => "a2a-run-owner-ask",
             Self::MissingRun { .. } => "task-not-found",
             Self::TaskNotCancelable { .. } => "task-not-cancelable",
+            Self::Draining => "a2a-agent-draining",
             Self::InvalidLifecycle { .. } => "invalid-command-lifecycle",
         }
     }
@@ -272,6 +276,9 @@ impl RakkaA2AHandlerError {
             Self::Unavailable { message } => A2AError::internal(format!("{code}: {message}")),
             Self::StreamLimit { message } => A2AError::internal(format!("{code}: {message}")),
             Self::OwnerAsk { message } => A2AError::internal(format!("{code}: {message}")),
+            Self::Draining => {
+                A2AError::internal("a2a-agent-draining: node is draining; retry another endpoint")
+            }
         }
     }
 }
@@ -293,6 +300,7 @@ impl Display for RakkaA2AHandlerError {
             Self::TaskNotCancelable { task_id } => {
                 write!(f, "task {task_id} is terminal and cannot be cancelled")
             }
+            Self::Draining => f.write_str("node is draining"),
             Self::InvalidLifecycle { task_id, reason } => {
                 write!(f, "task {task_id} has invalid command lifecycle: {reason}")
             }
@@ -310,7 +318,10 @@ impl Error for RakkaA2AHandlerError {
             Self::RunActor(error) => Some(error),
             Self::Persistence(error) => Some(error),
             Self::Push(error) => Some(error),
-            Self::Unavailable { .. } | Self::StreamLimit { .. } | Self::OwnerAsk { .. } => None,
+            Self::Unavailable { .. }
+            | Self::StreamLimit { .. }
+            | Self::OwnerAsk { .. }
+            | Self::Draining => None,
             Self::MissingRun { .. }
             | Self::TaskNotCancelable { .. }
             | Self::InvalidLifecycle { .. } => None,
@@ -377,6 +388,7 @@ pub struct RakkaA2ARequestHandler {
     workflow_store: WorkflowStore,
     push_configs: A2APushConfigStore,
     stream_limits: A2AStreamLimits,
+    accepting_public_commands: Arc<AtomicBool>,
     header_observer: HeaderObserver,
     /// Shared so long-lived streams can poll the owner after the request
     /// handler call has returned.
@@ -403,6 +415,7 @@ impl RakkaA2ARequestHandler {
             workflow_store,
             push_configs,
             stream_limits: A2AStreamLimits::default(),
+            accepting_public_commands: Arc::new(AtomicBool::new(true)),
             header_observer,
             router: None,
         }
@@ -425,6 +438,26 @@ impl RakkaA2ARequestHandler {
     ) -> Self {
         self.stream_limits = A2AStreamLimits::new(settings);
         self
+    }
+
+    /// Closes mutating public ingress on this node for Kubernetes drain.
+    pub fn begin_drain(&self) {
+        self.accepting_public_commands
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// Returns whether mutating public ingress is still accepted.
+    #[must_use]
+    pub fn accepts_public_commands(&self) -> bool {
+        self.accepting_public_commands.load(Ordering::SeqCst)
+    }
+
+    fn ensure_accepting_public_commands(&self) -> Result<(), RakkaA2AHandlerError> {
+        if self.accepts_public_commands() {
+            Ok(())
+        } else {
+            Err(RakkaA2AHandlerError::Draining)
+        }
     }
 
     /// Rebuilds any missing local task projections from durable run state.
@@ -484,6 +517,7 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, RakkaA2AHandlerError> {
+        self.ensure_accepting_public_commands()?;
         let received_at = now_agent_timestamp();
         let draft = build_send_message_command_draft(
             params,
@@ -510,6 +544,7 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, RakkaA2AHandlerError> {
+        self.ensure_accepting_public_commands()?;
         let requested_tenant = canonical_read_tenant(params, req.tenant.as_deref())?;
         // Admit before the owner round-trip so over-limit subscribes fail
         // fast; the lease is dropped (released) on any later error.
@@ -569,6 +604,7 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, RakkaA2AHandlerError> {
+        self.ensure_accepting_public_commands()?;
         let projection = self
             .authorized_task_projection(params, &req.task_id, req.tenant.as_deref())
             .await?;
@@ -623,6 +659,7 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), RakkaA2AHandlerError> {
+        self.ensure_accepting_public_commands()?;
         let projection = self
             .authorized_task_projection(params, &req.task_id, req.tenant.as_deref())
             .await?;
@@ -745,6 +782,7 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, RakkaA2AHandlerError> {
+        self.ensure_accepting_public_commands()?;
         let received_at = now_agent_timestamp();
         let draft = build_send_message_command_draft(
             params,
@@ -854,6 +892,7 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, RakkaA2AHandlerError> {
+        self.ensure_accepting_public_commands()?;
         let received_at = now_agent_timestamp();
         let draft = build_cancel_task_command_draft(params, &req, &self.workflow, received_at)?;
         if let Some(router) = &self.router {

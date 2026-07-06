@@ -12,16 +12,20 @@ use std::sync::Arc;
 
 use rakka::agent_workflow::substrate::WorkflowState;
 use rakka::agent_workflow::AgentRunState;
+#[cfg(feature = "postgres")]
+use rakka::persistence::StateCodec;
 use rakka::persistence::{
     DurableError, DurableResult, DurableState, DurableStateStore, InMemoryDurableStateStore,
     PersistenceId, Revision, StateRecord, StoreFuture,
 };
+#[cfg(feature = "postgres")]
+use rakka_persistence_postgres::PostgresDurableStateStore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::config::ExampleConfig;
+use crate::config::{ExampleConfig, PersistenceKind};
 use crate::push_config::A2APushConfigState;
-use crate::support::{hex_decode, hex_encode};
+use crate::support::{example_error, hex_decode, hex_encode, ExampleResult};
 
 /// Durable store for agent run state.
 pub type RunStore = ExampleDurableStateStore<AgentRunState>;
@@ -33,13 +37,17 @@ pub type WorkflowStore = ExampleDurableStateStore<WorkflowState>;
 pub type PushConfigStore = ExampleDurableStateStore<A2APushConfigState>;
 
 /// Builds the runtime stores from environment-backed configuration.
-#[must_use]
-pub fn build_stores(config: &ExampleConfig) -> (RunStore, WorkflowStore, PushConfigStore) {
-    (
-        RunStore::file(config.state_dir.join("runs")),
-        WorkflowStore::file(config.state_dir.join("workflow")),
-        PushConfigStore::file(config.state_dir.join("push-configs")),
-    )
+pub async fn build_stores(
+    config: &ExampleConfig,
+) -> ExampleResult<(RunStore, WorkflowStore, PushConfigStore)> {
+    match config.persistence {
+        PersistenceKind::File => Ok((
+            RunStore::file(config.state_dir.join("runs")),
+            WorkflowStore::file(config.state_dir.join("workflow")),
+            PushConfigStore::file(config.state_dir.join("push-configs")),
+        )),
+        PersistenceKind::Postgres => build_postgres_stores(config).await,
+    }
 }
 
 /// Builds isolated in-memory stores for unit tests.
@@ -54,7 +62,6 @@ pub fn build_in_memory_stores() -> (RunStore, WorkflowStore, PushConfigStore) {
 }
 
 /// Example durable store implementation.
-#[derive(Debug)]
 pub enum ExampleDurableStateStore<S>
 where
     S: DurableState,
@@ -63,6 +70,23 @@ where
     Memory(InMemoryDurableStateStore<S>),
     /// File-backed store for local multi-node recovery.
     File(FileDurableStateStore<S>),
+    /// Shared PostgreSQL store for multi-pod recovery.
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresDurableStateStore<JsonStateCodec<S>>),
+}
+
+impl<S> std::fmt::Debug for ExampleDurableStateStore<S>
+where
+    S: DurableState,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(_) => f.write_str("ExampleDurableStateStore::Memory"),
+            Self::File(_) => f.write_str("ExampleDurableStateStore::File"),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => f.write_str("ExampleDurableStateStore::Postgres"),
+        }
+    }
 }
 
 impl<S> ExampleDurableStateStore<S>
@@ -91,18 +115,22 @@ where
         match self {
             Self::Memory(store) => Self::Memory(store.clone()),
             Self::File(store) => Self::File(store.clone()),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => Self::Postgres(store.clone()),
         }
     }
 }
 
 impl<S> DurableStateStore<S> for ExampleDurableStateStore<S>
 where
-    S: DurableState + Serialize + DeserializeOwned,
+    S: DurableState + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     fn backend_name(&self) -> &'static str {
         match self {
             Self::Memory(store) => store.backend_name(),
             Self::File(store) => store.backend_name(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.backend_name(),
         }
     }
 
@@ -113,6 +141,8 @@ where
         match self {
             Self::Memory(store) => store.load(persistence_id),
             Self::File(store) => store.load(persistence_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.load(persistence_id),
         }
     }
 
@@ -125,6 +155,10 @@ where
         match self {
             Self::Memory(store) => store.compare_and_set(persistence_id, expected_revision, state),
             Self::File(store) => store.compare_and_set(persistence_id, expected_revision, state),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                store.compare_and_set(persistence_id, expected_revision, state)
+            }
         }
     }
 
@@ -136,6 +170,8 @@ where
         match self {
             Self::Memory(store) => store.delete(persistence_id, expected_revision),
             Self::File(store) => store.delete(persistence_id, expected_revision),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.delete(persistence_id, expected_revision),
         }
     }
 
@@ -143,8 +179,98 @@ where
         match self {
             Self::Memory(store) => store.persistence_ids(),
             Self::File(store) => store.persistence_ids(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.persistence_ids(),
         }
     }
+}
+
+/// JSON `StateCodec` used by the PostgreSQL store.
+#[cfg(feature = "postgres")]
+pub struct JsonStateCodec<S> {
+    _state: PhantomData<fn() -> S>,
+}
+
+#[cfg(feature = "postgres")]
+impl<S> JsonStateCodec<S> {
+    fn new() -> Self {
+        Self {
+            _state: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl<S> Clone for JsonStateCodec<S> {
+    fn clone(&self) -> Self {
+        Self {
+            _state: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl<S> StateCodec<S> for JsonStateCodec<S>
+where
+    S: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    fn encode(&self, state: &S) -> DurableResult<Vec<u8>> {
+        serde_json::to_vec(state).map_err(|error| DurableError::codec(error.to_string()))
+    }
+
+    fn decode(&self, bytes: &[u8]) -> DurableResult<S> {
+        serde_json::from_slice(bytes).map_err(|error| DurableError::codec(error.to_string()))
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn build_postgres_stores(
+    config: &ExampleConfig,
+) -> ExampleResult<(RunStore, WorkflowStore, PushConfigStore)> {
+    let dsn = config.postgres_dsn.as_deref().ok_or_else(|| {
+        example_error("RAKKA_POSTGRES_DSN is required when RAKKA_PERSISTENCE=postgres")
+    })?;
+    let run = connect_postgres_store::<AgentRunState>(dsn).await?;
+    let workflow = connect_postgres_store::<WorkflowState>(dsn).await?;
+    let push = connect_postgres_store::<A2APushConfigState>(dsn).await?;
+    Ok((
+        RunStore::Postgres(run),
+        WorkflowStore::Postgres(workflow),
+        PushConfigStore::Postgres(push),
+    ))
+}
+
+#[cfg(feature = "postgres")]
+async fn connect_postgres_store<S>(
+    dsn: &str,
+) -> ExampleResult<PostgresDurableStateStore<JsonStateCodec<S>>>
+where
+    S: DurableState + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| example_error(format!("postgres connect failed: {error}")))?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("postgres connection error: {error}");
+        }
+    });
+    let store = PostgresDurableStateStore::new(client, JsonStateCodec::<S>::new());
+    store
+        .migrate()
+        .await
+        .map_err(|error| example_error(format!("postgres migrate failed: {error}")))?;
+    Ok(store)
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn build_postgres_stores(
+    _config: &ExampleConfig,
+) -> ExampleResult<(RunStore, WorkflowStore, PushConfigStore)> {
+    Err(
+        example_error("RAKKA_PERSISTENCE=postgres requires building with --features postgres")
+            .into(),
+    )
 }
 
 /// Small JSON file state store for local multi-process demos.

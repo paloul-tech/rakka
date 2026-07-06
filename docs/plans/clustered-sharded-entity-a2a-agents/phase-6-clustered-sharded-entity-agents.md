@@ -1,6 +1,6 @@
 # Phase 6 Clustered Sharded Entity A2A Agents
 
-Status: planning draft
+Status: implemented
 Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
 
 ## Goal
@@ -14,7 +14,7 @@ failure-injection coverage.
 
 ### Slice 6.1: Production Topology Document
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -34,7 +34,7 @@ Acceptance:
 
 ### Slice 6.2: Kubernetes Manifests Or Template
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -55,7 +55,7 @@ Acceptance:
 
 ### Slice 6.3: PostgreSQL Persistence And Migrations
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -75,7 +75,7 @@ Acceptance:
 
 ### Slice 6.4: Discovery, Membership, And Self-Fencing
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -93,7 +93,7 @@ Acceptance:
 
 ### Slice 6.5: Drain And Shutdown
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -112,7 +112,7 @@ Acceptance:
 
 ### Slice 6.6: Observability And Operational Snapshots
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -133,7 +133,7 @@ Acceptance:
 
 ### Slice 6.7: Autoscaling Signals
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -152,7 +152,7 @@ Acceptance:
 
 ### Slice 6.8: Production Failure Injection
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -173,7 +173,7 @@ Acceptance:
 
 ### Slice 6.9: Production Candidate Review
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -196,9 +196,85 @@ Acceptance:
 - Operational telemetry and runbooks are sufficient for a production-candidate
   review.
 
+## Implementation Summary
+
+- Slice 6.1 is implemented in
+  `examples/clustered-sharded-entity-a2a-agents/doc/phase-6-production-topology.md`
+  and the example README. The topology guide separates public A2A ingress,
+  private Rakka remoting, etcd membership, PostgreSQL persistence, and local
+  developer file mode. `build_agent_card` now advertises
+  `RAKKA_A2A_PUBLIC_URL` and test coverage verifies the card uses the
+  load-balanced URL.
+- Slice 6.2 is implemented by
+  `examples/clustered-sharded-entity-a2a-agents/Dockerfile` and
+  `examples/clustered-sharded-entity-a2a-agents/k8s/`. The manifest set defines
+  namespace, service account, config, Secret-backed PostgreSQL DSN, public
+  A2A Service, private headless remoting Service, StatefulSet, readiness,
+  liveness, startup, preStop drain, PodDisruptionBudget, HPA, and demo-grade
+  etcd/PostgreSQL services.
+- Slice 6.3 is implemented for shared durable run/workflow/push-config state by
+  the optional `postgres` feature in the A2A example. `RAKKA_PERSISTENCE` now
+  selects `file` or `postgres`; Postgres mode connects three
+  `PostgresDurableStateStore` instances and self-applies the persistence
+  migration. The Phase 6 guide documents backup/restore expectations and calls
+  out the remaining extraction follow-up for a shared PostgreSQL A2A
+  task-event projection table.
+- Slice 6.4 builds on the existing etcd discovery and reachability
+  self-fencing modules. The Kubernetes config selects etcd, the topology guide
+  documents lease TTL, membership refresh, lease revoke, partial partitions,
+  and the separation between load-balancer health and shard ownership.
+- Slice 6.5 is implemented by the new A2A ingress drain gate. `/drain` flips
+  readiness to HTTP 503 with `ready=false`, keeps liveness HTTP 200, and
+  rejects new mutating public A2A calls and new streams with the stable
+  retryable `a2a-agent-draining` code while safe reads remain available.
+  Existing shutdown still notifies discovery and leaves the local runtime.
+- Slice 6.6 is documented in the Phase 6 topology guide and backed by existing
+  stream-limit metrics, durable acceptance/outbox state, push scheduling,
+  Rakka agent-workflow metrics/snapshots, and OTLP guidance. The doc repeats
+  the bounded-label policy and names the runtime, outbox, recovery, human,
+  shard, stream, task projection, and push snapshots needed for review.
+- Slice 6.7 is documented in the Phase 6 topology guide and referenced by the
+  HPA manifest. The HPA starts with CPU as a portable baseline and points
+  operators at bounded scale-out signals: active streams, pending inbox
+  commands, due outbox effects, dispatcher backlog, in-flight dispatches,
+  stream lag, and A2A request latency.
+- Slice 6.8 is implemented as a production failure-injection runbook in the
+  Phase 6 topology guide, with existing cluster tests covering owner movement,
+  duplicate retries, lazy recovery, stream reconnect behavior, and push effect
+  scheduling. The runbook adds pod kill, dispatcher kill, ingress stream kill,
+  Postgres restart, and scale up/down drills for real clusters.
+- Slice 6.9 is captured in the Production-Candidate Review section of the
+  Phase 6 guide. It scopes the current result as a production-shaped example,
+  not a reusable `rakka-a2a` crate, and records review items for API stability,
+  security/tenancy, migration/retention, task-event projection durability,
+  push dispatch ownership, and metadata compatibility.
+
+Validation added:
+
+- `phase6_kubernetes_manifest_covers_public_private_and_persistence_paths`
+  keeps the manifest shape tied to public ingress, private remoting, etcd,
+  PostgreSQL, probes, drain, PDB, and HPA.
+- `phase6_docs_cover_exit_criteria_and_known_boundaries` keeps the README and
+  Phase 6 guide tied to the exit criteria and known production-candidate
+  boundaries.
+- `drain_closes_mutating_ingress_but_keeps_reads_available` verifies readiness
+  flips to HTTP 503 while liveness stays HTTP 200, new sends are rejected with
+  retryable `a2a-agent-draining`, and accepted task reads still work.
+- `card_advertises_load_balancer_url_and_implemented_features` verifies
+  streaming, intentionally disabled push advertisement, and load-balanced
+  agent-card URLs.
+
 ## References
 
 - `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
+- `examples/clustered-sharded-entity-a2a-agents/doc/phase-6-production-topology.md`
+- `examples/clustered-sharded-entity-a2a-agents/k8s/`
+- `examples/clustered-sharded-entity-a2a-agents/Dockerfile`
+- `examples/clustered-sharded-entity-a2a-agents/src/config.rs`
+- `examples/clustered-sharded-entity-a2a-agents/src/durable_stores.rs`
+- `examples/clustered-sharded-entity-a2a-agents/src/server.rs`
+- `examples/clustered-sharded-entity-a2a-agents/src/a2a_handler.rs`
+- `examples/clustered-sharded-entity-a2a-agents/src/agent_card.rs`
 - `examples/clustered-agent-workflow-http-grpc/k8s/`
 - `examples/clustered-agent-workflow-http-grpc/doc/kubernetes-etcd-discovery.md`
 - `examples/clustered-agent-workflow-http-grpc/src/server.rs`

@@ -24,7 +24,7 @@ use tower::ServiceExt;
 use crate::a2a_handler::{A2ARunRouter, HeaderObserver, RakkaA2ARequestHandler};
 use crate::agent_card::build_agent_card;
 use crate::codec::serialization_registry;
-use crate::config::{DiscoveryProviderKind, ExampleConfig};
+use crate::config::{DiscoveryProviderKind, ExampleConfig, PersistenceKind};
 use crate::durable_stores::build_stores;
 use crate::push_config::A2APushConfigStore;
 use crate::reachability::PeerReachability;
@@ -62,6 +62,8 @@ fn test_config(logical_id: &str, state_dir: &Path) -> ExampleConfig {
         etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
         etcd_prefix: crate::support::DEFAULT_ETCD_PREFIX.to_string(),
         etcd_lease_ttl_seconds: crate::support::DEFAULT_ETCD_LEASE_TTL_SECONDS,
+        persistence: PersistenceKind::File,
+        postgres_dsn: None,
         state_dir: state_dir.to_path_buf(),
         self_fence: false,
         self_fence_after: Duration::from_secs(15),
@@ -107,7 +109,8 @@ async fn build_node(
     let ask_client = runtime.ask_client();
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime).expect("sharding");
     let key = a2a_run_entity_key().expect("entity key");
-    let (run_store, workflow_store, push_config_store) = build_stores(&config);
+    let (run_store, workflow_store, push_config_store) =
+        build_stores(&config).await.expect("durable stores");
     let task_store = InMemoryA2ATaskProjectionStore::local();
     let push_configs = A2APushConfigStore::new(push_config_store);
     init_a2a_run_sharding(

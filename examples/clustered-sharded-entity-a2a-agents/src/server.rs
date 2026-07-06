@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use crate::a2a_handler::{A2ARunRouter, HeaderObserver, RakkaA2ARequestHandler};
 use crate::agent_card::build_agent_card;
 use crate::codec::serialization_registry;
-use crate::config::{DiscoveryProviderKind, ExampleConfig};
+use crate::config::{DiscoveryProviderKind, ExampleConfig, PersistenceKind};
 use crate::discovery::{
     membership_snapshot, new_membership_view, run_file_discovery, seed_file_discovery,
     MembershipView,
@@ -72,6 +72,12 @@ struct ReadinessResponse {
 }
 
 #[derive(Serialize)]
+struct DrainResponse {
+    draining: bool,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
 struct HeaderSnapshot {
     last_header_names: Vec<String>,
 }
@@ -109,6 +115,7 @@ fn health_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
+        .route("/drain", get(drain).post(drain))
         .route("/cluster", get(cluster))
         .route("/debug/last-a2a-headers", get(last_a2a_headers))
         .with_state(state)
@@ -122,10 +129,33 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-async fn readiness() -> Json<ReadinessResponse> {
-    Json(ReadinessResponse {
-        ready: true,
-        reason: "phase-3-clustered-a2a-handler-ready",
+async fn readiness(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, Json<ReadinessResponse>) {
+    let accepting = state.handler.accepts_public_commands();
+    let status = if accepting {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(ReadinessResponse {
+            ready: accepting,
+            reason: if accepting {
+                "phase-6-clustered-a2a-handler-ready"
+            } else {
+                "draining"
+            },
+        }),
+    )
+}
+
+async fn drain(State(state): State<AppState>) -> Json<DrainResponse> {
+    state.handler.begin_drain();
+    Json(DrainResponse {
+        draining: true,
+        reason: "kubernetes-drain",
     })
 }
 
@@ -175,7 +205,7 @@ async fn boot() -> ExampleResult<Booted> {
     let ask_client = runtime.ask_client();
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
     let key = a2a_run_entity_key()?;
-    let (run_store, workflow_store, push_config_store) = build_stores(&config);
+    let (run_store, workflow_store, push_config_store) = build_stores(&config).await?;
     let task_store = InMemoryA2ATaskProjectionStore::local();
     let push_configs = A2APushConfigStore::new(push_config_store);
     init_a2a_run_sharding(
@@ -300,12 +330,16 @@ fn print_banner(booted: &Booted) {
         DiscoveryProviderKind::File => "file",
         DiscoveryProviderKind::Etcd => "etcd",
     };
+    let persistence = match booted.config.persistence {
+        PersistenceKind::File => "file",
+        PersistenceKind::Postgres => "postgres",
+    };
     println!(
-        "Rakka A2A Phase 4 node {} | remoting {} | HTTP/A2A {}",
+        "Rakka A2A Phase 6 node {} | remoting {} | HTTP/A2A {}",
         booted.config.node_logical_id, booted.config.rakka_port, addr,
     );
     println!(
-        "discovery: {discovery}; state dir: {}",
+        "discovery: {discovery}; persistence: {persistence}; state dir: {}",
         booted.config.state_dir.display()
     );
     println!("agent card: http://{}/.well-known/agent-card.json", addr);
@@ -322,6 +356,12 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    const PHASE6_DOC: &str = include_str!("../doc/phase-6-production-topology.md");
+    const README: &str = include_str!("../README.md");
+    const K8S_AGENT: &str = include_str!("../k8s/agent-a2a.yaml");
+    const K8S_ETCD: &str = include_str!("../k8s/etcd.yaml");
+    const K8S_POSTGRES: &str = include_str!("../k8s/postgres.yaml");
+
     /// Route state plus the shared stores tests inspect directly.
     struct TestContext {
         state: AppState,
@@ -330,6 +370,96 @@ mod tests {
         run_store: RunStore,
         workflow_store: WorkflowStore,
         push_config_store: PushConfigStore,
+    }
+
+    #[test]
+    fn phase6_kubernetes_manifest_covers_public_private_and_persistence_paths() {
+        for manifest in [K8S_AGENT, K8S_ETCD, K8S_POSTGRES] {
+            for doc in manifest_documents(manifest) {
+                assert!(doc.contains("apiVersion:"), "missing apiVersion: {doc}");
+                assert!(doc.contains("kind:"), "missing kind: {doc}");
+                assert!(doc.contains("metadata:"), "missing metadata: {doc}");
+                assert!(doc.contains("  name:"), "missing metadata.name: {doc}");
+            }
+        }
+
+        for expected in [
+            "kind: Namespace",
+            "kind: ServiceAccount",
+            "name: rakka-a2a-agent-config",
+            "RAKKA_DISCOVERY_PROVIDER: etcd",
+            "RAKKA_ETCD_ENDPOINTS: http://rakka-a2a-etcd:2379",
+            "RAKKA_PERSISTENCE: postgres",
+            "RAKKA_A2A_PUBLIC_URL:",
+            "secretKeyRef:",
+            "name: RAKKA_POSTGRES_DSN",
+            "kind: StatefulSet",
+            "readinessProbe:",
+            "path: /readyz",
+            "livenessProbe:",
+            "path: /healthz",
+            "startupProbe:",
+            "preStop:",
+            "path: /drain",
+            "kind: PodDisruptionBudget",
+            "kind: HorizontalPodAutoscaler",
+        ] {
+            assert!(
+                K8S_AGENT.contains(expected),
+                "app manifest missing {expected}"
+            );
+        }
+
+        let internal = manifest_document_named(K8S_AGENT, "Service", "rakka-a2a-internal");
+        assert!(internal.contains("clusterIP: None"));
+        assert!(internal.contains("publishNotReadyAddresses: true"));
+        assert!(internal.contains("name: remoting"));
+
+        let public = manifest_document_named(K8S_AGENT, "Service", "rakka-a2a-public");
+        assert!(public.contains("type: LoadBalancer"));
+        assert!(public.contains("name: http"));
+        assert!(
+            !public.contains("remoting"),
+            "public A2A Service must not expose Rakka remoting"
+        );
+
+        assert!(K8S_ETCD.contains("kind: Deployment"));
+        assert!(K8S_ETCD.contains("name: rakka-a2a-etcd"));
+        assert!(K8S_POSTGRES.contains("kind: Secret"));
+        assert!(K8S_POSTGRES.contains("dsn: host=rakka-a2a-postgres"));
+    }
+
+    #[test]
+    fn phase6_docs_cover_exit_criteria_and_known_boundaries() {
+        for expected in [
+            "Public traffic enters through the load-balanced `rakka-a2a-public` Service",
+            "Private Rakka remoting uses the headless `rakka-a2a-internal` Service",
+            "etcd provides dynamic membership",
+            "`RAKKA_PERSISTENCE=postgres`",
+            "The agent card must point to that public URL",
+            "`/drain` closes mutating public A2A ingress",
+            "OpenTelemetry guidance",
+            "Scale-out signals",
+            "Failure Injection",
+            "Production-Candidate Review",
+            "shared PostgreSQL query/event table",
+        ] {
+            assert!(
+                PHASE6_DOC.contains(expected),
+                "Phase 6 doc missing {expected}"
+            );
+        }
+
+        for expected in [
+            "RAKKA_PERSISTENCE",
+            "--features postgres",
+            "examples/clustered-sharded-entity-a2a-agents/k8s/",
+            "a2a-agent-draining",
+            "RAKKA_A2A_PUBLIC_URL",
+            "doc/phase-6-production-topology.md",
+        ] {
+            assert!(README.contains(expected), "README missing {expected}");
+        }
     }
 
     #[tokio::test]
@@ -444,6 +574,108 @@ mod tests {
         let bytes = list.into_body().collect().await.unwrap().to_bytes();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload["tasks"].as_array().expect("tasks").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_closes_mutating_ingress_but_keeps_reads_available() {
+        let app = router(test_state().state);
+        let accepted = serde_json::json!({
+            "message": {
+                "messageId": "drain-before-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "accepted before drain"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        });
+        let first = post_json(app.clone(), "/a2a/message:send", &accepted, "tenant-a").await;
+        let task_id = first["task"]["id"].as_str().expect("task id").to_string();
+
+        let drain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/drain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(drain.status(), StatusCode::OK);
+
+        let readiness = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = readiness.into_body().collect().await.unwrap().to_bytes();
+        let readiness: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(readiness["ready"], false);
+        assert_eq!(readiness["reason"], "draining");
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "liveness must stay healthy during graceful drain"
+        );
+
+        let rejected = serde_json::json!({
+            "message": {
+                "messageId": "drain-after-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "reject during drain"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/a2a/message:send")
+                    .header("content-type", "application/json")
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::from(rejected.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            error.to_string().contains("a2a-agent-draining"),
+            "drain rejection should carry a stable code: {error}"
+        );
+
+        let read = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/a2a/tasks/{task_id}"))
+                    .header("x-rakka-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1056,6 +1288,8 @@ mod tests {
             etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
             etcd_prefix: crate::support::DEFAULT_ETCD_PREFIX.to_string(),
             etcd_lease_ttl_seconds: crate::support::DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            persistence: PersistenceKind::File,
+            postgres_dsn: None,
             state_dir: std::env::temp_dir(),
             self_fence: false,
             self_fence_after: Duration::from_secs(15),
@@ -1277,6 +1511,8 @@ mod tests {
             etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
             etcd_prefix: crate::support::DEFAULT_ETCD_PREFIX.to_string(),
             etcd_lease_ttl_seconds: crate::support::DEFAULT_ETCD_LEASE_TTL_SECONDS,
+            persistence: PersistenceKind::File,
+            postgres_dsn: None,
             state_dir: std::env::temp_dir(),
             self_fence: false,
             self_fence_after: Duration::from_secs(15),
@@ -1340,5 +1576,28 @@ mod tests {
             String::from_utf8_lossy(&bytes)
         );
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn manifest_documents(manifest: &'static str) -> Vec<String> {
+        manifest
+            .split("\n---")
+            .map(|doc| {
+                doc.lines()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .map(|doc| doc.trim().to_string())
+            .filter(|doc| !doc.is_empty())
+            .collect()
+    }
+
+    fn manifest_document_named(manifest: &'static str, kind: &str, name: &str) -> String {
+        let kind = format!("kind: {kind}");
+        let name = format!("  name: {name}");
+        manifest_documents(manifest)
+            .into_iter()
+            .find(|doc| doc.contains(&kind) && doc.contains(&name))
+            .unwrap_or_else(|| panic!("missing document {kind} {name}"))
     }
 }

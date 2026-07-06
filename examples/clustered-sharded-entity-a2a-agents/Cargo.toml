@@ -16,6 +16,12 @@ name = "rakka-example-clustered-sharded-entity-a2a-agents"
 path = "src/main.rs"
 doc = false
 
+[features]
+default = []
+# Optional shared PostgreSQL durable store, required for correct multi-pod
+# Kubernetes recovery. Off by default so local/file mode needs no database.
+postgres = ["dep:rakka-persistence-postgres", "dep:tokio-postgres", "rakka/postgres"]
+
 [dependencies]
 a2a = { package = "a2a-lf", version = "0.3.0" }
 a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
@@ -32,9 +38,11 @@ rakka = { path = "../../crates/rakka", default-features = false, features = [
     "remote",
     "sharding",
 ] }
+rakka-persistence-postgres = { path = "../../crates/rakka-persistence-postgres", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-postgres = { workspace = true, optional = true }
 
 [dev-dependencies]
 http-body-util.workspace = true
