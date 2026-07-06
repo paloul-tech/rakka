@@ -744,6 +744,7 @@ fn dispatch_entry(dispatch_id: &str, run_id: &AgentRunId) -> AgentDispatchEntry 
         }),
         last_fencing_token: 1,
         attempts: 1,
+        cancellation_requested: false,
         last_error_code: None,
         created_at: ts(1_000),
         updated_at: ts(1_100),

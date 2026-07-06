@@ -271,9 +271,15 @@ pub enum AgentDispatchTargetClass {
 
 impl AgentDispatchTargetClass {
     /// Classifies an effect target.
+    ///
+    /// The `target_class` attribute and target type may refine the kind-based
+    /// class, but only to a class that can actually route the effect kind —
+    /// an incompatible refinement falls back to the kind-based class instead
+    /// of routing the effect to a dispatcher that deterministically rejects
+    /// it.
     #[must_use]
     pub fn classify(effect_kind: AgentEffectKind, target: &AgentEffectTarget) -> Self {
-        match effect_kind {
+        let base = match effect_kind {
             AgentEffectKind::ModelCall => Self::Model,
             AgentEffectKind::ToolCall => Self::Tool,
             AgentEffectKind::ProcessCall => Self::Process,
@@ -285,8 +291,38 @@ impl AgentDispatchTargetClass {
             AgentEffectKind::ArtifactWrite => Self::Artifact,
             AgentEffectKind::ChildWorkflowCommand => Self::ChildWorkflow,
             AgentEffectKind::AuditEvent => Self::Audit,
+        };
+        base.refine_with_target_type(effect_kind, target)
+    }
+
+    /// Returns true when this dispatch class can route the effect kind.
+    #[must_use]
+    pub const fn accepts_effect_kind(self, kind: AgentEffectKind) -> bool {
+        match self {
+            Self::Model => matches!(kind, AgentEffectKind::ModelCall),
+            Self::Tool => matches!(kind, AgentEffectKind::ToolCall),
+            Self::Process => matches!(kind, AgentEffectKind::ProcessCall),
+            Self::A2aPeer => {
+                matches!(kind, AgentEffectKind::HttpCall | AgentEffectKind::GrpcCall)
+            }
+            Self::Http => matches!(kind, AgentEffectKind::HttpCall),
+            Self::Grpc => matches!(kind, AgentEffectKind::GrpcCall),
+            Self::Webhook => {
+                matches!(
+                    kind,
+                    AgentEffectKind::HttpCall | AgentEffectKind::Notification
+                )
+            }
+            Self::Notification | Self::PushNotification => {
+                matches!(kind, AgentEffectKind::Notification)
+            }
+            Self::Human => matches!(kind, AgentEffectKind::HumanApprovalRequest),
+            Self::Stream => matches!(kind, AgentEffectKind::StreamPublish),
+            Self::Artifact => matches!(kind, AgentEffectKind::ArtifactWrite),
+            Self::ChildWorkflow => matches!(kind, AgentEffectKind::ChildWorkflowCommand),
+            Self::Audit => matches!(kind, AgentEffectKind::AuditEvent),
+            Self::Other => true,
         }
-        .refine_with_target_type(target)
     }
 
     /// Stable lowercase label for metrics and snapshots.
@@ -311,11 +347,16 @@ impl AgentDispatchTargetClass {
         }
     }
 
-    fn refine_with_target_type(self, target: &AgentEffectTarget) -> Self {
+    fn refine_with_target_type(
+        self,
+        effect_kind: AgentEffectKind,
+        target: &AgentEffectTarget,
+    ) -> Self {
         if let Some(class) = target
             .attributes
             .get(ATTR_TARGET_CLASS)
             .and_then(|value| dispatch_class_from_label(value))
+            .filter(|class| class.accepts_effect_kind(effect_kind))
         {
             return class;
         }
@@ -323,10 +364,11 @@ impl AgentDispatchTargetClass {
             .attributes
             .get("notification_protocol")
             .is_some_and(|value| value == "a2a-push")
+            && Self::PushNotification.accepts_effect_kind(effect_kind)
         {
             return Self::PushNotification;
         }
-        match target.target_type.as_str() {
+        let by_target_type = match target.target_type.as_str() {
             "model" => Self::Model,
             "tool" => Self::Tool,
             "process" => Self::Process,
@@ -338,6 +380,11 @@ impl AgentDispatchTargetClass {
             "notification" => Self::Notification,
             "human" => Self::Human,
             _ => self,
+        };
+        if by_target_type.accepts_effect_kind(effect_kind) {
+            by_target_type
+        } else {
+            self
         }
     }
 }
@@ -441,6 +488,14 @@ pub struct AgentDispatchEntry {
     pub last_fencing_token: u64,
     /// Last known outbox attempt count.
     pub attempts: u32,
+    /// True when durable cancellation was requested while a lease was active.
+    ///
+    /// A cancellation-requested entry is never claimable again. Its in-flight
+    /// worker may still finish and record a truthful completion; if the lease
+    /// expires instead, the entry is finalized as `Cancelled` on the next
+    /// worker refresh and its outbox message is settled as cancelled.
+    #[serde(default)]
+    pub cancellation_requested: bool,
     /// Stable error code or summary for the last failed dispatch.
     pub last_error_code: Option<String>,
     /// Creation timestamp.
@@ -488,6 +543,7 @@ impl AgentDispatchEntry {
             lease: None,
             last_fencing_token: 0,
             attempts: due.entry.attempts().attempts(),
+            cancellation_requested: false,
             last_error_code: effect.last_error_code.clone(),
             created_at: now,
             updated_at: now,
@@ -500,6 +556,9 @@ impl AgentDispatchEntry {
     /// Returns true when this entry can be claimed at `now`.
     #[must_use]
     pub fn is_claimable_at(&self, now: AgentTimestampMillis) -> bool {
+        if self.cancellation_requested {
+            return false;
+        }
         match self.status {
             AgentDispatchStatus::Pending | AgentDispatchStatus::RetryScheduled => {
                 self.due_at <= now
@@ -544,7 +603,7 @@ impl AgentDispatchEntry {
         due: &AgentDueEffect,
         now: AgentTimestampMillis,
     ) -> Self {
-        if self.status.is_terminal() {
+        if self.status.is_terminal() || self.cancellation_requested {
             return self;
         }
 
@@ -909,8 +968,13 @@ pub struct AgentDispatcherCancellation {
     pub cancelled_entries: usize,
     /// Entries already terminal before the cancellation pass.
     pub already_terminal_entries: usize,
-    /// Actively leased entries left in-flight and annotated for ignore-on-completion policy.
+    /// Actively leased entries marked cancellation requested. They are left
+    /// for the in-flight worker to finish truthfully; if the lease expires
+    /// they are finalized as cancelled on the next worker refresh.
     pub in_flight_entries: usize,
+    /// Effect ids of entries moved to `Cancelled` by this pass, to settle at
+    /// the durable outbox layer.
+    pub cancelled_effect_ids: Vec<AgentEffectId>,
 }
 
 /// Result of one claim pass.
@@ -1156,12 +1220,15 @@ where
         })
     }
 
-    /// Marks claimable dispatch entries for a run cancelled.
+    /// Marks claimable dispatch entries for a run cancelled in the fleet index.
     ///
-    /// Active leases are not forcibly completed at the lower outbox layer. They
-    /// are annotated and left for the worker's in-flight side effect to finish
-    /// or time out; higher-level run cancellation remains durable because it is
-    /// persisted before this best-effort dispatcher pass.
+    /// Active leases are not forcibly completed. They are marked cancellation
+    /// requested and left for the worker's in-flight side effect to finish
+    /// truthfully; a cancellation-requested entry is never claimable again,
+    /// and if its lease expires it is finalized by
+    /// [`Self::finalize_run_cancellations`]. This pass updates only the fleet
+    /// index — use [`AgentDispatcherWorker::cancel_run_dispatches`] to also
+    /// settle the cancelled effects at the durable outbox layer.
     pub async fn cancel_run_dispatches(
         &mut self,
         run_id: &AgentRunId,
@@ -1176,6 +1243,7 @@ where
         let mut cancelled_entries = 0;
         let mut already_terminal_entries = 0;
         let mut in_flight_entries = 0;
+        let mut cancelled_effect_ids = Vec::new();
         let mut changed = false;
 
         for entry in next
@@ -1187,15 +1255,14 @@ where
                 already_terminal_entries += 1;
             } else if entry.is_in_flight_at(now) {
                 in_flight_entries += 1;
-                entry
-                    .attributes
-                    .insert("cancellation_requested".to_string(), "true".to_string());
+                entry.cancellation_requested = true;
                 entry.last_error_code = Some("cancellation-requested".to_string());
                 entry.updated_at = now;
                 changed = true;
             } else {
                 let updated = entry.clone().mark_cancelled(now);
                 *entry = updated;
+                cancelled_effect_ids.push(entry.effect_id.clone());
                 cancelled_entries += 1;
                 changed = true;
             }
@@ -1213,7 +1280,53 @@ where
             cancelled_entries,
             already_terminal_entries,
             in_flight_entries,
+            cancelled_effect_ids,
         })
+    }
+
+    /// Finalizes cancellation-requested entries for one run whose leases are
+    /// no longer active, returning the effect ids to settle at the durable
+    /// outbox layer.
+    ///
+    /// A cancellation-requested entry whose worker completes normally records
+    /// a truthful terminal outcome instead; this pass only converges entries
+    /// whose worker crashed or lost its lease after cancellation.
+    pub async fn finalize_run_cancellations(
+        &mut self,
+        run_id: &AgentRunId,
+    ) -> AgentDispatcherResult<Vec<AgentEffectId>> {
+        if self.record.is_none() {
+            self.recover().await?;
+        }
+
+        let now = current_agent_timestamp(&self.clock);
+        let record = self.current_record()?;
+        let mut next = record.state;
+        let mut finalized_effect_ids = Vec::new();
+
+        for entry in next.entries.values_mut().filter(|entry| {
+            &entry.run_id == run_id
+                && entry.cancellation_requested
+                && !entry.status.is_terminal()
+                && !entry.is_in_flight_at(now)
+        }) {
+            let updated = entry.clone().mark_cancelled(now);
+            *entry = updated;
+            finalized_effect_ids.push(entry.effect_id.clone());
+        }
+
+        if !finalized_effect_ids.is_empty() {
+            next.updated_at = now;
+            self.persist(record.revision, next).await?;
+            self.record_gauges(now);
+            self.record_metric(
+                "cancel",
+                "finalized",
+                "lease-expired",
+                finalized_effect_ids.len() as u64,
+            );
+        }
+        Ok(finalized_effect_ids)
     }
 
     /// Completes a current claim.
@@ -1259,6 +1372,7 @@ where
                 ..
             } => entry.mark_exhausted(*attempts, message.clone(), now),
             WorkflowTelemetryEvent::OutboxDispatchSucceeded { .. } => entry.mark_completed(now),
+            WorkflowTelemetryEvent::OutboxDispatchCancelled { .. } => entry.mark_cancelled(now),
         })
         .await
     }
@@ -1722,6 +1836,13 @@ where
     }
 
     /// Refreshes due effects for one run.
+    ///
+    /// Cancellation-requested entries whose leases expired are finalized as
+    /// cancelled before registration, and every cancelled fleet entry whose
+    /// outbox message is still unsettled is settled as cancelled — so a
+    /// cancelled run's effects are never redelivered after a worker crash,
+    /// even one that interrupted an earlier cancellation pass between its
+    /// fleet and outbox writes.
     pub async fn refresh_run(
         &mut self,
         run_id: AgentRunId,
@@ -1734,10 +1855,84 @@ where
             self.metrics.clone(),
         );
         inbox.recover().await?;
+        self.fleet.finalize_run_cancellations(&run_id).await?;
+        let cancelled_effect_ids: Vec<AgentEffectId> = self
+            .fleet
+            .state()?
+            .entries()
+            .values()
+            .filter(|entry| {
+                entry.run_id == run_id && entry.status == AgentDispatchStatus::Cancelled
+            })
+            .map(|entry| entry.effect_id.clone())
+            .collect();
+        self.settle_cancelled_effects(&mut inbox, &cancelled_effect_ids, "dispatch-cancelled")
+            .await?;
         let effects = inbox.due_effects()?;
         self.fleet
             .register_due_effects(run_id, workflow_id, effects)
             .await
+    }
+
+    /// Cancels a run's dispatch entries and settles the cancelled effects at
+    /// the durable outbox layer.
+    ///
+    /// Unclaimed entries are marked cancelled in both the fleet index and the
+    /// run's durable outbox, so they are never dispatched and their durable
+    /// state converges. Actively leased entries are marked cancellation
+    /// requested and left for the in-flight side effect to finish truthfully
+    /// or be finalized after lease expiry by [`Self::refresh_run`].
+    pub async fn cancel_run_dispatches(
+        &mut self,
+        run_id: &AgentRunId,
+    ) -> AgentDispatcherResult<AgentDispatcherCancellation> {
+        let cancellation = self.fleet.cancel_run_dispatches(run_id).await?;
+        if !cancellation.cancelled_effect_ids.is_empty() {
+            let mut inbox = AgentRunInbox::with_clock_and_metrics(
+                run_id.clone(),
+                self.workflow_store.clone(),
+                self.clock.clone(),
+                self.metrics.clone(),
+            );
+            inbox.recover().await?;
+            self.settle_cancelled_effects(
+                &mut inbox,
+                &cancellation.cancelled_effect_ids,
+                "run-cancelled",
+            )
+            .await?;
+        }
+        Ok(cancellation)
+    }
+
+    /// Settles cancelled effects at the durable outbox layer.
+    ///
+    /// Outbox entries that already reached a terminal state (or were
+    /// compacted away) are skipped, so the settlement pass is idempotent and
+    /// safe to repeat on every refresh.
+    async fn settle_cancelled_effects(
+        &self,
+        inbox: &mut AgentRunInbox<WorkflowStore, Clock>,
+        effect_ids: &[AgentEffectId],
+        reason: &str,
+    ) -> AgentDispatcherResult<()> {
+        for effect_id in effect_ids {
+            let message_id = OutboxMessageId::new(effect_id.as_str());
+            let cancellable = inbox
+                .inner()
+                .state()
+                .map_err(AgentDispatcherError::from)?
+                .outbox_entry(&message_id)
+                .is_some_and(OutboxEntry::is_cancellable);
+            if cancellable {
+                inbox
+                    .inner_mut()
+                    .record_outbox_cancelled(&message_id, reason)
+                    .await
+                    .map_err(AgentDispatcherError::from)?;
+            }
+        }
+        Ok(())
     }
 
     /// Claims due work for this worker.
@@ -1920,6 +2115,9 @@ pub struct AgentDispatcherEntrySnapshot {
     pub graph_loop_instance_id: Option<String>,
     /// Due timestamp.
     pub due_at: AgentTimestampMillis,
+    /// True when durable cancellation was requested while a lease was active.
+    #[serde(default)]
+    pub cancellation_requested: bool,
     /// Worker holding the lease, when claimed.
     pub worker_id: Option<AgentDispatcherWorkerId>,
     /// Fencing token, when claimed.
@@ -1941,6 +2139,7 @@ impl AgentDispatcherEntrySnapshot {
             graph_node_kind: entry.graph_node_kind,
             graph_loop_instance_id: entry.graph_loop_instance_id.clone(),
             due_at: entry.due_at,
+            cancellation_requested: entry.cancellation_requested,
             worker_id: entry.lease.as_ref().map(|lease| lease.worker_id.clone()),
             fencing_token: entry.lease.as_ref().map(|lease| lease.fencing_token),
             lease_expires_at: entry.lease.as_ref().map(|lease| lease.lease_expires_at),

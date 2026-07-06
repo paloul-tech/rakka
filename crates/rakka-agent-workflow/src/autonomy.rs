@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentAttributes, AgentAuditEvent, AgentAuditEventId, AgentAuditEventKind, AgentCausationId,
-    AgentCorrelationId, AgentEffect, AgentEffectKind, AgentRunId, AgentTelemetryContext,
-    AgentTenantId, AgentTimestampMillis, AgentWorkflowId, ArtifactKind, RedactionStatus,
-    WorkflowDefinitionVersion,
+    AgentCorrelationId, AgentDispatchTargetClass, AgentEffect, AgentEffectKind, AgentRunId,
+    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentWorkflowId, ArtifactKind,
+    RedactionStatus, WorkflowDefinitionVersion,
 };
 
 /// Attribute recording the autonomy policy version that made a decision.
@@ -88,25 +88,40 @@ impl AgentAutonomyTargetClass {
     }
 
     /// Classifies one scheduled effect into a Phase 5 autonomy target class.
+    ///
+    /// The class is derived from the dispatcher's
+    /// [`AgentDispatchTargetClass::classify`] so that policy admission and
+    /// dispatch routing always agree on the class of one effect.
     #[must_use]
     pub fn for_effect(effect: &AgentEffect) -> Self {
-        if let Some(class) = target_class_override(effect) {
-            return class;
-        }
-        match effect.kind {
-            AgentEffectKind::ModelCall => Self::Model,
-            AgentEffectKind::ToolCall => Self::Tool,
-            AgentEffectKind::ProcessCall => Self::ProcessTool,
-            AgentEffectKind::HumanApprovalRequest => Self::HumanCheckpoint,
-            AgentEffectKind::Notification if is_push_notification(effect) => Self::PushNotification,
-            AgentEffectKind::Notification if is_webhook(effect) => Self::Webhook,
-            AgentEffectKind::HttpCall | AgentEffectKind::GrpcCall if is_a2a_peer(effect) => {
-                Self::A2aPeer
-            }
-            AgentEffectKind::HttpCall | AgentEffectKind::GrpcCall if is_webhook(effect) => {
-                Self::Webhook
-            }
-            _ => Self::Other,
+        Self::from_dispatch_class(AgentDispatchTargetClass::classify(
+            effect.kind,
+            &effect.target,
+        ))
+    }
+
+    /// Maps the dispatcher routing class onto the autonomy policy class.
+    ///
+    /// Dispatch classes outside the Phase 5 autonomy catalog map to
+    /// [`Self::Other`], which fails closed against the default catalog.
+    #[must_use]
+    pub const fn from_dispatch_class(class: AgentDispatchTargetClass) -> Self {
+        match class {
+            AgentDispatchTargetClass::Model => Self::Model,
+            AgentDispatchTargetClass::Tool => Self::Tool,
+            AgentDispatchTargetClass::Process => Self::ProcessTool,
+            AgentDispatchTargetClass::A2aPeer => Self::A2aPeer,
+            AgentDispatchTargetClass::Webhook => Self::Webhook,
+            AgentDispatchTargetClass::PushNotification => Self::PushNotification,
+            AgentDispatchTargetClass::Human => Self::HumanCheckpoint,
+            AgentDispatchTargetClass::Http
+            | AgentDispatchTargetClass::Grpc
+            | AgentDispatchTargetClass::Notification
+            | AgentDispatchTargetClass::Stream
+            | AgentDispatchTargetClass::Artifact
+            | AgentDispatchTargetClass::ChildWorkflow
+            | AgentDispatchTargetClass::Audit
+            | AgentDispatchTargetClass::Other => Self::Other,
         }
     }
 }
@@ -876,44 +891,6 @@ fn policy_decision(
         decided_at: now,
         attributes: AgentAttributes::new(),
     }
-}
-
-fn target_class_override(effect: &AgentEffect) -> Option<AgentAutonomyTargetClass> {
-    effect
-        .target
-        .attributes
-        .get("target_class")
-        .and_then(|value| AgentAutonomyTargetClass::from_label(value))
-        .or_else(|| AgentAutonomyTargetClass::from_label(effect.target.target_type.as_str()))
-}
-
-fn is_push_notification(effect: &AgentEffect) -> bool {
-    effect.target.target_type == "push"
-        || effect.target.name == "a2a-push-webhook"
-        || effect
-            .target
-            .attributes
-            .get("notification_protocol")
-            .is_some_and(|value| value == "a2a-push")
-}
-
-fn is_webhook(effect: &AgentEffect) -> bool {
-    effect.target.target_type == "webhook"
-        || effect.target.name.contains("webhook")
-        || effect
-            .target
-            .attributes
-            .get("target_class")
-            .is_some_and(|value| value == "webhook")
-}
-
-fn is_a2a_peer(effect: &AgentEffect) -> bool {
-    effect.target.target_type == "a2a-peer"
-        || effect
-            .target
-            .attributes
-            .get("target_class")
-            .is_some_and(|value| value == "a2a-peer")
 }
 
 fn tool_name_is_disallowed(

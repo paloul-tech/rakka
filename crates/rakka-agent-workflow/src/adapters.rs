@@ -16,8 +16,8 @@ use rakka_workflow::OutboxDispatchResult;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentAttributes, AgentCausationId, AgentCorrelationId, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectTarget, AgentIdempotencyKey, AgentTelemetryContext,
+    AgentAttributes, AgentCausationId, AgentCorrelationId, AgentDispatchTargetClass, AgentEffect,
+    AgentEffectId, AgentEffectKind, AgentEffectTarget, AgentIdempotencyKey, AgentTelemetryContext,
     AgentTimestampMillis, ArtifactRef, RedactionStatus,
 };
 
@@ -873,15 +873,8 @@ fn model_name_from_target(target: &AgentEffectTarget) -> Option<String> {
 }
 
 fn is_a2a_peer_effect(effect: &AgentEffect) -> bool {
-    matches!(
-        effect.kind,
-        AgentEffectKind::HttpCall | AgentEffectKind::GrpcCall
-    ) && (effect.target.target_type == "a2a-peer"
-        || effect
-            .target
-            .attributes
-            .get("target_class")
-            .is_some_and(|value| value == "a2a-peer"))
+    AgentDispatchTargetClass::classify(effect.kind, &effect.target)
+        == AgentDispatchTargetClass::A2aPeer
 }
 
 fn peer_card_ref_from_attributes(attributes: &AgentAttributes) -> Option<ArtifactRef> {

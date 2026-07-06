@@ -5,12 +5,13 @@ use std::collections::BTreeMap;
 use rakka_agent_workflow::{
     agent_autonomy_policy_audit_event, AgentAuditEventId, AgentAuditEventKind, AgentAutonomyPolicy,
     AgentAutonomyPolicyDecisionStatus, AgentAutonomyTargetClass, AgentAutonomyUsage,
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentEffectTargetCatalog,
-    AgentIdempotencyKey, AgentRunId, AgentTelemetryContext, AgentTenantId, AgentTimestampMillis,
-    AgentWorkflowId, ArtifactKind, ArtifactRef, RedactionStatus, WorkflowDefinitionVersion,
-    AGENT_AUTONOMY_DECISION_STATUS_ATTRIBUTE, AGENT_AUTONOMY_POLICY_VERSION_ATTRIBUTE,
-    AGENT_AUTONOMY_REASON_CODE_ATTRIBUTE, AGENT_AUTONOMY_TARGET_CLASS_ATTRIBUTE,
+    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentDispatchTargetClass,
+    AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus, AgentEffectTarget,
+    AgentEffectTargetCatalog, AgentIdempotencyKey, AgentRunId, AgentTelemetryContext,
+    AgentTenantId, AgentTimestampMillis, AgentWorkflowId, ArtifactKind, ArtifactRef,
+    RedactionStatus, WorkflowDefinitionVersion, AGENT_AUTONOMY_DECISION_STATUS_ATTRIBUTE,
+    AGENT_AUTONOMY_POLICY_VERSION_ATTRIBUTE, AGENT_AUTONOMY_REASON_CODE_ATTRIBUTE,
+    AGENT_AUTONOMY_TARGET_CLASS_ATTRIBUTE,
 };
 
 #[test]
@@ -146,6 +147,72 @@ fn budgets_approval_and_cancellation_are_durable_policy_decisions() {
         .expect("cancel decision");
     assert_eq!(cancelled.reason_code, "cancellation-requested");
     assert!(cancelled.is_rejected());
+}
+
+#[test]
+fn autonomy_classification_agrees_with_dispatch_classification() {
+    let cases = [
+        // Name-based heuristics no longer classify: a notification whose name
+        // merely contains "webhook" is not policy-classified as a webhook.
+        (
+            effect(
+                "notify-named-webhook",
+                AgentEffectKind::Notification,
+                "notification",
+                "slack-webhook",
+                [],
+                None,
+            ),
+            AgentAutonomyTargetClass::Other,
+        ),
+        // Explicit target types and target_class attributes still classify.
+        (
+            effect(
+                "notify-webhook",
+                AgentEffectKind::Notification,
+                "webhook",
+                "customer-callback",
+                [],
+                None,
+            ),
+            AgentAutonomyTargetClass::Webhook,
+        ),
+        (
+            effect(
+                "peer-call",
+                AgentEffectKind::HttpCall,
+                "http",
+                "billing-agent",
+                [("target_class", "a2a-peer")],
+                None,
+            ),
+            AgentAutonomyTargetClass::A2aPeer,
+        ),
+        // A kind-incompatible target_class label cannot reroute the effect.
+        (
+            effect(
+                "notify-peer-label",
+                AgentEffectKind::Notification,
+                "notification",
+                "ops-alert",
+                [("target_class", "a2a-peer")],
+                None,
+            ),
+            AgentAutonomyTargetClass::Other,
+        ),
+    ];
+
+    for (effect, expected) in cases {
+        let autonomy_class = AgentAutonomyTargetClass::for_effect(&effect);
+        assert_eq!(autonomy_class, expected, "effect {}", effect.effect_id);
+        let dispatch_class = AgentDispatchTargetClass::classify(effect.kind, &effect.target);
+        assert_eq!(
+            autonomy_class,
+            AgentAutonomyTargetClass::from_dispatch_class(dispatch_class),
+            "policy and dispatch must agree for effect {}",
+            effect.effect_id
+        );
+    }
 }
 
 #[test]

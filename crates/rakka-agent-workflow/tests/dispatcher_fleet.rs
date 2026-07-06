@@ -682,8 +682,8 @@ async fn cancellation_marks_unclaimed_dispatch_entries_cancelled() {
     let mut worker = worker(
         "dispatcher-cancel-pending",
         fleet_store,
-        workflow_store,
-        clock,
+        workflow_store.clone(),
+        clock.clone(),
         metrics,
         AgentDispatcherFleetSettings::new(8, 1_000),
     );
@@ -694,12 +694,12 @@ async fn cancellation_marks_unclaimed_dispatch_entries_cancelled() {
         .expect("effects should index");
 
     let cancelled = worker
-        .fleet_mut()
         .cancel_run_dispatches(&run_id)
         .await
         .expect("cancellation pass should succeed");
     assert_eq!(cancelled.cancelled_entries, 2);
     assert_eq!(cancelled.in_flight_entries, 0);
+    assert_eq!(cancelled.cancelled_effect_ids.len(), 2);
     assert!(worker
         .claim_due()
         .await
@@ -713,6 +713,22 @@ async fn cancellation_marks_unclaimed_dispatch_entries_cancelled() {
         .entries()
         .values()
         .all(|entry| entry.status == AgentDispatchStatus::Cancelled));
+    assert_outbox_status(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        "effect-cancel-model",
+        OutboxStatus::Cancelled,
+    )
+    .await;
+    assert_outbox_status(
+        &workflow_store,
+        &clock,
+        run_id,
+        "effect-cancel-tool",
+        OutboxStatus::Cancelled,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -754,12 +770,12 @@ async fn cancellation_annotates_active_claims_without_erasing_durable_request() 
         .expect("one claim should be issued");
 
     let cancelled = worker
-        .fleet_mut()
         .cancel_run_dispatches(&run_id)
         .await
         .expect("cancellation pass should succeed");
     assert_eq!(cancelled.cancelled_entries, 0);
     assert_eq!(cancelled.in_flight_entries, 1);
+    assert!(cancelled.cancelled_effect_ids.is_empty());
     let entry = worker
         .fleet()
         .state()
@@ -767,13 +783,7 @@ async fn cancellation_annotates_active_claims_without_erasing_durable_request() 
         .entry(&claim.dispatch_id)
         .expect("entry should exist");
     assert_eq!(entry.status, AgentDispatchStatus::Claimed);
-    assert_eq!(
-        entry
-            .attributes
-            .get("cancellation_requested")
-            .map(String::as_str),
-        Some("true")
-    );
+    assert!(entry.cancellation_requested);
 
     let mut dispatcher = RecordingDispatcher::new([OutboxDispatchResult::Success]);
     let completion = worker
@@ -787,6 +797,129 @@ async fn cancellation_annotates_active_claims_without_erasing_durable_request() 
         run_id,
         effect_id,
         OutboxStatus::Dispatched,
+    )
+    .await;
+}
+
+#[test]
+fn kind_incompatible_target_class_refinement_falls_back_to_kind_class() {
+    let http_with_tool_label = AgentEffectTarget {
+        target_type: "http".to_string(),
+        name: "billing-api".to_string(),
+        address: Some("https://example.com/billing".to_string()),
+        attributes: BTreeMap::from([("target_class".to_string(), "tool".to_string())]),
+    };
+    assert_eq!(
+        AgentDispatchTargetClass::classify(AgentEffectKind::HttpCall, &http_with_tool_label),
+        AgentDispatchTargetClass::Http
+    );
+
+    let notification_with_peer_label = AgentEffectTarget {
+        target_type: "notification".to_string(),
+        name: "ops-alert".to_string(),
+        address: None,
+        attributes: BTreeMap::from([("target_class".to_string(), "a2a-peer".to_string())]),
+    };
+    assert_eq!(
+        AgentDispatchTargetClass::classify(
+            AgentEffectKind::Notification,
+            &notification_with_peer_label
+        ),
+        AgentDispatchTargetClass::Notification
+    );
+
+    let http_with_peer_label = AgentEffectTarget {
+        target_type: "http".to_string(),
+        name: "billing-agent".to_string(),
+        address: Some("https://example.com/peer".to_string()),
+        attributes: BTreeMap::from([("target_class".to_string(), "a2a-peer".to_string())]),
+    };
+    assert_eq!(
+        AgentDispatchTargetClass::classify(AgentEffectKind::HttpCall, &http_with_peer_label),
+        AgentDispatchTargetClass::A2aPeer
+    );
+}
+
+#[tokio::test]
+async fn cancelled_in_flight_dispatch_is_not_reclaimed_after_lease_expiry() {
+    let workflow_store = WorkflowStore::new();
+    let fleet_store = FleetStore::new();
+    let clock = ManualWorkflowClock::new(WorkflowTimestamp::from_millis(100));
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let run_id = AgentRunId::new("run-dispatch-cancel-crashed-worker");
+    let effect_id = "effect-cancel-crashed-worker";
+
+    schedule_effect(
+        &workflow_store,
+        &clock,
+        run_id.clone(),
+        effect(effect_id, AgentEffectKind::ToolCall, "tool", "search", 100),
+    )
+    .await;
+
+    let mut worker = worker(
+        "dispatcher-cancel-crashed",
+        fleet_store,
+        workflow_store.clone(),
+        clock.clone(),
+        metrics,
+        AgentDispatcherFleetSettings::new(8, 1_000),
+    );
+    worker.recover().await.expect("fleet should recover");
+    worker
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("effect should index");
+    let claim = worker
+        .claim_due()
+        .await
+        .expect("claim should succeed")
+        .claims
+        .pop()
+        .expect("one claim should be issued");
+
+    let cancelled = worker
+        .cancel_run_dispatches(&run_id)
+        .await
+        .expect("cancellation pass should succeed");
+    assert_eq!(cancelled.in_flight_entries, 1);
+
+    // The claiming worker crashes: its lease expires without a completion.
+    clock.advance_millis(2_000);
+
+    assert!(worker
+        .claim_due()
+        .await
+        .expect("cancellation-requested entry must not be reclaimed")
+        .claims
+        .is_empty());
+
+    // The next worker refresh finalizes the cancellation and settles the
+    // durable outbox entry instead of redelivering the effect.
+    let registration = worker
+        .refresh_run(run_id.clone(), None)
+        .await
+        .expect("refresh should finalize the cancellation");
+    assert_eq!(registration.registered_effects, 0);
+    let entry = worker
+        .fleet()
+        .state()
+        .expect("fleet state")
+        .entry(&claim.dispatch_id)
+        .expect("entry should exist");
+    assert_eq!(entry.status, AgentDispatchStatus::Cancelled);
+    assert!(worker
+        .claim_due()
+        .await
+        .expect("cancelled entry must not claim")
+        .claims
+        .is_empty());
+    assert_outbox_status(
+        &workflow_store,
+        &clock,
+        run_id,
+        effect_id,
+        OutboxStatus::Cancelled,
     )
     .await;
 }

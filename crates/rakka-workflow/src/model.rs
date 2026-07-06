@@ -216,6 +216,8 @@ pub enum OutboxStatus {
     Failed,
     /// Retry budget is exhausted.
     Exhausted,
+    /// Dispatch was cancelled before completion.
+    Cancelled,
 }
 
 /// Retry attempt metadata shared by inbox and outbox entries.
@@ -615,8 +617,17 @@ impl OutboxEntry {
                 .next_retry_at()
                 .is_some_and(|next| next <= now),
             OutboxStatus::Dispatching => true,
-            OutboxStatus::Dispatched | OutboxStatus::Exhausted => false,
+            OutboxStatus::Dispatched | OutboxStatus::Exhausted | OutboxStatus::Cancelled => false,
         }
+    }
+
+    /// Returns true when this entry can still be cancelled.
+    #[must_use]
+    pub const fn is_cancellable(&self) -> bool {
+        matches!(
+            self.status,
+            OutboxStatus::Pending | OutboxStatus::Dispatching | OutboxStatus::Failed
+        )
     }
 
     pub(crate) fn set_status(&mut self, status: OutboxStatus, now: WorkflowTimestamp) {
@@ -626,6 +637,10 @@ impl OutboxEntry {
 
     pub(crate) fn mark_dispatched(&mut self, now: WorkflowTimestamp) {
         self.set_status(OutboxStatus::Dispatched, now);
+    }
+
+    pub(crate) fn mark_cancelled(&mut self, now: WorkflowTimestamp) {
+        self.set_status(OutboxStatus::Cancelled, now);
     }
 
     pub(crate) fn record_failure(
@@ -703,6 +718,15 @@ pub enum WorkflowTelemetryEvent {
         /// Total attempts made.
         attempts: u32,
         /// Failure detail.
+        message: String,
+    },
+    /// Outbox dispatch was cancelled before completion.
+    OutboxDispatchCancelled {
+        /// Outbox message id.
+        message_id: OutboxMessageId,
+        /// Cancellation timestamp.
+        at: WorkflowTimestamp,
+        /// Cancellation detail.
         message: String,
     },
 }
@@ -980,7 +1004,7 @@ impl WorkflowState {
             .filter(|(_message_id, entry)| {
                 matches!(
                     entry.status(),
-                    OutboxStatus::Dispatched | OutboxStatus::Exhausted
+                    OutboxStatus::Dispatched | OutboxStatus::Exhausted | OutboxStatus::Cancelled
                 ) && should_remove_terminal_workflow_entry(
                     entry.updated_at(),
                     policy.completed_outbox_entry_retention_ms,
