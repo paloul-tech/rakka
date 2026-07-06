@@ -63,6 +63,10 @@ const STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// events. Owner-held tasks broadcast locally; this poll is the live-update
 /// path for streams served from other public nodes.
 const STREAM_OWNER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Consecutive owner-poll failures tolerated before a stream ends with
+/// reconnect guidance; a single transient blip must not tear down every
+/// subscriber for a task.
+const MAX_STREAM_POLL_FAILURES: usize = 3;
 const REPLAY_CURSOR_HEADER: &str = "rakka-a2a-replay-cursor";
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 /// Bound on optimistic-concurrency re-drives for inbox accepts and run
@@ -419,9 +423,19 @@ impl RakkaA2ARequestHandler {
 
     async fn schedule_push_effects(
         &self,
+        tenant: &str,
+        task_id: &str,
         events: &[A2ATaskEvent],
     ) -> Result<(), RakkaA2AHandlerError> {
-        schedule_push_effects_for_events(&self.workflow_store, &self.push_configs, events).await?;
+        schedule_push_effects_for_events(
+            &self.workflow_store,
+            &self.push_configs,
+            &self.task_store,
+            tenant,
+            task_id,
+            events,
+        )
+        .await?;
         Ok(())
     }
 
@@ -681,6 +695,7 @@ impl RakkaA2ARequestHandler {
             limits: self.stream_limits.clone(),
             router: self.router.clone(),
             poll_owner_now,
+            poll_failures: 0,
             last_emitted: Instant::now(),
             _lease: lease,
             done: false,
@@ -778,7 +793,15 @@ impl RakkaA2ARequestHandler {
             &run_state,
             received_at,
         )?;
-        self.schedule_push_effects(&events).await?;
+        // Runs even when this retry emitted nothing new: the scheduler works
+        // from its watermark over the retained log, so a retry heals a push
+        // schedule that failed after the original acceptance.
+        self.schedule_push_effects(
+            draft.normalized.tenant.as_str(),
+            &draft.normalized.task_id,
+            &events,
+        )
+        .await?;
         let task = self.task_store.get(
             Some(draft.normalized.tenant.as_str()),
             &draft.normalized.task_id,
@@ -826,16 +849,21 @@ impl RakkaA2ARequestHandler {
             // Converge the projection to the terminal truth before rejecting
             // so a follow-up read observes the final state, then answer with
             // the protocol's canonical error for terminal cancels.
-            let event = sync_status_projection(
+            let events: Vec<A2ATaskEvent> = sync_status_projection(
                 &self.task_store,
                 &run_state,
                 &draft.normalized.context_id,
                 received_at,
                 None,
-            )?;
-            if let Some(event) = event {
-                self.schedule_push_effects(&[event]).await?;
-            }
+            )?
+            .into_iter()
+            .collect();
+            self.schedule_push_effects(
+                draft.normalized.tenant.as_str(),
+                &draft.normalized.task_id,
+                &events,
+            )
+            .await?;
             return Err(RakkaA2AHandlerError::TaskNotCancelable {
                 task_id: draft.normalized.task_id.clone(),
             });
@@ -848,16 +876,21 @@ impl RakkaA2ARequestHandler {
         run_state = self
             .apply_cancellation(&mut runner, run_state, received_at)
             .await?;
-        let event = sync_status_projection(
+        let events: Vec<A2ATaskEvent> = sync_status_projection(
             &self.task_store,
             &run_state,
             &draft.normalized.context_id,
             received_at,
             None,
-        )?;
-        if let Some(event) = event {
-            self.schedule_push_effects(&[event]).await?;
-        }
+        )?
+        .into_iter()
+        .collect();
+        self.schedule_push_effects(
+            draft.normalized.tenant.as_str(),
+            &draft.normalized.task_id,
+            &events,
+        )
+        .await?;
         self.task_store
             .get(
                 Some(draft.normalized.tenant.as_str()),
@@ -1415,6 +1448,10 @@ struct A2AStreamState {
     /// Poll the owner before waiting on the local watcher (set on open with
     /// a client cursor, and after every watcher timeout in clustered mode).
     poll_owner_now: bool,
+    /// Consecutive owner-poll failures; reset on any successful poll. Owner
+    /// churn (rebalance, passivation, one ask timeout) is cluster-normal, so
+    /// a single failed poll must not end the stream.
+    poll_failures: usize,
     /// When the last item was returned; paces heartbeats between owner polls.
     last_emitted: Instant,
     _lease: A2AStreamLease,
@@ -1506,6 +1543,7 @@ async fn poll_owner_events(state: &mut A2AStreamState) -> Option<Result<StreamRe
     };
     match outcome {
         Ok((projection, events, resync)) => {
+            state.poll_failures = 0;
             if resync {
                 // The owner cannot resume from this cursor (owner moved or
                 // the window compacted); re-bootstrap from its snapshot.
@@ -1528,6 +1566,13 @@ async fn poll_owner_events(state: &mut A2AStreamState) -> Option<Result<StreamRe
             first
         }
         Err(_) => {
+            state.poll_failures += 1;
+            if state.poll_failures < MAX_STREAM_POLL_FAILURES {
+                // Transient owner churn (rebalance, passivation, one ask
+                // timeout); retry on the next poll interval instead of
+                // ending the stream.
+                return None;
+            }
             state.limits.record_dropped();
             Some(Err(A2AError::internal(
                 "a2a-stream-owner-unavailable: task owner is unavailable; \

@@ -468,7 +468,18 @@ where
         &run_state,
         received_at,
     )?;
-    schedule_push_effects_for_events(workflow_store, push_configs, &events).await?;
+    // Runs even when this retry emitted nothing new: the scheduler works
+    // from its watermark over the retained log, so a retry heals a push
+    // schedule that failed after the original acceptance.
+    schedule_push_effects_for_events(
+        workflow_store,
+        push_configs,
+        task_store,
+        draft.normalized.tenant.as_str(),
+        &draft.normalized.task_id,
+        &events,
+    )
+    .await?;
     task_store
         .projection(
             Some(draft.normalized.tenant.as_str()),
@@ -496,15 +507,24 @@ where
         return Err(missing_run(&draft.normalized.task_id));
     }
     if run_is_terminal(run_state.status) {
-        if let Some(event) = sync_status_projection(
+        let events: Vec<A2ATaskEvent> = sync_status_projection(
             task_store,
             &run_state,
             &draft.normalized.context_id,
             received_at,
             None,
-        )? {
-            schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
-        }
+        )?
+        .into_iter()
+        .collect();
+        schedule_push_effects_for_events(
+            workflow_store,
+            push_configs,
+            task_store,
+            draft.normalized.tenant.as_str(),
+            &draft.normalized.task_id,
+            &events,
+        )
+        .await?;
         return Err(RakkaA2AHandlerError::TaskNotCancelable {
             task_id: draft.normalized.task_id.clone(),
         });
@@ -512,15 +532,24 @@ where
     validate_inbox_collision(workflow_store, &draft, true).await?;
     accept_child_command(child, draft.command.clone()).await?;
     run_state = apply_cancellation(child, run_state, received_at).await?;
-    if let Some(event) = sync_status_projection(
+    let events: Vec<A2ATaskEvent> = sync_status_projection(
         task_store,
         &run_state,
         &draft.normalized.context_id,
         received_at,
         None,
-    )? {
-        schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
-    }
+    )?
+    .into_iter()
+    .collect();
+    schedule_push_effects_for_events(
+        workflow_store,
+        push_configs,
+        task_store,
+        draft.normalized.tenant.as_str(),
+        &draft.normalized.task_id,
+        &events,
+    )
+    .await?;
     task_store
         .projection(
             Some(draft.normalized.tenant.as_str()),
@@ -556,34 +585,43 @@ where
     // Convergence on the read path emits real public events (a transition can
     // be observed here first, e.g. a step that completed with no follow-up
     // command), so those events must schedule push effects like any other.
-    match task_store.projection(Some(tenant), run_id.as_str()) {
-        Ok(projection) => {
-            if let Some(event) = sync_status_projection(
-                task_store,
-                &run_state,
-                &projection.context_id,
-                run_state.updated_at,
-                Some(projection.status),
-            )? {
-                schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
-            }
-        }
+    let emitted: Vec<A2ATaskEvent> = match task_store.projection(Some(tenant), run_id.as_str()) {
+        Ok(projection) => sync_status_projection(
+            task_store,
+            &run_state,
+            &projection.context_id,
+            run_state.updated_at,
+            Some(projection.status),
+        )?
+        .into_iter()
+        .collect(),
         Err(TaskProjectionError::TaskNotFound { .. }) => {
             let context_id = recover_context_id(workflow_store, run_id)
                 .await?
                 .unwrap_or_else(|| run_id.as_str().to_string());
-            let event = snapshot_projection(
+            vec![snapshot_projection(
                 task_store,
                 &run_state,
                 &context_id,
                 Vec::new(),
                 Vec::new(),
                 run_state.updated_at,
-            )?;
-            schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
+            )?]
         }
         Err(error) => return Err(error.into()),
-    }
+    };
+    // Unconditional: a read also heals push schedules that failed on an
+    // earlier request (e.g. a terminal event whose scheduling errored), via
+    // the scheduler's watermark over the retained log.
+    schedule_push_effects_for_events(
+        workflow_store,
+        push_configs,
+        task_store,
+        tenant,
+        run_id.as_str(),
+        &emitted,
+    )
+    .await?;
 
     task_store
         .projection(Some(tenant), run_id.as_str())

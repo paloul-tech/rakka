@@ -1,8 +1,10 @@
 //! Durable A2A push notification configuration and outbox scheduling.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use a2a::{
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
@@ -20,7 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable_stores::PushConfigStore;
 use crate::support::{current_timestamp_millis, hex_encode};
-use crate::task_projection::{A2ATaskEvent, A2ATaskEventRedaction};
+use crate::task_projection::{
+    encode_replay_cursor, A2ATaskEvent, A2ATaskEventRedaction, InMemoryA2ATaskProjectionStore,
+};
 
 const PUSH_CONFIG_PERSISTENCE_PREFIX: &str = "a2a-push-config";
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -166,11 +170,38 @@ pub(crate) enum A2APushConfigAuditKind {
 #[derive(Debug, Clone)]
 pub(crate) struct A2APushConfigStore {
     store: PushConfigStore,
+    /// Highest event sequence per (tenant, task id) whose push effects were
+    /// durably scheduled (or confirmed unnecessary). Node-local memory: on
+    /// loss the retained event log is re-offered and the durable
+    /// deduplication keys drop anything scheduled twice.
+    scheduled: Arc<Mutex<BTreeMap<(String, String), u64>>>,
 }
 
 impl A2APushConfigStore {
     pub(crate) fn new(store: PushConfigStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            scheduled: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn scheduled_watermark(&self, tenant: &str, task_id: &str) -> u64 {
+        self.scheduled
+            .lock()
+            .expect("push watermark mutex")
+            .get(&(tenant.to_string(), task_id.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Overwrites (rather than maxes) the watermark: event sequences restart
+    /// per owner epoch, so tracking the current epoch's tail is correct and
+    /// a stale higher value would skip real events forever.
+    fn record_scheduled_watermark(&self, tenant: &str, task_id: &str, sequence: u64) {
+        self.scheduled
+            .lock()
+            .expect("push watermark mutex")
+            .insert((tenant.to_string(), task_id.to_string()), sequence);
     }
 
     pub(crate) async fn save(
@@ -361,35 +392,59 @@ impl A2APushConfigStore {
 /// concurrent writer, so the bound is a livelock guard.
 const MAX_PUSH_SCHEDULE_REDRIVES: usize = 3;
 
-/// Schedules push notification effects for a batch of public task events.
+/// Schedules push notification effects for a task's public events.
 ///
-/// Every event in a batch belongs to the same task, so one config scan and
-/// one workflow inbox recovery serve the whole batch. Revision conflicts
-/// with the run actor's own inbox writes are re-driven a bounded number of
-/// times; the idempotency keys derived from task id, event sequence, and
-/// config id make retried schedules deduplicate instead of double-scheduling.
+/// The unit of work is the task's event log past the store's scheduled
+/// watermark, not just `newly_emitted`: a scheduling failure on an earlier
+/// request leaves the watermark behind, so the client's retry (or any later
+/// read that converges the projection) re-offers the missed events and heals
+/// the gap. The watermark only advances on success, and the idempotency keys
+/// derived from task id, event sequence, and config id make re-offered
+/// events deduplicate instead of double-scheduling.
+///
+/// One config scan and one workflow inbox recovery serve the whole batch,
+/// and revision conflicts with the run actor's own inbox writes are
+/// re-driven a bounded number of times.
 pub(crate) async fn schedule_push_effects_for_events<WorkflowStoreT>(
     workflow_store: &WorkflowStoreT,
     push_configs: &A2APushConfigStore,
-    events: &[A2ATaskEvent],
+    task_store: &InMemoryA2ATaskProjectionStore,
+    tenant: &str,
+    task_id: &str,
+    newly_emitted: &[A2ATaskEvent],
 ) -> A2APushConfigResult<usize>
 where
     WorkflowStoreT: DurableStateStore<WorkflowState>,
 {
-    let Some(first) = events.first() else {
+    let watermark = push_configs.scheduled_watermark(tenant, task_id);
+    let cursor = encode_replay_cursor(task_id, watermark);
+    let pending = match task_store.replay_events(tenant, task_id, Some(&cursor)) {
+        Ok(events) => events,
+        // The log cannot resume from the watermark (compaction, or an owner
+        // epoch change reset the sequences). Events older than the retained
+        // window are past this example's retention policy; schedule what the
+        // caller just emitted and re-anchor the watermark to it.
+        Err(_) => newly_emitted.to_vec(),
+    };
+    let Some(last_sequence) = pending.last().map(|event| event.sequence) else {
         return Ok(0);
     };
-    let configs = push_configs
-        .active_configs(&first.tenant, &first.task_id)
-        .await?;
+
+    let configs = push_configs.active_configs(tenant, task_id).await?;
     if configs.is_empty() {
+        // Configs apply from registration onward; mark these events handled
+        // so a config added later does not receive historical events.
+        push_configs.record_scheduled_watermark(tenant, task_id, last_sequence);
         return Ok(0);
     }
 
     let mut attempts = 0;
     loop {
-        match schedule_effect_batch(workflow_store, &first.task_id, &configs, events).await {
-            Ok(scheduled) => return Ok(scheduled),
+        match schedule_effect_batch(workflow_store, task_id, &configs, &pending).await {
+            Ok(scheduled) => {
+                push_configs.record_scheduled_watermark(tenant, task_id, last_sequence);
+                return Ok(scheduled);
+            }
             Err(error)
                 if attempts < MAX_PUSH_SCHEDULE_REDRIVES && schedule_revision_conflict(&error) =>
             {
@@ -709,9 +764,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_batch_schedules_once_and_retries_deduplicate() {
+    async fn watermark_catchup_heals_missed_schedules_and_deduplicates() {
         use crate::durable_stores::WorkflowStore;
-        use crate::task_projection::A2ATaskEventPayload;
+        use crate::task_projection::{A2ATaskEventPayload, A2ATaskProjection};
 
         let store = store();
         store
@@ -719,50 +774,125 @@ mod tests {
             .await
             .expect("save config");
         let workflow_store = WorkflowStore::memory();
-        let events = vec![
-            A2ATaskEvent::new(
-                "tenant-a",
-                "task-1",
-                "ctx",
-                1,
-                AgentTimestampMillis::new(10),
-                A2ATaskEventPayload::StatusUpdate {
-                    state: a2a::TaskState::Working,
-                },
-            ),
-            A2ATaskEvent::new(
-                "tenant-a",
-                "task-1",
-                "ctx",
-                2,
-                AgentTimestampMillis::new(11),
-                A2ATaskEventPayload::Terminal {
-                    state: a2a::TaskState::Completed,
-                },
-            ),
-        ];
+        let task_store = InMemoryA2ATaskProjectionStore::local();
 
+        // Nothing recorded yet: an empty batch is a no-op.
         assert_eq!(
-            schedule_push_effects_for_events(&workflow_store, &store, &[])
-                .await
-                .expect("empty batch"),
+            schedule_push_effects_for_events(
+                &workflow_store,
+                &store,
+                &task_store,
+                "tenant-a",
+                "task-1",
+                &[],
+            )
+            .await
+            .expect("empty task"),
             0
         );
 
-        let scheduled = schedule_push_effects_for_events(&workflow_store, &store, &events)
-            .await
-            .expect("schedule batch");
-        assert_eq!(scheduled, 2);
+        // Two events land in the log as if a prior request appended them but
+        // its scheduling failed before advancing the watermark.
+        let snapshot = A2ATaskProjection::accepted(
+            "task-1",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        );
+        task_store
+            .append_event_payload(
+                "tenant-a",
+                "task-1",
+                "ctx",
+                AgentTimestampMillis::new(10),
+                A2ATaskEventPayload::Snapshot(snapshot),
+            )
+            .expect("snapshot event");
+        task_store
+            .append_event_payload(
+                "tenant-a",
+                "task-1",
+                "ctx",
+                AgentTimestampMillis::new(11),
+                A2ATaskEventPayload::StatusUpdate {
+                    state: a2a::TaskState::Working,
+                },
+            )
+            .expect("status event");
 
-        // A conflict re-drive replays the identical batch; the derived
-        // idempotency keys must deduplicate instead of double-scheduling.
-        schedule_push_effects_for_events(&workflow_store, &store, &events)
+        // A later call with nothing newly emitted (a client retry or a read)
+        // heals the gap from the retained log.
+        let caught_up = schedule_push_effects_for_events(
+            &workflow_store,
+            &store,
+            &task_store,
+            "tenant-a",
+            "task-1",
+            &[],
+        )
+        .await
+        .expect("catch up");
+        assert_eq!(caught_up, 2, "missed events must be scheduled by catch-up");
+
+        // The watermark now covers the log: repeating is a fast no-op.
+        assert_eq!(
+            schedule_push_effects_for_events(
+                &workflow_store,
+                &store,
+                &task_store,
+                "tenant-a",
+                "task-1",
+                &[],
+            )
             .await
-            .expect("retry batch");
+            .expect("no-op"),
+            0
+        );
+
+        // A new event goes through the normal path and only it is offered.
+        let terminal = task_store
+            .append_event_payload(
+                "tenant-a",
+                "task-1",
+                "ctx",
+                AgentTimestampMillis::new(12),
+                A2ATaskEventPayload::Terminal {
+                    state: a2a::TaskState::Completed,
+                },
+            )
+            .expect("terminal event");
+        let scheduled = schedule_push_effects_for_events(
+            &workflow_store,
+            &store,
+            &task_store,
+            "tenant-a",
+            "task-1",
+            &[terminal],
+        )
+        .await
+        .expect("schedule terminal");
+        assert_eq!(scheduled, 1);
+
+        // A lost watermark (process restart) re-offers the whole retained
+        // log; the durable deduplication keys drop the repeats.
+        store.record_scheduled_watermark("tenant-a", "task-1", 0);
+        schedule_push_effects_for_events(
+            &workflow_store,
+            &store,
+            &task_store,
+            "tenant-a",
+            "task-1",
+            &[],
+        )
+        .await
+        .expect("re-offer after watermark loss");
         let mut inbox = AgentRunInbox::new(AgentRunId::new("task-1"), workflow_store);
         inbox.recover().await.expect("recover");
         let due = inbox.due_effects().expect("due effects");
-        assert_eq!(due.len(), 2, "retried batch must not duplicate effects");
+        assert_eq!(due.len(), 3, "re-offered events must not duplicate effects");
     }
 
     #[test]
