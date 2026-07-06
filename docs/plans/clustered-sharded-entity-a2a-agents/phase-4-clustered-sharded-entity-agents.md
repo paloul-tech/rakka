@@ -199,8 +199,11 @@ Acceptance:
   bounded per-node/per-task stream admission and low-cardinality stream metrics.
 - `examples/clustered-sharded-entity-a2a-agents/src/push_config.rs` adds the
   durable push config store plus durable notification effect scheduling for
-  emitted public task events. Request handlers never send webhook HTTP calls
-  directly.
+  emitted public task events. Scheduling is batched per task-event batch (one
+  config scan and one workflow inbox recovery per batch) and re-drives bounded
+  times on revision conflicts with the run actor's own inbox writes, relying
+  on the derived idempotency keys to deduplicate retried schedules. Request
+  handlers never send webhook HTTP calls directly.
 - `examples/clustered-sharded-entity-a2a-agents/README.md` documents the Phase 4
   boundary and SSE/load-balancer expectations.
 

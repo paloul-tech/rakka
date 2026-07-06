@@ -8,7 +8,7 @@ use a2a::{
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
     TaskPushNotificationConfig,
 };
-use rakka::agent_workflow::substrate::WorkflowState;
+use rakka::agent_workflow::substrate::{WorkflowError, WorkflowState};
 use rakka::agent_workflow::{
     AgentAttributes, AgentCausationId, AgentCorrelationId, AgentDeduplicationKey,
     AgentDurabilityMetadata, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
@@ -355,34 +355,82 @@ impl A2APushConfigStore {
     }
 }
 
-pub(crate) async fn schedule_push_effects_for_event<WorkflowStoreT>(
+/// Bound on optimistic-concurrency re-drives for push-effect scheduling.
+/// The run actor can advance the same durable workflow state between the
+/// batch's recovery and its schedule writes; each retry requires a distinct
+/// concurrent writer, so the bound is a livelock guard.
+const MAX_PUSH_SCHEDULE_REDRIVES: usize = 3;
+
+/// Schedules push notification effects for a batch of public task events.
+///
+/// Every event in a batch belongs to the same task, so one config scan and
+/// one workflow inbox recovery serve the whole batch. Revision conflicts
+/// with the run actor's own inbox writes are re-driven a bounded number of
+/// times; the idempotency keys derived from task id, event sequence, and
+/// config id make retried schedules deduplicate instead of double-scheduling.
+pub(crate) async fn schedule_push_effects_for_events<WorkflowStoreT>(
     workflow_store: &WorkflowStoreT,
     push_configs: &A2APushConfigStore,
-    event: &A2ATaskEvent,
+    events: &[A2ATaskEvent],
 ) -> A2APushConfigResult<usize>
 where
     WorkflowStoreT: DurableStateStore<WorkflowState>,
 {
+    let Some(first) = events.first() else {
+        return Ok(0);
+    };
     let configs = push_configs
-        .active_configs(&event.tenant, &event.task_id)
+        .active_configs(&first.tenant, &first.task_id)
         .await?;
     if configs.is_empty() {
         return Ok(0);
     }
 
-    let mut inbox = AgentRunInbox::new(
-        AgentRunId::new(event.task_id.clone()),
-        workflow_store.clone(),
-    );
+    let mut attempts = 0;
+    loop {
+        match schedule_effect_batch(workflow_store, &first.task_id, &configs, events).await {
+            Ok(scheduled) => return Ok(scheduled),
+            Err(error)
+                if attempts < MAX_PUSH_SCHEDULE_REDRIVES && schedule_revision_conflict(&error) =>
+            {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn schedule_effect_batch<WorkflowStoreT>(
+    workflow_store: &WorkflowStoreT,
+    task_id: &str,
+    configs: &[TaskPushNotificationConfig],
+    events: &[A2ATaskEvent],
+) -> A2APushConfigResult<usize>
+where
+    WorkflowStoreT: DurableStateStore<WorkflowState>,
+{
+    let mut inbox =
+        AgentRunInbox::new(AgentRunId::new(task_id.to_string()), workflow_store.clone());
     inbox.recover().await?;
 
     let mut scheduled = 0;
-    for config in configs {
-        let effect = push_effect(event, &config)?;
-        inbox.schedule_effect(effect).await?;
-        scheduled += 1;
+    for event in events {
+        for config in configs {
+            let effect = push_effect(event, config)?;
+            inbox.schedule_effect(effect).await?;
+            scheduled += 1;
+        }
     }
     Ok(scheduled)
+}
+
+fn schedule_revision_conflict(error: &A2APushConfigError) -> bool {
+    matches!(
+        error,
+        A2APushConfigError::Outbox(AgentOutboxError::Workflow {
+            error: WorkflowError::RevisionConflict { .. },
+        })
+    )
 }
 
 fn push_effect(
@@ -658,5 +706,82 @@ mod tests {
         config.url = "file:///tmp/hook".to_string();
         let error = store.save("tenant-a", config).await.expect_err("invalid");
         assert_eq!(error.code(), "invalid-push-config");
+    }
+
+    #[tokio::test]
+    async fn event_batch_schedules_once_and_retries_deduplicate() {
+        use crate::durable_stores::WorkflowStore;
+        use crate::task_projection::A2ATaskEventPayload;
+
+        let store = store();
+        store
+            .save("tenant-a", config("task-1", "cfg-1"))
+            .await
+            .expect("save config");
+        let workflow_store = WorkflowStore::memory();
+        let events = vec![
+            A2ATaskEvent::new(
+                "tenant-a",
+                "task-1",
+                "ctx",
+                1,
+                AgentTimestampMillis::new(10),
+                A2ATaskEventPayload::StatusUpdate {
+                    state: a2a::TaskState::Working,
+                },
+            ),
+            A2ATaskEvent::new(
+                "tenant-a",
+                "task-1",
+                "ctx",
+                2,
+                AgentTimestampMillis::new(11),
+                A2ATaskEventPayload::Terminal {
+                    state: a2a::TaskState::Completed,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            schedule_push_effects_for_events(&workflow_store, &store, &[])
+                .await
+                .expect("empty batch"),
+            0
+        );
+
+        let scheduled = schedule_push_effects_for_events(&workflow_store, &store, &events)
+            .await
+            .expect("schedule batch");
+        assert_eq!(scheduled, 2);
+
+        // A conflict re-drive replays the identical batch; the derived
+        // idempotency keys must deduplicate instead of double-scheduling.
+        schedule_push_effects_for_events(&workflow_store, &store, &events)
+            .await
+            .expect("retry batch");
+        let mut inbox = AgentRunInbox::new(AgentRunId::new("task-1"), workflow_store);
+        inbox.recover().await.expect("recover");
+        let due = inbox.due_effects().expect("due effects");
+        assert_eq!(due.len(), 2, "retried batch must not duplicate effects");
+    }
+
+    #[test]
+    fn only_revision_conflicts_are_redriven() {
+        use rakka::agent_workflow::substrate::WorkflowId;
+        use rakka::persistence::Revision;
+
+        let conflict = A2APushConfigError::Outbox(AgentOutboxError::Workflow {
+            error: WorkflowError::RevisionConflict {
+                workflow_id: WorkflowId::new("task-1"),
+                expected: Revision::INITIAL,
+                actual: Revision::INITIAL,
+            },
+        });
+        assert!(schedule_revision_conflict(&conflict));
+
+        let other = A2APushConfigError::InvalidPageToken {
+            token: "x".to_string(),
+        };
+        assert!(!schedule_revision_conflict(&other));
     }
 }

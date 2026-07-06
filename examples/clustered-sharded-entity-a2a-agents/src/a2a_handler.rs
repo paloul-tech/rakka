@@ -46,7 +46,9 @@ use crate::protocol::{
     A2AProjectionHints, A2ARunCommandMetadata, A2ARunFailureKind, A2ARunRequest, A2ARunRequestKind,
     A2ARunResponse, A2ARunResponseKind, A2ATimeoutPolicy, A2A_RUN_PROTOCOL_VERSION,
 };
-use crate::push_config::{schedule_push_effects_for_event, A2APushConfigError, A2APushConfigStore};
+use crate::push_config::{
+    schedule_push_effects_for_events, A2APushConfigError, A2APushConfigStore,
+};
 use crate::reachability::PeerReachability;
 use crate::sharded_run_entity::A2ARunEntityCommand;
 use crate::stream_limits::{A2AStreamLease, A2AStreamLimitError, A2AStreamLimits};
@@ -419,10 +421,7 @@ impl RakkaA2ARequestHandler {
         &self,
         events: &[A2ATaskEvent],
     ) -> Result<(), RakkaA2AHandlerError> {
-        for event in events {
-            schedule_push_effects_for_event(&self.workflow_store, &self.push_configs, event)
-                .await?;
-        }
+        schedule_push_effects_for_events(&self.workflow_store, &self.push_configs, events).await?;
         Ok(())
     }
 
@@ -442,16 +441,19 @@ impl RakkaA2ARequestHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, RakkaA2AHandlerError> {
+        let received_at = now_agent_timestamp();
         let draft = build_send_message_command_draft(
             params,
             &req,
             &self.workflow,
             A2APayloadPolicy::default().without_artifact_strategy(),
-            now_agent_timestamp(),
+            received_at,
         )?;
         let tenant = draft.normalized.tenant.as_str().to_string();
         let task_id = draft.normalized.task_id.clone();
-        let _response = self.send_message_impl(params, req).await?;
+        let _response = self
+            .send_message_with_draft(req, draft, received_at)
+            .await?;
         let projection = self.task_store.projection(Some(&tenant), &task_id)?;
         self.stream_task(tenant, task_id, None, true, projection)
     }
@@ -699,6 +701,17 @@ impl RakkaA2ARequestHandler {
             A2APayloadPolicy::default().without_artifact_strategy(),
             received_at,
         )?;
+        self.send_message_with_draft(req, draft, received_at).await
+    }
+
+    /// Accepts a send whose command draft the caller already built, so the
+    /// streaming path normalizes the request exactly once.
+    async fn send_message_with_draft(
+        &self,
+        req: SendMessageRequest,
+        draft: A2ACommandDraft,
+        received_at: AgentTimestampMillis,
+    ) -> Result<SendMessageResponse, RakkaA2AHandlerError> {
         if let Some(router) = &self.router {
             let tenant = draft.normalized.tenant.as_str().to_string();
             let request = A2ARunRequest::new(
@@ -813,7 +826,8 @@ impl RakkaA2ARequestHandler {
             // Converge the projection to the terminal truth before rejecting
             // so a follow-up read observes the final state, then answer with
             // the protocol's canonical error for terminal cancels.
-            let event = self.sync_status_projection(
+            let event = sync_status_projection(
+                &self.task_store,
                 &run_state,
                 &draft.normalized.context_id,
                 received_at,
@@ -834,7 +848,8 @@ impl RakkaA2ARequestHandler {
         run_state = self
             .apply_cancellation(&mut runner, run_state, received_at)
             .await?;
-        let event = self.sync_status_projection(
+        let event = sync_status_projection(
+            &self.task_store,
             &run_state,
             &draft.normalized.context_id,
             received_at,
@@ -878,7 +893,10 @@ impl RakkaA2ARequestHandler {
                 .recover_context_id(&run_id)
                 .await?
                 .unwrap_or_else(|| state.run_id.as_str().to_string());
-            let _ = self.snapshot_projection(
+            // Boot recovery rebuilds caches for already-durable state; it is
+            // not a new transition, so no push effects are scheduled.
+            let _ = snapshot_projection(
+                &self.task_store,
                 &state,
                 &context_id,
                 Vec::new(),
@@ -1097,135 +1115,153 @@ impl RakkaA2ARequestHandler {
         run_state: &AgentRunState,
         now: AgentTimestampMillis,
     ) -> Result<Vec<A2ATaskEvent>, RakkaA2AHandlerError> {
-        let tenant = draft.normalized.tenant.as_str();
-        let mut events = Vec::new();
-        match self
-            .task_store
-            .projection(Some(tenant), &draft.normalized.task_id)
-        {
-            Ok(projection) => {
-                // The message is appended by history presence, not by fresh
-                // acceptance: a durably accepted command whose projection
-                // write was lost must be healed by its retry, while ordinary
-                // duplicates find their message already recorded. (A message
-                // evicted from the bounded history would be re-appended by a
-                // very late duplicate; acceptable for this local example.)
-                let already_projected = projection
-                    .history
-                    .iter()
-                    .any(|recorded| recorded.message_id == message.message_id);
-                if !already_projected {
-                    events.push(self.task_store.append_event_payload(
-                        tenant,
-                        &draft.normalized.task_id,
-                        &draft.normalized.context_id,
-                        now,
-                        A2ATaskEventPayload::MessageUpdate {
-                            message: message.clone(),
-                        },
-                    )?);
-                }
-                if let Some(event) = self.sync_status_projection(
-                    run_state,
+        project_send_result(&self.task_store, draft, message, artifacts, run_state, now)
+    }
+}
+
+/// Projects a durably accepted send into the task store, returning the
+/// public events it emitted. Shared by the local handler and the sharded
+/// owner entity so both paths produce identical event streams.
+pub(crate) fn project_send_result(
+    task_store: &InMemoryA2ATaskProjectionStore,
+    draft: &A2ACommandDraft,
+    message: &Message,
+    artifacts: Vec<ArtifactRef>,
+    run_state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> Result<Vec<A2ATaskEvent>, RakkaA2AHandlerError> {
+    let tenant = draft.normalized.tenant.as_str();
+    let mut events = Vec::new();
+    match task_store.projection(Some(tenant), &draft.normalized.task_id) {
+        Ok(projection) => {
+            // The message is appended by history presence, not by fresh
+            // acceptance: a durably accepted command whose projection
+            // write was lost must be healed by its retry, while ordinary
+            // duplicates find their message already recorded. (A message
+            // evicted from the bounded history would be re-appended by a
+            // very late duplicate; acceptable for this local example.)
+            let already_projected = projection
+                .history
+                .iter()
+                .any(|recorded| recorded.message_id == message.message_id);
+            if !already_projected {
+                events.push(task_store.append_event_payload(
+                    tenant,
+                    &draft.normalized.task_id,
                     &draft.normalized.context_id,
                     now,
-                    Some(projection.status),
-                )? {
-                    events.push(event);
-                }
-                Ok(events)
-            }
-            Err(TaskProjectionError::TaskNotFound { .. }) => {
-                events.push(self.snapshot_projection(
-                    run_state,
-                    &draft.normalized.context_id,
-                    vec![message.clone()],
-                    artifacts,
-                    now,
+                    A2ATaskEventPayload::MessageUpdate {
+                        message: message.clone(),
+                    },
                 )?);
-                Ok(events)
             }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Brings the task projection in line with durable run state, creating it
-    /// when missing and appending a status event only when the public task
-    /// state actually changed. `current_status` skips the projection read
-    /// when the caller already holds it.
-    fn sync_status_projection(
-        &self,
-        run_state: &AgentRunState,
-        context_id: &str,
-        now: AgentTimestampMillis,
-        current_status: Option<TaskState>,
-    ) -> Result<Option<A2ATaskEvent>, RakkaA2AHandlerError> {
-        let tenant = run_tenant(run_state);
-        let state = task_state(run_state.status);
-        let current = match current_status {
-            Some(status) => status,
-            None => match self
-                .task_store
-                .projection(Some(&tenant), run_state.run_id.as_str())
-            {
-                Ok(projection) => projection.status,
-                Err(TaskProjectionError::TaskNotFound { .. }) => {
-                    return self
-                        .snapshot_projection(run_state, context_id, Vec::new(), Vec::new(), now)
-                        .map(Some);
-                }
-                Err(error) => return Err(error.into()),
-            },
-        };
-        if current == state {
-            return Ok(None);
-        }
-        // The shared no-regression rule (also enforced inside apply_event)
-        // is checked here first so a disallowed transition — e.g. from a
-        // stale run-state snapshot — appends no event at all.
-        if !status_transition_allowed(&current, &state) {
-            return Ok(None);
-        }
-        let payload = if state.is_terminal() {
-            A2ATaskEventPayload::Terminal { state }
-        } else {
-            A2ATaskEventPayload::StatusUpdate { state }
-        };
-        self.task_store
-            .append_event_payload(
-                tenant.as_str(),
-                run_state.run_id.as_str(),
-                context_id,
+            if let Some(event) = sync_status_projection(
+                task_store,
+                run_state,
+                &draft.normalized.context_id,
                 now,
-                payload,
-            )
-            .map(Some)
-            .map_err(Into::into)
-    }
-
-    fn snapshot_projection(
-        &self,
-        run_state: &AgentRunState,
-        context_id: &str,
-        history: Vec<Message>,
-        artifacts: Vec<ArtifactRef>,
-        now: AgentTimestampMillis,
-    ) -> Result<A2ATaskEvent, RakkaA2AHandlerError> {
-        let projection =
-            A2ATaskProjection::from_run_state(run_state, context_id, history, artifacts, 0);
-        let tenant = projection.tenant.clone();
-        let task_id = projection.task_id.clone();
-        let context_id = projection.context_id.clone();
-        self.task_store
-            .append_event_payload(
-                tenant,
-                task_id,
-                context_id,
+                Some(projection.status),
+            )? {
+                events.push(event);
+            }
+            Ok(events)
+        }
+        Err(TaskProjectionError::TaskNotFound { .. }) => {
+            events.push(snapshot_projection(
+                task_store,
+                run_state,
+                &draft.normalized.context_id,
+                vec![message.clone()],
+                artifacts,
                 now,
-                A2ATaskEventPayload::Snapshot(projection),
-            )
-            .map_err(Into::into)
+            )?);
+            Ok(events)
+        }
+        Err(error) => Err(error.into()),
     }
+}
+
+/// Brings the task projection in line with durable run state, creating it
+/// when missing and appending a status event only when the public task
+/// state actually changed. `current_status` skips the projection read
+/// when the caller already holds it.
+pub(crate) fn sync_status_projection(
+    task_store: &InMemoryA2ATaskProjectionStore,
+    run_state: &AgentRunState,
+    context_id: &str,
+    now: AgentTimestampMillis,
+    current_status: Option<TaskState>,
+) -> Result<Option<A2ATaskEvent>, RakkaA2AHandlerError> {
+    let tenant = run_tenant(run_state);
+    let state = task_state(run_state.status);
+    let current = match current_status {
+        Some(status) => status,
+        None => match task_store.projection(Some(&tenant), run_state.run_id.as_str()) {
+            Ok(projection) => projection.status,
+            Err(TaskProjectionError::TaskNotFound { .. }) => {
+                return snapshot_projection(
+                    task_store,
+                    run_state,
+                    context_id,
+                    Vec::new(),
+                    Vec::new(),
+                    now,
+                )
+                .map(Some);
+            }
+            Err(error) => return Err(error.into()),
+        },
+    };
+    if current == state {
+        return Ok(None);
+    }
+    // The shared no-regression rule (also enforced inside apply_event)
+    // is checked here first so a disallowed transition — e.g. from a
+    // stale run-state snapshot — appends no event at all.
+    if !status_transition_allowed(&current, &state) {
+        return Ok(None);
+    }
+    let payload = if state.is_terminal() {
+        A2ATaskEventPayload::Terminal { state }
+    } else {
+        A2ATaskEventPayload::StatusUpdate { state }
+    };
+    task_store
+        .append_event_payload(
+            tenant.as_str(),
+            run_state.run_id.as_str(),
+            context_id,
+            now,
+            payload,
+        )
+        .map(Some)
+        .map_err(Into::into)
+}
+
+/// Appends a snapshot event rebuilt from durable run state, bootstrapping
+/// the projection for tasks the local store has not seen.
+pub(crate) fn snapshot_projection(
+    task_store: &InMemoryA2ATaskProjectionStore,
+    run_state: &AgentRunState,
+    context_id: &str,
+    history: Vec<Message>,
+    artifacts: Vec<ArtifactRef>,
+    now: AgentTimestampMillis,
+) -> Result<A2ATaskEvent, RakkaA2AHandlerError> {
+    let projection =
+        A2ATaskProjection::from_run_state(run_state, context_id, history, artifacts, 0);
+    let tenant = projection.tenant.clone();
+    let task_id = projection.task_id.clone();
+    let context_id = projection.context_id.clone();
+    task_store
+        .append_event_payload(
+            tenant,
+            task_id,
+            context_id,
+            now,
+            A2ATaskEventPayload::Snapshot(projection),
+        )
+        .map_err(Into::into)
 }
 
 /// Validates a send request's lifecycle intent against recovered run state.
@@ -1504,29 +1540,14 @@ async fn poll_owner_events(state: &mut A2AStreamState) -> Option<Result<StreamRe
 fn stream_cursor_from_response(
     response: A2ARunResponse,
 ) -> Result<(A2ATaskProjection, Vec<A2ATaskEvent>, bool), RakkaA2AHandlerError> {
-    if response.version != A2A_RUN_PROTOCOL_VERSION {
-        return Err(RakkaA2AHandlerError::InvalidLifecycle {
-            task_id: response.task_id,
-            reason: "owner response protocol version mismatch",
-        });
-    }
-    match response.outcome {
+    let (task_id, outcome) = owner_response_outcome(response)?;
+    match outcome {
         A2ARunResponseKind::StreamCursor {
             projection,
             events,
             resync,
         } => Ok((projection, events, resync)),
-        A2ARunResponseKind::Failure { failure } => Err(owner_failure_error(
-            &response.task_id,
-            failure.kind,
-            failure.message,
-        )),
-        A2ARunResponseKind::TaskSnapshot { .. }
-        | A2ARunResponseKind::PushConfigRecorded { .. }
-        | A2ARunResponseKind::PushConfigDeleted => Err(RakkaA2AHandlerError::InvalidLifecycle {
-            task_id: response.task_id,
-            reason: "owner returned an unexpected response kind",
-        }),
+        _ => Err(unexpected_owner_response(task_id)),
     }
 }
 
@@ -1797,9 +1818,13 @@ fn projection_hints(history_length: Option<i32>) -> A2AProjectionHints {
     A2AProjectionHints::new(history_length, true)
 }
 
-fn projection_from_response(
+/// Validates the owner protocol version and maps owner-side failures,
+/// returning the successful outcome for the caller to match. Shared by
+/// every owner-response decoder so version and failure handling cannot
+/// drift between response kinds.
+fn owner_response_outcome(
     response: A2ARunResponse,
-) -> Result<A2ATaskProjection, RakkaA2AHandlerError> {
+) -> Result<(String, A2ARunResponseKind), RakkaA2AHandlerError> {
     if response.version != A2A_RUN_PROTOCOL_VERSION {
         return Err(RakkaA2AHandlerError::InvalidLifecycle {
             task_id: response.task_id,
@@ -1807,68 +1832,47 @@ fn projection_from_response(
         });
     }
     match response.outcome {
-        A2ARunResponseKind::TaskSnapshot { projection } => Ok(projection),
         A2ARunResponseKind::Failure { failure } => Err(owner_failure_error(
             &response.task_id,
             failure.kind,
             failure.message,
         )),
-        A2ARunResponseKind::StreamCursor { .. }
-        | A2ARunResponseKind::PushConfigRecorded { .. }
-        | A2ARunResponseKind::PushConfigDeleted => Err(RakkaA2AHandlerError::InvalidLifecycle {
-            task_id: response.task_id,
-            reason: "owner returned an unexpected response kind",
-        }),
+        outcome => Ok((response.task_id, outcome)),
+    }
+}
+
+fn unexpected_owner_response(task_id: String) -> RakkaA2AHandlerError {
+    RakkaA2AHandlerError::InvalidLifecycle {
+        task_id,
+        reason: "owner returned an unexpected response kind",
+    }
+}
+
+fn projection_from_response(
+    response: A2ARunResponse,
+) -> Result<A2ATaskProjection, RakkaA2AHandlerError> {
+    let (task_id, outcome) = owner_response_outcome(response)?;
+    match outcome {
+        A2ARunResponseKind::TaskSnapshot { projection } => Ok(projection),
+        _ => Err(unexpected_owner_response(task_id)),
     }
 }
 
 fn push_config_from_response(
     response: A2ARunResponse,
 ) -> Result<TaskPushNotificationConfig, RakkaA2AHandlerError> {
-    if response.version != A2A_RUN_PROTOCOL_VERSION {
-        return Err(RakkaA2AHandlerError::InvalidLifecycle {
-            task_id: response.task_id,
-            reason: "owner response protocol version mismatch",
-        });
-    }
-    match response.outcome {
+    let (task_id, outcome) = owner_response_outcome(response)?;
+    match outcome {
         A2ARunResponseKind::PushConfigRecorded { config } => Ok(config),
-        A2ARunResponseKind::Failure { failure } => Err(owner_failure_error(
-            &response.task_id,
-            failure.kind,
-            failure.message,
-        )),
-        A2ARunResponseKind::TaskSnapshot { .. }
-        | A2ARunResponseKind::StreamCursor { .. }
-        | A2ARunResponseKind::PushConfigDeleted => Err(RakkaA2AHandlerError::InvalidLifecycle {
-            task_id: response.task_id,
-            reason: "owner returned an unexpected response kind",
-        }),
+        _ => Err(unexpected_owner_response(task_id)),
     }
 }
 
 fn push_delete_from_response(response: A2ARunResponse) -> Result<(), RakkaA2AHandlerError> {
-    if response.version != A2A_RUN_PROTOCOL_VERSION {
-        return Err(RakkaA2AHandlerError::InvalidLifecycle {
-            task_id: response.task_id,
-            reason: "owner response protocol version mismatch",
-        });
-    }
-    match response.outcome {
+    let (task_id, outcome) = owner_response_outcome(response)?;
+    match outcome {
         A2ARunResponseKind::PushConfigDeleted => Ok(()),
-        A2ARunResponseKind::Failure { failure } => Err(owner_failure_error(
-            &response.task_id,
-            failure.kind,
-            failure.message,
-        )),
-        A2ARunResponseKind::TaskSnapshot { .. }
-        | A2ARunResponseKind::StreamCursor { .. }
-        | A2ARunResponseKind::PushConfigRecorded { .. } => {
-            Err(RakkaA2AHandlerError::InvalidLifecycle {
-                task_id: response.task_id,
-                reason: "owner returned an unexpected response kind",
-            })
-        }
+        _ => Err(unexpected_owner_response(task_id)),
     }
 }
 

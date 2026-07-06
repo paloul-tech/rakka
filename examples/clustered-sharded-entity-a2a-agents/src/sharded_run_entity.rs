@@ -20,8 +20,9 @@ use rakka::prelude::*;
 use rakka::sharding::ClusterNodeRuntime;
 
 use crate::a2a_handler::{
-    known_command, missing_run, run_is_terminal, run_tenant, state_payload, task_state,
-    validate_adopted_run, validate_send_lifecycle, RakkaA2AHandlerError,
+    known_command, missing_run, project_send_result, run_is_terminal, run_tenant,
+    snapshot_projection, state_payload, sync_status_projection, validate_adopted_run,
+    validate_send_lifecycle, RakkaA2AHandlerError,
 };
 use crate::a2a_mapping::{A2ACommandDraft, A2ATaskIntent, ATTR_CONTEXT_ID, DEFAULT_TENANT};
 use crate::durable_stores::{RunStore, WorkflowStore};
@@ -29,11 +30,10 @@ use crate::protocol::{
     A2ARunFailure, A2ARunFailureKind, A2ARunRequest, A2ARunRequestKind, A2ARunResponse,
     A2A_RUN_PROTOCOL_VERSION,
 };
-use crate::push_config::{schedule_push_effects_for_event, A2APushConfigStore};
+use crate::push_config::{schedule_push_effects_for_events, A2APushConfigStore};
 use crate::support::{ENTITY_TYPE, NUMBER_OF_SHARDS, RUN_ASK_TIMEOUT};
 use crate::task_projection::{
-    status_transition_allowed, A2ATaskEvent, A2ATaskEventPayload, A2ATaskProjection,
-    InMemoryA2ATaskProjectionStore, TaskProjectionError,
+    A2ATaskEvent, A2ATaskProjection, InMemoryA2ATaskProjectionStore, TaskProjectionError,
 };
 
 const MAX_CONFLICT_ATTEMPTS: usize = 3;
@@ -468,7 +468,7 @@ where
         &run_state,
         received_at,
     )?;
-    schedule_owner_push_effects(workflow_store, push_configs, &events).await?;
+    schedule_push_effects_for_events(workflow_store, push_configs, &events).await?;
     task_store
         .projection(
             Some(draft.normalized.tenant.as_str()),
@@ -503,7 +503,7 @@ where
             received_at,
             None,
         )? {
-            schedule_owner_push_effects(workflow_store, push_configs, &[event]).await?;
+            schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
         }
         return Err(RakkaA2AHandlerError::TaskNotCancelable {
             task_id: draft.normalized.task_id.clone(),
@@ -519,7 +519,7 @@ where
         received_at,
         None,
     )? {
-        schedule_owner_push_effects(workflow_store, push_configs, &[event]).await?;
+        schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
     }
     task_store
         .projection(
@@ -565,7 +565,7 @@ where
                 run_state.updated_at,
                 Some(projection.status),
             )? {
-                schedule_owner_push_effects(workflow_store, push_configs, &[event]).await?;
+                schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
             }
         }
         Err(TaskProjectionError::TaskNotFound { .. }) => {
@@ -580,7 +580,7 @@ where
                 Vec::new(),
                 run_state.updated_at,
             )?;
-            schedule_owner_push_effects(workflow_store, push_configs, &[event]).await?;
+            schedule_push_effects_for_events(workflow_store, push_configs, &[event]).await?;
         }
         Err(error) => return Err(error.into()),
     }
@@ -687,20 +687,6 @@ async fn authorize_owner_task(
             }
         })
         .map_err(Into::into)
-}
-
-async fn schedule_owner_push_effects<WorkflowStoreT>(
-    workflow_store: &WorkflowStoreT,
-    push_configs: &A2APushConfigStore,
-    events: &[A2ATaskEvent],
-) -> Result<(), RakkaA2AHandlerError>
-where
-    WorkflowStoreT: DurableStateStore<WorkflowState>,
-{
-    for event in events {
-        schedule_push_effects_for_event(workflow_store, push_configs, event).await?;
-    }
-    Ok(())
 }
 
 async fn validate_inbox_collision<WorkflowStoreT>(
@@ -936,130 +922,6 @@ fn initial_run_state(
         updated_at: now,
         completed_at: None,
     })
-}
-
-fn project_send_result(
-    task_store: &InMemoryA2ATaskProjectionStore,
-    draft: &A2ACommandDraft,
-    message: &a2a::Message,
-    artifacts: Vec<ArtifactRef>,
-    run_state: &AgentRunState,
-    now: AgentTimestampMillis,
-) -> Result<Vec<A2ATaskEvent>, RakkaA2AHandlerError> {
-    let tenant = draft.normalized.tenant.as_str();
-    let mut events = Vec::new();
-    match task_store.projection(Some(tenant), &draft.normalized.task_id) {
-        Ok(projection) => {
-            let already_projected = projection
-                .history
-                .iter()
-                .any(|recorded| recorded.message_id == message.message_id);
-            if !already_projected {
-                events.push(task_store.append_event_payload(
-                    tenant,
-                    &draft.normalized.task_id,
-                    &draft.normalized.context_id,
-                    now,
-                    A2ATaskEventPayload::MessageUpdate {
-                        message: message.clone(),
-                    },
-                )?);
-            }
-            if let Some(event) = sync_status_projection(
-                task_store,
-                run_state,
-                &draft.normalized.context_id,
-                now,
-                Some(projection.status),
-            )? {
-                events.push(event);
-            }
-            Ok(events)
-        }
-        Err(TaskProjectionError::TaskNotFound { .. }) => {
-            events.push(snapshot_projection(
-                task_store,
-                run_state,
-                &draft.normalized.context_id,
-                vec![message.clone()],
-                artifacts,
-                now,
-            )?);
-            Ok(events)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn sync_status_projection(
-    task_store: &InMemoryA2ATaskProjectionStore,
-    run_state: &AgentRunState,
-    context_id: &str,
-    now: AgentTimestampMillis,
-    current_status: Option<a2a::TaskState>,
-) -> Result<Option<A2ATaskEvent>, RakkaA2AHandlerError> {
-    let tenant = run_tenant(run_state);
-    let state = task_state(run_state.status);
-    let current = match current_status {
-        Some(status) => status,
-        None => match task_store.projection(Some(&tenant), run_state.run_id.as_str()) {
-            Ok(projection) => projection.status,
-            Err(TaskProjectionError::TaskNotFound { .. }) => {
-                return snapshot_projection(
-                    task_store,
-                    run_state,
-                    context_id,
-                    Vec::new(),
-                    Vec::new(),
-                    now,
-                )
-                .map(Some);
-            }
-            Err(error) => return Err(error.into()),
-        },
-    };
-    if current == state || !status_transition_allowed(&current, &state) {
-        return Ok(None);
-    }
-    let payload = if state.is_terminal() {
-        A2ATaskEventPayload::Terminal { state }
-    } else {
-        A2ATaskEventPayload::StatusUpdate { state }
-    };
-    task_store
-        .append_event_payload(
-            tenant.as_str(),
-            run_state.run_id.as_str(),
-            context_id,
-            now,
-            payload,
-        )
-        .map(Some)
-        .map_err(Into::into)
-}
-
-fn snapshot_projection(
-    task_store: &InMemoryA2ATaskProjectionStore,
-    run_state: &AgentRunState,
-    context_id: &str,
-    history: Vec<a2a::Message>,
-    artifacts: Vec<ArtifactRef>,
-    now: AgentTimestampMillis,
-) -> Result<A2ATaskEvent, RakkaA2AHandlerError> {
-    let projection =
-        A2ATaskProjection::from_run_state(run_state, context_id, history, artifacts, 0);
-    let tenant = projection.tenant.clone();
-    let task_id = projection.task_id.clone();
-    let context_id = projection.context_id.clone();
-    task_store
-        .append_event_payload(
-            tenant,
-            task_id,
-            context_id,
-            now,
-            A2ATaskEventPayload::Snapshot(projection),
-        )
-        .map_err(Into::into)
 }
 
 fn inbox_revision_conflict(error: &RakkaA2AHandlerError) -> bool {
