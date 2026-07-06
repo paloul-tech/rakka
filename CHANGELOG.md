@@ -12,6 +12,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - `scripts/validate.sh` as the required local validation entry point.
 - `scripts/package-check.sh` as the offline package metadata and publishability check entry point.
 - V1 release-candidate review docs for reliability boundaries, N/N+1 rolling updates, known limitations, post-v1 roadmap, and final review checklist.
+- Phase 5 agent workflow autonomy APIs: effect target catalog and policy validation, A2A peer adapter contracts, dispatcher registry routing, A2A peer/webhook/push dispatch classes, and deterministic dispatcher cancellation marking.
 
 ### Changed
 
@@ -20,6 +21,10 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - Workspace crates now share release metadata and internal path dependencies include explicit versions for packaging.
 - CI separates required validation from optional PostgreSQL and local Kubernetes integration jobs.
 - Historical implementation plans now live under `docs/plans/` instead of the product-doc root.
+- `rakka-workflow` outbox entries support a terminal `Cancelled` status: `DurableInbox::record_outbox_cancelled` settles an undelivered entry before dispatch, cancelled entries are never due again, and compaction reclaims them like other terminal entries.
+- Agent dispatcher cancellation is durable end to end: `AgentDispatcherWorker::cancel_run_dispatches` settles cancelled effects at the outbox layer, in-flight entries carry a typed `cancellation_requested` flag that blocks re-claiming after lease expiry, and worker refresh finalizes expired cancellation-requested entries as cancelled instead of redelivering them.
+- Agent dispatch target classification only honors `target_class` attribute and target-type refinements that are compatible with the effect kind, so a mislabeled effect can no longer be routed to a dispatcher that deterministically rejects it.
+- Agent autonomy policy classification (`AgentAutonomyTargetClass::for_effect`) is derived from the dispatcher's `AgentDispatchTargetClass::classify`, removing the name-substring webhook/push heuristics so policy admission and dispatch routing always agree on an effect's class.
 
 ### Security
 

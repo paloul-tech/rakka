@@ -208,6 +208,26 @@ async fn postgres_query_index_round_trips_bounded_operational_queries() {
         .expect("stuck dispatch query should succeed");
     assert_eq!(dispatch_ids(&stuck_dispatches), vec!["pg-dispatch-stuck"]);
 
+    insert_dispatch_with_raw_target_class(
+        &namespace,
+        "pg-dispatch-future-target",
+        "pg-run-future-target",
+        "future-target-class",
+    )
+    .await;
+    let future_target_dispatches = index
+        .query_dispatches(AgentDispatchQuery::new().run_id("pg-run-future-target"))
+        .await
+        .expect("unknown target class should not poison dispatch query");
+    assert_eq!(
+        dispatch_ids(&future_target_dispatches),
+        vec!["pg-dispatch-future-target"]
+    );
+    assert_eq!(
+        future_target_dispatches[0].target_class,
+        AgentDispatchTargetClass::Other
+    );
+
     let shard_owned = index
         .query_runs(
             AgentWorkflowRunQuery::new()
@@ -678,6 +698,49 @@ WHERE store_namespace = $1
         .await
         .expect("checkpoint count query should succeed")
         .get(0)
+}
+
+async fn insert_dispatch_with_raw_target_class(
+    namespace: &str,
+    dispatch_id: &str,
+    run_id: &str,
+    target_class: &str,
+) {
+    let Some(client) = connect_client().await else {
+        return;
+    };
+    let workflow_id = workflow_id();
+    let effect_id = format!("effect:{dispatch_id}");
+    client
+        .execute(
+            r#"
+INSERT INTO rakka_agent_workflow_dispatch_index (
+    store_namespace,
+    dispatch_id,
+    workflow_id,
+    run_id,
+    effect_id,
+    effect_kind,
+    target_class,
+    due_at_millis,
+    status,
+    fencing_token,
+    updated_at_millis
+) VALUES (
+    $1, $2, $3, $4, $5, 'tool-call', $6, 100, 'pending', 1, 100
+)
+"#,
+            &[
+                &namespace,
+                &dispatch_id,
+                &workflow_id.as_str(),
+                &run_id,
+                &effect_id,
+                &target_class,
+            ],
+        )
+        .await
+        .expect("raw dispatch row should insert");
 }
 
 fn unique_namespace(test_name: &str) -> String {

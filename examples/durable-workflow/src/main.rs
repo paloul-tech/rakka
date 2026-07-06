@@ -142,5 +142,10 @@ fn describe_event(event: &WorkflowTelemetryEvent) -> String {
             attempts,
             message,
         } => format!("{message_id} exhausted after {attempts} attempts with {message}"),
+        WorkflowTelemetryEvent::OutboxDispatchCancelled {
+            message_id,
+            message,
+            ..
+        } => format!("{message_id} cancelled with {message}"),
     }
 }

@@ -1,6 +1,6 @@
 # Phase 5 Clustered Sharded Entity A2A Agents
 
-Status: planning draft
+Status: implemented
 Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
 
 ## Goal
@@ -13,7 +13,7 @@ agent run advances through durable state transitions and durable outbox effects.
 
 ### Slice 5.1: Effect Target Catalog
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -32,7 +32,7 @@ Acceptance:
 
 ### Slice 5.2: Dispatcher Registration
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -50,7 +50,7 @@ Acceptance:
 
 ### Slice 5.3: A2A Peer Call Adapter
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -71,7 +71,7 @@ Acceptance:
 
 ### Slice 5.4: Timer And Human Checkpoint Integration
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -90,7 +90,7 @@ Acceptance:
 
 ### Slice 5.5: Autonomy Policy
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -108,7 +108,7 @@ Acceptance:
 
 ### Slice 5.6: Cancellation And Compensation
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -126,7 +126,7 @@ Acceptance:
 
 ### Slice 5.7: Audit, Retention, And Artifacts
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -145,7 +145,7 @@ Acceptance:
 
 ### Slice 5.8: Failure Injection For Autonomy
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -167,6 +167,61 @@ Acceptance:
 - Timers and human checkpoints pause without live tasks.
 - Policy limits bound autonomy.
 - Cancellation and failure handling are deterministic and durable.
+
+## Implementation Summary
+
+- Slice 5.1 is implemented in
+  `crates/rakka-agent-workflow/src/autonomy.rs`. The Phase 5 catalog defines
+  model, tool, process-tool, A2A-peer, human-checkpoint, timer, webhook, and
+  push-notification target classes, with per-class idempotency and artifact
+  policies. `AgentEffectTargetCatalog::validate_effect` rejects unsupported
+  targets, disallowed skill/target mappings, disallowed tool names, and
+  required-artifact misses before durable scheduling.
+- Slice 5.2 is implemented in
+  `crates/rakka-agent-workflow/src/dispatcher.rs`. Dispatcher target
+  classification now includes A2A peer, webhook, and push notification classes.
+  `AgentEffectDispatcherRegistry` routes claimed work to class-specific
+  dispatchers, and adapter-backed dispatchers are available for model, tool,
+  and A2A peer effects. Existing fleet state continues to persist claim,
+  retry, timeout, exhaustion, backlog, and in-flight status.
+- Slice 5.3 is implemented as a core adapter contract in
+  `crates/rakka-agent-workflow/src/adapters.rs`. `AgentA2APeerRequest`,
+  `AgentA2APeerOutcome`, and `AgentA2APeerAdapter` preserve peer task id,
+  context id, transport preference, idempotency key, correlation metadata, and
+  result/error artifact refs while leaving concrete `a2a-client` card
+  resolution and REST/JSON-RPC selection to the A2A-facing adapter layer.
+- Slice 5.4 is satisfied by the existing durable timer and human checkpoint
+  APIs, with the Phase 5 catalog adding explicit timer and human-checkpoint
+  target policy. The existing graph effect bridge and timer/checkpoint runtimes
+  schedule waits durably and resume through durable commands after restart.
+- Slice 5.5 is implemented in
+  `crates/rakka-agent-workflow/src/autonomy.rs`. `AgentAutonomyPolicy` supports
+  max autonomous steps, wall-clock timeout, external-call and token budgets,
+  target/tool allowlists, approval requirements, fail-closed defaults, and
+  durable cancellation decisions. `agent_autonomy_policy_audit_event` emits
+  bounded audit attributes for approvals, denials, and cancellation decisions.
+- Slice 5.6 is implemented in
+  `crates/rakka-agent-workflow/src/dispatcher.rs`.
+  `AgentDispatcherFleet::cancel_run_dispatches` deterministically cancels
+  unclaimed dispatch entries and annotates active leases as cancellation
+  requested without erasing the durable cancellation request or pretending an
+  in-flight external side effect can be unsent.
+- Slice 5.7 is covered by the autonomy audit helper plus the existing artifact
+  and retention modules. The new policy/catalog tests verify decisions carry
+  bounded audit attributes and use artifact refs for large autonomous inputs and
+  outputs.
+- Slice 5.8 is covered by focused tests in
+  `crates/rakka-agent-workflow/tests/autonomy_policy.rs`,
+  `crates/rakka-agent-workflow/tests/adapters.rs`, and
+  `crates/rakka-agent-workflow/tests/dispatcher_fleet.rs`, alongside the
+  existing failure-injection, timer, human checkpoint, effect bridge, and
+  dispatcher recovery tests.
+
+Follow-up for the A2A-facing adapter extraction: wire an example-local or
+future `rakka-a2a` implementation of `AgentA2APeerAdapter` to the SDK
+`a2a-client` factory so peer agent-card resolution and REST/JSON-RPC transport
+selection happen at the public protocol boundary rather than in the neutral
+workflow crate.
 
 ## References
 
