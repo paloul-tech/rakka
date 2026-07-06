@@ -29,6 +29,9 @@ use crate::task_projection::{
 const PUSH_CONFIG_PERSISTENCE_PREFIX: &str = "a2a-push-config";
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 100;
+/// Bound on retained audit records per push config; request-level configs
+/// are re-saved on every send, so the trail must not grow with traffic.
+const MAX_PUSH_CONFIG_AUDIT_RECORDS: usize = 32;
 static GENERATED_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type A2APushConfigResult<T> = Result<T, A2APushConfigError>;
@@ -236,6 +239,12 @@ impl A2APushConfigStore {
         let (expected, state) = match existing {
             Some(record) => {
                 let mut state = record.state;
+                // Request-level configs arrive on every send; an identical
+                // re-save is a no-op read rather than a durable rewrite with
+                // audit churn.
+                if !state.deleted && state.config == redacted && state.auth == auth {
+                    return Ok(state.config);
+                }
                 let kind = if state.deleted {
                     A2APushConfigAuditKind::Created
                 } else {
@@ -250,6 +259,7 @@ impl A2APushConfigStore {
                     occurred_at: now,
                     redaction: auth.redaction,
                 });
+                cap_audit(&mut state.audit);
                 (record.revision, state)
             }
             None => (
@@ -346,6 +356,7 @@ impl A2APushConfigStore {
             occurred_at: now,
             redaction: state.auth.redaction,
         });
+        cap_audit(&mut state.audit);
         self.store
             .compare_and_set(&persistence_id, record.revision, state)
             .await?;
@@ -538,6 +549,14 @@ fn push_effect(
     let schedule = AgentEffectSchedule::new(AgentEffectKind::Notification, target, metadata)?
         .expected_result_type("a2a.push.delivery")?;
     Ok(schedule.into_effect()?)
+}
+
+/// Keeps the newest `MAX_PUSH_CONFIG_AUDIT_RECORDS` audit entries.
+fn cap_audit(audit: &mut Vec<A2APushConfigAuditRecord>) {
+    if audit.len() > MAX_PUSH_CONFIG_AUDIT_RECORDS {
+        let excess = audit.len() - MAX_PUSH_CONFIG_AUDIT_RECORDS;
+        audit.drain(..excess);
+    }
 }
 
 fn redacted_config(mut config: TaskPushNotificationConfig) -> TaskPushNotificationConfig {
@@ -761,6 +780,52 @@ mod tests {
         config.url = "file:///tmp/hook".to_string();
         let error = store.save("tenant-a", config).await.expect_err("invalid");
         assert_eq!(error.code(), "invalid-push-config");
+    }
+
+    #[tokio::test]
+    async fn identical_resave_skips_audit_and_audit_stays_bounded() {
+        let store = store();
+        store
+            .save("tenant-a", config("task-1", "cfg-1"))
+            .await
+            .expect("save");
+        // Request-level configs arrive on every send; an identical re-save
+        // must not grow the durable record.
+        store
+            .save("tenant-a", config("task-1", "cfg-1"))
+            .await
+            .expect("re-save");
+        let persisted = store
+            .store
+            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
+            .await
+            .expect("load")
+            .expect("state")
+            .state;
+        assert_eq!(
+            persisted.audit.len(),
+            1,
+            "identical re-save must not append audit records"
+        );
+
+        // Genuine updates keep the audit trail bounded.
+        for index in 0..(MAX_PUSH_CONFIG_AUDIT_RECORDS + 8) {
+            let mut updated = config("task-1", "cfg-1");
+            updated.url = format!("https://example.com/hook-{index}");
+            store.save("tenant-a", updated).await.expect("update");
+        }
+        let persisted = store
+            .store
+            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
+            .await
+            .expect("load")
+            .expect("state")
+            .state;
+        assert!(
+            persisted.audit.len() <= MAX_PUSH_CONFIG_AUDIT_RECORDS,
+            "audit trail must stay bounded, got {}",
+            persisted.audit.len()
+        );
     }
 
     #[tokio::test]

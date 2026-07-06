@@ -612,8 +612,11 @@ where
     };
     // Unconditional: a read also heals push schedules that failed on an
     // earlier request (e.g. a terminal event whose scheduling errored), via
-    // the scheduler's watermark over the retained log.
-    schedule_push_effects_for_events(
+    // the scheduler's watermark over the retained log. A scheduling failure
+    // does not fail the read: the projection converged, the events are in
+    // the log, and the watermark re-offers them on the next command, read,
+    // or stream poll.
+    if let Err(error) = schedule_push_effects_for_events(
         workflow_store,
         push_configs,
         task_store,
@@ -621,7 +624,13 @@ where
         run_id.as_str(),
         &emitted,
     )
-    .await?;
+    .await
+    {
+        eprintln!(
+            "warning: push scheduling deferred for task {}: {error}",
+            run_id.as_str()
+        );
+    }
 
     task_store
         .projection(Some(tenant), run_id.as_str())

@@ -701,6 +701,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_limit_rejection_precedes_durable_acceptance() {
+        use crate::stream_limits::A2AStreamLimitSettings;
+        use a2a_server::{RequestHandler, ServiceParams};
+        use rakka::persistence::DurableStateStore;
+
+        let ctx = test_state();
+        let handler = RakkaA2ARequestHandler::new(
+            ctx.state.agent_card.clone(),
+            ctx.workflow.clone(),
+            ctx.task_store.clone(),
+            ctx.run_store.clone(),
+            ctx.workflow_store.clone(),
+            A2APushConfigStore::new(ctx.push_config_store.clone()),
+            HeaderObserver::default(),
+        )
+        .with_stream_limits(A2AStreamLimitSettings {
+            max_node_streams: 0,
+            max_task_streams: 1,
+        });
+
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+        let request = serde_json::from_value(serde_json::json!({
+            "message": {
+                "messageId": "over-limit-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        }))
+        .expect("send request");
+
+        let error = match handler.send_streaming_message(&params, request).await {
+            Err(error) => error,
+            Ok(_) => panic!("node stream limit must reject the stream"),
+        };
+        assert!(
+            error.to_string().contains("a2a-stream-limit"),
+            "unexpected error: {error}"
+        );
+
+        // Admission ran before the durable accept: nothing was committed,
+        // so the client's "retry on another node" guidance is truthful.
+        assert!(
+            ctx.run_store
+                .persistence_ids()
+                .await
+                .expect("run ids")
+                .is_empty(),
+            "over-limit stream must not durably accept the send"
+        );
+        assert!(
+            ctx.workflow_store
+                .persistence_ids()
+                .await
+                .expect("workflow ids")
+                .is_empty(),
+            "over-limit stream must not write inbox state"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stream_frames_carry_replay_cursor() {
+        use a2a::{StreamResponse, SubscribeToTaskRequest};
+        use a2a_server::{RequestHandler, ServiceParams};
+        use futures_util::StreamExt;
+        use tokio::time::{timeout, Duration};
+
+        let ctx = test_state();
+        let handler = ctx.state.handler.clone();
+        let app = router(ctx.state);
+        let new_task = serde_json::json!({
+            "message": {
+                "messageId": "cursor-message-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        });
+        let sent = post_json(app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
+        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+        let mut stream = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task_id.clone(),
+                    tenant: Some("tenant-a".to_string()),
+                },
+            )
+            .await
+            .expect("subscribe");
+        let first = stream
+            .next()
+            .await
+            .expect("initial snapshot")
+            .expect("stream response");
+        assert!(matches!(first, StreamResponse::Task(_)));
+
+        // A continuation appends a MessageUpdate event; its stream frame
+        // must carry the replay cursor a client resumes from on reconnect.
+        let continuation = serde_json::json!({
+            "message": {
+                "messageId": "cursor-message-2",
+                "taskId": task_id,
+                "role": "ROLE_USER",
+                "parts": [{"text": "again"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        });
+        post_json(app, "/a2a/message:send", &continuation, "tenant-a").await;
+
+        let item = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("message frame within deadline")
+            .expect("stream open")
+            .expect("stream response");
+        match item {
+            StreamResponse::Message(message) => {
+                let metadata = message.metadata.expect("message frame metadata");
+                assert!(
+                    metadata.contains_key("io.rakka.replay.cursor"),
+                    "message frames must carry the replay cursor"
+                );
+            }
+            other => panic!("expected message frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn send_to_terminal_task_is_rejected() {
         use rakka::agent_workflow::{AgentRunId, AgentStepRunner};
 

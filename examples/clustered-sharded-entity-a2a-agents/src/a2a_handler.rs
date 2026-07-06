@@ -122,6 +122,23 @@ impl A2ARunRouter {
         }
     }
 
+    /// True when this node currently owns the task's shard, so the local
+    /// projection watcher already observes every appended event. Resolved
+    /// from the coordinator cache; callers re-check per use because
+    /// ownership moves with rebalances.
+    fn local_node_owns(&self, task_id: &str) -> bool {
+        let Ok(entity) = self.sharding.entity_ref_for(&self.key, task_id.to_string()) else {
+            return false;
+        };
+        let Ok((owner, _shard)) = entity.region().resolve(entity.entity_ref()) else {
+            return false;
+        };
+        entity
+            .region()
+            .local_node_id()
+            .is_some_and(|local| local == &owner)
+    }
+
     async fn route(&self, request: A2ARunRequest) -> Result<A2ARunResponse, RakkaA2AHandlerError> {
         let entity = self
             .sharding
@@ -398,6 +415,18 @@ impl RakkaA2ARequestHandler {
         self
     }
 
+    /// Overrides the bounded stream admission settings (tests exercise the
+    /// over-limit paths with tiny caps).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_stream_limits(
+        mut self,
+        settings: crate::stream_limits::A2AStreamLimitSettings,
+    ) -> Self {
+        self.stream_limits = A2AStreamLimits::new(settings);
+        self
+    }
+
     /// Rebuilds any missing local task projections from durable run state.
     pub async fn recover_task_projections(&self) -> Result<usize, RakkaA2AHandlerError> {
         self.recover_task_projections_impl().await
@@ -465,11 +494,15 @@ impl RakkaA2ARequestHandler {
         )?;
         let tenant = draft.normalized.tenant.as_str().to_string();
         let task_id = draft.normalized.task_id.clone();
+        // Admission runs before the durable accept: a stream-limit rejection
+        // must not leave the client told "retry" for a send that actually
+        // committed. The lease is dropped (released) on any later error.
+        let lease = self.stream_limits.acquire(&task_id)?;
         let _response = self
             .send_message_with_draft(req, draft, received_at)
             .await?;
         let projection = self.task_store.projection(Some(&tenant), &task_id)?;
-        self.stream_task(tenant, task_id, None, true, projection)
+        self.stream_task(tenant, task_id, None, true, projection, lease)
     }
 
     async fn subscribe_to_task_impl(
@@ -478,6 +511,9 @@ impl RakkaA2ARequestHandler {
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, RakkaA2AHandlerError> {
         let requested_tenant = canonical_read_tenant(params, req.tenant.as_deref())?;
+        // Admit before the owner round-trip so over-limit subscribes fail
+        // fast; the lease is dropped (released) on any later error.
+        let lease = self.stream_limits.acquire(&req.id)?;
         let projection = if let Some(router) = &self.router {
             let request = A2ARunRequest::new(
                 req.id.clone(),
@@ -500,6 +536,7 @@ impl RakkaA2ARequestHandler {
             replay_cursor_from_params(params),
             false,
             projection,
+            lease,
         )
     }
 
@@ -614,8 +651,8 @@ impl RakkaA2ARequestHandler {
         after_cursor: Option<String>,
         snapshot_first: bool,
         projection: A2ATaskProjection,
+        lease: A2AStreamLease,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, RakkaA2AHandlerError> {
-        let lease = self.stream_limits.acquire(&task_id)?;
         // Subscribe before reading snapshot or replay state so an event
         // appended in between still reaches the stream through the watcher;
         // the sequence dedup below drops the overlap.
@@ -1508,8 +1545,15 @@ async fn next_stream_item(
                 return None;
             }
             Err(_) => {
-                if state.router.is_some() {
-                    state.poll_owner_now = true;
+                if let Some(router) = &state.router {
+                    // Owner-local streams are served by the local watcher;
+                    // routing a poll to ourselves would only repeat what the
+                    // watcher already delivered. Re-checked every interval
+                    // so a rebalance that moves the shard away resumes
+                    // polling within one interval.
+                    if !router.local_node_owns(&state.task_id) {
+                        state.poll_owner_now = true;
+                    }
                     if state.last_emitted.elapsed() < STREAM_HEARTBEAT_INTERVAL {
                         continue;
                     }
@@ -1654,7 +1698,16 @@ fn stream_response_from_event(event: A2ATaskEvent) -> Result<StreamResponse, A2A
                 metadata: Some(metadata),
             }))
         }
-        A2ATaskEventPayload::MessageUpdate { message } => Ok(StreamResponse::Message(message)),
+        A2ATaskEventPayload::MessageUpdate { mut message } => {
+            // Message frames carry the replay cursor too; without it a
+            // reconnecting client resumes from the preceding status event
+            // and re-receives every message frame.
+            message
+                .metadata
+                .get_or_insert_with(HashMap::new)
+                .extend(metadata);
+            Ok(StreamResponse::Message(message))
+        }
     }
 }
 
