@@ -9,6 +9,8 @@
 mod a2a_handler;
 mod a2a_mapping;
 mod agent_card;
+#[cfg(test)]
+mod cluster_tests;
 mod codec;
 mod config;
 mod discovery;

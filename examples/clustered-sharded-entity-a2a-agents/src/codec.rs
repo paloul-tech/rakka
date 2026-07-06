@@ -100,7 +100,7 @@ mod tests {
         let registry = serialization_registry().unwrap();
         let request = A2ARunRequest::new(
             "task-1",
-            "tenant-a",
+            Some("tenant-a".to_string()),
             A2ARunCommandMetadata::query(),
             A2AProjectionHints::default(),
             A2ATimeoutPolicy {

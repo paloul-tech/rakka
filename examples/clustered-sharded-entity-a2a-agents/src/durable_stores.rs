@@ -6,7 +6,8 @@
 //! stores instead of this intentionally small example file store.
 
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rakka::agent_workflow::substrate::WorkflowState;
@@ -19,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ExampleConfig;
-use crate::support::{current_timestamp_millis, hex_encode};
+use crate::support::{hex_decode, hex_encode};
 
 /// Durable store for agent run state.
 pub type RunStore = ExampleDurableStateStore<AgentRunState>;
@@ -138,6 +139,15 @@ where
 }
 
 /// Small JSON file state store for local multi-process demos.
+///
+/// Each revision of a record is committed as its own immutable file named
+/// `<hex(id)>.r<revision>.json`. A commit writes a unique temp file and then
+/// `hard_link`s it to the revision name; the link is atomic and exclusive on
+/// POSIX filesystems, so two processes racing the same compare-and-set can
+/// never both win — the loser observes the existing revision file and reports
+/// a revision conflict. `delete` has no such claim and is only safe while no
+/// concurrent writer exists for the same record; this example never deletes
+/// concurrently.
 #[derive(Debug)]
 pub struct FileDurableStateStore<S>
 where
@@ -146,6 +156,9 @@ where
     root: Arc<PathBuf>,
     _state: PhantomData<fn() -> S>,
 }
+
+/// Monotonic per-process suffix keeping temp file names collision-free.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredStateRecord<S> {
@@ -167,9 +180,66 @@ where
         }
     }
 
-    fn record_path(&self, persistence_id: &PersistenceId) -> PathBuf {
-        self.root
-            .join(format!("{}.json", hex_encode(persistence_id.as_str())))
+    fn revision_path(&self, persistence_id: &PersistenceId, revision: Revision) -> PathBuf {
+        self.root.join(format!(
+            "{}.r{:020}.json",
+            hex_encode(persistence_id.as_str()),
+            revision.get()
+        ))
+    }
+
+    /// Parses `<hex(id)>.r<revision>.json` file names; temp files never match.
+    fn parse_record_file_name(file_name: &str) -> Option<(String, Revision)> {
+        let stem = file_name.strip_suffix(".json")?;
+        let (hex, digits) = stem.rsplit_once(".r")?;
+        let revision = digits.parse::<u64>().ok()?;
+        Some((hex_decode(hex)?, Revision::new(revision)))
+    }
+
+    fn record_files(&self) -> DurableResult<Vec<(String, Revision, PathBuf)>> {
+        let entries = match std::fs::read_dir(self.root.as_ref()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(file_store_error(error)),
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(file_store_error)?.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some((id, revision)) = Self::parse_record_file_name(file_name) else {
+                continue;
+            };
+            records.push((id, revision, path));
+        }
+        Ok(records)
+    }
+
+    /// Returns the newest committed revision file for `persistence_id`.
+    fn current_revision_file(
+        &self,
+        persistence_id: &PersistenceId,
+    ) -> DurableResult<Option<(Revision, PathBuf)>> {
+        let mut newest: Option<(Revision, PathBuf)> = None;
+        for (id, revision, path) in self.record_files()? {
+            if id != persistence_id.as_str() {
+                continue;
+            }
+            if newest
+                .as_ref()
+                .is_none_or(|(current, _)| revision > *current)
+            {
+                newest = Some((revision, path));
+            }
+        }
+        Ok(newest)
+    }
+
+    fn current_revision(&self, persistence_id: &PersistenceId) -> DurableResult<Revision> {
+        Ok(self
+            .current_revision_file(persistence_id)?
+            .map_or(Revision::INITIAL, |(revision, _)| revision))
     }
 }
 
@@ -178,12 +248,10 @@ where
     S: DurableState + Serialize + DeserializeOwned,
 {
     fn load_record(&self, persistence_id: &PersistenceId) -> DurableResult<Option<StateRecord<S>>> {
-        let path = self.record_path(persistence_id);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(file_store_error(error)),
+        let Some((_, path)) = self.current_revision_file(persistence_id)? else {
+            return Ok(None);
         };
+        let bytes = std::fs::read(&path).map_err(file_store_error)?;
         let stored: StoredStateRecord<S> = serde_json::from_slice(&bytes)
             .map_err(|error| DurableError::codec(error.to_string()))?;
         if stored.persistence_id != *persistence_id {
@@ -198,14 +266,24 @@ where
         )))
     }
 
-    fn write_record(
+    /// Commits `record` as the exclusive winner of its revision.
+    ///
+    /// The `hard_link` from the fully written temp file to the revision file
+    /// is the atomic claim: if another process (or task) already committed
+    /// this revision the link fails with `AlreadyExists` and the caller gets
+    /// a revision conflict instead of silently overwriting durable state.
+    fn commit_record(
         &self,
         persistence_id: &PersistenceId,
         record: &StateRecord<S>,
     ) -> DurableResult<()> {
         std::fs::create_dir_all(self.root.as_ref()).map_err(file_store_error)?;
-        let path = self.record_path(persistence_id);
-        let temp = path.with_extension(format!("json.tmp.{}", current_timestamp_millis()));
+        let path = self.revision_path(persistence_id, record.revision);
+        let temp = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let stored = StoredStateRecord {
             persistence_id: persistence_id.clone(),
             revision: record.revision.get(),
@@ -213,38 +291,53 @@ where
         };
         let bytes = serde_json::to_vec_pretty(&stored)
             .map_err(|error| DurableError::codec(error.to_string()))?;
-        std::fs::write(&temp, bytes).map_err(file_store_error)?;
-        std::fs::rename(&temp, &path).map_err(file_store_error)?;
-        Ok(())
+        let write_result = (|| {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(file_store_error(error));
+        }
+        let linked = std::fs::hard_link(&temp, &path);
+        let _ = std::fs::remove_file(&temp);
+        match linked {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let actual = self.current_revision(persistence_id)?;
+                Err(DurableError::revision_conflict(
+                    persistence_id.clone(),
+                    Revision::new(record.revision.get().saturating_sub(1)),
+                    actual,
+                ))
+            }
+            Err(error) => Err(file_store_error(error)),
+        }
+    }
+
+    /// Best-effort removal of revision files older than `keep`.
+    fn prune_older_revisions(&self, persistence_id: &PersistenceId, keep: Revision) {
+        let Ok(records) = self.record_files() else {
+            return;
+        };
+        for (id, revision, path) in records {
+            if id == persistence_id.as_str() && revision < keep {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     fn list_persistence_ids(&self) -> DurableResult<Vec<PersistenceId>> {
-        let entries = match std::fs::read_dir(self.root.as_ref()) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(file_store_error(error)),
-        };
-        let mut ids = Vec::new();
-        for entry in entries {
-            let path = entry.map_err(file_store_error)?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(id) = self.persistence_id_from_file(&path)? else {
-                continue;
-            };
-            ids.push(id);
-        }
+        let mut ids = self
+            .record_files()?
+            .into_iter()
+            .map(|(id, _, _)| PersistenceId::new(id))
+            .collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
         Ok(ids)
-    }
-
-    fn persistence_id_from_file(&self, path: &Path) -> DurableResult<Option<PersistenceId>> {
-        let bytes = std::fs::read(path).map_err(file_store_error)?;
-        let stored: StoredStateRecord<serde_json::Value> = serde_json::from_slice(&bytes)
-            .map_err(|error| DurableError::codec(error.to_string()))?;
-        Ok(Some(stored.persistence_id))
     }
 }
 
@@ -282,9 +375,7 @@ where
         state: S,
     ) -> StoreFuture<'a, StateRecord<S>> {
         Box::pin(async move {
-            let actual = self
-                .load_record(persistence_id)?
-                .map_or(Revision::INITIAL, |record| record.revision);
+            let actual = self.current_revision(persistence_id)?;
             if actual != expected_revision {
                 return Err(DurableError::revision_conflict(
                     persistence_id.clone(),
@@ -294,7 +385,11 @@ where
             }
 
             let record = StateRecord::new(state, expected_revision.next());
-            self.write_record(persistence_id, &record)?;
+            // The commit itself re-checks exclusivity: a concurrent writer
+            // that also passed the revision check loses the hard-link claim
+            // and surfaces as a revision conflict, never a lost update.
+            self.commit_record(persistence_id, &record)?;
+            self.prune_older_revisions(persistence_id, record.revision);
             Ok(record)
         })
     }
@@ -305,9 +400,7 @@ where
         expected_revision: Revision,
     ) -> StoreFuture<'a, Revision> {
         Box::pin(async move {
-            let actual = self
-                .load_record(persistence_id)?
-                .map_or(Revision::INITIAL, |record| record.revision);
+            let actual = self.current_revision(persistence_id)?;
             if actual != expected_revision {
                 return Err(DurableError::revision_conflict(
                     persistence_id.clone(),
@@ -316,11 +409,16 @@ where
                 ));
             }
 
-            match std::fs::remove_file(self.record_path(persistence_id)) {
-                Ok(()) => Ok(Revision::INITIAL),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Revision::INITIAL),
-                Err(error) => Err(file_store_error(error)),
+            for (id, _, path) in self.record_files()? {
+                if id == persistence_id.as_str() {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(file_store_error(error)),
+                    }
+                }
             }
+            Ok(Revision::INITIAL)
         })
     }
 
@@ -336,21 +434,15 @@ fn file_store_error(error: impl ToString) -> DurableError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::support::current_timestamp_millis;
     use rakka::agent_workflow::{
         AgentRunId, AgentRunStatus, AgentStatePayload, AgentTimestampMillis, AgentWorkflowId,
         StateSchemaVersion, WorkflowDefinitionVersion,
     };
 
-    #[tokio::test]
-    async fn file_store_round_trips_state_and_ids() {
-        let root = std::env::temp_dir().join(format!(
-            "rakka-a2a-file-store-test-{}",
-            current_timestamp_millis()
-        ));
-        let store = FileDurableStateStore::new(&root);
-        let persistence_id = PersistenceId::new("agent-run:run-1");
-        let state = AgentRunState {
-            run_id: AgentRunId::new("run-1"),
+    fn sample_state(run_id: &str, attempt: u32) -> AgentRunState {
+        AgentRunState {
+            run_id: AgentRunId::new(run_id),
             workflow_id: AgentWorkflowId::new("workflow"),
             tenant: None,
             definition_version: WorkflowDefinitionVersion::new("v1"),
@@ -358,7 +450,7 @@ mod tests {
             graph_state: None,
             status: AgentRunStatus::Accepted,
             current_step_id: None,
-            current_attempt: 0,
+            current_attempt: attempt,
             inputs_ref: None,
             state_payload: AgentStatePayload::Empty,
             checkpoints: Vec::new(),
@@ -368,7 +460,23 @@ mod tests {
             created_at: AgentTimestampMillis::new(1),
             updated_at: AgentTimestampMillis::new(1),
             completed_at: None,
-        };
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rakka-a2a-file-store-{label}-{}-{}",
+            std::process::id(),
+            current_timestamp_millis()
+        ))
+    }
+
+    #[tokio::test]
+    async fn file_store_round_trips_state_and_ids() {
+        let root = temp_root("round-trip");
+        let store = FileDurableStateStore::new(&root);
+        let persistence_id = PersistenceId::new("agent-run:run-1");
+        let state = sample_state("run-1", 0);
 
         let written = store
             .compare_and_set(&persistence_id, Revision::INITIAL, state.clone())
@@ -380,6 +488,52 @@ mod tests {
             state
         );
         assert_eq!(store.persistence_ids().await.unwrap(), vec![persistence_id]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn compare_and_set_admits_exactly_one_writer_per_revision() {
+        let root = temp_root("cas-race");
+        // Two store handles over one directory stand in for two node
+        // processes sharing RAKKA_STATE_DIR during shard ownership overlap.
+        let store_a = FileDurableStateStore::new(&root);
+        let store_b = FileDurableStateStore::new(&root);
+        let persistence_id = PersistenceId::new("agent-run:run-race");
+
+        store_a
+            .compare_and_set(
+                &persistence_id,
+                Revision::INITIAL,
+                sample_state("run-race", 0),
+            )
+            .await
+            .unwrap();
+
+        // Model the lost-update window directly: both writers already passed
+        // the revision check at revision 1 and now race the commit of
+        // revision 2. The hard-link claim admits exactly one.
+        let winner = StateRecord::new(sample_state("run-race", 1), Revision::new(2));
+        store_a.commit_record(&persistence_id, &winner).unwrap();
+        let loser = StateRecord::new(sample_state("run-race", 9), Revision::new(2));
+        let conflict = store_b.commit_record(&persistence_id, &loser).unwrap_err();
+        assert!(matches!(conflict, DurableError::RevisionConflict { .. }));
+
+        // The winner's acknowledged write survived intact.
+        let current = store_b.load(&persistence_id).await.unwrap().unwrap();
+        assert_eq!(current.revision, Revision::new(2));
+        assert_eq!(current.state.current_attempt, 1);
+
+        // The loser recovers by re-reading and retrying at the new revision.
+        let retried = store_b
+            .compare_and_set(
+                &persistence_id,
+                Revision::new(2),
+                sample_state("run-race", 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.revision, Revision::new(3));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -41,6 +41,13 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounded ask timeout for sharded owner and local run actor requests.
 pub const RUN_ASK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long an idle run entity stays resident before passivating.
+///
+/// Passivation keeps read-only probes for arbitrary task ids from pinning an
+/// entity and child run actor forever; durable state recovers lazily on the
+/// next reference.
+pub const RUN_ENTITY_IDLE_PASSIVATION: Duration = Duration::from_secs(120);
+
 /// Bounded workflow type label used by the demo workflow.
 pub const WORKFLOW_TYPE: &str = "a2a-phase-2-demo";
 
@@ -106,6 +113,19 @@ pub fn hex_encode(value: &str) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+/// Inverse of [`hex_encode`]; returns `None` for malformed input.
+pub fn hex_decode(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Builds a simple `std::io::Error` from a message for example error paths.

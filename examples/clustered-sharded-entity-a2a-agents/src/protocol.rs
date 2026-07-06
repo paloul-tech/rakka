@@ -34,7 +34,12 @@ pub struct A2ARunRequest {
     /// A2A task id, equal to Rakka run id and sharded entity id.
     pub task_id: String,
     /// Canonical tenant for authorization and durable command boundaries.
-    pub tenant: String,
+    ///
+    /// `None` marks an unscoped read: the owner resolves the run's stored
+    /// tenant instead of enforcing a caller-supplied one, mirroring the
+    /// local-mode projection store's unscoped read semantics. Durable
+    /// commands (accept, cancel) always carry `Some` canonical tenant.
+    pub tenant: Option<String>,
     /// Bounded command metadata used for routing diagnostics and evolution.
     pub command: A2ARunCommandMetadata,
     /// Projection controls requested by the ingress node.
@@ -50,7 +55,7 @@ impl A2ARunRequest {
     #[must_use]
     pub fn new(
         task_id: impl Into<String>,
-        tenant: impl Into<String>,
+        tenant: Option<String>,
         command: A2ARunCommandMetadata,
         projection: A2AProjectionHints,
         timeout: A2ATimeoutPolicy,
@@ -59,7 +64,7 @@ impl A2ARunRequest {
         Self {
             version: A2A_RUN_PROTOCOL_VERSION,
             task_id: task_id.into(),
-            tenant: tenant.into(),
+            tenant,
             command,
             projection,
             timeout,

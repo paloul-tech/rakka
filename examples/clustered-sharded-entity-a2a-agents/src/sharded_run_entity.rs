@@ -6,6 +6,9 @@
 //! [`AgentRunActorCommand`] messages and projection operations; those local
 //! actor commands are never serialized over the wire.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use rakka::agent_workflow::substrate::{WorkflowError, WorkflowState};
 use rakka::agent_workflow::{
     AgentCommand, AgentCommandKind, AgentInboxAcceptance, AgentInboxError, AgentRunActor,
@@ -20,7 +23,7 @@ use crate::a2a_handler::{
     known_command, missing_run, run_is_terminal, run_tenant, state_payload, task_state,
     validate_adopted_run, validate_send_lifecycle, RakkaA2AHandlerError,
 };
-use crate::a2a_mapping::{A2ACommandDraft, A2ATaskIntent, ATTR_CONTEXT_ID};
+use crate::a2a_mapping::{A2ACommandDraft, A2ATaskIntent, ATTR_CONTEXT_ID, DEFAULT_TENANT};
 use crate::durable_stores::{RunStore, WorkflowStore};
 use crate::protocol::{
     A2ARunFailure, A2ARunFailureKind, A2ARunRequest, A2ARunRequestKind, A2ARunResponse,
@@ -33,6 +36,12 @@ use crate::task_projection::{
 };
 
 const MAX_CONFLICT_ATTEMPTS: usize = 3;
+
+/// Monotonic suffix keeping child actor names unique across entity
+/// re-activations: a passivated entity's child may still be terminating when
+/// the same entity id is activated again, so reusing the previous child name
+/// would collide with the still-registered actor path.
+static CHILD_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 /// Local-only command protocol for the sharded owner shell.
 pub enum A2ARunEntityCommand {
@@ -54,7 +63,9 @@ where
     workflow: AgentWorkflow,
     workflow_store: WorkflowStoreT,
     task_store: InMemoryA2ATaskProjectionStore,
-    child: ActorRef<AgentRunActorCommand>,
+    /// `None` when the child run actor failed to spawn; requests are then
+    /// answered with a retryable failure instead of panicking the factory.
+    child: Option<ActorRef<AgentRunActorCommand>>,
 }
 
 impl<WorkflowStoreT> A2ARunEntity<WorkflowStoreT>
@@ -73,17 +84,29 @@ where
         RunStoreT: DurableStateStore<AgentRunState>,
     {
         let run_id = AgentRunId::new(context.entity_id().as_str());
-        let child = system
-            .spawn(
-                format!("{}-agent-run", context.actor_name()),
-                AgentRunActor::new(
-                    workflow.clone(),
-                    run_id.clone(),
-                    run_store,
-                    workflow_store.clone(),
-                ),
-            )
-            .expect("A2A agent run child actor should spawn");
+        let child_name = format!(
+            "{}-agent-run-{}",
+            context.actor_name(),
+            CHILD_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let child = match system.spawn(
+            child_name,
+            AgentRunActor::new(
+                workflow.clone(),
+                run_id.clone(),
+                run_store,
+                workflow_store.clone(),
+            ),
+        ) {
+            Ok(child) => Some(child),
+            Err(error) => {
+                eprintln!(
+                    "warning: run entity {} could not spawn its run actor: {error}",
+                    run_id.as_str()
+                );
+                None
+            }
+        };
         Self {
             run_id,
             workflow,
@@ -113,15 +136,26 @@ where
         actor_future(async move {
             match msg {
                 A2ARunEntityCommand::Handle { request, reply_to } => {
-                    let response = handle_owner_request(
-                        child,
-                        run_id,
-                        workflow,
-                        workflow_store,
-                        task_store,
-                        request,
-                    )
-                    .await;
+                    let response = match child {
+                        Some(child) => {
+                            handle_owner_request(
+                                child,
+                                run_id,
+                                workflow,
+                                workflow_store,
+                                task_store,
+                                request,
+                            )
+                            .await
+                        }
+                        None => A2ARunResponse::failure(
+                            request.task_id,
+                            echo_tenant(&request.tenant),
+                            failure_from_error(RakkaA2AHandlerError::Unavailable {
+                                message: "owner run actor failed to spawn; retry".to_string(),
+                            }),
+                        ),
+                    };
                     let _reply_dropped = reply_to.reply(response);
                 }
             }
@@ -135,8 +169,16 @@ where
         _reason: &'a TerminationReason,
     ) -> ActorFuture<'a> {
         let child = self.child.clone();
+        let run_id = self.run_id.clone();
         actor_future(async move {
-            let _ = child.stop();
+            if let Some(child) = child {
+                if let Err(error) = child.stop() {
+                    eprintln!(
+                        "warning: run entity {} could not stop its run actor: {error}",
+                        run_id.as_str()
+                    );
+                }
+            }
             Ok(ActorAction::Continue)
         })
     }
@@ -152,6 +194,11 @@ pub struct A2ARunHost {
     pub workflow_store: WorkflowStore,
     /// Local task projection store.
     pub task_store: InMemoryA2ATaskProjectionStore,
+    /// How long an idle entity stays resident before passivating.
+    ///
+    /// Without passivation, a read probe for an arbitrary task id would pin
+    /// an entity and child run actor forever.
+    pub idle_passivation: Duration,
 }
 
 /// Initializes the remote-aware sharded A2A run owner entity.
@@ -167,6 +214,7 @@ pub fn init_a2a_run_sharding(
         run_store,
         workflow_store,
         task_store,
+        idle_passivation,
     } = host;
     let registration = sharding.init_remote_with_ask(
         runtime,
@@ -182,7 +230,8 @@ pub fn init_a2a_run_sharding(
                     task_store.clone(),
                 )
             }
-        }),
+        })
+        .with_idle_passivation(idle_passivation),
         |request: A2ARunRequest, reply_to: ReplyTo<A2ARunResponse>| A2ARunEntityCommand::Handle {
             request,
             reply_to,
@@ -211,7 +260,7 @@ where
     if request.version != A2A_RUN_PROTOCOL_VERSION {
         return A2ARunResponse::failure(
             request.task_id,
-            request.tenant,
+            echo_tenant(&request.tenant),
             A2ARunFailure::version_mismatch(request.version),
         );
     }
@@ -242,7 +291,14 @@ where
             .await
         }
         A2ARunRequestKind::QueryTaskSnapshot => {
-            query_task_projection(&child, &workflow_store, &task_store, &run_id, &tenant).await
+            query_task_projection(
+                &child,
+                &workflow_store,
+                &task_store,
+                &run_id,
+                tenant.as_deref(),
+            )
+            .await
         }
         A2ARunRequestKind::CancelTask { draft, received_at } => {
             cancel_task(&child, &workflow_store, &task_store, *draft, received_at).await
@@ -259,9 +315,21 @@ where
     };
 
     match result {
-        Ok(projection) => A2ARunResponse::task(task_id, tenant, projection),
-        Err(error) => A2ARunResponse::failure(task_id, tenant, failure_from_error(error)),
+        // Echo the projection's stored tenant so unscoped reads report the
+        // run's true tenant rather than a caller-side default.
+        Ok(projection) => {
+            let tenant = projection.tenant.clone();
+            A2ARunResponse::task(task_id, tenant, projection)
+        }
+        Err(error) => {
+            A2ARunResponse::failure(task_id, echo_tenant(&tenant), failure_from_error(error))
+        }
     }
+}
+
+/// Tenant echoed on failure responses when no canonical tenant is known.
+fn echo_tenant(tenant: &Option<String>) -> String {
+    tenant.clone().unwrap_or_else(|| DEFAULT_TENANT.to_string())
 }
 
 struct AcceptMessageInput {
@@ -376,7 +444,7 @@ async fn query_task_projection<WorkflowStoreT>(
     workflow_store: &WorkflowStoreT,
     task_store: &InMemoryA2ATaskProjectionStore,
     run_id: &AgentRunId,
-    tenant: &str,
+    tenant: Option<&str>,
 ) -> Result<A2ATaskProjection, RakkaA2AHandlerError>
 where
     WorkflowStoreT: DurableStateStore<WorkflowState>,
@@ -385,9 +453,14 @@ where
     let run_state = snapshot
         .run_state
         .ok_or_else(|| missing_run(run_id.as_str()))?;
-    if run_tenant(&run_state) != tenant {
+    // A caller-scoped read must not see another tenant's run; an unscoped
+    // read (`None`) resolves the run's stored tenant, matching the local
+    // projection store's unscoped read semantics.
+    let resolved = run_tenant(&run_state);
+    if tenant.is_some_and(|scoped| scoped != resolved) {
         return Err(missing_run(run_id.as_str()));
     }
+    let tenant = resolved.as_str();
 
     match task_store.projection(Some(tenant), run_id.as_str()) {
         Ok(projection) => {

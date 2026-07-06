@@ -33,7 +33,7 @@ use crate::reachability::PeerReachability;
 use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
 use crate::support::{
     current_timestamp_millis, ExampleResult, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_RECONNECT_BACKOFF,
+    DEFAULT_RECONNECT_BACKOFF, RUN_ENTITY_IDLE_PASSIVATION,
 };
 use crate::task_projection::InMemoryA2ATaskProjectionStore;
 use crate::workflow::demo_workflow;
@@ -49,12 +49,12 @@ struct Booted {
 
 /// Shared HTTP route state.
 #[derive(Clone)]
-struct AppState {
-    node_id: String,
-    membership: MembershipView,
-    agent_card: a2a::AgentCard,
-    header_observer: HeaderObserver,
-    handler: Arc<RakkaA2ARequestHandler>,
+pub(crate) struct AppState {
+    pub(crate) node_id: String,
+    pub(crate) membership: MembershipView,
+    pub(crate) agent_card: a2a::AgentCard,
+    pub(crate) header_observer: HeaderObserver,
+    pub(crate) handler: Arc<RakkaA2ARequestHandler>,
 }
 
 #[derive(Serialize)]
@@ -92,7 +92,7 @@ pub async fn run() -> ExampleResult<()> {
     shutdown(booted).await
 }
 
-fn router(state: AppState) -> Router {
+pub(crate) fn router(state: AppState) -> Router {
     let agent_card = state.agent_card.clone();
     let handler = state.handler.clone();
 
@@ -186,6 +186,7 @@ async fn boot() -> ExampleResult<Booted> {
             run_store: run_store.clone(),
             workflow_store: workflow_store.clone(),
             task_store: task_store.clone(),
+            idle_passivation: RUN_ENTITY_IDLE_PASSIVATION,
         },
     )?;
 
@@ -853,6 +854,7 @@ mod tests {
                 run_store: run_store.clone(),
                 workflow_store: workflow_store.clone(),
                 task_store: task_store.clone(),
+                idle_passivation: RUN_ENTITY_IDLE_PASSIVATION,
             },
         )
         .unwrap();

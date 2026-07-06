@@ -399,7 +399,7 @@ impl RakkaA2ARequestHandler {
             let tenant = draft.normalized.tenant.as_str().to_string();
             let request = A2ARunRequest::new(
                 draft.normalized.task_id.clone(),
-                tenant,
+                Some(tenant),
                 A2ARunCommandMetadata::from_draft(&draft),
                 projection_hints(
                     req.configuration
@@ -480,7 +480,7 @@ impl RakkaA2ARequestHandler {
             let tenant = draft.normalized.tenant.as_str().to_string();
             let request = A2ARunRequest::new(
                 draft.normalized.task_id.clone(),
-                tenant,
+                Some(tenant),
                 A2ARunCommandMetadata::from_draft(&draft),
                 A2AProjectionHints::default(),
                 A2ATimeoutPolicy::from_duration(RUN_ASK_TIMEOUT),
@@ -1081,7 +1081,9 @@ impl RequestHandler for RakkaA2ARequestHandler {
             .map_err(RakkaA2AHandlerError::Mapping)
             .map_err(RakkaA2AHandlerError::into_a2a_error)?;
         if let Some(router) = &self.router {
-            let tenant = tenant.unwrap_or_else(|| DEFAULT_TENANT.to_string());
+            // A missing tenant stays `None` end-to-end: the owner resolves
+            // the run's stored tenant, matching the local unscoped read path
+            // instead of forcing the local-development default tenant.
             let request = A2ARunRequest::new(
                 req.id.clone(),
                 tenant,
@@ -1302,14 +1304,16 @@ fn record_remote_outcome(
     }
 }
 
+/// Classifies which remote ask failures count as peer-unreachability
+/// evidence for self-fencing.
+///
+/// Only transport send failures qualify. Reply timeouts are deliberately
+/// neutral: the ingress ask budget can elapse while a healthy owner is still
+/// doing durable work, so counting timeouts would let a slow peer fence a
+/// healthy ingress node out of the cluster. Validation and codec errors are
+/// ignored per the routing contract.
 fn is_peer_unreachable(error: &RemoteEntityAskError) -> bool {
     matches!(error, RemoteEntityAskError::Send { .. })
-        || matches!(
-            error,
-            RemoteEntityAskError::Reply {
-                error: RemoteRequestError::Timeout
-            }
-        )
 }
 
 fn entity_ask_error(error: EntityAskError) -> RakkaA2AHandlerError {

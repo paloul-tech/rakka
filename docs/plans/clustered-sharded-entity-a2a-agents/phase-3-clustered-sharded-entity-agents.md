@@ -178,6 +178,21 @@ Acceptance:
 - Updated the example README and agent card text to distinguish the
   load-balanced public A2A endpoint from private Rakka remoting, and to document
   two-node local commands.
+- Added slice 3.6 owner movement and recovery tests in
+  `examples/clustered-sharded-entity-a2a-agents/src/cluster_tests.rs`: two
+  in-process loopback nodes with shared file-backed stores cover acceptance on
+  one node with scoped/unscoped read and cancel from the other, owner shutdown
+  with downing and lazy durable recovery on the new owner, an in-flight
+  command racing the ownership move with an idempotent client retry, idle
+  passivation with lazy re-activation, and duplicate send retry after owner
+  movement.
+- Hardened the clustered path per PR review: the example file store commits
+  each revision through an exclusive hard-link claim so concurrent
+  compare-and-set writers can never lose an update across processes; run
+  entities passivate when idle and spawn uniquely named child actors without
+  panicking on re-activation races; unscoped reads carry an optional tenant
+  end-to-end instead of coercing the local default; and remote ask timeouts
+  no longer count as peer-unreachability evidence for self-fencing.
 
 ## References
 
