@@ -20,10 +20,11 @@ use rakka_workflow::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentAttributes, AgentCompiledNodeId, AgentCompiledNodeKind, AgentCompiledPlanFingerprint,
-    AgentDispatchId, AgentDispatcherWorkerId, AgentDueEffect, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectTarget, AgentInboxError, AgentOutboxError, AgentRunId,
-    AgentRunInbox, AgentTimestampMillis, AgentWorkflowId,
+    AgentA2APeerAdapter, AgentA2APeerRequest, AgentAttributes, AgentCompiledNodeId,
+    AgentCompiledNodeKind, AgentCompiledPlanFingerprint, AgentDispatchId, AgentDispatcherWorkerId,
+    AgentDueEffect, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectTarget,
+    AgentInboxError, AgentModelAdapter, AgentModelRequest, AgentOutboxError, AgentRunId,
+    AgentRunInbox, AgentTimestampMillis, AgentToolAdapter, AgentToolRequest, AgentWorkflowId,
 };
 
 const ATTR_COMPILED_NODE_ID: &str = "compiled_node_id";
@@ -242,12 +243,18 @@ pub enum AgentDispatchTargetClass {
     Tool,
     /// Process actor request.
     Process,
+    /// A2A peer-agent request.
+    A2aPeer,
     /// HTTP request.
     Http,
     /// gRPC request.
     Grpc,
+    /// Webhook callback request.
+    Webhook,
     /// Notification request.
     Notification,
+    /// A2A push notification request.
+    PushNotification,
     /// Human checkpoint request.
     Human,
     /// Stream publication.
@@ -289,9 +296,12 @@ impl AgentDispatchTargetClass {
             Self::Model => "model",
             Self::Tool => "tool",
             Self::Process => "process",
+            Self::A2aPeer => "a2a-peer",
             Self::Http => "http",
             Self::Grpc => "grpc",
+            Self::Webhook => "webhook",
             Self::Notification => "notification",
+            Self::PushNotification => "push-notification",
             Self::Human => "human",
             Self::Stream => "stream",
             Self::Artifact => "artifact",
@@ -302,10 +312,27 @@ impl AgentDispatchTargetClass {
     }
 
     fn refine_with_target_type(self, target: &AgentEffectTarget) -> Self {
+        if let Some(class) = target
+            .attributes
+            .get(ATTR_TARGET_CLASS)
+            .and_then(|value| dispatch_class_from_label(value))
+        {
+            return class;
+        }
+        if target
+            .attributes
+            .get("notification_protocol")
+            .is_some_and(|value| value == "a2a-push")
+        {
+            return Self::PushNotification;
+        }
         match target.target_type.as_str() {
             "model" => Self::Model,
             "tool" => Self::Tool,
             "process" => Self::Process,
+            "a2a-peer" => Self::A2aPeer,
+            "webhook" => Self::Webhook,
+            "push" | "a2a-push" => Self::PushNotification,
             "http" => Self::Http,
             "grpc" => Self::Grpc,
             "notification" => Self::Notification,
@@ -616,6 +643,14 @@ impl AgentDispatchEntry {
         self
     }
 
+    fn mark_cancelled(mut self, now: AgentTimestampMillis) -> Self {
+        self.status = AgentDispatchStatus::Cancelled;
+        self.lease = None;
+        self.updated_at = now;
+        self.completed_at = Some(now);
+        self
+    }
+
     fn validate(&self) -> AgentDispatcherResult<()> {
         require_dispatch(&self.dispatch_id, self.dispatch_id.as_str(), "dispatch_id")?;
         require_dispatch(&self.dispatch_id, self.run_id.as_str(), "run_id")?;
@@ -683,9 +718,12 @@ impl AgentDispatchConcurrencyLimits {
             AgentDispatchTargetClass::Model,
             AgentDispatchTargetClass::Tool,
             AgentDispatchTargetClass::Process,
+            AgentDispatchTargetClass::A2aPeer,
             AgentDispatchTargetClass::Http,
             AgentDispatchTargetClass::Grpc,
+            AgentDispatchTargetClass::Webhook,
             AgentDispatchTargetClass::Notification,
+            AgentDispatchTargetClass::PushNotification,
         ] {
             class_limits.insert(class, default_limit);
         }
@@ -858,6 +896,21 @@ pub struct AgentDispatcherRegistration {
     pub observed_due_effects: usize,
     /// Number of fleet entries inserted or refreshed.
     pub registered_effects: usize,
+}
+
+/// Result of marking dispatch entries cancelled or cancellation requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDispatcherCancellation {
+    /// Run whose dispatch entries were considered.
+    pub run_id: AgentRunId,
+    /// Timestamp used for the cancellation pass.
+    pub cancelled_at: AgentTimestampMillis,
+    /// Entries moved to `Cancelled`.
+    pub cancelled_entries: usize,
+    /// Entries already terminal before the cancellation pass.
+    pub already_terminal_entries: usize,
+    /// Actively leased entries left in-flight and annotated for ignore-on-completion policy.
+    pub in_flight_entries: usize,
 }
 
 /// Result of one claim pass.
@@ -1103,6 +1156,66 @@ where
         })
     }
 
+    /// Marks claimable dispatch entries for a run cancelled.
+    ///
+    /// Active leases are not forcibly completed at the lower outbox layer. They
+    /// are annotated and left for the worker's in-flight side effect to finish
+    /// or time out; higher-level run cancellation remains durable because it is
+    /// persisted before this best-effort dispatcher pass.
+    pub async fn cancel_run_dispatches(
+        &mut self,
+        run_id: &AgentRunId,
+    ) -> AgentDispatcherResult<AgentDispatcherCancellation> {
+        if self.record.is_none() {
+            self.recover().await?;
+        }
+
+        let now = current_agent_timestamp(&self.clock);
+        let record = self.current_record()?;
+        let mut next = record.state;
+        let mut cancelled_entries = 0;
+        let mut already_terminal_entries = 0;
+        let mut in_flight_entries = 0;
+        let mut changed = false;
+
+        for entry in next
+            .entries
+            .values_mut()
+            .filter(|entry| &entry.run_id == run_id)
+        {
+            if entry.status.is_terminal() {
+                already_terminal_entries += 1;
+            } else if entry.is_in_flight_at(now) {
+                in_flight_entries += 1;
+                entry
+                    .attributes
+                    .insert("cancellation_requested".to_string(), "true".to_string());
+                entry.last_error_code = Some("cancellation-requested".to_string());
+                entry.updated_at = now;
+                changed = true;
+            } else {
+                let updated = entry.clone().mark_cancelled(now);
+                *entry = updated;
+                cancelled_entries += 1;
+                changed = true;
+            }
+        }
+
+        if changed {
+            next.updated_at = now;
+            self.persist(record.revision, next).await?;
+            self.record_gauges(now);
+        }
+        self.record_metric("cancel", "cancelled", "none", cancelled_entries as u64);
+        Ok(AgentDispatcherCancellation {
+            run_id: run_id.clone(),
+            cancelled_at: now,
+            cancelled_entries,
+            already_terminal_entries,
+            in_flight_entries,
+        })
+    }
+
     /// Completes a current claim.
     pub async fn complete_claim(
         &mut self,
@@ -1282,6 +1395,197 @@ pub type AgentEffectDispatchFuture<'a> =
 pub trait AgentEffectDispatcher: Send {
     /// Dispatches one claimed effect.
     fn dispatch<'a>(&'a mut self, job: &'a AgentDispatchJob) -> AgentEffectDispatchFuture<'a>;
+}
+
+/// Registry that routes claimed effects to target-class dispatchers.
+#[derive(Default)]
+pub struct AgentEffectDispatcherRegistry {
+    dispatchers: BTreeMap<AgentDispatchTargetClass, Box<dyn AgentEffectDispatcher>>,
+    fallback: Option<Box<dyn AgentEffectDispatcher>>,
+}
+
+impl AgentEffectDispatcherRegistry {
+    /// Creates an empty dispatcher registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a dispatcher for one target class.
+    #[must_use]
+    pub fn with_dispatcher<D>(
+        mut self,
+        target_class: AgentDispatchTargetClass,
+        dispatcher: D,
+    ) -> Self
+    where
+        D: AgentEffectDispatcher + 'static,
+    {
+        self.dispatchers.insert(target_class, Box::new(dispatcher));
+        self
+    }
+
+    /// Registers a fallback dispatcher used when no class-specific dispatcher exists.
+    #[must_use]
+    pub fn with_fallback<D>(mut self, dispatcher: D) -> Self
+    where
+        D: AgentEffectDispatcher + 'static,
+    {
+        self.fallback = Some(Box::new(dispatcher));
+        self
+    }
+
+    /// Returns true when a dispatcher is registered for the class.
+    #[must_use]
+    pub fn contains(&self, target_class: AgentDispatchTargetClass) -> bool {
+        self.dispatchers.contains_key(&target_class)
+    }
+}
+
+impl AgentEffectDispatcher for AgentEffectDispatcherRegistry {
+    fn dispatch<'a>(&'a mut self, job: &'a AgentDispatchJob) -> AgentEffectDispatchFuture<'a> {
+        if let Some(dispatcher) = self.dispatchers.get_mut(&job.claim.target_class) {
+            dispatcher.dispatch(job)
+        } else if let Some(dispatcher) = self.fallback.as_mut() {
+            dispatcher.dispatch(job)
+        } else {
+            Box::pin(async move {
+                OutboxDispatchResult::failure(format!(
+                    "dispatcher-unregistered:{}",
+                    job.claim.target_class.as_label()
+                ))
+            })
+        }
+    }
+}
+
+/// Dispatcher that invokes an [`AgentModelAdapter`].
+pub struct AgentModelEffectDispatcher<A> {
+    adapter: A,
+}
+
+impl<A> AgentModelEffectDispatcher<A> {
+    /// Creates a model effect dispatcher.
+    #[must_use]
+    pub const fn new(adapter: A) -> Self {
+        Self { adapter }
+    }
+
+    /// Mutable access to the wrapped adapter.
+    #[must_use]
+    pub fn adapter_mut(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
+    /// Consumes the dispatcher and returns the wrapped adapter.
+    #[must_use]
+    pub fn into_inner(self) -> A {
+        self.adapter
+    }
+}
+
+impl<A> AgentEffectDispatcher for AgentModelEffectDispatcher<A>
+where
+    A: AgentModelAdapter,
+{
+    fn dispatch<'a>(&'a mut self, job: &'a AgentDispatchJob) -> AgentEffectDispatchFuture<'a> {
+        Box::pin(async move {
+            let request = match AgentModelRequest::from_effect(job.effect.clone()) {
+                Ok(request) => request,
+                Err(error) => return OutboxDispatchResult::failure(error.code()),
+            };
+            match self.adapter.invoke_model(request).await {
+                Ok(outcome) => outcome.to_outbox_dispatch_result(),
+                Err(error) => OutboxDispatchResult::failure(error.code()),
+            }
+        })
+    }
+}
+
+/// Dispatcher that invokes an [`AgentToolAdapter`].
+pub struct AgentToolEffectDispatcher<A> {
+    adapter: A,
+}
+
+impl<A> AgentToolEffectDispatcher<A> {
+    /// Creates a tool effect dispatcher.
+    #[must_use]
+    pub const fn new(adapter: A) -> Self {
+        Self { adapter }
+    }
+
+    /// Mutable access to the wrapped adapter.
+    #[must_use]
+    pub fn adapter_mut(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
+    /// Consumes the dispatcher and returns the wrapped adapter.
+    #[must_use]
+    pub fn into_inner(self) -> A {
+        self.adapter
+    }
+}
+
+impl<A> AgentEffectDispatcher for AgentToolEffectDispatcher<A>
+where
+    A: AgentToolAdapter,
+{
+    fn dispatch<'a>(&'a mut self, job: &'a AgentDispatchJob) -> AgentEffectDispatchFuture<'a> {
+        Box::pin(async move {
+            let request = match AgentToolRequest::from_effect(job.effect.clone()) {
+                Ok(request) => request,
+                Err(error) => return OutboxDispatchResult::failure(error.code()),
+            };
+            match self.adapter.invoke_tool(request).await {
+                Ok(outcome) => outcome.to_outbox_dispatch_result(),
+                Err(error) => OutboxDispatchResult::failure(error.code()),
+            }
+        })
+    }
+}
+
+/// Dispatcher that invokes an [`AgentA2APeerAdapter`].
+pub struct AgentA2APeerEffectDispatcher<A> {
+    adapter: A,
+}
+
+impl<A> AgentA2APeerEffectDispatcher<A> {
+    /// Creates an A2A peer effect dispatcher.
+    #[must_use]
+    pub const fn new(adapter: A) -> Self {
+        Self { adapter }
+    }
+
+    /// Mutable access to the wrapped adapter.
+    #[must_use]
+    pub fn adapter_mut(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
+    /// Consumes the dispatcher and returns the wrapped adapter.
+    #[must_use]
+    pub fn into_inner(self) -> A {
+        self.adapter
+    }
+}
+
+impl<A> AgentEffectDispatcher for AgentA2APeerEffectDispatcher<A>
+where
+    A: AgentA2APeerAdapter,
+{
+    fn dispatch<'a>(&'a mut self, job: &'a AgentDispatchJob) -> AgentEffectDispatchFuture<'a> {
+        Box::pin(async move {
+            let request = match AgentA2APeerRequest::from_effect(job.effect.clone()) {
+                Ok(request) => request,
+                Err(error) => return OutboxDispatchResult::failure(error.code()),
+            };
+            match self.adapter.invoke_peer(request).await {
+                Ok(outcome) => outcome.to_outbox_dispatch_result(),
+                Err(error) => OutboxDispatchResult::failure(error.code()),
+            }
+        })
+    }
 }
 
 /// Result of one dispatched claim.
@@ -1751,6 +2055,27 @@ fn current_agent_timestamp(clock: &impl WorkflowClock) -> AgentTimestampMillis {
 
 fn target_limit_key(class: AgentDispatchTargetClass, target_name: &str) -> String {
     format!("{}:{target_name}", class.as_label())
+}
+
+fn dispatch_class_from_label(value: &str) -> Option<AgentDispatchTargetClass> {
+    Some(match value {
+        "model" => AgentDispatchTargetClass::Model,
+        "tool" => AgentDispatchTargetClass::Tool,
+        "process" | "process-tool" => AgentDispatchTargetClass::Process,
+        "a2a-peer" => AgentDispatchTargetClass::A2aPeer,
+        "http" => AgentDispatchTargetClass::Http,
+        "grpc" => AgentDispatchTargetClass::Grpc,
+        "webhook" => AgentDispatchTargetClass::Webhook,
+        "notification" => AgentDispatchTargetClass::Notification,
+        "push" | "a2a-push" | "push-notification" => AgentDispatchTargetClass::PushNotification,
+        "human" | "human-checkpoint" => AgentDispatchTargetClass::Human,
+        "stream" => AgentDispatchTargetClass::Stream,
+        "artifact" => AgentDispatchTargetClass::Artifact,
+        "child-workflow" => AgentDispatchTargetClass::ChildWorkflow,
+        "audit" => AgentDispatchTargetClass::Audit,
+        "other" => AgentDispatchTargetClass::Other,
+        _ => return None,
+    })
 }
 
 fn graph_dispatch_context_from_effect(effect: &AgentEffect) -> AgentDispatchGraphContext {

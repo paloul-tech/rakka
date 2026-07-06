@@ -12,6 +12,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - `scripts/validate.sh` as the required local validation entry point.
 - `scripts/package-check.sh` as the offline package metadata and publishability check entry point.
 - V1 release-candidate review docs for reliability boundaries, N/N+1 rolling updates, known limitations, post-v1 roadmap, and final review checklist.
+- Phase 5 agent workflow autonomy APIs: effect target catalog and policy validation, A2A peer adapter contracts, dispatcher registry routing, A2A peer/webhook/push dispatch classes, and deterministic dispatcher cancellation marking.
 
 ### Changed
 

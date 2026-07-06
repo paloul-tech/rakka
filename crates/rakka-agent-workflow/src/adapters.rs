@@ -43,6 +43,10 @@ pub type AgentAdapterResult<T> = Result<T, AgentAdapterError>;
 pub type AgentAdapterFuture<'a> =
     Pin<Box<dyn Future<Output = AgentAdapterResult<AgentAdapterOutcome>> + Send + 'a>>;
 
+/// Boxed future returned by A2A peer adapters.
+pub type AgentA2APeerAdapterFuture<'a> =
+    Pin<Box<dyn Future<Output = AgentAdapterResult<AgentA2APeerOutcome>> + Send + 'a>>;
+
 /// Adapter-level failures that occur before a provider/tool outcome exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAdapterError {
@@ -457,6 +461,169 @@ impl AgentToolRequest {
     }
 }
 
+/// Request sent to an A2A peer-call adapter.
+///
+/// The core crate deliberately keeps this shape independent from the A2A SDK
+/// wire types. An adapter in an A2A-facing crate can resolve the peer card,
+/// choose REST or JSON-RPC with `a2a-client`, and translate this durable effect
+/// into the SDK's `SendMessageRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentA2APeerRequest {
+    /// Source durable effect.
+    pub effect: AgentEffect,
+    /// Common adapter metadata.
+    pub metadata: AgentAdapterRequestMetadata,
+    /// Out-of-line A2A message/request artifact.
+    pub request_ref: Option<ArtifactRef>,
+    /// Stable peer name selected by the effect target.
+    pub peer_name: String,
+    /// Optional peer agent-card artifact or logical card reference.
+    pub peer_card_ref: Option<ArtifactRef>,
+    /// Optional parent context id to pass to the peer.
+    pub context_id: Option<String>,
+    /// Optional peer task id for retries or continuations.
+    pub peer_task_id: Option<String>,
+    /// Optional preferred transport binding such as `jsonrpc` or `rest`.
+    pub preferred_transport: Option<String>,
+    /// Bounded target parameters.
+    pub parameters: AgentAttributes,
+}
+
+impl AgentA2APeerRequest {
+    /// Builds a peer request from a durable A2A-peer effect.
+    pub fn from_effect(effect: AgentEffect) -> AgentAdapterResult<Self> {
+        if !is_a2a_peer_effect(&effect) {
+            return Err(AgentAdapterError::InvalidEffectKind {
+                effect_id: effect.effect_id,
+                expected: "a2a-peer",
+                actual: effect.kind,
+            });
+        }
+        let request_ref = effect.payload_ref.clone();
+        let peer_card_ref = peer_card_ref_from_attributes(&effect.target.attributes);
+        Ok(Self {
+            metadata: AgentAdapterRequestMetadata::from_effect(&effect, request_ref.as_ref()),
+            peer_name: effect.target.name.clone(),
+            context_id: effect.target.attributes.get("context_id").cloned(),
+            peer_task_id: effect.target.attributes.get("peer_task_id").cloned(),
+            preferred_transport: effect.target.attributes.get("preferred_transport").cloned(),
+            parameters: effect.target.attributes.clone(),
+            effect,
+            request_ref,
+            peer_card_ref,
+        })
+    }
+}
+
+/// Result returned by an A2A peer-call adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AgentA2APeerOutcome {
+    /// Peer call completed successfully.
+    Completed {
+        /// Durable receipt.
+        receipt: AgentAdapterReceipt,
+        /// Peer task id returned by the remote agent.
+        peer_task_id: String,
+        /// Peer context id returned by the remote agent.
+        context_id: Option<String>,
+        /// Result artifact reference.
+        result_ref: Option<ArtifactRef>,
+    },
+    /// Peer call failed before completion.
+    Failed {
+        /// Durable receipt.
+        receipt: AgentAdapterReceipt,
+        /// Retry classification.
+        classification: AgentAdapterFailureClass,
+        /// Stable bounded error code.
+        error_code: String,
+        /// Optional retry-after timestamp.
+        retry_after: Option<AgentTimestampMillis>,
+        /// Optional artifact containing bounded error details.
+        error_ref: Option<ArtifactRef>,
+    },
+    /// Peer call timed out.
+    TimedOut {
+        /// Durable receipt.
+        receipt: AgentAdapterReceipt,
+        /// Timeout budget that elapsed.
+        timeout_ms: u64,
+        /// Peer task id when the request may have been accepted remotely.
+        peer_task_id: Option<String>,
+    },
+}
+
+impl AgentA2APeerOutcome {
+    /// Creates a successful peer outcome.
+    #[must_use]
+    pub fn completed(
+        receipt: AgentAdapterReceipt,
+        peer_task_id: impl Into<String>,
+        context_id: Option<String>,
+        result_ref: Option<ArtifactRef>,
+    ) -> Self {
+        Self::Completed {
+            receipt,
+            peer_task_id: peer_task_id.into(),
+            context_id,
+            result_ref,
+        }
+    }
+
+    /// Creates a failed peer outcome.
+    #[must_use]
+    pub fn failed(
+        receipt: AgentAdapterReceipt,
+        classification: AgentAdapterFailureClass,
+        error_code: impl Into<String>,
+    ) -> Self {
+        Self::Failed {
+            receipt,
+            classification,
+            error_code: error_code.into(),
+            retry_after: None,
+            error_ref: None,
+        }
+    }
+
+    /// Creates a timed-out peer outcome.
+    #[must_use]
+    pub fn timed_out(
+        receipt: AgentAdapterReceipt,
+        timeout_ms: u64,
+        peer_task_id: Option<String>,
+    ) -> Self {
+        Self::TimedOut {
+            receipt,
+            timeout_ms,
+            peer_task_id,
+        }
+    }
+
+    /// Maps the peer outcome into the durable outbox dispatch result.
+    #[must_use]
+    pub fn to_outbox_dispatch_result(&self) -> OutboxDispatchResult {
+        match self {
+            Self::Completed { .. } => OutboxDispatchResult::Success,
+            Self::Failed {
+                classification,
+                error_code,
+                ..
+            } => {
+                let prefix = match classification {
+                    AgentAdapterFailureClass::Retryable => "retryable",
+                    AgentAdapterFailureClass::Permanent => "permanent",
+                };
+                OutboxDispatchResult::failure(format!("{prefix}:a2a-peer:{error_code}"))
+            }
+            Self::TimedOut { timeout_ms, .. } => {
+                OutboxDispatchResult::timeout(format!("a2a-peer-timeout:{timeout_ms}"))
+            }
+        }
+    }
+}
+
 /// Result returned by model and tool adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -581,6 +748,13 @@ pub trait AgentToolAdapter: Send {
     fn invoke_tool<'a>(&'a mut self, request: AgentToolRequest) -> AgentAdapterFuture<'a>;
 }
 
+/// Trait implemented by A2A peer-call adapters.
+pub trait AgentA2APeerAdapter: Send {
+    /// Invokes an A2A peer task call.
+    fn invoke_peer<'a>(&'a mut self, request: AgentA2APeerRequest)
+        -> AgentA2APeerAdapterFuture<'a>;
+}
+
 /// Feature-gated example of a process-backed tool adapter using
 /// `rakka-process` file-watch mode.
 #[cfg(feature = "process-tools")]
@@ -696,6 +870,34 @@ fn model_name_from_target(target: &AgentEffectTarget) -> Option<String> {
             .cloned()
             .unwrap_or_else(|| target.name.clone()),
     )
+}
+
+fn is_a2a_peer_effect(effect: &AgentEffect) -> bool {
+    matches!(
+        effect.kind,
+        AgentEffectKind::HttpCall | AgentEffectKind::GrpcCall
+    ) && (effect.target.target_type == "a2a-peer"
+        || effect
+            .target
+            .attributes
+            .get("target_class")
+            .is_some_and(|value| value == "a2a-peer"))
+}
+
+fn peer_card_ref_from_attributes(attributes: &AgentAttributes) -> Option<ArtifactRef> {
+    attributes.get("peer_card_ref").map(|value| ArtifactRef {
+        artifact_id: value.clone(),
+        kind: crate::ArtifactKind::Other,
+        uri: value.clone(),
+        checksum: None,
+        content_type: Some("application/vnd.a2a.agent-card+json".to_string()),
+        byte_len: None,
+        retention_class: None,
+        encryption: None,
+        redaction: RedactionStatus::ReferenceOnly,
+        created_at: AgentTimestampMillis::new(0),
+        metadata: AgentAttributes::new(),
+    })
 }
 
 #[cfg(feature = "process-tools")]
