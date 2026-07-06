@@ -56,6 +56,9 @@
 - Keep optional integration layers feature-gated through `crates/rakka/Cargo.toml`; maintain no-default checks for `rakka-stream` and `rakka-process`.
 - Streams and mailboxes are bounded by design. Preserve back-pressure, cancellation, drain, and message ownership on failure.
 - Metrics labels must be bounded and operationally meaningful; avoid raw ids, actor paths, prompts, payloads, command args, temp paths, and full error text.
+- Commit messages have a title, and a body with a short bulleted description of the change.
+- PR messages must be generated as Markdown, not plain text.
+- PR messages must have a title; the body should consist of a summary, completed work, notes, and list of validation commands.
 
 ## 5. Strict Boundaries
 
