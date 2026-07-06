@@ -52,11 +52,15 @@ use crate::sharded_run_entity::A2ARunEntityCommand;
 use crate::stream_limits::{A2AStreamLease, A2AStreamLimitError, A2AStreamLimits};
 use crate::support::RUN_ASK_TIMEOUT;
 use crate::task_projection::{
-    status_transition_allowed, A2ATaskEvent, A2ATaskEventPayload, A2ATaskProjection,
-    InMemoryA2ATaskProjectionStore, TaskProjectionError,
+    encode_replay_cursor, parse_replay_cursor, status_transition_allowed, A2ATaskEvent,
+    A2ATaskEventPayload, A2ATaskProjection, InMemoryA2ATaskProjectionStore, TaskProjectionError,
 };
 
 const STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// How often an owner-routed stream polls the shard owner for new public
+/// events. Owner-held tasks broadcast locally; this poll is the live-update
+/// path for streams served from other public nodes.
+const STREAM_OWNER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const REPLAY_CURSOR_HEADER: &str = "rakka-a2a-replay-cursor";
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 /// Bound on optimistic-concurrency re-drives for inbox accepts and run
@@ -351,7 +355,9 @@ pub struct RakkaA2ARequestHandler {
     push_configs: A2APushConfigStore,
     stream_limits: A2AStreamLimits,
     header_observer: HeaderObserver,
-    router: Option<A2ARunRouter>,
+    /// Shared so long-lived streams can poll the owner after the request
+    /// handler call has returned.
+    router: Option<Arc<A2ARunRouter>>,
 }
 
 impl RakkaA2ARequestHandler {
@@ -382,7 +388,7 @@ impl RakkaA2ARequestHandler {
     /// Creates a durable handler that routes owner-only work through sharding.
     #[must_use]
     pub fn with_router(mut self, router: A2ARunRouter) -> Self {
-        self.router = Some(router);
+        self.router = Some(Arc::new(router));
         self
     }
 
@@ -594,35 +600,62 @@ impl RakkaA2ARequestHandler {
         projection: A2ATaskProjection,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, RakkaA2AHandlerError> {
         let lease = self.stream_limits.acquire(&task_id)?;
+        // Subscribe before reading snapshot or replay state so an event
+        // appended in between still reaches the stream through the watcher;
+        // the sequence dedup below drops the overlap.
         let receiver = self.task_store.watch(&tenant, &task_id);
+        // Re-read after subscribing: the caller's projection copy may predate
+        // events appended before the subscription existed.
+        let projection = match self.task_store.projection(Some(&tenant), &task_id) {
+            Ok(current) => current,
+            Err(TaskProjectionError::TaskNotFound { .. }) => projection,
+            Err(error) => return Err(error.into()),
+        };
         let started = Instant::now();
         let mut pending = VecDeque::new();
         let mut last_sequence = projection.projection_revision;
+        let mut poll_owner_now = false;
 
         if let Some(cursor) = after_cursor.as_deref() {
-            match self
-                .task_store
-                .replay_events(&tenant, &task_id, Some(cursor))
-            {
-                Ok(events) => {
-                    if let Some(last) = events.last() {
-                        last_sequence = last.sequence;
+            if self.router.is_some() {
+                // The owner holds the authoritative event log; replay through
+                // it on the first poll instead of trusting this node's local
+                // log, so a valid cursor resumes without duplicate events.
+                match parse_replay_cursor(cursor) {
+                    Ok((cursor_task_id, sequence)) if cursor_task_id == task_id => {
+                        last_sequence = sequence;
+                        poll_owner_now = true;
                     }
-                    pending.extend(events.into_iter().map(stream_response_from_event));
+                    _ => {
+                        pending.push_back(Ok(StreamResponse::Task(projection.to_task(None, true))));
+                        last_sequence = projection.projection_revision;
+                    }
                 }
-                Err(TaskProjectionError::ReplayWindowExpired { .. })
-                | Err(TaskProjectionError::InvalidReplayCursor { .. }) => {
-                    pending.push_back(Ok(StreamResponse::Task(projection.to_task(None, true))));
-                    last_sequence = projection.projection_revision;
+            } else {
+                match self
+                    .task_store
+                    .replay_events(&tenant, &task_id, Some(cursor))
+                {
+                    Ok(events) => {
+                        if let Some(last) = events.last() {
+                            last_sequence = last.sequence;
+                        }
+                        pending.extend(events.into_iter().map(stream_response_from_event));
+                    }
+                    Err(TaskProjectionError::ReplayWindowExpired { .. })
+                    | Err(TaskProjectionError::InvalidReplayCursor { .. }) => {
+                        pending.push_back(Ok(StreamResponse::Task(projection.to_task(None, true))));
+                        last_sequence = projection.projection_revision;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             }
         } else {
             pending.push_back(Ok(StreamResponse::Task(projection.to_task(None, true))));
             last_sequence = projection.projection_revision;
         }
 
-        if snapshot_first && pending.is_empty() {
+        if snapshot_first && pending.is_empty() && !poll_owner_now {
             pending.push_back(Ok(StreamResponse::Task(projection.to_task(None, true))));
             last_sequence = projection.projection_revision;
         }
@@ -640,9 +673,13 @@ impl RakkaA2ARequestHandler {
             pending,
             last_sequence,
             status,
+            tenant,
             task_id,
             context_id: projection.context_id,
             limits: self.stream_limits.clone(),
+            router: self.router.clone(),
+            poll_owner_now,
+            last_emitted: Instant::now(),
             _lease: lease,
             done: false,
         };
@@ -1332,9 +1369,18 @@ struct A2AStreamState {
     pending: VecDeque<Result<StreamResponse, A2AError>>,
     last_sequence: u64,
     status: TaskStatus,
+    tenant: String,
     task_id: String,
     context_id: String,
     limits: A2AStreamLimits,
+    /// Present in clustered mode: the live-update path for tasks whose owner
+    /// is another public node.
+    router: Option<Arc<A2ARunRouter>>,
+    /// Poll the owner before waiting on the local watcher (set on open with
+    /// a client cursor, and after every watcher timeout in clustered mode).
+    poll_owner_now: bool,
+    /// When the last item was returned; paces heartbeats between owner polls.
+    last_emitted: Instant,
     _lease: A2AStreamLease,
     done: bool,
 }
@@ -1347,16 +1393,31 @@ async fn next_stream_item(
     }
     if let Some(item) = state.pending.pop_front() {
         apply_stream_response_state(&mut state, &item);
+        state.last_emitted = Instant::now();
         return Some((item, state));
     }
 
     loop {
-        match time::timeout(STREAM_HEARTBEAT_INTERVAL, state.receiver.recv()).await {
+        if state.poll_owner_now {
+            state.poll_owner_now = false;
+            if let Some(item) = poll_owner_events(&mut state).await {
+                apply_stream_response_state(&mut state, &item);
+                state.last_emitted = Instant::now();
+                return Some((item, state));
+            }
+        }
+        let wait = if state.router.is_some() {
+            STREAM_OWNER_POLL_INTERVAL
+        } else {
+            STREAM_HEARTBEAT_INTERVAL
+        };
+        match time::timeout(wait, state.receiver.recv()).await {
             Ok(Ok(event)) if event.sequence <= state.last_sequence => continue,
             Ok(Ok(event)) => {
                 state.last_sequence = event.sequence;
                 let item = stream_response_from_event(event);
                 apply_stream_response_state(&mut state, &item);
+                state.last_emitted = Instant::now();
                 return Some((item, state));
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
@@ -1373,8 +1434,99 @@ async fn next_stream_item(
                 state.limits.record_dropped();
                 return None;
             }
-            Err(_) => return Some((Ok(heartbeat_response(&state)), state)),
+            Err(_) => {
+                if state.router.is_some() {
+                    state.poll_owner_now = true;
+                    if state.last_emitted.elapsed() < STREAM_HEARTBEAT_INTERVAL {
+                        continue;
+                    }
+                }
+                state.last_emitted = Instant::now();
+                return Some((Ok(heartbeat_response(&state)), state));
+            }
         }
+    }
+}
+
+/// Polls the shard owner for public events after the stream's cursor.
+///
+/// Returns the next item to emit, queueing any extra events on
+/// `state.pending`; `None` means the owner reported nothing new.
+async fn poll_owner_events(state: &mut A2AStreamState) -> Option<Result<StreamResponse, A2AError>> {
+    let router = state.router.clone()?;
+    let request = A2ARunRequest::new(
+        state.task_id.clone(),
+        Some(state.tenant.clone()),
+        A2ARunCommandMetadata::query(),
+        A2AProjectionHints::default(),
+        A2ATimeoutPolicy::from_duration(RUN_ASK_TIMEOUT),
+        A2ARunRequestKind::OpenStreamCursor {
+            after_cursor: Some(encode_replay_cursor(&state.task_id, state.last_sequence)),
+        },
+    );
+    let outcome = match router.route(request).await {
+        Ok(response) => stream_cursor_from_response(response),
+        Err(error) => Err(error),
+    };
+    match outcome {
+        Ok((projection, events, resync)) => {
+            if resync {
+                // The owner cannot resume from this cursor (owner moved or
+                // the window compacted); re-bootstrap from its snapshot.
+                state.last_sequence = projection.projection_revision;
+                return Some(Ok(StreamResponse::Task(projection.to_task(None, true))));
+            }
+            let mut first = None;
+            for event in events {
+                if event.sequence <= state.last_sequence {
+                    continue;
+                }
+                state.last_sequence = event.sequence;
+                let item = stream_response_from_event(event);
+                if first.is_none() {
+                    first = Some(item);
+                } else {
+                    state.pending.push_back(item);
+                }
+            }
+            first
+        }
+        Err(_) => {
+            state.limits.record_dropped();
+            Some(Err(A2AError::internal(
+                "a2a-stream-owner-unavailable: task owner is unavailable; \
+                 reconnect with the last replay cursor",
+            )))
+        }
+    }
+}
+
+fn stream_cursor_from_response(
+    response: A2ARunResponse,
+) -> Result<(A2ATaskProjection, Vec<A2ATaskEvent>, bool), RakkaA2AHandlerError> {
+    if response.version != A2A_RUN_PROTOCOL_VERSION {
+        return Err(RakkaA2AHandlerError::InvalidLifecycle {
+            task_id: response.task_id,
+            reason: "owner response protocol version mismatch",
+        });
+    }
+    match response.outcome {
+        A2ARunResponseKind::StreamCursor {
+            projection,
+            events,
+            resync,
+        } => Ok((projection, events, resync)),
+        A2ARunResponseKind::Failure { failure } => Err(owner_failure_error(
+            &response.task_id,
+            failure.kind,
+            failure.message,
+        )),
+        A2ARunResponseKind::TaskSnapshot { .. }
+        | A2ARunResponseKind::PushConfigRecorded { .. }
+        | A2ARunResponseKind::PushConfigDeleted => Err(RakkaA2AHandlerError::InvalidLifecycle {
+            task_id: response.task_id,
+            reason: "owner returned an unexpected response kind",
+        }),
     }
 }
 
@@ -1452,7 +1604,10 @@ fn heartbeat_response(state: &A2AStreamState) -> StreamResponse {
             ),
             (
                 "io.rakka.replay.cursor".to_string(),
-                serde_json::Value::String(format!("{}:{}", state.task_id, state.last_sequence)),
+                serde_json::Value::String(encode_replay_cursor(
+                    &state.task_id,
+                    state.last_sequence,
+                )),
             ),
         ])),
     })

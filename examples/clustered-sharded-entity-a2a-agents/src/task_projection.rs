@@ -469,7 +469,7 @@ impl A2ATaskEvent {
     /// Replay cursor for `subscribe_to_task` and reconnect support.
     #[must_use]
     pub fn replay_cursor(&self) -> String {
-        format!("{}:{}", self.task_id, self.sequence)
+        encode_replay_cursor(&self.task_id, self.sequence)
     }
 
     /// Returns true when this event carries a terminal task state.
@@ -574,6 +574,12 @@ impl InMemoryA2ATaskProjectionStore {
     /// Opens a bounded live watcher for future task events.
     pub fn watch(&self, tenant: &str, task_id: &str) -> broadcast::Receiver<A2ATaskEvent> {
         let mut state = self.inner.lock().expect("projection store mutex");
+        // Sweep senders whose subscribers have all disconnected so the
+        // watcher map stays bounded by live streams, not by every task id
+        // ever streamed.
+        state
+            .watchers
+            .retain(|_, sender| sender.receiver_count() > 0);
         let key = (tenant.to_string(), task_id.to_string());
         state
             .watchers
@@ -691,8 +697,32 @@ impl InMemoryA2ATaskProjectionStore {
             }
         };
         let state = self.inner.lock().expect("projection store mutex");
-        let Some(events) = state.events.get(&(tenant.to_string(), task_id.to_string())) else {
-            return Ok(Vec::new());
+        let key = (tenant.to_string(), task_id.to_string());
+        // A cursor that points past everything this store has ever recorded
+        // came from another node or an earlier owner epoch; it cannot prove
+        // continuity here, so the caller must re-bootstrap from the snapshot.
+        if after_sequence > 0 {
+            let revision = state
+                .projections
+                .get(&key)
+                .map(|projection| projection.projection_revision);
+            if revision.is_none_or(|revision| after_sequence > revision) {
+                return Err(TaskProjectionError::InvalidReplayCursor {
+                    cursor: after_cursor.unwrap_or_default().to_string(),
+                });
+            }
+        }
+        let Some(events) = state.events.get(&key) else {
+            if after_sequence == 0 {
+                return Ok(Vec::new());
+            }
+            // The projection is known (e.g. cached from a routed owner
+            // response) but no local event log covers the cursor, so replay
+            // cannot resume incrementally from here.
+            return Err(TaskProjectionError::ReplayWindowExpired {
+                task_id: task_id.to_string(),
+                earliest_sequence: 0,
+            });
         };
         // The retained log is bounded; a request that starts before the
         // retained window would silently skip dropped events, so signal the
@@ -920,6 +950,17 @@ fn page_offset(page_token: Option<&str>) -> TaskProjectionResult<usize> {
     }
 }
 
+/// Encodes a replay cursor for a task position.
+#[must_use]
+pub fn encode_replay_cursor(task_id: &str, sequence: u64) -> String {
+    format!("{task_id}:{sequence}")
+}
+
+/// Parses a replay cursor into its task id and sequence.
+pub fn parse_replay_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
+    parse_cursor(cursor)
+}
+
 fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
     let Some((task_id, sequence)) = cursor.rsplit_once(':') else {
         return Err(TaskProjectionError::InvalidReplayCursor {
@@ -982,11 +1023,13 @@ fn apply_event_locked(
     let events = state.events.entry(key).or_default();
     events.push(event.clone());
     compact_event_log(events);
-    if let Some(sender) = state
-        .watchers
-        .get(&(event.tenant.clone(), event.task_id.clone()))
-    {
-        let _ = sender.send(event.clone());
+    let watcher_key = (event.tenant.clone(), event.task_id.clone());
+    if let Some(sender) = state.watchers.get(&watcher_key) {
+        // A send with no live receivers means every subscriber disconnected;
+        // drop the sender so terminal tasks do not pin watchers forever.
+        if sender.send(event.clone()).is_err() {
+            state.watchers.remove(&watcher_key);
+        }
     }
     Ok(event)
 }
@@ -1286,6 +1329,116 @@ mod tests {
             .replay_events("tenant-a", "task-1", None)
             .expect("replay")
             .is_empty());
+    }
+
+    #[test]
+    fn replay_cursor_without_local_log_requires_rebootstrap() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        // A projection cached from a routed owner response: known revision,
+        // but no local event log covering the cursor.
+        store.upsert(A2ATaskProjection::accepted(
+            "task-1",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            5,
+        ));
+
+        let error = store
+            .replay_events("tenant-a", "task-1", Some("task-1:3"))
+            .expect_err("a cursor without a local log must not read as an empty tail");
+
+        assert_eq!(error.code(), "replay-window-expired");
+    }
+
+    #[test]
+    fn replay_cursor_beyond_known_revision_is_invalid() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        let snapshot = A2ATaskProjection::accepted(
+            "task-1",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        );
+        store
+            .append_event_payload(
+                "tenant-a",
+                "task-1",
+                "ctx",
+                AgentTimestampMillis::new(10),
+                A2ATaskEventPayload::Snapshot(snapshot),
+            )
+            .expect("bootstrap snapshot");
+
+        // A cursor from another node or owner epoch can point past everything
+        // recorded here; it cannot prove continuity and must force a resync.
+        let error = store
+            .replay_events("tenant-a", "task-1", Some("task-1:99"))
+            .expect_err("future cursor must be rejected");
+
+        assert_eq!(error.code(), "invalid-replay-cursor");
+    }
+
+    #[test]
+    fn dead_watchers_are_pruned_on_append_and_watch() {
+        let store = InMemoryA2ATaskProjectionStore::local();
+        let snapshot = A2ATaskProjection::accepted(
+            "task-w",
+            "ctx",
+            "tenant-a",
+            "workflow",
+            AgentTimestampMillis::new(10),
+            Vec::new(),
+            0,
+        );
+        store
+            .append_event_payload(
+                "tenant-a",
+                "task-w",
+                "ctx",
+                AgentTimestampMillis::new(10),
+                A2ATaskEventPayload::Snapshot(snapshot),
+            )
+            .expect("bootstrap snapshot");
+
+        // Appending to a watcher whose receivers all dropped removes it.
+        let receiver = store.watch("tenant-a", "task-w");
+        drop(receiver);
+        store
+            .append_event_payload(
+                "tenant-a",
+                "task-w",
+                "ctx",
+                AgentTimestampMillis::new(11),
+                A2ATaskEventPayload::StatusUpdate {
+                    state: TaskState::Working,
+                },
+            )
+            .expect("append after receiver dropped");
+        assert!(
+            store
+                .inner
+                .lock()
+                .expect("projection store mutex")
+                .watchers
+                .is_empty(),
+            "append must prune watchers with no receivers"
+        );
+
+        // Opening any watcher sweeps dead senders left on other tasks.
+        let stale = store.watch("tenant-a", "task-w");
+        drop(stale);
+        let _live = store.watch("tenant-a", "task-other");
+        let state = store.inner.lock().expect("projection store mutex");
+        assert_eq!(state.watchers.len(), 1, "watch must sweep dead senders");
+        assert!(state
+            .watchers
+            .contains_key(&("tenant-a".to_string(), "task-other".to_string())));
     }
 
     #[test]

@@ -309,6 +309,7 @@ where
                 &child,
                 &workflow_store,
                 &task_store,
+                &push_configs,
                 &run_id,
                 tenant.as_deref(),
             )
@@ -325,9 +326,27 @@ where
             )
             .await
         }
-        A2ARunRequestKind::OpenStreamCursor { .. } => Err(RakkaA2AHandlerError::Unavailable {
-            message: "A2A streaming is deferred until the streaming phase".to_string(),
-        }),
+        A2ARunRequestKind::OpenStreamCursor { after_cursor } => {
+            match open_stream_cursor(
+                &child,
+                &workflow_store,
+                &task_store,
+                &push_configs,
+                &run_id,
+                tenant.as_deref(),
+                after_cursor.as_deref(),
+            )
+            .await
+            {
+                Ok((projection, events, resync)) => {
+                    let tenant = projection.tenant.clone();
+                    return A2ARunResponse::stream_cursor(
+                        task_id, tenant, projection, events, resync,
+                    );
+                }
+                Err(error) => Err(error),
+            }
+        }
         A2ARunRequestKind::RecordPushConfig { config } => {
             match record_push_config(
                 &child,
@@ -514,6 +533,7 @@ async fn query_task_projection<WorkflowStoreT>(
     child: &ActorRef<AgentRunActorCommand>,
     workflow_store: &WorkflowStoreT,
     task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
     run_id: &AgentRunId,
     tenant: Option<&str>,
 ) -> Result<A2ATaskProjection, RakkaA2AHandlerError>
@@ -533,21 +553,26 @@ where
     }
     let tenant = resolved.as_str();
 
+    // Convergence on the read path emits real public events (a transition can
+    // be observed here first, e.g. a step that completed with no follow-up
+    // command), so those events must schedule push effects like any other.
     match task_store.projection(Some(tenant), run_id.as_str()) {
         Ok(projection) => {
-            let _ = sync_status_projection(
+            if let Some(event) = sync_status_projection(
                 task_store,
                 &run_state,
                 &projection.context_id,
                 run_state.updated_at,
                 Some(projection.status),
-            )?;
+            )? {
+                schedule_owner_push_effects(workflow_store, push_configs, &[event]).await?;
+            }
         }
         Err(TaskProjectionError::TaskNotFound { .. }) => {
             let context_id = recover_context_id(workflow_store, run_id)
                 .await?
                 .unwrap_or_else(|| run_id.as_str().to_string());
-            let _ = snapshot_projection(
+            let event = snapshot_projection(
                 task_store,
                 &run_state,
                 &context_id,
@@ -555,6 +580,7 @@ where
                 Vec::new(),
                 run_state.updated_at,
             )?;
+            schedule_owner_push_effects(workflow_store, push_configs, &[event]).await?;
         }
         Err(error) => return Err(error.into()),
     }
@@ -562,6 +588,43 @@ where
     task_store
         .projection(Some(tenant), run_id.as_str())
         .map_err(Into::into)
+}
+
+/// Converges the owner projection, then replays public events after the
+/// caller's cursor for a stream subscriber on another public node.
+///
+/// Returns the current projection, the replayable events, and whether the
+/// subscriber must re-bootstrap from the projection snapshot because the
+/// cursor is invalid or fell out of the retained window.
+async fn open_stream_cursor<WorkflowStoreT>(
+    child: &ActorRef<AgentRunActorCommand>,
+    workflow_store: &WorkflowStoreT,
+    task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
+    run_id: &AgentRunId,
+    tenant: Option<&str>,
+    after_cursor: Option<&str>,
+) -> Result<(A2ATaskProjection, Vec<A2ATaskEvent>, bool), RakkaA2AHandlerError>
+where
+    WorkflowStoreT: DurableStateStore<WorkflowState>,
+{
+    let projection = query_task_projection(
+        child,
+        workflow_store,
+        task_store,
+        push_configs,
+        run_id,
+        tenant,
+    )
+    .await?;
+    match task_store.replay_events(&projection.tenant, run_id.as_str(), after_cursor) {
+        Ok(events) => Ok((projection, events, false)),
+        Err(
+            TaskProjectionError::ReplayWindowExpired { .. }
+            | TaskProjectionError::InvalidReplayCursor { .. },
+        ) => Ok((projection, Vec::new(), true)),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn record_push_config(

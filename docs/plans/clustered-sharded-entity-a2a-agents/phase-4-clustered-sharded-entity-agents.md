@@ -178,11 +178,23 @@ Acceptance:
 - `examples/clustered-sharded-entity-a2a-agents/src/task_projection.rs` now
   carries public task event state, projected task state, redaction status,
   replay cursors, bounded per-task replay logs, snapshot-preserving compaction,
-  and live watchers for stream subscribers.
+  and live watchers for stream subscribers. A replay cursor that the local log
+  cannot prove contiguous (no log entry, or a sequence past the known
+  revision) is rejected so callers re-bootstrap from the snapshot, and watcher
+  senders are pruned once every subscriber disconnects.
 - `examples/clustered-sharded-entity-a2a-agents/src/a2a_handler.rs` now serves
   `send_streaming_message`, `subscribe_to_task`, and A2A push config
   create/get/list/delete through the same durable acceptance and owner-routing
-  boundaries used by Phase 3 commands.
+  boundaries used by Phase 3 commands. Streams subscribe to the local watcher
+  before reading the snapshot (no lost-event window), and in clustered mode
+  poll the shard owner's event log through `OpenStreamCursor` so streams on
+  non-owner public nodes receive live updates, cursor replay without
+  duplicates, and terminal completion.
+- `examples/clustered-sharded-entity-a2a-agents/src/sharded_run_entity.rs`
+  serves `OpenStreamCursor` (converge + replay after cursor, with snapshot
+  resync when the cursor cannot be honored) and schedules push notification
+  effects for task events emitted by read-path convergence, not just
+  send/cancel commands.
 - `examples/clustered-sharded-entity-a2a-agents/src/stream_limits.rs` adds
   bounded per-node/per-task stream admission and low-cardinality stream metrics.
 - `examples/clustered-sharded-entity-a2a-agents/src/push_config.rs` adds the

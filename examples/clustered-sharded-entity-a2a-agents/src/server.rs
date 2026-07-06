@@ -885,8 +885,21 @@ mod tests {
         assert_eq!(same_tenant.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn clustered_handler_routes_send_through_sharded_owner() {
+    /// Single-node sharded harness: the handler routes owner work through
+    /// real cluster sharding, so owner-only paths (`QueryTaskSnapshot`,
+    /// `OpenStreamCursor`, push config routing) are exercised end to end.
+    struct ClusteredTestContext {
+        system: ActorSystem,
+        handler: Arc<RakkaA2ARequestHandler>,
+        app: axum::Router,
+        run_store: RunStore,
+        workflow_store: WorkflowStore,
+        workflow: rakka::agent_workflow::AgentWorkflow,
+    }
+
+    /// Returns `None` (skipping the test) when loopback binding is
+    /// unavailable in the sandbox, mirroring the other networked tests.
+    async fn clustered_test_state() -> Option<ClusteredTestContext> {
         use crate::codec::serialization_registry;
         use crate::reachability::PeerReachability;
         use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
@@ -937,9 +950,9 @@ mod tests {
             .build()
             .await;
         let Ok(mut runtime) = runtime else {
-            eprintln!("skipping clustered handler route test; loopback bind unavailable");
+            eprintln!("skipping clustered handler test; loopback bind unavailable");
             system.terminate().await.unwrap();
-            return;
+            return None;
         };
         let ask_client = runtime.ask_client();
         let sharding = ClusterSharding::for_node_runtime(&system, &runtime).unwrap();
@@ -970,10 +983,10 @@ mod tests {
         let handler = Arc::new(
             RakkaA2ARequestHandler::new(
                 agent_card.clone(),
-                workflow,
+                workflow.clone(),
                 task_store,
-                run_store,
-                workflow_store,
+                run_store.clone(),
+                workflow_store.clone(),
                 push_configs,
                 HeaderObserver::default(),
             )
@@ -986,8 +999,23 @@ mod tests {
             ])),
             agent_card,
             header_observer: HeaderObserver::default(),
-            handler,
+            handler: handler.clone(),
         });
+        Some(ClusteredTestContext {
+            system,
+            handler,
+            app,
+            run_store,
+            workflow_store,
+            workflow,
+        })
+    }
+
+    #[tokio::test]
+    async fn clustered_handler_routes_send_through_sharded_owner() {
+        let Some(ctx) = clustered_test_state().await else {
+            return;
+        };
 
         let body = serde_json::json!({
             "message": {
@@ -1000,10 +1028,105 @@ mod tests {
             },
             "tenant": "tenant-a"
         });
-        let sent = post_json(app, "/a2a/message:send", &body, "tenant-a").await;
+        let sent = post_json(ctx.app.clone(), "/a2a/message:send", &body, "tenant-a").await;
         assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
 
-        system.terminate().await.unwrap();
+        ctx.system.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_path_terminal_transition_schedules_push_effect() {
+        use a2a::{GetTaskRequest, TaskPushNotificationConfig, TaskState};
+        use a2a_server::{RequestHandler, ServiceParams};
+        use rakka::agent_workflow::{AgentEffectKind, AgentRunId, AgentRunInbox, AgentStepRunner};
+
+        let Some(ctx) = clustered_test_state().await else {
+            return;
+        };
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+
+        // Accept a task without any push config so acceptance schedules no
+        // notification effects.
+        let new_task = serde_json::json!({
+            "message": {
+                "messageId": "read-path-push-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": {
+                "returnImmediately": true
+            },
+            "tenant": "tenant-a"
+        });
+        let sent = post_json(ctx.app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
+        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+        // Register the push config after acceptance.
+        let config = TaskPushNotificationConfig {
+            url: "https://example.com/read-path-hook".to_string(),
+            id: Some("cfg-read".to_string()),
+            task_id: task_id.clone(),
+            token: None,
+            authentication: None,
+            tenant: Some("tenant-a".to_string()),
+        };
+        ctx.handler
+            .create_push_config(&params, config)
+            .await
+            .expect("create push config");
+
+        // Drive the run terminal outside any A2A command, as a completed
+        // step would: the projection has not observed the transition yet.
+        let mut runner = AgentStepRunner::new(
+            ctx.workflow.clone(),
+            AgentRunId::new(task_id.clone()),
+            ctx.run_store.clone(),
+        );
+        runner.recover().await.unwrap();
+        runner
+            .request_cancellation("test", None, now_millis())
+            .await
+            .unwrap();
+        runner.cancel(now_millis()).await.unwrap();
+
+        // A read converges the projection on the owner; the terminal event
+        // it emits must schedule the push notification effect.
+        let task = ctx
+            .handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task_id.clone(),
+                    history_length: None,
+                    tenant: Some("tenant-a".to_string()),
+                },
+            )
+            .await
+            .expect("get task");
+        assert_eq!(task.status.state, TaskState::Canceled);
+
+        let mut inbox =
+            AgentRunInbox::new(AgentRunId::new(task_id.clone()), ctx.workflow_store.clone());
+        inbox.recover().await.expect("recover workflow");
+        let due = inbox.due_effects().expect("due effects");
+        assert_eq!(due.len(), 1, "read-path terminal event must schedule push");
+        let effect = &due[0].effect;
+        assert_eq!(effect.kind, AgentEffectKind::Notification);
+        assert_eq!(
+            effect.target.address.as_deref(),
+            Some("https://example.com/read-path-hook")
+        );
+        assert_eq!(
+            effect
+                .target
+                .attributes
+                .get("task_event_kind")
+                .map(String::as_str),
+            Some("terminal")
+        );
+
+        ctx.system.terminate().await.unwrap();
     }
 
     fn test_state() -> TestContext {

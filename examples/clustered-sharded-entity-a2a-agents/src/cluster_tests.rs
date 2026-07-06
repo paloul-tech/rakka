@@ -40,6 +40,7 @@ struct TestNode {
     system: ActorSystem,
     runtime: ClusterNodeRuntime,
     app: Router,
+    handler: Arc<RakkaA2ARequestHandler>,
 }
 
 impl TestNode {
@@ -143,13 +144,14 @@ async fn build_node(
         membership: Arc::new(std::sync::Mutex::new(vec![format!("{logical_id}#test")])),
         agent_card,
         header_observer: HeaderObserver::default(),
-        handler,
+        handler: handler.clone(),
     });
     Some(TestNode {
         logical_id: logical_id.to_string(),
         system,
         runtime,
         app,
+        handler,
     })
 }
 
@@ -334,6 +336,114 @@ async fn task_accepted_on_one_node_reads_and_cancels_from_another() {
     .await;
     assert_eq!(status, StatusCode::OK, "cancel failed: {canceled}");
     assert_eq!(canceled["status"]["state"], "TASK_STATE_CANCELED");
+
+    node_a.terminate().await;
+    node_b.terminate().await;
+    let _ = std::fs::remove_dir_all(state_dir);
+}
+
+/// Slice 4.4: a stream opened on the public node that does NOT own the shard
+/// still receives live updates and terminal completion, via the owner-routed
+/// stream cursor bridge.
+#[tokio::test]
+async fn stream_on_non_owner_node_receives_live_terminal_event() {
+    use a2a::{StreamResponse, SubscribeToTaskRequest, TaskState};
+    use a2a_server::{RequestHandler, ServiceParams};
+    use futures_util::StreamExt;
+    use tokio::time::timeout;
+
+    let state_dir = temp_state_dir("stream-cross-node");
+    let Some(mut node_a) = build_node("stream-a", &state_dir, RUN_ENTITY_IDLE_PASSIVATION).await
+    else {
+        return;
+    };
+    let Some(mut node_b) = build_node("stream-b", &state_dir, RUN_ENTITY_IDLE_PASSIVATION).await
+    else {
+        node_a.terminate().await;
+        return;
+    };
+    let members = member_nodes(&[&mut node_a, &mut node_b]);
+    apply_membership(&mut [&mut node_a, &mut node_b], members, 1);
+
+    let sent = send_ok(&node_a.app, &send_body("stream-cross-message", None, true)).await;
+    let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+    // Subscribe deliberately through the node that does not own the shard.
+    let owner = owner_logical_id(&node_a, &task_id);
+    let (subscriber, canceller) = if owner == node_a.logical_id {
+        (&node_b, &node_a)
+    } else {
+        (&node_a, &node_b)
+    };
+    let params =
+        ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+    let mut stream = subscriber
+        .handler
+        .subscribe_to_task(
+            &params,
+            SubscribeToTaskRequest {
+                id: task_id.clone(),
+                tenant: Some("tenant-a".to_string()),
+            },
+        )
+        .await
+        .expect("subscribe on non-owner node");
+
+    let first = timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("first stream item within deadline")
+        .expect("stream open")
+        .expect("stream response");
+    match first {
+        StreamResponse::Task(task) => assert_eq!(task.status.state, TaskState::Submitted),
+        other => panic!("expected initial task snapshot, got {other:?}"),
+    }
+
+    // Cancel through the other node; the owner emits the terminal event.
+    let (status, canceled) = http(
+        &canceller.app,
+        "POST",
+        &format!("/a2a/tasks/{task_id}:cancel"),
+        None,
+        Some("tenant-a"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {canceled}");
+
+    // The non-owner stream must observe the canceled terminal state through
+    // owner polling (heartbeats carry the pre-cancel status and are skipped).
+    let mut saw_terminal = false;
+    for _ in 0..20 {
+        let Ok(item) = timeout(Duration::from_secs(20), stream.next()).await else {
+            break;
+        };
+        let Some(item) = item else {
+            break;
+        };
+        let response = item.expect("stream response");
+        if let StreamResponse::StatusUpdate(update) = &response {
+            if update.status.state == TaskState::Canceled {
+                saw_terminal = true;
+                break;
+            }
+        }
+        if let StreamResponse::Task(task) = &response {
+            if task.status.state == TaskState::Canceled {
+                saw_terminal = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_terminal,
+        "non-owner stream never observed the terminal state"
+    );
+
+    // Terminal state completes the stream.
+    let end = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("stream end within deadline");
+    assert!(end.is_none(), "stream must end after the terminal event");
 
     node_a.terminate().await;
     node_b.terminate().await;

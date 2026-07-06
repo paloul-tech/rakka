@@ -97,7 +97,9 @@ Implemented:
 - Projection-backed `send_message`, `get_task`, `list_tasks`, and `cancel_task`.
 - A2A `send_streaming_message` and `subscribe_to_task` served from public task
   events, with current-task snapshots, bounded replay cursors, live projection
-  watchers, heartbeats, and terminal stream completion.
+  watchers, heartbeats, and terminal stream completion. Streams opened on a
+  non-owner public node receive live updates by polling the shard owner's
+  event log through the sharded run protocol (`OpenStreamCursor`).
 - Bounded stream admission with per-node and per-task limits plus bounded
   metrics for opened, closed, over-limit, lagged, dropped, and replay work.
 - Durable A2A push notification config create/get/list/delete keyed by tenant,
@@ -122,11 +124,16 @@ Not implemented in Phase 4:
 ## SSE And Load Balancers
 
 - Sticky sessions are optional for correctness. Any public node can authorize a
-  task and open a stream; when the current node is not the shard owner it routes
-  the snapshot query to the owner before streaming.
+  task and open a stream; when the current node is not the shard owner it
+  routes the snapshot query to the owner and then polls the owner's event log
+  (every 2 seconds) for live updates, so non-owner streams observe status,
+  message, and terminal events with at most one poll interval of added
+  latency. Owner-node streams deliver events immediately.
 - Reconnect clients with the latest replay cursor. The handler accepts
   `rakka-a2a-replay-cursor` or `last-event-id` service params when the selected
-  binding forwards them.
+  binding forwards them. In clustered mode a valid cursor is replayed through
+  the shard owner, so reconnecting to a different node does not re-send
+  already acknowledged events.
 - If a cursor is missing, invalid, or compacted out of the bounded replay log,
   the handler returns the current task snapshot and then resumes live updates.
 - Configure ingress/proxies for SSE: disable response buffering, allow long
