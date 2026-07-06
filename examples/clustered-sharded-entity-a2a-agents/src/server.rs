@@ -29,6 +29,7 @@ use crate::discovery::{
 };
 use crate::durable_stores::build_stores;
 use crate::etcd_discovery::{connect, run_etcd_discovery};
+use crate::push_config::A2APushConfigStore;
 use crate::reachability::PeerReachability;
 use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
 use crate::support::{
@@ -174,8 +175,9 @@ async fn boot() -> ExampleResult<Booted> {
     let ask_client = runtime.ask_client();
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
     let key = a2a_run_entity_key()?;
-    let (run_store, workflow_store) = build_stores(&config);
+    let (run_store, workflow_store, push_config_store) = build_stores(&config);
     let task_store = InMemoryA2ATaskProjectionStore::local();
+    let push_configs = A2APushConfigStore::new(push_config_store);
     init_a2a_run_sharding(
         &system,
         &mut runtime,
@@ -186,6 +188,7 @@ async fn boot() -> ExampleResult<Booted> {
             run_store: run_store.clone(),
             workflow_store: workflow_store.clone(),
             task_store: task_store.clone(),
+            push_configs: push_configs.clone(),
             idle_passivation: RUN_ENTITY_IDLE_PASSIVATION,
         },
     )?;
@@ -229,15 +232,18 @@ async fn boot() -> ExampleResult<Booted> {
     let agent_card = build_agent_card(&config);
     let header_observer = HeaderObserver::default();
     let router = A2ARunRouter::new(sharding, key, ask_client, reachability);
-    let handler = Arc::new(RakkaA2ARequestHandler::new_clustered(
-        agent_card.clone(),
-        workflow,
-        task_store,
-        run_store,
-        workflow_store,
-        header_observer.clone(),
-        router,
-    ));
+    let handler = Arc::new(
+        RakkaA2ARequestHandler::new(
+            agent_card.clone(),
+            workflow,
+            task_store,
+            run_store,
+            workflow_store,
+            push_configs,
+            header_observer.clone(),
+        )
+        .with_router(router),
+    );
     handler.recover_task_projections().await?;
 
     let state = AppState {
@@ -295,7 +301,7 @@ fn print_banner(booted: &Booted) {
         DiscoveryProviderKind::Etcd => "etcd",
     };
     println!(
-        "Rakka A2A Phase 3 node {} | remoting {} | HTTP/A2A {}",
+        "Rakka A2A Phase 4 node {} | remoting {} | HTTP/A2A {}",
         booted.config.node_logical_id, booted.config.rakka_port, addr,
     );
     println!(
@@ -310,7 +316,7 @@ fn print_banner(booted: &Booted) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_stores::{build_in_memory_stores, RunStore, WorkflowStore};
+    use crate::durable_stores::{build_in_memory_stores, PushConfigStore, RunStore, WorkflowStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -323,6 +329,7 @@ mod tests {
         task_store: InMemoryA2ATaskProjectionStore,
         run_store: RunStore,
         workflow_store: WorkflowStore,
+        push_config_store: PushConfigStore,
     }
 
     #[tokio::test]
@@ -603,6 +610,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_send_persists_push_config_and_schedules_notification_effect() {
+        use a2a::{StreamResponse, TaskState};
+        use a2a_server::{RequestHandler, ServiceParams};
+        use futures_util::StreamExt;
+        use rakka::agent_workflow::{AgentEffectKind, AgentRunId, AgentRunInbox};
+
+        let ctx = test_state();
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+        let request = serde_json::from_value(serde_json::json!({
+            "message": {
+                "messageId": "streaming-push-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello stream"}]
+            },
+            "configuration": {
+                "returnImmediately": true,
+                "taskPushNotificationConfig": {
+                    "id": "cfg-1",
+                    "url": "https://example.com/a2a-push",
+                    "token": "secret-token",
+                    "authentication": {
+                        "scheme": "bearer",
+                        "credentials": "secret"
+                    }
+                }
+            },
+            "tenant": "tenant-a"
+        }))
+        .expect("send request");
+
+        let mut stream = ctx
+            .state
+            .handler
+            .send_streaming_message(&params, request)
+            .await
+            .expect("stream");
+        let first = stream
+            .next()
+            .await
+            .expect("first stream event")
+            .expect("stream response");
+        let task = match first {
+            StreamResponse::Task(task) => task,
+            other => panic!("expected task stream event, got {other:?}"),
+        };
+        assert_eq!(task.status.state, TaskState::Submitted);
+
+        let push_configs = A2APushConfigStore::new(ctx.push_config_store.clone());
+        let saved = push_configs
+            .get("tenant-a", &task.id, "cfg-1")
+            .await
+            .expect("saved push config");
+        assert_eq!(saved.url, "https://example.com/a2a-push");
+        assert_eq!(saved.tenant.as_deref(), Some("tenant-a"));
+        assert!(saved.token.is_none());
+        assert!(saved
+            .authentication
+            .as_ref()
+            .and_then(|auth| auth.credentials.as_ref())
+            .is_none());
+
+        let mut inbox = AgentRunInbox::new(AgentRunId::new(task.id.clone()), ctx.workflow_store);
+        inbox.recover().await.expect("recover workflow");
+        let due = inbox.due_effects().expect("due effects");
+        assert_eq!(due.len(), 1);
+        let effect = &due[0].effect;
+        assert_eq!(effect.kind, AgentEffectKind::Notification);
+        assert_eq!(
+            effect.target.address.as_deref(),
+            Some("https://example.com/a2a-push")
+        );
+        assert_eq!(
+            effect
+                .target
+                .attributes
+                .get("notification_protocol")
+                .map(String::as_str),
+            Some("a2a-push")
+        );
+        assert_eq!(
+            effect
+                .target
+                .attributes
+                .get("task_event_kind")
+                .map(String::as_str),
+            Some("snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_limit_rejection_precedes_durable_acceptance() {
+        use crate::stream_limits::A2AStreamLimitSettings;
+        use a2a_server::{RequestHandler, ServiceParams};
+        use rakka::persistence::DurableStateStore;
+
+        let ctx = test_state();
+        let handler = RakkaA2ARequestHandler::new(
+            ctx.state.agent_card.clone(),
+            ctx.workflow.clone(),
+            ctx.task_store.clone(),
+            ctx.run_store.clone(),
+            ctx.workflow_store.clone(),
+            A2APushConfigStore::new(ctx.push_config_store.clone()),
+            HeaderObserver::default(),
+        )
+        .with_stream_limits(A2AStreamLimitSettings {
+            max_node_streams: 0,
+            max_task_streams: 1,
+        });
+
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+        let request = serde_json::from_value(serde_json::json!({
+            "message": {
+                "messageId": "over-limit-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        }))
+        .expect("send request");
+
+        let error = match handler.send_streaming_message(&params, request).await {
+            Err(error) => error,
+            Ok(_) => panic!("node stream limit must reject the stream"),
+        };
+        assert!(
+            error.to_string().contains("a2a-stream-limit"),
+            "unexpected error: {error}"
+        );
+
+        // Admission ran before the durable accept: nothing was committed,
+        // so the client's "retry on another node" guidance is truthful.
+        assert!(
+            ctx.run_store
+                .persistence_ids()
+                .await
+                .expect("run ids")
+                .is_empty(),
+            "over-limit stream must not durably accept the send"
+        );
+        assert!(
+            ctx.workflow_store
+                .persistence_ids()
+                .await
+                .expect("workflow ids")
+                .is_empty(),
+            "over-limit stream must not write inbox state"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_stream_frames_carry_replay_cursor() {
+        use a2a::{StreamResponse, SubscribeToTaskRequest};
+        use a2a_server::{RequestHandler, ServiceParams};
+        use futures_util::StreamExt;
+        use tokio::time::{timeout, Duration};
+
+        let ctx = test_state();
+        let handler = ctx.state.handler.clone();
+        let app = router(ctx.state);
+        let new_task = serde_json::json!({
+            "message": {
+                "messageId": "cursor-message-1",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        });
+        let sent = post_json(app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
+        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+        let mut stream = handler
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: task_id.clone(),
+                    tenant: Some("tenant-a".to_string()),
+                },
+            )
+            .await
+            .expect("subscribe");
+        let first = stream
+            .next()
+            .await
+            .expect("initial snapshot")
+            .expect("stream response");
+        assert!(matches!(first, StreamResponse::Task(_)));
+
+        // A continuation appends a MessageUpdate event; its stream frame
+        // must carry the replay cursor a client resumes from on reconnect.
+        let continuation = serde_json::json!({
+            "message": {
+                "messageId": "cursor-message-2",
+                "taskId": task_id,
+                "role": "ROLE_USER",
+                "parts": [{"text": "again"}]
+            },
+            "configuration": { "returnImmediately": true },
+            "tenant": "tenant-a"
+        });
+        post_json(app, "/a2a/message:send", &continuation, "tenant-a").await;
+
+        let item = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("message frame within deadline")
+            .expect("stream open")
+            .expect("stream response");
+        match item {
+            StreamResponse::Message(message) => {
+                let metadata = message.metadata.expect("message frame metadata");
+                assert!(
+                    metadata.contains_key("io.rakka.replay.cursor"),
+                    "message frames must carry the replay cursor"
+                );
+            }
+            other => panic!("expected message frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn send_to_terminal_task_is_rejected() {
         use rakka::agent_workflow::{AgentRunId, AgentStepRunner};
 
@@ -729,6 +962,7 @@ mod tests {
             fresh_task_store.clone(),
             ctx.run_store.clone(),
             ctx.workflow_store.clone(),
+            A2APushConfigStore::new(ctx.push_config_store.clone()),
             HeaderObserver::default(),
         );
         let recovered = recovery_handler.recover_task_projections().await.unwrap();
@@ -786,8 +1020,21 @@ mod tests {
         assert_eq!(same_tenant.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn clustered_handler_routes_send_through_sharded_owner() {
+    /// Single-node sharded harness: the handler routes owner work through
+    /// real cluster sharding, so owner-only paths (`QueryTaskSnapshot`,
+    /// `OpenStreamCursor`, push config routing) are exercised end to end.
+    struct ClusteredTestContext {
+        system: ActorSystem,
+        handler: Arc<RakkaA2ARequestHandler>,
+        app: axum::Router,
+        run_store: RunStore,
+        workflow_store: WorkflowStore,
+        workflow: rakka::agent_workflow::AgentWorkflow,
+    }
+
+    /// Returns `None` (skipping the test) when loopback binding is
+    /// unavailable in the sandbox, mirroring the other networked tests.
+    async fn clustered_test_state() -> Option<ClusteredTestContext> {
         use crate::codec::serialization_registry;
         use crate::reachability::PeerReachability;
         use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
@@ -817,7 +1064,8 @@ mod tests {
         });
         let workflow = demo_workflow();
         let task_store = InMemoryA2ATaskProjectionStore::local();
-        let (run_store, workflow_store) = build_in_memory_stores();
+        let (run_store, workflow_store, push_config_store) = build_in_memory_stores();
+        let push_configs = A2APushConfigStore::new(push_config_store.clone());
         let system = ActorSystem::new("clustered-a2a-handler-test");
         let local_node = ClusterNode::new(
             NodeId::new("clustered-test-node", "test"),
@@ -837,9 +1085,9 @@ mod tests {
             .build()
             .await;
         let Ok(mut runtime) = runtime else {
-            eprintln!("skipping clustered handler route test; loopback bind unavailable");
+            eprintln!("skipping clustered handler test; loopback bind unavailable");
             system.terminate().await.unwrap();
-            return;
+            return None;
         };
         let ask_client = runtime.ask_client();
         let sharding = ClusterSharding::for_node_runtime(&system, &runtime).unwrap();
@@ -854,6 +1102,7 @@ mod tests {
                 run_store: run_store.clone(),
                 workflow_store: workflow_store.clone(),
                 task_store: task_store.clone(),
+                push_configs: push_configs.clone(),
                 idle_passivation: RUN_ENTITY_IDLE_PASSIVATION,
             },
         )
@@ -866,15 +1115,18 @@ mod tests {
             ))
             .unwrap();
         let route_helper = A2ARunRouter::new(sharding, key, ask_client, PeerReachability::new());
-        let handler = Arc::new(RakkaA2ARequestHandler::new_clustered(
-            agent_card.clone(),
-            workflow,
-            task_store,
-            run_store,
-            workflow_store,
-            HeaderObserver::default(),
-            route_helper,
-        ));
+        let handler = Arc::new(
+            RakkaA2ARequestHandler::new(
+                agent_card.clone(),
+                workflow.clone(),
+                task_store,
+                run_store.clone(),
+                workflow_store.clone(),
+                push_configs,
+                HeaderObserver::default(),
+            )
+            .with_router(route_helper),
+        );
         let app = router(AppState {
             node_id: "clustered-test-node#test".to_string(),
             membership: Arc::new(std::sync::Mutex::new(vec![
@@ -882,8 +1134,23 @@ mod tests {
             ])),
             agent_card,
             header_observer: HeaderObserver::default(),
-            handler,
+            handler: handler.clone(),
         });
+        Some(ClusteredTestContext {
+            system,
+            handler,
+            app,
+            run_store,
+            workflow_store,
+            workflow,
+        })
+    }
+
+    #[tokio::test]
+    async fn clustered_handler_routes_send_through_sharded_owner() {
+        let Some(ctx) = clustered_test_state().await else {
+            return;
+        };
 
         let body = serde_json::json!({
             "message": {
@@ -896,10 +1163,105 @@ mod tests {
             },
             "tenant": "tenant-a"
         });
-        let sent = post_json(app, "/a2a/message:send", &body, "tenant-a").await;
+        let sent = post_json(ctx.app.clone(), "/a2a/message:send", &body, "tenant-a").await;
         assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
 
-        system.terminate().await.unwrap();
+        ctx.system.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_path_terminal_transition_schedules_push_effect() {
+        use a2a::{GetTaskRequest, TaskPushNotificationConfig, TaskState};
+        use a2a_server::{RequestHandler, ServiceParams};
+        use rakka::agent_workflow::{AgentEffectKind, AgentRunId, AgentRunInbox, AgentStepRunner};
+
+        let Some(ctx) = clustered_test_state().await else {
+            return;
+        };
+        let params =
+            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
+
+        // Accept a task without any push config so acceptance schedules no
+        // notification effects.
+        let new_task = serde_json::json!({
+            "message": {
+                "messageId": "read-path-push-message",
+                "role": "ROLE_USER",
+                "parts": [{"text": "hello"}]
+            },
+            "configuration": {
+                "returnImmediately": true
+            },
+            "tenant": "tenant-a"
+        });
+        let sent = post_json(ctx.app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
+        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
+
+        // Register the push config after acceptance.
+        let config = TaskPushNotificationConfig {
+            url: "https://example.com/read-path-hook".to_string(),
+            id: Some("cfg-read".to_string()),
+            task_id: task_id.clone(),
+            token: None,
+            authentication: None,
+            tenant: Some("tenant-a".to_string()),
+        };
+        ctx.handler
+            .create_push_config(&params, config)
+            .await
+            .expect("create push config");
+
+        // Drive the run terminal outside any A2A command, as a completed
+        // step would: the projection has not observed the transition yet.
+        let mut runner = AgentStepRunner::new(
+            ctx.workflow.clone(),
+            AgentRunId::new(task_id.clone()),
+            ctx.run_store.clone(),
+        );
+        runner.recover().await.unwrap();
+        runner
+            .request_cancellation("test", None, now_millis())
+            .await
+            .unwrap();
+        runner.cancel(now_millis()).await.unwrap();
+
+        // A read converges the projection on the owner; the terminal event
+        // it emits must schedule the push notification effect.
+        let task = ctx
+            .handler
+            .get_task(
+                &params,
+                GetTaskRequest {
+                    id: task_id.clone(),
+                    history_length: None,
+                    tenant: Some("tenant-a".to_string()),
+                },
+            )
+            .await
+            .expect("get task");
+        assert_eq!(task.status.state, TaskState::Canceled);
+
+        let mut inbox =
+            AgentRunInbox::new(AgentRunId::new(task_id.clone()), ctx.workflow_store.clone());
+        inbox.recover().await.expect("recover workflow");
+        let due = inbox.due_effects().expect("due effects");
+        assert_eq!(due.len(), 1, "read-path terminal event must schedule push");
+        let effect = &due[0].effect;
+        assert_eq!(effect.kind, AgentEffectKind::Notification);
+        assert_eq!(
+            effect.target.address.as_deref(),
+            Some("https://example.com/read-path-hook")
+        );
+        assert_eq!(
+            effect
+                .target
+                .attributes
+                .get("task_event_kind")
+                .map(String::as_str),
+            Some("terminal")
+        );
+
+        ctx.system.terminate().await.unwrap();
     }
 
     fn test_state() -> TestContext {
@@ -923,7 +1285,8 @@ mod tests {
         });
         let workflow = demo_workflow();
         let task_store = InMemoryA2ATaskProjectionStore::local();
-        let (run_store, workflow_store) = build_in_memory_stores();
+        let (run_store, workflow_store, push_config_store) = build_in_memory_stores();
+        let push_configs = A2APushConfigStore::new(push_config_store.clone());
         let header_observer = HeaderObserver::default();
         let handler = Arc::new(RakkaA2ARequestHandler::new(
             agent_card.clone(),
@@ -931,6 +1294,7 @@ mod tests {
             task_store.clone(),
             run_store.clone(),
             workflow_store.clone(),
+            push_configs,
             header_observer.clone(),
         ));
         TestContext {
@@ -945,6 +1309,7 @@ mod tests {
             task_store,
             run_store,
             workflow_store,
+            push_config_store,
         }
     }
 

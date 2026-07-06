@@ -20,8 +20,9 @@ use rakka::prelude::*;
 use rakka::sharding::ClusterNodeRuntime;
 
 use crate::a2a_handler::{
-    known_command, missing_run, run_is_terminal, run_tenant, state_payload, task_state,
-    validate_adopted_run, validate_send_lifecycle, RakkaA2AHandlerError,
+    known_command, missing_run, project_send_result, run_is_terminal, run_tenant,
+    snapshot_projection, state_payload, sync_status_projection, validate_adopted_run,
+    validate_send_lifecycle, RakkaA2AHandlerError,
 };
 use crate::a2a_mapping::{A2ACommandDraft, A2ATaskIntent, ATTR_CONTEXT_ID, DEFAULT_TENANT};
 use crate::durable_stores::{RunStore, WorkflowStore};
@@ -29,10 +30,10 @@ use crate::protocol::{
     A2ARunFailure, A2ARunFailureKind, A2ARunRequest, A2ARunRequestKind, A2ARunResponse,
     A2A_RUN_PROTOCOL_VERSION,
 };
+use crate::push_config::{schedule_push_effects_for_events, A2APushConfigStore};
 use crate::support::{ENTITY_TYPE, NUMBER_OF_SHARDS, RUN_ASK_TIMEOUT};
 use crate::task_projection::{
-    status_transition_allowed, A2ATaskEventPayload, A2ATaskProjection,
-    InMemoryA2ATaskProjectionStore, TaskProjectionError,
+    A2ATaskEvent, A2ATaskProjection, InMemoryA2ATaskProjectionStore, TaskProjectionError,
 };
 
 const MAX_CONFLICT_ATTEMPTS: usize = 3;
@@ -63,6 +64,7 @@ where
     workflow: AgentWorkflow,
     workflow_store: WorkflowStoreT,
     task_store: InMemoryA2ATaskProjectionStore,
+    push_configs: A2APushConfigStore,
     /// `None` when the child run actor failed to spawn; requests are then
     /// answered with a retryable failure instead of panicking the factory.
     child: Option<ActorRef<AgentRunActorCommand>>,
@@ -79,6 +81,7 @@ where
         run_store: RunStoreT,
         workflow_store: WorkflowStoreT,
         task_store: InMemoryA2ATaskProjectionStore,
+        push_configs: A2APushConfigStore,
     ) -> Self
     where
         RunStoreT: DurableStateStore<AgentRunState>,
@@ -112,6 +115,7 @@ where
             workflow,
             workflow_store,
             task_store,
+            push_configs,
             child,
         }
     }
@@ -133,6 +137,7 @@ where
         let workflow = self.workflow.clone();
         let workflow_store = self.workflow_store.clone();
         let task_store = self.task_store.clone();
+        let push_configs = self.push_configs.clone();
         actor_future(async move {
             match msg {
                 A2ARunEntityCommand::Handle { request, reply_to } => {
@@ -144,6 +149,7 @@ where
                                 workflow,
                                 workflow_store,
                                 task_store,
+                                push_configs,
                                 request,
                             )
                             .await
@@ -194,6 +200,8 @@ pub struct A2ARunHost {
     pub workflow_store: WorkflowStore,
     /// Local task projection store.
     pub task_store: InMemoryA2ATaskProjectionStore,
+    /// Durable push config store.
+    pub push_configs: A2APushConfigStore,
     /// How long an idle entity stays resident before passivating.
     ///
     /// Without passivation, a read probe for an arbitrary task id would pin
@@ -214,6 +222,7 @@ pub fn init_a2a_run_sharding(
         run_store,
         workflow_store,
         task_store,
+        push_configs,
         idle_passivation,
     } = host;
     let registration = sharding.init_remote_with_ask(
@@ -228,6 +237,7 @@ pub fn init_a2a_run_sharding(
                     run_store.clone(),
                     workflow_store.clone(),
                     task_store.clone(),
+                    push_configs.clone(),
                 )
             }
         })
@@ -252,6 +262,7 @@ async fn handle_owner_request<WorkflowStoreT>(
     workflow: AgentWorkflow,
     workflow_store: WorkflowStoreT,
     task_store: InMemoryA2ATaskProjectionStore,
+    push_configs: A2APushConfigStore,
     request: A2ARunRequest,
 ) -> A2ARunResponse
 where
@@ -272,6 +283,7 @@ where
             draft,
             projected_message,
             artifacts,
+            request_push_config,
             return_immediately,
             received_at,
         } => {
@@ -280,10 +292,12 @@ where
                 &workflow,
                 &workflow_store,
                 &task_store,
+                &push_configs,
                 AcceptMessageInput {
                     draft: *draft,
                     projected_message: *projected_message,
                     artifacts,
+                    request_push_config,
                     return_immediately,
                     received_at,
                 },
@@ -295,22 +309,84 @@ where
                 &child,
                 &workflow_store,
                 &task_store,
+                &push_configs,
                 &run_id,
                 tenant.as_deref(),
             )
             .await
         }
         A2ARunRequestKind::CancelTask { draft, received_at } => {
-            cancel_task(&child, &workflow_store, &task_store, *draft, received_at).await
+            cancel_task(
+                &child,
+                &workflow_store,
+                &task_store,
+                &push_configs,
+                *draft,
+                received_at,
+            )
+            .await
         }
-        A2ARunRequestKind::OpenStreamCursor { .. } => Err(RakkaA2AHandlerError::Unavailable {
-            message: "A2A streaming is deferred until the streaming phase".to_string(),
-        }),
-        A2ARunRequestKind::RecordPushConfig { .. } | A2ARunRequestKind::DeletePushConfig { .. } => {
-            Err(RakkaA2AHandlerError::Unavailable {
-                message: "A2A push notification config storage is deferred until the push phase"
-                    .to_string(),
-            })
+        A2ARunRequestKind::OpenStreamCursor { after_cursor } => {
+            match open_stream_cursor(
+                &child,
+                &workflow_store,
+                &task_store,
+                &push_configs,
+                &run_id,
+                tenant.as_deref(),
+                after_cursor.as_deref(),
+            )
+            .await
+            {
+                Ok((projection, events, resync)) => {
+                    let tenant = projection.tenant.clone();
+                    return A2ARunResponse::stream_cursor(
+                        task_id, tenant, projection, events, resync,
+                    );
+                }
+                Err(error) => Err(error),
+            }
+        }
+        A2ARunRequestKind::RecordPushConfig { config } => {
+            match record_push_config(
+                &child,
+                &task_store,
+                &push_configs,
+                &run_id,
+                tenant.as_deref(),
+                config,
+            )
+            .await
+            {
+                Ok(config) => {
+                    return A2ARunResponse::push_config_recorded(
+                        task_id,
+                        config
+                            .tenant
+                            .clone()
+                            .unwrap_or_else(|| echo_tenant(&tenant)),
+                        config,
+                    );
+                }
+                Err(error) => Err(error),
+            }
+        }
+        A2ARunRequestKind::DeletePushConfig { config_id } => {
+            match delete_push_config(
+                &child,
+                &task_store,
+                &push_configs,
+                &run_id,
+                tenant.as_deref(),
+                &config_id,
+            )
+            .await
+            {
+                Ok(tenant) => {
+                    return A2ARunResponse::push_config_deleted(task_id, tenant);
+                }
+                Err(error) => Err(error),
+            }
         }
     };
 
@@ -336,6 +412,7 @@ struct AcceptMessageInput {
     draft: A2ACommandDraft,
     projected_message: a2a::Message,
     artifacts: Vec<ArtifactRef>,
+    request_push_config: Option<a2a::TaskPushNotificationConfig>,
     return_immediately: bool,
     received_at: AgentTimestampMillis,
 }
@@ -345,6 +422,7 @@ async fn accept_message<WorkflowStoreT>(
     workflow: &AgentWorkflow,
     workflow_store: &WorkflowStoreT,
     task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
     input: AcceptMessageInput,
 ) -> Result<A2ATaskProjection, RakkaA2AHandlerError>
 where
@@ -354,6 +432,7 @@ where
         draft,
         projected_message,
         artifacts,
+        request_push_config,
         return_immediately,
         received_at,
     } = input;
@@ -376,7 +455,12 @@ where
     if !return_immediately && run_state.status == AgentRunStatus::Accepted {
         run_state = begin_child_step(child, received_at).await?;
     }
-    project_send_result(
+    if let Some(config) = request_push_config {
+        push_configs
+            .save(draft.normalized.tenant.as_str(), config)
+            .await?;
+    }
+    let events = project_send_result(
         task_store,
         &draft,
         &projected_message,
@@ -384,6 +468,18 @@ where
         &run_state,
         received_at,
     )?;
+    // Runs even when this retry emitted nothing new: the scheduler works
+    // from its watermark over the retained log, so a retry heals a push
+    // schedule that failed after the original acceptance.
+    schedule_push_effects_for_events(
+        workflow_store,
+        push_configs,
+        task_store,
+        draft.normalized.tenant.as_str(),
+        &draft.normalized.task_id,
+        &events,
+    )
+    .await?;
     task_store
         .projection(
             Some(draft.normalized.tenant.as_str()),
@@ -396,6 +492,7 @@ async fn cancel_task<WorkflowStoreT>(
     child: &ActorRef<AgentRunActorCommand>,
     workflow_store: &WorkflowStoreT,
     task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
     draft: A2ACommandDraft,
     received_at: AgentTimestampMillis,
 ) -> Result<A2ATaskProjection, RakkaA2AHandlerError>
@@ -410,13 +507,24 @@ where
         return Err(missing_run(&draft.normalized.task_id));
     }
     if run_is_terminal(run_state.status) {
-        sync_status_projection(
+        let events: Vec<A2ATaskEvent> = sync_status_projection(
             task_store,
             &run_state,
             &draft.normalized.context_id,
             received_at,
             None,
-        )?;
+        )?
+        .into_iter()
+        .collect();
+        schedule_push_effects_for_events(
+            workflow_store,
+            push_configs,
+            task_store,
+            draft.normalized.tenant.as_str(),
+            &draft.normalized.task_id,
+            &events,
+        )
+        .await?;
         return Err(RakkaA2AHandlerError::TaskNotCancelable {
             task_id: draft.normalized.task_id.clone(),
         });
@@ -424,13 +532,24 @@ where
     validate_inbox_collision(workflow_store, &draft, true).await?;
     accept_child_command(child, draft.command.clone()).await?;
     run_state = apply_cancellation(child, run_state, received_at).await?;
-    sync_status_projection(
+    let events: Vec<A2ATaskEvent> = sync_status_projection(
         task_store,
         &run_state,
         &draft.normalized.context_id,
         received_at,
         None,
-    )?;
+    )?
+    .into_iter()
+    .collect();
+    schedule_push_effects_for_events(
+        workflow_store,
+        push_configs,
+        task_store,
+        draft.normalized.tenant.as_str(),
+        &draft.normalized.task_id,
+        &events,
+    )
+    .await?;
     task_store
         .projection(
             Some(draft.normalized.tenant.as_str()),
@@ -443,6 +562,7 @@ async fn query_task_projection<WorkflowStoreT>(
     child: &ActorRef<AgentRunActorCommand>,
     workflow_store: &WorkflowStoreT,
     task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
     run_id: &AgentRunId,
     tenant: Option<&str>,
 ) -> Result<A2ATaskProjection, RakkaA2AHandlerError>
@@ -462,34 +582,157 @@ where
     }
     let tenant = resolved.as_str();
 
-    match task_store.projection(Some(tenant), run_id.as_str()) {
-        Ok(projection) => {
-            sync_status_projection(
-                task_store,
-                &run_state,
-                &projection.context_id,
-                run_state.updated_at,
-                Some(projection.status),
-            )?;
-        }
+    // Convergence on the read path emits real public events (a transition can
+    // be observed here first, e.g. a step that completed with no follow-up
+    // command), so those events must schedule push effects like any other.
+    let emitted: Vec<A2ATaskEvent> = match task_store.projection(Some(tenant), run_id.as_str()) {
+        Ok(projection) => sync_status_projection(
+            task_store,
+            &run_state,
+            &projection.context_id,
+            run_state.updated_at,
+            Some(projection.status),
+        )?
+        .into_iter()
+        .collect(),
         Err(TaskProjectionError::TaskNotFound { .. }) => {
             let context_id = recover_context_id(workflow_store, run_id)
                 .await?
                 .unwrap_or_else(|| run_id.as_str().to_string());
-            snapshot_projection(
+            vec![snapshot_projection(
                 task_store,
                 &run_state,
                 &context_id,
                 Vec::new(),
                 Vec::new(),
                 run_state.updated_at,
-            )?;
+            )?]
         }
         Err(error) => return Err(error.into()),
+    };
+    // Unconditional: a read also heals push schedules that failed on an
+    // earlier request (e.g. a terminal event whose scheduling errored), via
+    // the scheduler's watermark over the retained log. A scheduling failure
+    // does not fail the read: the projection converged, the events are in
+    // the log, and the watermark re-offers them on the next command, read,
+    // or stream poll.
+    if let Err(error) = schedule_push_effects_for_events(
+        workflow_store,
+        push_configs,
+        task_store,
+        tenant,
+        run_id.as_str(),
+        &emitted,
+    )
+    .await
+    {
+        eprintln!(
+            "warning: push scheduling deferred for task {}: {error}",
+            run_id.as_str()
+        );
     }
 
     task_store
         .projection(Some(tenant), run_id.as_str())
+        .map_err(Into::into)
+}
+
+/// Converges the owner projection, then replays public events after the
+/// caller's cursor for a stream subscriber on another public node.
+///
+/// Returns the current projection, the replayable events, and whether the
+/// subscriber must re-bootstrap from the projection snapshot because the
+/// cursor is invalid or fell out of the retained window.
+async fn open_stream_cursor<WorkflowStoreT>(
+    child: &ActorRef<AgentRunActorCommand>,
+    workflow_store: &WorkflowStoreT,
+    task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
+    run_id: &AgentRunId,
+    tenant: Option<&str>,
+    after_cursor: Option<&str>,
+) -> Result<(A2ATaskProjection, Vec<A2ATaskEvent>, bool), RakkaA2AHandlerError>
+where
+    WorkflowStoreT: DurableStateStore<WorkflowState>,
+{
+    let projection = query_task_projection(
+        child,
+        workflow_store,
+        task_store,
+        push_configs,
+        run_id,
+        tenant,
+    )
+    .await?;
+    match task_store.replay_events(&projection.tenant, run_id.as_str(), after_cursor) {
+        Ok(events) => Ok((projection, events, false)),
+        Err(
+            TaskProjectionError::ReplayWindowExpired { .. }
+            | TaskProjectionError::InvalidReplayCursor { .. },
+        ) => Ok((projection, Vec::new(), true)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn record_push_config(
+    child: &ActorRef<AgentRunActorCommand>,
+    task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
+    run_id: &AgentRunId,
+    tenant: Option<&str>,
+    config: a2a::TaskPushNotificationConfig,
+) -> Result<a2a::TaskPushNotificationConfig, RakkaA2AHandlerError> {
+    let projection = authorize_owner_task(child, task_store, run_id, tenant).await?;
+    push_configs
+        .save(&projection.tenant, config)
+        .await
+        .map_err(Into::into)
+}
+
+async fn delete_push_config(
+    child: &ActorRef<AgentRunActorCommand>,
+    task_store: &InMemoryA2ATaskProjectionStore,
+    push_configs: &A2APushConfigStore,
+    run_id: &AgentRunId,
+    tenant: Option<&str>,
+    config_id: &str,
+) -> Result<String, RakkaA2AHandlerError> {
+    let projection = authorize_owner_task(child, task_store, run_id, tenant).await?;
+    push_configs
+        .delete(&projection.tenant, run_id.as_str(), config_id)
+        .await?;
+    Ok(projection.tenant)
+}
+
+async fn authorize_owner_task(
+    child: &ActorRef<AgentRunActorCommand>,
+    task_store: &InMemoryA2ATaskProjectionStore,
+    run_id: &AgentRunId,
+    tenant: Option<&str>,
+) -> Result<A2ATaskProjection, RakkaA2AHandlerError> {
+    let snapshot = recover_child(child).await?;
+    let run_state = snapshot
+        .run_state
+        .ok_or_else(|| missing_run(run_id.as_str()))?;
+    let resolved = run_tenant(&run_state);
+    if tenant.is_some_and(|scoped| scoped != resolved) {
+        return Err(missing_run(run_id.as_str()));
+    }
+    task_store
+        .projection(Some(&resolved), run_id.as_str())
+        .or_else(|error| {
+            if matches!(error, TaskProjectionError::TaskNotFound { .. }) {
+                Ok(A2ATaskProjection::from_run_state(
+                    &run_state,
+                    run_id.as_str(),
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                ))
+            } else {
+                Err(error)
+            }
+        })
         .map_err(Into::into)
 }
 
@@ -728,119 +971,6 @@ fn initial_run_state(
     })
 }
 
-fn project_send_result(
-    task_store: &InMemoryA2ATaskProjectionStore,
-    draft: &A2ACommandDraft,
-    message: &a2a::Message,
-    artifacts: Vec<ArtifactRef>,
-    run_state: &AgentRunState,
-    now: AgentTimestampMillis,
-) -> Result<(), RakkaA2AHandlerError> {
-    let tenant = draft.normalized.tenant.as_str();
-    match task_store.projection(Some(tenant), &draft.normalized.task_id) {
-        Ok(projection) => {
-            let already_projected = projection
-                .history
-                .iter()
-                .any(|recorded| recorded.message_id == message.message_id);
-            if !already_projected {
-                task_store.append_event_payload(
-                    tenant,
-                    &draft.normalized.task_id,
-                    &draft.normalized.context_id,
-                    now,
-                    A2ATaskEventPayload::MessageUpdate {
-                        message: message.clone(),
-                    },
-                )?;
-            }
-            sync_status_projection(
-                task_store,
-                run_state,
-                &draft.normalized.context_id,
-                now,
-                Some(projection.status),
-            )
-        }
-        Err(TaskProjectionError::TaskNotFound { .. }) => snapshot_projection(
-            task_store,
-            run_state,
-            &draft.normalized.context_id,
-            vec![message.clone()],
-            artifacts,
-            now,
-        ),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn sync_status_projection(
-    task_store: &InMemoryA2ATaskProjectionStore,
-    run_state: &AgentRunState,
-    context_id: &str,
-    now: AgentTimestampMillis,
-    current_status: Option<a2a::TaskState>,
-) -> Result<(), RakkaA2AHandlerError> {
-    let tenant = run_tenant(run_state);
-    let state = task_state(run_state.status);
-    let current = match current_status {
-        Some(status) => status,
-        None => match task_store.projection(Some(&tenant), run_state.run_id.as_str()) {
-            Ok(projection) => projection.status,
-            Err(TaskProjectionError::TaskNotFound { .. }) => {
-                return snapshot_projection(
-                    task_store,
-                    run_state,
-                    context_id,
-                    Vec::new(),
-                    Vec::new(),
-                    now,
-                );
-            }
-            Err(error) => return Err(error.into()),
-        },
-    };
-    if current == state || !status_transition_allowed(&current, &state) {
-        return Ok(());
-    }
-    let payload = if state.is_terminal() {
-        A2ATaskEventPayload::Terminal { state }
-    } else {
-        A2ATaskEventPayload::StatusUpdate { state }
-    };
-    task_store.append_event_payload(
-        tenant.as_str(),
-        run_state.run_id.as_str(),
-        context_id,
-        now,
-        payload,
-    )?;
-    Ok(())
-}
-
-fn snapshot_projection(
-    task_store: &InMemoryA2ATaskProjectionStore,
-    run_state: &AgentRunState,
-    context_id: &str,
-    history: Vec<a2a::Message>,
-    artifacts: Vec<ArtifactRef>,
-    now: AgentTimestampMillis,
-) -> Result<(), RakkaA2AHandlerError> {
-    let projection =
-        A2ATaskProjection::from_run_state(run_state, context_id, history, artifacts, 0);
-    let tenant = projection.tenant.clone();
-    let task_id = projection.task_id.clone();
-    let context_id = projection.context_id.clone();
-    task_store.append_event_payload(
-        tenant,
-        task_id,
-        context_id,
-        now,
-        A2ATaskEventPayload::Snapshot(projection),
-    )?;
-    Ok(())
-}
-
 fn inbox_revision_conflict(error: &RakkaA2AHandlerError) -> bool {
     matches!(
         error,
@@ -895,10 +1025,12 @@ fn failure_from_error(error: RakkaA2AHandlerError) -> A2ARunFailure {
         RakkaA2AHandlerError::Unavailable { .. } | RakkaA2AHandlerError::OwnerAsk { .. } => {
             A2ARunFailureKind::Unavailable
         }
+        RakkaA2AHandlerError::StreamLimit { .. } => A2ARunFailureKind::Unavailable,
         RakkaA2AHandlerError::Inbox(_)
         | RakkaA2AHandlerError::RunEngine(_)
         | RakkaA2AHandlerError::RunActor(_)
-        | RakkaA2AHandlerError::Persistence(_) => A2ARunFailureKind::Internal,
+        | RakkaA2AHandlerError::Persistence(_)
+        | RakkaA2AHandlerError::Push(_) => A2ARunFailureKind::Internal,
     };
     let retryable = matches!(kind, A2ARunFailureKind::Unavailable);
     A2ARunFailure::new(code, message, kind, retryable)

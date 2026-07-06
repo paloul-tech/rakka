@@ -12,7 +12,7 @@ use rakka::agent_workflow::{AgentTimestampMillis, ArtifactRef};
 use serde::{Deserialize, Serialize};
 
 use crate::a2a_mapping::{A2ACommandDraft, A2ATaskIntent};
-use crate::task_projection::A2ATaskProjection;
+use crate::task_projection::{A2ATaskEvent, A2ATaskProjection};
 
 /// Current adapter-owned inter-node protocol version.
 pub const A2A_RUN_PROTOCOL_VERSION: u32 = 1;
@@ -85,6 +85,8 @@ pub enum A2ARunRequestKind {
         projected_message: Box<Message>,
         /// Artifact references derived during normalization.
         artifacts: Vec<ArtifactRef>,
+        /// Request-supplied push config to persist before emitting task events.
+        request_push_config: Option<TaskPushNotificationConfig>,
         /// Whether to return immediately after durable acceptance.
         return_immediately: bool,
         /// Ingress receipt timestamp.
@@ -99,7 +101,8 @@ pub enum A2ARunRequestKind {
         /// Ingress receipt timestamp.
         received_at: AgentTimestampMillis,
     },
-    /// Open a stream cursor for a later streaming phase.
+    /// Converge the owner projection and replay public task events after a
+    /// cursor, so ingress nodes can serve live streams for owner-held tasks.
     OpenStreamCursor {
         /// Replay cursor supplied by the client, if any.
         after_cursor: Option<String>,
@@ -261,6 +264,53 @@ impl A2ARunResponse {
             outcome: A2ARunResponseKind::Failure { failure },
         }
     }
+
+    /// Successful stream cursor replay response.
+    #[must_use]
+    pub fn stream_cursor(
+        task_id: impl Into<String>,
+        tenant: impl Into<String>,
+        projection: A2ATaskProjection,
+        events: Vec<A2ATaskEvent>,
+        resync: bool,
+    ) -> Self {
+        Self {
+            version: A2A_RUN_PROTOCOL_VERSION,
+            task_id: task_id.into(),
+            tenant: tenant.into(),
+            outcome: A2ARunResponseKind::StreamCursor {
+                projection,
+                events,
+                resync,
+            },
+        }
+    }
+
+    /// Successful push config record response.
+    #[must_use]
+    pub fn push_config_recorded(
+        task_id: impl Into<String>,
+        tenant: impl Into<String>,
+        config: TaskPushNotificationConfig,
+    ) -> Self {
+        Self {
+            version: A2A_RUN_PROTOCOL_VERSION,
+            task_id: task_id.into(),
+            tenant: tenant.into(),
+            outcome: A2ARunResponseKind::PushConfigRecorded { config },
+        }
+    }
+
+    /// Successful push config delete response.
+    #[must_use]
+    pub fn push_config_deleted(task_id: impl Into<String>, tenant: impl Into<String>) -> Self {
+        Self {
+            version: A2A_RUN_PROTOCOL_VERSION,
+            task_id: task_id.into(),
+            tenant: tenant.into(),
+            outcome: A2ARunResponseKind::PushConfigDeleted,
+        }
+    }
 }
 
 /// Owner response payload.
@@ -272,10 +322,15 @@ pub enum A2ARunResponseKind {
         /// Adapter-owned projection record.
         projection: A2ATaskProjection,
     },
-    /// Stream cursor opened by a later streaming phase.
+    /// Owner-side replay served for a stream subscriber.
     StreamCursor {
-        /// Replay cursor.
-        cursor: String,
+        /// Current public task projection on the owner.
+        projection: A2ATaskProjection,
+        /// Public events after the requested cursor, in sequence order.
+        events: Vec<A2ATaskEvent>,
+        /// True when the cursor could not be honored and the subscriber must
+        /// re-bootstrap from the projection snapshot.
+        resync: bool,
     },
     /// Push config recorded by a later push phase.
     PushConfigRecorded {
