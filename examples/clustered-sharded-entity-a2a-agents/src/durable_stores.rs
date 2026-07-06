@@ -230,9 +230,28 @@ async fn build_postgres_stores(
     let dsn = config.postgres_dsn.as_deref().ok_or_else(|| {
         example_error("RAKKA_POSTGRES_DSN is required when RAKKA_PERSISTENCE=postgres")
     })?;
-    let run = connect_postgres_store::<AgentRunState>(dsn).await?;
-    let workflow = connect_postgres_store::<WorkflowState>(dsn).await?;
-    let push = connect_postgres_store::<A2APushConfigState>(dsn).await?;
+    // One connection backs all three typed stores: they share the single
+    // `rakka_durable_state` table keyed by disjoint persistence-id prefixes
+    // (`agent-run:`, `workflow:`, `a2a-push-config:`), so opening a connection
+    // per store only multiplies connection pressure.
+    let client = connect_shared_postgres_client(dsn).await?;
+    let run = PostgresDurableStateStore::from_shared_client(
+        Arc::clone(&client),
+        JsonStateCodec::<AgentRunState>::new(),
+    );
+    let workflow = PostgresDurableStateStore::from_shared_client(
+        Arc::clone(&client),
+        JsonStateCodec::<WorkflowState>::new(),
+    );
+    let push = PostgresDurableStateStore::from_shared_client(
+        client,
+        JsonStateCodec::<A2APushConfigState>::new(),
+    );
+    // The migration is codec-independent and idempotent, and all three stores
+    // target the same table, so it only needs to run once.
+    run.migrate()
+        .await
+        .map_err(|error| example_error(format!("postgres migrate failed: {error}")))?;
     Ok((
         RunStore::Postgres(run),
         WorkflowStore::Postgres(workflow),
@@ -241,12 +260,7 @@ async fn build_postgres_stores(
 }
 
 #[cfg(feature = "postgres")]
-async fn connect_postgres_store<S>(
-    dsn: &str,
-) -> ExampleResult<PostgresDurableStateStore<JsonStateCodec<S>>>
-where
-    S: DurableState + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-{
+async fn connect_shared_postgres_client(dsn: &str) -> ExampleResult<Arc<tokio_postgres::Client>> {
     let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .map_err(|error| example_error(format!("postgres connect failed: {error}")))?;
@@ -255,12 +269,7 @@ where
             eprintln!("postgres connection error: {error}");
         }
     });
-    let store = PostgresDurableStateStore::new(client, JsonStateCodec::<S>::new());
-    store
-        .migrate()
-        .await
-        .map_err(|error| example_error(format!("postgres migrate failed: {error}")))?;
-    Ok(store)
+    Ok(Arc::new(client))
 }
 
 #[cfg(not(feature = "postgres"))]

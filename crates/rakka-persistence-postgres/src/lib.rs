@@ -89,6 +89,15 @@ where
         }
     }
 
+    /// Creates a store that shares an already-`Arc`-wrapped client.
+    ///
+    /// Use this to back several typed stores with a single PostgreSQL
+    /// connection instead of opening one connection per store.
+    #[must_use]
+    pub fn from_shared_client(client: Arc<Client>, codec: C) -> Self {
+        Self { client, codec }
+    }
+
     /// Applies the default table migration.
     pub async fn migrate(&self) -> DurableResult<()> {
         self.client
