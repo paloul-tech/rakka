@@ -20,6 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ExampleConfig;
+use crate::push_config::A2APushConfigState;
 use crate::support::{hex_decode, hex_encode};
 
 /// Durable store for agent run state.
@@ -28,20 +29,28 @@ pub type RunStore = ExampleDurableStateStore<AgentRunState>;
 /// Durable store for workflow inbox/outbox state.
 pub type WorkflowStore = ExampleDurableStateStore<WorkflowState>;
 
+/// Durable store for A2A push notification configs.
+pub type PushConfigStore = ExampleDurableStateStore<A2APushConfigState>;
+
 /// Builds the runtime stores from environment-backed configuration.
 #[must_use]
-pub fn build_stores(config: &ExampleConfig) -> (RunStore, WorkflowStore) {
+pub fn build_stores(config: &ExampleConfig) -> (RunStore, WorkflowStore, PushConfigStore) {
     (
         RunStore::file(config.state_dir.join("runs")),
         WorkflowStore::file(config.state_dir.join("workflow")),
+        PushConfigStore::file(config.state_dir.join("push-configs")),
     )
 }
 
 /// Builds isolated in-memory stores for unit tests.
 #[must_use]
 #[cfg(test)]
-pub fn build_in_memory_stores() -> (RunStore, WorkflowStore) {
-    (RunStore::memory(), WorkflowStore::memory())
+pub fn build_in_memory_stores() -> (RunStore, WorkflowStore, PushConfigStore) {
+    (
+        RunStore::memory(),
+        WorkflowStore::memory(),
+        PushConfigStore::memory(),
+    )
 }
 
 /// Example durable store implementation.

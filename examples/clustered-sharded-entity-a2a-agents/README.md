@@ -1,6 +1,6 @@
 # Clustered Sharded Entity A2A Agents
 
-Phase 3 runnable example for exposing durable Rakka agent runs through the A2A
+Phase 4 runnable example for exposing durable Rakka agent runs through the A2A
 Rust SDK with clustered sharded run ownership. This example is the incubator for
 a future `rakka-a2a` crate; no reusable public Rakka A2A API is introduced here.
 
@@ -28,6 +28,10 @@ Useful routes:
 - `GET /cluster`
 - `GET /.well-known/agent-card.json`
 - `POST /a2a/message:send`
+- `POST /a2a/message:stream`
+- `GET|POST /a2a/tasks/{id}/subscribe`
+- `POST|GET /a2a/tasks/{id}/pushNotificationConfigs`
+- `GET|DELETE /a2a/tasks/{id}/pushNotificationConfigs/{config_id}`
 - `POST /a2a/jsonrpc`
 
 Run two local nodes with shared file discovery and shared example file state:
@@ -58,7 +62,7 @@ Rakka remoting stays private to node-to-node communication on `RAKKA_PORT`.
 Public A2A clients should use the HTTP address or a load-balanced
 `RAKKA_A2A_PUBLIC_URL`, not the Rakka remoting address.
 
-## Phase 3 Boundary
+## Phase 4 Boundary
 
 Implemented:
 
@@ -91,14 +95,45 @@ Implemented:
   in-memory task projection store. Owner responses carry projection snapshots so
   ingress nodes can answer routed requests and cache the projection locally.
 - Projection-backed `send_message`, `get_task`, `list_tasks`, and `cancel_task`.
+- A2A `send_streaming_message` and `subscribe_to_task` served from public task
+  events, with current-task snapshots, bounded replay cursors, live projection
+  watchers, heartbeats, and terminal stream completion.
+- Bounded stream admission with per-node and per-task limits plus bounded
+  metrics for opened, closed, over-limit, lagged, dropped, and replay work.
+- Durable A2A push notification config create/get/list/delete keyed by tenant,
+  task id, and config id. Stored configs redact tokens and credentials while
+  retaining secret-presence audit metadata.
+- Request-level push configs from `message:send` and `message:stream`.
+- Push notification work scheduled as `AgentEffectKind::Notification` durable
+  outbox effects after public task events are emitted. Request handlers do not
+  call external webhook URLs directly.
 
-Not implemented in Phase 3:
+Not implemented in Phase 4:
 
-- Streaming, push notification delivery, step execution to completion, or peer
-  A2A calls.
+- A production HTTP webhook dispatcher for the scheduled A2A push outbox
+  effects. The durable effect record carries the callback target and bounded
+  labels; an adapter-owned worker should resolve any credential binding and send
+  the webhook.
+- Step execution to completion or peer A2A calls.
 - Production PostgreSQL persistence in this example. Shared file state is for
   local multi-process demos only.
 - A reusable `rakka-a2a` crate or top-level `rakka` facade feature.
+
+## SSE And Load Balancers
+
+- Sticky sessions are optional for correctness. Any public node can authorize a
+  task and open a stream; when the current node is not the shard owner it routes
+  the snapshot query to the owner before streaming.
+- Reconnect clients with the latest replay cursor. The handler accepts
+  `rakka-a2a-replay-cursor` or `last-event-id` service params when the selected
+  binding forwards them.
+- If a cursor is missing, invalid, or compacted out of the bounded replay log,
+  the handler returns the current task snapshot and then resumes live updates.
+- Configure ingress/proxies for SSE: disable response buffering, allow long
+  request durations, and set idle timeouts above the heartbeat interval. The
+  example emits heartbeat status events every 15 seconds while a stream is idle.
+- Slow clients are disconnected rather than buffered indefinitely. Over-limit
+  responses are protocol-shaped errors and should be retried with backoff.
 
 ## Future Extraction Map
 

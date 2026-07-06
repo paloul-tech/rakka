@@ -1,6 +1,6 @@
 # Phase 4 Clustered Sharded Entity A2A Agents
 
-Status: planning draft
+Status: implemented
 Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
 
 ## Goal
@@ -13,7 +13,7 @@ execution remains durable and independent of any live client connection.
 
 ### Slice 4.1: Task Event Projection Schema
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -34,7 +34,7 @@ Acceptance:
 
 ### Slice 4.2: Runtime Event To Task Event Bridge
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -54,7 +54,7 @@ Acceptance:
 
 ### Slice 4.3: `send_streaming_message`
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -75,7 +75,7 @@ Acceptance:
 
 ### Slice 4.4: `subscribe_to_task`
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -97,7 +97,7 @@ Acceptance:
 
 ### Slice 4.5: Stream Backpressure And Limits
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -117,7 +117,11 @@ Acceptance:
 
 ### Slice 4.6: Durable Push Config Store
 
-Status: planned
+Status: implemented
+
+Implementation note: push configs are persisted in the example durable state
+store. Tokens and auth credentials are redacted from persisted API records while
+secret-presence metadata is retained for audit.
 
 Work:
 
@@ -136,7 +140,7 @@ Acceptance:
 
 ### Slice 4.7: Push Delivery Through Durable Outbox
 
-Status: planned
+Status: implemented for durable scheduling; webhook worker deferred
 
 Work:
 
@@ -156,7 +160,7 @@ Acceptance:
 
 ### Slice 4.8: Load Balancer Streaming Runbook
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -169,13 +173,38 @@ Acceptance:
 
 - Operators have enough guidance to run streams behind a load balancer.
 
+## Implementation Summary
+
+- `examples/clustered-sharded-entity-a2a-agents/src/task_projection.rs` now
+  carries public task event state, projected task state, redaction status,
+  replay cursors, bounded per-task replay logs, snapshot-preserving compaction,
+  and live watchers for stream subscribers.
+- `examples/clustered-sharded-entity-a2a-agents/src/a2a_handler.rs` now serves
+  `send_streaming_message`, `subscribe_to_task`, and A2A push config
+  create/get/list/delete through the same durable acceptance and owner-routing
+  boundaries used by Phase 3 commands.
+- `examples/clustered-sharded-entity-a2a-agents/src/stream_limits.rs` adds
+  bounded per-node/per-task stream admission and low-cardinality stream metrics.
+- `examples/clustered-sharded-entity-a2a-agents/src/push_config.rs` adds the
+  durable push config store plus durable notification effect scheduling for
+  emitted public task events. Request handlers never send webhook HTTP calls
+  directly.
+- `examples/clustered-sharded-entity-a2a-agents/README.md` documents the Phase 4
+  boundary and SSE/load-balancer expectations.
+
+Follow-up before production push delivery: add an adapter-owned worker that
+claims the scheduled notification effects, resolves credential bindings outside
+the persisted config record, sends the A2A webhook, and records success,
+retryable failure, or exhaustion through the workflow outbox APIs.
+
 ## Exit Criteria
 
 - `send_streaming_message` and `subscribe_to_task` are served from durable
   task events.
 - Stream reconnect works across public nodes.
 - Push configs are durable.
-- Push sends are durable outbox effects.
+- Push sends are durable outbox effects. Actual webhook HTTP dispatch is left to
+  the follow-up adapter worker described above.
 
 ## References
 

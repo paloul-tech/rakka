@@ -26,6 +26,7 @@ use crate::agent_card::build_agent_card;
 use crate::codec::serialization_registry;
 use crate::config::{DiscoveryProviderKind, ExampleConfig};
 use crate::durable_stores::build_stores;
+use crate::push_config::A2APushConfigStore;
 use crate::reachability::PeerReachability;
 use crate::server::{router, AppState};
 use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
@@ -105,8 +106,9 @@ async fn build_node(
     let ask_client = runtime.ask_client();
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime).expect("sharding");
     let key = a2a_run_entity_key().expect("entity key");
-    let (run_store, workflow_store) = build_stores(&config);
+    let (run_store, workflow_store, push_config_store) = build_stores(&config);
     let task_store = InMemoryA2ATaskProjectionStore::local();
+    let push_configs = A2APushConfigStore::new(push_config_store);
     init_a2a_run_sharding(
         &system,
         &mut runtime,
@@ -117,21 +119,25 @@ async fn build_node(
             run_store: run_store.clone(),
             workflow_store: workflow_store.clone(),
             task_store: task_store.clone(),
+            push_configs: push_configs.clone(),
             idle_passivation,
         },
     )
     .expect("sharding init");
     let agent_card = build_agent_card(&config);
     let route_helper = A2ARunRouter::new(sharding, key, ask_client, PeerReachability::new());
-    let handler = Arc::new(RakkaA2ARequestHandler::new_clustered(
-        agent_card.clone(),
-        workflow,
-        task_store,
-        run_store,
-        workflow_store,
-        HeaderObserver::default(),
-        route_helper,
-    ));
+    let handler = Arc::new(
+        RakkaA2ARequestHandler::new(
+            agent_card.clone(),
+            workflow,
+            task_store,
+            run_store,
+            workflow_store,
+            push_configs,
+            HeaderObserver::default(),
+        )
+        .with_router(route_helper),
+    );
     let app = router(AppState {
         node_id: format!("{logical_id}#test"),
         membership: Arc::new(std::sync::Mutex::new(vec![format!("{logical_id}#test")])),

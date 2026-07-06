@@ -85,6 +85,8 @@ pub enum A2ARunRequestKind {
         projected_message: Box<Message>,
         /// Artifact references derived during normalization.
         artifacts: Vec<ArtifactRef>,
+        /// Request-supplied push config to persist before emitting task events.
+        request_push_config: Option<TaskPushNotificationConfig>,
         /// Whether to return immediately after durable acceptance.
         return_immediately: bool,
         /// Ingress receipt timestamp.
@@ -259,6 +261,32 @@ impl A2ARunResponse {
             task_id: task_id.into(),
             tenant: tenant.into(),
             outcome: A2ARunResponseKind::Failure { failure },
+        }
+    }
+
+    /// Successful push config record response.
+    #[must_use]
+    pub fn push_config_recorded(
+        task_id: impl Into<String>,
+        tenant: impl Into<String>,
+        config: TaskPushNotificationConfig,
+    ) -> Self {
+        Self {
+            version: A2A_RUN_PROTOCOL_VERSION,
+            task_id: task_id.into(),
+            tenant: tenant.into(),
+            outcome: A2ARunResponseKind::PushConfigRecorded { config },
+        }
+    }
+
+    /// Successful push config delete response.
+    #[must_use]
+    pub fn push_config_deleted(task_id: impl Into<String>, tenant: impl Into<String>) -> Self {
+        Self {
+            version: A2A_RUN_PROTOCOL_VERSION,
+            task_id: task_id.into(),
+            tenant: tenant.into(),
+            outcome: A2ARunResponseKind::PushConfigDeleted,
         }
     }
 }
