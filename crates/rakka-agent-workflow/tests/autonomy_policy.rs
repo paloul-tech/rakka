@@ -91,6 +91,19 @@ fn skill_and_workflow_policy_reject_disallowed_targets_before_scheduling() {
         .validate_effect(&policy, &usage, &disallowed_tool, Some("research"), now)
         .expect("policy decision");
     assert_eq!(denied.reason_code, "tool-disallowed");
+
+    let model = effect(
+        "model-call",
+        AgentEffectKind::ModelCall,
+        "model",
+        "reasoning-model",
+        [],
+        Some(artifact("model-input")),
+    );
+    let denied = catalog
+        .validate_effect(&policy, &usage, &model, Some("researhc"), now)
+        .expect("policy decision");
+    assert_eq!(denied.reason_code, "skill-target-class-disallowed");
 }
 
 #[test]
@@ -197,6 +210,20 @@ fn autonomy_classification_agrees_with_dispatch_classification() {
                 "ops-alert",
                 [("target_class", "a2a-peer")],
                 None,
+            ),
+            AgentAutonomyTargetClass::Other,
+        ),
+        // gRPC targets whose type is labelled "webhook" remain plain gRPC for
+        // dispatcher policy; the default catalog does not advertise gRPC
+        // webhook support.
+        (
+            effect(
+                "grpc-webhook-label",
+                AgentEffectKind::GrpcCall,
+                "webhook",
+                "customer-callback",
+                [],
+                Some(artifact("grpc-request")),
             ),
             AgentAutonomyTargetClass::Other,
         ),

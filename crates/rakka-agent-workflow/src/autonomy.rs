@@ -359,9 +359,11 @@ impl AgentEffectTargetCatalog {
         skill: Option<&str>,
         target_class: AgentAutonomyTargetClass,
     ) -> bool {
-        skill
-            .and_then(|skill| self.skill_targets.get(skill))
-            .is_none_or(|allowed| allowed.contains(&target_class))
+        skill.is_none_or(|skill| {
+            self.skill_targets
+                .get(skill)
+                .is_some_and(|allowed| allowed.contains(&target_class))
+        })
     }
 
     /// Validates one effect target against the catalog and autonomy policy.

@@ -1481,7 +1481,7 @@ fn decode_dispatch_row(row: Row) -> AgentWorkflowQueryResult<AgentDispatchIndexE
         run_id: AgentRunId::new(row.get::<_, String>("run_id")),
         effect_id: AgentEffectId::new(row.get::<_, String>("effect_id")),
         effect_kind: parse_effect_kind(&row.get::<_, String>("effect_kind"))?,
-        target_class: parse_target_class(&row.get::<_, String>("target_class"))?,
+        target_class: parse_target_class(&row.get::<_, String>("target_class")),
         graph_plan_fingerprint: row
             .get::<_, Option<String>>("graph_plan_fingerprint")
             .map(AgentCompiledPlanFingerprint::new),
@@ -1626,24 +1626,24 @@ fn parse_dispatch_status(value: &str) -> AgentWorkflowQueryResult<AgentDispatchS
     }
 }
 
-fn parse_target_class(value: &str) -> AgentWorkflowQueryResult<AgentDispatchTargetClass> {
+fn parse_target_class(value: &str) -> AgentDispatchTargetClass {
     match value {
-        "model" => Ok(AgentDispatchTargetClass::Model),
-        "tool" => Ok(AgentDispatchTargetClass::Tool),
-        "process" => Ok(AgentDispatchTargetClass::Process),
-        "a2a-peer" => Ok(AgentDispatchTargetClass::A2aPeer),
-        "http" => Ok(AgentDispatchTargetClass::Http),
-        "grpc" => Ok(AgentDispatchTargetClass::Grpc),
-        "webhook" => Ok(AgentDispatchTargetClass::Webhook),
-        "notification" => Ok(AgentDispatchTargetClass::Notification),
-        "push-notification" => Ok(AgentDispatchTargetClass::PushNotification),
-        "human" => Ok(AgentDispatchTargetClass::Human),
-        "stream" => Ok(AgentDispatchTargetClass::Stream),
-        "artifact" => Ok(AgentDispatchTargetClass::Artifact),
-        "child-workflow" => Ok(AgentDispatchTargetClass::ChildWorkflow),
-        "audit" => Ok(AgentDispatchTargetClass::Audit),
-        "other" => Ok(AgentDispatchTargetClass::Other),
-        _ => Err(invalid_label("dispatch.target_class", value)),
+        "model" => AgentDispatchTargetClass::Model,
+        "tool" => AgentDispatchTargetClass::Tool,
+        "process" => AgentDispatchTargetClass::Process,
+        "a2a-peer" => AgentDispatchTargetClass::A2aPeer,
+        "http" => AgentDispatchTargetClass::Http,
+        "grpc" => AgentDispatchTargetClass::Grpc,
+        "webhook" => AgentDispatchTargetClass::Webhook,
+        "notification" => AgentDispatchTargetClass::Notification,
+        "push-notification" => AgentDispatchTargetClass::PushNotification,
+        "human" => AgentDispatchTargetClass::Human,
+        "stream" => AgentDispatchTargetClass::Stream,
+        "artifact" => AgentDispatchTargetClass::Artifact,
+        "child-workflow" => AgentDispatchTargetClass::ChildWorkflow,
+        "audit" => AgentDispatchTargetClass::Audit,
+        "other" => AgentDispatchTargetClass::Other,
+        _ => AgentDispatchTargetClass::Other,
     }
 }
 
