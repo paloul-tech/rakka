@@ -1,6 +1,6 @@
 # Phase 3 Clustered Sharded Entity A2A Agents
 
-Status: planning draft
+Status: implemented
 Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
 
 ## Goal
@@ -13,7 +13,7 @@ owner-only commands through Rakka remoting.
 
 ### Slice 3.1: Remote-Safe Run Protocol
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -35,7 +35,7 @@ Acceptance:
 
 ### Slice 3.2: Codec And Registry Wiring
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -54,7 +54,7 @@ Acceptance:
 
 ### Slice 3.3: Clustered Run Entity
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -74,7 +74,7 @@ Acceptance:
 
 ### Slice 3.4: Cluster Routing Helper
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -94,7 +94,7 @@ Acceptance:
 
 ### Slice 3.5: Cluster Boot Modes
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -112,7 +112,7 @@ Acceptance:
 
 ### Slice 3.6: Owner Movement And Recovery Tests
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -130,7 +130,7 @@ Acceptance:
 
 ### Slice 3.7: Cluster Documentation
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -149,6 +149,50 @@ Acceptance:
 - The owner-only run actor remains the only writer for run execution.
 - Durable recovery works after owner movement.
 - The remote protocol is separate from A2A public wire types.
+
+## Implementation Summary
+
+- Added a versioned `A2ARunRequest`/`A2ARunResponse` protocol in
+  `examples/clustered-sharded-entity-a2a-agents/src/protocol.rs` with variants
+  for message acceptance, task query, cancellation, stream cursor opening, and
+  push config create/delete placeholders.
+- Registered schema-versioned example JSON codecs for the remote-safe protocol
+  in the per-node `SerializationRegistry`, with tests for round trip, unknown
+  payload type, schema mismatch, and malformed payload decode.
+- Replaced the Phase 2 placeholder run sharding with `A2ARunEntity`, a sharded
+  owner shell registered through `ClusterSharding::init_remote_with_ask`. The
+  entity hosts a local `AgentRunActor`, maps owner requests to local
+  `AgentRunActorCommand` values, and stops the child when the entity stops.
+- Added `A2ARunRouter` to resolve `Task.id` to a `ShardedEntityRef`, choose
+  local `ask` versus remote `remote_ask`, record remote reachability outcomes,
+  and map local/remote ask failures into A2A handler errors.
+- Switched the public A2A handler to route `send_message`, `get_task`, and
+  `cancel_task` through the sharded owner when clustered routing is configured,
+  while retaining the local fallback for focused unit tests.
+- Added an example file-backed durable state store selected by `RAKKA_STATE_DIR`
+  so local multi-node runs can share run and workflow inbox/outbox state for
+  lazy recovery after ownership movement.
+- Added `RAKKA_DISCOVERY_PROVIDER=file|etcd` boot modes. File discovery remains
+  the single-node/local default; etcd mode registers nodes under leases and uses
+  remote ask reachability as self-fencing input.
+- Updated the example README and agent card text to distinguish the
+  load-balanced public A2A endpoint from private Rakka remoting, and to document
+  two-node local commands.
+- Added slice 3.6 owner movement and recovery tests in
+  `examples/clustered-sharded-entity-a2a-agents/src/cluster_tests.rs`: two
+  in-process loopback nodes with shared file-backed stores cover acceptance on
+  one node with scoped/unscoped read and cancel from the other, owner shutdown
+  with downing and lazy durable recovery on the new owner, an in-flight
+  command racing the ownership move with an idempotent client retry, idle
+  passivation with lazy re-activation, and duplicate send retry after owner
+  movement.
+- Hardened the clustered path per PR review: the example file store commits
+  each revision through an exclusive hard-link claim so concurrent
+  compare-and-set writers can never lose an update across processes; run
+  entities passivate when idle and spawn uniquely named child actors without
+  panicking on re-activation races; unscoped reads carry an optional tenant
+  end-to-end instead of coercing the local default; and remote ask timeouts
+  no longer count as peer-unreachability evidence for self-fencing.
 
 ## References
 

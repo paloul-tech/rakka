@@ -185,7 +185,8 @@ pub enum A2ATenantSource {
 }
 
 /// Whether an A2A message starts or continues a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum A2ATaskIntent {
     /// A new task/run id was generated.
     NewTask,
@@ -200,7 +201,7 @@ impl A2ATaskIntent {
 }
 
 /// Normalized identity and metadata for one A2A command request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedA2ACommand {
     /// A2A task id, equal to Rakka run id and sharded entity id.
     pub task_id: String,
@@ -319,7 +320,7 @@ pub struct A2AArtifactDraft {
 }
 
 /// Validated Rakka command plus its payload placement draft.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A2ACommandDraft {
     /// Normalized A2A metadata.
     pub normalized: NormalizedA2ACommand,

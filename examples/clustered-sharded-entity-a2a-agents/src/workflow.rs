@@ -1,4 +1,4 @@
-//! Demo workflow definition advertised by the Phase 2 agent card.
+//! Demo workflow definition advertised by the clustered A2A agent card.
 
 use std::collections::BTreeMap;
 
@@ -20,7 +20,7 @@ pub fn demo_workflow() -> AgentWorkflow {
         workflow_type: WORKFLOW_TYPE.to_string(),
         definition_version: WorkflowDefinitionVersion::new(DEFINITION_VERSION),
         state_schema_version: StateSchemaVersion::new(1),
-        display_name: Some("A2A Phase 2 demo workflow".to_string()),
+        display_name: Some("A2A clustered demo workflow".to_string()),
         status_labels: vec![
             AgentRunStatus::Accepted.as_label().to_string(),
             AgentRunStatus::Running.as_label().to_string(),

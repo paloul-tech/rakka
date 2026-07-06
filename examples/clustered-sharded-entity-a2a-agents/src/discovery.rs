@@ -1,4 +1,4 @@
-//! File-based local discovery for Phase 2 developer mode.
+//! File-based local discovery for Phase 3 developer mode.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,7 @@ pub fn membership_snapshot(view: &MembershipView) -> Vec<String> {
     view.lock().expect("membership view mutex").clone()
 }
 
-fn set_membership(view: &MembershipView, nodes: &[ClusterNode]) {
+pub(crate) fn set_membership(view: &MembershipView, nodes: &[ClusterNode]) {
     let mut ids: Vec<String> = nodes.iter().map(|node| node.id().to_string()).collect();
     ids.sort();
     ids.dedup();

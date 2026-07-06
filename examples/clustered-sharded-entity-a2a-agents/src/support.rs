@@ -17,6 +17,12 @@ pub const NUMBER_OF_SHARDS: u32 = 32;
 /// Default Rakka TCP remoting port for local development.
 pub const DEFAULT_RAKKA_PORT: u16 = 25_580;
 
+/// Default etcd discovery key prefix for production-like testing.
+pub const DEFAULT_ETCD_PREFIX: &str = "/rakka/examples/a2a-agents";
+
+/// Default etcd lease TTL in seconds.
+pub const DEFAULT_ETCD_LEASE_TTL_SECONDS: i64 = 10;
+
 /// How often each process republishes file-discovery membership.
 pub const DEFAULT_DISCOVERY_POLL: Duration = Duration::from_millis(750);
 
@@ -32,6 +38,16 @@ pub const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_millis(25);
 /// TCP remoting idle timeout.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bounded ask timeout for sharded owner and local run actor requests.
+pub const RUN_ASK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long an idle run entity stays resident before passivating.
+///
+/// Passivation keeps read-only probes for arbitrary task ids from pinning an
+/// entity and child run actor forever; durable state recovers lazily on the
+/// next reference.
+pub const RUN_ENTITY_IDLE_PASSIVATION: Duration = Duration::from_secs(120);
+
 /// Bounded workflow type label used by the demo workflow.
 pub const WORKFLOW_TYPE: &str = "a2a-phase-2-demo";
 
@@ -45,6 +61,14 @@ pub fn env_u16(name: &str, default: u16) -> ExampleResult<u16> {
         .map(|value| parse_u16(name, &value))
         .transpose()
         .map(|value| value.unwrap_or(default))
+}
+
+/// Reads an environment variable as a `u64`, falling back to `default`.
+pub fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Parses a `u16` with a contextual error message.
@@ -89,6 +113,19 @@ pub fn hex_encode(value: &str) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+/// Inverse of [`hex_encode`]; returns `None` for malformed input.
+pub fn hex_decode(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Builds a simple `std::io::Error` from a message for example error paths.
