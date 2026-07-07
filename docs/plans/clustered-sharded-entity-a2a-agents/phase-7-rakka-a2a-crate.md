@@ -1,8 +1,8 @@
 # Phase 7 Rakka A2A Crate Extraction
 
-Status: planning draft
-Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`
-Source example: `examples/clustered-sharded-entity-a2a-agents/`
+Status: planned/approved - 2026-07-07  
+Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`  
+Source example: `examples/clustered-sharded-entity-a2a-agents/`  
 
 ## Goal
 
@@ -104,7 +104,12 @@ Initial features:
 
 Add a top-level facade feature only after the crate API settles:
 
-- `crates/rakka/Cargo.toml`: `a2a = ["dep:rakka-a2a"]`.
+- `crates/rakka/Cargo.toml`: `a2a = ["dep:rakka-a2a"]`, plus sub-feature
+  passthroughs for the crate's optional adapters, following the existing
+  `rakka-agent-workflow?/...` pattern, e.g.
+  `a2a-postgres = ["a2a", "rakka-a2a?/postgres"]`,
+  `a2a-k8s = ["a2a", "rakka-a2a?/k8s"]`, and
+  `a2a-otel = ["a2a", "rakka-a2a?/otel"]`.
 - `crates/rakka/src/lib.rs`: gated `pub mod a2a` and curated
   `rakka::prelude` exports for the stable builder and request handler.
 
@@ -118,7 +123,8 @@ Candidate modules:
 - `task`: `A2ATaskProjection`, `A2ATaskEvent`, status mapping, artifact
   mapping, replay cursor parsing, compaction rules, and bounded task rendering.
 - `projection`: async `A2ATaskProjectionStore` trait, in-memory store,
-  PostgreSQL store, watcher interface, retention policy, and query pagination.
+  PostgreSQL store, `A2ATaskEventWatcher` interface, retention policy, and query
+  pagination.
 - `push`: push config store trait, redaction model, config validation, outbox
   scheduling, dispatcher adapter contract, retry/exhaustion metrics, and
   credential-binding policy hooks.
@@ -204,7 +210,8 @@ should include at least:
 
 Migration requirements:
 
-- Use explicit schema versions and additive changes.
+- Use explicit schema versions or idempotent additive DDL, as DN-1 decides;
+  prefer additive changes either way.
 - Support offline package checks.
 - Use migration locks where available.
 - Include downgrade-safe N/N+1 guidance for rolling updates.
@@ -244,8 +251,8 @@ Requirements the chosen mechanism must satisfy regardless of path:
 
 - Idempotent apply that is safe to run from every node at startup.
 - Concurrency-safe when many pods apply at once. Wrap apply in a Postgres
-  advisory lock (`pg_advisory_lock`), matching the shard coordinator, and
-  document the lock key.
+  advisory lock, matching the `acquire_migration_lock` / `MIGRATION_LOCK_ID`
+  pattern in `rakka-sharding-postgres`, and document the A2A lock key.
 - Offline-packageable: SQL ships embedded in the crate with no runtime file or
   network dependency.
 - Additive-only columns/indexes within a release, with downgrade-safe N/N+1
@@ -347,13 +354,14 @@ Decision:
 
 ## Implementation Slices
 
-Each slice must leave the workspace green: after every slice both
-`cargo test -p rakka-a2a` and
+Slices 7.2-7.8 build the crate with its own tests and do not modify the example.
+They port crate-owned, generalized copies of the reusable code while the example
+keeps running on its own local copies. The two copies coexist until Slice 7.9,
+the single cutover that rewires the example onto `rakka-a2a` and deletes the
+example-local copies. Every slice must still leave the workspace green: after
+each slice both `cargo test -p rakka-a2a` and
 `cargo test -p rakka-example-clustered-sharded-entity-a2a-agents` pass. The
-example is migrated incrementally across Slices 7.3-7.9; where a slice leaves the
-example partially migrated (for example, a crate store wired under an
-example-local handler), keep it compiling and passing and name any temporary
-bridge in the slice so Slice 7.9 removes it.
+example passes unchanged before 7.9 and on the crate afterward.
 
 ### Slice 7.1: Crate Skeleton And Dependency Boundary
 
@@ -366,7 +374,7 @@ Work:
 - Add A2A SDK dependencies using the example's current package names:
   `a2a-lf` as `a2a` and `a2a-server-lf` as `a2a-server` with
   `default-features = false`.
-- Add a design note for SDK version policy and MSRV compatibility.
+- Document SDK version policy and MSRV compatibility in the crate docs.
 - Do not add top-level `rakka` facade exports yet.
 
 Acceptance:
@@ -383,8 +391,9 @@ Status: planned
 
 Work:
 
-- Move and generalize `a2a_mapping.rs`, `task_projection.rs`, `protocol.rs`,
-  `codec.rs`, and `stream_limits.rs`.
+- Port and generalize `a2a_mapping.rs`, `task_projection.rs`, `protocol.rs`,
+  `codec.rs`, and `stream_limits.rs` into the crate as crate-owned copies; the
+  example keeps its own modules until the 7.9 cutover.
 - Rename remote type ids from `rakka.examples.a2a.*` to stable
   `rakka.a2a.*` ids.
 - Make metadata keys, replay cursors, status mapping, and error codes public
@@ -411,7 +420,8 @@ Work:
 - Add task and task-event migrations.
 - Implement replay from shared durable events before owner polling.
 - Add retention and compaction behavior for bounded event tails.
-- Update the example to use the crate store instead of local projection code.
+- Validate the store through crate and gated PostgreSQL tests; the example moves
+  onto the crate store at the 7.9 cutover.
 
 Acceptance:
 
@@ -430,7 +440,7 @@ Design inputs: DN-3 (tenant read scoping).
 
 Work:
 
-- Move and generalize `RakkaA2ARequestHandler`.
+- Port and generalize `RakkaA2ARequestHandler` as a crate-owned copy.
 - Replace direct field construction with `RakkaA2AServiceBuilder`.
 - Add workflow catalog support.
 - Add tenant resolver and authorizer hooks.
@@ -453,8 +463,8 @@ Status: planned
 
 Work:
 
-- Move and generalize `A2ARunEntity`, `A2ARunHost`, `A2ARunRouter`, and
-  sharding initialization helpers.
+- Port and generalize `A2ARunEntity`, `A2ARunHost`, `A2ARunRouter`, and
+  sharding initialization helpers as crate-owned copies.
 - Keep the remote protocol serializable and free of actor refs, reply channels,
   stores, and `Arc` values.
 - Add version mismatch and unsupported-operation handling.
@@ -467,8 +477,8 @@ Acceptance:
   owner.
 - Owner restart, passivation, and shard movement recover from durable stores on
   next access.
-- Existing example cluster tests move to crate or crate-backed integration
-  tests.
+- New crate-backed cluster/integration tests cover the sharded host; the
+  example's existing cluster tests stay in place until the 7.9 cutover.
 
 ### Slice 7.6: Streaming From Durable Events
 
@@ -484,7 +494,7 @@ Work:
   lag handling, and terminal completion.
 - Retain owner polling only as an optimization when the owner is local or when
   durable watcher support is unavailable.
-- Add a store watcher abstraction for memory and PostgreSQL.
+- Add the `A2ATaskEventWatcher` abstraction for memory and PostgreSQL (DN-2).
 
 Acceptance:
 
@@ -492,6 +502,10 @@ Acceptance:
 - Streams do not cancel runs on disconnect.
 - Slow clients are disconnected with retry guidance instead of causing
   unbounded buffering.
+- Reconnect through a different node after new events resumes with no gap and no
+  duplicate at the durable-versus-owner-served boundary (DN-2).
+- A cursor older than the compaction window yields `resync`, not a silent gap
+  (DN-2).
 
 ### Slice 7.7: Push Configs And Push Dispatch
 
@@ -501,7 +515,8 @@ Design inputs: DN-4 (push credential binding).
 
 Work:
 
-- Move push config validation, redaction, and outbox scheduling.
+- Port push config validation, redaction, and outbox scheduling as crate-owned
+  copies.
 - Add PostgreSQL push config storage and scheduler watermark storage.
 - Add `A2APushDispatcher` or an agent-workflow dispatcher adapter that sends
   A2A push webhooks from durable effects.
@@ -550,8 +565,8 @@ Status: planned
 
 Work:
 
-- Refactor `examples/clustered-sharded-entity-a2a-agents` to consume
-  `rakka-a2a`.
+- Perform the single cutover from the coexistence period: refactor
+  `examples/clustered-sharded-entity-a2a-agents` to consume `rakka-a2a`.
 - Delete example-local copies of reusable handler, mapping, protocol,
   projection, stream, push, and sharded host code.
 - Keep demo workflow, local env config, file discovery, etcd bootstrap,
@@ -573,7 +588,8 @@ Status: planned
 
 Work:
 
-- Add the gated top-level `rakka` facade feature once APIs are stable enough.
+- Add the gated top-level `rakka` facade feature and its sub-feature
+  passthroughs once APIs are stable enough.
 - Document crate usage, topology, reliability boundary, migration policy,
   security model, and operational runbooks.
 - Update `README.md`, relevant `docs/*.md`, `CHANGELOG.md`, and package
@@ -640,12 +656,19 @@ Narrow validation while implementing:
 cargo test -p rakka-a2a
 cargo test -p rakka-a2a --all-features
 cargo check -p rakka-a2a --no-default-features
+cargo check -p rakka-a2a --features server
+cargo check -p rakka-a2a --features sharding
+cargo check -p rakka-a2a --features postgres
 cargo test -p rakka-example-clustered-sharded-entity-a2a-agents
 ```
 
-Add `cargo check -p rakka-a2a --no-default-features` to the minimal-feature
-checks in `scripts/validate.sh`, alongside the existing `rakka-stream` and
-`rakka-process` no-default-feature checks.
+Because the crate ships `default = []`, the no-default-features check mainly
+guards against a future non-empty default and keeps parity with the
+`scripts/validate.sh` convention; the single-feature checks above give real
+coverage by catching feature-unification breaks that `--all-features` hides. Add
+`cargo check -p rakka-a2a --no-default-features` to the minimal-feature checks in
+`scripts/validate.sh`, alongside the existing `rakka-stream` and `rakka-process`
+no-default-feature checks.
 
 Gated validation when relevant:
 
