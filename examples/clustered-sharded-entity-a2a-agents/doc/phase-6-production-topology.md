@@ -37,9 +37,12 @@ PostgreSQL is the shared durable store for:
 - A2A push notification configs
 
 The example rebuilds process-local A2A task projections from durable run and
-inbox state on restart. A future extracted `rakka-a2a` crate should promote the
-A2A task-event projection to a shared PostgreSQL query/event table so every node
-can serve replay without owner polling.
+inbox state on restart. The reusable [`rakka-a2a`](../../../crates/rakka-a2a)
+crate promotes the A2A task-event projection to a shared PostgreSQL query/event table
+(`rakka_a2a::postgres`) so every node can serve replay without owner polling;
+point the crate at its PostgreSQL projection store to enable shared durable
+replay. This example keeps the in-memory projection store plus owner polling for
+local simplicity.
 
 ## Local Developer Topology
 
@@ -240,18 +243,21 @@ Expected outcomes:
 
 ## Production-Candidate Review
 
-Before extracting into `rakka-a2a`, review:
+The reusable behavior described here was extracted into the
+[`rakka-a2a`](../../../crates/rakka-a2a) crate in Phase 7. The extraction
+resolved each review item as follows:
 
-- API stability of metadata keys, task-event projection schema, and replay
-  cursor shape;
-- security and tenancy assumptions;
-- migration and retention policy;
-- whether task-event projection needs a shared PostgreSQL table before broad
-  reuse;
-- whether the push dispatcher is product-owned or crate-owned;
-- compatibility of agent-card capabilities and transport URLs;
-- documentation for local, Kubernetes, backup/restore, drain, and failure
-  injection operation.
+- metadata keys, task-event projection schema, and replay cursor shape are
+  documented compatibility commitments in the crate;
+- tenancy is a durable command-boundary concern with a tenant-scoped mode that
+  refuses unscoped reads against shared stores;
+- the crate ships an idempotent, advisory-lock-guarded PostgreSQL migration plus
+  a retention policy that preserves terminal snapshots and replay cursors;
+- the task-event projection has a shared PostgreSQL store enabling cross-node
+  replay without owner polling;
+- the push dispatcher is a crate-defined boundary the application implements;
+- the dynamic agent card advertises implemented transports and only advertises
+  push support when a dispatcher is configured.
 
 Current candidate scope: production-shaped example deployment and recovery
 validation, not a reusable public `rakka-a2a` API and not exactly-once external

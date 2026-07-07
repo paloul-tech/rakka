@@ -1,6 +1,6 @@
 # Phase 7 Rakka A2A Crate Extraction
 
-Status: planned/approved - 2026-07-07  
+Status: implemented - 2026-07-07  
 Source spec: `docs/plans/clustered-sharded-entity-a2a-agents/spec.md`  
 Source example: `examples/clustered-sharded-entity-a2a-agents/`  
 
@@ -247,6 +247,17 @@ Decision to record here before implementing 7.3:
   migrations is required, scope it as its own work item, not folded into "add a
   table".
 
+**Decision (recorded 2026-07-07): reuse path.** The A2A schema ships as
+idempotent additive `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
+DDL embedded in `rakka-a2a` as `const &str` (`MIGRATION_SQL`), applied by an
+explicit `migrate()` call that wraps `batch_execute` in a Postgres advisory
+lock. The crate-owned lock key is `rakka_a2a::postgres::MIGRATION_LOCK_ID =
+982_451_777`, deliberately distinct from the `rakka-sharding-postgres`
+coordinator lock id (`982_451_653`). No ordered `schema_version` table is
+introduced; schema evolution stays additive-only within a release, and the
+N/N+1 rolling-update rule (old pods tolerate new columns, new pods tolerate
+absent new-optional columns) is documented on the migration constant.
+
 Requirements the chosen mechanism must satisfy regardless of path:
 
 - Idempotent apply that is safe to run from every node at startup.
@@ -283,6 +294,18 @@ Watcher abstraction:
 - The watcher only signals "there may be new events at or after sequence S". The
   serving node then reads durable events; it never trusts the notification
   payload as data.
+
+**Decision (recorded 2026-07-07): bounded interval polling.** The first
+PostgreSQL `A2ATaskEventWatcher` polls the durable per-task high watermark
+(`MAX(sequence)` over `rakka_a2a_task_events` for `(tenant, task_id)`) on a
+bounded interval (default 500ms, configurable) and signals only the observed
+high watermark. `LISTEN/NOTIFY` is deliberately deferred: it requires a
+dedicated connection with reconnect handling, while the polling watcher works
+over the same shared single-connection client the other Rakka PostgreSQL
+stores use, and its latency bound (one poll interval) still improves on the
+2-second cross-node owner polling it replaces. The watcher trait is transport
+neutral, so a `LISTEN/NOTIFY` implementation can be added later behind the
+same interface without changing stream code.
 
 Cursor invariant (correctness, holds in all paths):
 
@@ -365,7 +388,7 @@ example passes unchanged before 7.9 and on the crate afterward.
 
 ### Slice 7.1: Crate Skeleton And Dependency Boundary
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -387,7 +410,7 @@ Acceptance:
 
 ### Slice 7.2: Mapping, Task Projection Types, And Remote Protocol
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -409,7 +432,7 @@ Acceptance:
 
 ### Slice 7.3: Durable Projection Store And PostgreSQL Migration
 
-Status: planned
+Status: implemented
 
 Design inputs: DN-1 (migration mechanism), DN-3 (tenant read scoping).
 
@@ -434,7 +457,7 @@ Acceptance:
 
 ### Slice 7.4: Durable Request Handler Builder
 
-Status: planned
+Status: implemented
 
 Design inputs: DN-3 (tenant read scoping).
 
@@ -459,7 +482,7 @@ Acceptance:
 
 ### Slice 7.5: Sharded Owner Host
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -482,7 +505,7 @@ Acceptance:
 
 ### Slice 7.6: Streaming From Durable Events
 
-Status: planned
+Status: implemented
 
 Design inputs: DN-2 (replay watcher and cursor invariant).
 
@@ -509,7 +532,7 @@ Acceptance:
 
 ### Slice 7.7: Push Configs And Push Dispatch
 
-Status: planned
+Status: implemented
 
 Design inputs: DN-4 (push credential binding).
 
@@ -536,7 +559,7 @@ Acceptance:
 
 ### Slice 7.8: Agent Cards, Routes, And Observability
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -561,7 +584,7 @@ Acceptance:
 
 ### Slice 7.9: Example Migration
 
-Status: planned
+Status: implemented
 
 Work:
 
@@ -584,7 +607,7 @@ Acceptance:
 
 ### Slice 7.10: Facade, Docs, And Release Review
 
-Status: planned
+Status: implemented
 
 Work:
 

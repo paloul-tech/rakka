@@ -12,6 +12,7 @@ members = [
     "crates/rakka-sharding-postgres",
     "crates/rakka-workflow",
     "crates/rakka-agent-workflow",
+    "crates/rakka-a2a",
     "crates/rakka-stream",
     "crates/rakka-process",
     "crates/rakka-http",

@@ -28,8 +28,8 @@ Component crates continue to own implementation-specific concepts:
   foundations until a higher-level facade stabilizes.
 - `rakka-cluster`, `rakka-remote`, and `rakka-sharding` own distributed
   foundations.
-- `rakka-stream`, `rakka-process`, `rakka-http`, `rakka-grpc`, and `rakka-k8s`
-  own integration adapters.
+- `rakka-stream`, `rakka-process`, `rakka-http`, `rakka-grpc`, `rakka-k8s`, and
+  `rakka-a2a` own integration adapters.
 - `rakka-testkit` owns test/support helpers.
 
 ## Crate Inventory
@@ -50,6 +50,7 @@ Component crates continue to own implementation-specific concepts:
 | `rakka-http` | Adapter | Axum-backed HTTP adapters. |
 | `rakka-grpc` | Adapter | Tonic-backed gRPC adapters. |
 | `rakka-k8s` | Adapter | Kubernetes health, drain, discovery, and manifest helpers. |
+| `rakka-a2a` | Adapter | A2A protocol adapter over HTTP, PostgreSQL, and sharding: durable request handler, task projection and streaming replay, push config persistence and dispatch boundary, sharded run owner host, owner router, and dynamic agent card. |
 | `rakka-testkit` | Test/support | Cross-crate probes, assertions, compatibility fixtures, and repository hygiene tests. |
 
 ## Prelude Inventory

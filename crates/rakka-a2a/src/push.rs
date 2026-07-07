@@ -1,4 +1,15 @@
 //! Durable A2A push notification configuration and outbox scheduling.
+//!
+//! Push configs are stored with credentials redacted: the crate never
+//! persists resolved credentials or secret material in state, outbox
+//! effects, task events, logs, metrics, snapshots, or indexes. By default
+//! raw credential material is **rejected**; applications that own secret
+//! storage supply an [`A2ACredentialBindingResolver`] whose logical binding
+//! reference is the only credential-related value persisted.
+//!
+//! Push delivery is at-least-once: effects carry stable idempotency keys
+//! derived from task id, event sequence, and config id, so the webhook
+//! target must deduplicate if it needs exactly-once semantics.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -10,21 +21,19 @@ use a2a::{
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
     TaskPushNotificationConfig,
 };
-use rakka::agent_workflow::substrate::{WorkflowError, WorkflowState};
-use rakka::agent_workflow::{
+use rakka_agent_workflow::substrate::{WorkflowError, WorkflowState};
+use rakka_agent_workflow::{
     AgentAttributes, AgentCausationId, AgentCorrelationId, AgentDeduplicationKey,
-    AgentDurabilityMetadata, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
+    AgentDurabilityMetadata, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectMetadata,
     AgentEffectSchedule, AgentEffectTarget, AgentFacadeError, AgentIdempotencyKey, AgentInboxError,
     AgentOutboxError, AgentRunId, AgentRunInbox, AgentTelemetryContext, AgentTimestampMillis,
 };
-use rakka::persistence::{DurableError, DurableStateStore, PersistenceId, Revision};
+use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision};
 use serde::{Deserialize, Serialize};
 
-use crate::durable_stores::PushConfigStore;
+use crate::stores::SharedDurableStateStore;
 use crate::support::{current_timestamp_millis, hex_encode};
-use crate::task_projection::{
-    encode_replay_cursor, A2ATaskEvent, A2ATaskEventRedaction, InMemoryA2ATaskProjectionStore,
-};
+use crate::task::{encode_replay_cursor, A2ATaskEvent, A2ATaskEventRedaction};
 
 const PUSH_CONFIG_PERSISTENCE_PREFIX: &str = "a2a-push-config";
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -34,29 +43,48 @@ const MAX_PAGE_SIZE: usize = 100;
 const MAX_PUSH_CONFIG_AUDIT_RECORDS: usize = 32;
 static GENERATED_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) type A2APushConfigResult<T> = Result<T, A2APushConfigError>;
+/// Shared durable store handle for push config state.
+pub type A2APushConfigStateStore = SharedDurableStateStore<A2APushConfigState>;
 
+/// Shared result type for push configuration.
+pub type A2APushConfigResult<T> = Result<T, A2APushConfigError>;
+
+/// Stable push configuration failures.
 #[derive(Debug, Clone)]
-pub(crate) enum A2APushConfigError {
+pub enum A2APushConfigError {
+    /// A push config field failed validation or policy.
     InvalidConfig {
+        /// Stable field name.
         field: &'static str,
+        /// Stable reason.
         reason: &'static str,
     },
+    /// Page token is malformed.
     InvalidPageToken {
+        /// Token supplied by the client.
         token: String,
     },
+    /// The requested push config does not exist.
     ConfigNotFound {
+        /// Task id.
         task_id: String,
+        /// Config id.
         config_id: String,
     },
+    /// Durable store failure.
     Persistence(DurableError),
+    /// Agent facade validation failure.
     Facade(AgentFacadeError),
+    /// Durable inbox failure.
     Inbox(AgentInboxError),
+    /// Durable outbox failure.
     Outbox(AgentOutboxError),
 }
 
 impl A2APushConfigError {
-    pub(crate) fn code(&self) -> &'static str {
+    /// Stable machine-readable code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidConfig { .. } => "invalid-push-config",
             Self::InvalidPageToken { .. } => "invalid-page-token",
@@ -134,45 +162,130 @@ fn facade_error_code(error: &AgentFacadeError) -> &'static str {
     }
 }
 
+/// Logical reference to an application-managed credential binding.
+///
+/// Only this reference is persisted; the application backend resolves it to
+/// real credentials at dispatch time. The value must never contain secret
+/// material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2ACredentialBindingRef(String);
+
+impl A2ACredentialBindingRef {
+    /// Creates a binding reference.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The stable reference value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Resolves raw push credential input to a logical binding reference.
+///
+/// Implemented by the application backend that owns secret storage. The
+/// resolver may inspect the incoming config (including transient credential
+/// fields) to mint or look up a binding; `rakka-a2a` persists only the
+/// returned reference and never the raw values.
+pub trait A2ACredentialBindingResolver: Send + Sync + 'static {
+    /// Resolves the binding for a saved config; `Ok(None)` means the config
+    /// carries no credential binding.
+    fn resolve(
+        &self,
+        tenant: &str,
+        config: &TaskPushNotificationConfig,
+    ) -> A2APushConfigResult<Option<A2ACredentialBindingRef>>;
+}
+
+/// Policy for push configs that arrive carrying raw credential material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum A2APushCredentialPolicy {
+    /// Reject configs carrying raw credentials unless a binding resolver is
+    /// configured (secure default).
+    #[default]
+    RejectRawCredentials,
+    /// Strip raw credentials and record only their presence. Appropriate for
+    /// local/demo deployments without a secret backend; deliveries then go
+    /// out unauthenticated.
+    RedactAndRecordPresence,
+}
+
+/// Durable push config record.
+///
+/// Public so applications can wire their chosen durable-state backend (for
+/// example a PostgreSQL store with a JSON codec) for push config storage.
+/// The stored config is always redacted; `auth` carries only presence
+/// metadata and the optional logical binding reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct A2APushConfigState {
-    pub(crate) tenant: String,
-    pub(crate) task_id: String,
-    pub(crate) config_id: String,
-    pub(crate) config: TaskPushNotificationConfig,
-    pub(crate) auth: A2APushConfigAuthMetadata,
-    pub(crate) deleted: bool,
-    pub(crate) created_at: AgentTimestampMillis,
-    pub(crate) updated_at: AgentTimestampMillis,
-    pub(crate) audit: Vec<A2APushConfigAuditRecord>,
+pub struct A2APushConfigState {
+    /// Owning tenant.
+    pub tenant: String,
+    /// Task id.
+    pub task_id: String,
+    /// Config id.
+    pub config_id: String,
+    /// Redacted public config (no token, no credentials).
+    pub config: TaskPushNotificationConfig,
+    /// Redacted credential-presence metadata.
+    pub auth: A2APushConfigAuthMetadata,
+    /// Soft-delete flag.
+    pub deleted: bool,
+    /// Creation timestamp.
+    pub created_at: AgentTimestampMillis,
+    /// Last update timestamp.
+    pub updated_at: AgentTimestampMillis,
+    /// Bounded audit tail.
+    pub audit: Vec<A2APushConfigAuditRecord>,
 }
 
+/// Redacted credential-presence metadata for one push config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct A2APushConfigAuthMetadata {
-    pub(crate) token_present: bool,
-    pub(crate) authentication_scheme: Option<String>,
-    pub(crate) credentials_present: bool,
-    pub(crate) redaction: A2ATaskEventRedaction,
+pub struct A2APushConfigAuthMetadata {
+    /// Whether the client supplied a token (never stored).
+    pub token_present: bool,
+    /// Authentication scheme label, when supplied.
+    pub authentication_scheme: Option<String>,
+    /// Whether the client supplied credentials (never stored).
+    pub credentials_present: bool,
+    /// Redaction marker for this metadata.
+    pub redaction: A2ATaskEventRedaction,
+    /// Logical credential binding reference, when resolved.
+    #[serde(default)]
+    pub credential_binding_ref: Option<A2ACredentialBindingRef>,
 }
 
+/// One bounded audit record for a push config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct A2APushConfigAuditRecord {
-    pub(crate) kind: A2APushConfigAuditKind,
-    pub(crate) occurred_at: AgentTimestampMillis,
-    pub(crate) redaction: A2ATaskEventRedaction,
+pub struct A2APushConfigAuditRecord {
+    /// Change kind.
+    pub kind: A2APushConfigAuditKind,
+    /// Change timestamp.
+    pub occurred_at: AgentTimestampMillis,
+    /// Redaction marker for the audited change.
+    pub redaction: A2ATaskEventRedaction,
 }
 
+/// Push config audit change kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum A2APushConfigAuditKind {
+pub enum A2APushConfigAuditKind {
+    /// Config was created (or re-created after delete).
     Created,
+    /// Config was updated.
     Updated,
+    /// Config was deleted.
     Deleted,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct A2APushConfigStore {
-    store: PushConfigStore,
+/// Durable push config store with node-local scheduling watermarks.
+#[derive(Clone)]
+pub struct A2APushConfigStore {
+    store: A2APushConfigStateStore,
+    credential_policy: A2APushCredentialPolicy,
+    binding_resolver: Option<Arc<dyn A2ACredentialBindingResolver>>,
     /// Highest event sequence per (tenant, task id) whose push effects were
     /// durably scheduled (or confirmed unnecessary). Node-local memory: on
     /// loss the retained event log is re-offered and the durable
@@ -180,15 +293,46 @@ pub(crate) struct A2APushConfigStore {
     scheduled: Arc<Mutex<BTreeMap<(String, String), u64>>>,
 }
 
+impl std::fmt::Debug for A2APushConfigStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A2APushConfigStore")
+            .field("credential_policy", &self.credential_policy)
+            .field("binding_resolver", &self.binding_resolver.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl A2APushConfigStore {
-    pub(crate) fn new(store: PushConfigStore) -> Self {
+    /// Creates a push config store over any durable state backend.
+    #[must_use]
+    pub fn new(store: impl DurableStateStore<A2APushConfigState>) -> Self {
         Self {
-            store,
+            store: SharedDurableStateStore::new(store),
+            credential_policy: A2APushCredentialPolicy::default(),
+            binding_resolver: None,
             scheduled: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
-    fn scheduled_watermark(&self, tenant: &str, task_id: &str) -> u64 {
+    /// Overrides the raw-credential policy. See
+    /// [`A2APushCredentialPolicy`]; the default rejects raw credentials.
+    #[must_use]
+    pub fn with_credential_policy(mut self, policy: A2APushCredentialPolicy) -> Self {
+        self.credential_policy = policy;
+        self
+    }
+
+    /// Installs the application's credential binding resolver.
+    #[must_use]
+    pub fn with_credential_binding_resolver(
+        mut self,
+        resolver: Arc<dyn A2ACredentialBindingResolver>,
+    ) -> Self {
+        self.binding_resolver = Some(resolver);
+        self
+    }
+
+    pub(crate) fn scheduled_watermark(&self, tenant: &str, task_id: &str) -> u64 {
         self.scheduled
             .lock()
             .expect("push watermark mutex")
@@ -200,14 +344,15 @@ impl A2APushConfigStore {
     /// Overwrites (rather than maxes) the watermark: event sequences restart
     /// per owner epoch, so tracking the current epoch's tail is correct and
     /// a stale higher value would skip real events forever.
-    fn record_scheduled_watermark(&self, tenant: &str, task_id: &str, sequence: u64) {
+    pub(crate) fn record_scheduled_watermark(&self, tenant: &str, task_id: &str, sequence: u64) {
         self.scheduled
             .lock()
             .expect("push watermark mutex")
             .insert((tenant.to_string(), task_id.to_string()), sequence);
     }
 
-    pub(crate) async fn save(
+    /// Saves (creates or updates) a push config, redacting credentials.
+    pub async fn save(
         &self,
         tenant: &str,
         mut config: TaskPushNotificationConfig,
@@ -225,6 +370,7 @@ impl A2APushConfigStore {
         }
         config.tenant = Some(tenant.to_string());
         validate_config(&config)?;
+        let binding_ref = self.resolve_binding(tenant, &config)?;
 
         if config.id.as_deref().is_none_or(str::is_empty) {
             config.id = Some(generated_config_id());
@@ -232,7 +378,7 @@ impl A2APushConfigStore {
         let config_id = config.id.clone().expect("config id set");
         let persistence_id = push_config_persistence_id(tenant, &config.task_id, &config_id);
         let now = AgentTimestampMillis::new(current_timestamp_millis());
-        let auth = auth_metadata(&config);
+        let auth = auth_metadata(&config, binding_ref);
         let redacted = redacted_config(config);
 
         let existing = self.store.load(&persistence_id).await?;
@@ -288,7 +434,35 @@ impl A2APushConfigStore {
         Ok(record.state.config)
     }
 
-    pub(crate) async fn get(
+    /// Applies the DN-4 credential-binding policy: reject, never hold.
+    fn resolve_binding(
+        &self,
+        tenant: &str,
+        config: &TaskPushNotificationConfig,
+    ) -> A2APushConfigResult<Option<A2ACredentialBindingRef>> {
+        if let Some(resolver) = &self.binding_resolver {
+            return resolver.resolve(tenant, config);
+        }
+        let has_secret_material = config.token.is_some()
+            || config
+                .authentication
+                .as_ref()
+                .and_then(|authentication| authentication.credentials.as_ref())
+                .is_some();
+        if has_secret_material
+            && self.credential_policy == A2APushCredentialPolicy::RejectRawCredentials
+        {
+            return Err(A2APushConfigError::InvalidConfig {
+                field: "authentication",
+                reason: "raw push credentials are rejected; configure a credential \
+                         binding resolver or remove inline credentials",
+            });
+        }
+        Ok(None)
+    }
+
+    /// Reads one active push config.
+    pub async fn get(
         &self,
         tenant: &str,
         task_id: &str,
@@ -308,7 +482,8 @@ impl A2APushConfigStore {
         Ok(state.config)
     }
 
-    pub(crate) async fn list(
+    /// Lists active push configs for one task with deterministic pagination.
+    pub async fn list(
         &self,
         tenant: &str,
         request: &ListTaskPushNotificationConfigsRequest,
@@ -333,7 +508,8 @@ impl A2APushConfigStore {
         })
     }
 
-    pub(crate) async fn delete(
+    /// Soft-deletes one push config; deleting a missing config is a no-op.
+    pub async fn delete(
         &self,
         tenant: &str,
         task_id: &str,
@@ -363,7 +539,8 @@ impl A2APushConfigStore {
         Ok(())
     }
 
-    pub(crate) async fn active_configs(
+    /// Lists active configs for scheduling.
+    pub async fn active_configs(
         &self,
         tenant: &str,
         task_id: &str,
@@ -416,10 +593,10 @@ const MAX_PUSH_SCHEDULE_REDRIVES: usize = 3;
 /// One config scan and one workflow inbox recovery serve the whole batch,
 /// and revision conflicts with the run actor's own inbox writes are
 /// re-driven a bounded number of times.
-pub(crate) async fn schedule_push_effects_for_events<WorkflowStoreT>(
+pub async fn schedule_push_effects_for_events<WorkflowStoreT>(
     workflow_store: &WorkflowStoreT,
     push_configs: &A2APushConfigStore,
-    task_store: &InMemoryA2ATaskProjectionStore,
+    task_store: &dyn crate::projection::A2ATaskProjectionStore,
     tenant: &str,
     task_id: &str,
     newly_emitted: &[A2ATaskEvent],
@@ -429,12 +606,15 @@ where
 {
     let watermark = push_configs.scheduled_watermark(tenant, task_id);
     let cursor = encode_replay_cursor(task_id, watermark);
-    let pending = match task_store.replay_events(tenant, task_id, Some(&cursor)) {
+    let pending = match task_store
+        .replay_events(tenant, task_id, Some(&cursor))
+        .await
+    {
         Ok(events) => events,
         // The log cannot resume from the watermark (compaction, or an owner
         // epoch change reset the sequences). Events older than the retained
-        // window are past this example's retention policy; schedule what the
-        // caller just emitted and re-anchor the watermark to it.
+        // window are past retention policy; schedule what the caller just
+        // emitted and re-anchor the watermark to it.
         Err(_) => newly_emitted.to_vec(),
     };
     let Some(last_sequence) = pending.last().map(|event| event.sequence) else {
@@ -499,10 +679,36 @@ fn schedule_revision_conflict(error: &A2APushConfigError) -> bool {
     )
 }
 
-fn push_effect(
+/// Effect target type used for A2A push notification webhooks.
+pub const PUSH_EFFECT_TARGET_TYPE: &str = "notification";
+/// Effect target name used for A2A push notification webhooks.
+pub const PUSH_EFFECT_TARGET_NAME: &str = "a2a-push-webhook";
+/// Effect target attribute key carrying the owning tenant.
+pub const PUSH_ATTR_TENANT: &str = "a2a_tenant";
+/// Effect target attribute key carrying the task id.
+pub const PUSH_ATTR_TASK_ID: &str = "a2a_task_id";
+/// Effect target attribute key carrying the push config id.
+pub const PUSH_ATTR_CONFIG_ID: &str = "a2a_config_id";
+/// Effect target attribute key carrying the task-event sequence.
+pub const PUSH_ATTR_SEQUENCE: &str = "a2a_task_event_sequence";
+/// Effect target attribute key carrying the task-event kind label.
+pub const PUSH_ATTR_EVENT_KIND: &str = "task_event_kind";
+/// Effect target attribute key carrying the public task-state label.
+pub const PUSH_ATTR_TASK_STATE: &str = "task_state";
+/// Effect target attribute key carrying the redaction label.
+pub const PUSH_ATTR_REDACTION: &str = "redaction";
+
+/// Builds the durable push notification effect for one event and config.
+///
+/// The effect carries only the callback URL plus bounded, non-secret labels;
+/// the stable idempotency key `a2a-push:<task>:<sequence>:<config>` makes
+/// re-offered events deduplicate in the durable outbox. No credential material
+/// is ever placed on the effect (DN-4); the dispatcher resolves auth from the
+/// application's binding at send time.
+pub(crate) fn push_effect(
     event: &A2ATaskEvent,
     config: &TaskPushNotificationConfig,
-) -> A2APushConfigResult<rakka::agent_workflow::AgentEffect> {
+) -> A2APushConfigResult<AgentEffect> {
     let config_id = config.id.as_deref().unwrap_or("default");
     let key = format!(
         "a2a-push:{}:{}:{}",
@@ -527,22 +733,26 @@ fn push_effect(
 
     let mut attributes = AgentAttributes::new();
     attributes.insert("notification_protocol".to_string(), "a2a-push".to_string());
+    attributes.insert(PUSH_ATTR_TENANT.to_string(), event.tenant.clone());
+    attributes.insert(PUSH_ATTR_TASK_ID.to_string(), event.task_id.clone());
+    attributes.insert(PUSH_ATTR_CONFIG_ID.to_string(), config_id.to_string());
+    attributes.insert(PUSH_ATTR_SEQUENCE.to_string(), event.sequence.to_string());
     attributes.insert(
-        "task_event_kind".to_string(),
+        PUSH_ATTR_EVENT_KIND.to_string(),
         event.kind().as_label().to_string(),
     );
     attributes.insert(
-        "task_state".to_string(),
+        PUSH_ATTR_TASK_STATE.to_string(),
         task_state_label(&event.projected_state).to_string(),
     );
     attributes.insert(
-        "redaction".to_string(),
+        PUSH_ATTR_REDACTION.to_string(),
         event.redaction.as_label().to_string(),
     );
 
     let target = AgentEffectTarget {
-        target_type: "notification".to_string(),
-        name: "a2a-push-webhook".to_string(),
+        target_type: PUSH_EFFECT_TARGET_TYPE.to_string(),
+        name: PUSH_EFFECT_TARGET_NAME.to_string(),
         address: Some(config.url.clone()),
         attributes,
     };
@@ -567,7 +777,10 @@ fn redacted_config(mut config: TaskPushNotificationConfig) -> TaskPushNotificati
     config
 }
 
-fn auth_metadata(config: &TaskPushNotificationConfig) -> A2APushConfigAuthMetadata {
+fn auth_metadata(
+    config: &TaskPushNotificationConfig,
+    credential_binding_ref: Option<A2ACredentialBindingRef>,
+) -> A2APushConfigAuthMetadata {
     A2APushConfigAuthMetadata {
         token_present: config.token.is_some(),
         authentication_scheme: config
@@ -580,6 +793,7 @@ fn auth_metadata(config: &TaskPushNotificationConfig) -> A2APushConfigAuthMetada
             .and_then(|authentication| authentication.credentials.as_ref())
             .is_some(),
         redaction: A2ATaskEventRedaction::Redacted,
+        credential_binding_ref,
     }
 }
 
@@ -699,10 +913,15 @@ fn task_state_label(state: &a2a::TaskState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_stores::PushConfigStore;
+    use rakka_persistence::InMemoryDurableStateStore;
 
-    fn store() -> A2APushConfigStore {
-        A2APushConfigStore::new(PushConfigStore::memory())
+    fn permissive_store() -> A2APushConfigStore {
+        A2APushConfigStore::new(InMemoryDurableStateStore::<A2APushConfigState>::new())
+            .with_credential_policy(A2APushCredentialPolicy::RedactAndRecordPresence)
+    }
+
+    fn rejecting_store() -> A2APushConfigStore {
+        A2APushConfigStore::new(InMemoryDurableStateStore::<A2APushConfigState>::new())
     }
 
     fn config(task_id: &str, id: &str) -> TaskPushNotificationConfig {
@@ -719,9 +938,77 @@ mod tests {
         }
     }
 
+    fn credential_free_config(task_id: &str, id: &str) -> TaskPushNotificationConfig {
+        TaskPushNotificationConfig {
+            token: None,
+            authentication: None,
+            ..config(task_id, id)
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_credentials_are_rejected_by_default() {
+        let store = rejecting_store();
+        let error = store
+            .save("tenant-a", config("task-1", "cfg-1"))
+            .await
+            .expect_err("raw credentials must be rejected");
+        assert_eq!(error.code(), "invalid-push-config");
+
+        // Credential-free configs remain accepted under the default policy.
+        store
+            .save("tenant-a", credential_free_config("task-1", "cfg-2"))
+            .await
+            .expect("credential-free config");
+    }
+
+    #[tokio::test]
+    async fn binding_resolver_persists_reference_never_secret_material() {
+        struct FixedResolver;
+        impl A2ACredentialBindingResolver for FixedResolver {
+            fn resolve(
+                &self,
+                tenant: &str,
+                _config: &TaskPushNotificationConfig,
+            ) -> A2APushConfigResult<Option<A2ACredentialBindingRef>> {
+                Ok(Some(A2ACredentialBindingRef::new(format!(
+                    "binding:{tenant}:webhook"
+                ))))
+            }
+        }
+
+        let durable = InMemoryDurableStateStore::<A2APushConfigState>::new();
+        let store = A2APushConfigStore::new(durable.clone())
+            .with_credential_binding_resolver(Arc::new(FixedResolver));
+        let saved = store
+            .save("tenant-a", config("task-1", "cfg-1"))
+            .await
+            .expect("save with binding resolver");
+        assert!(saved.token.is_none());
+
+        let persisted = durable
+            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
+            .await
+            .expect("load")
+            .expect("state")
+            .state;
+        assert_eq!(
+            persisted.auth.credential_binding_ref,
+            Some(A2ACredentialBindingRef::new("binding:tenant-a:webhook"))
+        );
+        assert!(persisted.config.token.is_none());
+        let serialized = serde_json::to_string(&persisted).expect("state json");
+        assert!(
+            !serialized.contains("secret"),
+            "persisted state must not contain raw credentials: {serialized}"
+        );
+    }
+
     #[tokio::test]
     async fn save_get_list_and_delete_redacts_auth_material() {
-        let store = store();
+        let durable = InMemoryDurableStateStore::<A2APushConfigState>::new();
+        let store = A2APushConfigStore::new(durable.clone())
+            .with_credential_policy(A2APushCredentialPolicy::RedactAndRecordPresence);
         let saved = store
             .save("tenant-a", config("task-1", "cfg-1"))
             .await
@@ -736,8 +1023,7 @@ mod tests {
 
         let fetched = store.get("tenant-a", "task-1", "cfg-1").await.expect("get");
         assert_eq!(fetched.url, "https://example.com/hook");
-        let persisted = store
-            .store
+        let persisted = durable
             .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
             .await
             .expect("load persisted")
@@ -775,7 +1061,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_callback_url_is_rejected() {
-        let store = store();
+        let store = permissive_store();
         let mut config = config("task-1", "cfg-1");
         config.url = "file:///tmp/hook".to_string();
         let error = store.save("tenant-a", config).await.expect_err("invalid");
@@ -784,7 +1070,9 @@ mod tests {
 
     #[tokio::test]
     async fn identical_resave_skips_audit_and_audit_stays_bounded() {
-        let store = store();
+        let durable = InMemoryDurableStateStore::<A2APushConfigState>::new();
+        let store = A2APushConfigStore::new(durable.clone())
+            .with_credential_policy(A2APushCredentialPolicy::RedactAndRecordPresence);
         store
             .save("tenant-a", config("task-1", "cfg-1"))
             .await
@@ -795,8 +1083,7 @@ mod tests {
             .save("tenant-a", config("task-1", "cfg-1"))
             .await
             .expect("re-save");
-        let persisted = store
-            .store
+        let persisted = durable
             .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
             .await
             .expect("load")
@@ -814,8 +1101,7 @@ mod tests {
             updated.url = format!("https://example.com/hook-{index}");
             store.save("tenant-a", updated).await.expect("update");
         }
-        let persisted = store
-            .store
+        let persisted = durable
             .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
             .await
             .expect("load")
@@ -830,15 +1116,16 @@ mod tests {
 
     #[tokio::test]
     async fn watermark_catchup_heals_missed_schedules_and_deduplicates() {
-        use crate::durable_stores::WorkflowStore;
-        use crate::task_projection::{A2ATaskEventPayload, A2ATaskProjection};
+        use crate::projection::{A2ATaskProjectionStore, InMemoryA2ATaskProjectionStore};
+        use crate::task::{A2ATaskEventPayload, A2ATaskProjection};
+        use rakka_agent_workflow::substrate::WorkflowState;
 
-        let store = store();
+        let store = permissive_store();
         store
             .save("tenant-a", config("task-1", "cfg-1"))
             .await
             .expect("save config");
-        let workflow_store = WorkflowStore::memory();
+        let workflow_store = InMemoryDurableStateStore::<WorkflowState>::new();
         let task_store = InMemoryA2ATaskProjectionStore::local();
 
         // Nothing recorded yet: an empty batch is a no-op.
@@ -875,6 +1162,7 @@ mod tests {
                 AgentTimestampMillis::new(10),
                 A2ATaskEventPayload::Snapshot(snapshot),
             )
+            .await
             .expect("snapshot event");
         task_store
             .append_event_payload(
@@ -886,6 +1174,7 @@ mod tests {
                     state: a2a::TaskState::Working,
                 },
             )
+            .await
             .expect("status event");
 
         // A later call with nothing newly emitted (a client retry or a read)
@@ -928,6 +1217,7 @@ mod tests {
                     state: a2a::TaskState::Completed,
                 },
             )
+            .await
             .expect("terminal event");
         let scheduled = schedule_push_effects_for_events(
             &workflow_store,
@@ -962,8 +1252,7 @@ mod tests {
 
     #[test]
     fn only_revision_conflicts_are_redriven() {
-        use rakka::agent_workflow::substrate::WorkflowId;
-        use rakka::persistence::Revision;
+        use rakka_agent_workflow::substrate::WorkflowId;
 
         let conflict = A2APushConfigError::Outbox(AgentOutboxError::Workflow {
             error: WorkflowError::RevisionConflict {

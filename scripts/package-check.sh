@@ -25,6 +25,7 @@ rakka-process
 rakka-http
 rakka-grpc
 rakka-k8s
+rakka-a2a
 rakka-testkit
 "
 

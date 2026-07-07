@@ -1,31 +1,43 @@
-//! A2A task read model and public task-event projection.
-#![allow(dead_code)]
+//! A2A task read model and public task-event projection types.
+//!
+//! The task projection is a query/observability surface: durable run state
+//! plus durable inbox/outbox state remain the source of correctness. These
+//! types define the bounded public shape of a task, the ordered public task
+//! events that update it, and the replay cursors clients resume from.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::{Arc, Mutex};
 
-use a2a::{
-    Artifact, ListTasksRequest, ListTasksResponse, Message, Part, Task, TaskId, TaskState,
-    TaskStatus,
-};
+use a2a::{Artifact, Message, Part, Task, TaskId, TaskState, TaskStatus};
 use chrono::{DateTime, Utc};
-use rakka::agent_workflow::{
+use rakka_agent_workflow::{
     AgentRunState, AgentRunStatus, AgentRuntimeEvent, AgentRuntimeEventKind, AgentTenantId,
     AgentTimestampMillis, ArtifactRef, RedactionStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::broadcast;
 
-use crate::a2a_mapping::DEFAULT_TENANT;
+use crate::mapping::DEFAULT_TENANT;
 
-const DEFAULT_PAGE_SIZE: usize = 50;
-const MAX_PAGE_SIZE: usize = 100;
-const DEFAULT_HISTORY_LIMIT: usize = 20;
-const DEFAULT_ARTIFACT_LIMIT: usize = 20;
-const EVENT_WATCH_BUFFER: usize = 64;
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 50;
+pub(crate) const MAX_PAGE_SIZE: usize = 100;
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 20;
+pub(crate) const DEFAULT_ARTIFACT_LIMIT: usize = 20;
+
+/// Task metadata key carrying the projection revision.
+///
+/// Compatibility commitment: clients read this key from `Task.metadata` and
+/// stream frames to correlate reads with replay cursors.
+pub const META_PROJECTION_REVISION: &str = "io.rakka.projection.revision";
+/// Task metadata key describing which surface produced the current status.
+pub const META_STATUS_SOURCE: &str = "io.rakka.status.source";
+/// Artifact metadata key carrying the Rakka artifact kind label.
+pub const META_ARTIFACT_KIND: &str = "io.rakka.artifact.kind";
+/// Artifact metadata key carrying the Rakka artifact redaction label.
+pub const META_ARTIFACT_REDACTION: &str = "io.rakka.artifact.redaction";
+/// Artifact metadata key carrying the artifact byte length.
+pub const META_ARTIFACT_BYTE_LEN: &str = "io.rakka.artifact.byte_len";
 
 /// Shared result type for task projections.
 pub type TaskProjectionResult<T> = Result<T, TaskProjectionError>;
@@ -64,10 +76,20 @@ pub enum TaskProjectionError {
         /// Actual sequence.
         actual: u64,
     },
+    /// The projection store backend failed.
+    Store {
+        /// Stable backend name.
+        backend: &'static str,
+        /// Failure summary. Never contains payload or secret material.
+        message: String,
+    },
 }
 
 impl TaskProjectionError {
     /// Stable machine-readable code.
+    ///
+    /// Compatibility commitment: these codes surface in A2A error messages
+    /// and adapter metrics labels.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -77,6 +99,7 @@ impl TaskProjectionError {
             Self::ReplayWindowExpired { .. } => "replay-window-expired",
             Self::TaskNotFound { .. } => "task-not-found",
             Self::EventOrder { .. } => "event-order",
+            Self::Store { .. } => "projection-store",
         }
     }
 }
@@ -104,6 +127,9 @@ impl Display for TaskProjectionError {
                     f,
                     "event sequence {actual} does not follow expected {expected}"
                 )
+            }
+            Self::Store { backend, message } => {
+                write!(f, "projection store {backend} failed: {message}")
             }
         }
     }
@@ -194,12 +220,12 @@ impl A2ATaskProjection {
             artifacts: Vec::new(),
             metadata: HashMap::from([
                 (
-                    "io.rakka.projection.revision".to_string(),
+                    META_PROJECTION_REVISION.to_string(),
                     Value::Number(projection_revision.into()),
                 ),
                 (
-                    "io.rakka.status.source".to_string(),
-                    Value::String("phase1-command-draft".to_string()),
+                    META_STATUS_SOURCE.to_string(),
+                    Value::String("a2a-command-draft".to_string()),
                 ),
             ]),
             projection_revision,
@@ -238,7 +264,7 @@ impl A2ATaskProjection {
         self.status_timestamp = self.status_timestamp.max(event.occurred_at);
         self.projection_revision = event.sequence;
         self.metadata.insert(
-            "io.rakka.projection.revision".to_string(),
+            META_PROJECTION_REVISION.to_string(),
             Value::Number(event.sequence.into()),
         );
         match &event.payload {
@@ -399,7 +425,7 @@ impl A2ATaskEventPayload {
             Self::ArtifactUpdate { artifact } => artifact
                 .metadata
                 .as_ref()
-                .and_then(|metadata| metadata.get("io.rakka.artifact.redaction"))
+                .and_then(|metadata| metadata.get(META_ARTIFACT_REDACTION))
                 .and_then(Value::as_str)
                 .map(A2ATaskEventRedaction::from_label)
                 .unwrap_or(A2ATaskEventRedaction::Unknown),
@@ -479,281 +505,6 @@ impl A2ATaskEvent {
     }
 }
 
-/// In-memory local-mode projection store.
-#[derive(Debug, Clone)]
-pub struct InMemoryA2ATaskProjectionStore {
-    inner: Arc<Mutex<ProjectionStoreState>>,
-    require_tenant_filter: bool,
-}
-
-#[derive(Debug, Default)]
-struct ProjectionStoreState {
-    projections: BTreeMap<(String, TaskId), A2ATaskProjection>,
-    events: BTreeMap<(String, TaskId), Vec<A2ATaskEvent>>,
-    watchers: BTreeMap<(String, TaskId), broadcast::Sender<A2ATaskEvent>>,
-}
-
-impl InMemoryA2ATaskProjectionStore {
-    /// Creates a local-mode store that permits global listing for examples.
-    #[must_use]
-    pub fn local() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ProjectionStoreState::default())),
-            require_tenant_filter: false,
-        }
-    }
-
-    /// Creates a tenant-scoped store that requires tenant filters.
-    #[must_use]
-    pub fn tenant_scoped() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ProjectionStoreState::default())),
-            require_tenant_filter: true,
-        }
-    }
-
-    /// Inserts or replaces one projection.
-    pub fn upsert(&self, projection: A2ATaskProjection) {
-        self.inner
-            .lock()
-            .expect("projection store mutex")
-            .projections
-            .insert(
-                (projection.tenant.clone(), projection.task_id.clone()),
-                projection,
-            );
-    }
-
-    /// Reads one raw projection record.
-    pub fn projection(
-        &self,
-        tenant: Option<&str>,
-        task_id: &str,
-    ) -> TaskProjectionResult<A2ATaskProjection> {
-        if self.require_tenant_filter && tenant.is_none() {
-            return Err(TaskProjectionError::TenantRequired);
-        }
-        let state = self.inner.lock().expect("projection store mutex");
-        find_projection(&state, tenant, task_id)
-            .cloned()
-            .ok_or_else(|| TaskProjectionError::TaskNotFound {
-                task_id: task_id.to_string(),
-            })
-    }
-
-    /// Appends a payload as the next event for the task and returns the event.
-    pub fn append_event_payload(
-        &self,
-        tenant: impl Into<String>,
-        task_id: impl Into<String>,
-        context_id: impl Into<String>,
-        occurred_at: AgentTimestampMillis,
-        payload: A2ATaskEventPayload,
-    ) -> TaskProjectionResult<A2ATaskEvent> {
-        let mut state = self.inner.lock().expect("projection store mutex");
-        let tenant = tenant.into();
-        let task_id = task_id.into();
-        let context_id = context_id.into();
-        let key = (tenant.clone(), task_id.clone());
-        let sequence = state.projections.get(&key).map_or(1, |projection| {
-            projection.projection_revision.saturating_add(1)
-        });
-        let event = A2ATaskEvent::new(tenant, task_id, context_id, sequence, occurred_at, payload);
-        apply_event_locked(&mut state, event)
-    }
-
-    /// Appends a public event, updating or bootstrapping the current projection.
-    ///
-    /// Events for unknown tasks are rejected unless they carry a snapshot, so
-    /// the replay log never records an event that no projection accepted.
-    pub fn append_event(&self, event: A2ATaskEvent) -> TaskProjectionResult<()> {
-        let mut state = self.inner.lock().expect("projection store mutex");
-        apply_event_locked(&mut state, event).map(|_| ())
-    }
-
-    /// Opens a bounded live watcher for future task events.
-    pub fn watch(&self, tenant: &str, task_id: &str) -> broadcast::Receiver<A2ATaskEvent> {
-        let mut state = self.inner.lock().expect("projection store mutex");
-        // Sweep senders whose subscribers have all disconnected so the
-        // watcher map stays bounded by live streams, not by every task id
-        // ever streamed.
-        state
-            .watchers
-            .retain(|_, sender| sender.receiver_count() > 0);
-        let key = (tenant.to_string(), task_id.to_string());
-        state
-            .watchers
-            .entry(key)
-            .or_insert_with(|| {
-                let (sender, _) = broadcast::channel(EVENT_WATCH_BUFFER);
-                sender
-            })
-            .subscribe()
-    }
-
-    /// Reads one task projection.
-    pub fn get(
-        &self,
-        tenant: Option<&str>,
-        task_id: &str,
-        history_length: Option<i32>,
-    ) -> TaskProjectionResult<Task> {
-        if self.require_tenant_filter && tenant.is_none() {
-            return Err(TaskProjectionError::TenantRequired);
-        }
-        let state = self.inner.lock().expect("projection store mutex");
-        let projection = find_projection(&state, tenant, task_id).ok_or_else(|| {
-            TaskProjectionError::TaskNotFound {
-                task_id: task_id.to_string(),
-            }
-        })?;
-        Ok(projection.to_task(history_length, true))
-    }
-
-    /// Lists projections with deterministic pagination.
-    pub fn list(&self, request: &ListTasksRequest) -> TaskProjectionResult<ListTasksResponse> {
-        if self.require_tenant_filter && request.tenant.is_none() {
-            return Err(TaskProjectionError::TenantRequired);
-        }
-        let offset = page_offset(request.page_token.as_deref())?;
-        let page_size = page_size(request.page_size);
-        let after = request.status_timestamp_after;
-        let state = self.inner.lock().expect("projection store mutex");
-        let filtered = state
-            .projections
-            .values()
-            .filter(|projection| {
-                request
-                    .tenant
-                    .as_deref()
-                    .is_none_or(|tenant| projection.tenant == tenant)
-            })
-            .filter(|projection| {
-                request
-                    .context_id
-                    .as_deref()
-                    .is_none_or(|context_id| projection.context_id == context_id)
-            })
-            .filter(|projection| {
-                request
-                    .status
-                    .as_ref()
-                    .is_none_or(|status| &projection.status == status)
-            })
-            .filter(|projection| {
-                after.is_none_or(|after| {
-                    timestamp_to_datetime(projection.status_timestamp)
-                        .is_some_and(|timestamp| timestamp > after)
-                })
-            })
-            // References only: the non-page remainder is never materialized.
-            .collect::<Vec<_>>();
-        let total_size = i32::try_from(filtered.len()).unwrap_or(i32::MAX);
-        let tasks = filtered
-            .iter()
-            .skip(offset)
-            .take(page_size)
-            .map(|projection| {
-                projection.to_task(
-                    request.history_length,
-                    request.include_artifacts.unwrap_or(false),
-                )
-            })
-            .collect::<Vec<_>>();
-        let next_offset = offset.saturating_add(tasks.len());
-        let next_page_token = if next_offset < filtered.len() {
-            next_offset.to_string()
-        } else {
-            String::new()
-        };
-        Ok(ListTasksResponse {
-            tasks,
-            next_page_token,
-            page_size: i32::try_from(page_size).unwrap_or(i32::MAX),
-            total_size,
-        })
-    }
-
-    /// Replays public task events after an optional cursor.
-    ///
-    /// Cursors are only valid for the task that minted them; a cursor from a
-    /// different task is rejected instead of silently skipping events.
-    pub fn replay_events(
-        &self,
-        tenant: &str,
-        task_id: &str,
-        after_cursor: Option<&str>,
-    ) -> TaskProjectionResult<Vec<A2ATaskEvent>> {
-        let after_sequence = match after_cursor {
-            None => 0,
-            Some(cursor) => {
-                let (cursor_task_id, sequence) = parse_cursor(cursor)?;
-                if cursor_task_id != task_id {
-                    return Err(TaskProjectionError::InvalidReplayCursor {
-                        cursor: cursor.to_string(),
-                    });
-                }
-                sequence
-            }
-        };
-        let state = self.inner.lock().expect("projection store mutex");
-        let key = (tenant.to_string(), task_id.to_string());
-        // A cursor that points past everything this store has ever recorded
-        // came from another node or an earlier owner epoch; it cannot prove
-        // continuity here, so the caller must re-bootstrap from the snapshot.
-        if after_sequence > 0 {
-            let revision = state
-                .projections
-                .get(&key)
-                .map(|projection| projection.projection_revision);
-            if revision.is_none_or(|revision| after_sequence > revision) {
-                return Err(TaskProjectionError::InvalidReplayCursor {
-                    cursor: after_cursor.unwrap_or_default().to_string(),
-                });
-            }
-        }
-        let Some(events) = state.events.get(&key) else {
-            if after_sequence == 0 {
-                return Ok(Vec::new());
-            }
-            // The projection is known (e.g. cached from a routed owner
-            // response) but no local event log covers the cursor, so replay
-            // cannot resume incrementally from here.
-            return Err(TaskProjectionError::ReplayWindowExpired {
-                task_id: task_id.to_string(),
-                earliest_sequence: 0,
-            });
-        };
-        // The retained log is bounded; a request that starts before the
-        // retained window would silently skip dropped events, so signal the
-        // truncation and let the caller re-bootstrap from the current task.
-        let mut expected = after_sequence.saturating_add(1);
-        for event in events
-            .iter()
-            .filter(|event| event.sequence > after_sequence)
-        {
-            if event.sequence != expected {
-                return Err(TaskProjectionError::ReplayWindowExpired {
-                    task_id: task_id.to_string(),
-                    earliest_sequence: event.sequence,
-                });
-            }
-            expected = event.sequence.saturating_add(1);
-        }
-        Ok(events
-            .iter()
-            .filter(|event| event.sequence > after_sequence)
-            .cloned()
-            .collect())
-    }
-}
-
-impl Default for InMemoryA2ATaskProjectionStore {
-    fn default() -> Self {
-        Self::local()
-    }
-}
-
 /// Maps durable Rakka run status to public A2A task state.
 #[must_use]
 pub const fn task_state_from_run_status(status: AgentRunStatus) -> TaskState {
@@ -772,6 +523,9 @@ pub const fn task_state_from_run_status(status: AgentRunStatus) -> TaskState {
 }
 
 /// Projects selected runtime events into public A2A task events.
+///
+/// Only run-level lifecycle transitions become public task events; node,
+/// effect, timer, and internal scheduler events stay private.
 #[must_use]
 pub fn task_event_from_runtime_event(
     tenant: &AgentTenantId,
@@ -822,20 +576,23 @@ pub fn task_event_from_runtime_event(
 }
 
 /// Converts a Rakka artifact reference into a public A2A artifact projection.
+///
+/// Only the reference, content type, and bounded metadata cross into the
+/// public artifact; payload bytes never do.
 #[must_use]
 pub fn a2a_artifact_from_ref(reference: &ArtifactRef) -> Artifact {
     let mut metadata = HashMap::from([
         (
-            "io.rakka.artifact.kind".to_string(),
+            META_ARTIFACT_KIND.to_string(),
             Value::String(reference.kind.as_label().to_string()),
         ),
         (
-            "io.rakka.artifact.redaction".to_string(),
+            META_ARTIFACT_REDACTION.to_string(),
             Value::String(reference.redaction.as_label().to_string()),
         ),
     ]);
     if let Some(byte_len) = reference.byte_len {
-        metadata.insert("io.rakka.artifact.byte_len".to_string(), byte_len.into());
+        metadata.insert(META_ARTIFACT_BYTE_LEN.to_string(), byte_len.into());
     }
     Artifact {
         artifact_id: reference.artifact_id.clone(),
@@ -860,19 +617,19 @@ fn projection_metadata(
 ) -> HashMap<String, Value> {
     HashMap::from([
         (
-            "io.rakka.workflow.id".to_string(),
+            crate::mapping::META_WORKFLOW_ID.to_string(),
             Value::String(run_state.workflow_id.to_string()),
         ),
         (
-            "io.rakka.workflow.definition_version".to_string(),
+            crate::mapping::META_DEFINITION_VERSION.to_string(),
             Value::String(run_state.definition_version.to_string()),
         ),
         (
-            "io.rakka.status.source".to_string(),
+            META_STATUS_SOURCE.to_string(),
             Value::String("agent-run-state".to_string()),
         ),
         (
-            "io.rakka.projection.revision".to_string(),
+            META_PROJECTION_REVISION.to_string(),
             Value::Number(projection_revision.into()),
         ),
         (
@@ -886,11 +643,11 @@ fn projection_metadata(
     ])
 }
 
-fn timestamp_to_datetime(timestamp: AgentTimestampMillis) -> Option<DateTime<Utc>> {
+pub(crate) fn timestamp_to_datetime(timestamp: AgentTimestampMillis) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(i64::try_from(timestamp.as_millis()).ok()?)
 }
 
-fn bounded_tail<T: Clone>(mut values: Vec<T>, limit: usize) -> Vec<T> {
+pub(crate) fn bounded_tail<T: Clone>(mut values: Vec<T>, limit: usize) -> Vec<T> {
     cap_front(&mut values, limit);
     values
 }
@@ -899,7 +656,7 @@ fn bounded_tail<T: Clone>(mut values: Vec<T>, limit: usize) -> Vec<T> {
 ///
 /// The single definition of the drop-oldest rule shared by the projection
 /// history/artifact bounds and the replay event log.
-fn cap_front<T>(values: &mut Vec<T>, limit: usize) {
+pub(crate) fn cap_front<T>(values: &mut Vec<T>, limit: usize) {
     if values.len() > limit {
         let excess = values.len() - limit;
         values.drain(0..excess);
@@ -923,7 +680,7 @@ pub(crate) fn status_transition_allowed(current: &TaskState, next: &TaskState) -
     !current.is_terminal() || next.is_terminal()
 }
 
-fn history_limit(history_length: Option<i32>) -> usize {
+pub(crate) fn history_limit(history_length: Option<i32>) -> usize {
     match history_length {
         Some(value) if value <= 0 => 0,
         Some(value) => usize::try_from(value).unwrap_or(DEFAULT_HISTORY_LIMIT),
@@ -931,7 +688,7 @@ fn history_limit(history_length: Option<i32>) -> usize {
     }
 }
 
-fn page_size(page_size: Option<i32>) -> usize {
+pub(crate) fn page_size(page_size: Option<i32>) -> usize {
     match page_size {
         Some(value) if value > 0 => usize::try_from(value).unwrap_or(DEFAULT_PAGE_SIZE),
         _ => DEFAULT_PAGE_SIZE,
@@ -939,7 +696,7 @@ fn page_size(page_size: Option<i32>) -> usize {
     .min(MAX_PAGE_SIZE)
 }
 
-fn page_offset(page_token: Option<&str>) -> TaskProjectionResult<usize> {
+pub(crate) fn page_offset(page_token: Option<&str>) -> TaskProjectionResult<usize> {
     match page_token {
         None | Some("") => Ok(0),
         Some(token) => token
@@ -951,6 +708,9 @@ fn page_offset(page_token: Option<&str>) -> TaskProjectionResult<usize> {
 }
 
 /// Encodes a replay cursor for a task position.
+///
+/// Compatibility commitment: the `<task-id>:<sequence>` cursor shape is what
+/// clients echo back through `last-event-id` / replay-cursor headers.
 #[must_use]
 pub fn encode_replay_cursor(task_id: &str, sequence: u64) -> String {
     format!("{task_id}:{sequence}")
@@ -958,10 +718,6 @@ pub fn encode_replay_cursor(task_id: &str, sequence: u64) -> String {
 
 /// Parses a replay cursor into its task id and sequence.
 pub fn parse_replay_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
-    parse_cursor(cursor)
-}
-
-fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
     let Some((task_id, sequence)) = cursor.rsplit_once(':') else {
         return Err(TaskProjectionError::InvalidReplayCursor {
             cursor: cursor.to_string(),
@@ -976,130 +732,31 @@ fn parse_cursor(cursor: &str) -> TaskProjectionResult<(String, u64)> {
     Ok((task_id.to_string(), sequence))
 }
 
-/// Maximum retained replay events per task; older events are dropped first.
-const EVENT_LOG_LIMIT: usize = 256;
-
-/// Resolves one projection, keyed when the tenant is known and by scan for
-/// unscoped local-mode reads.
-fn find_projection<'a>(
-    state: &'a ProjectionStoreState,
-    tenant: Option<&str>,
-    task_id: &str,
-) -> Option<&'a A2ATaskProjection> {
-    match tenant {
-        Some(tenant) => state
-            .projections
-            .get(&(tenant.to_string(), task_id.to_string())),
-        None => state
-            .projections
-            .values()
-            .find(|projection| projection.task_id == task_id),
-    }
-}
-
-/// Applies one event under the store lock, bootstrapping only from snapshots.
-///
-/// Events for unknown tasks are rejected unless they carry a snapshot, so the
-/// replay log never records an event that no projection accepted. The retained
-/// log is bounded to [`EVENT_LOG_LIMIT`] events per task, so replay from a
-/// cursor older than the retained window returns only the surviving events.
-fn apply_event_locked(
-    state: &mut ProjectionStoreState,
-    mut event: A2ATaskEvent,
-) -> TaskProjectionResult<A2ATaskEvent> {
-    let key = (event.tenant.clone(), event.task_id.clone());
-    if let Some(projection) = state.projections.get_mut(&key) {
-        projection.apply_event(&event)?;
-        event.projected_state = projection.status.clone();
-    } else if let A2ATaskEventPayload::Snapshot(snapshot) = &event.payload {
-        let adopted = adopted_snapshot(snapshot, &event);
-        event.projected_state = adopted.status.clone();
-        state.projections.insert(key.clone(), adopted);
-    } else {
-        return Err(TaskProjectionError::TaskNotFound {
-            task_id: event.task_id,
-        });
-    }
-    let events = state.events.entry(key).or_default();
-    events.push(event.clone());
-    compact_event_log(events);
-    let watcher_key = (event.tenant.clone(), event.task_id.clone());
-    if let Some(sender) = state.watchers.get(&watcher_key) {
-        // A send with no live receivers means every subscriber disconnected;
-        // drop the sender so terminal tasks do not pin watchers forever.
-        if sender.send(event.clone()).is_err() {
-            state.watchers.remove(&watcher_key);
-        }
-    }
-    Ok(event)
-}
-
-fn adopted_snapshot(snapshot: &A2ATaskProjection, event: &A2ATaskEvent) -> A2ATaskProjection {
+/// Adopts a snapshot payload, letting the event own revision and timestamp.
+pub(crate) fn adopted_snapshot(
+    snapshot: &A2ATaskProjection,
+    event: &A2ATaskEvent,
+) -> A2ATaskProjection {
     let mut adopted = snapshot.clone();
     adopted.status_timestamp = event.occurred_at;
     adopted.projection_revision = event.sequence;
     adopted.metadata.insert(
-        "io.rakka.projection.revision".to_string(),
+        META_PROJECTION_REVISION.to_string(),
         Value::Number(event.sequence.into()),
     );
     adopted
-}
-
-fn compact_event_log(events: &mut Vec<A2ATaskEvent>) {
-    while events.len() > EVENT_LOG_LIMIT {
-        let latest_snapshot = events
-            .iter()
-            .rposition(|event| matches!(event.payload, A2ATaskEventPayload::Snapshot(_)));
-        let remove_at = events
-            .iter()
-            .enumerate()
-            .find_map(|(index, event)| {
-                if Some(index) != latest_snapshot
-                    && !matches!(event.payload, A2ATaskEventPayload::Snapshot(_))
-                {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| latest_snapshot.map(|snapshot| snapshot.saturating_sub(1)))
-            .unwrap_or(0);
-        events.remove(remove_at);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use a2a::{Message, Part, Role};
-    use rakka::agent_workflow::{
+    use rakka_agent_workflow::{
         AgentAttributes, AgentCausationId, AgentCompiledPlanFingerprint, AgentCorrelationId,
-        AgentRunId, AgentStatePayload, AgentTelemetryContext, AgentWorkflowId, StateSchemaVersion,
-        WorkflowDefinitionVersion,
+        AgentRunId, AgentTelemetryContext, AgentWorkflowId, WorkflowDefinitionVersion,
     };
 
-    fn run_state(status: AgentRunStatus) -> AgentRunState {
-        AgentRunState {
-            run_id: AgentRunId::new("task-1"),
-            workflow_id: AgentWorkflowId::new("workflow-1"),
-            tenant: Some(AgentTenantId::new("tenant-a")),
-            definition_version: WorkflowDefinitionVersion::new("v1"),
-            state_schema_version: StateSchemaVersion::new(1),
-            graph_state: None,
-            status,
-            current_step_id: None,
-            current_attempt: 0,
-            inputs_ref: None,
-            state_payload: AgentStatePayload::Empty,
-            checkpoints: Vec::new(),
-            pending_effects: Vec::new(),
-            pending_human_checkpoint: None,
-            cancellation: None,
-            created_at: AgentTimestampMillis::new(10),
-            updated_at: AgentTimestampMillis::new(20),
-            completed_at: None,
-        }
-    }
+    use crate::testing::fixture_run_state;
 
     #[test]
     fn every_run_status_maps_to_valid_task_state() {
@@ -1135,7 +792,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let projection = A2ATaskProjection::from_run_state(
-            &run_state(AgentRunStatus::Completed),
+            &fixture_run_state("task-1", AgentRunStatus::Completed),
             "ctx",
             history,
             Vec::new(),
@@ -1154,14 +811,14 @@ mod tests {
     fn artifact_projection_uses_url_reference_not_payload_bytes() {
         let reference = ArtifactRef {
             artifact_id: "artifact-1".to_string(),
-            kind: rakka::agent_workflow::ArtifactKind::Input,
+            kind: rakka_agent_workflow::ArtifactKind::Input,
             uri: "s3://bucket/key".to_string(),
             checksum: Some("sha256:test".to_string()),
             content_type: Some("text/plain".to_string()),
             byte_len: Some(99),
             retention_class: Some("standard".to_string()),
             encryption: None,
-            redaction: rakka::agent_workflow::RedactionStatus::ReferenceOnly,
+            redaction: RedactionStatus::ReferenceOnly,
             created_at: AgentTimestampMillis::new(10),
             metadata: AgentAttributes::new(),
         };
@@ -1169,69 +826,6 @@ mod tests {
         assert_eq!(artifact.parts[0].as_text(), None);
         let serialized = serde_json::to_value(&artifact).expect("artifact json");
         assert_eq!(serialized["parts"][0]["url"], "s3://bucket/key");
-    }
-
-    #[test]
-    fn query_store_filters_and_paginates_deterministically() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        for index in 0..3 {
-            store.upsert(A2ATaskProjection::accepted(
-                format!("task-{index}"),
-                "ctx",
-                "tenant-a",
-                "workflow",
-                AgentTimestampMillis::new(index + 1),
-                Vec::new(),
-                index + 1,
-            ));
-        }
-
-        let page1 = store
-            .list(&ListTasksRequest {
-                context_id: Some("ctx".to_string()),
-                status: Some(TaskState::Submitted),
-                page_size: Some(2),
-                page_token: None,
-                history_length: None,
-                status_timestamp_after: None,
-                include_artifacts: None,
-                tenant: Some("tenant-a".to_string()),
-            })
-            .expect("page1");
-        assert_eq!(page1.tasks.len(), 2);
-        assert_eq!(page1.next_page_token, "2");
-
-        let page2 = store
-            .list(&ListTasksRequest {
-                page_token: Some(page1.next_page_token),
-                page_size: Some(2),
-                tenant: Some("tenant-a".to_string()),
-                context_id: None,
-                status: None,
-                history_length: None,
-                status_timestamp_after: None,
-                include_artifacts: None,
-            })
-            .expect("page2");
-        assert_eq!(page2.tasks.len(), 1);
-    }
-
-    #[test]
-    fn tenant_scoped_store_requires_tenant_filter() {
-        let store = InMemoryA2ATaskProjectionStore::tenant_scoped();
-        let error = store
-            .list(&ListTasksRequest {
-                context_id: None,
-                status: None,
-                page_size: None,
-                page_token: None,
-                history_length: None,
-                status_timestamp_after: None,
-                include_artifacts: None,
-                tenant: None,
-            })
-            .expect_err("tenant required");
-        assert_eq!(error.code(), "tenant-required");
     }
 
     #[test]
@@ -1294,284 +888,9 @@ mod tests {
         assert_eq!(projection.projection_revision, 1);
         assert_eq!(projection.status_timestamp, AgentTimestampMillis::new(20));
         assert_eq!(
-            projection.metadata["io.rakka.projection.revision"],
+            projection.metadata[META_PROJECTION_REVISION],
             Value::Number(1.into())
         );
-    }
-
-    #[test]
-    fn failed_event_apply_is_not_recorded_for_replay() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        store.upsert(A2ATaskProjection::accepted(
-            "task-1",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            0,
-        ));
-        let event = A2ATaskEvent::new(
-            "tenant-a",
-            "task-1",
-            "ctx",
-            3,
-            AgentTimestampMillis::new(20),
-            A2ATaskEventPayload::StatusUpdate {
-                state: TaskState::Working,
-            },
-        );
-
-        let error = store.append_event(event).expect_err("sequence error");
-
-        assert_eq!(error.code(), "event-order");
-        assert!(store
-            .replay_events("tenant-a", "task-1", None)
-            .expect("replay")
-            .is_empty());
-    }
-
-    #[test]
-    fn replay_cursor_without_local_log_requires_rebootstrap() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        // A projection cached from a routed owner response: known revision,
-        // but no local event log covering the cursor.
-        store.upsert(A2ATaskProjection::accepted(
-            "task-1",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            5,
-        ));
-
-        let error = store
-            .replay_events("tenant-a", "task-1", Some("task-1:3"))
-            .expect_err("a cursor without a local log must not read as an empty tail");
-
-        assert_eq!(error.code(), "replay-window-expired");
-    }
-
-    #[test]
-    fn replay_cursor_beyond_known_revision_is_invalid() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        let snapshot = A2ATaskProjection::accepted(
-            "task-1",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            0,
-        );
-        store
-            .append_event_payload(
-                "tenant-a",
-                "task-1",
-                "ctx",
-                AgentTimestampMillis::new(10),
-                A2ATaskEventPayload::Snapshot(snapshot),
-            )
-            .expect("bootstrap snapshot");
-
-        // A cursor from another node or owner epoch can point past everything
-        // recorded here; it cannot prove continuity and must force a resync.
-        let error = store
-            .replay_events("tenant-a", "task-1", Some("task-1:99"))
-            .expect_err("future cursor must be rejected");
-
-        assert_eq!(error.code(), "invalid-replay-cursor");
-    }
-
-    #[test]
-    fn dead_watchers_are_pruned_on_append_and_watch() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        let snapshot = A2ATaskProjection::accepted(
-            "task-w",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            0,
-        );
-        store
-            .append_event_payload(
-                "tenant-a",
-                "task-w",
-                "ctx",
-                AgentTimestampMillis::new(10),
-                A2ATaskEventPayload::Snapshot(snapshot),
-            )
-            .expect("bootstrap snapshot");
-
-        // Appending to a watcher whose receivers all dropped removes it.
-        let receiver = store.watch("tenant-a", "task-w");
-        drop(receiver);
-        store
-            .append_event_payload(
-                "tenant-a",
-                "task-w",
-                "ctx",
-                AgentTimestampMillis::new(11),
-                A2ATaskEventPayload::StatusUpdate {
-                    state: TaskState::Working,
-                },
-            )
-            .expect("append after receiver dropped");
-        assert!(
-            store
-                .inner
-                .lock()
-                .expect("projection store mutex")
-                .watchers
-                .is_empty(),
-            "append must prune watchers with no receivers"
-        );
-
-        // Opening any watcher sweeps dead senders left on other tasks.
-        let stale = store.watch("tenant-a", "task-w");
-        drop(stale);
-        let _live = store.watch("tenant-a", "task-other");
-        let state = store.inner.lock().expect("projection store mutex");
-        assert_eq!(state.watchers.len(), 1, "watch must sweep dead senders");
-        assert!(state
-            .watchers
-            .contains_key(&("tenant-a".to_string(), "task-other".to_string())));
-    }
-
-    #[test]
-    fn orphan_event_for_unknown_task_is_rejected_and_not_recorded() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        let event = A2ATaskEvent::new(
-            "tenant-a",
-            "task-unknown",
-            "ctx",
-            5,
-            AgentTimestampMillis::new(20),
-            A2ATaskEventPayload::StatusUpdate {
-                state: TaskState::Working,
-            },
-        );
-
-        let error = store.append_event(event).expect_err("orphan event");
-
-        assert_eq!(error.code(), "task-not-found");
-        assert!(store
-            .replay_events("tenant-a", "task-unknown", None)
-            .expect("replay")
-            .is_empty());
-    }
-
-    #[test]
-    fn event_log_is_bounded_per_task() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        let snapshot = A2ATaskProjection::accepted(
-            "task-log",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            0,
-        );
-        store
-            .append_event_payload(
-                "tenant-a",
-                "task-log",
-                "ctx",
-                AgentTimestampMillis::new(10),
-                A2ATaskEventPayload::Snapshot(snapshot),
-            )
-            .expect("bootstrap snapshot");
-
-        for index in 0..EVENT_LOG_LIMIT + 10 {
-            let mut message = Message::new(Role::User, vec![Part::text("hello")]);
-            message.message_id = format!("msg-{index}");
-            store
-                .append_event_payload(
-                    "tenant-a",
-                    "task-log",
-                    "ctx",
-                    AgentTimestampMillis::new(20 + index as u64),
-                    A2ATaskEventPayload::MessageUpdate { message },
-                )
-                .expect("append message");
-        }
-
-        // Sequences run 1..=LIMIT+11. Compaction keeps the bootstrap snapshot
-        // at sequence 1 and the newest live tail, so replay from before the
-        // live tail reports the first contiguous retained update.
-        let earliest_retained = 13;
-        let expired = store
-            .replay_events("tenant-a", "task-log", None)
-            .expect_err("replay from before the retained window must fail");
-        assert!(matches!(
-            expired,
-            TaskProjectionError::ReplayWindowExpired {
-                earliest_sequence,
-                ..
-            } if earliest_sequence == earliest_retained
-        ));
-
-        let boundary_cursor = format!("task-log:{}", earliest_retained - 1);
-        let events = store
-            .replay_events("tenant-a", "task-log", Some(&boundary_cursor))
-            .expect("replay from the window boundary");
-        assert_eq!(events.len(), EVENT_LOG_LIMIT - 1);
-        assert_eq!(
-            events.first().map(|event| event.sequence),
-            Some(earliest_retained)
-        );
-    }
-
-    #[test]
-    fn snapshot_event_bootstraps_unknown_task() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        let snapshot = A2ATaskProjection::accepted(
-            "task-boot",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            0,
-        );
-        let event = A2ATaskEvent::new(
-            "tenant-a",
-            "task-boot",
-            "ctx",
-            1,
-            AgentTimestampMillis::new(20),
-            A2ATaskEventPayload::Snapshot(snapshot),
-        );
-
-        store.append_event(event).expect("bootstrap snapshot");
-
-        let task = store.get(Some("tenant-a"), "task-boot", None).expect("get");
-        assert_eq!(task.id, "task-boot");
-        assert_eq!(
-            store
-                .replay_events("tenant-a", "task-boot", None)
-                .expect("replay")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn replay_cursor_from_another_task_is_rejected() {
-        let store = InMemoryA2ATaskProjectionStore::local();
-        let error = store
-            .replay_events("tenant-a", "task-1", Some("task-2:5"))
-            .expect_err("cursor task mismatch");
-        assert_eq!(error.code(), "invalid-replay-cursor");
-
-        let error = store
-            .replay_events("tenant-a", "task-1", Some("not-a-cursor"))
-            .expect_err("malformed cursor");
-        assert_eq!(error.code(), "invalid-replay-cursor");
     }
 
     #[test]
@@ -1579,21 +898,21 @@ mod tests {
         let refs = (0..DEFAULT_ARTIFACT_LIMIT + 5)
             .map(|index| ArtifactRef {
                 artifact_id: format!("artifact-{index}"),
-                kind: rakka::agent_workflow::ArtifactKind::Input,
+                kind: rakka_agent_workflow::ArtifactKind::Input,
                 uri: format!("s3://bucket/{index}"),
                 checksum: None,
                 content_type: Some("text/plain".to_string()),
                 byte_len: Some(1),
                 retention_class: Some("standard".to_string()),
                 encryption: None,
-                redaction: rakka::agent_workflow::RedactionStatus::ReferenceOnly,
+                redaction: RedactionStatus::ReferenceOnly,
                 created_at: AgentTimestampMillis::new(10),
                 metadata: AgentAttributes::new(),
             })
             .collect::<Vec<_>>();
 
         let projection = A2ATaskProjection::from_run_state(
-            &run_state(AgentRunStatus::Running),
+            &fixture_run_state("task-1", AgentRunStatus::Running),
             "ctx",
             Vec::new(),
             refs,
@@ -1651,5 +970,16 @@ mod tests {
             3,
         )
         .is_none());
+    }
+
+    #[test]
+    fn replay_cursor_round_trips_and_rejects_malformed_input() {
+        let cursor = encode_replay_cursor("task-1", 42);
+        assert_eq!(
+            parse_replay_cursor(&cursor).expect("parse"),
+            ("task-1".to_string(), 42)
+        );
+        assert!(parse_replay_cursor("not-a-cursor").is_err());
+        assert!(parse_replay_cursor("task-1:not-a-number").is_err());
     }
 }

@@ -196,6 +196,25 @@ Non-guarantees:
 - Rakka is not a full web framework.
 - Authentication, authorization, request validation, rate limiting, TLS, ingress policy, and public API evolution are application/operator responsibilities.
 
+## A2A Adapter
+
+`rakka-a2a` exposes durable Rakka agent-workflow runs through the A2A protocol.
+
+Guarantees:
+
+- Public A2A commands are acknowledged only after the durable workflow inbox accepts them; a returned task means the command is durable, and duplicate retries deduplicate on the durable command id and dedup key.
+- `A2A Task.id` maps to `AgentRunId` and the sharded entity id; owner-only work crosses remoting through the versioned, remote-safe `A2ARunRequest`/`A2ARunResponse` protocol, never local actor messages or store handles.
+- Task projections and public task events are query/observability surfaces; durable run state plus durable inbox/outbox state remain authoritative. Stream replay is defined solely by durable projection event sequence, so reconnect through a different node resumes with no gap and no duplicate, and a cursor older than the retained window returns `resync` rather than a silent gap.
+- Tenant and principal identity are part of the durable command boundary. In tenant-scoped mode every durable read and command carries a resolved tenant and unscoped reads are refused; a tenant mismatch is indistinguishable from a missing task.
+- The crate never persists resolved credentials or secret material in plans, durable state, outbox effects, task events, logs, metrics, snapshots, or indexes; push credentials are rejected by default or replaced by an application-supplied logical binding reference.
+
+Non-guarantees:
+
+- A2A actor, remote, and sharded delivery inherit the at-most-once core contract; the durable guarantees above come from the inbox/outbox layer, not from delivery.
+- Push notification (webhook) delivery is at-least-once: effects carry stable idempotency keys, and the webhook target must deduplicate for effective exactly-once processing.
+- External model calls, tool calls, and peer A2A calls are at-least-once unless the target participates in idempotency.
+- Rakka remoting stays trusted private cluster traffic and is never used as public A2A transport; authentication, authorization, TLS, and ingress policy remain application/operator responsibilities.
+
 ## Kubernetes Operation
 
 `rakka-k8s` and `examples/kubernetes` provide readiness, liveness, drain, metrics, snapshot, remoting, and rolling-update examples.

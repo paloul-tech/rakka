@@ -30,6 +30,14 @@ default = [
 cluster = ["dep:rakka-cluster"]
 discovery-etcd = ["dep:rakka-discovery-etcd", "cluster"]
 agent-workflow = ["dep:rakka-agent-workflow"]
+a2a = ["dep:rakka-a2a", "agent-workflow"]
+a2a-server = ["a2a", "rakka-a2a?/server"]
+a2a-sharding = ["a2a", "rakka-a2a?/sharding", "sharding"]
+a2a-postgres = ["a2a", "rakka-a2a?/postgres", "postgres"]
+a2a-http = ["a2a", "rakka-a2a?/http", "http"]
+a2a-k8s = ["a2a", "rakka-a2a?/k8s", "k8s"]
+a2a-otel = ["a2a", "rakka-a2a?/otel"]
+a2a-testkit = ["a2a", "rakka-a2a?/testkit"]
 grpc = ["dep:rakka-grpc"]
 http = ["dep:rakka-http", "rakka-agent-workflow?/http"]
 k8s = ["dep:rakka-k8s", "rakka-agent-workflow?/k8s"]
@@ -44,6 +52,7 @@ workflow = ["dep:rakka-workflow"]
 
 [dependencies]
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
+rakka-a2a = { path = "../rakka-a2a", version = "0.1.0", optional = true }
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0", optional = true }
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0", optional = true }
 rakka-discovery-etcd = { path = "../rakka-discovery-etcd", version = "0.1.0", optional = true }

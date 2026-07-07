@@ -23,8 +23,9 @@ use rakka_persistence_postgres::PostgresDurableStateStore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use rakka_a2a::push::A2APushConfigState;
+
 use crate::config::{ExampleConfig, PersistenceKind};
-use crate::push_config::A2APushConfigState;
 use crate::support::{example_error, hex_decode, hex_encode, ExampleResult};
 
 /// Durable store for agent run state.
