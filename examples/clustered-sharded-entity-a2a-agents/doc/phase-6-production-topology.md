@@ -182,8 +182,13 @@ OpenTelemetry guidance:
 
 Operational snapshots for production review should include runtime, outbox,
 recovery, human checkpoints, shards, streams, task projection, and push
-delivery. The example has local runtime/stream/push state; a reusable crate
-should register these snapshots through the shared HTTP snapshot registry.
+delivery. Rakka provides the generic metrics exporters, HTTP observability
+routes, `OperationalSnapshotRegistry`, and agent-workflow snapshot/metric
+primitives. The example has local runtime/stream/push state, but reusable
+A2A-specific ingress metrics, stream/task-projection/push snapshots, push
+retry/exhaustion visibility, and shared `/metrics`, `/otel/metrics`, and
+`/snapshots` route registration naturally belong in the future `rakka-a2a`
+crate.
 
 ## Autoscaling Signals
 

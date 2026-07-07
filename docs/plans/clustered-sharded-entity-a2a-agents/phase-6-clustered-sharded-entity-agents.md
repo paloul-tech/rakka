@@ -55,7 +55,8 @@ Acceptance:
 
 ### Slice 6.3: PostgreSQL Persistence And Migrations
 
-Status: implemented
+Status: partially implemented; shared A2A projection/index migrations deferred
+to the future `rakka-a2a` crate
 
 Work:
 
@@ -72,6 +73,15 @@ Acceptance:
 - A pod restart recovers accepted tasks.
 - A new owner recovers run state after old owner removal.
 - Projection and push config data survive process restart.
+
+Deferral:
+
+- Phase 6 implements PostgreSQL durable state for run state, workflow
+  inbox/outbox state, and push configs in the example. Shared PostgreSQL A2A
+  task-event projection, production query indexes, timer/dispatcher/audit-index
+  migrations, and migration-lock orchestration remain deferred until the
+  reusable `rakka-a2a` crate defines the shared A2A projection schema and
+  migration surface.
 
 ### Slice 6.4: Discovery, Membership, And Self-Fencing
 
@@ -112,7 +122,8 @@ Acceptance:
 
 ### Slice 6.6: Observability And Operational Snapshots
 
-Status: implemented
+Status: partially implemented; A2A-specific metrics and operational snapshots
+deferred to the future `rakka-a2a` crate
 
 Work:
 
@@ -130,6 +141,16 @@ Acceptance:
 - Operators can see active runs, due effects, stream counts, push retry counts,
   shard ownership, and recovery errors.
 - Trace context survives durable boundaries using span links where appropriate.
+
+Deferral:
+
+- Rakka already provides generic metrics exporters, HTTP metrics routes,
+  `OperationalSnapshotRegistry`, agent-workflow metric names, and workflow
+  snapshot registries. Phase 6 documents the required production surface and
+  uses some example-local counters/state, but reusable A2A ingress metrics,
+  stream/task-projection/push snapshots, push retry/exhaustion visibility, and
+  shared `/metrics`, `/otel/metrics`, and `/snapshots` registration are
+  deferred until the future `rakka-a2a` crate owns the A2A adapter surface.
 
 ### Slice 6.7: Autoscaling Signals
 
@@ -212,13 +233,14 @@ Acceptance:
   A2A Service, private headless remoting Service, StatefulSet, readiness,
   liveness, startup, preStop drain, PodDisruptionBudget, HPA, and demo-grade
   etcd/PostgreSQL services.
-- Slice 6.3 is implemented for shared durable run/workflow/push-config state by
-  the optional `postgres` feature in the A2A example. `RAKKA_PERSISTENCE` now
-  selects `file` or `postgres`; Postgres mode connects three
-  `PostgresDurableStateStore` instances and self-applies the persistence
-  migration. The Phase 6 guide documents backup/restore expectations and calls
-  out the remaining extraction follow-up for a shared PostgreSQL A2A
-  task-event projection table.
+- Slice 6.3 is partially implemented for shared durable run/workflow/push-config
+  state by the optional `postgres` feature in the A2A example.
+  `RAKKA_PERSISTENCE` selects `file` or `postgres`; Postgres mode uses
+  `PostgresDurableStateStore` and self-applies the base persistence migration.
+  The full shared PostgreSQL A2A task-event projection, production query
+  indexes, timer/dispatcher/audit-index migrations, and migration-lock
+  orchestration are deferred until the reusable `rakka-a2a` crate defines that
+  shared projection and migration surface.
 - Slice 6.4 builds on the existing etcd discovery and reachability
   self-fencing modules. The Kubernetes config selects etcd, the topology guide
   documents lease TTL, membership refresh, lease revoke, partial partitions,
@@ -228,11 +250,14 @@ Acceptance:
   rejects new mutating public A2A calls and new streams with the stable
   retryable `a2a-agent-draining` code while safe reads remain available.
   Existing shutdown still notifies discovery and leaves the local runtime.
-- Slice 6.6 is documented in the Phase 6 topology guide and backed by existing
-  stream-limit metrics, durable acceptance/outbox state, push scheduling,
-  Rakka agent-workflow metrics/snapshots, and OTLP guidance. The doc repeats
-  the bounded-label policy and names the runtime, outbox, recovery, human,
-  shard, stream, task projection, and push snapshots needed for review.
+- Slice 6.6 is partially implemented as production observability guidance. The
+  Phase 6 topology guide names the required metrics/snapshots and bounded-label
+  policy, and Rakka already has generic metrics exporters, HTTP observability
+  routes, `OperationalSnapshotRegistry`, and agent-workflow snapshot/metric
+  primitives. The reusable A2A-specific pieces -- ingress metrics,
+  stream/task-projection/push snapshots, push retry/exhaustion visibility, and
+  shared route registration for `/metrics`, `/otel/metrics`, and `/snapshots`
+  -- naturally belong in the future `rakka-a2a` crate and are deferred there.
 - Slice 6.7 is documented in the Phase 6 topology guide and referenced by the
   HPA manifest. The HPA starts with CPU as a portable baseline and points
   operators at bounded scale-out signals: active streams, pending inbox
