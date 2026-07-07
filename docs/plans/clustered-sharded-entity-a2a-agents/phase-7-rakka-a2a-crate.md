@@ -82,6 +82,10 @@ The example also shows the boundaries that must change before reuse:
 Add `crates/rakka-a2a` with `default = []`. Prefer component crate
 dependencies over depending on the top-level `rakka` facade.
 
+In the API boundary inventory, `rakka-a2a` is an Adapter-tier crate: a protocol
+and edge adapter over HTTP, PostgreSQL, and sharding. Record it as Adapter when
+updating `docs/rakka-api-boundary-inventory.md` in Slice 7.10.
+
 Initial features:
 
 - `server`: A2A SDK `RequestHandler`, REST, JSON-RPC, and agent-card router
@@ -159,7 +163,8 @@ workflow catalog, and topology:
 The builder should make secure defaults easy:
 
 - Require an explicit tenant resolver in tenant-scoped production mode.
-- Reject or transform raw push credentials through a credential-binding hook.
+- Reject raw push credentials by default; accept only a pre-resolved logical
+  binding reference from the credential-binding hook. See Design Note DN-4.
 - Require bounded payload policy and artifact strategy when large inputs are
   accepted.
 - Require public base URLs for advertised agent-card interfaces.
@@ -206,7 +211,149 @@ Migration requirements:
 - Retention may compact event tails but must preserve terminal task snapshots
   and replay cursor behavior.
 
+## Design Notes
+
+These notes resolve mechanisms and invariants that the slices below assume but
+do not specify. Each is a pre-implementation decision point: record the concrete
+choice here before starting the referenced slice.
+
+### DN-1: PostgreSQL Migration And Schema Versioning Mechanism
+
+Applies before Slice 7.3.
+
+The repository has no shared migration framework. `rakka-persistence-postgres`
+applies schema with idempotent `CREATE TABLE IF NOT EXISTS` string constants
+self-applied at store construction; `rakka-sharding-postgres` adds migration
+helpers and advisory-lock-style coordination for its durable coordinator. The
+plan's requirements for "explicit schema versions", "migration locks", and
+"N/N+1 downgrade-safe guidance" are therefore net-new unless an existing pattern
+is reused.
+
+Decision to record here before implementing 7.3:
+
+- Reuse path (preferred): model the A2A schema on the
+  `rakka-persistence-postgres` idempotent-DDL pattern plus the
+  `rakka-sharding-postgres` migration-helper/advisory-lock pattern. Embed SQL as
+  `const &str` so `cargo package --offline` and `scripts/package-check.sh` keep
+  working with no external migration files.
+- Versioned-mechanism path: if an ordered `schema_version` table with stepwise
+  migrations is required, scope it as its own work item, not folded into "add a
+  table".
+
+Requirements the chosen mechanism must satisfy regardless of path:
+
+- Idempotent apply that is safe to run from every node at startup.
+- Concurrency-safe when many pods apply at once. Wrap apply in a Postgres
+  advisory lock (`pg_advisory_lock`), matching the shard coordinator, and
+  document the lock key.
+- Offline-packageable: SQL ships embedded in the crate with no runtime file or
+  network dependency.
+- Additive-only columns/indexes within a release, with downgrade-safe N/N+1
+  behavior: during a rolling update old pods must tolerate new columns and new
+  pods must tolerate new-optional columns being absent.
+
+### DN-2: Durable Stream Replay Watcher And Cursor Invariant
+
+Applies before Slice 7.6.
+
+Slice 7.6 makes durable event replay the primary streaming path with owner
+polling as fallback, but does not specify how a non-owner serving node learns of
+new durable events, nor how the client cursor stays consistent across the
+owner-served and durable-replay seam. Both are resolved here.
+
+Watcher abstraction:
+
+- Define `A2ATaskEventWatcher` with in-memory and PostgreSQL implementations,
+  keyed by `(tenant, task_id)`.
+- In-memory: process-local broadcast/notify.
+- PostgreSQL: choose and record the notification transport. Candidates:
+  - `LISTEN/NOTIFY` on task-event insert. Lowest latency; needs a dedicated
+    connection with reconnect handling. The payload must be bounded to
+    `(tenant, task_id, high_watermark)` only, never event content or secrets.
+  - Bounded interval polling of `rakka_a2a_task_events` /
+    `rakka_a2a_projection_watermarks` above the last-served sequence. Simpler;
+    higher latency; database load scales with active streams.
+- The watcher only signals "there may be new events at or after sequence S". The
+  serving node then reads durable events; it never trusts the notification
+  payload as data.
+
+Cursor invariant (correctness, holds in all paths):
+
+- The client replay cursor is defined solely by durable projection event
+  sequence for `(tenant, task_id)`. Nothing else advances it.
+- A serving node must not emit an event or advance the client cursor past the
+  highest durably persisted sequence. Owner-served live events (the polling
+  fallback) may be surfaced only once durable, so a reconnect to a different node
+  replaying from durable state sees neither a gap nor a duplicate at the seam.
+- Compaction interacts with replay through the existing `resync` signal
+  (`A2ARunResponseKind::StreamCursor`): a cursor older than the retained event
+  tail returns `resync = true` and the client re-bootstraps from the current
+  projection snapshot. Wire `resync` through the durable-replay path, not only
+  the owner-polling path.
+- Heartbeats and terminal close are cursor-neutral and never advance the cursor.
+
+Acceptance additions for Slice 7.6:
+
+- Reconnect through a different node after new events resumes with no gap and no
+  duplicate at the durable-versus-owner-served boundary.
+- A cursor older than the compaction window yields `resync`, not a silent gap.
+
+### DN-3: Multi-Tenant Read Scoping And The Unscoped-Read Path
+
+Applies before Slices 7.3 and 7.4.
+
+The remote protocol currently allows `A2ARunRequest.tenant = None` as an
+unscoped read that resolves the run's stored tenant, mirroring the local-mode
+projection store. Against a shared multi-tenant durable store this is a
+cross-tenant read hazard and must not survive extraction unchanged.
+
+Decision:
+
+- The unscoped (`tenant = None`) read path is a single-tenant / local-mode
+  affordance only. When a tenant-scoped production configuration is active
+  (explicit `A2ATenantResolver` plus a multi-tenant durable store), the builder
+  must refuse to construct a handler that can issue unscoped reads. Every durable
+  read and command then carries `Some` canonical tenant.
+- Durable store queries are always tenant-scoped by primary key `(tenant, ...)`.
+  In tenant-scoped mode there is no store method that returns a task without a
+  tenant predicate.
+- Tenant mismatch remains indistinguishable from missing task (unchanged
+  security behavior).
+- Add a gated PostgreSQL test asserting an unscoped read cannot be issued in
+  tenant-scoped mode and that a tenant-scoped query never returns a
+  foreign-tenant row.
+
+### DN-4: Push Credential Binding Rejects, Never Holds
+
+Applies before Slice 7.7.
+
+The application backend owns secret storage; `rakka-a2a` must never hold secret
+material, even transiently. Wording that implies the crate can "convert" a raw
+credential is out of boundary.
+
+Decision:
+
+- The crate does not convert, transform, or store raw push credentials. It
+  rejects raw secret material by default, or accepts a pre-resolved logical
+  binding reference produced by the application's `A2ACredentialBindingResolver`.
+- `A2APushConfigStore` persists URL plus redacted public config plus a
+  credential-binding ref or secret-presence metadata only.
+- No raw credential value enters state, outbox effects, task events, logs,
+  metrics, snapshots, or indexes at any point, including transient in-handler
+  values that could be logged on error.
+- Advertise `push_notifications=true` only when a dispatcher is configured. Push
+  delivery is at-least-once; the agent card and docs must not imply exactly-once
+  delivery to the webhook target.
+
 ## Implementation Slices
+
+Each slice must leave the workspace green: after every slice both
+`cargo test -p rakka-a2a` and
+`cargo test -p rakka-example-clustered-sharded-entity-a2a-agents` pass. The
+example is migrated incrementally across Slices 7.3-7.9; where a slice leaves the
+example partially migrated (for example, a crate store wired under an
+example-local handler), keep it compiling and passing and name any temporary
+bridge in the slice so Slice 7.9 removes it.
 
 ### Slice 7.1: Crate Skeleton And Dependency Boundary
 
@@ -225,6 +372,8 @@ Work:
 Acceptance:
 
 - `cargo test -p rakka-a2a` builds with default features.
+- `cargo check -p rakka-a2a --no-default-features` passes and is added to the
+  minimal-feature checks in `scripts/validate.sh`.
 - The crate has no example-only configuration, discovery, Kubernetes, or demo
   workflow code.
 
@@ -253,6 +402,8 @@ Acceptance:
 
 Status: planned
 
+Design inputs: DN-1 (migration mechanism), DN-3 (tenant read scoping).
+
 Work:
 
 - Implement `InMemoryA2ATaskProjectionStore` behind the async store trait.
@@ -274,6 +425,8 @@ Acceptance:
 ### Slice 7.4: Durable Request Handler Builder
 
 Status: planned
+
+Design inputs: DN-3 (tenant read scoping).
 
 Work:
 
@@ -321,6 +474,8 @@ Acceptance:
 
 Status: planned
 
+Design inputs: DN-2 (replay watcher and cursor invariant).
+
 Work:
 
 - Make durable event replay the primary `send_streaming_message` and
@@ -342,14 +497,17 @@ Acceptance:
 
 Status: planned
 
+Design inputs: DN-4 (push credential binding).
+
 Work:
 
 - Move push config validation, redaction, and outbox scheduling.
 - Add PostgreSQL push config storage and scheduler watermark storage.
 - Add `A2APushDispatcher` or an agent-workflow dispatcher adapter that sends
   A2A push webhooks from durable effects.
-- Add credential-binding policy so raw credentials are rejected or converted to
-  logical refs before persistence.
+- Add credential-binding policy so raw credentials are rejected (never converted
+  or held); only application-supplied logical binding refs are persisted. See
+  Design Note DN-4.
 - Advertise `push_notifications=true` only when delivery is configured.
 
 Acceptance:
@@ -481,8 +639,13 @@ Narrow validation while implementing:
 ```sh
 cargo test -p rakka-a2a
 cargo test -p rakka-a2a --all-features
+cargo check -p rakka-a2a --no-default-features
 cargo test -p rakka-example-clustered-sharded-entity-a2a-agents
 ```
+
+Add `cargo check -p rakka-a2a --no-default-features` to the minimal-feature
+checks in `scripts/validate.sh`, alongside the existing `rakka-stream` and
+`rakka-process` no-default-feature checks.
 
 Gated validation when relevant:
 
