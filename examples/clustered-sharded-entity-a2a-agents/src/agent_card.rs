@@ -27,7 +27,7 @@ pub fn build_agent_card(config: &ExampleConfig) -> AgentCard {
             AgentInterface::new(format!("{base_url}/a2a/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC),
         ],
         capabilities: AgentCapabilities {
-            streaming: Some(false),
+            streaming: Some(true),
             push_notifications: Some(false),
             extensions: None,
             extended_agent_card: Some(false),
@@ -53,5 +53,43 @@ pub fn build_agent_card(config: &ExampleConfig) -> AgentCard {
         security_schemes: None,
         security_requirements: None,
         signatures: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::{DiscoveryProviderKind, PersistenceKind};
+
+    #[test]
+    fn card_advertises_load_balancer_url_and_implemented_features() {
+        let card = build_agent_card(&ExampleConfig {
+            bind_host: "0.0.0.0".parse().expect("bind host"),
+            advertise_host: "10.0.0.10".to_string(),
+            rakka_port: 25_580,
+            http_port: 35_580,
+            node_logical_id: "rakka-a2a-0".to_string(),
+            node_incarnation: "pod-uid".to_string(),
+            discovery_provider: DiscoveryProviderKind::Etcd,
+            discovery_dir: std::env::temp_dir(),
+            etcd_endpoints: vec!["http://rakka-a2a-etcd:2379".to_string()],
+            etcd_prefix: "/rakka/examples/a2a-agents".to_string(),
+            etcd_lease_ttl_seconds: 10,
+            persistence: PersistenceKind::Postgres,
+            postgres_dsn: Some("host=rakka-postgres dbname=postgres".to_string()),
+            state_dir: std::env::temp_dir(),
+            self_fence: true,
+            self_fence_after: Duration::from_secs(15),
+            self_fence_rejoin_after: Duration::from_secs(10),
+            public_url: Some("https://agents.example.test/rakka-a2a".to_string()),
+        });
+
+        assert_eq!(card.capabilities.streaming, Some(true));
+        assert_eq!(card.capabilities.push_notifications, Some(false));
+        assert!(card.supported_interfaces.iter().all(|interface| interface
+            .url
+            .starts_with("https://agents.example.test/rakka-a2a")));
     }
 }

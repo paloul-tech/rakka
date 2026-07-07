@@ -1025,7 +1025,9 @@ fn failure_from_error(error: RakkaA2AHandlerError) -> A2ARunFailure {
         RakkaA2AHandlerError::Unavailable { .. } | RakkaA2AHandlerError::OwnerAsk { .. } => {
             A2ARunFailureKind::Unavailable
         }
-        RakkaA2AHandlerError::StreamLimit { .. } => A2ARunFailureKind::Unavailable,
+        RakkaA2AHandlerError::StreamLimit { .. } | RakkaA2AHandlerError::Draining => {
+            A2ARunFailureKind::Unavailable
+        }
         RakkaA2AHandlerError::Inbox(_)
         | RakkaA2AHandlerError::RunEngine(_)
         | RakkaA2AHandlerError::RunActor(_)

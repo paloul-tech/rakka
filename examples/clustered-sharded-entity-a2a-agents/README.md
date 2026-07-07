@@ -1,6 +1,6 @@
 # Clustered Sharded Entity A2A Agents
 
-Phase 4 runnable example for exposing durable Rakka agent runs through the A2A
+Phase 6 runnable example for exposing durable Rakka agent runs through the A2A
 Rust SDK with clustered sharded run ownership. This example is the incubator for
 a future `rakka-a2a` crate; no reusable public Rakka A2A API is introduced here.
 
@@ -62,7 +62,42 @@ Rakka remoting stays private to node-to-node communication on `RAKKA_PORT`.
 Public A2A clients should use the HTTP address or a load-balanced
 `RAKKA_A2A_PUBLIC_URL`, not the Rakka remoting address.
 
-## Phase 4 Boundary
+## Production-Like Mode
+
+`RAKKA_PERSISTENCE` selects the durable store:
+
+- `file` (default): one-host local development only.
+- `postgres`: shared durable state for multi-pod recovery, built with
+  `--features postgres`.
+
+```sh
+RAKKA_DISCOVERY_PROVIDER=etcd \
+RAKKA_ETCD_ENDPOINTS=http://127.0.0.1:2379 \
+RAKKA_PERSISTENCE=postgres \
+RAKKA_POSTGRES_DSN="host=127.0.0.1 user=postgres password=postgres dbname=postgres" \
+RAKKA_A2A_PUBLIC_URL=https://agents.example.test/rakka-a2a \
+  cargo run -p rakka-example-clustered-sharded-entity-a2a-agents --features postgres
+```
+
+Build the Kubernetes image and apply the demo stack:
+
+```sh
+docker build -f examples/clustered-sharded-entity-a2a-agents/Dockerfile \
+  -t rakka-clustered-a2a-agents:0.1.0 .
+
+kubectl apply -f examples/clustered-sharded-entity-a2a-agents/k8s/
+```
+
+The manifests include demo-grade single-node etcd and PostgreSQL. Production
+deployments should use HA/managed services, external secret management, network
+policy around private remoting/etcd/PostgreSQL, and an HTTPS load balancer whose
+URL is supplied through `RAKKA_A2A_PUBLIC_URL`.
+
+See [`doc/phase-6-production-topology.md`](doc/phase-6-production-topology.md)
+for the Phase 6 topology, drain, telemetry, autoscaling, failure-injection, and
+production-candidate review contract.
+
+## Phase 6 Boundary
 
 Implemented:
 
@@ -109,16 +144,28 @@ Implemented:
 - Push notification work scheduled as `AgentEffectKind::Notification` durable
   outbox effects after public task events are emitted. Request handlers do not
   call external webhook URLs directly.
+- Optional PostgreSQL durable-state mode for run state, workflow inbox/outbox
+  state, and A2A push notification configs.
+- Kubernetes manifests for public load-balanced A2A HTTP, private Rakka
+  remoting, etcd discovery, PostgreSQL persistence, readiness, liveness,
+  startup, drain, PodDisruptionBudget, and HorizontalPodAutoscaler guidance.
+- `/drain` closes mutating public A2A ingress with the stable
+  `a2a-agent-draining` code while keeping safe reads available until shutdown.
+- Agent cards advertise streaming support and use `RAKKA_A2A_PUBLIC_URL` for
+  load-balanced production URLs.
 
-Not implemented in Phase 4:
+Not implemented in Phase 6:
 
 - A production HTTP webhook dispatcher for the scheduled A2A push outbox
   effects. The durable effect record carries the callback target and bounded
   labels; an adapter-owned worker should resolve any credential binding and send
-  the webhook.
+  the webhook. The agent card keeps `push_notifications=false` until delivery
+  exists.
 - Step execution to completion or peer A2A calls.
-- Production PostgreSQL persistence in this example. Shared file state is for
-  local multi-process demos only.
+- A shared PostgreSQL A2A task-event projection table. The example rebuilds
+  current task projections from durable run/inbox state and uses owner polling
+  for cross-node replay; a reusable `rakka-a2a` crate should promote task-event
+  replay to a shared durable projection.
 - A reusable `rakka-a2a` crate or top-level `rakka` facade feature.
 
 ## SSE And Load Balancers

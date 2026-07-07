@@ -1719,9 +1719,11 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "rakka",
+ "rakka-persistence-postgres",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-postgres",
  "tower 0.5.3",
 ]
 

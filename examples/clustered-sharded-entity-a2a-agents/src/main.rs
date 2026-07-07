@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! Phase 3 A2A agent example: clustered Rakka boot plus durable A2A handling.
+//! Clustered sharded-entity A2A agent example.
 //!
 //! This example is intentionally an incubator, not a reusable `rakka-a2a`
-//! crate. Phase 3 adds owner-routed sharded run hosting while preserving the
-//! public A2A request-handler boundary.
+//! crate. It preserves the public A2A request-handler boundary while routing
+//! durable run ownership through Rakka cluster sharding.
 
 mod a2a_handler;
 mod a2a_mapping;
