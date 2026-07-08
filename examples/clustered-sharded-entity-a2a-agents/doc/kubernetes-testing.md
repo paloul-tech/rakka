@@ -152,6 +152,26 @@ curl -s "localhost:8080/a2a/tasks/$TASK/pushNotificationConfigs" \
   -H 'x-rakka-tenant: tenant-a' | jq
 ```
 
+## Automated Smoke Test
+
+For a repeatable, one-command version of steps 4–7, use
+[`../scripts/k8s-smoke-test.sh`](../scripts/k8s-smoke-test.sh). It applies the
+stack, waits for readiness, sends a task, registers a push config, force-deletes
+an agent pod, and asserts the task and its push config still resolve — proving
+failover and durable recovery. It needs `kubectl`, `curl`, and `jq`, and the
+image already loaded into the cluster (steps 1–2).
+
+```sh
+# Preview the plan without touching the cluster
+SMOKE_DRY_RUN=1 examples/clustered-sharded-entity-a2a-agents/scripts/k8s-smoke-test.sh
+
+# Run it (add SMOKE_CLEANUP=1 to delete the stack on success)
+examples/clustered-sharded-entity-a2a-agents/scripts/k8s-smoke-test.sh
+```
+
+The manual steps below explain what the script automates and cover behaviors it
+does not assert (scaling, drain, cross-node reads).
+
 ## 7. Test The Distributed Behaviors
 
 These are the behaviors that only appear on a real multi-pod cluster:
