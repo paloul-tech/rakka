@@ -101,7 +101,7 @@ pub async fn connect_shared_postgres_client(dsn: &str) -> TaskProjectionResult<A
         .map_err(store_error)?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
-            eprintln!("rakka-a2a postgres connection error: {error}");
+            tracing::warn!(error = %error, "rakka-a2a postgres connection closed");
         }
     });
     Ok(Arc::new(client))

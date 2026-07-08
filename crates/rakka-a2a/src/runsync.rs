@@ -305,10 +305,11 @@ where
             Err(error) => {
                 // Surface undecodable durable payloads instead of silently
                 // degrading recovery.
-                eprintln!(
-                    "warning: skipping undecodable inbox entry {} for run {}: {error}",
-                    entry.message_id().as_str(),
-                    run_id.as_str(),
+                tracing::warn!(
+                    run_id = run_id.as_str(),
+                    message_id = entry.message_id().as_str(),
+                    error = %error,
+                    "skipping undecodable a2a inbox entry during context recovery"
                 );
                 continue;
             }

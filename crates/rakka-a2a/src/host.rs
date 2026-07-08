@@ -211,9 +211,10 @@ impl A2ARunEntity {
         ) {
             Ok(child) => Some(child),
             Err(error) => {
-                eprintln!(
-                    "warning: run entity {} could not spawn its run actor: {error}",
-                    run_id.as_str()
+                tracing::warn!(
+                    run_id = run_id.as_str(),
+                    error = %error,
+                    "a2a run entity could not spawn its run actor"
                 );
                 None
             }
@@ -267,9 +268,10 @@ impl Actor for A2ARunEntity {
         actor_future(async move {
             if let Some(child) = child {
                 if let Err(error) = child.stop() {
-                    eprintln!(
-                        "warning: run entity {} could not stop its run actor: {error}",
-                        run_id.as_str()
+                    tracing::warn!(
+                        run_id = run_id.as_str(),
+                        error = %error,
+                        "a2a run entity could not stop its run actor"
                     );
                 }
             }
@@ -597,9 +599,10 @@ async fn query_task_projection(
     )
     .await
     {
-        eprintln!(
-            "warning: push scheduling deferred for task {}: {error}",
-            run_id.as_str()
+        tracing::warn!(
+            task_id = run_id.as_str(),
+            error = %error,
+            "a2a push scheduling deferred; a later read heals it from the watermark"
         );
     }
 

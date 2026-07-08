@@ -41,6 +41,14 @@ const MAX_PAGE_SIZE: usize = 100;
 /// Bound on retained audit records per push config; request-level configs
 /// are re-saved on every send, so the trail must not grow with traffic.
 const MAX_PUSH_CONFIG_AUDIT_RECORDS: usize = 32;
+/// Bound on retained push configs per task. Request-level configs can arrive
+/// with fresh generated ids, so the per-task aggregate record must not grow
+/// without limit; the oldest soft-deleted (then oldest live) entry is dropped.
+const MAX_PUSH_CONFIGS_PER_TASK: usize = 64;
+/// Bound on optimistic-concurrency re-drives when writing the shared per-task
+/// record; each retry needs a distinct concurrent writer, so this is a
+/// livelock guard, not a backoff.
+const MAX_PUSH_CONFIG_WRITE_ATTEMPTS: usize = 5;
 static GENERATED_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Shared durable store handle for push config state.
@@ -213,18 +221,30 @@ pub enum A2APushCredentialPolicy {
     RedactAndRecordPresence,
 }
 
-/// Durable push config record.
+/// Durable push-config record for one `(tenant, task_id)` scope.
 ///
-/// Public so applications can wire their chosen durable-state backend (for
-/// example a PostgreSQL store with a JSON codec) for push config storage.
-/// The stored config is always redacted; `auth` carries only presence
-/// metadata and the optional logical binding reference.
+/// Holds every push config registered for the task as bounded entries, so a
+/// single durable `load` serves scheduling, reads, and listing without
+/// scanning the store. Public so applications can wire their chosen
+/// durable-state backend (for example a PostgreSQL store with a JSON codec)
+/// for push config storage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct A2APushConfigState {
     /// Owning tenant.
     pub tenant: String,
     /// Task id.
     pub task_id: String,
+    /// Registered push configs, one entry per config id. Soft-deleted entries
+    /// are retained until compacted, and the total is bounded per task.
+    pub configs: Vec<A2APushConfigEntry>,
+}
+
+/// One redacted push config within a task's durable record.
+///
+/// The stored config is always redacted; `auth` carries only presence
+/// metadata and the optional logical binding reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct A2APushConfigEntry {
     /// Config id.
     pub config_id: String,
     /// Redacted public config (no token, no credentials).
@@ -352,6 +372,11 @@ impl A2APushConfigStore {
     }
 
     /// Saves (creates or updates) a push config, redacting credentials.
+    ///
+    /// Reads and writes only the single `(tenant, task_id)` record, so cost is
+    /// bounded by the configs on that task rather than the whole store.
+    /// Concurrent writers to the same task record are re-driven a bounded
+    /// number of times on optimistic-concurrency conflicts.
     pub async fn save(
         &self,
         tenant: &str,
@@ -376,44 +401,54 @@ impl A2APushConfigStore {
             config.id = Some(generated_config_id());
         }
         let config_id = config.id.clone().expect("config id set");
-        let persistence_id = push_config_persistence_id(tenant, &config.task_id, &config_id);
-        let now = AgentTimestampMillis::new(current_timestamp_millis());
+        let task_id = config.task_id.clone();
+        let persistence_id = push_config_persistence_id(tenant, &task_id);
         let auth = auth_metadata(&config, binding_ref);
         let redacted = redacted_config(config);
 
-        let existing = self.store.load(&persistence_id).await?;
-        let (expected, state) = match existing {
-            Some(record) => {
-                let mut state = record.state;
+        for _ in 0..MAX_PUSH_CONFIG_WRITE_ATTEMPTS {
+            let now = AgentTimestampMillis::new(current_timestamp_millis());
+            let (expected, mut state) = match self.store.load(&persistence_id).await? {
+                Some(record) => (record.revision, record.state),
+                None => (
+                    Revision::INITIAL,
+                    A2APushConfigState {
+                        tenant: tenant.to_string(),
+                        task_id: task_id.clone(),
+                        configs: Vec::new(),
+                    },
+                ),
+            };
+
+            if let Some(entry) = state
+                .configs
+                .iter_mut()
+                .find(|entry| entry.config_id == config_id)
+            {
                 // Request-level configs arrive on every send; an identical
                 // re-save is a no-op read rather than a durable rewrite with
                 // audit churn.
-                if !state.deleted && state.config == redacted && state.auth == auth {
-                    return Ok(state.config);
+                if !entry.deleted && entry.config == redacted && entry.auth == auth {
+                    return Ok(entry.config.clone());
                 }
-                let kind = if state.deleted {
+                let kind = if entry.deleted {
                     A2APushConfigAuditKind::Created
                 } else {
                     A2APushConfigAuditKind::Updated
                 };
-                state.config = redacted.clone();
-                state.auth = auth.clone();
-                state.deleted = false;
-                state.updated_at = now;
-                state.audit.push(A2APushConfigAuditRecord {
+                entry.config = redacted.clone();
+                entry.auth = auth.clone();
+                entry.deleted = false;
+                entry.updated_at = now;
+                entry.audit.push(A2APushConfigAuditRecord {
                     kind,
                     occurred_at: now,
                     redaction: auth.redaction,
                 });
-                cap_audit(&mut state.audit);
-                (record.revision, state)
-            }
-            None => (
-                Revision::INITIAL,
-                A2APushConfigState {
-                    tenant: tenant.to_string(),
-                    task_id: redacted.task_id.clone(),
-                    config_id,
+                cap_audit(&mut entry.audit);
+            } else {
+                state.configs.push(A2APushConfigEntry {
+                    config_id: config_id.clone(),
                     config: redacted.clone(),
                     auth: auth.clone(),
                     deleted: false,
@@ -424,14 +459,24 @@ impl A2APushConfigStore {
                         occurred_at: now,
                         redaction: auth.redaction,
                     }],
-                },
-            ),
-        };
-        let record = self
-            .store
-            .compare_and_set(&persistence_id, expected, state)
-            .await?;
-        Ok(record.state.config)
+                });
+                cap_configs(&mut state.configs);
+            }
+
+            match self
+                .store
+                .compare_and_set(&persistence_id, expected, state)
+                .await
+            {
+                Ok(_) => return Ok(redacted),
+                Err(DurableError::RevisionConflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(A2APushConfigError::Persistence(DurableError::store(
+            self.store.backend_name(),
+            "push config save contention exceeded retry bound",
+        )))
     }
 
     /// Applies the DN-4 credential-binding policy: reject, never hold.
@@ -469,17 +514,19 @@ impl A2APushConfigStore {
         config_id: &str,
     ) -> A2APushConfigResult<TaskPushNotificationConfig> {
         validate_tenant(tenant)?;
-        let state = self
-            .store
-            .load(&push_config_persistence_id(tenant, task_id, config_id))
+        self.load_state(tenant, task_id)
             .await?
-            .map(|record| record.state)
-            .filter(|state| !state.deleted)
+            .and_then(|state| {
+                state
+                    .configs
+                    .into_iter()
+                    .find(|entry| entry.config_id == config_id && !entry.deleted)
+            })
+            .map(|entry| entry.config)
             .ok_or_else(|| A2APushConfigError::ConfigNotFound {
                 task_id: task_id.to_string(),
                 config_id: config_id.to_string(),
-            })?;
-        Ok(state.config)
+            })
     }
 
     /// Lists active push configs for one task with deterministic pagination.
@@ -491,17 +538,17 @@ impl A2APushConfigStore {
         validate_tenant(tenant)?;
         let offset = page_offset(request.page_token.as_deref())?;
         let page_size = page_size(request.page_size);
-        let mut states = self.active_states(tenant, &request.task_id).await?;
-        states.sort_by(|left, right| left.config_id.cmp(&right.config_id));
+        let mut entries = self.active_entries(tenant, &request.task_id).await?;
+        entries.sort_by(|left, right| left.config_id.cmp(&right.config_id));
 
-        let configs = states
+        let configs = entries
             .iter()
             .skip(offset)
             .take(page_size)
-            .map(|state| state.config.clone())
+            .map(|entry| entry.config.clone())
             .collect::<Vec<_>>();
         let next_offset = offset.saturating_add(configs.len());
-        let next_page_token = (next_offset < states.len()).then(|| next_offset.to_string());
+        let next_page_token = (next_offset < entries.len()).then(|| next_offset.to_string());
         Ok(ListTaskPushNotificationConfigsResponse {
             configs,
             next_page_token,
@@ -516,27 +563,43 @@ impl A2APushConfigStore {
         config_id: &str,
     ) -> A2APushConfigResult<()> {
         validate_tenant(tenant)?;
-        let persistence_id = push_config_persistence_id(tenant, task_id, config_id);
-        let Some(record) = self.store.load(&persistence_id).await? else {
-            return Ok(());
-        };
-        if record.state.deleted {
-            return Ok(());
+        let persistence_id = push_config_persistence_id(tenant, task_id);
+        for _ in 0..MAX_PUSH_CONFIG_WRITE_ATTEMPTS {
+            let Some(record) = self.store.load(&persistence_id).await? else {
+                return Ok(());
+            };
+            let expected = record.revision;
+            let mut state = record.state;
+            let Some(entry) = state
+                .configs
+                .iter_mut()
+                .find(|entry| entry.config_id == config_id && !entry.deleted)
+            else {
+                return Ok(());
+            };
+            let now = AgentTimestampMillis::new(current_timestamp_millis());
+            entry.deleted = true;
+            entry.updated_at = now;
+            entry.audit.push(A2APushConfigAuditRecord {
+                kind: A2APushConfigAuditKind::Deleted,
+                occurred_at: now,
+                redaction: entry.auth.redaction,
+            });
+            cap_audit(&mut entry.audit);
+            match self
+                .store
+                .compare_and_set(&persistence_id, expected, state)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(DurableError::RevisionConflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        let now = AgentTimestampMillis::new(current_timestamp_millis());
-        let mut state = record.state;
-        state.deleted = true;
-        state.updated_at = now;
-        state.audit.push(A2APushConfigAuditRecord {
-            kind: A2APushConfigAuditKind::Deleted,
-            occurred_at: now,
-            redaction: state.auth.redaction,
-        });
-        cap_audit(&mut state.audit);
-        self.store
-            .compare_and_set(&persistence_id, record.revision, state)
-            .await?;
-        Ok(())
+        Err(A2APushConfigError::Persistence(DurableError::store(
+            self.store.backend_name(),
+            "push config delete contention exceeded retry bound",
+        )))
     }
 
     /// Lists active configs for scheduling.
@@ -546,31 +609,40 @@ impl A2APushConfigStore {
         task_id: &str,
     ) -> A2APushConfigResult<Vec<TaskPushNotificationConfig>> {
         Ok(self
-            .active_states(tenant, task_id)
+            .active_entries(tenant, task_id)
             .await?
             .into_iter()
-            .map(|state| state.config)
+            .map(|entry| entry.config)
             .collect())
     }
 
-    async fn active_states(
+    /// Loads the single `(tenant, task_id)` push-config record, if present.
+    async fn load_state(
         &self,
         tenant: &str,
         task_id: &str,
-    ) -> A2APushConfigResult<Vec<A2APushConfigState>> {
-        let prefix = push_config_persistence_prefix(tenant, task_id);
-        let mut states = Vec::new();
-        for id in self.store.persistence_ids().await? {
-            if !id.as_str().starts_with(&prefix) {
-                continue;
-            }
-            if let Some(record) = self.store.load(&id).await? {
-                if !record.state.deleted {
-                    states.push(record.state);
-                }
-            }
-        }
-        Ok(states)
+    ) -> A2APushConfigResult<Option<A2APushConfigState>> {
+        Ok(self
+            .store
+            .load(&push_config_persistence_id(tenant, task_id))
+            .await?
+            .map(|record| record.state))
+    }
+
+    /// Returns the active (non-deleted) config entries for one task.
+    async fn active_entries(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> A2APushConfigResult<Vec<A2APushConfigEntry>> {
+        let Some(state) = self.load_state(tenant, task_id).await? else {
+            return Ok(Vec::new());
+        };
+        Ok(state
+            .configs
+            .into_iter()
+            .filter(|entry| !entry.deleted)
+            .collect())
     }
 }
 
@@ -769,6 +841,33 @@ fn cap_audit(audit: &mut Vec<A2APushConfigAuditRecord>) {
     }
 }
 
+/// Keeps the per-task record bounded at `MAX_PUSH_CONFIGS_PER_TASK`, evicting
+/// the oldest soft-deleted entry first and otherwise the oldest by creation
+/// time, so live configs survive longer than tombstones.
+fn cap_configs(configs: &mut Vec<A2APushConfigEntry>) {
+    while configs.len() > MAX_PUSH_CONFIGS_PER_TASK {
+        let victim = configs
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.deleted)
+            .min_by_key(|(_, entry)| entry.updated_at.as_millis())
+            .map(|(index, _)| index)
+            .or_else(|| {
+                configs
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, entry)| entry.created_at.as_millis())
+                    .map(|(index, _)| index)
+            });
+        match victim {
+            Some(index) => {
+                configs.remove(index);
+            }
+            None => break,
+        }
+    }
+}
+
 fn redacted_config(mut config: TaskPushNotificationConfig) -> TaskPushNotificationConfig {
     config.token = None;
     if let Some(authentication) = config.authentication.as_mut() {
@@ -861,19 +960,11 @@ fn generated_config_id() -> String {
     )
 }
 
-fn push_config_persistence_prefix(tenant: &str, task_id: &str) -> String {
-    format!(
-        "{PUSH_CONFIG_PERSISTENCE_PREFIX}:{}:{}:",
+fn push_config_persistence_id(tenant: &str, task_id: &str) -> PersistenceId {
+    PersistenceId::new(format!(
+        "{PUSH_CONFIG_PERSISTENCE_PREFIX}:{}:{}",
         hex_encode(tenant),
         hex_encode(task_id)
-    )
-}
-
-fn push_config_persistence_id(tenant: &str, task_id: &str, config_id: &str) -> PersistenceId {
-    PersistenceId::new(format!(
-        "{}{}",
-        push_config_persistence_prefix(tenant, task_id),
-        hex_encode(config_id)
     ))
 }
 
@@ -946,6 +1037,24 @@ mod tests {
         }
     }
 
+    async fn load_entry(
+        durable: &InMemoryDurableStateStore<A2APushConfigState>,
+        tenant: &str,
+        task_id: &str,
+        config_id: &str,
+    ) -> A2APushConfigEntry {
+        durable
+            .load(&push_config_persistence_id(tenant, task_id))
+            .await
+            .expect("load")
+            .expect("state")
+            .state
+            .configs
+            .into_iter()
+            .find(|entry| entry.config_id == config_id)
+            .expect("entry present")
+    }
+
     #[tokio::test]
     async fn raw_credentials_are_rejected_by_default() {
         let store = rejecting_store();
@@ -986,18 +1095,13 @@ mod tests {
             .expect("save with binding resolver");
         assert!(saved.token.is_none());
 
-        let persisted = durable
-            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
-            .await
-            .expect("load")
-            .expect("state")
-            .state;
+        let entry = load_entry(&durable, "tenant-a", "task-1", "cfg-1").await;
         assert_eq!(
-            persisted.auth.credential_binding_ref,
+            entry.auth.credential_binding_ref,
             Some(A2ACredentialBindingRef::new("binding:tenant-a:webhook"))
         );
-        assert!(persisted.config.token.is_none());
-        let serialized = serde_json::to_string(&persisted).expect("state json");
+        assert!(entry.config.token.is_none());
+        let serialized = serde_json::to_string(&entry).expect("entry json");
         assert!(
             !serialized.contains("secret"),
             "persisted state must not contain raw credentials: {serialized}"
@@ -1023,15 +1127,10 @@ mod tests {
 
         let fetched = store.get("tenant-a", "task-1", "cfg-1").await.expect("get");
         assert_eq!(fetched.url, "https://example.com/hook");
-        let persisted = durable
-            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
-            .await
-            .expect("load persisted")
-            .expect("persisted state")
-            .state;
-        assert!(persisted.auth.token_present);
-        assert!(persisted.auth.credentials_present);
-        assert!(persisted.config.token.is_none());
+        let entry = load_entry(&durable, "tenant-a", "task-1", "cfg-1").await;
+        assert!(entry.auth.token_present);
+        assert!(entry.auth.credentials_present);
+        assert!(entry.config.token.is_none());
 
         let listed = store
             .list(
@@ -1068,6 +1167,122 @@ mod tests {
         assert_eq!(error.code(), "invalid-push-config");
     }
 
+    /// Durable store that refuses `persistence_ids` (inheriting the trait
+    /// default), mirroring backends without a store-wide id scan. Push config
+    /// storage must work entirely from `(tenant, task)` loads over it.
+    #[derive(Clone)]
+    struct NoScanStore(InMemoryDurableStateStore<A2APushConfigState>);
+
+    impl DurableStateStore<A2APushConfigState> for NoScanStore {
+        fn backend_name(&self) -> &'static str {
+            "no-scan"
+        }
+
+        fn load<'a>(
+            &'a self,
+            persistence_id: &'a PersistenceId,
+        ) -> rakka_persistence::StoreFuture<
+            'a,
+            Option<rakka_persistence::StateRecord<A2APushConfigState>>,
+        > {
+            self.0.load(persistence_id)
+        }
+
+        fn compare_and_set<'a>(
+            &'a self,
+            persistence_id: &'a PersistenceId,
+            expected_revision: Revision,
+            state: A2APushConfigState,
+        ) -> rakka_persistence::StoreFuture<'a, rakka_persistence::StateRecord<A2APushConfigState>>
+        {
+            self.0
+                .compare_and_set(persistence_id, expected_revision, state)
+        }
+
+        fn delete<'a>(
+            &'a self,
+            persistence_id: &'a PersistenceId,
+            expected_revision: Revision,
+        ) -> rakka_persistence::StoreFuture<'a, Revision> {
+            self.0.delete(persistence_id, expected_revision)
+        }
+        // persistence_ids is intentionally not overridden: the trait default
+        // errors, so this test fails loudly if any path scans the store.
+    }
+
+    #[tokio::test]
+    async fn store_operations_do_not_scan_persistence_ids() {
+        let store = A2APushConfigStore::new(NoScanStore(InMemoryDurableStateStore::new()))
+            .with_credential_policy(A2APushCredentialPolicy::RedactAndRecordPresence);
+        store
+            .save("tenant-a", config("task-1", "cfg-1"))
+            .await
+            .expect("save cfg-1");
+        store
+            .save("tenant-a", config("task-1", "cfg-2"))
+            .await
+            .expect("save cfg-2");
+
+        store
+            .get("tenant-a", "task-1", "cfg-1")
+            .await
+            .expect("get without scan");
+        let listed = store
+            .list(
+                "tenant-a",
+                &ListTaskPushNotificationConfigsRequest {
+                    task_id: "task-1".to_string(),
+                    page_size: None,
+                    page_token: None,
+                    tenant: Some("tenant-a".to_string()),
+                },
+            )
+            .await
+            .expect("list without scan");
+        assert_eq!(listed.configs.len(), 2);
+        assert_eq!(
+            store
+                .active_configs("tenant-a", "task-1")
+                .await
+                .expect("active without scan")
+                .len(),
+            2
+        );
+
+        store
+            .delete("tenant-a", "task-1", "cfg-1")
+            .await
+            .expect("delete without scan");
+        assert_eq!(
+            store
+                .active_configs("tenant-a", "task-1")
+                .await
+                .expect("active after delete")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn per_task_configs_are_bounded() {
+        let store = permissive_store();
+        for index in 0..(MAX_PUSH_CONFIGS_PER_TASK + 10) {
+            store
+                .save("tenant-a", config("task-1", &format!("cfg-{index}")))
+                .await
+                .expect("save");
+        }
+        assert!(
+            store
+                .active_configs("tenant-a", "task-1")
+                .await
+                .expect("active")
+                .len()
+                <= MAX_PUSH_CONFIGS_PER_TASK,
+            "per-task config count must stay bounded"
+        );
+    }
+
     #[tokio::test]
     async fn identical_resave_skips_audit_and_audit_stays_bounded() {
         let durable = InMemoryDurableStateStore::<A2APushConfigState>::new();
@@ -1083,14 +1298,9 @@ mod tests {
             .save("tenant-a", config("task-1", "cfg-1"))
             .await
             .expect("re-save");
-        let persisted = durable
-            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
-            .await
-            .expect("load")
-            .expect("state")
-            .state;
+        let entry = load_entry(&durable, "tenant-a", "task-1", "cfg-1").await;
         assert_eq!(
-            persisted.audit.len(),
+            entry.audit.len(),
             1,
             "identical re-save must not append audit records"
         );
@@ -1101,16 +1311,11 @@ mod tests {
             updated.url = format!("https://example.com/hook-{index}");
             store.save("tenant-a", updated).await.expect("update");
         }
-        let persisted = durable
-            .load(&push_config_persistence_id("tenant-a", "task-1", "cfg-1"))
-            .await
-            .expect("load")
-            .expect("state")
-            .state;
+        let entry = load_entry(&durable, "tenant-a", "task-1", "cfg-1").await;
         assert!(
-            persisted.audit.len() <= MAX_PUSH_CONFIG_AUDIT_RECORDS,
+            entry.audit.len() <= MAX_PUSH_CONFIG_AUDIT_RECORDS,
             "audit trail must stay bounded, got {}",
-            persisted.audit.len()
+            entry.audit.len()
         );
     }
 
