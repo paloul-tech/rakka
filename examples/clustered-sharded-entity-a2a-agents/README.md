@@ -101,6 +101,11 @@ deployments should use HA/managed services, external secret management, network
 policy around private remoting/etcd/PostgreSQL, and an HTTPS load balancer whose
 URL is supplied through `RAKKA_A2A_PUBLIC_URL`.
 
+See [`doc/kubernetes-testing.md`](doc/kubernetes-testing.md) for a step-by-step
+guide to building the Docker image, loading it into a cluster, applying the
+stack, driving the A2A API, and testing routing, drain, failover, and durable
+recovery.
+
 See [`doc/phase-6-production-topology.md`](doc/phase-6-production-topology.md)
 for the Phase 6 topology, drain, telemetry, autoscaling, failure-injection, and
 production-candidate review contract.
