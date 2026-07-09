@@ -1,8 +1,16 @@
 # Clustered Sharded Entity A2A Agents
 
-Phase 6 runnable example for exposing durable Rakka agent runs through the A2A
-Rust SDK with clustered sharded run ownership. This example is the incubator for
-a future `rakka-a2a` crate; no reusable public Rakka A2A API is introduced here.
+Runnable example for exposing durable Rakka agent runs through the A2A Rust SDK
+with clustered sharded run ownership.
+
+As of Phase 7 this example is a thin **product composition** over the reusable
+[`rakka-a2a`](../../crates/rakka-a2a) crate. All reusable A2A adapter behavior —
+the durable request handler, task projection and streaming replay, push config
+persistence and dispatch boundary, the sharded run owner host, the owner router,
+the dynamic agent card, and route composition — lives in `rakka-a2a`. This
+example supplies only the demo workflow, environment configuration, file/etcd
+discovery, the example durable stores, Kubernetes manifests, and run
+instructions. See the crate for the reusable public API and its own tests.
 
 ## SDK Choice
 
@@ -93,6 +101,11 @@ deployments should use HA/managed services, external secret management, network
 policy around private remoting/etcd/PostgreSQL, and an HTTPS load balancer whose
 URL is supplied through `RAKKA_A2A_PUBLIC_URL`.
 
+See [`doc/kubernetes-testing.md`](doc/kubernetes-testing.md) for a step-by-step
+guide to building the Docker image, loading it into a cluster, applying the
+stack, driving the A2A API, and testing routing, drain, failover, and durable
+recovery.
+
 See [`doc/phase-6-production-topology.md`](doc/phase-6-production-topology.md)
 for the Phase 6 topology, drain, telemetry, autoscaling, failure-injection, and
 production-candidate review contract.
@@ -154,19 +167,21 @@ Implemented:
 - Agent cards advertise streaming support and use `RAKKA_A2A_PUBLIC_URL` for
   load-balanced production URLs.
 
-Not implemented in Phase 6:
+Reusable behavior promoted into `rakka-a2a` (Phase 7):
 
-- A production HTTP webhook dispatcher for the scheduled A2A push outbox
-  effects. The durable effect record carries the callback target and bounded
-  labels; an adapter-owned worker should resolve any credential binding and send
-  the webhook. The agent card keeps `push_notifications=false` until delivery
-  exists.
+- A production push dispatch boundary: `rakka_a2a::dispatch::A2APushDispatcher`
+  sends A2A push webhooks from the durable notification effects, resolving any
+  credential binding at send time, with retry/exhaustion metrics. This example
+  keeps `push_notifications=false` on its card because it wires no dispatcher.
+- A shared PostgreSQL A2A task-projection and task-event store
+  (`rakka_a2a::postgres`) that any node reads for cross-node replay without owner
+  polling. This example still uses the in-memory task projection store and owner
+  polling for cross-node replay; point `rakka-a2a` at its PostgreSQL store to get
+  shared durable replay.
+
+Still out of scope for this example:
+
 - Step execution to completion or peer A2A calls.
-- A shared PostgreSQL A2A task-event projection table. The example rebuilds
-  current task projections from durable run/inbox state and uses owner polling
-  for cross-node replay; a reusable `rakka-a2a` crate should promote task-event
-  replay to a shared durable projection.
-- A reusable `rakka-a2a` crate or top-level `rakka` facade feature.
 
 ## SSE And Load Balancers
 

@@ -1,4 +1,8 @@
-//! Bounded stream admission and example-local stream metrics.
+//! Bounded stream admission and stream metrics.
+
+// The request handler (Slice 7.4) is the in-crate consumer of the admission
+// internals; until it lands only the public settings/snapshot types are used.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -6,10 +10,13 @@ use std::sync::{Arc, Mutex, Weak};
 const DEFAULT_MAX_NODE_STREAMS: usize = 128;
 const DEFAULT_MAX_TASK_STREAMS: usize = 32;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct A2AStreamLimitSettings {
-    pub(crate) max_node_streams: usize,
-    pub(crate) max_task_streams: usize,
+/// Bounded admission limits for A2A streaming subscribers on one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct A2AStreamLimitSettings {
+    /// Maximum concurrently open streams on this node.
+    pub max_node_streams: usize,
+    /// Maximum concurrently open streams per task on this node.
+    pub max_task_streams: usize,
 }
 
 impl Default for A2AStreamLimitSettings {
@@ -21,16 +28,28 @@ impl Default for A2AStreamLimitSettings {
     }
 }
 
+/// Bounded counters describing stream admission and delivery on one node.
+///
+/// An operational snapshot, never a correctness source. Labels and fields
+/// stay bounded: no task ids, payloads, or errors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct A2AStreamMetricsSnapshot {
-    pub(crate) open_streams: usize,
-    pub(crate) opened_streams: u64,
-    pub(crate) closed_streams: u64,
-    pub(crate) over_limit_streams: u64,
-    pub(crate) lagged_streams: u64,
-    pub(crate) dropped_streams: u64,
-    pub(crate) replay_requests: u64,
-    pub(crate) replay_latency_millis: u64,
+pub struct A2AStreamMetricsSnapshot {
+    /// Streams currently open.
+    pub open_streams: usize,
+    /// Total streams admitted since start.
+    pub opened_streams: u64,
+    /// Total streams closed since start.
+    pub closed_streams: u64,
+    /// Admissions rejected by node or task limits.
+    pub over_limit_streams: u64,
+    /// Streams ended because the subscriber lagged the event buffer.
+    pub lagged_streams: u64,
+    /// Streams dropped by disconnect or owner unavailability.
+    pub dropped_streams: u64,
+    /// Replay requests served on stream open.
+    pub replay_requests: u64,
+    /// Total replay latency across replay requests, in milliseconds.
+    pub replay_latency_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +135,6 @@ impl A2AStreamLimits {
             .saturating_add(latency_millis);
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> A2AStreamMetricsSnapshot {
         self.inner
             .lock()

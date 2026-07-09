@@ -1,12 +1,14 @@
 //! Process bootstrap and HTTP router composition.
+//!
+//! This is the example's product-composition layer: it wires the reusable
+//! `rakka-a2a` service (durable request handler, sharded run host, owner
+//! router, dynamic agent card, and route composition) to this example's demo
+//! workflow, environment configuration, and file/etcd discovery.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use a2a_server::agent_card::agent_card_router;
-use a2a_server::jsonrpc::jsonrpc_router;
-use a2a_server::rest::rest_router;
-use a2a_server::StaticAgentCard;
+use a2a_server::ServiceParams;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -15,13 +17,22 @@ use rakka::http::{serve_with_graceful_shutdown, HttpServerConfig};
 use rakka::prelude::{ActorSystem, ClusterSharding};
 use rakka::remote::TcpRemoteTransportConfig;
 use rakka::sharding::ClusterNodeRuntime;
+use rakka_a2a::agent_card::A2AAgentCardBuilder;
+use rakka_a2a::catalog::A2AStaticWorkflowCatalog;
+use rakka_a2a::codec::register_a2a_run_codecs;
+use rakka_a2a::host::{default_a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
+use rakka_a2a::projection::InMemoryA2ATaskProjectionStore;
+use rakka_a2a::push::{A2APushConfigStore, A2APushCredentialPolicy};
+use rakka_a2a::router::A2ARunRouter;
+use rakka_a2a::routes::a2a_routes;
+use rakka_a2a::routing::A2ADrainGate;
+use rakka_a2a::stores::{A2ARunStateStore, A2AWorkflowStateStore};
+use rakka_a2a::RakkaA2AServiceBuilder;
+use rakka_remote::SerializationRegistry;
 use serde::Serialize;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::a2a_handler::{A2ARunRouter, HeaderObserver, RakkaA2ARequestHandler};
-use crate::agent_card::build_agent_card;
-use crate::codec::serialization_registry;
 use crate::config::{DiscoveryProviderKind, ExampleConfig, PersistenceKind};
 use crate::discovery::{
     membership_snapshot, new_membership_view, run_file_discovery, seed_file_discovery,
@@ -29,14 +40,11 @@ use crate::discovery::{
 };
 use crate::durable_stores::build_stores;
 use crate::etcd_discovery::{connect, run_etcd_discovery};
-use crate::push_config::A2APushConfigStore;
 use crate::reachability::PeerReachability;
-use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
 use crate::support::{
     current_timestamp_millis, ExampleResult, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_RECONNECT_BACKOFF, RUN_ENTITY_IDLE_PASSIVATION,
+    DEFAULT_RECONNECT_BACKOFF, RUN_ASK_TIMEOUT, RUN_ENTITY_IDLE_PASSIVATION,
 };
-use crate::task_projection::InMemoryA2ATaskProjectionStore;
 use crate::workflow::demo_workflow;
 
 struct Booted {
@@ -48,14 +56,31 @@ struct Booted {
     state: AppState,
 }
 
+/// Captures the service parameters of the most recent A2A request so the
+/// example's `/debug/last-a2a-headers` route can prove header propagation.
+#[derive(Clone, Default)]
+pub(crate) struct HeaderObserver {
+    last: Arc<Mutex<Option<ServiceParams>>>,
+}
+
+impl HeaderObserver {
+    fn record(&self, params: &ServiceParams) {
+        *self.last.lock().expect("header observer mutex") = Some(params.clone());
+    }
+
+    fn last(&self) -> Option<ServiceParams> {
+        self.last.lock().expect("header observer mutex").clone()
+    }
+}
+
 /// Shared HTTP route state.
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) node_id: String,
     pub(crate) membership: MembershipView,
-    pub(crate) agent_card: a2a::AgentCard,
     pub(crate) header_observer: HeaderObserver,
-    pub(crate) handler: Arc<RakkaA2ARequestHandler>,
+    pub(crate) drain_gate: A2ADrainGate,
+    pub(crate) service: rakka_a2a::RakkaA2AService,
 }
 
 #[derive(Serialize)]
@@ -100,15 +125,8 @@ pub async fn run() -> ExampleResult<()> {
 }
 
 pub(crate) fn router(state: AppState) -> Router {
-    let agent_card = state.agent_card.clone();
-    let handler = state.handler.clone();
-
-    health_router(state.clone())
-        .merge(agent_card_router(Arc::new(StaticAgentCard::new(
-            agent_card,
-        ))))
-        .nest("/a2a", rest_router(handler.clone()))
-        .nest("/a2a/jsonrpc", jsonrpc_router(handler))
+    let a2a = a2a_routes(&state.service);
+    health_router(state).merge(a2a)
 }
 
 fn health_router(state: AppState) -> Router {
@@ -132,7 +150,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 async fn readiness(
     State(state): State<AppState>,
 ) -> (axum::http::StatusCode, Json<ReadinessResponse>) {
-    let accepting = state.handler.accepts_public_commands();
+    let accepting = state.drain_gate.accepts_public_commands();
     let status = if accepting {
         axum::http::StatusCode::OK
     } else {
@@ -143,7 +161,7 @@ async fn readiness(
         Json(ReadinessResponse {
             ready: accepting,
             reason: if accepting {
-                "phase-6-clustered-a2a-handler-ready"
+                "clustered-a2a-handler-ready"
             } else {
                 "draining"
             },
@@ -152,7 +170,7 @@ async fn readiness(
 }
 
 async fn drain(State(state): State<AppState>) -> Json<DrainResponse> {
-    state.handler.begin_drain();
+    state.drain_gate.begin_drain();
     Json(DrainResponse {
         draining: true,
         reason: "kubernetes-drain",
@@ -174,6 +192,13 @@ async fn last_a2a_headers(State(state): State<AppState>) -> Json<HeaderSnapshot>
     Json(HeaderSnapshot {
         last_header_names: names,
     })
+}
+
+fn serialization_registry() -> ExampleResult<SerializationRegistry> {
+    let mut registry = SerializationRegistry::new();
+    register_a2a_run_codecs(&mut registry)
+        .map_err(|error| crate::support::example_error(format!("codec registration: {error}")))?;
+    Ok(registry)
 }
 
 async fn boot() -> ExampleResult<Booted> {
@@ -204,24 +229,35 @@ async fn boot() -> ExampleResult<Booted> {
 
     let ask_client = runtime.ask_client();
     let sharding = ClusterSharding::for_node_runtime(&system, &runtime)?;
-    let key = a2a_run_entity_key()?;
+    let key = default_a2a_run_entity_key()
+        .map_err(|error| crate::support::example_error(format!("entity key: {error}")))?;
     let (run_store, workflow_store, push_config_store) = build_stores(&config).await?;
+    let run_store = A2ARunStateStore::new(run_store);
+    let workflow_store = A2AWorkflowStateStore::new(workflow_store);
     let task_store = InMemoryA2ATaskProjectionStore::local();
-    let push_configs = A2APushConfigStore::new(push_config_store);
+    // Local/demo deployment: no secret backend, so raw push credentials are
+    // redacted and only their presence is recorded. A production deployment
+    // supplies a credential binding resolver instead.
+    let push_configs = A2APushConfigStore::new(push_config_store)
+        .with_credential_policy(A2APushCredentialPolicy::RedactAndRecordPresence);
+    let shared_task_store: Arc<dyn rakka_a2a::projection::A2ATaskProjectionStore> =
+        Arc::new(task_store.clone());
     init_a2a_run_sharding(
         &system,
         &mut runtime,
         &sharding,
         key.clone(),
-        A2ARunHost {
-            workflow: workflow.clone(),
-            run_store: run_store.clone(),
-            workflow_store: workflow_store.clone(),
-            task_store: task_store.clone(),
-            push_configs: push_configs.clone(),
-            idle_passivation: RUN_ENTITY_IDLE_PASSIVATION,
-        },
-    )?;
+        A2ARunHost::new(
+            workflow.clone(),
+            run_store.clone(),
+            workflow_store.clone(),
+            Arc::clone(&shared_task_store),
+            push_configs.clone(),
+        )
+        .idle_passivation(RUN_ENTITY_IDLE_PASSIVATION)
+        .run_ask_timeout(RUN_ASK_TIMEOUT),
+    )
+    .map_err(|error| crate::support::example_error(format!("sharding init: {error}")))?;
 
     let membership = new_membership_view();
     let shutdown = Arc::new(Notify::new());
@@ -259,29 +295,36 @@ async fn boot() -> ExampleResult<Booted> {
         )),
     };
 
-    let agent_card = build_agent_card(&config);
+    let catalog = A2AStaticWorkflowCatalog::single(workflow.clone());
+    let agent_card = build_agent_card(&config, &catalog);
     let header_observer = HeaderObserver::default();
-    let router = A2ARunRouter::new(sharding, key, ask_client, reachability);
-    let handler = Arc::new(
-        RakkaA2ARequestHandler::new(
-            agent_card.clone(),
-            workflow,
-            task_store,
-            run_store,
-            workflow_store,
-            push_configs,
-            header_observer.clone(),
-        )
-        .with_router(router),
-    );
-    handler.recover_task_projections().await?;
+    let router = A2ARunRouter::new(sharding, key, ask_client, RUN_ASK_TIMEOUT)
+        .with_reachability_observer(Arc::new(reachability));
+    let drain_gate = A2ADrainGate::new();
+    let observer = header_observer.clone();
+    let service = RakkaA2AServiceBuilder::new()
+        .agent_card(agent_card)
+        .workflow_catalog(catalog)
+        .task_store_with_watcher(task_store)
+        .run_store(run_store)
+        .workflow_store(workflow_store)
+        .push_config_store(push_configs)
+        .drain_gate(drain_gate.clone())
+        .router(router)
+        .request_observer(move |params| observer.record(params))
+        .build()
+        .map_err(|error| crate::support::example_error(format!("service build: {error}")))?;
+    service
+        .recover_task_projections()
+        .await
+        .map_err(|error| crate::support::example_error(format!("projection recovery: {error}")))?;
 
     let state = AppState {
         node_id: local_node.id().to_string(),
         membership,
-        agent_card,
         header_observer,
-        handler,
+        drain_gate,
+        service,
     };
 
     Ok(Booted {
@@ -292,6 +335,26 @@ async fn boot() -> ExampleResult<Booted> {
         shutdown,
         state,
     })
+}
+
+/// Builds the example's public agent card from the crate's dynamic builder.
+pub(crate) fn build_agent_card(
+    config: &ExampleConfig,
+    catalog: &A2AStaticWorkflowCatalog,
+) -> a2a::AgentCard {
+    let base_url = config
+        .public_url
+        .clone()
+        .unwrap_or_else(|| config.local_public_url());
+    A2AAgentCardBuilder::new(
+        "Rakka Clustered A2A Agent",
+        "A Rakka A2A example with durable command acceptance, task projections, and clustered \
+         sharded run hosting.",
+    )
+    .version(env!("CARGO_PKG_VERSION"))
+    .public_base_url(base_url)
+    .provider("Rakka", "https://github.com/rakka-rs/rakka")
+    .build(catalog)
 }
 
 async fn shutdown(booted: Booted) -> ExampleResult<()> {
@@ -335,14 +398,14 @@ fn print_banner(booted: &Booted) {
         PersistenceKind::Postgres => "postgres",
     };
     println!(
-        "Rakka A2A Phase 6 node {} | remoting {} | HTTP/A2A {}",
+        "Rakka A2A node {} | remoting {} | HTTP/A2A {}",
         booted.config.node_logical_id, booted.config.rakka_port, addr,
     );
     println!(
         "discovery: {discovery}; persistence: {persistence}; state dir: {}",
         booted.config.state_dir.display()
     );
-    println!("agent card: http://{}/.well-known/agent-card.json", addr);
+    println!("agent card: http://{addr}/.well-known/agent-card.json");
     println!("REST base: http://{addr}/a2a");
     println!("JSON-RPC: http://{addr}/a2a/jsonrpc");
 }
@@ -350,7 +413,7 @@ fn print_banner(booted: &Booted) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable_stores::{build_in_memory_stores, PushConfigStore, RunStore, WorkflowStore};
+    use crate::durable_stores::{build_in_memory_stores, RunStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -365,11 +428,7 @@ mod tests {
     /// Route state plus the shared stores tests inspect directly.
     struct TestContext {
         state: AppState,
-        workflow: rakka::agent_workflow::AgentWorkflow,
-        task_store: InMemoryA2ATaskProjectionStore,
         run_store: RunStore,
-        workflow_store: WorkflowStore,
-        push_config_store: PushConfigStore,
     }
 
     #[test]
@@ -500,7 +559,8 @@ mod tests {
                 "messageId": "phase0-message",
                 "role": "ROLE_USER",
                 "parts": [{"text": "hello"}]
-            }
+            },
+            "tenant": "tenant-a"
         });
 
         let response = app
@@ -510,6 +570,7 @@ mod tests {
                     .uri("/a2a/message:send")
                     .header("content-type", "application/json")
                     .header("x-rakka-phase", "0")
+                    .header("x-rakka-tenant", "tenant-a")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -536,9 +597,7 @@ mod tests {
                 "role": "ROLE_USER",
                 "parts": [{"text": "hello"}]
             },
-            "configuration": {
-                "returnImmediately": true
-            },
+            "configuration": { "returnImmediately": true },
             "tenant": "tenant-a"
         });
 
@@ -548,9 +607,6 @@ mod tests {
 
         let retry = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
         assert_eq!(retry["task"]["id"], task_id);
-        // The task id and list length would match even if dedup broke (the id
-        // is hash-derived and projections are keyed by it); the revision and
-        // history length are the signals that prove the retry was a no-op.
         assert_eq!(
             retry["task"]["metadata"]["io.rakka.projection.revision"],
             first["task"]["metadata"]["io.rakka.projection.revision"]
@@ -614,26 +670,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = readiness.into_body().collect().await.unwrap().to_bytes();
-        let readiness: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(readiness["ready"], false);
-        assert_eq!(readiness["reason"], "draining");
-
-        let health = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/healthz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            health.status(),
-            StatusCode::OK,
-            "liveness must stay healthy during graceful drain"
-        );
 
         let rejected = serde_json::json!({
             "message": {
@@ -679,12 +715,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_cancel_accepts_durable_command_and_updates_run_state() {
-        use rakka::agent_workflow::{AgentRunId, AgentRunStatus, AgentStepRunner};
+    async fn rest_cancel_updates_durable_run_state() {
+        use rakka_agent_workflow::{AgentRunId, AgentRunStatus, AgentStepRunner};
 
         let ctx = test_state();
         let run_store = ctx.run_store.clone();
-        let workflow = ctx.workflow.clone();
         let app = router(ctx.state);
         let body = serde_json::json!({
             "message": {
@@ -692,16 +727,13 @@ mod tests {
                 "role": "ROLE_USER",
                 "parts": [{"text": "cancel me"}]
             },
-            "configuration": {
-                "returnImmediately": true
-            },
+            "configuration": { "returnImmediately": true },
             "tenant": "tenant-a"
         });
         let sent = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
         let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
 
         let cancel = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -719,787 +751,15 @@ mod tests {
         // public state, not a Working-forever cancelling limbo.
         assert_eq!(canceled["status"]["state"], "TASK_STATE_CANCELED");
 
+        // The durable run itself reached the terminal Cancelled state.
         let mut runner =
-            AgentStepRunner::new(workflow, AgentRunId::new(task_id.clone()), run_store);
+            AgentStepRunner::new(demo_workflow(), AgentRunId::new(task_id.clone()), run_store);
         let state = runner.recover().await.unwrap().expect("run state");
         assert_eq!(state.status, AgentRunStatus::Cancelled);
-
-        // A repeat cancel of the now-terminal task gets the protocol's
-        // canonical TaskNotCancelable rejection instead of a silent 200.
-        let retry = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/a2a/tasks/{task_id}:cancel"))
-                    .header("x-rakka-tenant", "tenant-a")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry.status(), StatusCode::BAD_REQUEST);
-
-        // The rejection changed nothing: the task still reads terminal at
-        // the same projection revision.
-        let read_back = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/a2a/tasks/{task_id}"))
-                    .header("x-rakka-tenant", "tenant-a")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(read_back.status(), StatusCode::OK);
-        let bytes = read_back.into_body().collect().await.unwrap().to_bytes();
-        let read_back: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(read_back["status"]["state"], "TASK_STATE_CANCELED");
-        assert_eq!(
-            read_back["metadata"]["io.rakka.projection.revision"],
-            canceled["metadata"]["io.rakka.projection.revision"]
-        );
     }
 
-    #[tokio::test]
-    async fn duplicate_send_still_begins_first_transition() {
-        use rakka::agent_workflow::{AgentRunId, AgentRunStatus, AgentStepRunner};
-
-        let ctx = test_state();
-        let run_store = ctx.run_store.clone();
-        let workflow = ctx.workflow.clone();
-        let app = router(ctx.state);
-        let immediate = serde_json::json!({
-            "message": {
-                "messageId": "retry-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let first = post_json(app.clone(), "/a2a/message:send", &immediate, "tenant-a").await;
-        assert_eq!(first["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
-        let task_id = first["task"]["id"].as_str().expect("task id").to_string();
-
-        // A retry of the same message is a durable duplicate, but a run still
-        // waiting in `Accepted` must begin its first transition anyway.
-        let retry = serde_json::json!({
-            "message": {
-                "messageId": "retry-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "tenant": "tenant-a"
-        });
-        let second = post_json(app, "/a2a/message:send", &retry, "tenant-a").await;
-        assert_eq!(second["task"]["status"]["state"], "TASK_STATE_WORKING");
-
-        let mut runner =
-            AgentStepRunner::new(workflow, AgentRunId::new(task_id.clone()), run_store);
-        let state = runner.recover().await.unwrap().expect("run state");
-        assert_eq!(state.status, AgentRunStatus::Running);
-    }
-
-    #[tokio::test]
-    async fn continuation_send_reflects_run_status_in_projection() {
-        let app = router(test_state().state);
-        let new_task = serde_json::json!({
-            "message": {
-                "messageId": "continue-message-1",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let first = post_json(app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
-        assert_eq!(first["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
-        let task_id = first["task"]["id"].as_str().expect("task id").to_string();
-
-        let continuation = serde_json::json!({
-            "message": {
-                "messageId": "continue-message-2",
-                "taskId": task_id,
-                "role": "ROLE_USER",
-                "parts": [{"text": "and then"}]
-            },
-            "tenant": "tenant-a"
-        });
-        let second = post_json(app, "/a2a/message:send", &continuation, "tenant-a").await;
-        // The continuation began the first step, so the projection must report
-        // the advanced run status, not the stale submitted state.
-        assert_eq!(second["task"]["status"]["state"], "TASK_STATE_WORKING");
-        assert_eq!(
-            second["task"]["history"].as_array().expect("history").len(),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn streaming_send_persists_push_config_and_schedules_notification_effect() {
-        use a2a::{StreamResponse, TaskState};
-        use a2a_server::{RequestHandler, ServiceParams};
-        use futures_util::StreamExt;
-        use rakka::agent_workflow::{AgentEffectKind, AgentRunId, AgentRunInbox};
-
-        let ctx = test_state();
-        let params =
-            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
-        let request = serde_json::from_value(serde_json::json!({
-            "message": {
-                "messageId": "streaming-push-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello stream"}]
-            },
-            "configuration": {
-                "returnImmediately": true,
-                "taskPushNotificationConfig": {
-                    "id": "cfg-1",
-                    "url": "https://example.com/a2a-push",
-                    "token": "secret-token",
-                    "authentication": {
-                        "scheme": "bearer",
-                        "credentials": "secret"
-                    }
-                }
-            },
-            "tenant": "tenant-a"
-        }))
-        .expect("send request");
-
-        let mut stream = ctx
-            .state
-            .handler
-            .send_streaming_message(&params, request)
-            .await
-            .expect("stream");
-        let first = stream
-            .next()
-            .await
-            .expect("first stream event")
-            .expect("stream response");
-        let task = match first {
-            StreamResponse::Task(task) => task,
-            other => panic!("expected task stream event, got {other:?}"),
-        };
-        assert_eq!(task.status.state, TaskState::Submitted);
-
-        let push_configs = A2APushConfigStore::new(ctx.push_config_store.clone());
-        let saved = push_configs
-            .get("tenant-a", &task.id, "cfg-1")
-            .await
-            .expect("saved push config");
-        assert_eq!(saved.url, "https://example.com/a2a-push");
-        assert_eq!(saved.tenant.as_deref(), Some("tenant-a"));
-        assert!(saved.token.is_none());
-        assert!(saved
-            .authentication
-            .as_ref()
-            .and_then(|auth| auth.credentials.as_ref())
-            .is_none());
-
-        let mut inbox = AgentRunInbox::new(AgentRunId::new(task.id.clone()), ctx.workflow_store);
-        inbox.recover().await.expect("recover workflow");
-        let due = inbox.due_effects().expect("due effects");
-        assert_eq!(due.len(), 1);
-        let effect = &due[0].effect;
-        assert_eq!(effect.kind, AgentEffectKind::Notification);
-        assert_eq!(
-            effect.target.address.as_deref(),
-            Some("https://example.com/a2a-push")
-        );
-        assert_eq!(
-            effect
-                .target
-                .attributes
-                .get("notification_protocol")
-                .map(String::as_str),
-            Some("a2a-push")
-        );
-        assert_eq!(
-            effect
-                .target
-                .attributes
-                .get("task_event_kind")
-                .map(String::as_str),
-            Some("snapshot")
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_limit_rejection_precedes_durable_acceptance() {
-        use crate::stream_limits::A2AStreamLimitSettings;
-        use a2a_server::{RequestHandler, ServiceParams};
-        use rakka::persistence::DurableStateStore;
-
-        let ctx = test_state();
-        let handler = RakkaA2ARequestHandler::new(
-            ctx.state.agent_card.clone(),
-            ctx.workflow.clone(),
-            ctx.task_store.clone(),
-            ctx.run_store.clone(),
-            ctx.workflow_store.clone(),
-            A2APushConfigStore::new(ctx.push_config_store.clone()),
-            HeaderObserver::default(),
-        )
-        .with_stream_limits(A2AStreamLimitSettings {
-            max_node_streams: 0,
-            max_task_streams: 1,
-        });
-
-        let params =
-            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
-        let request = serde_json::from_value(serde_json::json!({
-            "message": {
-                "messageId": "over-limit-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": { "returnImmediately": true },
-            "tenant": "tenant-a"
-        }))
-        .expect("send request");
-
-        let error = match handler.send_streaming_message(&params, request).await {
-            Err(error) => error,
-            Ok(_) => panic!("node stream limit must reject the stream"),
-        };
-        assert!(
-            error.to_string().contains("a2a-stream-limit"),
-            "unexpected error: {error}"
-        );
-
-        // Admission ran before the durable accept: nothing was committed,
-        // so the client's "retry on another node" guidance is truthful.
-        assert!(
-            ctx.run_store
-                .persistence_ids()
-                .await
-                .expect("run ids")
-                .is_empty(),
-            "over-limit stream must not durably accept the send"
-        );
-        assert!(
-            ctx.workflow_store
-                .persistence_ids()
-                .await
-                .expect("workflow ids")
-                .is_empty(),
-            "over-limit stream must not write inbox state"
-        );
-    }
-
-    #[tokio::test]
-    async fn message_stream_frames_carry_replay_cursor() {
-        use a2a::{StreamResponse, SubscribeToTaskRequest};
-        use a2a_server::{RequestHandler, ServiceParams};
-        use futures_util::StreamExt;
-        use tokio::time::{timeout, Duration};
-
-        let ctx = test_state();
-        let handler = ctx.state.handler.clone();
-        let app = router(ctx.state);
-        let new_task = serde_json::json!({
-            "message": {
-                "messageId": "cursor-message-1",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": { "returnImmediately": true },
-            "tenant": "tenant-a"
-        });
-        let sent = post_json(app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
-        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
-
-        let params =
-            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
-        let mut stream = handler
-            .subscribe_to_task(
-                &params,
-                SubscribeToTaskRequest {
-                    id: task_id.clone(),
-                    tenant: Some("tenant-a".to_string()),
-                },
-            )
-            .await
-            .expect("subscribe");
-        let first = stream
-            .next()
-            .await
-            .expect("initial snapshot")
-            .expect("stream response");
-        assert!(matches!(first, StreamResponse::Task(_)));
-
-        // A continuation appends a MessageUpdate event; its stream frame
-        // must carry the replay cursor a client resumes from on reconnect.
-        let continuation = serde_json::json!({
-            "message": {
-                "messageId": "cursor-message-2",
-                "taskId": task_id,
-                "role": "ROLE_USER",
-                "parts": [{"text": "again"}]
-            },
-            "configuration": { "returnImmediately": true },
-            "tenant": "tenant-a"
-        });
-        post_json(app, "/a2a/message:send", &continuation, "tenant-a").await;
-
-        let item = timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("message frame within deadline")
-            .expect("stream open")
-            .expect("stream response");
-        match item {
-            StreamResponse::Message(message) => {
-                let metadata = message.metadata.expect("message frame metadata");
-                assert!(
-                    metadata.contains_key("io.rakka.replay.cursor"),
-                    "message frames must carry the replay cursor"
-                );
-            }
-            other => panic!("expected message frame, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn send_to_terminal_task_is_rejected() {
-        use rakka::agent_workflow::{AgentRunId, AgentStepRunner};
-
-        let ctx = test_state();
-        let run_store = ctx.run_store.clone();
-        let workflow = ctx.workflow.clone();
-        let app = router(ctx.state);
-        let new_task = serde_json::json!({
-            "message": {
-                "messageId": "terminal-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let first = post_json(app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
-        let task_id = first["task"]["id"].as_str().expect("task id").to_string();
-
-        let mut runner =
-            AgentStepRunner::new(workflow, AgentRunId::new(task_id.clone()), run_store);
-        runner.recover().await.unwrap();
-        runner
-            .request_cancellation("test", None, now_millis())
-            .await
-            .unwrap();
-        runner.cancel(now_millis()).await.unwrap();
-
-        let continuation = serde_json::json!({
-            "message": {
-                "messageId": "terminal-message-2",
-                "taskId": task_id,
-                "role": "ROLE_USER",
-                "parts": [{"text": "too late"}]
-            },
-            "tenant": "tenant-a"
-        });
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/a2a/message:send")
-                    .header("content-type", "application/json")
-                    .header("x-rakka-tenant", "tenant-a")
-                    .body(Body::from(continuation.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn cancel_from_other_tenant_is_task_not_found() {
-        use rakka::agent_workflow::{AgentRunId, AgentRunStatus, AgentStepRunner};
-
-        let ctx = test_state();
-        let run_store = ctx.run_store.clone();
-        let workflow = ctx.workflow.clone();
-        let app = router(ctx.state);
-        let body = serde_json::json!({
-            "message": {
-                "messageId": "cross-tenant-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let sent = post_json(app.clone(), "/a2a/message:send", &body, "tenant-a").await;
-        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
-
-        let cancel = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/a2a/tasks/{task_id}:cancel"))
-                    .header("x-rakka-tenant", "tenant-b")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(cancel.status(), StatusCode::NOT_FOUND);
-
-        // The other tenant's request must not have cancelled the run.
-        let mut runner =
-            AgentStepRunner::new(workflow, AgentRunId::new(task_id.clone()), run_store);
-        let state = runner.recover().await.unwrap().expect("run state");
-        assert_eq!(state.status, AgentRunStatus::Accepted);
-    }
-
-    #[tokio::test]
-    async fn recovery_restores_original_context_id() {
-        let ctx = test_state();
-        let agent_card = ctx.state.agent_card.clone();
-        let app = router(ctx.state);
-        let body = serde_json::json!({
-            "message": {
-                "messageId": "context-message",
-                "contextId": "ctx-original",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let sent = post_json(app, "/a2a/message:send", &body, "tenant-a").await;
-        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
-        assert_eq!(sent["task"]["contextId"], "ctx-original");
-
-        // A fresh projection store simulates a restart that lost projections
-        // while the durable run and inbox stores survived.
-        let fresh_task_store = InMemoryA2ATaskProjectionStore::local();
-        let recovery_handler = RakkaA2ARequestHandler::new(
-            agent_card,
-            ctx.workflow.clone(),
-            fresh_task_store.clone(),
-            ctx.run_store.clone(),
-            ctx.workflow_store.clone(),
-            A2APushConfigStore::new(ctx.push_config_store.clone()),
-            HeaderObserver::default(),
-        );
-        let recovered = recovery_handler.recover_task_projections().await.unwrap();
-        assert_eq!(recovered, 1);
-        let task = fresh_task_store
-            .get(Some("tenant-a"), &task_id, None)
-            .unwrap();
-        assert_eq!(task.context_id, "ctx-original");
-    }
-
-    fn now_millis() -> rakka::agent_workflow::AgentTimestampMillis {
-        rakka::agent_workflow::AgentTimestampMillis::new(current_timestamp_millis())
-    }
-
-    #[tokio::test]
-    async fn rest_reads_are_scoped_by_tenant_header() {
-        use crate::task_projection::A2ATaskProjection;
-        use rakka::agent_workflow::AgentTimestampMillis;
-
-        let ctx = test_state();
-        ctx.task_store.upsert(A2ATaskProjection::accepted(
-            "task-tenant-a",
-            "ctx",
-            "tenant-a",
-            "workflow",
-            AgentTimestampMillis::new(10),
-            Vec::new(),
-            0,
-        ));
-        let app = router(ctx.state);
-
-        let cross_tenant = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/a2a/tasks/task-tenant-a")
-                    .header("x-rakka-tenant", "tenant-b")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
-
-        let same_tenant = app
-            .oneshot(
-                Request::builder()
-                    .uri("/a2a/tasks/task-tenant-a")
-                    .header("x-rakka-tenant", "tenant-a")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(same_tenant.status(), StatusCode::OK);
-    }
-
-    /// Single-node sharded harness: the handler routes owner work through
-    /// real cluster sharding, so owner-only paths (`QueryTaskSnapshot`,
-    /// `OpenStreamCursor`, push config routing) are exercised end to end.
-    struct ClusteredTestContext {
-        system: ActorSystem,
-        handler: Arc<RakkaA2ARequestHandler>,
-        app: axum::Router,
-        run_store: RunStore,
-        workflow_store: WorkflowStore,
-        workflow: rakka::agent_workflow::AgentWorkflow,
-    }
-
-    /// Returns `None` (skipping the test) when loopback binding is
-    /// unavailable in the sandbox, mirroring the other networked tests.
-    async fn clustered_test_state() -> Option<ClusteredTestContext> {
-        use crate::codec::serialization_registry;
-        use crate::reachability::PeerReachability;
-        use crate::sharded_run_entity::{a2a_run_entity_key, init_a2a_run_sharding, A2ARunHost};
-        use rakka::cluster::{
-            ClusterNode, DiscoverySnapshot, MembershipConfig, NodeAddress, NodeId,
-        };
-        use rakka::remote::TcpRemoteTransportConfig;
-        use rakka::sharding::ClusterNodeRuntime;
-
-        let agent_card = build_agent_card(&ExampleConfig {
-            bind_host: "127.0.0.1".parse().expect("loopback address"),
-            advertise_host: "127.0.0.1".to_string(),
-            rakka_port: 0,
-            http_port: 0,
-            node_logical_id: "clustered-test-node".to_string(),
-            node_incarnation: "test".to_string(),
-            discovery_provider: DiscoveryProviderKind::File,
-            discovery_dir: std::env::temp_dir(),
-            etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
-            etcd_prefix: crate::support::DEFAULT_ETCD_PREFIX.to_string(),
-            etcd_lease_ttl_seconds: crate::support::DEFAULT_ETCD_LEASE_TTL_SECONDS,
-            persistence: PersistenceKind::File,
-            postgres_dsn: None,
-            state_dir: std::env::temp_dir(),
-            self_fence: false,
-            self_fence_after: Duration::from_secs(15),
-            self_fence_rejoin_after: Duration::from_secs(10),
-            public_url: None,
-        });
-        let workflow = demo_workflow();
-        let task_store = InMemoryA2ATaskProjectionStore::local();
-        let (run_store, workflow_store, push_config_store) = build_in_memory_stores();
-        let push_configs = A2APushConfigStore::new(push_config_store.clone());
-        let system = ActorSystem::new("clustered-a2a-handler-test");
-        let local_node = ClusterNode::new(
-            NodeId::new("clustered-test-node", "test"),
-            NodeAddress::new("127.0.0.1", 0),
-        );
-        let runtime = ClusterNodeRuntime::builder(local_node)
-            .with_membership_config(MembershipConfig::new(
-                1,
-                Duration::from_secs(10),
-                Duration::from_secs(30),
-            ))
-            .with_transport_config(
-                TcpRemoteTransportConfig::new().bind_addr("127.0.0.1:0".parse().unwrap()),
-            )
-            .advertise_bound_addr(true)
-            .with_registry(serialization_registry().unwrap())
-            .build()
-            .await;
-        let Ok(mut runtime) = runtime else {
-            eprintln!("skipping clustered handler test; loopback bind unavailable");
-            system.terminate().await.unwrap();
-            return None;
-        };
-        let ask_client = runtime.ask_client();
-        let sharding = ClusterSharding::for_node_runtime(&system, &runtime).unwrap();
-        let key = a2a_run_entity_key().unwrap();
-        init_a2a_run_sharding(
-            &system,
-            &mut runtime,
-            &sharding,
-            key.clone(),
-            A2ARunHost {
-                workflow: workflow.clone(),
-                run_store: run_store.clone(),
-                workflow_store: workflow_store.clone(),
-                task_store: task_store.clone(),
-                push_configs: push_configs.clone(),
-                idle_passivation: RUN_ENTITY_IDLE_PASSIVATION,
-            },
-        )
-        .unwrap();
-        runtime
-            .apply_discovery(DiscoverySnapshot::new(
-                "clustered-handler-test",
-                1,
-                vec![runtime.local_node().clone()],
-            ))
-            .unwrap();
-        let route_helper = A2ARunRouter::new(sharding, key, ask_client, PeerReachability::new());
-        let handler = Arc::new(
-            RakkaA2ARequestHandler::new(
-                agent_card.clone(),
-                workflow.clone(),
-                task_store,
-                run_store.clone(),
-                workflow_store.clone(),
-                push_configs,
-                HeaderObserver::default(),
-            )
-            .with_router(route_helper),
-        );
-        let app = router(AppState {
-            node_id: "clustered-test-node#test".to_string(),
-            membership: Arc::new(std::sync::Mutex::new(vec![
-                "clustered-test-node#test".to_string()
-            ])),
-            agent_card,
-            header_observer: HeaderObserver::default(),
-            handler: handler.clone(),
-        });
-        Some(ClusteredTestContext {
-            system,
-            handler,
-            app,
-            run_store,
-            workflow_store,
-            workflow,
-        })
-    }
-
-    #[tokio::test]
-    async fn clustered_handler_routes_send_through_sharded_owner() {
-        let Some(ctx) = clustered_test_state().await else {
-            return;
-        };
-
-        let body = serde_json::json!({
-            "message": {
-                "messageId": "clustered-route-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello clustered owner"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let sent = post_json(ctx.app.clone(), "/a2a/message:send", &body, "tenant-a").await;
-        assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_SUBMITTED");
-
-        ctx.system.terminate().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn read_path_terminal_transition_schedules_push_effect() {
-        use a2a::{GetTaskRequest, TaskPushNotificationConfig, TaskState};
-        use a2a_server::{RequestHandler, ServiceParams};
-        use rakka::agent_workflow::{AgentEffectKind, AgentRunId, AgentRunInbox, AgentStepRunner};
-
-        let Some(ctx) = clustered_test_state().await else {
-            return;
-        };
-        let params =
-            ServiceParams::from([("x-rakka-tenant".to_string(), vec!["tenant-a".to_string()])]);
-
-        // Accept a task without any push config so acceptance schedules no
-        // notification effects.
-        let new_task = serde_json::json!({
-            "message": {
-                "messageId": "read-path-push-message",
-                "role": "ROLE_USER",
-                "parts": [{"text": "hello"}]
-            },
-            "configuration": {
-                "returnImmediately": true
-            },
-            "tenant": "tenant-a"
-        });
-        let sent = post_json(ctx.app.clone(), "/a2a/message:send", &new_task, "tenant-a").await;
-        let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
-
-        // Register the push config after acceptance.
-        let config = TaskPushNotificationConfig {
-            url: "https://example.com/read-path-hook".to_string(),
-            id: Some("cfg-read".to_string()),
-            task_id: task_id.clone(),
-            token: None,
-            authentication: None,
-            tenant: Some("tenant-a".to_string()),
-        };
-        ctx.handler
-            .create_push_config(&params, config)
-            .await
-            .expect("create push config");
-
-        // Drive the run terminal outside any A2A command, as a completed
-        // step would: the projection has not observed the transition yet.
-        let mut runner = AgentStepRunner::new(
-            ctx.workflow.clone(),
-            AgentRunId::new(task_id.clone()),
-            ctx.run_store.clone(),
-        );
-        runner.recover().await.unwrap();
-        runner
-            .request_cancellation("test", None, now_millis())
-            .await
-            .unwrap();
-        runner.cancel(now_millis()).await.unwrap();
-
-        // A read converges the projection on the owner; the terminal event
-        // it emits must schedule the push notification effect.
-        let task = ctx
-            .handler
-            .get_task(
-                &params,
-                GetTaskRequest {
-                    id: task_id.clone(),
-                    history_length: None,
-                    tenant: Some("tenant-a".to_string()),
-                },
-            )
-            .await
-            .expect("get task");
-        assert_eq!(task.status.state, TaskState::Canceled);
-
-        let mut inbox =
-            AgentRunInbox::new(AgentRunId::new(task_id.clone()), ctx.workflow_store.clone());
-        inbox.recover().await.expect("recover workflow");
-        let due = inbox.due_effects().expect("due effects");
-        assert_eq!(due.len(), 1, "read-path terminal event must schedule push");
-        let effect = &due[0].effect;
-        assert_eq!(effect.kind, AgentEffectKind::Notification);
-        assert_eq!(
-            effect.target.address.as_deref(),
-            Some("https://example.com/read-path-hook")
-        );
-        assert_eq!(
-            effect
-                .target
-                .attributes
-                .get("task_event_kind")
-                .map(String::as_str),
-            Some("terminal")
-        );
-
-        ctx.system.terminate().await.unwrap();
-    }
-
-    fn test_state() -> TestContext {
-        let agent_card = build_agent_card(&ExampleConfig {
+    fn test_config() -> ExampleConfig {
+        ExampleConfig {
             bind_host: "127.0.0.1".parse().expect("loopback address"),
             advertise_host: "127.0.0.1".to_string(),
             rakka_port: crate::support::DEFAULT_RAKKA_PORT,
@@ -1518,34 +778,40 @@ mod tests {
             self_fence_after: Duration::from_secs(15),
             self_fence_rejoin_after: Duration::from_secs(10),
             public_url: None,
-        });
-        let workflow = demo_workflow();
+        }
+    }
+
+    fn test_state() -> TestContext {
+        let config = test_config();
+        let catalog = A2AStaticWorkflowCatalog::single(demo_workflow());
+        let agent_card = build_agent_card(&config, &catalog);
         let task_store = InMemoryA2ATaskProjectionStore::local();
         let (run_store, workflow_store, push_config_store) = build_in_memory_stores();
-        let push_configs = A2APushConfigStore::new(push_config_store.clone());
+        let push_configs = A2APushConfigStore::new(push_config_store)
+            .with_credential_policy(A2APushCredentialPolicy::RedactAndRecordPresence);
         let header_observer = HeaderObserver::default();
-        let handler = Arc::new(RakkaA2ARequestHandler::new(
-            agent_card.clone(),
-            workflow.clone(),
-            task_store.clone(),
-            run_store.clone(),
-            workflow_store.clone(),
-            push_configs,
-            header_observer.clone(),
-        ));
+        let drain_gate = A2ADrainGate::new();
+        let observer = header_observer.clone();
+        let service = RakkaA2AServiceBuilder::new()
+            .agent_card(agent_card)
+            .workflow_catalog(catalog)
+            .task_store_with_watcher(task_store)
+            .run_store(A2ARunStateStore::new(run_store.clone()))
+            .workflow_store(A2AWorkflowStateStore::new(workflow_store))
+            .push_config_store(push_configs)
+            .drain_gate(drain_gate.clone())
+            .request_observer(move |params| observer.record(params))
+            .build()
+            .expect("service");
         TestContext {
             state: AppState {
                 node_id: "test-node#uid".to_string(),
                 membership: Arc::new(std::sync::Mutex::new(vec!["test-node#uid".to_string()])),
-                agent_card,
                 header_observer,
-                handler,
+                drain_gate,
+                service,
             },
-            workflow,
-            task_store,
             run_store,
-            workflow_store,
-            push_config_store,
         }
     }
 

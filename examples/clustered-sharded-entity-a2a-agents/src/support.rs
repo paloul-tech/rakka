@@ -11,9 +11,6 @@ pub type ExampleError = Box<dyn Error + Send + Sync>;
 /// Result type used by the example.
 pub type ExampleResult<T> = Result<T, ExampleError>;
 
-/// Number of shards used by the demo agent-run entity type.
-pub const NUMBER_OF_SHARDS: u32 = 32;
-
 /// Default Rakka TCP remoting port for local development.
 pub const DEFAULT_RAKKA_PORT: u16 = 25_580;
 
@@ -50,9 +47,6 @@ pub const RUN_ENTITY_IDLE_PASSIVATION: Duration = Duration::from_secs(120);
 
 /// Bounded workflow type label used by the demo workflow.
 pub const WORKFLOW_TYPE: &str = "a2a-phase-2-demo";
-
-/// Bounded entity type name for sharded agent runs in this example.
-pub const ENTITY_TYPE: &str = "A2AAgentRun";
 
 /// Reads an environment variable as a `u16`, falling back to `default`.
 pub fn env_u16(name: &str, default: u16) -> ExampleResult<u16> {

@@ -1338,6 +1338,8 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
 ]
 
 [[package]]
@@ -1591,6 +1593,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rakka"
 version = "0.1.0"
 dependencies = [
+ "rakka-a2a",
  "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",
@@ -1605,6 +1608,34 @@ dependencies = [
  "rakka-stream",
  "rakka-testkit",
  "rakka-workflow",
+]
+
+[[package]]
+name = "rakka-a2a"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "a2a-server-lf",
+ "async-trait",
+ "axum 0.8.9",
+ "chrono",
+ "futures-util",
+ "http-body-util",
+ "rakka-agent-workflow",
+ "rakka-cluster",
+ "rakka-core",
+ "rakka-http",
+ "rakka-k8s",
+ "rakka-persistence",
+ "rakka-persistence-postgres",
+ "rakka-remote",
+ "rakka-sharding",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tower 0.5.3",
+ "tracing",
 ]
 
 [[package]]
@@ -1713,13 +1744,13 @@ version = "0.1.0"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",
- "async-trait",
  "axum 0.8.9",
- "chrono",
- "futures-util",
  "http-body-util",
  "rakka",
+ "rakka-a2a",
+ "rakka-agent-workflow",
  "rakka-persistence-postgres",
+ "rakka-remote",
  "serde",
  "serde_json",
  "tokio",

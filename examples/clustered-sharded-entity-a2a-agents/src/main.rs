@@ -2,28 +2,20 @@
 
 //! Clustered sharded-entity A2A agent example.
 //!
-//! This example is intentionally an incubator, not a reusable `rakka-a2a`
-//! crate. It preserves the public A2A request-handler boundary while routing
-//! durable run ownership through Rakka cluster sharding.
+//! This example is a thin product composition over the reusable `rakka-a2a`
+//! crate: it supplies a demo workflow, environment configuration, file/etcd
+//! discovery, Kubernetes manifests, and local run instructions, while all the
+//! reusable A2A adapter behavior (durable request handling, task projection,
+//! streaming replay, push persistence, and sharded run ownership) lives in
+//! `rakka-a2a`.
 
-mod a2a_handler;
-mod a2a_mapping;
-mod agent_card;
-#[cfg(test)]
-mod cluster_tests;
-mod codec;
 mod config;
 mod discovery;
 mod durable_stores;
 mod etcd_discovery;
-mod protocol;
-mod push_config;
 mod reachability;
 mod server;
-mod sharded_run_entity;
-mod stream_limits;
 mod support;
-mod task_projection;
 mod workflow;
 
 use support::ExampleResult;

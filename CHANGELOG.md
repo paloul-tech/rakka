@@ -13,6 +13,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - `scripts/package-check.sh` as the offline package metadata and publishability check entry point.
 - V1 release-candidate review docs for reliability boundaries, N/N+1 rolling updates, known limitations, post-v1 roadmap, and final review checklist.
 - Phase 5 agent workflow autonomy APIs: effect target catalog and policy validation, A2A peer adapter contracts, dispatcher registry routing, A2A peer/webhook/push dispatch classes, and deterministic dispatcher cancellation marking.
+- `rakka-a2a`: a reusable A2A protocol adapter crate for durable Rakka agent-workflow runs. It provides A2A-to-Rakka command mapping, an async task projection store with in-memory and PostgreSQL implementations, durable public task-event streaming replay with a bounded-interval PostgreSQL event watcher, a builder-based durable A2A SDK `RequestHandler` with tenant-resolver/authorizer/workflow-catalog hooks, a sharded run owner host and cluster owner router, a push notification config store with credential redaction plus a push dispatch boundary, a dynamic agent-card builder, axum route composition, and bounded observability snapshots. Exposed through the gated `rakka` facade features `a2a`, `a2a-server`, `a2a-sharding`, `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, and `a2a-testkit`. The `clustered-sharded-entity-a2a-agents` example is now a thin product composition over this crate.
 
 ### Changed
 

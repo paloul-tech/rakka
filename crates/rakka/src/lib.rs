@@ -146,6 +146,15 @@ pub mod prelude {
         register_managed_process_shutdown_task, register_process_actor_stop_task,
         PROCESS_ACTOR_STOP_TASK_GRACE,
     };
+
+    #[cfg(feature = "a2a")]
+    pub use rakka_a2a::RakkaA2AHandlerError;
+
+    #[cfg(feature = "a2a-server")]
+    pub use rakka_a2a::{
+        RakkaA2ABuildError, RakkaA2ARequestHandler, RakkaA2AService, RakkaA2AServiceBuilder,
+        RakkaA2ASettings,
+    };
 }
 
 /// Actor runtime primitives.
@@ -157,6 +166,16 @@ pub mod actor {
 /// Agentic workflow orchestration facade.
 pub mod agent_workflow {
     pub use rakka_agent_workflow::*;
+}
+
+#[cfg(feature = "a2a")]
+/// A2A protocol adapter for durable agent workflow runs.
+///
+/// Enable with the `a2a` facade feature (plus `a2a-server`, `a2a-sharding`,
+/// `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, or `a2a-testkit` for the
+/// corresponding adapter surfaces).
+pub mod a2a {
+    pub use rakka_a2a::*;
 }
 
 #[cfg(feature = "cluster")]

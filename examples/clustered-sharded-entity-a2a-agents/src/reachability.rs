@@ -6,6 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use rakka_a2a::routing::A2APeerReachabilityObserver;
+
 #[derive(Default)]
 struct Window {
     attempts: u64,
@@ -39,7 +41,6 @@ impl PeerReachability {
     ///
     /// Returns `None` when there is no meaningful evidence.
     #[must_use]
-    #[allow(dead_code)]
     pub fn evaluate_and_reset(&self, member_count: usize) -> Option<bool> {
         let Ok(mut window) = self.window.lock() else {
             return None;
@@ -51,6 +52,12 @@ impl PeerReachability {
             return None;
         }
         Some(failures < attempts)
+    }
+}
+
+impl A2APeerReachabilityObserver for PeerReachability {
+    fn record(&self, reachable: bool) {
+        PeerReachability::record(self, reachable);
     }
 }
 

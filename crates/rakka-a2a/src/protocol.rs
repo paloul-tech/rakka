@@ -1,18 +1,21 @@
-//! Remote-safe protocol between public A2A ingress nodes and sharded run owners.
+//! Remote-safe protocol between public A2A ingress nodes and sharded run
+//! owners.
 //!
-//! These payloads are the only values serialized over Rakka remoting for this
-//! example. They intentionally exclude process-local values such as `ReplyTo`,
-//! actor refs, store handles, and `Arc`.
+//! These payloads are the only values this crate serializes over Rakka
+//! remoting. They intentionally exclude process-local values such as
+//! `ReplyTo`, actor refs, store handles, and `Arc`. The protocol version,
+//! remote schema version, and message type ids below are compatibility
+//! commitments across rolling updates.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use a2a::{Message, TaskPushNotificationConfig};
-use rakka::agent_workflow::{AgentTimestampMillis, ArtifactRef};
+use rakka_agent_workflow::{AgentTimestampMillis, ArtifactRef};
 use serde::{Deserialize, Serialize};
 
-use crate::a2a_mapping::{A2ACommandDraft, A2ATaskIntent};
-use crate::task_projection::{A2ATaskEvent, A2ATaskProjection};
+use crate::mapping::{A2ACommandDraft, A2ATaskIntent};
+use crate::task::{A2ATaskEvent, A2ATaskProjection};
 
 /// Current adapter-owned inter-node protocol version.
 pub const A2A_RUN_PROTOCOL_VERSION: u32 = 1;
@@ -21,10 +24,10 @@ pub const A2A_RUN_PROTOCOL_VERSION: u32 = 1;
 pub const A2A_RUN_REMOTE_SCHEMA_VERSION: u32 = 1;
 
 /// Stable remote message type id for owner requests.
-pub const A2A_RUN_REQUEST_TYPE_ID: &str = "rakka.examples.a2a.A2ARunRequest";
+pub const A2A_RUN_REQUEST_TYPE_ID: &str = "rakka.a2a.A2ARunRequest";
 
 /// Stable remote message type id for owner responses.
-pub const A2A_RUN_RESPONSE_TYPE_ID: &str = "rakka.examples.a2a.A2ARunResponse";
+pub const A2A_RUN_RESPONSE_TYPE_ID: &str = "rakka.a2a.A2ARunResponse";
 
 /// Adapter-owned request routed to the sharded run owner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,8 +40,10 @@ pub struct A2ARunRequest {
     ///
     /// `None` marks an unscoped read: the owner resolves the run's stored
     /// tenant instead of enforcing a caller-supplied one, mirroring the
-    /// local-mode projection store's unscoped read semantics. Durable
-    /// commands (accept, cancel) always carry `Some` canonical tenant.
+    /// single-tenant projection store's unscoped read semantics. This is a
+    /// single-tenant/local-mode affordance only; tenant-scoped services
+    /// never issue unscoped reads. Durable commands (accept, cancel) always
+    /// carry `Some` canonical tenant.
     pub tenant: Option<String>,
     /// Bounded command metadata used for routing diagnostics and evolution.
     pub command: A2ARunCommandMetadata,
@@ -107,12 +112,12 @@ pub enum A2ARunRequestKind {
         /// Replay cursor supplied by the client, if any.
         after_cursor: Option<String>,
     },
-    /// Record a push notification config for a later push phase.
+    /// Record a push notification config through the owner.
     RecordPushConfig {
-        /// Public push config to store durably in a later phase.
+        /// Public push config to store durably.
         config: TaskPushNotificationConfig,
     },
-    /// Delete a push notification config for a later push phase.
+    /// Delete a push notification config through the owner.
     DeletePushConfig {
         /// Config id or URL chosen by the public adapter.
         config_id: String,
@@ -332,12 +337,12 @@ pub enum A2ARunResponseKind {
         /// re-bootstrap from the projection snapshot.
         resync: bool,
     },
-    /// Push config recorded by a later push phase.
+    /// Push config recorded through the owner.
     PushConfigRecorded {
         /// Stored push notification config.
         config: TaskPushNotificationConfig,
     },
-    /// Push config deleted by a later push phase.
+    /// Push config deleted through the owner.
     PushConfigDeleted,
     /// Request failed on the owner.
     Failure {
@@ -360,7 +365,7 @@ pub enum A2ARunFailureKind {
     Unavailable,
     /// Request used an unsupported protocol version.
     VersionMismatch,
-    /// Operation is intentionally deferred to a later phase.
+    /// Operation is not supported by this owner.
     Unsupported,
     /// Internal owner failure.
     Internal,
@@ -403,6 +408,17 @@ impl A2ARunFailure {
             "a2a-run-protocol-version",
             format!("unsupported A2A run protocol version {version}"),
             A2ARunFailureKind::VersionMismatch,
+            false,
+        )
+    }
+
+    /// Failure for an operation the owner does not support.
+    #[must_use]
+    pub fn unsupported(operation: &str) -> Self {
+        Self::new(
+            "a2a-run-unsupported-operation",
+            format!("unsupported A2A run owner operation {operation}"),
+            A2ARunFailureKind::Unsupported,
             false,
         )
     }

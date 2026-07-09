@@ -1,7 +1,9 @@
 //! A2A wire-to-Rakka workflow conversion boundary.
 //!
 //! This module normalizes public A2A identity and metadata before the request
-//! handler crosses the durable Rakka inbox boundary.
+//! handler crosses the durable Rakka inbox boundary. The `io.rakka.*`
+//! metadata keys, the derived deduplication-key shape, and the stable
+//! [`A2AMappingError::code`] strings are compatibility commitments.
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -9,7 +11,7 @@ use std::fmt::{self, Display, Formatter};
 
 use a2a::{CancelTaskRequest, Message, Part, PartContent, SendMessageRequest};
 use a2a_server::ServiceParams;
-use rakka::agent_workflow::{
+use rakka_agent_workflow::{
     extract_agent_trace_context, parse_agent_trace_context, validate_command, AgentAttributes,
     AgentCausationId, AgentCommand, AgentCommandId, AgentCommandKind, AgentCommandMetadata,
     AgentCorrelationId, AgentDeduplicationKey, AgentDurabilityMetadata, AgentFacadeError,
@@ -23,7 +25,6 @@ use serde_json::Value;
 use crate::support::current_timestamp_millis;
 
 /// Metadata key for the adapter schema version.
-#[allow(dead_code)]
 pub const META_ADAPTER_VERSION: &str = "io.rakka.adapter.version";
 /// Metadata key for selecting a workflow id.
 pub const META_WORKFLOW_ID: &str = "io.rakka.workflow.id";
@@ -50,7 +51,11 @@ pub const META_TRACEPARENT: &str = "io.rakka.trace.traceparent";
 /// Metadata tracestate fallback used when transport headers are unavailable.
 pub const META_TRACESTATE: &str = "io.rakka.trace.tracestate";
 
-/// Default tenant used by local examples when no authenticated/request tenant exists.
+/// Service parameter (header) keys accepted as the canonical tenant source.
+pub const TENANT_HEADERS: [&str; 2] = ["x-rakka-tenant", "x-tenant-id"];
+
+/// Default tenant used in single-tenant/local mode when no authenticated or
+/// request tenant exists.
 pub const DEFAULT_TENANT: &str = "public";
 /// Default signal type for A2A continuation messages.
 pub const DEFAULT_SIGNAL_TYPE: &str = "a2a.message";
@@ -87,7 +92,7 @@ pub enum A2AMappingError {
         /// Conflicting metadata value.
         metadata: String,
     },
-    /// The selected workflow does not match the hosted workflow.
+    /// The selected workflow does not match a hosted workflow.
     InvalidWorkflowSelection {
         /// Workflow selection field.
         field: &'static str,
@@ -96,6 +101,8 @@ pub enum A2AMappingError {
         /// Actual value.
         actual: String,
     },
+    /// A tenant is required but none was resolved.
+    TenantRequired,
     /// A payload exceeded inline policy and no artifact strategy is enabled.
     PayloadTooLarge {
         /// Observed payload size.
@@ -112,6 +119,9 @@ pub enum A2AMappingError {
 
 impl A2AMappingError {
     /// Stable machine-readable validation code.
+    ///
+    /// Compatibility commitment: these codes surface in A2A error messages
+    /// and bounded adapter metrics labels.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
@@ -119,6 +129,7 @@ impl A2AMappingError {
             Self::InvalidMetadata { .. } => "invalid-metadata",
             Self::MetadataConflict { .. } => "metadata-conflict",
             Self::InvalidWorkflowSelection { .. } => "invalid-workflow-selection",
+            Self::TenantRequired => "tenant-required",
             Self::PayloadTooLarge { .. } => "payload-too-large",
             Self::CommandValidation { .. } => "command-validation",
         }
@@ -148,6 +159,7 @@ impl Display for A2AMappingError {
                 f,
                 "invalid workflow selection {field}: expected `{expected}`, got `{actual}`"
             ),
+            Self::TenantRequired => f.write_str("tenant is required"),
             Self::PayloadTooLarge {
                 size_bytes,
                 limit_bytes,
@@ -180,7 +192,9 @@ pub enum A2ATenantSource {
     ServiceParams,
     /// Tenant came from the A2A request field.
     Request,
-    /// Local development fallback.
+    /// Tenant came from an application-supplied resolver.
+    Resolver,
+    /// Single-tenant/local development fallback.
     Default,
 }
 
@@ -195,8 +209,74 @@ pub enum A2ATaskIntent {
 }
 
 impl A2ATaskIntent {
-    const fn is_new(self) -> bool {
+    pub(crate) const fn is_new(self) -> bool {
         matches!(self, Self::NewTask)
+    }
+}
+
+/// Resolves the canonical tenant for A2A commands and reads.
+///
+/// The default implementation ([`A2AHeaderTenantResolver`]) uses header-first
+/// precedence over the request tenant with conflict rejection. Applications
+/// with authenticated multi-tenant traffic must supply their own resolver
+/// that derives the tenant from verified transport identity, and must build
+/// the service in tenant-scoped mode so unscoped reads are refused.
+pub trait A2ATenantResolver: Send + Sync + 'static {
+    /// Resolves the tenant for a durable command.
+    ///
+    /// Returning `Ok(None)` means "no tenant input"; the handler then either
+    /// applies the single-tenant default or rejects, depending on mode.
+    fn resolve_command_tenant(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+    ) -> A2AMappingResult<Option<(String, A2ATenantSource)>>;
+
+    /// Resolves the tenant scope for a read.
+    ///
+    /// Returning `Ok(None)` requests an unscoped read, which is only
+    /// permitted in single-tenant/local mode.
+    fn resolve_read_tenant(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+    ) -> A2AMappingResult<Option<String>> {
+        Ok(self
+            .resolve_command_tenant(params, request_tenant)?
+            .map(|(tenant, _)| tenant))
+    }
+}
+
+/// Header-first tenant resolution with conflict rejection.
+///
+/// Accepts `x-rakka-tenant` / `x-tenant-id` service parameters as canonical,
+/// falls back to the request tenant, and rejects disagreements between the
+/// two. This resolver trusts transport headers, so it is only appropriate
+/// behind an ingress that authenticates and sets them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct A2AHeaderTenantResolver;
+
+impl A2ATenantResolver for A2AHeaderTenantResolver {
+    fn resolve_command_tenant(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+    ) -> A2AMappingResult<Option<(String, A2ATenantSource)>> {
+        let service_tenant = TENANT_HEADERS
+            .iter()
+            .find_map(|header| first_service_param(params, header));
+        if let (Some(service), Some(request)) = (service_tenant.as_deref(), request_tenant) {
+            reject_conflict("tenant", service, request, "request.tenant")?;
+        }
+
+        if let Some(tenant) = service_tenant {
+            return Ok(Some((tenant, A2ATenantSource::ServiceParams)));
+        }
+        let Some(tenant) = request_tenant else {
+            return Ok(None);
+        };
+        require_non_blank(tenant, "tenant")?;
+        Ok(Some((tenant.to_string(), A2ATenantSource::Request)))
     }
 }
 
@@ -257,7 +337,7 @@ pub struct A2APayloadPolicy {
 }
 
 impl A2APayloadPolicy {
-    /// Default local example policy.
+    /// Default bounded policy: 4 KiB inline with artifact references enabled.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -268,9 +348,15 @@ impl A2APayloadPolicy {
 
     /// Returns a policy that rejects anything too large for inline payloads.
     #[must_use]
-    #[allow(dead_code)]
     pub const fn without_artifact_strategy(mut self) -> Self {
         self.allow_artifact_references = false;
+        self
+    }
+
+    /// Returns a policy with a custom inline payload limit.
+    #[must_use]
+    pub const fn inline_limit_bytes(mut self, limit_bytes: u64) -> Self {
+        self.inline_limit_bytes = limit_bytes;
         self
     }
 }
@@ -285,7 +371,7 @@ impl Default for A2APayloadPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum A2ACommandPayload {
-    /// The complete bounded message can be persisted inline by a later phase.
+    /// The complete bounded message can be persisted inline.
     Inline(InlineState),
     /// Message parts are represented by artifact drafts pairing each reference
     /// with the source content that must be persisted behind it.
@@ -307,10 +393,10 @@ impl A2ACommandPayload {
 
 /// Artifact reference plus the source content it stands for.
 ///
-/// Only `reference` may reach durable state. A later phase must persist
-/// `content` behind `reference.uri` (computing a real checksum at that point)
-/// before durable inbox acceptance; `content` is `None` when the part already
-/// lives at an external URL.
+/// Only `reference` may reach durable state. The application's artifact
+/// strategy must persist `content` behind `reference.uri` (computing a real
+/// checksum at that point) before durable inbox acceptance; `content` is
+/// `None` when the part already lives at an external URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A2AArtifactDraft {
     /// Bounded, reference-only artifact metadata safe for durable state.
@@ -326,19 +412,93 @@ pub struct A2ACommandDraft {
     pub normalized: NormalizedA2ACommand,
     /// Validated Rakka agent command.
     pub command: AgentCommand,
-    /// Payload to persist before durable inbox acceptance in a later phase.
+    /// Payload to persist before durable inbox acceptance.
     pub payload: A2ACommandPayload,
+}
+
+/// Workflow selection extracted from A2A request/message metadata.
+///
+/// Every field is optional; an empty selection resolves to the catalog's
+/// default workflow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct A2AWorkflowSelection {
+    /// Selected workflow id, from [`META_WORKFLOW_ID`].
+    pub workflow_id: Option<String>,
+    /// Selected workflow type, from [`META_WORKFLOW_TYPE`].
+    pub workflow_type: Option<String>,
+    /// Selected definition version, from [`META_DEFINITION_VERSION`].
+    pub definition_version: Option<String>,
+}
+
+impl A2AWorkflowSelection {
+    /// Extracts the workflow selection from merged request metadata.
+    pub fn from_metadata(metadata: &HashMap<String, Value>) -> A2AMappingResult<Self> {
+        Ok(Self {
+            workflow_id: metadata_string(metadata, META_WORKFLOW_ID)?,
+            workflow_type: metadata_string(metadata, META_WORKFLOW_TYPE)?,
+            definition_version: metadata_string(metadata, META_DEFINITION_VERSION)?,
+        })
+    }
+
+    /// Extracts the workflow selection from a send-message request.
+    pub fn from_send_message_request(request: &SendMessageRequest) -> A2AMappingResult<Self> {
+        let merged = merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())?;
+        Self::from_metadata(&merged)
+    }
+
+    /// True when no selection field is present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.workflow_id.is_none()
+            && self.workflow_type.is_none()
+            && self.definition_version.is_none()
+    }
+
+    /// True when `workflow` satisfies every present selection field.
+    #[must_use]
+    pub fn matches(&self, workflow: &AgentWorkflow) -> bool {
+        self.workflow_id
+            .as_deref()
+            .is_none_or(|id| id == workflow.workflow_id.as_str())
+            && self
+                .workflow_type
+                .as_deref()
+                .is_none_or(|workflow_type| workflow_type == workflow.workflow_type)
+            && self
+                .definition_version
+                .as_deref()
+                .is_none_or(|version| version == workflow.definition_version.as_str())
+    }
+}
+
+/// Resolved tenant input shared by the normalization functions.
+pub(crate) fn canonical_tenant(
+    resolver: &dyn A2ATenantResolver,
+    default_tenant: Option<&str>,
+    params: &ServiceParams,
+    request_tenant: Option<&str>,
+) -> A2AMappingResult<(AgentTenantId, A2ATenantSource)> {
+    if let Some((tenant, source)) = resolver.resolve_command_tenant(params, request_tenant)? {
+        return Ok((AgentTenantId::new(tenant), source));
+    }
+    match default_tenant {
+        Some(tenant) => Ok((AgentTenantId::new(tenant), A2ATenantSource::Default)),
+        None => Err(A2AMappingError::TenantRequired),
+    }
 }
 
 /// Normalizes a send-message request without accepting it durably.
 pub fn normalize_send_message_request(
+    resolver: &dyn A2ATenantResolver,
+    default_tenant: Option<&str>,
     params: &ServiceParams,
     request: &SendMessageRequest,
     workflow: &AgentWorkflow,
-    _received_at: AgentTimestampMillis,
 ) -> A2AMappingResult<NormalizedA2ACommand> {
     let merged = merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())?;
     normalize_message(
+        resolver,
+        default_tenant,
         params,
         &request.message,
         request.tenant.as_deref(),
@@ -349,13 +509,16 @@ pub fn normalize_send_message_request(
 
 /// Builds a complete command draft for `message:send`.
 pub fn build_send_message_command_draft(
+    resolver: &dyn A2ATenantResolver,
+    default_tenant: Option<&str>,
     params: &ServiceParams,
     request: &SendMessageRequest,
     workflow: &AgentWorkflow,
     policy: A2APayloadPolicy,
     received_at: AgentTimestampMillis,
 ) -> A2AMappingResult<A2ACommandDraft> {
-    let normalized = normalize_send_message_request(params, request, workflow, received_at)?;
+    let normalized =
+        normalize_send_message_request(resolver, default_tenant, params, request, workflow)?;
     let payload = convert_message_payload(&request.message, &normalized, policy, received_at)?;
     let kind = command_kind_for_message(&normalized)?;
     build_command_draft(
@@ -369,13 +532,16 @@ pub fn build_send_message_command_draft(
 
 /// Builds a cancellation command draft without durable acceptance.
 pub fn build_cancel_task_command_draft(
+    resolver: &dyn A2ATenantResolver,
+    default_tenant: Option<&str>,
     params: &ServiceParams,
     request: &CancelTaskRequest,
     workflow: &AgentWorkflow,
     received_at: AgentTimestampMillis,
 ) -> A2AMappingResult<A2ACommandDraft> {
     require_non_blank(&request.id, "id")?;
-    let (tenant, tenant_source) = canonical_tenant(params, request.tenant.as_deref())?;
+    let (tenant, tenant_source) =
+        canonical_tenant(resolver, default_tenant, params, request.tenant.as_deref())?;
     let context_id = request.id.clone();
     let metadata = request.metadata.clone().unwrap_or_default();
     validate_workflow_selection(&metadata, workflow)?;
@@ -423,7 +589,10 @@ pub fn build_cancel_task_command_draft(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_message(
+    resolver: &dyn A2ATenantResolver,
+    default_tenant: Option<&str>,
     params: &ServiceParams,
     message: &Message,
     request_tenant: Option<&str>,
@@ -433,7 +602,8 @@ fn normalize_message(
     require_non_blank(&message.message_id, "message.message_id")?;
     validate_workflow_selection(metadata, workflow)?;
 
-    let (tenant, tenant_source) = canonical_tenant(params, request_tenant)?;
+    let (tenant, tenant_source) =
+        canonical_tenant(resolver, default_tenant, params, request_tenant)?;
     let (task_id, intent) = match message.task_id.as_deref() {
         Some(task_id) if !task_id.trim().is_empty() => {
             (task_id.to_string(), A2ATaskIntent::ContinueTask)
@@ -710,7 +880,9 @@ fn artifact_draft_for_part(
     })
 }
 
-fn merged_metadata(
+/// Merges request- and message-level metadata, rejecting `io.rakka.*`
+/// conflicts between the two levels.
+pub(crate) fn merged_metadata(
     request_metadata: Option<&HashMap<String, Value>>,
     message_metadata: Option<&HashMap<String, Value>>,
 ) -> A2AMappingResult<HashMap<String, Value>> {
@@ -764,46 +936,17 @@ fn validate_selection(
     Ok(())
 }
 
-fn canonical_tenant(
-    params: &ServiceParams,
-    request_tenant: Option<&str>,
-) -> A2AMappingResult<(AgentTenantId, A2ATenantSource)> {
-    let (tenant, source) = resolved_tenant(params, request_tenant)?
-        .unwrap_or_else(|| (DEFAULT_TENANT.to_string(), A2ATenantSource::Default));
-    Ok((AgentTenantId::new(tenant), source))
-}
-
 /// Resolves the tenant scope shared by A2A read paths.
 ///
-/// Reads use the command paths' header-first precedence and conflict
-/// rejection, but do not apply the local development default: with no tenant
-/// input the result is `None` and the projection store mode decides whether
-/// unscoped reads are permitted.
+/// Reads use the command paths' precedence and conflict rejection, but do not
+/// apply the single-tenant default: with no tenant input the result is `None`
+/// and the caller's tenant mode decides whether unscoped reads are permitted.
 pub fn canonical_read_tenant(
+    resolver: &dyn A2ATenantResolver,
     params: &ServiceParams,
     request_tenant: Option<&str>,
 ) -> A2AMappingResult<Option<String>> {
-    Ok(resolved_tenant(params, request_tenant)?.map(|(tenant, _)| tenant))
-}
-
-fn resolved_tenant(
-    params: &ServiceParams,
-    request_tenant: Option<&str>,
-) -> A2AMappingResult<Option<(String, A2ATenantSource)>> {
-    let service_tenant = first_service_param(params, "x-rakka-tenant")
-        .or_else(|| first_service_param(params, "x-tenant-id"));
-    if let (Some(service), Some(request)) = (service_tenant.as_deref(), request_tenant) {
-        reject_conflict("tenant", service, request, "request.tenant")?;
-    }
-
-    if let Some(tenant) = service_tenant {
-        return Ok(Some((tenant, A2ATenantSource::ServiceParams)));
-    }
-    let Some(tenant) = request_tenant else {
-        return Ok(None);
-    };
-    require_non_blank(tenant, "tenant")?;
-    Ok(Some((tenant.to_string(), A2ATenantSource::Request)))
+    resolver.resolve_read_tenant(params, request_tenant)
 }
 
 fn telemetry_context(
@@ -1013,12 +1156,12 @@ pub fn now_agent_timestamp() -> AgentTimestampMillis {
 mod tests {
     use super::*;
     use a2a::{Part, Role};
-    use rakka::agent_workflow::{
-        is_forbidden_agent_metric_attribute, AGENT_TRIGGER_KIND_ATTRIBUTE,
-    };
+    use rakka_agent_workflow::{is_forbidden_agent_metric_attribute, AGENT_TRIGGER_KIND_ATTRIBUTE};
     use serde_json::json;
 
-    use crate::workflow::demo_workflow;
+    use crate::testing::fixture_workflow;
+
+    const RESOLVER: A2AHeaderTenantResolver = A2AHeaderTenantResolver;
 
     fn params() -> ServiceParams {
         ServiceParams::new()
@@ -1040,25 +1183,42 @@ mod tests {
         }
     }
 
+    fn normalize(
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> A2AMappingResult<NormalizedA2ACommand> {
+        normalize_send_message_request(
+            &RESOLVER,
+            Some(DEFAULT_TENANT),
+            params,
+            request,
+            &fixture_workflow(),
+        )
+    }
+
+    fn draft(
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+        policy: A2APayloadPolicy,
+    ) -> A2AMappingResult<A2ACommandDraft> {
+        build_send_message_command_draft(
+            &RESOLVER,
+            Some(DEFAULT_TENANT),
+            params,
+            request,
+            &fixture_workflow(),
+            policy,
+            AgentTimestampMillis::new(10),
+        )
+    }
+
     #[test]
     fn new_message_generates_canonical_run_id_and_default_command_id() {
         let mut message = Message::new(Role::User, vec![Part::text("hello")]);
         message.message_id = "msg-1".to_string();
         let request = request(message.clone());
-        let normalized = normalize_send_message_request(
-            &params(),
-            &request,
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("normalize");
-        let retry = normalize_send_message_request(
-            &params(),
-            &request,
-            &demo_workflow(),
-            AgentTimestampMillis::new(11),
-        )
-        .expect("retry normalize");
+        let normalized = normalize(&params(), &request).expect("normalize");
+        let retry = normalize(&params(), &request).expect("retry normalize");
 
         assert_eq!(normalized.intent, A2ATaskIntent::NewTask);
         assert_eq!(normalized.task_id, "task-fa4457a412484d2b");
@@ -1075,13 +1235,7 @@ mod tests {
         message.message_id = "msg-2".to_string();
         message.task_id = Some("task-123".to_string());
 
-        let normalized = normalize_send_message_request(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("normalize");
+        let normalized = normalize(&params(), &request(message)).expect("normalize");
 
         assert_eq!(normalized.intent, A2ATaskIntent::ContinueTask);
         assert_eq!(normalized.task_id, "task-123");
@@ -1096,14 +1250,21 @@ mod tests {
 
         let mut req = request(message);
         req.tenant = Some("tenant-body".to_string());
-        let error = normalize_send_message_request(
-            &params,
-            &req,
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect_err("tenant conflict");
+        let error = normalize(&params, &req).expect_err("tenant conflict");
         assert_eq!(error.code(), "metadata-conflict");
+    }
+
+    #[test]
+    fn missing_tenant_without_default_is_rejected() {
+        let mut message = Message::new(Role::User, vec![Part::text("hello")]);
+        message.message_id = "msg-tenantless".to_string();
+        let mut req = request(message);
+        req.tenant = None;
+
+        let error =
+            normalize_send_message_request(&RESOLVER, None, &params(), &req, &fixture_workflow())
+                .expect_err("tenant required in tenant-scoped mode");
+        assert_eq!(error.code(), "tenant-required");
     }
 
     #[test]
@@ -1114,13 +1275,7 @@ mod tests {
             META_COMMAND_ID.to_string(),
             Value::String("different".to_string()),
         )]));
-        let error = normalize_send_message_request(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect_err("command id conflict");
+        let error = normalize(&params(), &request(message)).expect_err("command id conflict");
         assert_eq!(error.code(), "metadata-conflict");
     }
 
@@ -1133,13 +1288,7 @@ mod tests {
             Value::String("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string()),
         )]));
 
-        let normalized = normalize_send_message_request(
-            &traced_params(),
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("normalize");
+        let normalized = normalize(&traced_params(), &request(message)).expect("normalize");
 
         assert_eq!(
             normalized.telemetry_context.trace_parent.as_deref(),
@@ -1151,14 +1300,7 @@ mod tests {
     fn text_only_message_builds_valid_start_command_draft() {
         let fixture = include_str!("../tests/fixtures/send-message-new-task.json");
         let req: SendMessageRequest = serde_json::from_str(fixture).expect("fixture");
-        let draft = build_send_message_command_draft(
-            &params(),
-            &req,
-            &demo_workflow(),
-            A2APayloadPolicy::default(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("draft");
+        let draft = draft(&params(), &req, A2APayloadPolicy::default()).expect("draft");
 
         assert!(matches!(draft.command.kind, AgentCommandKind::StartRun));
         assert!(matches!(draft.payload, A2ACommandPayload::Inline(_)));
@@ -1179,14 +1321,8 @@ mod tests {
         let mut message = Message::new(Role::User, vec![Part::text("next")]);
         message.message_id = "msg-6".to_string();
         message.task_id = Some("task-6".to_string());
-        let draft = build_send_message_command_draft(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            A2APayloadPolicy::default(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("draft");
+        let draft =
+            draft(&params(), &request(message), A2APayloadPolicy::default()).expect("draft");
         assert!(matches!(
             draft.command.kind,
             AgentCommandKind::SubmitSignal { .. }
@@ -1199,14 +1335,8 @@ mod tests {
         let mut message = Message::new(Role::User, vec![Part::text("hello")]);
         message.message_id = "msg-labels".to_string();
         message.task_id = Some("task-labels".to_string());
-        let draft = build_send_message_command_draft(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            A2APayloadPolicy::default(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("draft");
+        let draft =
+            draft(&params(), &request(message), A2APayloadPolicy::default()).expect("draft");
 
         for key in draft.command.attributes.keys() {
             assert!(
@@ -1223,15 +1353,13 @@ mod tests {
             vec![Part::url("https://example.test/input.json").with_media_type("application/json")],
         );
         message.message_id = "msg-7".to_string();
-        let draft = build_send_message_command_draft(
+        let draft = draft(
             &params(),
             &request(message),
-            &demo_workflow(),
             A2APayloadPolicy {
                 inline_limit_bytes: 1,
                 allow_artifact_references: true,
             },
-            AgentTimestampMillis::new(10),
         )
         .expect("draft");
         assert_eq!(draft.payload.artifact_drafts().len(), 1);
@@ -1253,15 +1381,13 @@ mod tests {
         );
         message.message_id = "msg-multipart".to_string();
         message.task_id = Some("task-multipart".to_string());
-        let draft = build_send_message_command_draft(
+        let draft = draft(
             &params(),
             &request(message),
-            &demo_workflow(),
             A2APayloadPolicy {
                 inline_limit_bytes: 1,
                 allow_artifact_references: true,
             },
-            AgentTimestampMillis::new(10),
         )
         .expect("draft");
 
@@ -1281,15 +1407,13 @@ mod tests {
         let mut message = Message::new(Role::User, vec![Part::text("keep these bytes")]);
         message.message_id = "msg-content".to_string();
         message.task_id = Some("task-content".to_string());
-        let draft = build_send_message_command_draft(
+        let draft = draft(
             &params(),
             &request(message),
-            &demo_workflow(),
             A2APayloadPolicy {
                 inline_limit_bytes: 1,
                 allow_artifact_references: true,
             },
-            AgentTimestampMillis::new(10),
         )
         .expect("draft");
 
@@ -1308,15 +1432,13 @@ mod tests {
     fn oversized_payload_without_artifact_strategy_is_rejected() {
         let mut message = Message::new(Role::User, vec![Part::text("too large")]);
         message.message_id = "msg-8".to_string();
-        let error = build_send_message_command_draft(
+        let error = draft(
             &params(),
             &request(message),
-            &demo_workflow(),
             A2APayloadPolicy {
                 inline_limit_bytes: 1,
                 allow_artifact_references: false,
             },
-            AgentTimestampMillis::new(10),
         )
         .expect_err("oversize");
         assert_eq!(error.code(), "payload-too-large");
@@ -1330,13 +1452,7 @@ mod tests {
             META_PRINCIPAL_REF.to_string(),
             json!({"type": "user", "id": "alice", "displayName": "Alice"}),
         )]));
-        let normalized = normalize_send_message_request(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("normalize");
+        let normalized = normalize(&params(), &request(message)).expect("normalize");
         let principal = normalized.principal.expect("principal");
         assert_eq!(principal.principal_type, "user");
         assert_eq!(principal.principal_id, "alice");
@@ -1350,9 +1466,11 @@ mod tests {
             tenant: Some("tenant-a".to_string()),
         };
         let draft = build_cancel_task_command_draft(
+            &RESOLVER,
+            Some(DEFAULT_TENANT),
             &params(),
             &request,
-            &demo_workflow(),
+            &fixture_workflow(),
             AgentTimestampMillis::new(10),
         )
         .expect("draft");
@@ -1376,14 +1494,33 @@ mod tests {
             META_WORKFLOW_TYPE.to_string(),
             Value::String("other-workflow".to_string()),
         )]));
-        let error = normalize_send_message_request(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect_err("workflow mismatch");
+        let error = normalize(&params(), &request(message)).expect_err("workflow mismatch");
         assert_eq!(error.code(), "invalid-workflow-selection");
+    }
+
+    #[test]
+    fn workflow_selection_extraction_and_matching() {
+        let workflow = fixture_workflow();
+        let metadata = HashMap::from([
+            (
+                META_WORKFLOW_ID.to_string(),
+                Value::String(workflow.workflow_id.as_str().to_string()),
+            ),
+            (
+                META_DEFINITION_VERSION.to_string(),
+                Value::String(workflow.definition_version.to_string()),
+            ),
+        ]);
+        let selection = A2AWorkflowSelection::from_metadata(&metadata).expect("selection");
+        assert!(!selection.is_empty());
+        assert!(selection.matches(&workflow));
+
+        let mismatched = A2AWorkflowSelection {
+            workflow_id: Some("other".to_string()),
+            ..Default::default()
+        };
+        assert!(!mismatched.matches(&workflow));
+        assert!(A2AWorkflowSelection::default().is_empty());
     }
 
     #[test]
@@ -1392,13 +1529,7 @@ mod tests {
         message.message_id = "msg-12".to_string();
         let mut req = request(message);
         req.tenant = None;
-        let normalized = normalize_send_message_request(
-            &params(),
-            &req,
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("normalize");
+        let normalized = normalize(&params(), &req).expect("normalize");
         assert_eq!(normalized.tenant.as_str(), DEFAULT_TENANT);
         assert_eq!(normalized.tenant_source, A2ATenantSource::Default);
     }
@@ -1407,14 +1538,7 @@ mod tests {
     fn fixture_metadata_conflict_is_stable() {
         let fixture = include_str!("../tests/fixtures/send-message-conflict.json");
         let req: SendMessageRequest = serde_json::from_str(fixture).expect("fixture");
-        let error = build_send_message_command_draft(
-            &params(),
-            &req,
-            &demo_workflow(),
-            A2APayloadPolicy::default(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect_err("conflict");
+        let error = draft(&params(), &req, A2APayloadPolicy::default()).expect_err("conflict");
         assert_eq!(error.code(), "metadata-conflict");
     }
 
@@ -1426,13 +1550,7 @@ mod tests {
             META_COMMAND_ID.to_string(),
             Value::String("different".to_string()),
         )]));
-        let error = normalize_send_message_request(
-            &params(),
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect_err("command id conflict");
+        let error = normalize(&params(), &request(message)).expect_err("command id conflict");
         let rendered = error.to_string();
         assert!(rendered.contains("canonical `msg-canonical`"));
         assert!(rendered.contains(&format!("{META_COMMAND_ID}=different")));
@@ -1444,18 +1562,20 @@ mod tests {
         params.insert("x-rakka-tenant".to_string(), vec!["tenant-hdr".to_string()]);
 
         assert_eq!(
-            canonical_read_tenant(&params, None).expect("header tenant"),
+            canonical_read_tenant(&RESOLVER, &params, None).expect("header tenant"),
             Some("tenant-hdr".to_string())
         );
         assert_eq!(
-            canonical_read_tenant(&ServiceParams::new(), Some("tenant-body")).expect("body"),
+            canonical_read_tenant(&RESOLVER, &ServiceParams::new(), Some("tenant-body"))
+                .expect("body"),
             Some("tenant-body".to_string())
         );
         assert_eq!(
-            canonical_read_tenant(&ServiceParams::new(), None).expect("unscoped"),
+            canonical_read_tenant(&RESOLVER, &ServiceParams::new(), None).expect("unscoped"),
             None
         );
-        let error = canonical_read_tenant(&params, Some("tenant-body")).expect_err("conflict");
+        let error =
+            canonical_read_tenant(&RESOLVER, &params, Some("tenant-body")).expect_err("conflict");
         assert_eq!(error.code(), "metadata-conflict");
     }
 
@@ -1470,13 +1590,8 @@ mod tests {
             Value::String("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string()),
         )]));
 
-        let normalized = normalize_send_message_request(
-            &params,
-            &request(message),
-            &demo_workflow(),
-            AgentTimestampMillis::new(10),
-        )
-        .expect("malformed transport trace context must not fail the request");
+        let normalized = normalize(&params, &request(message))
+            .expect("malformed transport trace context must not fail the request");
 
         assert_eq!(
             normalized.telemetry_context.trace_parent.as_deref(),
