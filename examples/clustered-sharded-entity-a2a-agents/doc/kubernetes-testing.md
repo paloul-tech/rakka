@@ -144,10 +144,11 @@ curl -s "localhost:8080/a2a/tasks/$TASK" -H 'x-rakka-tenant: tenant-a' | jq
 # Stream public task events (SSE); reconnect with the last replay cursor is safe
 curl -N -H 'x-rakka-tenant: tenant-a' "localhost:8080/a2a/tasks/$TASK/subscribe"
 
-# Push notification config CRUD (durable, credential-redacted)
+# Push notification config CRUD (durable, credential-redacted). The body is a
+# flat TaskPushNotificationConfig (ProtoJSON), not a wrapped object.
 curl -s -X POST "localhost:8080/a2a/tasks/$TASK/pushNotificationConfigs" \
   -H 'content-type: application/json' -H 'x-rakka-tenant: tenant-a' \
-  -d '{"pushNotificationConfig":{"url":"https://example.com/hook"}}' | jq
+  -d "{\"url\":\"https://example.com/hook\",\"task_id\":\"$TASK\"}" | jq
 curl -s "localhost:8080/a2a/tasks/$TASK/pushNotificationConfigs" \
   -H 'x-rakka-tenant: tenant-a' | jq
 ```

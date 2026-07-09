@@ -182,10 +182,15 @@ read_task "$TASK" || fail "task $TASK not readable after send"
 info "status: $(jq -r '.status.state // .status // "unknown"' "$RESP_FILE")"
 
 log "Registering a push notification config"
-curl -sS -X POST "${BASE}/a2a/tasks/${TASK}/pushNotificationConfigs" \
+# The body is a flat TaskPushNotificationConfig (ProtoJSON); task_id also comes
+# from the path but is included for clarity.
+CREATE_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' \
+  -X POST "${BASE}/a2a/tasks/${TASK}/pushNotificationConfigs" \
   -H 'content-type: application/json' -H "x-rakka-tenant: ${TENANT}" \
-  -d '{"pushNotificationConfig":{"url":"https://example.com/smoke-hook"}}' \
-  >/dev/null || fail "push config create failed"
+  -d "{\"url\":\"https://example.com/smoke-hook\",\"task_id\":\"${TASK}\"}" \
+  2>/dev/null || echo 000)
+[ "$CREATE_CODE" = "200" ] \
+  || fail "push config create failed (HTTP $CREATE_CODE): $(cat "$RESP_FILE" 2>/dev/null)"
 CFG_COUNT=$(curl -sS -H "x-rakka-tenant: ${TENANT}" \
   "${BASE}/a2a/tasks/${TASK}/pushNotificationConfigs" \
   | jq '(.configs // []) | length' 2>/dev/null || echo 0)
