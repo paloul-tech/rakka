@@ -1,0 +1,85 @@
+# Single-node PostgreSQL for shared durable run/workflow/push-config state.
+#
+# Demo-grade: one replica, ephemeral storage, local password. Production should
+# use managed/HA PostgreSQL with backups, restore drills, TLS, and external
+# secret management.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rakka-a2a-postgres
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-postgres
+    app.kubernetes.io/part-of: rakka-clustered-a2a-agents
+type: Opaque
+stringData:
+  username: postgres
+  password: postgres
+  dsn: host=rakka-a2a-postgres port=5432 user=postgres password=postgres dbname=postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rakka-a2a-postgres
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-postgres
+    app.kubernetes.io/part-of: rakka-clustered-a2a-agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-a2a-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-a2a-postgres
+        app.kubernetes.io/part-of: rakka-clustered-a2a-agents
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-a2a-postgres
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-a2a-postgres
+                  key: password
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-a2a-postgres
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-postgres
+    app.kubernetes.io/part-of: rakka-clustered-a2a-agents
+spec:
+  selector:
+    app.kubernetes.io/name: rakka-a2a-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

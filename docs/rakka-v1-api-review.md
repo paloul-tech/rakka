@@ -29,6 +29,7 @@ This note records the current public API boundary for the v1 hardening work. It 
 | `rakka-http` | Adapter candidate | Axum-backed route adapters, HTTP server helpers, streaming adapters, public API compatibility constants, and `HttpError`. |
 | `rakka-grpc` | Adapter candidate | Tonic-backed unary/streaming adapters, generated API compatibility constants, and `GrpcError`. |
 | `rakka-k8s` | Adapter candidate | Pod identity, DNS discovery, readiness/liveness health, drain orchestration, manifest conventions, and Kubernetes metrics. |
+| `rakka-a2a` | Adapter candidate | A2A command mapping, task projection store trait with memory/PostgreSQL implementations, durable task-event streaming replay and watcher, builder-based durable A2A `RequestHandler`, sharded run owner host and router, push config store and dispatch boundary, dynamic agent card, route composition, and `RakkaA2AHandlerError`. |
 | `rakka-testkit` | Test/support | Integration helpers, surface assertions, metric/drain helpers, and compatibility fixtures. |
 
 ## Feature Boundaries
@@ -45,7 +46,14 @@ Review command:
 ```sh
 cargo check -p rakka-stream --no-default-features
 cargo check -p rakka-process --no-default-features
+cargo check -p rakka-a2a --no-default-features
 ```
+
+`rakka-a2a` ships `default = []`; every adapter surface is opt-in through the
+`server`, `sharding`, `postgres`, `http`, `k8s`, `otel`, and `testkit` features,
+exposed through the gated `rakka` facade features `a2a`, `a2a-server`,
+`a2a-sharding`, `a2a-postgres`, `a2a-http`, `a2a-k8s`, `a2a-otel`, and
+`a2a-testkit`.
 
 ## Error Codes
 
@@ -65,6 +73,7 @@ Internal/runtime errors:
 - `ShardingError::code()` covers identity, owner-cache, and routing failures.
 - `DurableError::code()` and `WorkflowError::code()` cover durable reliability boundaries.
 - `StreamError::code()` covers bounded stream lifecycle and back-pressure failures.
+- `RakkaA2AHandlerError::code()` covers A2A adapter mapping, projection, inbox/run-engine, push, owner-routing, draining, authorization, and lifecycle failures; the underlying `A2AMappingError`, `TaskProjectionError`, and `A2APushConfigError` codes are stable A2A adapter compatibility surfaces.
 
 ## Current Boundary Decisions
 

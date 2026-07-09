@@ -511,6 +511,7 @@ fn dispatch(
         }),
         last_fencing_token: 1,
         attempts: 1,
+        cancellation_requested: false,
         last_error_code: None,
         created_at: ts(90),
         updated_at: claimed_at,

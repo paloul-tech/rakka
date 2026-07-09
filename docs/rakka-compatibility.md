@@ -63,6 +63,15 @@ The helper APIs are:
 
 Rakka does not automatically diff Protobuf descriptors in v1. Schema compatibility is enforced by the explicit registry policy and by tests owned by the application.
 
+## A2A Adapter Surface
+
+`rakka-a2a` carries several compatibility commitments beyond the remoting envelope:
+
+- The owner remote protocol is versioned. The message type ids `rakka.a2a.A2ARunRequest` and `rakka.a2a.A2ARunResponse`, the JSON codec id `rakka-a2a-json`, the remote schema version, and the protocol version (`A2A_RUN_PROTOCOL_VERSION`) must agree across adjacent node versions; a mismatched protocol version fails closed with a `version-mismatch` owner failure, and an unknown type id or schema version fails closed with `RemoteError::UnknownCodec`.
+- The `io.rakka.*` A2A metadata keys (workflow selection, command id/kind, dedup key, causation/correlation, principal, trace context, projection revision, replay cursor, redaction) are public compatibility commitments consumed by clients.
+- The replay cursor shape `<task-id>:<sequence>` and the stable mapping/projection/handler error code strings are compatibility commitments surfaced in A2A errors and bounded metrics.
+- The PostgreSQL A2A schema evolves additively within a release: new tables, new nullable/defaulted columns, and new indexes only, applied by an idempotent, advisory-lock-guarded migration so N and N+1 pods share the schema during rolling updates.
+
 ## Kubernetes Rolling Updates
 
 Recommended sequence:

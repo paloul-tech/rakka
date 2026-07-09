@@ -1,0 +1,26 @@
+{
+  "message": {
+    "messageId": "msg-fixture-1",
+    "contextId": "ctx-fixture-1",
+    "role": "ROLE_USER",
+    "parts": [
+      {
+        "text": "start the fixture workflow"
+      }
+    ],
+    "metadata": {
+      "io.rakka.workflow.type": "rakka-a2a-fixture",
+      "io.rakka.principal.ref": {
+        "type": "user",
+        "id": "fixture-user",
+        "displayName": "Fixture User"
+      }
+    }
+  },
+  "metadata": {
+    "io.rakka.workflow.id": "workflow-rakka-a2a-fixture",
+    "io.rakka.workflow.definition_version": "v1",
+    "io.rakka.correlation_id": "ctx-fixture-1"
+  },
+  "tenant": "tenant-fixture"
+}

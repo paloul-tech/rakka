@@ -1,0 +1,55 @@
+[package]
+name = "rakka-example-clustered-sharded-entity-a2a-agents"
+version = "0.1.0"
+description = "A clustered A2A example composed over the reusable rakka-a2a crate for sharded durable Rakka agent runs."
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "rakka-example-clustered-sharded-entity-a2a-agents"
+path = "src/main.rs"
+doc = false
+
+[features]
+default = []
+# Optional shared PostgreSQL durable store, required for correct multi-pod
+# Kubernetes recovery. Off by default so local/file mode needs no database.
+postgres = ["dep:rakka-persistence-postgres", "dep:tokio-postgres", "rakka/postgres"]
+
+[dependencies]
+a2a = { package = "a2a-lf", version = "0.3.0" }
+a2a-server = { package = "a2a-server-lf", version = "0.4.0", default-features = false }
+axum.workspace = true
+rakka = { path = "../../crates/rakka", default-features = false, features = [
+    "agent-workflow",
+    "cluster",
+    "discovery-etcd",
+    "http",
+    "persistence",
+    "remote",
+    "sharding",
+] }
+rakka-a2a = { path = "../../crates/rakka-a2a", features = [
+    "server",
+    "sharding",
+] }
+rakka-agent-workflow = { path = "../../crates/rakka-agent-workflow" }
+rakka-persistence-postgres = { path = "../../crates/rakka-persistence-postgres", optional = true }
+rakka-remote = { path = "../../crates/rakka-remote" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres = { workspace = true, optional = true }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

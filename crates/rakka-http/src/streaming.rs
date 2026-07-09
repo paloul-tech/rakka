@@ -1,6 +1,5 @@
 //! HTTP streaming, SSE, and WebSocket adapters backed by Rakka streams.
 
-use std::borrow::Cow;
 use std::convert::Infallible;
 
 use axum::body::{Body, Bytes};
@@ -443,7 +442,7 @@ fn sse_error_message(error: StreamError) -> String {
 fn stream_error_close_frame(error: &HttpError) -> WebSocketMessage {
     WebSocketMessage::Close(Some(WebSocketCloseFrame {
         code: 1011,
-        reason: Cow::Owned(error.to_string()),
+        reason: error.to_string().into(),
     }))
 }
 

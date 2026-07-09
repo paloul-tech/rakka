@@ -40,6 +40,7 @@ Historical implementation plans live in `docs/plans/`.
 | `rakka-process`, `rakka-workflow`, `rakka-stream` | Child-process actors, durable inbox/outbox reliability, and bounded stream primitives. |
 | `rakka-agent-workflow` | Durable agent-workflow execution kernel: product-neutral compiled execution IR, durable graph run state, deterministic graph scheduler, and the durable outbox effect bridge. |
 | `rakka-http`, `rakka-grpc`, `rakka-k8s` | Edge adapters and Kubernetes operation surfaces. |
+| `rakka-a2a` | A2A protocol adapter for durable agent-workflow runs: durable request handler, task projection and streaming replay, push config persistence and dispatch boundary, sharded run owner host, and dynamic agent card. |
 | `rakka-testkit` | Cross-crate integration helpers and compatibility fixtures. |
 
 ## Validation Commands

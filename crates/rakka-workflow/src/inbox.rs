@@ -544,6 +544,44 @@ where
         })
     }
 
+    /// Cancels one outbox entry before its dispatch completes.
+    ///
+    /// Pending, dispatching, and retry-scheduled entries transition to the
+    /// terminal [`OutboxStatus::Cancelled`] state, so they are never dispatched
+    /// again and become reclaimable by compaction. Entries that already reached
+    /// a terminal state are left unchanged and `None` is returned, so a
+    /// dispatch that genuinely happened is never rewritten as unsent.
+    pub async fn record_outbox_cancelled(
+        &mut self,
+        message_id: &OutboxMessageId,
+        message: impl Into<String>,
+    ) -> WorkflowResult<Option<WorkflowTelemetryEvent>> {
+        let now = self.clock.now();
+        let record = self.recovered_record()?;
+        let mut next_state = record.state.clone();
+        let mut cancelled = false;
+        let entry = next_state
+            .update_outbox(message_id, |entry| {
+                if entry.is_cancellable() {
+                    entry.mark_cancelled(now);
+                    cancelled = true;
+                }
+            })
+            .ok_or_else(|| WorkflowError::OutboxEntryNotFound {
+                workflow_id: self.workflow_id.clone(),
+                message_id: message_id.clone(),
+            })?;
+        if !cancelled {
+            return Ok(None);
+        }
+        self.persist_state(record.revision, next_state).await?;
+        Ok(Some(WorkflowTelemetryEvent::OutboxDispatchCancelled {
+            message_id: entry.message_id().clone(),
+            at: now,
+            message: message.into(),
+        }))
+    }
+
     /// Records a failed outbox dispatch and either schedules retry or exhausts the entry.
     pub async fn record_outbox_failure(
         &mut self,

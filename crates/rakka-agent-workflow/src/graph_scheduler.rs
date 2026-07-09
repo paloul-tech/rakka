@@ -905,7 +905,7 @@ fn target_port_required(node: &AgentCompiledPlanNode, edge: &AgentCompiledPlanEd
     node.input_ports
         .iter()
         .find(|port| port.port_id == edge.target_port_id)
-        .map_or(true, |port| port.required)
+        .is_none_or(|port| port.required)
 }
 
 fn join_dependencies_satisfied(

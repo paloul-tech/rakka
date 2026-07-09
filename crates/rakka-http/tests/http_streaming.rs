@@ -181,7 +181,7 @@ async fn websocket_bridge_forwards_inbound_and_cancels_outbound_on_disconnect() 
     let (bridge, inbound, outbound) = websocket_bridge_pair(4).expect("bridge pair");
     let sent = Arc::new(Mutex::new(Vec::new()));
     let receiver = stream::iter([
-        Ok::<_, TestWebSocketError>(WebSocketMessage::Text("hello".to_owned())),
+        Ok::<_, TestWebSocketError>(WebSocketMessage::Text("hello".to_owned().into())),
         Ok::<_, TestWebSocketError>(WebSocketMessage::Close(None)),
     ]);
 
@@ -193,12 +193,12 @@ async fn websocket_bridge_forwards_inbound_and_cancels_outbound_on_disconnect() 
     assert_eq!(summary.outbound_messages(), 0);
     assert_eq!(
         inbound.next().await.expect("inbound stream item"),
-        Some(WebSocketMessage::Text("hello".to_owned()))
+        Some(WebSocketMessage::Text("hello".to_owned().into()))
     );
     assert_eq!(inbound.next().await.expect("inbound drain"), None);
     wait_for_cancelled(&outbound).await;
     let send_error = outbound
-        .send(WebSocketMessage::Text("after-close".to_owned()))
+        .send(WebSocketMessage::Text("after-close".to_owned().into()))
         .await
         .expect_err("outbound source should be cancelled");
     assert!(matches!(
@@ -218,7 +218,7 @@ async fn websocket_bridge_sends_outbound_messages_and_close_on_drain() {
     let (bridge, _inbound, outbound) = websocket_bridge_pair(4).expect("bridge pair");
     let sent = Arc::new(Mutex::new(Vec::new()));
     outbound
-        .send(WebSocketMessage::Text("world".to_owned()))
+        .send(WebSocketMessage::Text("world".to_owned().into()))
         .await
         .expect("outbound send");
     outbound.drain().expect("outbound should drain");
@@ -231,7 +231,7 @@ async fn websocket_bridge_sends_outbound_messages_and_close_on_drain() {
     assert_eq!(summary.inbound_messages(), 0);
     assert_eq!(summary.outbound_messages(), 1);
     let sent = sent.lock().expect("sent messages should not poison");
-    assert_eq!(sent[0], WebSocketMessage::Text("world".to_owned()));
+    assert_eq!(sent[0], WebSocketMessage::Text("world".to_owned().into()));
     assert!(matches!(sent[1], WebSocketMessage::Close(None)));
 }
 

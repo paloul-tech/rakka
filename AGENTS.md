@@ -4,7 +4,7 @@
 
 - Rakka is a Rust 2021 Cargo workspace for an Akka-inspired actor framework: typed actors, actor refs/paths, supervision, cluster membership, remoting, sharding, durable state/event sourcing, durable workflow inbox/outbox, bounded streams, process actors, HTTP/gRPC adapters, Kubernetes health/drain hooks, metrics, and operational snapshots. See `README.md`, `CLAUDE.md`, and `docs/rakka-actor-framework-spec.md`.
 - The repo is a v1 release-candidate foundation plus active `rakka-agent-workflow` work for durable agent/compiled-workflow execution. Agent workflow plans live under `docs/plans/agentic-workflow/` and `docs/plans/compiled_execution_with_graph_schdlr/`.
-- MSRV is Rust `1.80` from the workspace manifest; `rust-toolchain.toml` uses stable with `clippy` and `rustfmt`. gRPC/protobuf crates and examples require `protoc`.
+- MSRV is Rust `1.85` from the workspace manifest; `rust-toolchain.toml` uses stable with `clippy` and `rustfmt`. gRPC/protobuf crates and examples require `protoc`.
 - Main dependencies by surface: Tokio runtime, `prost`/`tonic` for Protobuf/gRPC, `axum` for HTTP, `tokio-postgres` for PostgreSQL adapters, `etcd-client` for etcd discovery, `serde`/`serde_json`, and `tracing`.
 - Application code should prefer the top-level `rakka` crate and `rakka::prelude`; component crates remain public for foundations, adapters, advanced wiring, and tests. See `docs/rakka-api-boundary-inventory.md` and `docs/rakka-v1-api-review.md`.
 
@@ -56,6 +56,9 @@
 - Keep optional integration layers feature-gated through `crates/rakka/Cargo.toml`; maintain no-default checks for `rakka-stream` and `rakka-process`.
 - Streams and mailboxes are bounded by design. Preserve back-pressure, cancellation, drain, and message ownership on failure.
 - Metrics labels must be bounded and operationally meaningful; avoid raw ids, actor paths, prompts, payloads, command args, temp paths, and full error text.
+- Commit messages have a title, and a body with a short bulleted description of the change.
+- PR messages must be generated as Markdown, not plain text.
+- PR messages must have a title; the body should consist of a summary, completed work, notes, and list of validation commands.
 
 ## 5. Strict Boundaries
 
@@ -82,3 +85,4 @@
 - Keep examples unpublished (`publish = false`) and keep generated contract code out of the repository.
 - Confirm no secrets, unbounded labels, raw high-cardinality ids, or resolved credential values were added to state, logs, metrics, snapshots, indexes, or tests.
 - Leave the repo with clear validation results and no accidental publishing, registry upload, or unrelated file churn.
+- When working off of a plan document, always mark the plan or slice as implemented when complete.

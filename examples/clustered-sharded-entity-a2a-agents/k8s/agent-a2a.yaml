@@ -1,0 +1,211 @@
+# Clustered sharded-entity A2A agents with load-balanced public ingress,
+# private Rakka remoting, etcd discovery, shared PostgreSQL state, readiness,
+# drain, and horizontal autoscaling guidance.
+#
+# Build and load the image first from the workspace root:
+#   docker build -f examples/clustered-sharded-entity-a2a-agents/Dockerfile \
+#     -t rakka-clustered-a2a-agents:0.1.0 .
+#
+# Then:
+#   kubectl apply -f examples/clustered-sharded-entity-a2a-agents/k8s/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/part-of: rakka-clustered-a2a-agents
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rakka-a2a-agent
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-agent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rakka-a2a-agent-config
+  namespace: rakka-a2a-agents
+data:
+  RAKKA_DISCOVERY_PROVIDER: etcd
+  RAKKA_ETCD_ENDPOINTS: http://rakka-a2a-etcd:2379
+  RAKKA_ETCD_PREFIX: /rakka/examples/a2a-agents/members/
+  RAKKA_PERSISTENCE: postgres
+  RAKKA_BIND_HOST: 0.0.0.0
+  RAKKA_PORT: "25580"
+  RAKKA_HTTP_PORT: "35580"
+  RAKKA_SELF_FENCE: "true"
+  RAKKA_SELF_FENCE_AFTER_SECONDS: "15"
+  RAKKA_SELF_FENCE_REJOIN_SECONDS: "10"
+  # Local-cluster default. Production should set this to the externally
+  # reachable HTTPS load balancer URL.
+  RAKKA_A2A_PUBLIC_URL: http://rakka-a2a-public.rakka-a2a-agents.svc.cluster.local
+  OTEL_SERVICE_NAME: rakka-clustered-a2a-agent
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://rakka-otel-collector.rakka-system.svc.cluster.local:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+---
+# Headless private service for pod-to-pod Rakka remoting. Public A2A clients
+# must not use this path.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-a2a-internal
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-agent
+    app.kubernetes.io/component: internal-remoting
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: rakka-a2a-agent
+  ports:
+    - name: remoting
+      port: 25580
+      targetPort: remoting
+---
+# Public load-balanced A2A HTTP/JSON and JSON-RPC ingress. Use LoadBalancer
+# when your cluster supports it; switch to ClusterIP for pure port-forwarded
+# local validation.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rakka-a2a-public
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-agent
+    app.kubernetes.io/component: public-a2a
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: rakka-a2a-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rakka-a2a-agent
+  namespace: rakka-a2a-agents
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-a2a-agent
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rakka-a2a-agent
+  namespace: rakka-a2a-agents
+  labels:
+    app.kubernetes.io/name: rakka-a2a-agent
+spec:
+  serviceName: rakka-a2a-internal
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rakka-a2a-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rakka-a2a-agent
+      annotations:
+        rakka.rs/remoting-trust-boundary: trusted-cluster
+        rakka.rs/a2a-adapter-stage: example-production-candidate
+    spec:
+      serviceAccountName: rakka-a2a-agent
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: rakka-a2a-agent
+          image: rakka-clustered-a2a-agents:0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: rakka-a2a-agent-config
+          env:
+            - name: RAKKA_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: rakka-a2a-postgres
+                  key: dsn
+            - name: RAKKA_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RAKKA_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: RAKKA_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RAKKA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: remoting
+              containerPort: 25580
+            - name: http
+              containerPort: 35580
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              httpGet:
+                path: /drain
+                port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: rakka-a2a-agent
+  namespace: rakka-a2a-agents
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: rakka-a2a-agent
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    # CPU is a portable baseline. Prefer bounded Rakka/custom metrics such as
+    # open stream count, pending inbox commands, due outbox effects, dispatcher
+    # backlog, in-flight dispatches, stream lag, and request latency when a
+    # custom-metrics adapter or KEDA is installed.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60

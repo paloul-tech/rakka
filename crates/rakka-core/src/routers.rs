@@ -1168,11 +1168,11 @@ where
     for (index, routee) in routees.iter().enumerate() {
         for virtual_node in 0..virtual_nodes {
             let point = routee_hash(routee, virtual_node);
-            if first.map_or(true, |(first_point, _)| point < first_point) {
+            if first.is_none_or(|(first_point, _)| point < first_point) {
                 first = Some((point, index));
             }
             if point >= key_hash
-                && selected.map_or(true, |(selected_point, _)| point < selected_point)
+                && selected.is_none_or(|(selected_point, _)| point < selected_point)
             {
                 selected = Some((point, index));
             }

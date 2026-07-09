@@ -703,11 +703,11 @@ impl AgentCompiledNodeKindCatalog {
                 descriptor.available = descriptor
                     .required_capability
                     .as_deref()
-                    .map_or(true, |required| capabilities.has_capability(required))
+                    .is_none_or(|required| capabilities.has_capability(required))
                     && descriptor
                         .required_feature
                         .as_deref()
-                        .map_or(true, |required| capabilities.has_enabled_feature(required));
+                        .is_none_or(|required| capabilities.has_enabled_feature(required));
                 descriptor
             })
             .collect();

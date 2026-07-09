@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 
 use rakka_agent_workflow::{
-    AgentAdapterFailureClass, AgentAdapterOutcome, AgentAdapterReceipt, AgentAdapterUsage,
-    AgentCausationId, AgentCorrelationId, AgentDeduplicationKey, AgentEffect, AgentEffectId,
-    AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey, AgentModelRequest,
-    AgentTelemetryContext, AgentTimestampMillis, AgentToolRequest, ArtifactKind, ArtifactRef,
-    RedactionStatus,
+    AgentA2APeerOutcome, AgentA2APeerRequest, AgentAdapterFailureClass, AgentAdapterOutcome,
+    AgentAdapterReceipt, AgentAdapterUsage, AgentCausationId, AgentCorrelationId,
+    AgentDeduplicationKey, AgentEffect, AgentEffectId, AgentEffectKind, AgentEffectStatus,
+    AgentEffectTarget, AgentIdempotencyKey, AgentModelRequest, AgentTelemetryContext,
+    AgentTimestampMillis, AgentToolRequest, ArtifactKind, ArtifactRef, RedactionStatus,
 };
 use rakka_workflow::OutboxDispatchResult;
 
@@ -113,6 +113,60 @@ fn request_builders_reject_incompatible_effect_kinds() {
     ))
     .expect_err("artifact effect must not become tool request");
     assert_eq!(tool_error.code(), "invalid-effect-kind");
+
+    let peer_error = AgentA2APeerRequest::from_effect(effect(
+        "not-peer",
+        AgentEffectKind::HttpCall,
+        None,
+        target("http", "plain-webhook", []),
+    ))
+    .expect_err("plain HTTP effect must not become A2A peer request");
+    assert_eq!(peer_error.code(), "invalid-effect-kind");
+}
+
+#[test]
+fn a2a_peer_request_preserves_correlation_and_peer_metadata() {
+    let request_ref = artifact(
+        "peer-request",
+        ArtifactKind::Input,
+        RedactionStatus::ReferenceOnly,
+    );
+    let effect = effect(
+        "peer-effect",
+        AgentEffectKind::HttpCall,
+        Some(request_ref.clone()),
+        target(
+            "a2a-peer",
+            "billing-agent",
+            [
+                ("target_class", "a2a-peer"),
+                ("context_id", "ctx-parent"),
+                ("peer_task_id", "peer-task-1"),
+                ("preferred_transport", "jsonrpc"),
+                ("peer_card_ref", "artifact:peer-card"),
+            ],
+        ),
+    );
+
+    let request = AgentA2APeerRequest::from_effect(effect.clone()).expect("peer request");
+
+    assert_eq!(request.effect, effect);
+    assert_eq!(request.request_ref, Some(request_ref));
+    assert_eq!(request.peer_name, "billing-agent");
+    assert_eq!(request.context_id.as_deref(), Some("ctx-parent"));
+    assert_eq!(request.peer_task_id.as_deref(), Some("peer-task-1"));
+    assert_eq!(request.preferred_transport.as_deref(), Some("jsonrpc"));
+    assert_eq!(
+        request
+            .peer_card_ref
+            .as_ref()
+            .map(|artifact| artifact.uri.as_str()),
+        Some("artifact:peer-card")
+    );
+    assert_eq!(
+        request.metadata.idempotency_key,
+        AgentIdempotencyKey::new("idem-peer-effect")
+    );
 }
 
 #[test]
@@ -228,6 +282,31 @@ fn adapter_outcomes_are_persistable_contracts() {
     let decoded: AgentAdapterOutcome =
         serde_json::from_str(&json).expect("deserialize adapter outcome");
     assert_eq!(decoded, outcome);
+
+    let peer = AgentA2APeerOutcome::completed(
+        receipt("receipt-peer"),
+        "peer-task-42",
+        Some("peer-context".to_string()),
+        Some(artifact(
+            "peer-result",
+            ArtifactKind::ToolOutput,
+            RedactionStatus::ReferenceOnly,
+        )),
+    );
+    assert_eq!(
+        peer.to_outbox_dispatch_result(),
+        OutboxDispatchResult::Success
+    );
+    let json = serde_json::to_string(&peer).expect("serialize peer outcome");
+    let decoded: AgentA2APeerOutcome =
+        serde_json::from_str(&json).expect("deserialize peer outcome");
+    assert_eq!(decoded, peer);
+
+    let timed_out = AgentA2APeerOutcome::timed_out(receipt("receipt-peer-timeout"), 10_000, None);
+    assert_eq!(
+        timed_out.to_outbox_dispatch_result(),
+        OutboxDispatchResult::timeout("a2a-peer-timeout:10000")
+    );
 }
 
 #[cfg(feature = "process-tools")]
