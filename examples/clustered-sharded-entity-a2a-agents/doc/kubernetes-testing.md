@@ -206,9 +206,15 @@ kubectl -n rakka-a2a-agents logs statefulset/rakka-a2a-agent -f
 curl -s localhost:8080/cluster | jq
 kubectl -n rakka-a2a-agents get hpa,pdb
 
-# Inspect the durable model directly
+# Inspect the durable model directly. This example persists agent-run,
+# workflow inbox/outbox, and push-config state in the shared
+# `rakka_durable_state` table, keyed by disjoint id prefixes
+# (`agent-run:`, `workflow:`, `a2a-push-config:`). The A2A task read-model
+# (task projections) is held in each pod's memory and rebuilt from this
+# durable state on recovery, so this example has no `rakka_a2a_tasks` table.
 kubectl -n rakka-a2a-agents exec deploy/rakka-a2a-postgres -- \
-  psql -U postgres -c '\dt' -c 'select task_id, status from rakka_a2a_tasks;'
+  psql -U postgres -c '\dt' \
+    -c 'select persistence_id, revision from rakka_durable_state order by persistence_id;'
 ```
 
 ## 9. Cleanup
