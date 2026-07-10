@@ -15,7 +15,8 @@ should later move into a dedicated implementation plan.
 ## Recommended Direction
 
 Build a new `rakka-agent` domain crate on top of
-`rakka-agent-workflow`. Use Rig for model/provider/tool abstraction, while
+`rakka-agent-workflow`. Use Rig as the default model/provider/tool abstraction
+behind a Rakka-owned adapter trait and a default-on `rig` cargo feature, while
 Rakka owns identity, loop state, durable transitions, effect safety, memory
 scope, recovery, passivation, and A2A projection.
 
@@ -176,11 +177,18 @@ Track, as applicable:
 - concurrent effects, children, depth, fan-out, and descendants; and
 - bounded artifact/output size.
 
-Reserve before dispatch and settle from the durable accepted result. Count an
-effect once it reaches `Started`, including an attempt that later becomes
-indeterminate. Idempotency changes safe retry behavior; it does not make an
-attempt free. Allocate child budgets atomically and return unused allocation
-only after a known terminal child outcome.
+Realize the hierarchy as escrow: debit a child's allocation from the parent
+scope inside the parent entity's own creating transition and carry it on the
+deduplicated creation command. Dispatch-time reservation then only debits the
+run's local durable ledger — a single-entity transition, never a synchronous
+cross-shard read, lock, or transaction. Settle from the durable accepted
+result. Count an effect once it reaches `Started`, including an attempt that
+later becomes indeterminate. Idempotency changes safe retry behavior; it does
+not make an attempt free. Return unused child allocation to the parent only
+after a known terminal child outcome, through the same deduplicated
+inter-entity command path, so a replay never credits twice. A run that
+exhausts its escrow parks with a structured reason and may request a further
+parent-local allocation through a deduplicated command.
 
 Distinguish hard ceilings from soft thresholds. A threshold may warn or
 request authorization; a ceiling must deterministically reject, park,
@@ -324,6 +332,36 @@ Avoid making one agent entity execute all of its runs serially. Let the stable
 agent entity own lifecycle and settings while independently sharded run
 entities own active loops. Private-memory writes still need compare-and-set or
 idempotent append because concurrent runs may learn simultaneously.
+
+## Inter-Entity Choreography
+
+The agent domain has at least three independently sharded single writers
+(`AgentEntity`, `AgentTaskEntity`, `AgentRunEntity`) plus later team and
+moderation entities. Every important behavior — create/assign/start a task,
+propose and validate a result, allocate and settle budget, delegate, hand off,
+cancel — is a cross-entity saga, and this is where the real distributed bugs
+will live. Treat the choreography as a first-class contract (normative form in
+spec Section 9.8):
+
+- Every state-changing exchange between entities uses the durable outbox/inbox
+  substrate with stable operation IDs, even when both entities are colocated.
+  No in-memory calls, no shared mutable state, no cross-entity transactions.
+- The initiator owns the saga: it records the pending exchange in its own
+  durable state and re-drives the same operation ID on recovery. The receiver
+  deduplicates and returns the original result for a replay.
+- Each entity is the source of truth only for its own decision: the task
+  entity for validation outcomes, the run entity for the run's consequence,
+  the parent scope for allocations. Convergence after a crash on either side
+  comes from replaying the pending exchange, never from synchronously reading
+  the other entity's state.
+- Keep `AgentEntity` out of the hot path. Definition, settings, and admission
+  revisions are durable readable data; routine run creation should not
+  serialize through the agent entity as a command round trip, or a popular
+  agent becomes a bottleneck entity.
+- Write the failure-window table before implementing: for each exchange,
+  enumerate initiator loss before send, receiver loss after acceptance, reply
+  loss, and duplicate delivery, and state how each converges. The
+  implementation plan should carry this table per exchange.
 
 ## Akka-Informed Contract Surface
 
@@ -705,9 +743,11 @@ previous decision:
 - pending checkpoint or timer ID; and
 - a versioned loop-state schema.
 
-Use Rig to build and execute a model request. Do not make Rig's internal
-serialized runner state the durable compatibility contract. This keeps Rakka
-able to upgrade Rig through an explicit adapter migration.
+Build and execute the model request through the Rakka-owned model adapter
+trait; the Rig-backed implementation lives behind the default-on `rig`
+feature. Do not make Rig's internal serialized runner state the durable
+compatibility contract. This keeps Rakka able to upgrade Rig through an
+explicit adapter migration and keeps the core crate compiling without Rig.
 
 ## Effect Safety Guidance
 
@@ -1242,11 +1282,16 @@ crates/rakka-agent
     goal/task/run domain types and typed task/result contracts
     goal, evaluation, delegation, and workflow-tool contracts
     durable loop runtime
-    Rig adapter
+    provider-neutral model adapter trait + deterministic test adapter
     tool/effect policy
     checkpoint, session-memory, and private-memory traits
     structured decision/runtime telemetry contracts
     in-memory/test implementations
+
+    feature "rig" (default)
+        Rig-backed model adapter implementation
+        owns the pinned Rig version and its upgrade review
+        no Rig types in the non-feature public API or persisted state
 
     feature "otel"
         reviewed GenAI semantic-convention mapping
@@ -1273,6 +1318,12 @@ crates/rakka-a2a, feature = "agents"
 the agent crate through an additive feature. Avoid making the core agent domain
 depend on the public protocol adapter and then creating a dependency cycle.
 
+The top-level `rakka` facade propagates `rig` (and `otel`) as optional
+passthrough features (`rakka-agent?/rig`), matching the existing workspace
+feature conventions. `rakka-agent` must stay green under
+`--no-default-features` in the workspace minimal-feature checks, and the
+deterministic test adapter must not require the `rig` feature.
+
 `rakka-agent-knowledge-graph` should not depend on a database driver or expose
 SQL, Cypher, SPARQL, vendor result types, or vendor-specific identifiers. A
 concrete store binding may be supplied by the application or by separately
@@ -1280,12 +1331,27 @@ versioned backend crates without changing the agent-facing contract.
 
 ## Suggested Delivery Slices
 
+The spec binds every requirement to a milestone (spec Section 2.1): M1 core
+agent, M2 memory, M3 continuous goals, M4 multi-agent goals, M5 coordination
+capabilities. Slices 0-4 deliver M1, slice 5 delivers M2, and slice 6 delivers
+M4 plus the M5 coordination capabilities; continuous-goal work (M3) currently
+has no slice of its own and should be planned as one. Slice 7 hardens whatever
+has shipped. A MUST bound to a later milestone is not a gate for an earlier
+slice, except identity and persisted-schema semantics, which always bind.
+
 ### Slice 0: Contract and Failure Model
 
 - Finalize agent, goal, typed task, run, delegation, run status, loop state,
   effect safety, result/evaluation, and checkpoint types.
 - Specify the indeterminate transition and recovery invariants.
-- Define the Rig version/upgrade boundary.
+- Specify the inter-entity choreography: the failure-window table for the
+  creation, assignment, run-acceptance, result proposal/decision, budget
+  allocation, and settlement/return exchanges.
+- Specify the escrow budget ledger: parent-local allocation at creation,
+  run-local dispatch-time reservation, and deduplicated settlement/return
+  commands.
+- Define the model adapter trait, the `rig` feature gate, and the Rig
+  version/upgrade boundary.
 - Define session correlation, span topology, decision events, redaction, and
   OpenTelemetry GenAI convention version policy.
 - Add no production model or memory backend yet.
@@ -1293,7 +1359,11 @@ versioned backend crates without changing the agent-facing contract.
 ### Slice 1: One Durable Rig Agent With Read-Only Tools
 
 - Create `rakka-agent` and an in-memory example.
+- Keep the crate green under `--no-default-features` (no Rig) from the first
+  commit; the deterministic test adapter drives the loop without it.
 - Accept one versioned typed task and validate a typed terminal result.
+- Crash either side of the run/task result exchange and prove replay
+  convergence without a duplicate validation or completion.
 - Drive one Rig model turn as a durable effect.
 - Trace A2A ingress, the bounded turn, one Rig model call, and recovery with
   correlated structured events and metrics.
@@ -1393,6 +1463,25 @@ The full-article technical review resolved these defaults:
 8. **A2A baseline:** target and pin a reviewed A2A 1.0 contract for the agent
    surface, with any legacy compatibility documented explicitly.
 
+### Approved Design-Review Decisions
+
+A follow-up design review (2026-07-10) resolved four additional defaults:
+
+1. **Milestone-bound normativity:** the spec binds every requirement to a
+   delivery milestone (M1 core, M2 memory, M3 continuous, M4 multi-agent, M5
+   coordination); identity and persisted-schema semantics bind from M1.
+2. **Inter-entity choreography:** all cross-entity exchanges are deduplicated
+   outbox/inbox sagas owned and re-driven by the initiator; no synchronous
+   cross-entity transactions, even when colocated; each exchange documents its
+   failure windows.
+3. **Escrow budgets:** child allocations are debited from the parent in the
+   parent's own creating transition; dispatch-time reservation is run-local
+   only; settlement/return flows upward through deduplicated commands.
+4. **Rig feature gate:** the core model contract is a Rakka-owned adapter
+   trait; the Rig implementation lives behind a default-on `rig` feature,
+   never in the core public API or persisted state, and the deterministic test
+   adapter does not require it.
+
 ### Remaining Discovery Decisions
 
 Recommended defaults are included so research can continue without blocking.
@@ -1479,6 +1568,10 @@ Recommended defaults are included so research can continue without blocking.
 - Implicitly exposing one agent's private memory to collaborators.
 - Assuming a sharded actor or per-run owner serializes multiple agents acting
   on the same external resource.
+- Passing results, assignments, or budget updates between agent/task/run
+  entities through in-memory calls because they are currently colocated.
+- Reserving budget at dispatch time against a parent or goal scope on another
+  shard instead of the run's own escrowed ledger.
 - Wrapping a compiled workflow and all of its effects in one opaque retryable
   tool call.
 - One durable effect wrapping multiple effectful tool calls.
@@ -1538,7 +1631,11 @@ The design is ready for implementation planning when:
 - the dispatcher table covers every effect safety class and crash window;
 - settings update and revocation timing is specified;
 - autonomy admission and hierarchical budget reservation/settlement are
-  specified across definition, goal, task/epoch, run, and effect scopes;
+  specified across definition, goal, task/epoch, run, and effect scopes, with
+  escrow allocation at creation and run-local dispatch-time reservation;
+- every cross-entity exchange (creation, assignment, run acceptance, result,
+  allocation, settlement, delegation, handoff, claim, turn, cancellation) has
+  an enumerated failure-window and replay-convergence contract;
 - tool visibility, admitted binding, effect intent, dispatch grant, credential
   resolution, and executor isolation are separate contracts;
 - Rig state versus Rakka durable state ownership is unambiguous;

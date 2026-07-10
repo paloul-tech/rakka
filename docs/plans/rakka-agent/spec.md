@@ -41,6 +41,53 @@ fully implemented.
 The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are to
 be interpreted as normative requirements for the proposed implementation.
 
+### 2.1 Milestone Binding
+
+This specification describes the complete target system. To keep it
+implementable, every requirement is bound to the delivery milestone at which
+it first becomes an acceptance obligation. A MUST in a section bound to a
+later milestone is not a compliance gate for an earlier milestone, with one
+standing exception: identity semantics, tenant-aware scope keys, and persisted
+schema/versioning rules bind from M1 whenever an earlier milestone persists
+the affected record, so that later milestones never force a durable-state
+migration.
+
+| Milestone | Content | Acceptance |
+| --- | --- | --- |
+| M1 | Core durable agent: identities, typed task and run, durable loop, inter-entity choreography, effect model, checkpoints/HITL, session memory, escrow budgets, autonomy admission, A2A task surface, recovery, baseline observability | Section 22 initial statement |
+| M2 | Agent-private long-term memory and communal knowledge graph | Section 22 memory milestone |
+| M3 | Continuous goals: wake controller, epochs, schedule fencing | Section 22 continuous milestone |
+| M4 | Multi-agent goals: delegation, fan-in, workflow tools, goal evaluation | Section 22 multi-agent milestone |
+| M5 | Coordination capabilities: handoff, team, moderation, human-owned tasks, replayable coordination events | Section 22 coordination milestone |
+
+M1 is the base for all other milestones; M2 through M5 MAY be re-ordered
+during implementation planning.
+
+Primary section bindings are listed below. A clause inside an earlier-bound
+section that describes a later feature binds with that feature.
+
+| Spec area | First binding milestone |
+| --- | --- |
+| 5-7 core boundaries, identity, definition, settings, admission (6.6 binds at M4; 6.9 and the continuous clauses of 7.4 bind at M3) | M1 |
+| 8.1-8.3 goal contract, controller, evidence (8.2 and continuous clauses bind at M3) | M4 |
+| 8.4-8.7 delegation, shared environment, workflow tools, goal cancellation | M4 |
+| 8.8-8.12 coordination capabilities and human-owned tasks | M5 |
+| 9 task/run/loop state, inter-entity choreography, escrow budgets | M1 |
+| 10 model adapter trait and Rig integration | M1 |
+| 11 effect model | M1 |
+| 12 checkpoints and HITL | M1 |
+| 13.1, 13.2, 13.5 memory core (13.3, 13.4, and the graph clauses of 13.6 bind at M2) | M1 |
+| 14 A2A surface (14.4 collaboration metadata binds at M4) | M1 |
+| 15 passivation and recovery (continuous clauses bind at M3) | M1 |
+| 16 security and authorization | M1 |
+| 17 observability, for the signals the active milestone emits | M1 |
+| 18 recovery scenarios, per the scenario tags in Section 18 | M1 |
+| 19-22 crate shape, compatibility, decisions, acceptance | M1 |
+
+Single-task cancellation semantics (dispatch fencing and nonterminal
+reconciliation) bind at M1 through Sections 11.5 and 14.3; the
+child-propagation clauses of Section 8.7 bind at M4.
+
 ## 3. Goals
 
 - Provide a stable, sharded agent identity independent of process or pod.
@@ -63,8 +110,9 @@ be interpreted as normative requirements for the proposed implementation.
   orchestration.
 - Allow independently durable compiled workflows to be invoked from an
   agent's toolset without hiding their internal effect-safety boundaries.
-- Use Rig as the model/provider/tool abstraction without making Rig the
-  durable correctness owner.
+- Use Rig as the default model/provider/tool abstraction behind a
+  feature-gated, Rakka-owned adapter trait, without making Rig the durable
+  correctness owner.
 - Survive actor restart, dispatcher restart, passivation, pod loss, rolling
   update, and shard movement.
 - Persist accepted work before acknowledgement and deduplicate replayed
@@ -170,7 +218,12 @@ The logical `AgentEntity` is sharded by `(TenantId, AgentId)` and owns:
 - current settings revision;
 - policy and logical credential-binding references;
 - the namespace for agent-private memory; and
-- commands that create or administratively affect runs.
+- administrative commands over its runs (suspend, resume, terminate).
+
+Routine run creation flows through task assignment (Section 9.8) against the
+agent's durable definition/admission state; it MUST NOT require a synchronous
+command round trip through `AgentEntity`, so a popular agent does not become a
+serialization bottleneck for its own runs.
 
 ### 6.3 AgentGoalId
 
@@ -837,7 +890,8 @@ dispatcher performs bounded I/O and returns a durable result command through
 the inbox.
 
 A run that proposes completion MUST submit a typed result proposal to its
-`AgentTaskEntity`. It MUST NOT make the public task terminal by mutating only
+`AgentTaskEntity` through the deduplicated inter-entity exchange defined in
+Section 9.8. It MUST NOT make the public task terminal by mutating only
 run state. The task becomes `Completed` only after schema/result-rule
 validation; root goal satisfaction remains a separate evaluation.
 
@@ -880,11 +934,34 @@ model calls, tokens, provider cost, tool calls, external effect starts and
 attempts, active execution time, elapsed deadline, concurrent effects,
 delegation depth/fan-out/descendants, and bounded output/artifact size.
 
-Before dispatch, the runtime MUST atomically reserve the applicable budget or
-deny/park the operation. It MUST settle usage from the durable accepted result.
-An effect that reaches durable `Started` consumes an attempt even if it later
-becomes `Indeterminate`; an idempotent retry consumes another attempt. Unused
-child allocation MAY return to the parent only after a known terminal outcome.
+The hierarchy MUST be realized as down-front escrow allocations rather than
+dispatch-time distributed transactions. When a goal, task, epoch, or run is
+created, its allocation MUST be durably debited from the parent scope inside
+the parent entity's own creating transition and carried on the deduplicated
+creation command. The sum of a parent's outstanding child allocations plus its
+own consumption MUST NOT exceed its allocation, and replaying an allocation
+command MUST NOT debit the parent twice.
+
+Before dispatch, the runtime MUST atomically reserve the applicable budget
+from the run's own durable ledger or deny/park the operation. A dispatch-time
+reservation MUST be a single-entity transition on the run and MUST NOT require
+a synchronous cross-entity or cross-shard read, lock, or transaction. Parent
+and definition ceilings are enforced at allocation and admission time;
+goal-window ceilings for continuous goals are enforced at epoch admission.
+
+The runtime MUST settle usage from the durable accepted result. An effect that
+reaches durable `Started` consumes an attempt even if it later becomes
+`Indeterminate`; an idempotent retry consumes another attempt. Settlement and
+the return of unused child allocation MUST flow upward through the
+deduplicated inter-entity command path of Section 9.8, and only after a known
+terminal child outcome; replaying a settlement or return command MUST NOT
+credit a parent twice.
+
+A run that exhausts its escrowed allocation MUST park with a structured
+budget-exhaustion reason. It MAY request additional allocation from its parent
+scope through a deduplicated command; the grant is an ordinary parent-local
+allocation decision under the same ceilings. Exhaustion MUST NOT be resolved
+by reading parent budget state directly at dispatch time.
 
 Budget decisions MUST carry scope, dimension, limit, consumed/reserved value,
 policy revision, and stable reason. Soft thresholds MAY warn or request
@@ -898,13 +975,91 @@ calendar-window goal ceiling. Refill MUST be a persisted logical-time policy
 transition and MUST NOT occur because an actor/pod restarted, a shard moved, or
 an entity was activated.
 
+### 9.8 Inter-Entity Choreography
+
+`AgentEntity`, `AgentTaskEntity`, `AgentRunEntity`, and later coordination
+entities are independently sharded single writers. Every state-changing
+exchange between two entities MUST traverse the durable outbox/inbox
+substrate: the sender persists the command intent through its outbox as part
+of its own transition, the receiver durably accepts and deduplicates the
+command by stable operation ID before acknowledgement, and any reply returns
+through the same mechanism. In-memory actor calls, shared mutable state, and
+synchronous cross-entity transactions MUST NOT be used for correctness, even
+when both entities are currently colocated on one node.
+
+Each cross-entity exchange is therefore a small saga with an explicit owner:
+
+- the initiating entity records the pending exchange (operation ID, target,
+  and expected reply) in its own durable state before or with the send;
+- recovery of the initiator MUST re-drive an unacknowledged exchange by
+  re-emitting the same operation ID, never by minting a new one;
+- the receiving entity MUST return the original logical result for a replayed
+  operation ID without performing a second transition; and
+- neither side MAY treat the absence of a reply as evidence that the exchange
+  did not execute.
+
+The canonical creation and assignment flow is:
+
+```text
+A2A ingress (durable, deduplicated)
+    -> AgentTaskEntity: create task (operation ID from ingress)
+    -> assignment decision recorded on the task
+       (definition/admission revisions read from durable state;
+        no synchronous round trip through AgentEntity)
+    -> run-creation command -> AgentRunEntity
+       (deduplicated by task ID + assignment generation)
+    -> run Accepted -> acceptance reply -> AgentTaskEntity
+    -> task InProgress
+```
+
+Replaying any step MUST converge on one task, one assignment for the current
+generation, and one run. `AgentEntity` participates through its durable
+definition, settings, and admission state; immediate safety policy is still
+rechecked before dispatch under Section 7.2.
+
+The canonical result flow is:
+
+```text
+AgentRunEntity: persist result proposal (proposal ID + digest)
+    -> proposal command -> AgentTaskEntity
+    -> schema + deterministic result-rule validation (Section 9.2)
+    -> durable accept/reject decision recorded on the task
+    -> decision reply -> AgentRunEntity
+    -> run records the outcome and transitions
+```
+
+The task entity's persisted decision is the source of truth for the
+validation outcome; the run's persisted state is the source of truth for the
+run's consequence of that outcome. If either side is lost mid-exchange,
+recovery re-drives the pending proposal or reply and converges without a
+second validation, a duplicate completion, or a lost rejection. A duplicate
+proposal with the same proposal ID MUST return the original decision.
+
+Every inter-entity exchange defined by this specification — creation,
+assignment, run acceptance, result proposal/decision, budget allocation,
+settlement and return, delegation, handoff, claim, turn, cancellation
+propagation, and evaluation requests — MUST document its failure windows
+(initiator loss before send, receiver loss after acceptance, reply loss, and
+duplicate delivery), and each window MUST converge under replay.
+
 ## 10. Rig Integration
 
-### 10.1 Adapter Boundary
+### 10.1 Model Adapter Trait and Rig Feature Gate
 
-`rakka-agent` MUST expose a Rig adapter behind Rakka-owned domain types. The
-adapter converts an immutable context snapshot and settings revision into a Rig
-request and converts the Rig response into a bounded Rakka result/artifact.
+`rakka-agent` MUST define a Rakka-owned, provider-neutral model adapter trait
+(working name `AgentModelAdapter`) as the core model contract. The trait
+converts an immutable context snapshot and settings revision into a bounded
+model request and converts the provider response into a bounded Rakka
+result/artifact. The durable loop, effect model, and testkit MUST depend only
+on this trait.
+
+The Rig-backed implementation of the trait MUST live behind a `rig` cargo
+feature of `rakka-agent`. The feature SHOULD be enabled by default, but the
+crate MUST compile and pass its tests with `--no-default-features`, and the
+workspace minimal-feature checks MUST cover that configuration. Types from
+`rig-core` or other Rig crates MUST NOT appear in the crate's non-`rig` public
+API, persisted state, or A2A metadata. The `rakka` facade MUST propagate the
+feature as an optional passthrough (`rakka-agent?/rig`).
 
 Rakka MUST NOT treat provider clients, streams, open HTTP requests, or
 credential values as durable state.
@@ -919,6 +1074,10 @@ Rig upgrades that change request, tool-call, message, or serialized run
 semantics MUST receive an adapter compatibility review and, when required, an
 explicit migration.
 
+The Rig version pin and its compatibility review are properties of the `rig`
+feature. A Rig upgrade MUST NOT change the Rakka-owned model adapter trait,
+core domain types, or persisted loop representation.
+
 ### 10.3 Conversation Memory
 
 Rig memory policies MAY be used to select, compact, summarize, or demote
@@ -928,11 +1087,12 @@ effect and deduplication boundary.
 
 ### 10.4 Deterministic Rig Test Adapter
 
-`rakka-agent` SHOULD provide a deterministic test adapter that can script Rig
-model text/results, structured task-result proposals, tool/delegation requests,
-and responses conditional on prior messages or tool results. It SHOULD compose
-with fake tools, peers, humans/authorization services, clocks, and memory
-adapters.
+`rakka-agent` SHOULD provide a deterministic test adapter that can script
+model text/results, structured task-result proposals, tool/delegation
+requests, and responses conditional on prior messages or tool results. It
+MUST implement the Rakka-owned model adapter trait of Section 10.1 and MUST be
+available without the `rig` feature. It SHOULD compose with fake tools, peers,
+humans/authorization services, clocks, and memory adapters.
 
 The test adapter MUST exercise the same durable model/effect/result path as a
 production provider. It MUST NOT make tests pass by invoking the loop directly
@@ -2101,6 +2261,12 @@ unless an independent domain change also requires it.
 
 ## 18. Required Recovery Scenarios
 
+Each scenario is bound to a milestone (Section 2.1) and joins the acceptance
+gate when that milestone is implemented. Scenarios 15, 16, 18, and 20 bind at
+M2; scenarios 36 and 47-51 bind at M3; scenarios 27-34 and 39 bind at M4;
+scenarios 38, 41-43, and 45 bind at M5. All other scenarios, including 58-61,
+bind at M1 and form the initial acceptance gate.
+
 The implementation is not production-ready until tests demonstrate:
 
 1. duplicate A2A task message acceptance does not create two tasks, initial
@@ -2216,7 +2382,20 @@ The implementation is not production-ready until tests demonstrate:
     correct when telemetry is sampled, delayed, dropped, or unavailable; and
 57. cancellation with an ambiguous consequential effect fences all new work,
     remains nonterminal in reconciliation, and projects terminal cancellation
-    only after the effect outcome/risk is explicitly resolved.
+    only after the effect outcome/risk is explicitly resolved;
+58. replaying any Section 9.8 inter-entity exchange (creation, assignment,
+    run acceptance, result proposal/decision, allocation, settlement/return)
+    produces one logical transition per operation ID on both entities;
+59. loss of the run or task entity at any point in the result exchange,
+    including after the task records its validation decision, converges on
+    recovery without a second validation, a duplicate completion, or a lost
+    rejection;
+60. cross-entity commands between colocated entities traverse durable
+    outbox/inbox acceptance and remain correct after the entities move to
+    different nodes; and
+61. dispatch-time budget reservation touches only the run's own durable
+    ledger, and replaying an allocation, settlement, or return command never
+    double-debits or double-credits a parent scope.
 
 Fault injection SHOULD kill the dispatcher or owner pod at every durable
 effect boundary, including after a test external system commits but before it
@@ -2227,12 +2406,13 @@ returns the receipt.
 The intended workspace shape is:
 
 - `rakka-agent`: goal/typed-task/run/evaluation/handoff/delegation/team/
-  moderation/workflow-tool domain, typed client, loop runtime, Rig adapter,
-  continuous wake controller, hierarchical budget ledger, autonomy admission,
-  guardrails, gates, tool-binding/dispatch-grant/effect policy,
-  execution-policy references, bounded operational query contracts,
-  session/private memory traits, structured decision/runtime telemetry, and
-  deterministic test support;
+  moderation/workflow-tool domain, typed client, loop runtime,
+  provider-neutral model adapter trait, continuous wake controller,
+  escrow-based hierarchical budget ledger, autonomy admission, guardrails,
+  gates, tool-binding/dispatch-grant/effect policy, execution-policy
+  references, bounded operational query contracts, session/private memory
+  traits, structured decision/runtime telemetry, and deterministic test
+  support;
 - `rakka-agent-postgres`: PostgreSQL session/private memory and `pgvector`
   retrieval adapter;
 - `rakka-agent-knowledge-graph`: optional database-agnostic communal graph
@@ -2241,6 +2421,12 @@ The intended workspace shape is:
   coordination metadata, task projection/event replay, and authenticated
   command/gate mapping; and
 - top-level `rakka` feature gates and curated prelude exports after API review.
+
+The `rakka-agent` `rig` feature (default) supplies the Rig-backed
+implementation of the model adapter trait and owns the pinned Rig version per
+Section 10.1. The core crate MUST build and test without it, the deterministic
+test adapter MUST NOT require it, and the top-level `rakka` facade MUST
+propagate it as an optional passthrough feature.
 
 The `rakka-agent` `otel` feature SHOULD map the stable Rakka telemetry domain to
 a pinned, reviewed OpenTelemetry GenAI semantic-convention revision and compose
@@ -2299,7 +2485,23 @@ The following decisions are normative in this draft:
    reconciliation.
 8. The target agent protocol baseline is a reviewed, pinned A2A 1.0 contract.
 
-### 21.2 Open Decisions
+### 21.2 Resolved Design-Review Decisions
+
+A follow-up design review (2026-07-10) resolved four additional defaults:
+
+9. Requirements bind by milestone (Section 2.1); identity, scope-key, and
+   persisted-schema semantics bind from M1.
+10. Inter-entity exchanges are deduplicated outbox/inbox sagas re-driven by
+    the initiator (Section 9.8); synchronous cross-entity transactions are
+    forbidden, including between colocated entities.
+11. Budgets are escrow allocations debited down-front in the parent's own
+    creating transition; dispatch-time reservation is run-local only, and
+    settlement/return flows upward through deduplicated commands.
+12. The core model contract is the Rakka-owned adapter trait of Section 10.1;
+    Rig is the default implementation behind the `rig` feature and never
+    appears in the core public API or persisted state.
+
+### 21.3 Open Decisions
 
 These decisions remain open until accepted by maintainers and product owners.
 The current recommended default is shown after each question.
@@ -2373,7 +2575,7 @@ The current recommended default is shown after each question.
 
 ## 22. Initial Acceptance Statement
 
-The first production-quality milestone is one sharded Rakka Agent that:
+The first production-quality milestone (M1) is one sharded Rakka Agent that:
 
 - is instantiated with versioned settings;
 - accepts an A2A task mapped to one durable `AgentTaskId` and initial
@@ -2404,11 +2606,12 @@ The first production-quality milestone is one sharded Rakka Agent that:
 - remains correct when telemetry export is unavailable while exposing bounded
   exporter/Collector loss signals.
 
-Private vector memory and the communal graph may follow as additive milestones,
-but their scopes and interfaces are defined now so the first implementation
-does not bake in an incompatible conversation or storage identity.
+Private vector memory and the communal graph follow as the memory milestone
+(M2), but their scopes and interfaces are defined now so the first
+implementation does not bake in an incompatible conversation or storage
+identity.
 
-### Continuous Goal Milestone
+### Continuous Goal Milestone (M3)
 
 The first continuous milestone is one stable `AgentGoalId`/root control task
 that:
@@ -2430,7 +2633,7 @@ that:
   budget, missed/coalesced trigger, and retirement state through an
   authoritative operational query.
 
-### Multi-Agent Goal Milestone
+### Multi-Agent Goal Milestone (M4)
 
 The first collaboration milestone is one durable `AgentGoalId` coordinated by
 a stable root task and its current root run that:
@@ -2450,7 +2653,7 @@ a stable root task and its current root run that:
   current criteria against durable evidence, while preserving indeterminate
   non-idempotent outcomes in any child.
 
-### Coordination Capability Milestone
+### Coordination Capability Milestone (M5)
 
 The Akka-informed coordination milestone additionally proves:
 
