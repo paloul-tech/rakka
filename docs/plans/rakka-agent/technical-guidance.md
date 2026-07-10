@@ -1,7 +1,7 @@
 # Rakka Agents Technical Guidance
 
 Status: design guidance
-Date: 2026-07-09
+Date: 2026-07-10
 Research basis: [background-research.md](background-research.md)
 Emerging specification: [spec.md](spec.md)
 
@@ -100,6 +100,205 @@ Measure logical service health separately from physical activity:
 This makes the architecture scale with active computation rather than the
 number or lifetime of logical agents. Continuous goals follow the same rule:
 one bounded epoch, one persisted next wake condition, then quiescence.
+
+## Continuous Goals and Operational Safety
+
+The full "Autonomous Agentic Systems at Scale" article provides strong
+supporting evidence for the existing architecture, but Rakka deliberately
+rejects its daemon-like continuous mode. Pod lifetime must never define agent
+lifetime, schedule, progress, or recovery.
+
+### Continuous Goal Controller
+
+Model continuous operation as a durable controller over finite work:
+
+```text
+stable AgentGoalId and root control task
+    -> durable AgentWakeId
+    -> finite child AgentTaskId
+    -> finite AgentRunId
+    -> result/evidence returned to the controller
+    -> next wake, suspension, or retirement
+```
+
+Prefer a distinct child task and run for every admitted epoch. This bounds
+short-term memory, makes task/effect history inspectable, gives each epoch a
+clean budget and setup revision, and creates a natural compatibility boundary
+for upgrades. Cross-epoch continuity belongs in agent-private long-term memory
+and explicit controller state, not one unbounded run transcript.
+
+Use a versioned `AgentWakePolicy` containing:
+
+- timer, external-event, A2A-command, callback, or hybrid triggers;
+- schedule revision and stable wake-ID construction;
+- maximum lateness and admission window;
+- overlap and trigger-coalescing policy;
+- missed-occurrence policy after downtime;
+- per-epoch budget and deadline;
+- failure backoff; and
+- suspension, renewal, and retirement rules.
+
+Recommended defaults are:
+
+- forbid overlapping epochs;
+- durably coalesce triggers received while an epoch is active;
+- admit one coalesced occurrence after downtime;
+- never perform unbounded catch-up;
+- fence wakes created by an obsolete schedule revision; and
+- require explicit policy for bounded parallel or replayed epochs.
+
+Build this controller on `rakka-agent-workflow` one-shot durable timers and
+deduplicated trigger injection. Do not introduce a recurring actor timer,
+sleeping future, Kubernetes `CronJob` correctness dependency, or pod-start
+hook. A pod start can make shared scanners available, but it cannot create an
+agent-domain occurrence unless a durable wake is due or a replayable event was
+accepted.
+
+### Hierarchical Budget Ledger
+
+Evolve the current autonomy counters into a durable allocation and reservation
+hierarchy:
+
+```text
+definition ceiling
+    -> goal allocation
+        -> task/epoch allocation
+            -> run allocation
+                -> turn/effect reservation and settlement
+```
+
+Track, as applicable:
+
+- autonomous iterations and model calls;
+- input/output/total tokens and provider-reported cost;
+- tool calls, external effect starts, and attempts;
+- active-execution time, elapsed deadline, and per-attempt timeout;
+- concurrent effects, children, depth, fan-out, and descendants; and
+- bounded artifact/output size.
+
+Reserve before dispatch and settle from the durable accepted result. Count an
+effect once it reaches `Started`, including an attempt that later becomes
+indeterminate. Idempotency changes safe retry behavior; it does not make an
+attempt free. Allocate child budgets atomically and return unused allocation
+only after a known terminal child outcome.
+
+Distinguish hard ceilings from soft thresholds. A threshold may warn or
+request authorization; a ceiling must deterministically reject, park,
+suspend, escalate, fail, or retire according to persisted policy. Represent
+budget exhaustion as a structured stop/wait reason rather than multiplying
+top-level task states.
+
+For continuous goals, combine a per-epoch allocation with a rolling or
+calendar-window goal ceiling. Window refill is a durable policy transition. It
+must not be inferred from process uptime or reset on activation, pod restart,
+or shard movement.
+
+### Autonomy Admission
+
+Add a fail-closed admission check for `Interactive`, `BoundedAsync`, and
+`Continuous` operation classes. The class describes operating behavior, not an
+industry risk taxonomy.
+
+Run admission when a definition is published, an agent/run is instantiated,
+or an update widens tools, peers, credentials, environment access, schedule,
+or budgets. Recheck immediate revocation at dispatch even when the previously
+recorded admission remains valid.
+
+Do not admit unattended execution without:
+
+- measurable completion, health, or progress criteria;
+- bounded cost, time, calls, effects, and collaboration;
+- cancellation, suspension, escalation, and recovery behavior;
+- inspectable state and progress;
+- classified tools/effects and scoped authority;
+- approval/authorization policy for consequential operations; and
+- indeterminate-effect reconciliation policy.
+
+Persist an `AutonomyAdmissionDecision` with definition/setup/policy revisions,
+reason codes, evaluating principal/service, constraints, and expiry. Rakka
+owns the contract and enforcement points; the application owns policy
+authoring and industry-specific risk classification.
+
+### Tool Visibility, Authority, and Executor Isolation
+
+Keep four layers explicit:
+
+| Layer | Purpose |
+| --- | --- |
+| `ToolDescriptor` | Bounded schema/description visible to Rig and the model |
+| `ToolBinding` | Definition-authorized target, safety class, capability, and credential class |
+| `EffectIntent` | Exact requested invocation, target, arguments digest, and revisions |
+| `DispatchGrant` | Current authorization to execute that exact intent |
+
+Model selection of a descriptor is only a request. Before `Started`, bind the
+dispatch grant to tenant/goal/task/agent/run/effect, descriptor version/schema
+digest, target and argument digest, safety class, capabilities, policy/setup
+revisions, credential binding, checkpoint grant, expiration, and allowed use
+count.
+
+Add an application-owned `ExecutionPolicyRef` to describe the required trust
+domain, workload identity, network-egress class, sandbox/process class, secret
+resolution class, and tenant-isolation class. Rakka persists and routes by the
+reference; it does not claim to implement Kubernetes RBAC, a service mesh, an
+identity provider, or an OS sandbox.
+
+Avoid a single broadly privileged dispatcher pool. Route effects by trust tier
+and support ephemeral effect sandboxes or dedicated workers for consequential
+tools. This is bounded executor placement, not a permanently resident pod per
+agent. Freeze or digest dynamic MCP descriptor/endpoint metadata in the effect
+intent so catalog drift cannot silently change a recovered invocation.
+
+### Bounded Task State and History
+
+Separate:
+
+1. bounded materialized state needed for the next legal transition;
+2. append-only domain/audit history;
+3. messages, observations, artifacts, tool content, and memory; and
+4. list/search/observability projections.
+
+An `AgentTaskEntity` can own assignment, result-validation, and lifecycle
+semantics without embedding every historical assignment, message, proposal,
+or tool result in its active state. Keep current IDs/status/revisions,
+dependency summary, assignment, pending references, accepted result, and
+terminal reason inline; keep unbounded content and old history behind bounded
+artifact/event references and cursors.
+
+Define limits for dependencies, children, handoffs, result rejections,
+pending effects/checkpoints, inline metadata, replay windows, and query page
+sizes. Snapshot/compact materialized state without turning memory into the
+lifecycle source. Public A2A task history remains bounded and authorized.
+
+### Authoritative Operational Queries
+
+Provide authoritative point queries from durable state and separate derived
+observability/search views. An operator must be able to inspect an agent when
+it is passivated and when telemetry is sampled, delayed, or unavailable.
+
+An `AgentOperationalSnapshot` should include:
+
+- logical lifecycle separately from current/last residency;
+- state revision, current task/run/phase, and last meaningful progress;
+- current wait reason and next durable wake;
+- budget allocation, reservation, consumption, and exhaustion reason;
+- pending effects, attempts, safety classes, and indeterminate work;
+- checkpoint/authorization state;
+- cancellation propagation state;
+- last recovery, passivation, shard owner, and dispatcher transition; and
+- event cursor plus projection freshness/lag.
+
+Use a cancellation progress model such as `NotRequested`, `Requested`,
+`Propagating`, `Quiesced`, `WaitingForReconciliation`, and `Completed`.
+Cancellation fences new work immediately but does not prove a started external
+effect stopped. If a non-idempotent effect is indeterminate, keep the task
+nonterminal in reconciliation with cancellation requested; project terminal
+`Cancelled` only after internal work is quiesced and consequential effect
+outcomes are known.
+
+Authoritative point reads should expose a state revision. List/search queries
+may be eventually consistent but should report projection revision or lag.
+OpenTelemetry and runtime-event projections remain essential for investigation
+and aggregation, but neither becomes an alternate execution state machine.
 
 ## Identity and Ownership
 
@@ -302,9 +501,10 @@ latest chat message. A useful contract includes:
 - retention, audit, and observability policy.
 
 The stable root `AgentTaskEntity` can own goal coordination initially, while
-the current root `AgentRunEntity` proposes decisions. Give the goal a separate
-type even if its initial ID defaults to the root `AgentTaskId`; this keeps child
-tasks/runs and future handoff from collapsing goal identity into one execution.
+the current finite root or continuous-epoch `AgentRunEntity` proposes
+decisions. Give the goal a separate type even if its initial ID defaults to the
+root `AgentTaskId`; this keeps child tasks/runs and future handoff from
+collapsing goal identity into one execution.
 
 ### Goal Lifecycle
 
@@ -324,9 +524,11 @@ goal; its output is evidence or a completed subgoal for the coordinator.
 For a finite goal, the coordinator continues through bounded turns,
 delegations, workflow tools, timers, and gates until it is satisfied or reaches
 another explicit terminal outcome. For a continuous goal, use bounded
-evaluation epochs and durable timers. It remains logically active until
-cancelled, expired, or terminated by policy; it does not run an in-memory poll
-loop forever.
+evaluation epochs admitted by durable wakes. Prefer one finite child
+`AgentTaskId` and `AgentRunId` per epoch while the stable goal/root control task
+remains logically active until cancelled, expired, retired, or terminated by
+policy. Neither the controller nor a future epoch depends on a resident loop,
+pod start, or process lifetime.
 
 ### Verify Progress and Completion
 
@@ -463,6 +665,13 @@ Root cancellation, expiry, or immediate capability revocation should propagate
 to active child agents and workflows as durable A2A/workflow commands. Parent
 termination does not prove a started child side effect was cancelled; child
 effects retain their own reconciliation duties.
+
+Treat cancellation as progress rather than one instantaneous boolean. Fence
+new model/tool/delegation dispatch immediately, then record propagation and
+quiescence. If any consequential effect has an unknowable outcome, retain a
+nonterminal reconciliation wait with cancellation requested. Do not project
+terminal cancellation until those effects have known outcomes or an explicit
+reconciliation decision records the remaining risk.
 
 Define fan-in policy explicitly: wait-for-all, wait-for-any, quorum, first
 acceptable evidence, or policy evaluator. Define whether failed children may be
@@ -947,6 +1156,13 @@ required, and backend endpoints.
 
 ### Session Query and Operator Views
 
+Start with an authoritative operational point query backed by durable
+task/run/effect/checkpoint/timer/budget state. It must remain available when an
+entity is passivated and must not depend on trace retention or exporter health.
+Return the state revision, lifecycle versus residency, last material progress,
+current wait, next wake, budget usage/reservations, pending/indeterminate
+effects, cancellation propagation, and projection freshness.
+
 Provide an authorized session observability query keyed by tenant plus
 `AgentId`/`AgentRunId`. It should assemble references to:
 
@@ -961,7 +1177,9 @@ Provide an authorized session observability query keyed by tenant plus
 - recovery, passivation, ownership, and dispatcher changes; and
 - protected content/artifact references when authorized.
 
-This query is an observability projection, not a second state machine.
+This query is an observability projection, not a second state machine. List and
+search projections may lag but should expose their revision or lag; an
+authoritative point read must make its durable revision explicit.
 
 Provide an authorized task view keyed by tenant plus `AgentTaskId`. It should
 assemble the typed definition/result, dependencies, assignment history,
@@ -999,6 +1217,14 @@ durable agent state merely because a telemetry convention changed.
   exists.
 - Persist credential binding references only. Resolve credentials at dispatch
   time and keep them in memory only for the bounded attempt.
+- Treat a model-visible `ToolDescriptor`, an admitted `ToolBinding`, a durable
+  `EffectIntent`, and a current `DispatchGrant` as separate security layers.
+- Bind consequential dispatch to an application-owned execution-policy
+  reference describing the workload identity, trust tier, network-egress,
+  sandbox, secret-resolution, and tenant-isolation classes.
+- Route high-authority effects to appropriately isolated dispatcher pools or
+  bounded sandboxes; do not give every shared dispatcher ambient access to
+  every agent tool or credential class.
 - Treat retrieved memory as untrusted content, not system instructions.
 - Preserve provenance and trust state in the prompt representation.
 - Require capabilities for private-memory writes and communal claim appends.
@@ -1137,7 +1363,37 @@ versioned backend crates without changing the agent-facing contract.
   mapping, trace/log correlation, redaction, tail-sampling retention,
   Collector loss visibility, bounded metrics, audit events, and artifacts.
 
-## Discovery Decisions to Resolve
+## Decision Register
+
+### Approved Article-Review Decisions
+
+The full-article technical review resolved these defaults:
+
+1. **Continuous execution:** use a stable durable goal/root controller that
+   admits finite child epoch tasks/runs. Pod lifetime never defines agent
+   lifetime and pod start never creates an epoch.
+2. **Wake behavior:** forbid overlapping epochs and coalesce triggers by
+   default; after downtime admit one coalesced occurrence rather than
+   unbounded catch-up. Fence obsolete schedule revisions.
+3. **Budgets:** use hierarchical durable allocations/reservations with
+   per-epoch and rolling/window ceilings. Count started, retried, and
+   indeterminate attempts against applicable budgets.
+4. **Admission:** fail closed for unattended operation unless criteria,
+   bounds, cancellation, inspectability, scoped authority, gates, escalation,
+   and recovery are defined.
+5. **Tool authority:** separate model-visible descriptor, admitted binding,
+   effect intent, dispatch grant, and executor isolation. Use trust-tier
+   dispatcher pools with stronger per-effect sandboxing where policy requires.
+6. **State and operations:** keep materialized task state bounded and separate
+   from history/content/memory/projections. Provide authoritative operational
+   queries independent of telemetry.
+7. **Cancellation:** fence new work immediately, but keep a task nonterminal
+   in reconciliation while a consequential effect has an indeterminate
+   outcome.
+8. **A2A baseline:** target and pin a reviewed A2A 1.0 contract for the agent
+   surface, with any legacy compatibility documented explicitly.
+
+### Remaining Discovery Decisions
 
 Recommended defaults are included so research can continue without blocking.
 
@@ -1180,28 +1436,33 @@ Recommended defaults are included so research can continue without blocking.
     root `AgentTaskEntity` coordinate it and allow its generated value to
     default to the root `AgentTaskId` without making the two types
     interchangeable.
-16. **Goal mode:** implement finite, evidence-verifiable goals first. Add
-    continuous goals later as bounded durable epochs with explicit health,
-    budget, suspension, and retirement policy.
-17. **Specialist selection:** allow a model or deterministic planner to request
+16. **Specialist selection:** allow a model or deterministic planner to request
     a skill, but let an application-owned authorized catalog resolve the
     concrete target `AgentId` and capabilities.
-18. **Workflow tools:** create or adopt an independently durable child workflow
+17. **Workflow tools:** create or adopt an independently durable child workflow
     run and preserve every internal effect boundary; do not dispatch an entire
     compiled workflow as one opaque retryable effect.
-19. **Task identity:** introduce `AgentTaskId` and map it to A2A `Task.id`;
+18. **Task identity:** introduce `AgentTaskId` and map it to A2A `Task.id`;
     preserve it across handoff while each assignee uses a distinct
     `AgentRunId`.
-20. **Coordination capabilities:** make handoff, delegation, team, and
+19. **Coordination capabilities:** make handoff, delegation, team, and
     moderation first-class typed durable state machines, not prompt templates.
-21. **Dynamic setup:** allow per-run instructions/capabilities only within the
+20. **Dynamic setup:** allow per-run instructions/capabilities only within the
     versioned definition and mandatory policy envelope.
-22. **Events:** expose replayable task/run/coordination events with cursor and
+21. **Events:** expose replayable task/run/coordination events with cursor and
     resync semantics; derived struggle signals remain observability only.
 
 ## Anti-Patterns to Avoid
 
 - One actor future executing an entire autonomous loop.
+- Starting or resuming an agent epoch because a pod, actor, or dispatcher
+  process started.
+- Using a Kubernetes `CronJob`, pod-local scheduler, recurring actor timer, or
+  sleeping future as the correctness source for continuous-agent wakes.
+- Reusing one unbounded `AgentRunId` and short-term-memory session for every
+  epoch of a continuous goal.
+- Resetting a schedule, missed-occurrence backlog, or safety budget on process
+  restart, activation, or shard movement.
 - Keeping a sleeping task, polling loop, connection, stream, dispatcher lease,
   or actor alive so an "always-on" agent can wake later.
 - Treating `Active`, `Running`, or `Waiting` as a physical residency state.
@@ -1224,6 +1485,12 @@ Recommended defaults are included so research can continue without blocking.
 - Treating dispatcher lease ownership as proof that an effect did not happen.
 - Automatically retrying an opaque non-idempotent `Started` effect.
 - Persisting a resolved credential or bearer token in agent state.
+- Treating a model-visible tool schema as proof of capability, authorization,
+  credential access, network reachability, or executor isolation.
+- Giving one shared dispatcher pool ambient authority for every tenant/tool
+  class when the software policy expects stronger isolation.
+- Embedding unbounded messages, tool results, assignment history, or memory in
+  materialized task state.
 - Using a caller-provided conversation string as the only memory boundary.
 - Letting Rig memory hooks write directly without stable operation IDs.
 - Treating vector retrieval results as deterministic correctness state.
@@ -1237,6 +1504,11 @@ Recommended defaults are included so research can continue without blocking.
 - Recording chain-of-thought, prompts, tool payloads, or memory content by
   default.
 - Using sampled traces to calculate correctness totals or audit evidence.
+- Using telemetry or an eventually consistent search projection as the only
+  way to answer current lifecycle, wait, wake, budget, cancellation, or
+  indeterminate-effect state.
+- Reporting terminal cancellation while a consequential external effect still
+  has an unknowable outcome.
 - Putting goal/task/agent/run/delegation/effect/memory IDs or raw user values
   in metric labels or baggage.
 - Coupling durable domain records to a Development GenAI convention revision.
@@ -1250,6 +1522,12 @@ The design is ready for implementation planning when:
   artifacts, and a public identity distinct from execution sessions;
 - logical availability, runtime residency, quiescence, durable wake sources,
   and cold reactivation have separate contracts and tests;
+- continuous goals have versioned wake, overlap, missed-occurrence, lateness,
+  coalescing, epoch, suspension, and retirement semantics that do not depend on
+  pod lifetime;
+- every continuous epoch is finite, independently budgeted, and isolated by a
+  distinct task/run session unless an explicit bounded alternative is
+  justified;
 - goal success criteria, progress evaluation, evidence, and terminal authority
   are explicit and versioned;
 - delegation lineage, fan-out/fan-in, cycle prevention, cancellation, and
@@ -1259,6 +1537,10 @@ The design is ready for implementation planning when:
 - each run status and checkpoint has defined recovery and A2A projection;
 - the dispatcher table covers every effect safety class and crash window;
 - settings update and revocation timing is specified;
+- autonomy admission and hierarchical budget reservation/settlement are
+  specified across definition, goal, task/epoch, run, and effect scopes;
+- tool visibility, admitted binding, effect intent, dispatch grant, credential
+  resolution, and executor isolation are separate contracts;
 - Rig state versus Rakka durable state ownership is unambiguous;
 - the first storage schemas can enforce idempotency and stale-writer rejection;
 - the communal graph SPI passes the same conformance suite without exposing a
@@ -1273,6 +1555,8 @@ The design is ready for implementation planning when:
   wake source;
 - content capture, redaction, sampling, and telemetry-loss behavior are
   explicitly testable;
+- authoritative operational queries remain correct without telemetry and task
+  materialized state remains bounded independently from history/content;
 - memory trust, deletion, and retention policies are represented in the model;
 - fault-injection acceptance scenarios are enumerated; and
 - unresolved product decisions are explicitly recorded in `spec.md` rather

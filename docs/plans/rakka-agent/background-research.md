@@ -1,7 +1,7 @@
 # Rakka Agents Background Research
 
 Status: research record
-Research date: 2026-07-09
+Research date: 2026-07-10
 Related guidance: [technical-guidance.md](technical-guidance.md)
 Emerging specification: [spec.md](spec.md)
 
@@ -17,7 +17,8 @@ The target is an agent that:
 - pursues an explicit goal and persists logically until that goal reaches an
   evidenced terminal outcome;
 - uses Rig as its language-model abstraction;
-- plans, decides, reasons, and invokes tools through its own agentic loop;
+- plans, decides, reasons, and invokes tools and/or other agents through
+  its own agentic loop;
 - collaborates concurrently with specialized agents, tools, and durable
   workflows in a shared environment;
 - has a stable sharded identity, typed durable tasks, and independently durable
@@ -94,18 +95,38 @@ or storage adapters already exist.
 12. Akka's declared delegation, handoff, team, and moderation capabilities are
     a useful capability vocabulary. Rakka should compile equivalent contracts
     into its durable task, A2A, graph, inbox/outbox, and passivation substrate.
+13. The full always-on article independently supports treating autonomy as the
+    durable operating model around a loop, but its pod-started daemon
+    interpretation is incompatible with Rakka's logical-availability and
+    passivation contract.
+14. Continuous goals should be stable controllers over finite child epoch
+    tasks/runs, with versioned durable wakes, explicit overlap/missed-occurrence
+    policy, and no schedule/budget reset on runtime restart.
+15. Budgets, autonomy admission, tool authority, executor isolation, and
+    authoritative operational queries are correctness/safety contracts rather
+    than prompt or telemetry conventions.
+16. Task materialized state must remain bounded and separate from append-only
+    history, content/artifacts, scoped memory, and derived projections.
 
 ## Goal-Driven and Multi-Agent Findings
 
 ### Useful "Always-On" Vocabulary
 
-The referenced LinkedIn article itself was not retrievable in this research
-environment, but the author's public companion post was available. It
-describes an autonomous agent as working toward a persistent goal, periodically
-observing a changing environment, using tools and context, and iterating over
-time. It also identifies the main design questions as unit of work, lifecycle,
-identity, memory, budgets, cancellation, permissions, instrumentation,
-isolation, and detecting whether the agent is progressing or stuck.
+The full referenced LinkedIn article was reviewed from the project owner's
+saved 12-page PDF after the original page was inaccessible to the initial
+research environment. The article argues that autonomy is the operating model
+around an agentic loop, not the loop itself. Once work continues without a
+synchronous caller, the system must own task identity, lifecycle, output,
+error handling, cancellation, retention, audit, permissions, memory,
+resumability, budgets, and observability.
+
+The article therefore provides strong practitioner support for the Rakka
+boundary already selected: Rig supplies model-facing reasoning and tool
+abstractions, while Rakka supplies the durable distributed-systems operating
+model. The article is directional evidence rather than a normative standard;
+its conclusions were checked against the current A2A, Kubernetes, and
+OpenTelemetry primary documentation before being carried into the guidance and
+specification.
 
 That vocabulary fits Rakka if "always-on" describes logical availability and
 durable intent rather than a permanently running process. A Rakka Agent is
@@ -144,6 +165,130 @@ from durable timers or application events, execute one bounded observation or
 decision epoch, persist the next effect/wait, and become passivatable again.
 They do not maintain an immortal polling loop.
 
+### Full-Article Technical Review
+
+The complete article adds six findings that materially reinforce the proposed
+architecture:
+
+| Article finding | Rakka consequence |
+| --- | --- |
+| Long-running autonomy needs a durable unit of work | Keep `AgentTaskId` distinct from `AgentRunId` and map the task to A2A `Task.id` |
+| Continuous monitoring and bounded asynchronous work need different controls | Model a continuous goal as a durable controller that admits finite child epoch tasks/runs |
+| Budgets constrain excessive agency, not only cost | Use durable hierarchical limits for iterations, model/tool calls, effects, tokens, cost, time, concurrency, and descendants |
+| Task state and memory are separate domains | Keep lifecycle state small and bounded; store conversations, observations, tool history, and learned context in scoped memory/artifact stores |
+| Model-visible tools are not an authority boundary | Bind dispatch to current capabilities, credentials, approvals, execution identity, network/sandbox policy, and effect safety |
+| Debugging autonomous fleets requires task, budget, tool, cancellation, memory, and trace views | Provide authoritative operational queries independently from sampled telemetry, plus linked OpenTelemetry signals |
+
+The article's distinction between continuous execution and asynchronous task
+execution is useful, but its daemon-like description of a loop that begins
+when a pod starts is rejected. Pod creation is a deployment event, not an
+agent-domain wake. A pod start, restart, replacement, rollout, or shard move
+must not create an epoch, reset a schedule, reset a budget, or alter logical
+agent lifetime.
+
+The recommended continuous model is instead:
+
+```text
+stable continuous goal/root control task
+    -> durable wake occurrence
+    -> finite child AgentTaskId
+    -> finite AgentRunId with isolated short-term memory
+    -> result/evidence returned to the continuous goal
+    -> next durable wake or retirement
+```
+
+This makes every epoch an ordinary recoverable unit of work while the
+continuous goal may remain logically active and fully passivated for months or
+years. Durable timer/event records, not resident computation, provide future
+wakes.
+
+### Wake, Overlap, and Missed-Occurrence Findings
+
+Kubernetes `CronJob` controls demonstrate that overlap and missed occurrences
+are explicit scheduling policy rather than safe implementation defaults.
+Rakka should reuse that vocabulary without using a `CronJob`, pod-local timer,
+or pod start as the agent scheduler.
+
+The initial Rakka policy should:
+
+- attach a monotonic schedule revision to every wake occurrence;
+- derive a stable wake/deduplication identity from the goal, revision, and
+  logical occurrence;
+- forbid overlapping epochs by default and durably coalesce triggers received
+  while one epoch is active;
+- admit one coalesced epoch after downtime by default rather than replaying an
+  unbounded backlog;
+- fence pending wakes from obsolete schedule revisions; and
+- make bounded replay or parallel epochs explicit opt-in policy.
+
+The current `rakka-agent-workflow` timer substrate already persists one-shot
+timer identity, target run, due time, deduplication key, telemetry context,
+status, and optional maximum lateness. The agent layer needs a durable wake
+controller above that primitive, not a second resident scheduling system.
+
+### Budget and Admission Findings
+
+The current autonomy policy records autonomous steps, external calls, tokens,
+and wall-clock start. That is a useful foundation but not yet a multi-scope
+safety ledger. Agent budgets need definition ceilings, goal allocations,
+task/epoch allocations, run allocations, and turn/effect reservations.
+
+An effect that reaches durable `Started` consumes an attempt even if the
+worker later disappears and the outcome becomes indeterminate. An idempotent
+retry also consumes an attempt. Continuous budget refills must be defined by a
+durable logical window or schedule revision and must never occur because a pod
+or actor restarted.
+
+The article's negative suitability criteria also support a fail-closed
+autonomy-admission step. An unattended definition should not be admitted
+without inspectable progress, cancellation, bounded cost/effects, scoped tool
+authority, success or health criteria, and approval/reconciliation policy.
+Rakka should persist and enforce the admission decision; the application owns
+the industry-specific risk rules.
+
+### Tool Authority and Workload Isolation Findings
+
+Kubernetes assigns ServiceAccounts and network policy to workloads, not to
+individual logical actors inside a shared process. Therefore a model-visible
+tool schema, an allowed Rakka capability, and the workload identity that can
+actually reach the target are three distinct layers.
+
+Shared dispatcher pods with broad ambient credentials would weaken isolation
+even if Rakka performs correct software authorization. Production deployments
+should be able to route effects to trust-tier dispatcher pools or ephemeral
+effect sandboxes with constrained workload identity, credentials, and network
+reachability. This is effect-executor isolation, not a pod per logical agent.
+
+Kubernetes NetworkPolicy is useful only when the selected network plugin
+enforces it and generally controls network-layer reachability rather than
+application authorization. The Rakka contract should consequently carry a
+logical execution-policy reference without claiming to implement the
+application's sandbox, identity provider, service mesh, or policy engine.
+
+### Bounded State and Operational Query Findings
+
+Task ownership does not require embedding unbounded history in the task
+entity's materialized state. The research supports four separate domains:
+
+1. bounded authoritative task/run state needed for the next transition;
+2. append-only durable domain events and audit history;
+3. content, artifacts, observations, and scoped memory; and
+4. derived list/search/observability projections.
+
+Current A2A 1.0 documentation supports bounded task history, list pagination,
+optional artifact inclusion, caller-scoped visibility, and explicit task
+cancellation. Cancellation remains an attempt and is not proof that an
+external operation stopped. For Rakka, a cancellation request must fence new
+work immediately, but a task with an ambiguous non-idempotent effect should
+remain nonterminal in reconciliation rather than falsely reporting safe
+cancellation.
+
+An authorized operational snapshot must be reconstructable from durable state
+even when the entity is passivated, trace sampling discarded routine spans,
+or the telemetry exporter is unavailable. OpenTelemetry supplies timing,
+correlation, aggregation, and investigation; it does not replace the task,
+run, budget, effect, checkpoint, timer, or event sources of truth.
+
 ### Goal Versus Agent Versus Run
 
 The design needs four distinct identities:
@@ -157,8 +302,9 @@ The design needs four distinct identities:
 
 For the first implementation, the stable root `AgentTaskEntity` can own the
 goal-coordinator state and `AgentGoalId` may default to the root `AgentTaskId`.
-The current root run proposes decisions against that state. Delegated children
-receive their own `AgentTaskId` and `AgentRunId`. A handoff preserves
+The current finite root or continuous-epoch run proposes decisions against
+that state. Delegated children receive their own `AgentTaskId` and `AgentRunId`.
+A handoff preserves
 `AgentTaskId` but creates a new target-agent `AgentRunId`, leaving the source
 run as immutable lineage rather than changing its agent/memory scope.
 
@@ -589,6 +735,14 @@ action and acquiring an OAuth credential as example use cases. It recommends
 that credentials be delivered out of band unless an explicit in-band extension
 has been negotiated, and that credentials be bound to the originating agent.
 
+The current public A2A documentation identifies 1.0 as the latest release. It
+adds/clarifies task listing with pagination/filtering, bounded history and
+artifact inclusion, caller-scoped visibility, timestamps, subscription, and
+cancellation behavior. `CancelTask` attempts cancellation but does not promise
+that already-started external work stopped. Rakka therefore needs a pinned
+protocol version and a richer internal cancellation/reconciliation state than
+the public terminal task enum alone can express.
+
 For Rakka Agents this implies:
 
 - `AgentTaskId` is the natural durable identity for A2A `Task.id`, while
@@ -600,7 +754,11 @@ For Rakka Agents this implies:
 - resolved credentials must not be stored in task history, durable effects,
   prompts, logs, or snapshots; and
 - agent-to-agent calls are external effects sent through the Rakka outbox, not
-  direct actor remoting exposed as a client protocol.
+  direct actor remoting exposed as a client protocol;
+- cancellation requests fence new work but remain nonterminal while an
+  indeterminate consequential effect requires reconciliation; and
+- A2A list/history/artifact projections remain bounded views rather than task
+  correctness or memory stores.
 
 ## Why an Indeterminate State Is Necessary
 
@@ -940,8 +1098,14 @@ selected Collector distribution.
 - [Akka multi-agent systems](https://doc.akka.io/sdk/use-cases/multi-agent-systems.html)
 - [Akka public SDK API/Javadocs](https://doc.akka.io/sdk/_attachments/api/)
 - [Akka autonomous-agent sample implementation](https://github.com/akka-samples/autonomous-agent-playground)
-- [A2A specification](https://github.com/a2aproject/A2A/blob/main/docs/specification.md)
+- [A2A 1.0 specification](https://a2a-protocol.org/dev/specification/)
+- [A2A task lifecycle](https://a2a-protocol.org/latest/topics/life-of-a-task/)
+- [A2A specification source](https://github.com/a2aproject/A2A/blob/main/docs/specification.md)
 - [A2A protocol schema](https://github.com/a2aproject/A2A/blob/main/specification/a2a.proto)
+- [Kubernetes CronJob](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/)
+- [Kubernetes ServiceAccounts](https://kubernetes.io/docs/concepts/security/service-accounts/)
+- [Kubernetes RBAC good practices](https://kubernetes.io/docs/concepts/security/rbac-good-practices/)
+- [Kubernetes NetworkPolicy](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
 - [pgvector](https://github.com/pgvector/pgvector)
 - [OpenTelemetry documentation](https://opentelemetry.io/docs/)
 - [OpenTelemetry tracing API](https://opentelemetry.io/docs/specs/otel/trace/api/)
@@ -954,6 +1118,9 @@ selected Collector distribution.
 - [OpenTelemetry sensitive-data guidance](https://opentelemetry.io/docs/security/handling-sensitive-data/)
 - [OpenTelemetry baggage guidance](https://opentelemetry.io/docs/concepts/signals/baggage/)
 - [Autonomous Agentic Systems at Scale article](https://www.linkedin.com/pulse/autonomous-agentic-systems-scale-practical-guide-agents-saucedo-ialvf/)
+- Project-owner supplied 12-page PDF export of the preceding article, reviewed
+  on 2026-07-10; the local research artifact is not committed to this
+  repository.
 - [Author's public companion post](https://www.linkedin.com/posts/axsaucedo_autonomous-agentic-systems-at-scale-a-practical-activity-7464918399110967296-wJNJ)
 
 ## Research Conclusions Carried Forward
@@ -983,7 +1150,27 @@ The guidance and specification should carry these constraints forward:
   thread or process.** Active is a durable lifecycle state, not a claim of
   runtime residency.
 - Goal satisfaction requires versioned criteria and evidence, while continuous
-  goals use bounded evaluation epochs and durable timers.
+  goals are durable controllers that admit finite child epoch tasks/runs from
+  deduplicated durable wakes and may passivate between every epoch.
+- Pod start, restart, replacement, rollout, and shard movement never create an
+  epoch, reset a schedule/budget, or define logical agent lifetime.
+- Continuous wake policy makes schedule revision, overlap, missed occurrence,
+  lateness, coalescing, failure backoff, suspension, and retirement explicit;
+  default behavior forbids overlap and admits at most one coalesced epoch after
+  downtime.
+- Budgets form a durable hierarchy from definition ceiling through goal,
+  task/epoch, run, and turn/effect reservations; started and indeterminate
+  attempts still consume their applicable safety budgets.
+- Unattended execution requires a fail-closed autonomy-admission decision that
+  verifies criteria, bounded authority/effects, cancellation, inspectability,
+  escalation, and recovery policy.
+- Model-visible tool descriptors, Rakka tool bindings, effect intents,
+  dispatch grants, and executor workload isolation are distinct contracts.
+- Authoritative task state remains bounded and separate from durable history,
+  content/memory, and observability projections.
+- Cancellation is an observable propagation process, not proof that a started
+  external effect stopped; indeterminate consequential effects reconcile
+  before the task projects terminal cancellation.
 - Agent observability uses bounded trace segments linked across durable waits,
   with `AgentRunId` as session correlation rather than one resident session
   span.

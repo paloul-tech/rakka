@@ -1,7 +1,7 @@
 # Rakka Agent Specification
 
 Status: planning draft
-Date: 2026-07-09
+Date: 2026-07-10
 Background research: [background-research.md](background-research.md)
 Technical guidance: [technical-guidance.md](technical-guidance.md)
 Akka comparison: [rakka-akka-technical-comparison.md](../../comparisons/akka/rakka-akka-technical-comparison.md)
@@ -49,6 +49,8 @@ be interpreted as normative requirements for the proposed implementation.
 - Represent a durable goal independently from the agent runs that contribute
   to it, with versioned success criteria, evidence, progress, and terminal
   authority.
+- Represent continuous goals as fully passivatable durable controllers that
+  admit finite epoch tasks/runs from versioned, deduplicated wake occurrences.
 - Represent typed durable tasks independently from the agent execution sessions
   assigned to them, preserving one public task across handoff/reassignment.
 - Provide independently recoverable agent runs with their own durable agentic
@@ -99,6 +101,10 @@ be interpreted as normative requirements for the proposed implementation.
   behavioral concepts through an independent Rust implementation.
 - Defining "always-on" as permanently resident computation, a sleeping async
   task, an immortal polling loop, a held connection, or a pinned shard owner.
+- Starting or resuming agent-domain work because a pod, actor, dispatcher, or
+  node process started, restarted, moved, or rolled out.
+- Using a Kubernetes `CronJob`, pod-local scheduler, or recurring in-memory
+  timer as the correctness source for continuous-agent wakes.
 
 ## 5. Ownership Boundaries
 
@@ -106,6 +112,8 @@ Rakka owns:
 
 - durable goal, agent, typed task, run, delegation, and workflow-link identity;
 - sharding, placement, passivation, and recovery;
+- continuous wake identity/admission, schedule fencing, epoch creation, and
+  hierarchical budget accounting;
 - versioned loop state and deterministic transitions;
 - accepted-command and result deduplication;
 - durable effect intent, safety policy, dispatch eligibility, and result
@@ -134,6 +142,8 @@ The application owns:
 - model/provider accounts and credential storage;
 - logical credential bindings and dispatch-time credential resolution;
 - tool implementations, sandboxes, and external reconciliation adapters;
+- workload identity, dispatcher trust-tier placement, network-egress policy,
+  and execution-policy realization;
 - specialist catalog/routing, team-formation, goal-evaluator, and terminal
   authority policy;
 - retention, classification, privacy, cost, and safety policy;
@@ -170,10 +180,11 @@ span multiple specialized agents, concurrent `AgentRunId` values, A2A tasks,
 workflow runs, waits, recoveries, and trace segments.
 
 The initial implementation SHOULD let the stable root `AgentTaskEntity`
-coordinate the goal, while the current root `AgentRunEntity` proposes decisions
-against it. Its generated `AgentGoalId` MAY default to the root `AgentTaskId`
-value, but the types and semantics MUST remain distinct so coordination can
-later move to a dedicated entity without changing the public contract.
+coordinate the goal, while the current finite root or continuous-epoch
+`AgentRunEntity` proposes decisions against it. Its generated `AgentGoalId` MAY
+default to the root `AgentTaskId` value, but the types and semantics MUST remain
+distinct so coordination can later move to a dedicated entity without changing
+the public contract.
 
 ### 6.4 AgentTaskId
 
@@ -216,6 +227,12 @@ The logical `AgentRunEntity` is sharded by
 One run MUST work on at most one `AgentTaskId` at a time. Parallel work uses
 multiple independently sharded runs.
 
+For a continuous goal, each admitted evaluation/observation epoch MUST use a
+distinct finite child `AgentTaskId` and `AgentRunId`. Cross-epoch continuity
+belongs in the stable goal/controller state, agent-private memory, and explicit
+artifacts; one unbounded run and short-term-memory session MUST NOT be the
+default continuous-execution model.
+
 ### 6.6 AgentDelegationId
 
 `AgentDelegationId` identifies one durable assignment of work from a parent
@@ -240,14 +257,27 @@ required by the external system.
 space MUST be tenant- or organization-scoped. Cross-tenant knowledge sharing
 MUST require an explicit federation design and authorization policy.
 
-### 6.9 Stable Operation IDs
+### 6.9 AgentWakeId and ScheduleRevision
 
-Commands, task/dependency/assignment/handoff/claim/turn transitions, effects,
+`AgentWakeId` identifies one durable logical occurrence that may admit a
+continuous-goal epoch. It MUST be stable across scanner/dispatcher restart,
+pod loss, passivation, duplicate trigger delivery, and shard movement.
+
+Every wake MUST bind `AgentGoalId`, the current `ScheduleRevision`, trigger
+kind/source, logical occurrence or event identity, due/accepted time,
+deduplication identity, and policy revision. A schedule update MUST create a
+monotonic revision and fence pending wakes from obsolete revisions unless an
+explicit migration adopts them.
+
+### 6.10 Stable Operation IDs
+
+Commands, wake/epoch admission, budget reservation/settlement,
+task/dependency/assignment/handoff/claim/turn transitions, effects/grants,
 memory writes, checkpoint resolutions, A2A sends, and graph claim appends MUST
 carry stable operation or deduplication IDs. Replaying the same accepted
 operation MUST NOT produce a second state transition or logical write.
 
-### 6.10 Logical Availability and Runtime Residency
+### 6.11 Logical Availability and Runtime Residency
 
 Logical availability is the ability to address a stable agent/goal/task/run,
 durably accept authorized work, and recover the next legal transition on the
@@ -286,11 +316,14 @@ An agent definition SHOULD include:
 - declared specialties, accepted goal classes, and typed handoff, delegation,
   team, and moderation capability limits;
 - allowed workflow tools and versioned input/output contracts;
-- loop, token, cost, time, and concurrency budgets;
+- admitted operation classes and continuous wake/overlap/missed-occurrence/
+  suspension/retirement policy where applicable;
+- loop, model/tool/effect, token, cost, time, and concurrency budgets;
 - goal-evaluator and progress/stagnation policy references;
 - memory and retrieval policy;
 - approval, authorization, and escalation policy references;
 - logical credential binding references;
+- execution-policy/trust-class references for tool dispatch;
 - A2A agent-card/skill metadata;
 - retention and classification policy; and
 - definition schema version.
@@ -338,19 +371,54 @@ knowledge access, add an unauthorized peer, or downgrade effect safety. The
 effective definition, setup, settings, and policy revisions MUST be recorded on
 the task/run and every resulting effect.
 
+### 7.4 Autonomy Admission
+
+Rakka Agent MUST distinguish at least `Interactive`, `BoundedAsync`, and
+`Continuous` operation classes. These classes describe operating behavior;
+industry-specific risk classification remains application policy.
+
+Unattended `BoundedAsync` or `Continuous` execution MUST fail closed unless an
+authorized admission policy verifies:
+
+- measurable completion, health, or progress criteria;
+- bounded time, cost, iterations, model/tool calls, effects, concurrency, and
+  collaboration as applicable;
+- cancellation, suspension, escalation, and recovery behavior;
+- authorized operational inspection;
+- classified tool/effect safety and scoped capabilities/credential bindings;
+- approval or security-authorization policy for consequential operations; and
+- indeterminate-effect reconciliation policy.
+
+Every accepted decision MUST create an immutable
+`AutonomyAdmissionDecision` containing operation class, admitted
+definition/setup/settings/policy revisions, evaluator principal or service,
+stable reasons/constraints, creation time, and optional expiry.
+
+Admission MUST run when a definition is published or instantiated and whenever
+an update may widen tools, peers, credentials, environment/knowledge access,
+schedule, budgets, or other autonomy. Narrowing updates MAY reuse an admission
+only when policy proves them monotonic. Immediate cancellation, revocation,
+grant validity, and safety policy MUST still be checked before every dispatch.
+
+Rakka owns the admission contract, durable decision, and enforcement points.
+The application owns policy authoring, risk taxonomy, and business/regulatory
+approval rules.
+
 ## 8. Goal-Driven Collaboration
 
 ### 8.1 Goal Contract and Lifecycle
 
 Every goal MUST have a durable, versioned `AgentGoalSpec` containing at least:
 
-- `TenantId`, `AgentGoalId`, owner/principal, root `AgentTaskId`, and root
-  `AgentRunId`;
+- `TenantId`, `AgentGoalId`, owner/principal, root `AgentTaskId`, and initial/
+  current coordinator `AgentRunId` when applicable;
 - objective and immutable or versioned success criteria;
-- finite or continuous goal mode;
+- finite or continuous goal mode and, for continuous mode, versioned wake,
+  overlap, missed-occurrence, suspension, and retirement policy;
 - constraints, priority, deadline, and cancellation policy;
-- token, cost, elapsed-time, descendant, fan-out, depth, and concurrency
-  budgets;
+- iteration, model/tool/effect, token, cost, active/elapsed-time, descendant,
+  fan-out, depth, and concurrency budgets plus refill/window policy where
+  applicable;
 - allowed agent skills, tools, workflows, knowledge spaces, and environment
   references;
 - evaluator/policy reference and required evidence classes;
@@ -380,10 +448,51 @@ budget or progress limit MUST park, escalate, or terminate according to policy.
 
 A finite goal terminates after its current versioned criteria are evaluated. A
 continuous goal, if enabled, MUST execute as bounded durable epochs with an
-explicit health condition, renewal/budget policy, and retirement path; it MUST
-NOT be implemented as an immortal polling future.
+explicit health condition, wake, renewal/budget, suspension, and retirement
+policy; it MUST NOT be implemented as an immortal polling future.
 
-### 8.2 Progress, Evidence, and Completion
+### 8.2 Continuous Goal Controller and Epochs
+
+A continuous goal MUST be represented as a stable, durable, fully passivatable
+controller. Its root control task MAY remain nonterminal for the goal's logical
+lifetime, but it MUST NOT own a resident loop, sleeping task, in-memory timer,
+held connection, open span, dispatcher reservation, or pod lease.
+
+Each admitted epoch MUST create one finite child `AgentTaskId` and one finite
+`AgentRunId`. The epoch MUST carry the goal/root task, `AgentWakeId`, schedule,
+definition/setup/settings/policy revisions, input observation scope, budget,
+deadline, and result/evidence contract. Epoch completion returns evidence to
+the controller and MUST NOT by itself terminate the continuous goal.
+
+Every continuous goal MUST have a versioned `AgentWakePolicy` defining:
+
+- allowed durable timer, external-event, authenticated A2A command, callback,
+  and/or hybrid triggers;
+- schedule revision, occurrence/deduplication construction, admission window,
+  and maximum lateness;
+- overlap, coalescing, and missed-occurrence behavior;
+- per-epoch budget/deadline and goal-level rolling/window ceiling;
+- failure backoff and escalation; and
+- suspension, renewal, expiry, and retirement.
+
+The default overlap policy MUST forbid a second active epoch and durably
+coalesce triggers received while one is active. The default missed-occurrence
+policy after downtime MUST admit at most one coalesced epoch. Parallel epochs,
+bounded catch-up, or replay of multiple occurrences MUST require an explicit
+definition and concurrency/result policy.
+
+A schedule update MUST fence obsolete occurrences. Duplicate timer scans,
+events, callbacks, A2A commands, or scanner restarts MUST produce one logical
+`AgentWakeId` and at most one admitted child epoch. A pod/actor/dispatcher start
+or restart MUST NOT itself create a wake, epoch, schedule reset, or budget
+refill. Kubernetes scheduling MAY operate shared Rakka services but MUST NOT be
+the continuous agent's correctness scheduler.
+
+Between every wake, admission, epoch transition, and result, the controller,
+task, and run MAY passivate. Future progress MUST depend only on durable or
+safely replayable triggers and authoritative shared state.
+
+### 8.3 Progress, Evidence, and Completion
 
 An agent or model MAY propose that a goal is complete, but that declaration is
 not sufficient to transition the goal to `Satisfied`. The configured evaluator
@@ -401,7 +510,7 @@ bounded forms of repetition, lack of material state change, budget exhaustion,
 and stale environmental assumptions, then continue, replan, wait, escalate, or
 terminate according to deterministic policy.
 
-### 8.3 Specialization and Durable Delegation
+### 8.4 Specialization and Durable Delegation
 
 An agent's specialties and accepted work contracts SHOULD be advertised as
 versioned A2A Agent Card/skill metadata. A model or deterministic planner MAY
@@ -433,7 +542,7 @@ other policy-defined cycles. Reassignment after ambiguity MUST use
 reconciliation or a new explicit delegation generation; it MUST NOT assume the
 prior child and its external effects never ran.
 
-### 8.4 Shared Environment and Collective Memory
+### 8.5 Shared Environment and Collective Memory
 
 Agents collaborate in a shared environment through authorized
 `AgentEnvironmentRef` values and tools, not through unsynchronized actor
@@ -451,7 +560,7 @@ operation ID. Concurrent or conflicting claims MUST retain provenance and
 coexist for policy-aware resolution rather than silently overwriting communal
 truth.
 
-### 8.5 Workflows as Tools
+### 8.6 Workflows as Tools
 
 An agent MAY expose or consume a compiled workflow as a tool only through a
 versioned `WorkflowToolDescriptor` containing the workflow definition/version,
@@ -468,12 +577,25 @@ The entire workflow MUST NOT be wrapped as one opaque retryable tool effect.
 Its scheduler, checkpoints, and individual external effects retain their own
 durable safety, retry, reconciliation, and indeterminate semantics.
 
-### 8.6 Cancellation, Failure, and Waiting
+### 8.7 Cancellation, Failure, and Waiting
 
 Goal cancellation, deadline, and immediate capability revocation MUST be
 propagated durably to active child runs and workflows. Propagation is a request
 with an observable outcome; it is not proof that an already-started external
 effect was cancelled.
+
+Acceptance of a cancellation request MUST immediately fence new model, tool,
+workflow, and delegation dispatch for the affected scope. Cancellation MUST
+track durable progress through request, propagation, quiescence, optional
+reconciliation, and terminal completion. It MUST NOT be represented only by a
+single in-memory flag or best-effort broadcast.
+
+If any started consequential effect has an unknowable outcome, the task MUST
+remain nonterminal in `WaitingForReconciliation` with cancellation requested.
+It MUST NOT project terminal `Cancelled` until internal work is quiescent and
+every such effect has a known outcome or explicit reconciliation decision.
+An A2A cancellation response represents the current result of an attempted
+cancellation, not proof that every external side effect stopped.
 
 A root coordinator MAY wait for all children, a quorum, a policy-selected
 subset, or an early satisfying result. The fan-in rule MUST be fixed in durable
@@ -482,7 +604,7 @@ indeterminate children MUST be handled explicitly by policy. While waiting for
 agents, workflows, humans, timers, or reconciliation, the coordinator SHOULD
 passivate and MUST NOT hold a live thread, future, or trace span.
 
-### 8.7 Coordination Capability Model
+### 8.8 Coordination Capability Model
 
 Rakka SHOULD expose a versioned `AgentCoordinationCapability` model with four
 initial variants:
@@ -506,7 +628,7 @@ compiled workflow. When the model is authorized to decide which specialist or
 coordination transition occurs next, it SHOULD use these capabilities. A
 workflow MAY invoke a durable agent task for a model-driven stage.
 
-### 8.8 Handoff
+### 8.9 Handoff
 
 Handoff transfers responsibility for the same `AgentTaskId` from a source run
 to a target agent. It MUST:
@@ -526,7 +648,7 @@ MUST NOT authorize replay of an opaque non-idempotent source effect.
 The handoff command/result MUST traverse the durable outbox/inbox and
 `rakka-a2a` boundary, including when source and target are currently colocated.
 
-### 8.9 Team Coordination
+### 8.10 Team Coordination
 
 A team MUST have a stable `AgentTeamId`, root goal, leader, bounded member
 types/instances, capability/scopes, creation/expiry policy, and a durable shared
@@ -545,7 +667,7 @@ passivate; a shared board is durable data, not a resident coordinator.
 Peer messages and task-transfer notifications MUST use durable commands and
 `rakka-a2a`, not direct actor references.
 
-### 8.10 Moderation
+### 8.11 Moderation
 
 A moderated interaction MUST have a stable `AgentConversationId`, moderator,
 authorized participant set, mode, durable turn/round state, transcript artifact
@@ -559,7 +681,7 @@ between turns.
 Turn requests/results MUST use durable A2A effects/commands with stable
 conversation, round, turn, participant, and deduplication identity.
 
-### 8.11 Human-Owned Tasks
+### 8.12 Human-Owned Tasks
 
 An `AgentTaskId` MAY be deliberately unassigned to an agent and completed by an
 authenticated human or external service with a typed result. This supports
@@ -581,8 +703,8 @@ A versioned `AgentTaskDefinition<R>` MUST declare:
 - permitted assignee agent classes/skills and human/service ownership policy;
 - dependency, failure/cancellation propagation, and handoff policy;
 - attachment/artifact media, size, classification, and loader policy;
-- per-task iteration, token, cost, elapsed-time, external-effect, and
-  coordination budgets;
+- per-task iteration, model-call, tool/effect-attempt, token, cost,
+  active/elapsed-time, artifact-size, and coordination budgets;
 - required evidence, guardrail, retention, and audit policy; and
 - schema-compatibility/migration metadata.
 
@@ -718,6 +840,63 @@ A run that proposes completion MUST submit a typed result proposal to its
 `AgentTaskEntity`. It MUST NOT make the public task terminal by mutating only
 run state. The task becomes `Completed` only after schema/result-rule
 validation; root goal satisfaction remains a separate evaluation.
+
+### 9.6 Bounded Task State and History
+
+The materialized state required for task transitions MUST be bounded
+independently from retention of domain history, content, memory, and
+observability projections.
+
+`AgentTaskEntity` current state MAY contain current identity/status/revisions,
+bounded dependency summary, assignment/claim, current run, pending
+effect/checkpoint/result references, accepted result reference, and terminal
+reason. It MUST NOT embed unbounded messages, observations, tool payloads,
+artifacts, assignment/handoff history, result proposals, audit events, or
+memory records.
+
+The runtime MUST separate:
+
+1. bounded authoritative materialized state;
+2. append-only durable domain/audit history;
+3. content/artifact and scoped-memory stores; and
+4. derived A2A, list/search, and observability projections.
+
+Task definitions or deployment policy MUST bound dependencies, children,
+handoffs/reassignments, result rejections, pending effects/checkpoints, inline
+metadata, history replay/query windows, and page sizes. Historical content MUST
+be queried through authorized cursors or immutable artifact references.
+Snapshotting/compaction MUST preserve correctness, deduplication, audit, and
+retention semantics without making memory the task lifecycle source.
+
+### 9.7 Hierarchical Budget Ledger
+
+Budgets MUST form a durable hierarchy from definition ceiling through goal
+allocation, task/epoch allocation, run allocation, and turn/effect reservation
+and settlement. A child allocation MUST NOT widen its parent or definition
+ceiling.
+
+The ledger MUST support applicable dimensions for autonomous iterations,
+model calls, tokens, provider cost, tool calls, external effect starts and
+attempts, active execution time, elapsed deadline, concurrent effects,
+delegation depth/fan-out/descendants, and bounded output/artifact size.
+
+Before dispatch, the runtime MUST atomically reserve the applicable budget or
+deny/park the operation. It MUST settle usage from the durable accepted result.
+An effect that reaches durable `Started` consumes an attempt even if it later
+becomes `Indeterminate`; an idempotent retry consumes another attempt. Unused
+child allocation MAY return to the parent only after a known terminal outcome.
+
+Budget decisions MUST carry scope, dimension, limit, consumed/reserved value,
+policy revision, and stable reason. Soft thresholds MAY warn or request
+authorization. Hard ceilings MUST deterministically reject, park, suspend,
+escalate, fail, expire, or retire according to persisted policy. Budget
+exhaustion SHOULD be a structured wait/stop/terminal reason rather than a new
+top-level task status for every dimension.
+
+Continuous goals MUST combine per-epoch allocation with a durable rolling or
+calendar-window goal ceiling. Refill MUST be a persisted logical-time policy
+transition and MUST NOT occur because an actor/pod restarted, a shard moved, or
+an entity was activated.
 
 ## 10. Rig Integration
 
@@ -872,13 +1051,52 @@ guardrails, timeout/deadline, and bounded result/artifact behavior.
 Entities, views, or compiled workflows MAY be presented through tool adapters,
 but their invocation MUST preserve the underlying component's durable identity
 and effect semantics. A workflow tool creates/adopts a durable workflow run as
-specified in Section 8.5.
+specified in Section 8.6.
 
 Remote MCP MAY be supported as an optional adapter for ordinary tools. It MUST
 NOT be used as an indirect peer-agent channel that bypasses the typed
 coordination runtime and `rakka-a2a`. Resolved endpoint credentials and tool
 responses remain subject to secret exclusion, content policy, and effect
 safety.
+
+### 11.8 Tool Authority and Execution Isolation
+
+The runtime MUST distinguish:
+
+- `ToolDescriptor`: bounded schema/description visible to Rig/model;
+- `ToolBinding`: definition/setup-authorized target, safety, capability, and
+  credential class;
+- `EffectIntent`: exact target, canonical argument digest, and revisions; and
+- `DispatchGrant`: current authorization to execute that exact intent.
+
+Model selection or generation of a tool call is a request only. It MUST NOT
+grant capability, credential access, network reachability, approval, or
+executor placement.
+
+Before durable `Started`, a dispatch grant MUST bind tenant, goal/task/agent/
+run/effect, descriptor name/version/schema digest, target and argument digest,
+safety class, definition/setup/settings/policy revisions, capability,
+credential binding, effect-bound checkpoint/grant where required, expiry, and
+allowed use count. The dispatcher MUST recheck immediate revocation and grant
+validity before each attempt.
+
+An effect intent SHOULD carry an application-owned `ExecutionPolicyRef`
+describing the required trust domain, workload identity class, network-egress
+class, sandbox/process class, secret-resolution class, and tenant-isolation
+class. Rakka owns routing, persistence, and enforcement of the reference; the
+application/platform owns the actual worker pool, Kubernetes RBAC,
+NetworkPolicy/service-mesh policy, credential issuer, and sandbox.
+
+Deployments MUST NOT claim strong per-agent isolation when all effects run in
+a shared worker with ambient authority for every tool/tenant class. Rakka MUST
+support routing by bounded trust/execution class and SHOULD support isolated or
+ephemeral effect executors for consequential tools. Such workers are bounded
+effect resources, not resident pods for logical agents.
+
+When MCP or another catalog can change descriptors/endpoints dynamically, the
+accepted effect MUST record or digest the selected descriptor/endpoint
+revision. Recovery MUST NOT silently execute against a materially different
+schema or target.
 
 ## 12. Durable Checkpoints and HITL
 
@@ -1144,6 +1362,12 @@ Run `HandedOff` or `Superseded` MUST NOT make the public task terminal while a
 successor run owns it. The projection follows authoritative task state and may
 include the current run condition as metadata.
 
+A cancellation request alone MUST NOT project `CANCELED`. While cancellation
+is propagating, project the authoritative nonterminal condition. If an
+indeterminate consequential effect still requires reconciliation, project
+`INPUT_REQUIRED` with bounded cancellation/reconciliation metadata until the
+task is safe to make terminal under Section 8.7.
+
 A2A `UNSPECIFIED` MUST NOT be used to represent an indeterminate external
 effect.
 
@@ -1221,6 +1445,12 @@ hold a thread or agent actor while waiting.
   production source of truth for run or memory recovery.
 - Continuous goals MUST use bounded epochs triggered by durable timers/events
   and MUST become passivatable between epochs; an immortal poller is forbidden.
+- Pod/actor/dispatcher start, restart, replacement, rollout, drain, or shard
+  movement MUST NOT create an epoch, reset a wake schedule, replay missed
+  occurrences without policy, or refill a budget.
+- Shared timer/event scanners MAY restart on a pod, but they MUST recover
+  durable `AgentWakeId` occurrences and inject them through deduplicated inbox
+  commands; they MUST NOT infer logical occurrences from their own uptime.
 
 ## 16. Security and Authorization
 
@@ -1229,6 +1459,14 @@ hold a thread or agent actor while waiting.
   existence across a tenant boundary.
 - Tool capabilities MUST be declared outside model output and enforced before
   effect scheduling and dispatch.
+- Model-visible tool descriptors MUST NOT imply dispatch authority. The
+  admitted binding, exact effect intent, current dispatch grant, credential
+  resolution, and execution-policy reference MUST each be validated at their
+  boundary.
+- Deployments claiming workload isolation MUST ensure the selected dispatcher
+  or sandbox lacks ambient authority beyond its declared trust/tool/tenant
+  class. Logical agent isolation MUST NOT be claimed solely from in-process
+  checks inside one universally privileged worker.
 - The runtime MUST apply versioned ordered guardrail stages, as configured, to
   A2A ingress/egress, retrieval/memory ingress, model request/response, and tool
   request/response boundaries.
@@ -1404,6 +1642,9 @@ operations use stable `rakka.agent.*` names.
 | Agent operation | Required span behavior |
 | --- | --- |
 | A2A ingress | Protocol `SERVER` span that extracts context before durable acceptance |
+| Continuous wake/epoch admission | `rakka.agent.wake.admit` bounded span linked to timer/event/A2A trigger with bounded outcome class |
+| Autonomy admission | `rakka.agent.autonomy.admit` bounded span/event with operation class and allow/deny reason |
+| Budget operation | `rakka.agent.budget.reserve` or `.settle` bounded span/event with scope/dimension class and outcome |
 | Active turn/invocation | Bounded `invoke_agent {agent.name}` `INTERNAL` span |
 | General decision | `rakka.agent.decide` `INTERNAL` span or event |
 | Explicit planning | `plan {agent.name}` `INTERNAL` span only when planning is reliably distinguishable |
@@ -1413,6 +1654,7 @@ operations use stable `rakka.agent.*` names.
 | Memory operation | Standard create/search/update/upsert/delete memory span |
 | Effect schedule | `rakka.agent.effect.schedule` `PRODUCER` span ending after durable acceptance |
 | Effect dispatch | `rakka.agent.effect.dispatch` `CONSUMER` span linked to schedule/prior attempts |
+| Tool dispatch grant | `rakka.agent.tool.authorize` bounded span/event with tool/trust class and allow/deny reason |
 | Tool execution | `execute_tool {tool.name}` `INTERNAL` span with downstream client spans |
 | Outbound A2A call | `invoke_agent {peer.name}` `CLIENT` span |
 | Task result validation | `rakka.agent.task.validate_result` `INTERNAL` span with bounded rule class/outcome |
@@ -1574,6 +1816,10 @@ Rakka Agent metrics SHOULD additionally cover:
 - delegation count/duration/outcome and active descendant count;
 - workflow-tool invocation count/duration/outcome;
 - task assignment/handoff/result-validation/dependency count and duration;
+- continuous wake accepted/duplicate/stale/coalesced/missed/late count, epoch
+  admission/result, and schedule-revision conflict;
+- autonomy admission allow/deny/expiry/recheck and budget
+  reserve/settle/deny/exhaustion by bounded scope/dimension class;
 - team claim/transfer/message and moderation turn/round count and duration;
 - active turn duration and outcome;
 - logically active/waiting goals and runs by bounded status class;
@@ -1628,8 +1874,13 @@ MUST NOT independently mutate correctness state.
 The runtime SHOULD produce immutable, queryable audit events for:
 
 - agent creation, settings change, suspension, and retirement;
+- autonomy admission/rejection/expiry and policy recheck;
 - goal proposal, activation, criteria revision, progress evaluation, wait,
   satisfaction, failure, cancellation, and expiry;
+- wake creation/admission/duplicate/stale/coalesced/missed/late outcome,
+  schedule revision, epoch creation, suspension, renewal, and retirement;
+- budget allocation/reservation/settlement/return/threshold/exhaustion by
+  scope and dimension class;
 - task creation, dependency, assignment, handoff/reassignment, result proposal,
   result acceptance/rejection, completion, failure, and cancellation;
 - delegation creation/resolution, child task acceptance/result, fan-in,
@@ -1645,7 +1896,9 @@ The runtime SHOULD produce immutable, queryable audit events for:
 - checkpoint open, resolution, timeout, escalation, and invalidation;
 - memory append, promotion, verification, dispute, retraction, tombstone, and
   deletion;
-- authorization grant reference and dispatch-time policy outcome; and
+- authorization grant reference and dispatch-time policy outcome;
+- tool binding/descriptor revision, dispatch-grant outcome, and selected
+  execution-policy/trust class; and
 - shard ownership/recovery events relevant to an incident.
 
 Audit events MUST reference durable identities and revisions without embedding
@@ -1743,7 +1996,35 @@ The selected Collector distribution and component versions MUST be pinned and
 revalidated during upgrades. Example manifests are not an evergreen security
 or compatibility guarantee.
 
-### 17.18 Session, Task, and Goal Observability Queries
+### 17.18 Authoritative Operational Queries and Observability Views
+
+Rakka Agent integrations MUST provide an authorized authoritative point query
+derived from durable task/run/effect/checkpoint/timer/budget state. It MUST
+remain useful when the entity is passivated, telemetry is sampled or delayed,
+and the Collector/exporter is unavailable.
+
+An `AgentOperationalSnapshot` SHOULD expose:
+
+- durable state revision and observation time;
+- logical lifecycle separately from current/last runtime residency;
+- current goal/task/run/phase, assignment/owner, and last material progress;
+- current wait reason and next durable wake occurrence;
+- budget allocations, reservations, consumption, thresholds, and exhaustion;
+- pending effects, attempts, safety classes, grants, and indeterminate work;
+- checkpoint/authorization state and bounded resolver requirements;
+- cancellation progress;
+- last activation, recovery, passivation, shard owner, and dispatcher state;
+  and
+- durable event cursor plus derived-projection revision/lag.
+
+Cancellation progress MUST distinguish at least `NotRequested`, `Requested`,
+`Propagating`, `Quiesced`, `WaitingForReconciliation`, and `Completed`. This
+state MUST follow Section 8.7 and MUST NOT infer terminal cancellation merely
+from acceptance of an A2A cancellation request.
+
+Authoritative point reads MUST return a durable state revision. List/search
+queries MAY use eventually consistent indexes but SHOULD expose projection
+revision/lag and MUST NOT be used to authorize or advance execution.
 
 Rakka Agent integrations SHOULD provide an authorized query/projection keyed by
 tenant plus `AgentId`/`AgentRunId` that assembles references to:
@@ -1788,6 +2069,10 @@ Initial dashboards and alerts SHOULD cover:
 - team backlog/claim age/transfer and moderation turn/round exhaustion;
 - workflow-tool invocation latency, failure, and cancellation;
 - active, waiting, failed, cancelled, and indeterminate runs/effects;
+- continuous wake backlog/age, coalescing, missed/late occurrence, active epoch,
+  and retirement state;
+- autonomy admission denials/expiry and budget allocation/reservation/
+  exhaustion by bounded scope/dimension;
 - A2A acceptance latency and durable rejection/duplicate/conflict rate;
 - active-turn and decision latency;
 - model/provider latency, errors, tokens, and streaming delay;
@@ -1903,7 +2188,35 @@ The implementation is not production-ready until tests demonstrate:
     explicit retention-gap/resync response; and
 46. an idle agent with assigned/blocked future tasks auto-passivates without
     requiring `terminate` or `suspend` and reactivates when work becomes
-    eligible.
+    eligible;
+47. pod/actor/dispatcher start, restart, rollout, and shard movement create no
+    continuous epoch unless a durable wake is independently due/accepted;
+48. duplicate timer scans, events, callbacks, or A2A trigger delivery resolve
+    to one `AgentWakeId` and at most one child epoch task/run;
+49. an obsolete schedule revision cannot admit an epoch after an update, and a
+    restart does not reset the revision or missed-occurrence policy;
+50. the default overlap policy coalesces concurrent triggers while exactly one
+    epoch owns execution, and the default downtime policy admits at most one
+    coalesced epoch rather than unbounded catch-up;
+51. continuous epochs use distinct finite task/run short-term-memory scopes and
+    recover cross-epoch continuity only from authorized goal/private-memory/
+    artifact state;
+52. budget allocation/reservation/settlement survives restart and concurrency
+    without oversubscription, and a `Started` attempt that becomes
+    `Indeterminate` still consumes its applicable attempt budget;
+53. unattended execution fails closed when admission is missing/expired or a
+    settings update widens an unadmitted tool, peer, credential, environment,
+    schedule, or budget scope;
+54. a model-visible tool call remains undispatchable when its binding, grant,
+    credential, checkpoint, execution-policy, or immediate safety check fails;
+55. bounded task materialized state remains within configured limits while
+    older history/content is available only through authorized cursors or
+    artifact references;
+56. authoritative lifecycle/wait/wake/budget/effect/cancellation queries remain
+    correct when telemetry is sampled, delayed, dropped, or unavailable; and
+57. cancellation with an ambiguous consequential effect fences all new work,
+    remains nonterminal in reconciliation, and projects terminal cancellation
+    only after the effect outcome/risk is explicitly resolved.
 
 Fault injection SHOULD kill the dispatcher or owner pod at every durable
 effect boundary, including after a test external system commits but before it
@@ -1915,8 +2228,11 @@ The intended workspace shape is:
 
 - `rakka-agent`: goal/typed-task/run/evaluation/handoff/delegation/team/
   moderation/workflow-tool domain, typed client, loop runtime, Rig adapter,
-  guardrails, gates, effect policy, session/private memory traits, structured
-  decision/runtime telemetry, and deterministic test support;
+  continuous wake controller, hierarchical budget ledger, autonomy admission,
+  guardrails, gates, tool-binding/dispatch-grant/effect policy,
+  execution-policy references, bounded operational query contracts,
+  session/private memory traits, structured decision/runtime telemetry, and
+  deterministic test support;
 - `rakka-agent-postgres`: PostgreSQL session/private memory and `pgvector`
   retrieval adapter;
 - `rakka-agent-knowledge-graph`: optional database-agnostic communal graph
@@ -1940,8 +2256,9 @@ based solely on the in-memory implementations.
 ## 20. Compatibility and Migration
 
 - All persisted goal, agent, typed-task/result, run, assignment/handoff,
-  delegation/team/moderation, workflow-link, loop, effect, checkpoint, memory,
-  and claim records MUST carry schema versions where evolution is expected.
+  wake/schedule, budget/admission, delegation/team/moderation, workflow-link,
+  loop, effect/grant/execution-policy, checkpoint, memory, and claim records
+  MUST carry schema versions where evolution is expected.
 - New statuses and fields SHOULD be additive and use stable kebab-case labels
   and stable error codes.
 - Existing `WaitingForHuman` data requires an explicit compatibility mapping if
@@ -1949,12 +2266,40 @@ based solely on the in-memory implementations.
 - A Rig dependency upgrade requires adapter and serialized-artifact review.
 - An OpenTelemetry GenAI convention upgrade requires an adapter compatibility
   review but MUST NOT by itself require durable agent-state migration.
+- The `rakka-a2a` agent surface MUST pin a reviewed A2A protocol version. The
+  target baseline is A2A 1.0; retaining or bridging an older surface requires a
+  documented compatibility matrix, explicit state/operation mapping, and
+  protocol negotiation rather than accidental mixed-version behavior.
 - N/N+1 nodes MUST agree on protocol/status/schema compatibility before sharing
   a cluster during rolling updates.
 - Unsupported state versions MUST fail closed rather than executing with
   guessed semantics.
 
-## 21. Open Decisions
+## 21. Decision Register
+
+### 21.1 Resolved Article-Review Decisions
+
+The following decisions are normative in this draft:
+
+1. Continuous goals are stable durable controllers that admit finite child
+   epoch tasks/runs; pod lifetime never defines agent lifetime or wake-up.
+2. Default wake policy forbids overlap, durably coalesces concurrent triggers,
+   admits at most one coalesced occurrence after downtime, and fences obsolete
+   schedule revisions.
+3. Budgets are hierarchical durable allocations/reservations with per-epoch
+   and rolling/window ceilings; started/retried/indeterminate attempts consume
+   applicable budget.
+4. Unattended execution requires fail-closed autonomy admission.
+5. Tool descriptor, binding, intent, dispatch grant, and executor isolation
+   are separate contracts; deployments route by bounded execution/trust class.
+6. Task materialized state is bounded separately from history, content,
+   memory, and derived projections.
+7. Authoritative operational queries do not depend on telemetry, and
+   cancellation remains nonterminal during consequential-effect
+   reconciliation.
+8. The target agent protocol baseline is a reviewed, pinned A2A 1.0 contract.
+
+### 21.2 Open Decisions
 
 These decisions remain open until accepted by maintainers and product owners.
 The current recommended default is shown after each question.
@@ -2005,27 +2350,24 @@ The current recommended default is shown after each question.
     underlying value for the goal/root task/initial run, but keep
     `AgentGoalId`, `AgentTaskId`, and `AgentRunId` as separate types and
     contracts.
-15. **Which goal modes ship first?** Recommended: finite, evidence-verifiable
-    goals first; add continuous goals only as bounded durable epochs with
-    explicit suspension and retirement semantics.
-16. **Who selects a specialist agent?** Recommended: the model/planner requests
+15. **Who selects a specialist agent?** Recommended: the model/planner requests
     a skill, while an application-owned authorized catalog resolves the
     concrete `AgentId`, endpoint, compatible contract, and scopes.
-17. **How does a compiled workflow appear as a tool?** Recommended: a versioned
+16. **How does a compiled workflow appear as a tool?** Recommended: a versioned
     descriptor creates or adopts an independently durable child workflow run;
     never treat the whole workflow as one opaque retryable external effect.
-18. **What maps to A2A `Task.id`?** Recommended: `AgentTaskId`; preserve it
+17. **What maps to A2A `Task.id`?** Recommended: `AgentTaskId`; preserve it
     across handoff while each assignee execution receives a new `AgentRunId`.
-19. **Which coordination patterns become first-class?** Recommended: handoff,
+18. **Which coordination patterns become first-class?** Recommended: handoff,
     delegation, team, and moderation, each compiled into typed durable state
     with bounded policy rather than prompt-only conventions.
-20. **How dynamic may run setup be?** Recommended: instructions and selected
+19. **How dynamic may run setup be?** Recommended: instructions and selected
     capabilities may vary within an authorized definition envelope; setup may
     never add undeclared tools/models/peers or weaken mandatory guardrails.
-21. **Should Rakka copy Akka's idle residency behavior?** Recommended: no.
+20. **Should Rakka copy Akka's idle residency behavior?** Recommended: no.
     Every quiescent Rakka task/run auto-passivates; suspend controls admission
     and terminate controls lifecycle, not memory-resource release.
-22. **Are coordination notifications replayable?** Recommended: yes, with
+21. **Are coordination notifications replayable?** Recommended: yes, with
     bounded retention, monotonic scoped cursor, and explicit resync on an
     expired window; authoritative task/run state remains the correctness source.
 
@@ -2037,6 +2379,9 @@ The first production-quality milestone is one sharded Rakka Agent that:
 - accepts an A2A task mapped to one durable `AgentTaskId` and initial
   `AgentRunId`;
 - validates one versioned typed result before completing the public task;
+- persists a fail-closed autonomy-admission decision and rejects any widening
+  setup/settings update not covered by it;
+- reserves and settles bounded run/model/tool/effect budgets durably;
 - remains logically addressable while fully passivated and uses no per-agent
   resident async task/thread/process while waiting;
 - executes a bounded Rig model turn through a dispatcher;
@@ -2052,6 +2397,8 @@ The first production-quality milestone is one sharded Rakka Agent that:
   automatically invoking it again;
 - resumes or terminates only after an authenticated, deduplicated reconciliation
   decision;
+- exposes an authoritative lifecycle/wait/budget/effect/cancellation snapshot
+  that remains correct without telemetry;
 - captures no prompt, output, hidden reasoning, tool payload, memory content,
   or credential material in default telemetry; and
 - remains correct when telemetry export is unavailable while exposing bounded
@@ -2060,6 +2407,28 @@ The first production-quality milestone is one sharded Rakka Agent that:
 Private vector memory and the communal graph may follow as additive milestones,
 but their scopes and interfaces are defined now so the first implementation
 does not bake in an incompatible conversation or storage identity.
+
+### Continuous Goal Milestone
+
+The first continuous milestone is one stable `AgentGoalId`/root control task
+that:
+
+- remains logically active and fully passivatable without a resident agent
+  actor, loop, timer task, connection, span, or pod;
+- admits finite child `AgentTaskId`/`AgentRunId` epochs only from versioned,
+  deduplicated durable `AgentWakeId` occurrences;
+- defaults to forbidden overlap, durable trigger coalescing, and at most one
+  coalesced occurrence after downtime;
+- preserves per-epoch short-term-memory isolation while using authorized
+  agent-private memory/artifacts for cross-epoch continuity;
+- enforces per-epoch and rolling/window budget ledgers without reset on pod
+  restart, activation, or shard movement;
+- fences obsolete schedule revisions and survives duplicate timer scans/events
+  without duplicate epochs or effects;
+- supports suspension, renewal, failure backoff, expiry, and retirement; and
+- exposes current schedule revision, next wake, last progress, active epoch,
+  budget, missed/coalesced trigger, and retirement state through an
+  authoritative operational query.
 
 ### Multi-Agent Goal Milestone
 
