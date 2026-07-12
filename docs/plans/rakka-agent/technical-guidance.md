@@ -415,8 +415,10 @@ AgentTaskId
     -> terminal typed result / failure / cancellation
 ```
 
-One `AgentRunEntity` works on one task at a time. Parallelism comes from
-multiple run entities, not concurrent mutation inside one run. A result-rule
+One `AgentRunEntity` remains bound to one task for its entire lifetime;
+handoff and reassignment create a new run rather than re-targeting an existing
+one. Parallelism comes from multiple run entities, not concurrent mutation
+inside one run. A result-rule
 rejection is a persisted bounded event: it may return sanitized feedback to the
 loop, increment a rejection/struggle counter, and consume another iteration. It
 does not silently accept the model's proposed result.
@@ -549,14 +551,17 @@ collapsing goal identity into one execution.
 Use an explicit goal lifecycle distinct from one agent run's technical status:
 
 ```text
-Proposed -> Active -> Waiting -> Active
-                 |         |
-                 |         +-> Satisfied
-                 +------------> Failed / Unsatisfied / Cancelled / Expired
+Proposed -> Active <-> Waiting
+               |          |
+               +----------+-> Satisfied / Unsatisfied / Failed
+                              / Cancelled / Expired
 ```
 
+Every terminal status is reachable from both `Active` and `Waiting`.
 `Satisfied` requires an accepted evaluation against the current goal revision
-and evidence. A child run may complete successfully without satisfying the root
+and evidence. `Unsatisfied` records an evaluator or policy decision that the
+criteria were not met under the current goal revision; `Failed` records an
+execution or policy failure that ended the goal. A child run may complete successfully without satisfying the root
 goal; its output is evidence or a completed subgoal for the coordinator.
 
 For a finite goal, the coordinator continues through bounded turns,
@@ -725,10 +730,10 @@ is:
 PreparingContext
     -> AwaitingModel
     -> EvaluatingModelOutput
-    -> AwaitingToolEffects (zero or more)
+    -> AwaitingTools (zero or more tool effects)
     -> RecordingTurn
     -> DecidingContinuation
-    -> PreparingContext | Completed | Suspended
+    -> PreparingContext | Complete | Suspended
 ```
 
 Persist enough information to recover the next transition without rerunning a
@@ -837,7 +842,9 @@ Duplicate submissions must not resume the run twice.
 
 ### A2A State Projection
 
-Recommended public mapping:
+The complete normative task/run-state mapping, including the task
+`WaitingForInput` row and the `Suspended` -> `WORKING` projection with bounded
+suspension metadata, is spec Section 14.3. The gate-focused summary is:
 
 | Rakka task/current-run condition | A2A task state |
 | --- | --- |
@@ -1001,7 +1008,7 @@ cover.
 | Active agent turn | `invoke_agent {agent.name}`, `INTERNAL` | Bounded active work only, not passive wait time |
 | General loop decision | `rakka.agent.decide`, `INTERNAL` | Emits structured outcome; does not capture hidden reasoning |
 | Explicit task decomposition | `plan {agent.name}`, `INTERNAL` | Emit only when planning is reliably distinguishable |
-| Rig model call | `{gen_ai.operation.name} {model}`, `CLIENT` | Usually `chat`, `generate_content`, or `text_completion` |
+| Model call (Rig-backed by default) | `{gen_ai.operation.name} {model}`, `CLIENT` | Usually `chat`, `generate_content`, or `text_completion` |
 | Embedding call | `embeddings {model}`, `CLIENT` | Child of memory promotion/retrieval preparation |
 | Memory retrieval | `retrieval {data_source}`, `CLIENT` | Query/content remains opt-in and protected |
 | Memory mutation | `create_memory`, `upsert_memory`, etc. | `CLIENT` for remote store, `INTERNAL` for in-process test store |
