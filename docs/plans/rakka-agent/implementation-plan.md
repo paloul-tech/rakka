@@ -1,0 +1,874 @@
+# Rakka Agent Implementation Plan
+
+Status: implementation plan  
+Date: 2026-07-11  
+Normative source: [spec.md](spec.md); milestone bindings in
+[spec 2.1](spec.md#21-milestone-binding)  
+Design guidance: [technical-guidance.md](technical-guidance.md)  
+Research record: [background-research.md](background-research.md)  
+
+## How to Use This Plan
+
+- Phases map to the spec milestones M1-M5 defined in
+  [spec 2.1](spec.md#21-milestone-binding), plus a final production-hardening
+  phase. A phase is complete when its milestone acceptance statement in
+  [spec 22](spec.md#22-initial-acceptance-statement) is demonstrated.
+- Slices are tight, focused units of work inside a phase. They are ordered by
+  dependency; a slice may span more than one PR, but each PR should belong to
+  exactly one slice.
+- Every slice links the spec sections that govern it. Read those sections (and
+  the linked guidance) before implementing the slice; the spec text is the
+  contract, this plan is the sequencing.
+- Exit criteria reference the recovery scenarios of
+  [spec 18](spec.md#18-required-recovery-scenarios) by number. A scenario
+  listed in a slice means a test proving it lands in that slice.
+- Every slice ends with `scripts/validate.sh` green (fmt, clippy
+  `-D warnings`, workspace tests, no-default-feature checks, doc build). All
+  public items need doc comments from the first commit.
+- Nothing is published to any registry at any point without explicit approval
+  (workspace publishing policy).
+- When a slice lands durable user-facing behavior, update the relevant
+  `docs/` product doc and record the change in `CHANGELOG.md`.
+
+## Standing Constraints (every phase)
+
+These are restated here because every slice touches them:
+
+1. **Always-on invariant** — active/waiting are durable states; quiescent
+   entities passivate with zero per-agent live resources
+   ([spec 6.11](spec.md#611-logical-availability-and-runtime-residency),
+   [spec 15](spec.md#15-passivation-recovery-and-shard-movement)).
+2. **Inter-entity choreography** — every cross-entity exchange is a
+   deduplicated outbox/inbox saga re-driven by the initiator; no in-memory
+   shortcuts, even colocated
+   ([spec 9.8](spec.md#98-inter-entity-choreography)).
+3. **Escrow budgets** — allocations debit the parent at creation; dispatch-time
+   reservation touches only the run's own ledger
+   ([spec 9.7](spec.md#97-hierarchical-budget-ledger)).
+4. **Model adapter trait** — the loop depends only on the Rakka-owned trait;
+   Rig lives behind the default-on `rig` feature and never appears in core
+   public API or persisted state
+   ([spec 10.1](spec.md#101-model-adapter-trait-and-rig-feature-gate)).
+5. **Serializable entity protocols** — every new sharded entity command/reply
+   surface must be serializable from the first commit (no `Arc` payloads or
+   in-process reply channels in the remote surface; box large payloads). The
+   existing process-local `AgentRunActorCommand` pattern in
+   `rakka-agent-workflow` cannot cross `rakka-remote`; see
+   `examples/clustered-agent-workflow-http-grpc` for the working
+   remote-ask pattern and verify against current code before reuse.
+6. **No resolved credentials** in state, effects, memory, events, telemetry,
+   or snapshots ([spec 11.1](spec.md#111-effect-intent),
+   [spec 16](spec.md#16-security-and-authorization)).
+7. **Schema versions** on every persisted record where evolution is expected;
+   unsupported versions fail closed
+   ([spec 20](spec.md#20-compatibility-and-migration)).
+
+## Phase Map
+
+| Phase | Milestone | Content | Acceptance |
+| --- | --- | --- | --- |
+| 1 | M1 | Core durable agent: crate, identities, task/run entities, choreography, loop, model adapter, effects, tool authority, budgets, admission, checkpoints, session memory, A2A, observability, recovery | [spec 22 initial statement](spec.md#22-initial-acceptance-statement) |
+| 2 | M2 | Private long-term memory, vector retrieval, communal knowledge graph | [spec 22 memory note](spec.md#22-initial-acceptance-statement) |
+| 3 | M3 | Continuous goals: wake identity/policy, controller, epochs, fencing | [Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3) |
+| 4 | M4 | Multi-agent goals: goal contract, evaluation, delegation, fan-in, workflow tools, cancellation propagation | [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4) |
+| 5 | M5 | Coordination: handoff, teams, moderation, human-owned tasks, replayable events | [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5) |
+| 6 | — | Production fault, security, and telemetry validation; docs | Phase 6 exit criteria below |
+
+Sequencing: Phase 1 is the base for everything. Phases 2-5 may be re-ordered
+per [spec 2.1](spec.md#21-milestone-binding), with these practical
+dependencies:
+
+- Phase 3 (continuous) needs Phase 1 budgets, timers, and the goal-contract
+  continuous clauses of [spec 8.1](spec.md#81-goal-contract-and-lifecycle);
+  it does not need Phase 2 or 4.
+- Phase 4 scenario 33 (communal provenance) needs the Phase 2 graph; if
+  Phase 4 runs first, defer that scenario to Phase 2 completion.
+- Phase 5 handoff/human tasks need only Phase 1; teams and moderation benefit
+  from Phase 4's collaboration metadata but do not strictly require it.
+
+---
+
+## Phase 1 — M1 Core Durable Agent
+
+Milestone: M1 ([spec 2.1](spec.md#21-milestone-binding)).
+Acceptance: [spec 22 initial statement](spec.md#22-initial-acceptance-statement).
+Scenarios owed: 1-14, 17, 19, 21-26, 35, 37, 40, 44, 46, 52-61
+(all M1-tagged scenarios in [spec 18](spec.md#18-required-recovery-scenarios)).
+
+Open decisions from [spec 21.3](spec.md#213-open-decisions) to confirm or
+revise during this phase: 1 (concurrent runs), 4 (model-call retry policy),
+5 (no generic retry for ambiguous non-idempotent effects), 7 (short-term
+retention), 10 (settings as A2A management skill), 11 (trace-segment split),
+12 (content capture), 13 (sampling), 17 (`Task.id` mapping), 20 (no idle
+residency).
+
+### Slice 1.1 — Crate scaffolding and feature gates
+
+Spec: [19](spec.md#19-crate-and-feature-shape),
+[10.1](spec.md#101-model-adapter-trait-and-rig-feature-gate).
+Guidance: [Suggested Crate Boundaries](technical-guidance.md#suggested-crate-boundaries).
+
+- Create `crates/rakka-agent` with workspace lints, `publish` metadata, and a
+  module map matching the spec's crate-shape bullet.
+- Wire features: `rig` (default), `otel`; crate compiles and tests with
+  `--no-default-features`; add that configuration to the workspace
+  minimal-feature checks in `scripts/validate.sh`.
+- Add `rakka` facade passthroughs (`rakka-agent?/rig`, `rakka-agent?/otel`)
+  following the existing `rakka-agent-workflow?/...` pattern in
+  `crates/rakka/Cargo.toml`.
+- Depend on `rakka-agent-workflow`; do not depend on `rakka-a2a` (the A2A
+  adaptation happens in `rakka-a2a` behind an `agents` feature later).
+
+Done when: empty-but-documented crate builds in both feature configurations
+and `scripts/validate.sh` is green.
+
+### Slice 1.2 — Identity, definition, settings, and setup contracts
+
+Spec: [6.1-6.5](spec.md#6-core-terms-and-identities),
+[6.10](spec.md#610-stable-operation-ids),
+[6.11](spec.md#611-logical-availability-and-runtime-residency),
+[7.1-7.3](spec.md#7-agent-definition-and-settings),
+[20](spec.md#20-compatibility-and-migration).
+Guidance: [Identity and Ownership](technical-guidance.md#identity-and-ownership),
+[Definition and Setup Revisions](technical-guidance.md#definition-and-setup-revisions).
+
+- Tenant-scoped newtype IDs: `AgentId`, `AgentGoalId`, `AgentTaskId`,
+  `AgentRunId` (plus `AgentDelegationId`, `AgentWakeId` types now, used in
+  later phases). Types stay distinct even where initial values coincide
+  ([spec 6.3](spec.md#63-agentgoalid), [spec 6.4](spec.md#64-agenttaskid)).
+- A run is bound to one task for its lifetime
+  ([spec 6.5](spec.md#65-agentrunid)); encode that in the constructor, not a
+  setter.
+- `AgentDefinitionRevision`, `SettingsRevision` with the three timing classes
+  (turn-bound / immediate safety / run-pinned,
+  [spec 7.2](spec.md#72-settings-revisions)), and `AgentSetupRevision` with
+  narrow-only envelope validation ([spec 7.3](spec.md#73-definition-versus-run-setup)).
+- Stable operation/deduplication ID construction helpers
+  ([spec 6.10](spec.md#610-stable-operation-ids)).
+- Schema-version fields and fail-closed deserialization on every persisted
+  record introduced here.
+
+Done when: contract-level tests prove envelope validation rejects widening
+setups (enforcement at dispatch lands in Slice 1.8) and unsupported schema
+versions fail closed.
+
+### Slice 1.3 — Inter-entity choreography substrate
+
+Spec: [9.8](spec.md#98-inter-entity-choreography),
+[6.10](spec.md#610-stable-operation-ids).
+Guidance: [Inter-Entity Choreography](technical-guidance.md#inter-entity-choreography).
+
+- Build exchange primitives over the `rakka-agent-workflow` inbox/outbox
+  (`inbox.rs`, `outbox.rs`): pending-exchange record on the initiator,
+  operation-ID re-drive on recovery, receiver-side dedup that returns the
+  original logical result.
+- Write the failure-window table (initiator loss before send, receiver loss
+  after acceptance, reply loss, duplicate delivery) for the exchanges this
+  phase implements: creation, assignment, run acceptance, result
+  proposal/decision, budget allocation, settlement/return. Commit it as a
+  doc section in the crate (`rustdoc` or `docs/`), one row per window per
+  exchange, with the test name that proves each row.
+- No colocated shortcut: the exchange path is identical whether entities
+  share a node or not.
+
+Done when: scenarios 58 and 60 pass against an in-memory store, including a
+split-across-nodes variant of 60.
+
+### Slice 1.4 — AgentTaskEntity
+
+Spec: [6.4](spec.md#64-agenttaskid), [9.1](spec.md#91-typed-task-definition),
+[9.2](spec.md#92-task-lifecycle-and-result-rules),
+[9.6](spec.md#96-bounded-task-state-and-history).
+Guidance: [Typed Task Contract](technical-guidance.md#typed-task-contract),
+[Bounded Task State and History](technical-guidance.md#bounded-task-state-and-history).
+
+- Sharded `AgentTaskEntity` keyed `(TenantId, AgentTaskId)` with a
+  serializable command protocol (standing constraint 5).
+- Versioned `AgentTaskDefinition<R>`: typed input/result schema references,
+  deterministic result rules, rejection limits, dependency policy,
+  per-task budgets, generics only as compile-time ergonomics
+  ([spec 9.1](spec.md#91-typed-task-definition)).
+- Task lifecycle enum and transitions ([spec 9.2](spec.md#92-task-lifecycle-and-result-rules));
+  dependencies are durable, bounded, acyclic; default failed-dependency
+  policy cancels dependents.
+- Result proposals validated in-entity by deterministic rules only;
+  model-assisted evaluation is a durable effect, never in-entity I/O.
+- Bounded materialized state with history/content behind cursors and
+  artifact references ([spec 9.6](spec.md#96-bounded-task-state-and-history));
+  configured limits enforced.
+
+Done when: scenarios 37, 40, and 55 pass; the creation/assignment exchange
+from [spec 9.8](spec.md#98-inter-entity-choreography) replays to one task and
+one assignment per generation.
+
+### Slice 1.5 — AgentRunEntity and the durable loop
+
+Spec: [6.5](spec.md#65-agentrunid), [9.3](spec.md#93-run-status),
+[9.4](spec.md#94-loop-phase), [9.5](spec.md#95-execution-rule).
+Guidance: [Durable Agent Loop](technical-guidance.md#durable-agent-loop).
+
+- Sharded `AgentRunEntity` keyed `(TenantId, AgentId, AgentRunId)` with a
+  serializable command protocol.
+- Run status enum ([spec 9.3](spec.md#93-run-status)) including the
+  `WaitingForHuman` compatibility note; loop phase enum and the durable
+  loop-state record ([spec 9.4](spec.md#94-loop-phase)) with schema/adapter
+  version.
+- Execution rule: handlers perform bounded transitions only; every transition
+  persists the next effect or wait before returning
+  ([spec 9.5](spec.md#95-execution-rule)).
+- Result proposal/decision exchange with the task entity over Slice 1.3
+  primitives; the run never makes the public task terminal by itself.
+- Passivation-by-default: after any persisted wait, the entity is idle.
+
+Done when: scenarios 2 and 59 pass (restart after every loop transition;
+result-exchange loss on either side converges).
+
+### Slice 1.6 — Model adapter trait, deterministic test adapter, Rig feature
+
+Spec: [10](spec.md#10-model-adapter-and-rig-integration) (all subsections).
+Guidance: [Durable Agent Loop](technical-guidance.md#durable-agent-loop),
+[Client, Events, and Testkit](technical-guidance.md#client-events-and-testkit).
+
+- Define `AgentModelAdapter` (working name): immutable context snapshot +
+  settings revision in, bounded result/artifact out
+  ([spec 10.1](spec.md#101-model-adapter-trait-and-rig-feature-gate)).
+- Deterministic test adapter implementing the trait without the `rig`
+  feature: scripted text/results, structured task-result proposals, tool
+  requests, conditional responses ([spec 10.4](spec.md#104-deterministic-rig-test-adapter)).
+  It exercises the same durable effect path as production.
+- `rig` feature: Rig-backed implementation, pinned Rig version, no Rig types
+  outside the feature; Rakka-owned versioned loop representation is the only
+  durable format ([spec 10.2](spec.md#102-persistence-compatibility)).
+- Model calls are effects with explicit retry policy
+  ([spec 11.5](spec.md#115-crash-and-timeout-rules); open decision 4).
+
+Done when: one scripted model turn runs end-to-end through the durable
+effect path under `--no-default-features`, and the same test passes with the
+`rig` feature against a stub provider.
+
+### Slice 1.7 — Effect model and dispatcher integration
+
+Spec: [11.1-11.6](spec.md#11-effect-model).
+Guidance: [Effect Safety Guidance](technical-guidance.md#effect-safety-guidance).
+
+- `EffectIntent` record ([spec 11.1](spec.md#111-effect-intent)), safety
+  classes ([spec 11.2](spec.md#112-safety-class)), effect status machine with
+  generations ([spec 11.3](spec.md#113-effect-state)).
+- Integrate with the `rakka-agent-workflow` dispatcher and effect bridge
+  (`dispatcher.rs`, `effect_bridge.rs`): durable `Started` with lease/fence
+  before invocation, dispatch-time credential resolution only, stale-result
+  rejection ([spec 11.4](spec.md#114-dispatch-invariants)).
+- Crash/timeout recovery per safety class, `Indeterminate` transition to
+  `WaitingForReconciliation`, dispatch-eligibility revocation
+  ([spec 11.5](spec.md#115-crash-and-timeout-rules)).
+- Cancellation fencing at the effect layer: fence new dispatch immediately;
+  ambiguous non-idempotent effects stay in reconciliation
+  ([spec 8.7](spec.md#87-cancellation-failure-and-waiting) single-task
+  clauses, [spec 11.5](spec.md#115-crash-and-timeout-rules)).
+
+Done when: scenarios 5-10 pass with fault injection at each crash window
+(before `Started`, after `Started` per safety class, after external commit),
+and the effect-layer half of scenario 57 passes.
+
+### Slice 1.8 — Tool registry, tool authority, and guardrail baseline
+
+Spec: [11.7](spec.md#117-tool-registry-and-component-tools),
+[11.8](spec.md#118-tool-authority-and-execution-isolation),
+[16](spec.md#16-security-and-authorization).
+Guidance: [Tool Visibility, Authority, and Executor Isolation](technical-guidance.md#tool-visibility-authority-and-executor-isolation),
+[Guardrail Chain](technical-guidance.md#guardrail-chain).
+
+- Tool registry with kinds, descriptor schema/version, safety class,
+  capabilities, credential class ([spec 11.7](spec.md#117-tool-registry-and-component-tools)).
+- Four authority layers: `ToolDescriptor` / `ToolBinding` / `EffectIntent` /
+  `DispatchGrant`; grant binding and pre-attempt revalidation; model output
+  cannot widen anything ([spec 11.8](spec.md#118-tool-authority-and-execution-isolation)).
+- `ExecutionPolicyRef` persistence and trust-class routing hooks (the
+  application owns realization).
+- Versioned ordered guardrail stages at model/tool/A2A/memory boundaries with
+  the bounded outcome set and deterministic-transform rule
+  ([spec 16](spec.md#16-security-and-authorization)); deployment-mandatory
+  stages cannot be removed by definition/setup.
+- Enforce the Slice 1.2 setup/settings envelope at dispatch.
+
+Done when: scenarios 44 and 54 pass (widening setups rejected; a
+model-visible call stays undispatchable when binding, grant, credential,
+checkpoint, execution-policy, or immediate-safety checks fail).
+
+### Slice 1.9 — Escrow budget ledger and autonomy admission
+
+Spec: [9.7](spec.md#97-hierarchical-budget-ledger),
+[7.4](spec.md#74-autonomy-admission).
+Guidance: [Hierarchical Budget Ledger](technical-guidance.md#hierarchical-budget-ledger),
+[Autonomy Admission](technical-guidance.md#autonomy-admission).
+
+- Escrow ledger: parent-local allocation debit inside the creating
+  transition, carried on the creation command; run-local dispatch-time
+  reservation as a single-entity transition; deduplicated settlement/return
+  upward through Slice 1.3 exchanges; top-up request command with structured
+  exhaustion parking ([spec 9.7](spec.md#97-hierarchical-budget-ledger)).
+- Extend the existing `autonomy.rs` counters into the ledger dimensions;
+  `Started` and `Indeterminate` attempts consume budget.
+- `AutonomyAdmissionDecision`: fail-closed admission for unattended classes,
+  recheck on widening updates, immediate-safety recheck at dispatch
+  ([spec 7.4](spec.md#74-autonomy-admission)).
+
+Done when: scenarios 52, 53, and 61 pass, including a concurrency test that
+cannot oversubscribe a parent allocation and a replay test that never
+double-debits or double-credits.
+
+### Slice 1.10 — Checkpoints and HITL
+
+Spec: [12](spec.md#12-durable-checkpoints-and-hitl) (all subsections).
+Guidance: [HITL and Authorization Guidance](technical-guidance.md#hitl-and-authorization-guidance),
+[Human Tasks Versus Effect Gates](technical-guidance.md#human-tasks-versus-effect-gates).
+
+- Generalize the existing `checkpoints.rs` substrate to the three kinds
+  (`Approval`, `SecurityAuthorization`,
+  `IndeterminateEffectReconciliation`) with the full checkpoint record
+  ([spec 12.2](spec.md#122-checkpoint-record)).
+- Grant binding to exact effect intent + argument digest; changed binding
+  invalidates; pre-dispatch revalidation ([spec 12.3](spec.md#123-grant-binding)).
+- Reconciliation decision set without a generic `Retry`
+  ([spec 12.5](spec.md#125-reconciliation-decisions)); `ConfirmedNotExecuted`
+  creates a new effect generation.
+- Durable timers for SLA/escalation; no auto-approve on timeout for
+  sensitive/non-idempotent work ([spec 12.6](spec.md#126-passivation-and-timers));
+  full passivation during waits.
+
+Done when: scenarios 3, 11, 12, and 13 pass, and the reconciliation half of
+scenario 57 passes (terminal cancellation only after outcomes are resolved).
+
+### Slice 1.11 — Session memory and context snapshots
+
+Spec: [13.1](spec.md#131-general-requirements),
+[13.2](spec.md#132-short-term-session-memory),
+[13.5](spec.md#135-memory-context-snapshot),
+[13.6](spec.md#136-storage-adapters) (short-term clauses).
+Guidance: [Memory Architecture Guidance](technical-guidance.md#memory-architecture-guidance).
+
+- Session-memory trait scoped `(TenantId, AgentId, AgentRunId)` with
+  `MemoryOperationId` idempotent append, ordered sequence, classification
+  metadata; in-memory implementation in `rakka-agent`.
+- `rakka-agent-postgres` crate: PostgreSQL session store with uniqueness
+  constraints making replay harmless; gated tests via
+  `RAKKA_POSTGRES_TEST_DSN` like `rakka-persistence-postgres`.
+- Immutable `MemoryContextSnapshot` persisted before every model effect;
+  retries reuse the snapshot ([spec 13.5](spec.md#135-memory-context-snapshot));
+  retrieved memory is untrusted context.
+- Rig memory policies (windowing/compaction) may shape history behind the
+  Rakka-owned write path only ([spec 10.3](spec.md#103-conversation-memory)).
+
+Done when: scenarios 14 and 17 pass against both the in-memory and Postgres
+stores.
+
+### Slice 1.12 — A2A surface and typed client
+
+Spec: [14.1](spec.md#141-public-boundary),
+[14.2](spec.md#142-task-identity-and-projection),
+[14.3](spec.md#143-taskrun-state-mapping),
+[14.5](spec.md#145-typed-agent-client),
+[7.2](spec.md#72-settings-revisions) (external settings entry).
+Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-testkit).
+
+- `rakka-a2a` `agents` feature: `AgentTaskId` <-> A2A `Task.id` mapping,
+  durable deduplicated ingress, and the full state projection table of
+  [spec 14.3](spec.md#143-taskrun-state-mapping) including the
+  `WaitingForInput` row, `Suspended` metadata, and the
+  no-terminal-cancellation-during-reconciliation rule.
+- Settings commands as a versioned A2A management skill/extension (open
+  decision 10), authenticated, entering through the durable inbox.
+- `RakkaAgentClient` facade over the same durable command path — no local
+  actor shortcut ([spec 14.5](spec.md#145-typed-agent-client)); replayable
+  task/run event subscription reuses the existing A2A event replay
+  (coordination events extend this in Phase 5).
+
+Done when: scenario 1 passes (duplicate A2A task messages create one task,
+one run, one turn) and the projection table has a test row-for-row.
+
+### Slice 1.13 — Observability baseline and operational queries
+
+Spec: [17](spec.md#17-audit-and-observability) (17.1-17.9, 17.12-17.18 as
+they apply to M1 signals), [17.18](spec.md#1718-authoritative-operational-queries-and-observability-views).
+Guidance: [Agent Observability Architecture Guidance](technical-guidance.md#agent-observability-architecture-guidance).
+
+- Bounded trace segments with persisted W3C context and links across every
+  durable boundary this phase created (reuse `trace_context.rs`); no span
+  open across a wait ([spec 17.4](spec.md#174-bounded-trace-segments),
+  [17.5](spec.md#175-durable-trace-context)).
+- Structured decision events ([spec 17.7](spec.md#177-agent-decision-observability))
+  and the M1 rows of the span model ([spec 17.6](spec.md#176-required-span-model)).
+- Bounded metrics per [spec 17.12](spec.md#1712-metrics); no IDs in labels.
+- Content capture disabled by default ([spec 17.14](spec.md#1714-content-capture-and-redaction)).
+- `otel` feature: pinned GenAI convention mapping over the existing OTLP
+  bridge (`otlp.rs`), extending the bridge additively where fields are
+  missing ([spec 17.17](spec.md#1717-otlp-and-collector-boundary)).
+- `AgentOperationalSnapshot` authoritative point query from durable state,
+  correct with telemetry unavailable ([spec 17.18](spec.md#1718-authoritative-operational-queries-and-observability-views)),
+  plus the session view assembled by `AgentRunId`.
+
+Done when: scenarios 21-26 and 56 pass.
+
+### Slice 1.14 — Recovery suite, fault injection, and M1 acceptance
+
+Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
+[18](spec.md#18-required-recovery-scenarios),
+[22](spec.md#22-initial-acceptance-statement).
+
+- Complete the M1 scenario suite: 4, 19, 35, 46 plus a full-regression run of
+  every M1 scenario landed by earlier slices, with dispatcher/owner kill
+  injection at every durable boundary (extend `testkit.rs` crash points).
+- End-to-end example crate (`publish = false`) demonstrating the
+  [spec 22](spec.md#22-initial-acceptance-statement) initial statement with
+  the deterministic model adapter; document expected stdout.
+- Measure per-turn durable-transition overhead (persist -> dispatch ->
+  result -> reactivate) and record the numbers in the example README; this
+  validates the durable-boundary design before Phases 3-5 multiply write
+  load (design-review follow-up, not a spec requirement).
+- Walk the [spec 22](spec.md#22-initial-acceptance-statement) checklist item
+  by item; fix or explicitly defer anything unmet.
+
+Done when: every M1 scenario passes under fault injection and the acceptance
+checklist is demonstrated by the example.
+
+---
+
+## Phase 2 — M2 Durable Memory
+
+Milestone: M2. Acceptance: the memory note in
+[spec 22](spec.md#22-initial-acceptance-statement) — scopes and interfaces
+were fixed in Phase 1; this phase delivers the stores.
+Scenarios owed: 15, 16, 18, 20.
+
+Open decisions to resolve: 2 (communal boundary), 3 (claims start
+`Proposed`), 7 (retention), 8 (graph backend selection deferred until the
+SPI is proven).
+
+### Slice 2.1 — Agent-private long-term memory
+
+Spec: [13.3](spec.md#133-agent-private-long-term-memory),
+[13.1](spec.md#131-general-requirements).
+
+- Private-memory trait scoped `(TenantId, AgentId)`; run provenance recorded
+  without widening access; full record shape per
+  [spec 13.3](spec.md#133-agent-private-long-term-memory).
+- Promotion/consolidation from session memory as idempotent durable effects;
+  CAS or idempotent append for concurrent runs (open decision 1).
+- Retention, tombstone, and deletion semantics from the first schema.
+
+Done when: scenario 15 passes and the private-memory half of scenarios 16
+and 18 passes.
+
+### Slice 2.2 — Vector retrieval adapter
+
+Spec: [13.3](spec.md#133-agent-private-long-term-memory),
+[13.6](spec.md#136-storage-adapters).
+
+- `pgvector` retrieval in `rakka-agent-postgres`: embeddings as rebuildable
+  derived data with model/dimension/version metadata; source content
+  preserved independently.
+- Tenant and `AgentId` filters enforced in schema and query even where it
+  costs index performance; recall characteristics documented.
+- Retrieval feeds `MemoryContextSnapshot` only through the Slice 1.11 path.
+
+Done when: retrieval isolation tests pass and a snapshot-reuse test proves
+index drift cannot change a retried model input (extends scenario 17).
+
+### Slice 2.3 — Communal knowledge graph crate
+
+Spec: [13.4](spec.md#134-communal-knowledge-graph),
+[13.6](spec.md#136-storage-adapters).
+
+- `rakka-agent-knowledge-graph`: claim records with provenance, trust states
+  (`Proposed`/`Verified`/`Disputed`/`Retracted`), append-only transitions,
+  `(TenantId, KnowledgeSpaceId)` scoping.
+- Database-agnostic SPI: claim append by operation ID, lookup, bounded
+  traversal, provenance/trust filtering, optional capability reporting; no
+  vendor clients, SQL/Cypher/SPARQL, or vendor identifiers in public types.
+- In-memory implementation plus contract-test harness.
+- HITL/policy promotion gate for consequential claims reusing Slice 1.10
+  checkpoints.
+
+Done when: the graph halves of scenarios 16 and 18 pass on the in-memory
+implementation.
+
+### Slice 2.4 — Backend conformance and M2 acceptance
+
+Spec: [13.6](spec.md#136-storage-adapters),
+[18](spec.md#18-required-recovery-scenarios) scenario 20.
+
+- Capture representative claim/traversal/tenancy/migration queries (open
+  decision 8), then validate the SPI against at least two structurally
+  different implementations or contract doubles before naming any reference
+  backend.
+- Run the full conformance suite (claim identity, idempotent append,
+  provenance, trust filtering, authorization, bounded queries) unchanged
+  across backends.
+
+Done when: scenario 20 passes across both implementations without touching
+agent-domain code.
+
+---
+
+## Phase 3 — M3 Continuous Goals
+
+Milestone: M3. Acceptance:
+[Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3).
+Scenarios owed: 36, 47-51.
+
+The continuous defaults are already resolved
+([spec 21.1](spec.md#211-resolved-article-review-decisions) items 1-3).
+
+### Slice 3.1 — Wake identity and policy
+
+Spec: [6.9](spec.md#69-agentwakeid-and-schedulerevision),
+[8.2](spec.md#82-continuous-goal-controller-and-epochs),
+[8.1](spec.md#81-goal-contract-and-lifecycle) (continuous clauses only).
+Guidance: [Continuous Goal Controller](technical-guidance.md#continuous-goal-controller).
+
+- `AgentWakeId` construction (goal + `ScheduleRevision` + logical
+  occurrence), versioned `AgentWakePolicy` with the full field set of
+  [spec 8.2](spec.md#82-continuous-goal-controller-and-epochs).
+- Continuous-mode fields on the goal/root-task contract (the full
+  `AgentGoalSpec` lands in Phase 4; here only what the controller needs).
+
+Done when: wake-ID dedup construction is property-tested (same occurrence
+from any trigger path yields one identity).
+
+### Slice 3.2 — Wake controller and scanners
+
+Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),
+[15](spec.md#15-passivation-recovery-and-shard-movement) (continuous
+clauses).
+
+- Durable wake controller over the `rakka-agent-workflow` one-shot timer and
+  trigger substrate (`timers.rs`, `triggers.rs`): default forbid-overlap,
+  durable coalescing, at-most-one occurrence after downtime, revision
+  fencing.
+- Shared scanners recover durable occurrences and inject deduplicated inbox
+  commands; scanner/pod uptime never creates an occurrence.
+
+Done when: scenarios 47, 48, 49, and 50 pass, including duplicate-scan and
+obsolete-revision injection.
+
+### Slice 3.3 — Epoch admission and budget windows
+
+Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),
+[9.7](spec.md#97-hierarchical-budget-ledger) (window clauses),
+[6.5](spec.md#65-agentrunid) (per-epoch task/run rule).
+
+- Admitted wake -> one finite child `AgentTaskId`/`AgentRunId` epoch carrying
+  goal, wake, revisions, observation scope, budget, deadline.
+- Per-epoch allocation plus durable rolling/calendar-window goal ceiling;
+  refill is a persisted logical-time transition, never restart-triggered.
+- Cross-epoch continuity only via controller state, private memory, and
+  artifacts; per-epoch session-memory isolation.
+
+Done when: scenarios 36 and 51 pass.
+
+### Slice 3.4 — Continuous lifecycle and M3 acceptance
+
+Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),
+[17.18](spec.md#1718-authoritative-operational-queries-and-observability-views),
+[Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3).
+
+- Suspension, renewal, failure backoff, expiry, and retirement transitions.
+- Operational query exposure: schedule revision, next wake, last progress,
+  active epoch, budget window, missed/coalesced counts, retirement state.
+- Wake/epoch metrics and audit events
+  ([spec 17.12](spec.md#1712-metrics),
+  [17.13](spec.md#1713-structured-logs-runtime-events-and-audit)).
+
+Done when: the continuous milestone checklist is demonstrated end to end by
+an example with fault injection across pod restart and shard movement.
+
+---
+
+## Phase 4 — M4 Multi-Agent Goals
+
+Milestone: M4. Acceptance:
+[Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4).
+Scenarios owed: 27-34, 39.
+
+Open decisions to resolve: 14 (distinct goal identity — resolved default),
+15 (catalog resolves specialists), 16 (workflow tools).
+
+### Slice 4.1 — Goal contract and lifecycle
+
+Spec: [8.1](spec.md#81-goal-contract-and-lifecycle),
+[6.3](spec.md#63-agentgoalid).
+Guidance: [Define the Goal Before Starting the Loop](technical-guidance.md#define-the-goal-before-starting-the-loop).
+
+- Full `AgentGoalSpec` and `AgentGoalStatus` lifecycle with the
+  `Unsatisfied`-vs-`Failed` semantics; root `AgentTaskEntity` coordinates,
+  `AgentGoalId` defaults to the root `AgentTaskId` value while types stay
+  distinct.
+- Budget-exhaustion parking/escalation policy at goal scope.
+
+Done when: goal lifecycle transitions are covered by unit tests and the goal
+remains addressable while fully passivated.
+
+### Slice 4.2 — Progress, evidence, and evaluation
+
+Spec: [8.3](spec.md#83-progress-evidence-and-completion).
+Guidance: [Verify Progress and Completion](technical-guidance.md#verify-progress-and-completion).
+
+- Evaluator contract: deterministic assertions, authoritative queries,
+  verification workflows, evaluator model/agent under a distinct policy, and
+  HITL — all executed as durable effects with persisted outcome, evidence
+  references, and criteria revision.
+- Stagnation detection (repetition fingerprints, no-progress epochs) feeding
+  deterministic continue/replan/wait/escalate/terminate policy.
+
+Done when: scenario 30 passes (goal `Satisfied` only after evaluation of the
+current criteria revision against durable evidence).
+
+### Slice 4.3 — Durable delegation and A2A collaboration metadata
+
+Spec: [8.4](spec.md#84-specialization-and-durable-delegation),
+[6.6](spec.md#66-agentdelegationid),
+[14.4](spec.md#144-agent-to-agent-effects).
+Guidance: [Durable Delegation Graph](technical-guidance.md#durable-delegation-graph).
+
+- `AgentDelegationId` records persisted before send with the full field set
+  of [spec 8.4](spec.md#84-specialization-and-durable-delegation); replay
+  resolves to the same child or an explicit conflict.
+- Versioned A2A collaboration metadata extension carrying goal/parent/
+  delegation/lineage/budget/deadline; unknown-optional compatibility and
+  fail-closed required metadata ([spec 14.4](spec.md#144-agent-to-agent-effects)).
+- Application-owned catalog resolution boundary: model requests a skill; the
+  catalog resolves the `AgentId`/endpoint (open decision 15).
+- Peer calls only via the outbox + `rakka-a2a`; the model cannot reach a peer
+  through a generic tool.
+
+Done when: scenarios 28 and 39 pass.
+
+### Slice 4.4 — Fan-out/fan-in, lineage, and coordinator limits
+
+Spec: [8.4](spec.md#84-specialization-and-durable-delegation),
+[8.7](spec.md#87-cancellation-failure-and-waiting) (fan-in policy),
+[9.7](spec.md#97-hierarchical-budget-ledger) (descendant dimensions).
+
+- Durable fan-out groups and deterministic fan-in (all/any/quorum/policy)
+  fixed before results are accepted; parent passivates while waiting.
+- Depth/fan-out/descendant/concurrency ceilings via the escrow ledger;
+  lineage-based cycle rejection.
+
+Done when: scenarios 27 and 34 pass, including coordinator loss and resume.
+
+### Slice 4.5 — Workflows as tools
+
+Spec: [8.6](spec.md#86-workflows-as-tools),
+[11.7](spec.md#117-tool-registry-and-component-tools).
+Guidance: [Workflows as Tools](technical-guidance.md#workflows-as-tools).
+
+- `WorkflowToolDescriptor`; invocation creates or adopts an independently
+  durable child workflow run keyed by stable identity; parent waits durably.
+- Internal workflow effects keep their own boundaries — never one opaque
+  retryable effect; fix the autonomy classifier gap where
+  `AgentDispatchTargetClass::ChildWorkflow` maps to `Other` (see
+  [research](background-research.md#workflows-as-tools); verify current code
+  first).
+
+Done when: scenario 32 passes (replayed invocation adopts one child run, no
+duplicated internal effects).
+
+### Slice 4.6 — Cancellation propagation and shared environment
+
+Spec: [8.7](spec.md#87-cancellation-failure-and-waiting),
+[8.5](spec.md#85-shared-environment-and-collective-memory).
+
+- Durable cancellation/deadline/revocation propagation to children with the
+  progress model (`Requested` -> `Propagating` -> `Quiesced` ->
+  `WaitingForReconciliation` -> `Completed`); child indeterminate effects
+  stay in reconciliation.
+- `AgentEnvironmentRef` contract and tool-adapter concurrency rules;
+  communal claims carry goal/task/run/delegation provenance (needs the
+  Phase 2 graph; defer scenario 33 if Phase 2 has not run).
+
+Done when: scenarios 29, 31, and 33 pass.
+
+### Slice 4.7 — M4 acceptance and goal views
+
+Spec: [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4),
+[17.18](spec.md#1718-authoritative-operational-queries-and-observability-views).
+
+- Authorized goal projection (tasks, runs, delegation graph, workflow links,
+  evaluations, evidence, budgets, cancellation state).
+- End-to-end example: root goal delegating to two specialists plus one
+  workflow tool, surviving root and child pod loss, satisfied only through
+  the evaluator.
+
+Done when: the multi-agent milestone checklist is demonstrated end to end.
+
+---
+
+## Phase 5 — M5 Coordination Capabilities
+
+Milestone: M5. Acceptance:
+[Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5).
+Scenarios owed: 38, 41-43, 45.
+
+Open decisions to resolve: 6 (agent cards/assignment), 18 (first-class
+patterns — resolved default), 19 (setup envelope — enforced since Phase 1),
+21 (replayable coordination events).
+
+### Slice 5.1 — Capability model and handoff
+
+Spec: [8.8](spec.md#88-coordination-capability-model),
+[8.9](spec.md#89-handoff), [14.2](spec.md#142-task-identity-and-projection)
+(handoff lineage).
+Guidance: [Coordination Capabilities](technical-guidance.md#coordination-capabilities).
+
+- `AgentCoordinationCapability` descriptors as trusted definition/setup data;
+  runtime may expose them to the model as tools, but model output cannot
+  create capability, target, budget, or scope.
+- Handoff: same `AgentTaskId`, source-run fencing, target-run creation,
+  explicit context/artifact projection only, `HandedOff` terminal recorded
+  after durable target acceptance; traverses outbox/inbox + `rakka-a2a` even
+  colocated.
+
+Done when: scenario 38 passes.
+
+### Slice 5.2 — Team coordination
+
+Spec: [8.10](spec.md#810-team-coordination).
+
+- `AgentTeamId`, bounded membership, durable shared task board; atomic
+  claim/release/transfer with revision/lease fencing and stable operation
+  IDs; mediated peer messages over durable commands.
+- Idle teams and members passivate; the board is data.
+
+Done when: scenario 42 passes (one normal claim owner; stale commands fail
+closed).
+
+### Slice 5.3 — Moderation
+
+Spec: [8.11](spec.md#811-moderation).
+
+- `AgentConversationId`, participant set, durable turn/round state,
+  transcript artifacts, budgets; only the current participant may submit;
+  duplicates rejected; participants passivate between turns.
+
+Done when: scenario 43 passes (turn recovery without duplication across
+passivation/shard movement).
+
+### Slice 5.4 — Human-owned tasks
+
+Spec: [8.12](spec.md#812-human-owned-tasks),
+[14.3](spec.md#143-taskrun-state-mapping) (`WaitingForInput` row).
+
+- Tasks deliberately unassigned to agents, completed by authenticated
+  humans/services with typed results through the same validation path;
+  dependency unblocking and failure propagation.
+- Keep the boundary with effect-bound checkpoints explicit
+  ([spec 8.12](spec.md#812-human-owned-tasks)).
+
+Done when: scenario 41 passes.
+
+### Slice 5.5 — Replayable coordination events
+
+Spec: [17.13](spec.md#1713-structured-logs-runtime-events-and-audit),
+[14.5](spec.md#145-typed-agent-client).
+Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-testkit).
+
+- Extend the Phase 1 event replay to coordination events (assignment,
+  handoff, claim, turn) with monotonic scoped cursor, bounded retention, and
+  explicit resync; derived struggle signals stay projections.
+
+Done when: scenario 45 passes.
+
+### Slice 5.6 — M5 acceptance
+
+Spec: [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5).
+
+- Deterministic model/tool scripts plus fault injection covering every task,
+  handoff, claim, turn, and effect boundary.
+- Walk the coordination milestone checklist end to end.
+
+Done when: the checklist is demonstrated and all M5 scenarios pass under
+fault injection.
+
+---
+
+## Phase 6 — Production Fault, Security, and Telemetry Validation
+
+No new milestone; this hardens whatever phases have shipped
+(guidance [Slice 7](technical-guidance.md#slice-7-production-fault-and-security-validation)).
+
+### Slice 6.1 — Multi-pod fault and soak validation
+
+Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
+[18](spec.md#18-required-recovery-scenarios) (fault-injection note).
+
+- Multi-process dispatcher and shard-movement fault injection (extend the
+  `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY` harness); kill owners and
+  dispatchers at every durable boundary including after external commit.
+- Settings changes and credential revocation injected during waits.
+
+### Slice 6.2 — Security validation
+
+Spec: [16](spec.md#16-security-and-authorization),
+[13.1](spec.md#131-general-requirements).
+
+- Memory ACL and poisoning defenses, retention/deletion/tombstone flows,
+  cross-tenant existence-leak tests, executor trust-class routing, secret
+  exclusion sweeps over state/events/telemetry.
+
+### Slice 6.3 — Telemetry and Collector validation
+
+Spec: [17.14-17.17](spec.md#1714-content-capture-and-redaction),
+[17.20](spec.md#1720-semantic-convention-compatibility).
+
+- Native OTLP wiring at an application binary, pinned GenAI convention
+  review, redaction/allowlist processors, tail-sampling retention rules,
+  Collector loss visibility, exporter failure behavior.
+
+### Slice 6.4 — Documentation and compatibility
+
+Spec: [20](spec.md#20-compatibility-and-migration).
+
+- Product docs under `docs/` for the agent surface, API boundary tier entry
+  in `docs/rakka-api-boundary-inventory.md`, `CHANGELOG.md` entries, N/N+1
+  compatibility notes, and the pinned A2A/Rig/GenAI revision matrix.
+
+Done when: all shipped-phase scenarios pass in the multi-process harness and
+the documentation set is current.
+
+---
+
+## Appendix — Scenario-to-Slice Coverage
+
+All scenario numbers refer to
+[spec 18](spec.md#18-required-recovery-scenarios).
+
+| Scenarios | Milestone | Proving slice |
+| --- | --- | --- |
+| 1 | M1 | 1.12 |
+| 2 | M1 | 1.5 |
+| 3, 11, 12, 13 | M1 | 1.10 |
+| 4, 19, 35, 46 | M1 | 1.14 |
+| 5-10 | M1 | 1.7 |
+| 14, 17 | M1 | 1.11 |
+| 21-26, 56 | M1 | 1.13 |
+| 37, 40, 55 | M1 | 1.4 |
+| 44, 54 | M1 | 1.8 |
+| 52, 53, 61 | M1 | 1.9 |
+| 57 | M1 | 1.7 (effect fencing) + 1.10 (reconciliation) |
+| 58, 60 | M1 | 1.3 |
+| 59 | M1 | 1.5 |
+| 15 | M2 | 2.1 |
+| 16, 18 | M2 | 2.1 (private) + 2.3 (graph) |
+| 20 | M2 | 2.4 |
+| 36, 51 | M3 | 3.3 |
+| 47-50 | M3 | 3.2 |
+| 27, 34 | M4 | 4.4 |
+| 28, 39 | M4 | 4.3 |
+| 29, 31, 33 | M4 | 4.6 |
+| 30 | M4 | 4.2 |
+| 32 | M4 | 4.5 |
+| 38 | M5 | 5.1 |
+| 41 | M5 | 5.4 |
+| 42 | M5 | 5.2 |
+| 43 | M5 | 5.3 |
+| 45 | M5 | 5.5 |
