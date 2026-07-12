@@ -81,7 +81,7 @@ section that describes a later feature binds with that feature.
 | 15 passivation and recovery (continuous clauses bind at M3) | M1 |
 | 16 security and authorization | M1 |
 | 17 observability, for the signals the active milestone emits | M1 |
-| 18 recovery scenarios, per the scenario tags in Section 18 | M1 |
+| 18 recovery scenarios | per scenario (tags in Section 18) |
 | 19-22 crate shape, compatibility, decisions, acceptance | M1 |
 
 Single-task cancellation semantics (dispatch fencing and nonterminal
@@ -277,8 +277,9 @@ The logical `AgentRunEntity` is sharded by
 - run budgets and deadline; and
 - its contribution to the owning task's projection/evidence.
 
-One run MUST work on at most one `AgentTaskId` at a time. Parallel work uses
-multiple independently sharded runs.
+A run MUST remain bound to its single `AgentTaskId` for its entire lifetime;
+handoff and reassignment create a new run rather than re-targeting an existing
+one. Parallel work uses multiple independently sharded runs.
 
 For a continuous goal, each admitted evaluation/observation epoch MUST use a
 distinct finite child `AgentTaskId` and `AgentRunId`. Cross-epoch continuity
@@ -494,6 +495,9 @@ enum AgentGoalStatus {
 ```
 
 `Satisfied`, `Unsatisfied`, `Failed`, `Cancelled`, and `Expired` are terminal.
+`Unsatisfied` records an evaluator or policy decision that the success
+criteria were not met under the current goal revision; `Failed` records an
+execution or policy failure that ended the goal.
 The logical goal MUST remain durably addressable through dispatcher restart,
 pod loss, passivation, and shard movement until an authorized terminal
 transition occurs. This durability does not authorize unbounded compute: a
@@ -836,7 +840,9 @@ enum AgentRunStatus {
 ```
 
 `HandedOff`, `Superseded`, `Completed`, `Failed`, and `Cancelled` are terminal
-for one run. Waiting and `Suspended` states are interrupted/non-executing
+for one run. `HandedOff` records a completed handoff (Section 8.9);
+`Superseded` records replacement through reassignment or a new run
+generation. Waiting and `Suspended` states are interrupted/non-executing
 states, not terminal states and not resident waits. `Accepted`, `Running`, and
 `Cancelling` also MUST NOT be interpreted as physical-residency guarantees; the
 entity MAY passivate whenever no bounded transition is immediately executable.
@@ -1042,7 +1048,7 @@ propagation, and evaluation requests — MUST document its failure windows
 (initiator loss before send, receiver loss after acceptance, reply loss, and
 duplicate delivery), and each window MUST converge under replay.
 
-## 10. Rig Integration
+## 10. Model Adapter and Rig Integration
 
 ### 10.1 Model Adapter Trait and Rig Feature Gate
 
@@ -1511,6 +1517,7 @@ before successful acknowledgement.
 | --- | --- |
 | Task `Created`, `Blocked`, `Assigned` | `SUBMITTED` with bounded dependency/assignment metadata |
 | Task `InProgress`; run `Accepted`, `Running`, `WaitingForTimer`, `WaitingForEffect`, `Suspended`, `Cancelling`, `Compensating` | `WORKING` |
+| Task `WaitingForInput` (including a human-owned task awaiting its typed result) | `INPUT_REQUIRED` |
 | `WaitingForApproval` | `INPUT_REQUIRED` |
 | `WaitingForAuthorization` | `AUTH_REQUIRED` |
 | `WaitingForReconciliation` | `INPUT_REQUIRED` with stable indeterminate reason |
@@ -1521,6 +1528,10 @@ before successful acknowledgement.
 Run `HandedOff` or `Superseded` MUST NOT make the public task terminal while a
 successor run owns it. The projection follows authoritative task state and may
 include the current run condition as metadata.
+
+A `Suspended` run projects `WORKING` because A2A defines no paused state; the
+projection SHOULD carry bounded suspension metadata so a client can
+distinguish administrative suspension from active work.
 
 A cancellation request alone MUST NOT project `CANCELED`. While cancellation
 is propagating, project the authoritative nonterminal condition. If an
@@ -1808,7 +1819,7 @@ operations use stable `rakka.agent.*` names.
 | Active turn/invocation | Bounded `invoke_agent {agent.name}` `INTERNAL` span |
 | General decision | `rakka.agent.decide` `INTERNAL` span or event |
 | Explicit planning | `plan {agent.name}` `INTERNAL` span only when planning is reliably distinguishable |
-| Rig inference | `{gen_ai.operation.name} {gen_ai.request.model}` `CLIENT` span, or `INTERNAL` for a same-process model |
+| Model inference | `{gen_ai.operation.name} {gen_ai.request.model}` `CLIENT` span, or `INTERNAL` for a same-process model |
 | Embeddings | `embeddings {model}` span |
 | Retrieval | `retrieval {data_source}` span |
 | Memory operation | Standard create/search/update/upsert/delete memory span |
@@ -1866,9 +1877,10 @@ or private model reasoning. Operational explainability is provided by durable
 inputs/revisions, selected action, policy evaluation, effect/result evidence,
 and protected summaries.
 
-### 17.8 Model and Rig Observability
+### 17.8 Model and Provider Observability
 
-Each Rig model/provider operation MUST be observable as a GenAI model span.
+Each model/provider operation executed through the model adapter MUST be
+observable as a GenAI model span.
 When supplied by the provider or safely known, the span/log/metrics mapping
 SHOULD include:
 
