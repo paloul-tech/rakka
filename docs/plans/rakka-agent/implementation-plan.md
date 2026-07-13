@@ -67,7 +67,7 @@ These are restated here because every slice touches them:
 
 | Phase | Milestone | Content | Acceptance |
 | --- | --- | --- | --- |
-| 1 | M1 | Core durable agent: crate, identities, task/run entities, choreography, loop, model adapter, effects, tool authority, budgets, admission, checkpoints, session memory, A2A, observability, recovery | [spec 22 initial statement](spec.md#22-initial-acceptance-statement) |
+| 1 | M1 | Core durable agent: crate, identities, agent/task/run entities, choreography, loop, model adapter, effects, tool authority, budgets, admission, checkpoints, session memory, A2A, observability, recovery | [spec 22 initial statement](spec.md#22-initial-acceptance-statement) |
 | 2 | M2 | Private long-term memory, vector retrieval, communal knowledge graph | [spec 22 memory note](spec.md#22-initial-acceptance-statement) |
 | 3 | M3 | Continuous goals: wake identity/policy, controller, epochs, fencing | [Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3) |
 | 4 | M4 | Multi-agent goals: goal contract, evaluation, delegation, fan-in, workflow tools, cancellation propagation | [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4) |
@@ -98,8 +98,10 @@ Scenarios owed: 1-14, 17, 19, 21-26, 35, 37, 40, 44, 46, 52-61
 Open decisions from [spec 21.3](spec.md#213-open-decisions) to confirm or
 revise during this phase: 1 (concurrent runs), 4 (model-call retry policy),
 5 (no generic retry for ambiguous non-idempotent effects), 7 (short-term
-retention), 10 (settings as A2A management skill), 11 (trace-segment split),
-12 (content capture), 13 (sampling), 17 (`Task.id` mapping), 20 (no idle
+retention), 9 (service-resolved authorization, exercised by Slice 1.10),
+10 (settings as A2A management skill), 11 (trace-segment split),
+12 (content capture), 13 (sampling), 17 (`Task.id` mapping), 19 (setup
+envelope, designed in Slice 1.2 and enforced in Slice 1.8), 20 (no idle
 residency).
 
 ### Slice 1.1 — Crate scaffolding and feature gates
@@ -122,9 +124,9 @@ Guidance: [Suggested Crate Boundaries](technical-guidance.md#suggested-crate-bou
 Done when: empty-but-documented crate builds in both feature configurations
 and `scripts/validate.sh` is green.
 
-### Slice 1.2 — Identity, definition, settings, and setup contracts
+### Slice 1.2 — Identity/definition/settings contracts and AgentEntity
 
-Spec: [6.1-6.5](spec.md#6-core-terms-and-identities),
+Spec: [6.1-6.8](spec.md#6-core-terms-and-identities),
 [6.10](spec.md#610-stable-operation-ids),
 [6.11](spec.md#611-logical-availability-and-runtime-residency),
 [7.1-7.3](spec.md#7-agent-definition-and-settings),
@@ -133,9 +135,13 @@ Guidance: [Identity and Ownership](technical-guidance.md#identity-and-ownership)
 [Definition and Setup Revisions](technical-guidance.md#definition-and-setup-revisions).
 
 - Tenant-scoped newtype IDs: `AgentId`, `AgentGoalId`, `AgentTaskId`,
-  `AgentRunId` (plus `AgentDelegationId`, `AgentWakeId` types now, used in
-  later phases). Types stay distinct even where initial values coincide
-  ([spec 6.3](spec.md#63-agentgoalid), [spec 6.4](spec.md#64-agenttaskid)).
+  `AgentRunId` (plus `AgentDelegationId`, `AgentWakeId`,
+  `AgentEnvironmentRef`, and `KnowledgeSpaceId` types now, used in later
+  phases — the latter two fix the environment/memory scope keys that M2 and
+  M4 build on, [spec 6.7](spec.md#67-agentenvironmentref),
+  [spec 6.8](spec.md#68-knowledgespaceid)). Types stay distinct even where
+  initial values coincide ([spec 6.3](spec.md#63-agentgoalid),
+  [spec 6.4](spec.md#64-agenttaskid)).
 - A run is bound to one task for its lifetime
   ([spec 6.5](spec.md#65-agentrunid)); encode that in the constructor, not a
   setter.
@@ -143,14 +149,24 @@ Guidance: [Identity and Ownership](technical-guidance.md#identity-and-ownership)
   (turn-bound / immediate safety / run-pinned,
   [spec 7.2](spec.md#72-settings-revisions)), and `AgentSetupRevision` with
   narrow-only envelope validation ([spec 7.3](spec.md#73-definition-versus-run-setup)).
+- Sharded `AgentEntity` keyed `(TenantId, AgentId)` with a serializable
+  command protocol (standing constraint 5), owning definition and lifecycle
+  status, the current settings revision, policy and logical
+  credential-binding references, the agent-private memory namespace, and
+  administrative suspend/resume/terminate commands
+  ([spec 6.2](spec.md#62-agentid)). Routine run creation never round-trips
+  through it synchronously: the Slice 1.4 assignment flow reads its durable
+  definition/admission state
+  ([spec 9.8](spec.md#98-inter-entity-choreography)).
 - Stable operation/deduplication ID construction helpers
   ([spec 6.10](spec.md#610-stable-operation-ids)).
 - Schema-version fields and fail-closed deserialization on every persisted
   record introduced here.
 
 Done when: contract-level tests prove envelope validation rejects widening
-setups (enforcement at dispatch lands in Slice 1.8) and unsupported schema
-versions fail closed.
+setups (enforcement at dispatch lands in Slice 1.8), unsupported schema
+versions fail closed, and an `AgentEntity` instantiated with versioned
+settings persists, passivates, and recovers its definition/settings state.
 
 ### Slice 1.3 — Inter-entity choreography substrate
 
@@ -170,6 +186,9 @@ Guidance: [Inter-Entity Choreography](technical-guidance.md#inter-entity-choreog
   exchange, with the test name that proves each row.
 - No colocated shortcut: the exchange path is identical whether entities
   share a node or not.
+- Cross-node variants run on the default per-node deterministic-modulo shard
+  coordinator (symmetric hosting); the fenced-lease coordinator collapses an
+  entity type onto the single lease holder and cannot host them.
 
 Done when: scenarios 58 and 60 pass against an in-memory store, including a
 split-across-nodes variant of 60.
@@ -184,6 +203,9 @@ Guidance: [Typed Task Contract](technical-guidance.md#typed-task-contract),
 
 - Sharded `AgentTaskEntity` keyed `(TenantId, AgentTaskId)` with a
   serializable command protocol (standing constraint 5).
+- Assignment decisions read the agent's durable definition/admission state
+  owned by the Slice 1.2 `AgentEntity`; no synchronous `AgentEntity` round
+  trip ([spec 9.8](spec.md#98-inter-entity-choreography)).
 - Versioned `AgentTaskDefinition<R>`: typed input/result schema references,
   deterministic result rules, rejection limits, dependency policy,
   per-task budgets, generics only as compile-time ergonomics
@@ -219,6 +241,12 @@ Guidance: [Durable Agent Loop](technical-guidance.md#durable-agent-loop).
 - Result proposal/decision exchange with the task entity over Slice 1.3
   primitives; the run never makes the public task terminal by itself.
 - Passivation-by-default: after any persisted wait, the entity is idle.
+- Interim effect contract: until Slice 1.7 lands, transitions persist
+  effects through the existing `rakka-agent-workflow` `AgentEffect`/outbox
+  substrate, and scenario 2 is driven by a scripted transition stub (the
+  deterministic adapter arrives in Slice 1.6). Slice 1.7 retrofits the full
+  `EffectIntent` machine; the Slice 1.14 regression re-proves scenario 2 on
+  it.
 
 Done when: scenarios 2 and 59 pass (restart after every loop transition;
 result-exchange loss on either side converges).
@@ -241,6 +269,12 @@ Guidance: [Durable Agent Loop](technical-guidance.md#durable-agent-loop),
   durable format ([spec 10.2](spec.md#102-persistence-compatibility)).
 - Model calls are effects with explicit retry policy
   ([spec 11.5](spec.md#115-crash-and-timeout-rules); open decision 4).
+- The scripted turn rides the existing dispatcher/effect-bridge substrate
+  (`dispatcher.rs`, `effect_bridge.rs`); Slice 1.7 upgrades this path to the
+  full effect-state machine without changing the adapter contract.
+- The adapter's context-snapshot input starts as an opaque versioned
+  reference; Slice 1.11 formalizes it as the `MemoryContextSnapshot` of
+  [spec 13.5](spec.md#135-memory-context-snapshot).
 
 Done when: one scripted model turn runs end-to-end through the durable
 effect path under `--no-default-features`, and the same test passes with the
@@ -265,6 +299,9 @@ Guidance: [Effect Safety Guidance](technical-guidance.md#effect-safety-guidance)
   ambiguous non-idempotent effects stay in reconciliation
   ([spec 8.7](spec.md#87-cancellation-failure-and-waiting) single-task
   clauses, [spec 11.5](spec.md#115-crash-and-timeout-rules)).
+- Retrofit the Slice 1.5 loop and Slice 1.6 model-call paths onto this
+  machine, and record a first rough per-turn durable-write count/latency
+  measurement (formalized in Slice 1.14).
 
 Done when: scenarios 5-10 pass with fault injection at each crash window
 (before `Started`, after `Started` per safety class, after external commit),
@@ -323,10 +360,12 @@ Spec: [12](spec.md#12-durable-checkpoints-and-hitl) (all subsections).
 Guidance: [HITL and Authorization Guidance](technical-guidance.md#hitl-and-authorization-guidance),
 [Human Tasks Versus Effect Gates](technical-guidance.md#human-tasks-versus-effect-gates).
 
-- Generalize the existing `checkpoints.rs` substrate to the three kinds
+- Extend the approval-centric `checkpoints.rs` runtime to the three kinds
   (`Approval`, `SecurityAuthorization`,
   `IndeterminateEffectReconciliation`) with the full checkpoint record
-  ([spec 12.2](spec.md#122-checkpoint-record)).
+  ([spec 12.2](spec.md#122-checkpoint-record)); digest-bound grants and the
+  reconciliation decision set are new surface, not a refactor — size the
+  slice accordingly.
 - Grant binding to exact effect intent + argument digest; changed binding
   invalidates; pre-dispatch revalidation ([spec 12.3](spec.md#123-grant-binding)).
 - Reconciliation decision set without a generic `Retry`
@@ -343,6 +382,7 @@ scenario 57 passes (terminal cancellation only after outcomes are resolved).
 
 Spec: [13.1](spec.md#131-general-requirements),
 [13.2](spec.md#132-short-term-session-memory),
+[13.3](spec.md#133-agent-private-long-term-memory) (interface only),
 [13.5](spec.md#135-memory-context-snapshot),
 [13.6](spec.md#136-storage-adapters) (short-term clauses).
 Guidance: [Memory Architecture Guidance](technical-guidance.md#memory-architecture-guidance).
@@ -350,6 +390,10 @@ Guidance: [Memory Architecture Guidance](technical-guidance.md#memory-architectu
 - Session-memory trait scoped `(TenantId, AgentId, AgentRunId)` with
   `MemoryOperationId` idempotent append, ordered sequence, classification
   metadata; in-memory implementation in `rakka-agent`.
+- Declare (without implementing) the agent-private long-term memory trait
+  scoped `(TenantId, AgentId)` so session and snapshot identities cannot
+  bake in an incompatible scope; Phase 2 delivers the stores
+  ([spec 22](spec.md#22-initial-acceptance-statement) memory note).
 - `rakka-agent-postgres` crate: PostgreSQL session store with uniqueness
   constraints making replay harmless; gated tests via
   `RAKKA_POSTGRES_TEST_DSN` like `rakka-persistence-postgres`.
@@ -377,7 +421,8 @@ Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-
   `WaitingForInput` row, `Suspended` metadata, and the
   no-terminal-cancellation-during-reconciliation rule.
 - Settings commands as a versioned A2A management skill/extension (open
-  decision 10), authenticated, entering through the durable inbox.
+  decision 10), authenticated, entering through the durable inbox of the
+  owning Slice 1.2 `AgentEntity`.
 - `RakkaAgentClient` facade over the same durable command path — no local
   actor shortcut ([spec 14.5](spec.md#145-typed-agent-client)); replayable
   task/run event subscription reuses the existing A2A event replay
