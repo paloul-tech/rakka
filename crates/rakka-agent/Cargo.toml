@@ -1,0 +1,31 @@
+[package]
+name = "rakka-agent"
+version = "0.1.0"
+description.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license-file.workspace = true
+
+[lib]
+name = "rakka_agent"
+
+[features]
+default = ["rig"]
+# Rig-backed implementation of the Rakka-owned model adapter trait. The crate
+# must build and test without it; the pinned Rig dependency lands with the
+# adapter implementation itself.
+rig = []
+# Mapping from the Rakka telemetry domain to a pinned OpenTelemetry GenAI
+# semantic-convention revision, composed over the agent-workflow OTLP bridge.
+otel = []
+
+[dependencies]
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
+rakka-core = { path = "../rakka-core", version = "0.1.0" }
+
+[lints]
+workspace = true
