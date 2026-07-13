@@ -76,8 +76,46 @@ pub mod query;
 #[cfg(feature = "rig")]
 pub mod rig;
 pub mod run;
+pub mod schema;
 pub mod task;
 pub mod testkit;
 pub mod tools;
 pub mod wake;
 pub mod workflow_tool;
+
+pub use agent::{
+    agent_entity_id, agent_entity_persistence_id, agent_entity_ref, agent_entity_type_key,
+    init_agent_entity_remote_sharding, init_agent_entity_sharding, load_agent_entity_state,
+    passivate_agent_entity, registered_agent_entity_ref, AgentEntity, AgentEntityCommand,
+    AgentEntityError, AgentEntityMessage, AgentEntityOutcome, AgentEntityRef,
+    AgentEntityRegistration, AgentEntityReply, AgentEntityResult, AgentEntityShardingSettings,
+    AgentEntitySnapshot, AgentEntityState, AgentEntityStore, AgentEntityTypeKey,
+    AgentLifecycleStatus, AgentOperationLog, AGENT_ENTITY_OPERATION_LOG_CAPACITY,
+    DEFAULT_AGENT_ENTITY_TYPE,
+};
+pub use definition::{
+    effective_settings_for_turn, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentCapabilityId,
+    AgentCoordinationCapabilityKind, AgentCredentialBindingRef, AgentDefinition,
+    AgentDefinitionError, AgentDefinitionId, AgentDefinitionResult, AgentDefinitionRevision,
+    AgentEffectSafetyClass, AgentEnvelopeDimension, AgentEnvelopeViolation,
+    AgentExecutionPolicyRef, AgentGuardrailStageId, AgentModelProfileId, AgentOperationClass,
+    AgentPolicyRef, AgentPolicyRefs, AgentRevisionNumber, AgentRevisionProvenance,
+    AgentSamplingSettings, AgentSettings, AgentSettingsChange, AgentSetupRevision,
+    AgentTaskDefinitionId, AgentToolDeclaration, AgentToolId, AgentWorkflowToolId,
+    SettingsRevision, SettingsTimingClass, AGENT_DESCRIPTION_MAX_LENGTH,
+    AGENT_SETTINGS_MAX_CHANGES,
+};
+pub use identity::{
+    validate_identity_segment, validate_tenant, AgentDelegationId, AgentEnvironmentRef,
+    AgentGoalId, AgentId, AgentIdentityError, AgentIdentityResult, AgentMemoryNamespace,
+    AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId, AgentRunScope, AgentScope,
+    AgentTaskId, AgentTaskScope, AgentWakeId, KnowledgeSpaceId, TenantId,
+    AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_NAMESPACE_PREFIX,
+    AGENT_PERSISTENCE_SEPARATOR, AGENT_SCOPE_SEPARATOR,
+};
+pub use schema::{
+    previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
+    AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
+    CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_SETTINGS_SCHEMA_VERSION, CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+};
