@@ -552,6 +552,44 @@ async fn a_published_definition_may_not_strand_the_settings_already_in_force() {
 }
 
 #[tokio::test]
+async fn a_definition_that_bypasses_construction_is_rejected_at_the_entity() {
+    let Fixture { system, entity, .. } = sharded_agent("AgentEntityDefinitionBounds");
+
+    applied(ask(&entity, instantiate_command()).await);
+
+    // The definition's fields are public, so a caller can assemble one without
+    // `AgentDefinition::new` — and a node-local command never crosses the
+    // deserialization boundary that would otherwise catch it. The entity
+    // re-validates at its accept path, so the bounded-description invariant
+    // holds no matter how the value was built.
+    let mut bypassed = definition();
+    bypassed.description = "x".repeat(rakka_agent::AGENT_DESCRIPTION_MAX_LENGTH + 1);
+
+    let code = rejection_code(
+        ask(
+            &entity,
+            AgentEntityCommand::PublishDefinition {
+                operation_id: operation(AgentOperationKind::DefinitionUpdate, "bypass"),
+                definition: Box::new(bypassed),
+                provenance: Box::new(provenance(2)),
+            },
+        )
+        .await,
+    );
+    assert_eq!(code, "agent-description-too-long");
+
+    // The rejection left no trace: the definition on record is untouched.
+    let recovered = snapshot(ask(&entity, AgentEntityCommand::Describe).await);
+    assert_eq!(recovered.definition_revision, AgentRevisionNumber::INITIAL);
+    assert_eq!(
+        recovered.description,
+        "Resolves customer support tickets end to end."
+    );
+
+    system.shutdown();
+}
+
+#[tokio::test]
 async fn an_entity_id_that_is_not_a_scope_key_rejects_every_command() {
     let system = ActorSystem::new("AgentEntityMalformedId");
     let sharding = ClusterSharding::get(&system);

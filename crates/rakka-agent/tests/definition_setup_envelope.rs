@@ -12,11 +12,11 @@
 use rakka_agent::{
     effective_settings_for_turn, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentCapabilityId,
     AgentCoordinationCapabilityKind, AgentCredentialBindingRef, AgentDefinition,
-    AgentDefinitionRevision, AgentEffectSafetyClass, AgentEnvironmentRef, AgentGuardrailStageId,
-    AgentId, AgentModelProfileId, AgentOperationClass, AgentPolicyRef, AgentRevisionNumber,
-    AgentRevisionProvenance, AgentSamplingSettings, AgentSettings, AgentSettingsChange,
-    AgentSetupRevision, AgentTaskDefinitionId, AgentToolDeclaration, AgentToolId,
-    AgentWorkflowToolId, KnowledgeSpaceId, SettingsRevision, SettingsTimingClass,
+    AgentDefinitionRevision, AgentEffectSafetyClass, AgentEnvironmentRef, AgentExecutionPolicyRef,
+    AgentGuardrailStageId, AgentId, AgentModelProfileId, AgentOperationClass, AgentPolicyRef,
+    AgentRevisionNumber, AgentRevisionProvenance, AgentSamplingSettings, AgentSettings,
+    AgentSettingsChange, AgentSetupRevision, AgentTaskDefinitionId, AgentToolDeclaration,
+    AgentToolId, AgentWorkflowToolId, KnowledgeSpaceId, SettingsRevision, SettingsTimingClass,
     AGENT_DESCRIPTION_MAX_LENGTH, AGENT_SETTINGS_MAX_CHANGES,
 };
 use rakka_agent_workflow::{
@@ -271,6 +271,76 @@ fn a_setup_may_not_add_an_unauthorized_peer() {
 }
 
 #[test]
+fn a_setup_may_not_reroute_or_drop_a_tool_execution_policy() {
+    // The execution policy is an opaque application reference: the narrowing
+    // check cannot rank "sandboxed" against "host-shell", so neither a
+    // substitute nor the policy's absence can be proven stricter. The only
+    // legal narrowing keeps the declared routing exactly.
+    let sandboxed =
+        AgentExecutionPolicyRef::new("sandboxed").expect("execution policy ref should be valid");
+    let permissive =
+        AgentExecutionPolicyRef::new("host-shell").expect("execution policy ref should be valid");
+
+    let mut granted = AgentAuthorityEnvelope::empty();
+    granted.tools.insert(
+        tool("deploy"),
+        AgentToolDeclaration::new(AgentEffectSafetyClass::Reconcileable)
+            .with_execution_policy(sandboxed.clone()),
+    );
+
+    // Keeping the declared routing is legal.
+    assert!(granted.narrowing_violations(&granted.clone()).is_empty());
+
+    // Substituting another policy is rejected.
+    let mut rerouted = granted.clone();
+    rerouted.tools.insert(
+        tool("deploy"),
+        AgentToolDeclaration::new(AgentEffectSafetyClass::Reconcileable)
+            .with_execution_policy(permissive.clone()),
+    );
+    let violations = granted.narrowing_violations(&rerouted);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(
+        violations[0].reason_code(),
+        "rerouted-tool-execution-policy"
+    );
+
+    // Dropping the policy is rejected too: absence may route the dispatch
+    // through a weaker default.
+    let mut dropped = granted.clone();
+    dropped.tools.insert(
+        tool("deploy"),
+        AgentToolDeclaration::new(AgentEffectSafetyClass::Reconcileable),
+    );
+    let violations = granted.narrowing_violations(&dropped);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(
+        violations[0].reason_code(),
+        "rerouted-tool-execution-policy"
+    );
+
+    // And a setup may not attach a policy to a tool the definition routes
+    // through none.
+    let mut unrouted = AgentAuthorityEnvelope::empty();
+    unrouted.tools.insert(
+        tool("deploy"),
+        AgentToolDeclaration::new(AgentEffectSafetyClass::Reconcileable),
+    );
+    let mut attached = unrouted.clone();
+    attached.tools.insert(
+        tool("deploy"),
+        AgentToolDeclaration::new(AgentEffectSafetyClass::Reconcileable)
+            .with_execution_policy(permissive),
+    );
+    let violations = unrouted.narrowing_violations(&attached);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(
+        violations[0].reason_code(),
+        "rerouted-tool-execution-policy"
+    );
+}
+
+#[test]
 fn a_setup_may_not_weaken_a_mandatory_guardrail() {
     let mut envelope = narrowed_envelope();
     envelope.mandatory_guardrails.clear();
@@ -364,6 +434,56 @@ fn a_definition_requires_a_bounded_outcome_oriented_description() {
         .code(),
         "agent-description-too-long"
     );
+}
+
+#[test]
+fn a_definition_fails_closed_on_deserialization_when_its_description_is_out_of_bounds() {
+    // The definition's fields are public, so construction alone cannot
+    // guarantee the bounds. Deserialization is the wire and load path, and it
+    // must reject what `AgentDefinition::new` rejects.
+    let valid = AgentDefinition::new(
+        rakka_agent::AgentDefinitionId::new("support-v1").expect("definition id"),
+        "Resolves customer support tickets end to end.",
+        AgentAuthorityEnvelope::empty(),
+    )
+    .expect("definition should be valid");
+
+    let mut oversized = serde_json::to_value(&valid).expect("definition should serialize");
+    oversized["description"] =
+        serde_json::Value::String("x".repeat(AGENT_DESCRIPTION_MAX_LENGTH + 1));
+    let error = serde_json::from_value::<AgentDefinition>(oversized)
+        .expect_err("an oversized description must not cross the wire or load from a record");
+    assert!(error.to_string().contains("exceeds"), "unexpected: {error}");
+
+    let mut empty = serde_json::to_value(&valid).expect("definition should serialize");
+    empty["description"] = serde_json::Value::String(String::new());
+    let error = serde_json::from_value::<AgentDefinition>(empty)
+        .expect_err("an empty description must not cross the wire or load from a record");
+    assert!(
+        error.to_string().contains("description"),
+        "unexpected: {error}"
+    );
+}
+
+#[test]
+fn a_settings_revision_bounds_its_changes_on_deserialization() {
+    let definition = definition();
+    let initial = SettingsRevision::initial(&definition, AgentSettings::default(), provenance(2))
+        .expect("initial settings should be accepted");
+    let revision = initial
+        .apply(
+            &definition,
+            vec![AgentSettingsChange::RetrievalLimit(4)],
+            provenance(3),
+        )
+        .expect("the settings update should be accepted");
+
+    let mut value = serde_json::to_value(&revision).expect("revision should serialize");
+    let change = value["changes"][0].clone();
+    value["changes"] = serde_json::Value::Array(vec![change; AGENT_SETTINGS_MAX_CHANGES + 1]);
+    let error = serde_json::from_value::<SettingsRevision>(value)
+        .expect_err("a change list beyond the bound must not cross the wire or load");
+    assert!(error.to_string().contains("exceeds"), "unexpected: {error}");
 }
 
 #[test]

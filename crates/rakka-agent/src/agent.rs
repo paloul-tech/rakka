@@ -771,6 +771,11 @@ where
             });
         }
 
+        // The definition's fields are public, so its bounded invariants cannot
+        // be assumed from construction; the entity re-checks them before
+        // anything is persisted.
+        definition.validate()?;
+
         let accepted_at = provenance.accepted_at;
         // The entity publishes the initial revision itself, so the first durable
         // record always carries revision 1 and the schema version this binary
@@ -790,6 +795,11 @@ where
         definition: AgentDefinition,
         provenance: AgentRevisionProvenance,
     ) -> AgentEntityResult<AgentEntityReply> {
+        // The definition's fields are public, so its bounded invariants cannot
+        // be assumed from construction; the entity re-checks them before
+        // anything is persisted.
+        definition.validate()?;
+
         let accepted_at = provenance.accepted_at;
         self.mutate(operation_id, accepted_at, |state| {
             let definition = state.definition.succeed(definition, provenance);

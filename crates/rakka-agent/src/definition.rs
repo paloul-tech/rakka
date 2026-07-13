@@ -26,6 +26,12 @@
 //! mandatory guardrail but never drop one, and may *lower* a budget ceiling but
 //! never raise it or replace a bounded ceiling with an unbounded one.
 //!
+//! A tool's execution-policy routing is pinned outright. The reference is
+//! opaque to Rakka, so two policies cannot be ordered by strictness, and
+//! neither substituting another policy nor dropping the declared one can be
+//! proven narrower — a narrowing envelope must keep the routing the definition
+//! declared.
+//!
 //! # Settings timing
 //!
 //! A settings update is a set of field-level changes, and each change declares
@@ -49,7 +55,8 @@ use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, ArtifactRef, PrincipalRef,
     StateSchemaVersion,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeserializeError;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::identity::{
     validated_id, AgentEnvironmentRef, AgentId, AgentIdentityError, KnowledgeSpaceId,
@@ -321,6 +328,10 @@ pub struct AgentToolDeclaration {
     /// Logical credential binding the tool's dispatch may resolve.
     pub credential_binding: Option<AgentCredentialBindingRef>,
     /// Execution policy or trust class the tool's dispatch is routed through.
+    ///
+    /// Pinned under narrowing: the reference is opaque, so a substitute — or
+    /// its absence — cannot be proven stricter, and a setup must keep the
+    /// routing the definition declared.
     pub execution_policy: Option<AgentExecutionPolicyRef>,
 }
 
@@ -485,6 +496,9 @@ pub enum AgentEnvelopeDimension {
     EffectSafety,
     /// A credential binding the definition never authorized for that tool.
     ToolCredentialBinding,
+    /// An execution policy differing from the one the definition routes that
+    /// tool's dispatch through.
+    ToolExecutionPolicy,
     /// A model or provider profile the definition never approved.
     ModelProfile,
     /// A workflow tool the definition never allowed.
@@ -519,6 +533,7 @@ impl AgentEnvelopeDimension {
             Self::ToolCapability => "widened-tool-capability",
             Self::EffectSafety => "downgraded-effect-safety",
             Self::ToolCredentialBinding => "widened-tool-credential-binding",
+            Self::ToolExecutionPolicy => "rerouted-tool-execution-policy",
             Self::ModelProfile => "unapproved-model-profile",
             Self::WorkflowTool => "undeclared-workflow-tool",
             Self::TaskDefinition => "unaccepted-task-definition",
@@ -653,6 +668,21 @@ impl AgentAuthorityEnvelope {
                     ));
                 }
             }
+
+            // The execution policy is an opaque application reference, so the
+            // check cannot rank a substitute — or the policy's absence — as
+            // stricter or weaker. The only safe narrowing keeps the declared
+            // routing exactly.
+            if declaration.execution_policy != declared.execution_policy {
+                violations.push(AgentEnvelopeViolation::new(
+                    AgentEnvelopeDimension::ToolExecutionPolicy,
+                    format!(
+                        "tool {tool} is routed through {} and the narrowed envelope may not reroute it through {}",
+                        execution_policy_label(declared.execution_policy.as_ref()),
+                        execution_policy_label(declaration.execution_policy.as_ref()),
+                    ),
+                ));
+            }
         }
 
         collect_subset_violations(
@@ -746,6 +776,13 @@ impl AgentAuthorityEnvelope {
     }
 }
 
+fn execution_policy_label(policy: Option<&AgentExecutionPolicyRef>) -> String {
+    policy.map_or_else(
+        || "no execution policy".to_string(),
+        |policy| format!("execution policy {policy}"),
+    )
+}
+
 fn collect_subset_violations<T>(
     granted: &BTreeSet<T>,
     candidate: &BTreeSet<T>,
@@ -781,7 +818,15 @@ pub struct AgentPolicyRefs {
 
 /// The content of one agent definition
 /// ([specification 7.1](../../../docs/plans/rakka-agent/spec.md)).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The fields are public so a definition can be assembled directly, which
+/// means construction alone cannot guarantee the bounded invariants.
+/// [`AgentDefinition::validate`] therefore runs at three points: inside
+/// [`AgentDefinition::new`], on deserialization — so an out-of-bounds
+/// definition can neither arrive over the wire nor load from a durable
+/// record — and again at the agent entity's accept path before anything is
+/// persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentDefinition {
     /// Stable definition identity.
     pub definition_id: AgentDefinitionId,
@@ -805,23 +850,33 @@ impl AgentDefinition {
         description: impl Into<String>,
         envelope: AgentAuthorityEnvelope,
     ) -> AgentDefinitionResult<Self> {
-        let description = description.into();
-        if description.is_empty() {
-            return Err(AgentDefinitionError::EmptyDescription);
-        }
-        if description.len() > AGENT_DESCRIPTION_MAX_LENGTH {
-            return Err(AgentDefinitionError::DescriptionTooLong {
-                length: description.len(),
-                maximum: AGENT_DESCRIPTION_MAX_LENGTH,
-            });
-        }
-        Ok(Self {
+        let definition = Self {
             definition_id,
-            description,
+            description: description.into(),
             instructions: None,
             envelope,
             policies: AgentPolicyRefs::default(),
-        })
+        };
+        definition.validate()?;
+        Ok(definition)
+    }
+
+    /// Accepts the definition's bounded invariants, or fails closed.
+    ///
+    /// This is the single check behind construction, deserialization, and the
+    /// agent entity's accept path, so a definition assembled field by field is
+    /// held to the same bounds as one built through [`AgentDefinition::new`].
+    pub fn validate(&self) -> AgentDefinitionResult<()> {
+        if self.description.is_empty() {
+            return Err(AgentDefinitionError::EmptyDescription);
+        }
+        if self.description.len() > AGENT_DESCRIPTION_MAX_LENGTH {
+            return Err(AgentDefinitionError::DescriptionTooLong {
+                length: self.description.len(),
+                maximum: AGENT_DESCRIPTION_MAX_LENGTH,
+            });
+        }
+        Ok(())
     }
 
     /// Points the definition at its out-of-line system instructions.
@@ -836,6 +891,33 @@ impl AgentDefinition {
     pub fn with_policies(mut self, policies: AgentPolicyRefs) -> Self {
         self.policies = policies;
         self
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Record {
+            definition_id: AgentDefinitionId,
+            description: String,
+            instructions: Option<ArtifactRef>,
+            envelope: AgentAuthorityEnvelope,
+            policies: AgentPolicyRefs,
+        }
+
+        let record = Record::deserialize(deserializer)?;
+        let definition = Self {
+            definition_id: record.definition_id,
+            description: record.description,
+            instructions: record.instructions,
+            envelope: record.envelope,
+            policies: record.policies,
+        };
+        definition.validate().map_err(DeserializeError::custom)?;
+        Ok(definition)
     }
 }
 
@@ -1106,7 +1188,11 @@ impl AgentSettings {
 /// The revision holds both the materialized settings and the changes that
 /// produced them, so an in-flight effect can be reasoned about against the exact
 /// revision recorded in its intent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The change list is bounded by [`AGENT_SETTINGS_MAX_CHANGES`] where a
+/// revision is produced *and* on deserialization, so an oversized list can
+/// neither cross the wire nor load from a durable record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsRevision {
     schema_version: StateSchemaVersion,
     revision: AgentRevisionNumber,
@@ -1232,6 +1318,39 @@ impl VersionedAgentRecord for SettingsRevision {
 
     fn schema_version(&self) -> StateSchemaVersion {
         self.schema_version
+    }
+}
+
+impl<'de> Deserialize<'de> for SettingsRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Record {
+            schema_version: StateSchemaVersion,
+            revision: AgentRevisionNumber,
+            settings: AgentSettings,
+            changes: Vec<AgentSettingsChange>,
+            provenance: AgentRevisionProvenance,
+        }
+
+        let record = Record::deserialize(deserializer)?;
+        if record.changes.len() > AGENT_SETTINGS_MAX_CHANGES {
+            return Err(DeserializeError::custom(
+                AgentDefinitionError::TooManySettingsChanges {
+                    count: record.changes.len(),
+                    maximum: AGENT_SETTINGS_MAX_CHANGES,
+                },
+            ));
+        }
+        Ok(Self {
+            schema_version: record.schema_version,
+            revision: record.revision,
+            settings: record.settings,
+            changes: record.changes,
+            provenance: record.provenance,
+        })
     }
 }
 
