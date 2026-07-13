@@ -10,11 +10,11 @@ use std::time::Duration;
 use rakka_agent::{
     agent_entity_ref, init_agent_entity_sharding, load_agent_entity_state, passivate_agent_entity,
     registered_agent_entity_ref, AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId,
-    AgentDefinitionRevision, AgentEntityCommand, AgentEntityRef, AgentEntityRegistration,
-    AgentEntityReply, AgentEntityShardingSettings, AgentEntitySnapshot, AgentEntityState,
-    AgentEntityStore, AgentId, AgentLifecycleStatus, AgentModelProfileId, AgentOperationId,
-    AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentSchemaPolicy,
-    AgentScope, AgentSettings, AgentSettingsChange, AgentToolDeclaration, AgentToolId, TenantId,
+    AgentEntityCommand, AgentEntityRef, AgentEntityRegistration, AgentEntityReply,
+    AgentEntityShardingSettings, AgentEntitySnapshot, AgentEntityState, AgentEntityStore, AgentId,
+    AgentLifecycleStatus, AgentModelProfileId, AgentOperationId, AgentOperationKind,
+    AgentRevisionNumber, AgentRevisionProvenance, AgentSchemaPolicy, AgentScope, AgentSettings,
+    AgentSettingsChange, AgentToolDeclaration, AgentToolId, TenantId,
     AGENT_ENTITY_OPERATION_LOG_CAPACITY,
 };
 use rakka_agent_workflow::{
@@ -53,7 +53,7 @@ fn model(id: &str) -> AgentModelProfileId {
     AgentModelProfileId::new(id).expect("model profile id should be valid")
 }
 
-fn definition() -> AgentDefinitionRevision {
+fn definition() -> AgentDefinition {
     let mut envelope = AgentAuthorityEnvelope::empty();
     envelope.model_profiles.insert(model("frontier"));
     envelope.model_profiles.insert(model("mini"));
@@ -62,13 +62,12 @@ fn definition() -> AgentDefinitionRevision {
         AgentToolDeclaration::new(rakka_agent::AgentEffectSafetyClass::ReadOnly),
     );
 
-    let definition = AgentDefinition::new(
+    AgentDefinition::new(
         AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
         "Resolves customer support tickets end to end.",
         envelope,
     )
-    .expect("definition should be valid");
-    AgentDefinitionRevision::initial(definition, provenance(1))
+    .expect("definition should be valid")
 }
 
 fn operation(kind: AgentOperationKind, discriminator: &str) -> AgentOperationId {
@@ -212,6 +211,7 @@ async fn an_agent_persists_passivates_and_recovers_its_definition_and_settings()
     // definition and settings from durable state alone.
     let recovered = snapshot(ask(&entity, AgentEntityCommand::Describe).await);
     assert_eq!(recovered.status, AgentLifecycleStatus::Active);
+    assert_eq!(recovered.lifecycle_revision, AgentRevisionNumber::INITIAL);
     assert_eq!(recovered.definition_revision, AgentRevisionNumber::INITIAL);
     assert_eq!(recovered.settings_revision, AgentRevisionNumber::new(2));
     assert_eq!(recovered.scope, scope());
@@ -413,12 +413,14 @@ async fn suspension_withdraws_dispatch_permission_and_termination_is_terminal() 
             &entity,
             AgentEntityCommand::Suspend {
                 operation_id: operation(AgentOperationKind::LifecycleCommand, "suspend-1"),
+                expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
                 provenance: Box::new(provenance(2)),
             },
         )
         .await,
     );
     assert_eq!(outcome.status, AgentLifecycleStatus::Suspended);
+    assert_eq!(outcome.lifecycle_revision, AgentRevisionNumber::new(2));
 
     // Suspension is an immediate-safety control: a dispatcher reading durable
     // state, without waking the entity, must see that dispatch is withdrawn.
@@ -428,11 +430,28 @@ async fn suspension_withdraws_dispatch_permission_and_termination_is_terminal() 
         .expect("the agent was instantiated");
     assert!(!durable.is_dispatch_permitted());
 
+    // A lifecycle command carries the lifecycle revision it expects to advance.
+    // A caller that read revision 1 never saw the suspension, so its resume must
+    // not reorder over it.
+    let code = rejection_code(
+        ask(
+            &entity,
+            AgentEntityCommand::Resume {
+                operation_id: operation(AgentOperationKind::LifecycleCommand, "resume-stale"),
+                expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
+                provenance: Box::new(provenance(3)),
+            },
+        )
+        .await,
+    );
+    assert_eq!(code, "stale-lifecycle-revision");
+
     let outcome = applied(
         ask(
             &entity,
             AgentEntityCommand::Resume {
                 operation_id: operation(AgentOperationKind::LifecycleCommand, "resume-1"),
+                expected_lifecycle_revision: AgentRevisionNumber::new(2),
                 provenance: Box::new(provenance(3)),
             },
         )
@@ -445,6 +464,7 @@ async fn suspension_withdraws_dispatch_permission_and_termination_is_terminal() 
             &entity,
             AgentEntityCommand::Terminate {
                 operation_id: operation(AgentOperationKind::LifecycleCommand, "terminate-1"),
+                expected_lifecycle_revision: AgentRevisionNumber::new(3),
                 provenance: Box::new(provenance(4)),
             },
         )
@@ -456,6 +476,7 @@ async fn suspension_withdraws_dispatch_permission_and_termination_is_terminal() 
             &entity,
             AgentEntityCommand::Resume {
                 operation_id: operation(AgentOperationKind::LifecycleCommand, "resume-2"),
+                expected_lifecycle_revision: AgentRevisionNumber::new(4),
                 provenance: Box::new(provenance(5)),
             },
         )
@@ -567,6 +588,7 @@ async fn commanding_an_agent_that_was_never_instantiated_fails_closed() {
             &entity,
             AgentEntityCommand::Suspend {
                 operation_id: operation(AgentOperationKind::LifecycleCommand, "suspend-1"),
+                expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
                 provenance: Box::new(provenance(2)),
             },
         )
@@ -622,6 +644,7 @@ fn the_command_protocol_is_serializable() {
         },
         AgentEntityCommand::Suspend {
             operation_id: operation(AgentOperationKind::LifecycleCommand, "suspend-1"),
+            expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
             provenance: Box::new(provenance(3)),
         },
         AgentEntityCommand::Describe,
@@ -635,6 +658,7 @@ fn the_command_protocol_is_serializable() {
     let reply = AgentEntityReply::Applied {
         outcome: rakka_agent::AgentEntityOutcome {
             status: AgentLifecycleStatus::Active,
+            lifecycle_revision: AgentRevisionNumber::INITIAL,
             definition_revision: AgentRevisionNumber::INITIAL,
             settings_revision: AgentRevisionNumber::INITIAL,
         },
@@ -656,8 +680,41 @@ async fn the_operation_log_stays_bounded() {
 
     applied(ask(&entity, instantiate_command()).await);
 
-    // Durable state must stay bounded, so the deduplication window is a ring. The
-    // instantiation plus this many updates overflows it by one.
+    // A suspend, a resume, and a second suspend. The resume ages out of the
+    // deduplication window below, and replaying it must not lift the suspension
+    // that came after it.
+    let resume = AgentEntityCommand::Resume {
+        operation_id: operation(AgentOperationKind::LifecycleCommand, "resume-1"),
+        expected_lifecycle_revision: AgentRevisionNumber::new(2),
+        provenance: Box::new(provenance(3)),
+    };
+    applied(
+        ask(
+            &entity,
+            AgentEntityCommand::Suspend {
+                operation_id: operation(AgentOperationKind::LifecycleCommand, "suspend-1"),
+                expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
+                provenance: Box::new(provenance(2)),
+            },
+        )
+        .await,
+    );
+    applied(ask(&entity, resume.clone()).await);
+    applied(
+        ask(
+            &entity,
+            AgentEntityCommand::Suspend {
+                operation_id: operation(AgentOperationKind::LifecycleCommand, "suspend-2"),
+                expected_lifecycle_revision: AgentRevisionNumber::new(3),
+                provenance: Box::new(provenance(4)),
+            },
+        )
+        .await,
+    );
+
+    // Durable state must stay bounded, so the deduplication window is a ring.
+    // These updates overflow it: the instantiation and every lifecycle operation
+    // above age out of the window.
     for index in 0..AGENT_ENTITY_OPERATION_LOG_CAPACITY {
         let expected = AgentRevisionNumber::new(index as u64 + 1);
         applied(
@@ -702,6 +759,19 @@ async fn the_operation_log_stays_bounded() {
         .await,
     );
     assert_eq!(code, "stale-settings-revision");
+
+    // The resume has aged out of the window too. Un-deduplicated, its replay
+    // would reactivate an agent a later command suspended; the lifecycle fence
+    // rejects it instead, and the suspension holds.
+    let code = rejection_code(ask(&entity, resume).await);
+    assert_eq!(code, "stale-lifecycle-revision");
+
+    let durable = load_agent_entity_state(&store, &scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the durable state should load")
+        .expect("the agent was instantiated");
+    assert_eq!(durable.status(), AgentLifecycleStatus::Suspended);
+    assert!(!durable.is_dispatch_permitted());
 
     system.shutdown();
 }

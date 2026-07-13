@@ -38,6 +38,11 @@
 //! [specification 7.2](../../../docs/plans/rakka-agent/spec.md): slice 1.8
 //! rechecks [`AgentEntityState::is_dispatch_permitted`] before every dispatch,
 //! alongside the immediate-safety settings of the current revision.
+//!
+//! Because suspension is a safety control, lifecycle transitions are fenced on
+//! a monotonic lifecycle revision, exactly as settings updates are fenced on
+//! theirs: a stale resume that has aged out of the deduplication window cannot
+//! reorder over a later suspension and silently lift it.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -79,8 +84,8 @@ pub const DEFAULT_AGENT_ENTITY_TYPE: &str = "RakkaAgent";
 /// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)). It is bounded
 /// because durable state must stay bounded; a replay older than the window is
 /// still safe, because every transition is additionally fenced — a settings
-/// update carries the revision it expects to succeed, and the lifecycle
-/// transitions are idempotent against the status they produce.
+/// update carries the settings revision it expects to succeed, and a lifecycle
+/// transition carries the lifecycle revision it expects to advance.
 pub const AGENT_ENTITY_OPERATION_LOG_CAPACITY: usize = 64;
 
 const DEFAULT_AGENT_ENTITY_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
@@ -192,6 +197,8 @@ struct AgentOperationLogEntry {
 pub struct AgentEntityOutcome {
     /// Lifecycle status after the transition.
     pub status: AgentLifecycleStatus,
+    /// Lifecycle revision after the transition.
+    pub lifecycle_revision: AgentRevisionNumber,
     /// Definition revision after the transition.
     pub definition_revision: AgentRevisionNumber,
     /// Settings revision after the transition.
@@ -208,6 +215,7 @@ pub struct AgentEntityState {
     schema_version: StateSchemaVersion,
     scope: AgentScope,
     status: AgentLifecycleStatus,
+    lifecycle_revision: AgentRevisionNumber,
     definition: AgentDefinitionRevision,
     settings: SettingsRevision,
     applied_operations: AgentOperationLog,
@@ -228,6 +236,7 @@ impl AgentEntityState {
             schema_version: CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
             scope,
             status: AgentLifecycleStatus::Active,
+            lifecycle_revision: AgentRevisionNumber::INITIAL,
             definition,
             settings,
             applied_operations: AgentOperationLog::default(),
@@ -251,6 +260,20 @@ impl AgentEntityState {
     #[must_use]
     pub const fn status(&self) -> AgentLifecycleStatus {
         self.status
+    }
+
+    /// Monotonic revision of the lifecycle status.
+    ///
+    /// Every accepted suspend, resume, or terminate advances it, and each
+    /// lifecycle command carries the revision it expects to advance. Statuses
+    /// recur — an agent can be suspended, resumed, and suspended again — so the
+    /// status alone cannot fence a stale replay; the revision can: a resume
+    /// issued before a later suspension is rejected rather than silently
+    /// lifting it, even after its operation id has aged out of the
+    /// deduplication window.
+    #[must_use]
+    pub const fn lifecycle_revision(&self) -> AgentRevisionNumber {
+        self.lifecycle_revision
     }
 
     /// Current definition revision.
@@ -308,6 +331,7 @@ impl AgentEntityState {
     pub const fn outcome(&self) -> AgentEntityOutcome {
         AgentEntityOutcome {
             status: self.status,
+            lifecycle_revision: self.lifecycle_revision,
             definition_revision: self.definition.revision(),
             settings_revision: self.settings.revision(),
         }
@@ -320,6 +344,7 @@ impl AgentEntityState {
         AgentEntitySnapshot {
             scope: self.scope.clone(),
             status: self.status,
+            lifecycle_revision: self.lifecycle_revision,
             definition_id: definition.definition_id.clone(),
             description: definition.description.clone(),
             definition_revision: self.definition.revision(),
@@ -346,6 +371,9 @@ pub struct AgentEntitySnapshot {
     pub scope: AgentScope,
     /// Current lifecycle status.
     pub status: AgentLifecycleStatus,
+    /// Current lifecycle revision, which the next lifecycle command must
+    /// expect.
+    pub lifecycle_revision: AgentRevisionNumber,
     /// Identity of the published definition.
     pub definition_id: AgentDefinitionId,
     /// Bounded outcome-oriented description.
@@ -374,8 +402,10 @@ pub enum AgentEntityCommand {
     Instantiate {
         /// Stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
-        /// First definition revision.
-        definition: Box<AgentDefinitionRevision>,
+        /// Content of the first definition. The entity publishes the initial
+        /// revision itself, so a foreign revision number or schema version can
+        /// never enter the first durable record.
+        definition: Box<AgentDefinition>,
         /// Initial settings.
         settings: Box<AgentSettings>,
         /// Who accepted the instantiation, when, and under which audit
@@ -407,6 +437,9 @@ pub enum AgentEntityCommand {
     Suspend {
         /// Stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
+        /// Lifecycle revision the caller believes is current. A mismatch is
+        /// rejected rather than reordered over a decision the caller never saw.
+        expected_lifecycle_revision: AgentRevisionNumber,
         /// Who suspended the agent, when, and under which audit reference.
         provenance: Box<AgentRevisionProvenance>,
     },
@@ -414,6 +447,9 @@ pub enum AgentEntityCommand {
     Resume {
         /// Stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
+        /// Lifecycle revision the caller believes is current. A mismatch is
+        /// rejected rather than reordered over a decision the caller never saw.
+        expected_lifecycle_revision: AgentRevisionNumber,
         /// Who resumed the agent, when, and under which audit reference.
         provenance: Box<AgentRevisionProvenance>,
     },
@@ -421,6 +457,9 @@ pub enum AgentEntityCommand {
     Terminate {
         /// Stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
+        /// Lifecycle revision the caller believes is current. A mismatch is
+        /// rejected rather than reordered over a decision the caller never saw.
+        expected_lifecycle_revision: AgentRevisionNumber,
         /// Who terminated the agent, when, and under which audit reference.
         provenance: Box<AgentRevisionProvenance>,
     },
@@ -679,10 +718,12 @@ where
             }
             AgentEntityCommand::Suspend {
                 operation_id,
+                expected_lifecycle_revision,
                 provenance,
             } => {
                 self.transition_lifecycle(
                     operation_id,
+                    expected_lifecycle_revision,
                     AgentLifecycleStatus::Suspended,
                     *provenance,
                 )
@@ -690,17 +731,25 @@ where
             }
             AgentEntityCommand::Resume {
                 operation_id,
-                provenance,
-            } => {
-                self.transition_lifecycle(operation_id, AgentLifecycleStatus::Active, *provenance)
-                    .await
-            }
-            AgentEntityCommand::Terminate {
-                operation_id,
+                expected_lifecycle_revision,
                 provenance,
             } => {
                 self.transition_lifecycle(
                     operation_id,
+                    expected_lifecycle_revision,
+                    AgentLifecycleStatus::Active,
+                    *provenance,
+                )
+                .await
+            }
+            AgentEntityCommand::Terminate {
+                operation_id,
+                expected_lifecycle_revision,
+                provenance,
+            } => {
+                self.transition_lifecycle(
+                    operation_id,
+                    expected_lifecycle_revision,
                     AgentLifecycleStatus::Terminated,
                     *provenance,
                 )
@@ -712,7 +761,7 @@ where
     async fn instantiate(
         &mut self,
         operation_id: AgentOperationId,
-        definition: AgentDefinitionRevision,
+        definition: AgentDefinition,
         settings: AgentSettings,
         provenance: AgentRevisionProvenance,
     ) -> AgentEntityResult<AgentEntityReply> {
@@ -723,6 +772,10 @@ where
         }
 
         let accepted_at = provenance.accepted_at;
+        // The entity publishes the initial revision itself, so the first durable
+        // record always carries revision 1 and the schema version this binary
+        // writes — a peer binary cannot hand it one it may later fail to read.
+        let definition = AgentDefinitionRevision::initial(definition, provenance.clone());
         let settings = SettingsRevision::initial(&definition, settings, provenance)?;
         let mut state =
             AgentEntityState::new(self.scope.clone(), definition, settings, accepted_at);
@@ -778,11 +831,20 @@ where
     async fn transition_lifecycle(
         &mut self,
         operation_id: AgentOperationId,
+        expected_lifecycle_revision: AgentRevisionNumber,
         target: AgentLifecycleStatus,
         provenance: AgentRevisionProvenance,
     ) -> AgentEntityResult<AgentEntityReply> {
         self.mutate(operation_id, provenance.accepted_at, |state| {
+            let current = state.lifecycle_revision;
+            if current != expected_lifecycle_revision {
+                return Err(AgentEntityError::StaleLifecycleRevision {
+                    expected: expected_lifecycle_revision,
+                    current,
+                });
+            }
             state.status = target;
+            state.lifecycle_revision = current.next();
             Ok(())
         })
         .await
@@ -1194,6 +1256,15 @@ pub enum AgentEntityError {
         /// Revision that is actually current.
         current: AgentRevisionNumber,
     },
+    /// The lifecycle command expected a lifecycle revision that is no longer
+    /// current, so applying it would reorder over a decision the caller never
+    /// saw.
+    StaleLifecycleRevision {
+        /// Lifecycle revision the caller expected to be current.
+        expected: AgentRevisionNumber,
+        /// Lifecycle revision that is actually current.
+        current: AgentRevisionNumber,
+    },
 }
 
 impl AgentEntityError {
@@ -1210,6 +1281,7 @@ impl AgentEntityError {
             Self::AlreadyInstantiated { .. } => "agent-already-instantiated",
             Self::Terminated { .. } => "agent-terminated",
             Self::StaleSettingsRevision { .. } => "stale-settings-revision",
+            Self::StaleLifecycleRevision { .. } => "stale-lifecycle-revision",
         }
     }
 }
@@ -1237,6 +1309,10 @@ impl Display for AgentEntityError {
             Self::StaleSettingsRevision { expected, current } => write!(
                 f,
                 "the settings update expected revision {expected} but revision {current} is current"
+            ),
+            Self::StaleLifecycleRevision { expected, current } => write!(
+                f,
+                "the lifecycle command expected lifecycle revision {expected} but revision {current} is current"
             ),
         }
     }
