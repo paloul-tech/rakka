@@ -1645,6 +1645,11 @@ version = "0.1.0"
 dependencies = [
  "rakka-agent-workflow",
  "rakka-core",
+ "rakka-persistence",
+ "rakka-sharding",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
