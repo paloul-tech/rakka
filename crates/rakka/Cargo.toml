@@ -30,6 +30,9 @@ default = [
 cluster = ["dep:rakka-cluster"]
 discovery-etcd = ["dep:rakka-discovery-etcd", "cluster"]
 agent-workflow = ["dep:rakka-agent-workflow"]
+agent = ["dep:rakka-agent", "agent-workflow"]
+agent-rig = ["agent", "rakka-agent?/rig"]
+agent-otel = ["agent", "rakka-agent?/otel"]
 a2a = ["dep:rakka-a2a", "agent-workflow"]
 a2a-server = ["a2a", "rakka-a2a?/server"]
 a2a-sharding = ["a2a", "rakka-a2a?/sharding", "sharding"]
@@ -53,6 +56,7 @@ workflow = ["dep:rakka-workflow"]
 [dependencies]
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
 rakka-a2a = { path = "../rakka-a2a", version = "0.1.0", optional = true }
+rakka-agent = { path = "../rakka-agent", version = "0.1.0", optional = true, default-features = false }
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0", optional = true }
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0", optional = true }
 rakka-discovery-etcd = { path = "../rakka-discovery-etcd", version = "0.1.0", optional = true }

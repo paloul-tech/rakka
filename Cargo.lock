@@ -1594,6 +1594,7 @@ name = "rakka"
 version = "0.1.0"
 dependencies = [
  "rakka-a2a",
+ "rakka-agent",
  "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",
@@ -1636,6 +1637,14 @@ dependencies = [
  "tokio-postgres",
  "tower 0.5.3",
  "tracing",
+]
+
+[[package]]
+name = "rakka-agent"
+version = "0.1.0"
+dependencies = [
+ "rakka-agent-workflow",
+ "rakka-core",
 ]
 
 [[package]]
