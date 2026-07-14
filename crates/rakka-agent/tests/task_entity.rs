@@ -120,7 +120,6 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         goal: None,
         parent: None,
         dependencies,
-        created_at: AgentTimestampMillis::new(1),
     }
 }
 

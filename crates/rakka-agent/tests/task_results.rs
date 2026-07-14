@@ -28,7 +28,7 @@ use rakka_agent::{
     AgentTaskEntityStore, AgentTaskHistoryCursor, AgentTaskHistoryKind, AgentTaskHistoryStore,
     AgentTaskId, AgentTaskLimits, AgentTaskResultCheck, AgentTaskResultProposal,
     AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
-    AgentTaskStatus, InMemoryAgentTaskHistoryStore, TenantId, TypedTask,
+    AgentTaskStatus, InMemoryAgentTaskHistoryStore, TenantId, TypedTask, AGENT_IDENTITY_MAX_LENGTH,
     AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
 };
 use rakka_agent_workflow::{
@@ -233,7 +233,6 @@ impl Fixture {
             goal: None,
             parent: None,
             dependencies: Vec::new(),
-            created_at: AgentTimestampMillis::new(1),
         };
 
         let mut entity = AgentTaskEntityStore::new(
@@ -563,6 +562,40 @@ async fn a_proposal_from_a_superseded_generation_is_fenced_and_costs_the_live_ru
     assert_eq!(
         snapshot.rejection_count, 0,
         "a superseded run's proposal must not consume the live run's rejection budget"
+    );
+    assert_eq!(snapshot.status, AgentTaskStatus::InProgress);
+}
+
+#[tokio::test]
+async fn an_unbounded_causation_id_is_refused_without_a_validation_decision() {
+    // A rejection persists the proposal's causation id, and the admission-time
+    // growth reserve is sized against bounded fields; an id past the identity
+    // bound is refused before any state is written.
+    let fx = Fixture::running().await;
+
+    let decision = fx
+        .propose_with("1", |proposal| {
+            proposal.content = AgentTaskContent::inline(
+                serde_json::json!({ "answer": "restart the router", "confidence": 90 }),
+            )
+            .expect("the result is inline-bounded");
+            proposal.causation_id =
+                AgentCausationId::new("c".repeat(AGENT_IDENTITY_MAX_LENGTH + 1));
+        })
+        .await;
+
+    match decision {
+        AgentTaskDecision::Refused { code, status } => {
+            assert_eq!(code, "proposal-causation-too-long");
+            assert_eq!(status, AgentTaskStatus::InProgress);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let snapshot = fx.snapshot().await;
+    assert_eq!(
+        snapshot.rejection_count, 0,
+        "a refusal is not a validation decision and consumes no budget"
     );
     assert_eq!(snapshot.status, AgentTaskStatus::InProgress);
 }

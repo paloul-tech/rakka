@@ -9,6 +9,7 @@
 //! stays bounded *because* the history left it, and the history is not lost
 //! *because* it is durable somewhere else.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -24,14 +25,17 @@ use rakka_agent::{
     AgentRevisionNumber, AgentRevisionProvenance, AgentRunScope, AgentSchemaId, AgentSchemaPolicy,
     AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation,
     AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskDependencyDeclaration,
-    AgentTaskEntityCommand, AgentTaskEntityStore, AgentTaskHistoryCursor, AgentTaskHistoryEntry,
-    AgentTaskHistoryKind, AgentTaskHistoryStore, AgentTaskId, AgentTaskLimits,
-    AgentTaskResultCheck, AgentTaskResultProposal, AgentTaskResultRule, AgentTaskRuleId,
-    AgentTaskScope, AgentTaskState, AgentTaskStatus, InMemoryAgentTaskHistoryStore, TenantId,
-    AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH, AGENT_TASK_HISTORY_MAX_PAGE_SIZE,
-    AGENT_TASK_INLINE_CONTENT_MAX_BYTES, AGENT_TASK_MATERIALIZED_MAX_BYTES,
-    AGENT_TASK_MAX_DEPENDENCIES, AGENT_TASK_MAX_HISTORY_PER_TRANSITION,
-    AGENT_TASK_PENDING_HISTORY_CAPACITY, AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
+    AgentTaskDependencyOutcome, AgentTaskEntityCommand, AgentTaskEntityStore,
+    AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind, AgentTaskHistoryStore,
+    AgentTaskId, AgentTaskLimits, AgentTaskResultCheck, AgentTaskResultProposal,
+    AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskState, AgentTaskStatus,
+    InMemoryAgentTaskHistoryStore, TenantId, AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH,
+    AGENT_TASK_HISTORY_MAX_PAGE_SIZE, AGENT_TASK_INLINE_CONTENT_MAX_BYTES,
+    AGENT_TASK_MATERIALIZED_MAX_BYTES, AGENT_TASK_MAX_DEPENDENCIES,
+    AGENT_TASK_MAX_HISTORY_PER_TRANSITION, AGENT_TASK_PENDING_HISTORY_CAPACITY,
+    AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE, AGENT_TASK_RULE_ONE_OF_MAX_VALUES,
+    AGENT_TASK_RULE_POINTER_MAX_LENGTH, AGENT_TASK_RULE_VALUE_MAX_LENGTH,
+    AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
 };
 use rakka_agent_workflow::{
     AgentAttributes, AgentAuditEventId, AgentCausationId, AgentCorrelationId, AgentTimestampMillis,
@@ -238,7 +242,6 @@ impl Fixture {
             goal: None,
             parent: None,
             dependencies: Vec::new(),
-            created_at: AgentTimestampMillis::new(1),
         };
 
         let mut entity = self.entity().await;
@@ -445,7 +448,6 @@ async fn the_widest_transition_never_loses_a_history_entry() {
         goal: None,
         parent: None,
         dependencies,
-        created_at: AgentTimestampMillis::new(1),
     };
 
     let mut entity = fx.entity().await;
@@ -684,7 +686,6 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
                         goal: None,
                         parent: None,
                         dependencies: Vec::new(),
-                        created_at: AgentTimestampMillis::new(1),
                     }),
                 },
                 &fx.task_router,
@@ -712,4 +713,197 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
         AgentAssignmentGeneration::new(u64::MAX),
     )
     .expect("the widest derivable run id stays a valid identity");
+}
+
+#[test]
+fn a_task_definition_bounds_its_rule_content() {
+    // A rule travels inside the definition, and the definition is part of the
+    // materialized record: an unbounded pointer or value set would let a
+    // definition grow durable state without limit.
+    let invalid = |definition: AgentTaskDefinition| {
+        assert_eq!(
+            definition.validate().map_err(|error| error.code()),
+            Err("invalid-task-definition")
+        );
+    };
+
+    invalid(task_definition().with_result_rule(AgentTaskResultRule::new(
+        AgentTaskRuleId::new("wide-pointer").expect("rule id should be valid"),
+        AgentTaskResultCheck::Required {
+            pointer: format!("/{}", "p".repeat(AGENT_TASK_RULE_POINTER_MAX_LENGTH)),
+        },
+    )));
+
+    invalid(
+        task_definition().with_result_rule(AgentTaskResultRule::new(
+            AgentTaskRuleId::new("wide-set").expect("rule id should be valid"),
+            AgentTaskResultCheck::OneOf {
+                pointer: "/status".to_string(),
+                values: (0..=AGENT_TASK_RULE_ONE_OF_MAX_VALUES)
+                    .map(|value| format!("value-{value}"))
+                    .collect(),
+            },
+        )),
+    );
+
+    invalid(
+        task_definition().with_result_rule(AgentTaskResultRule::new(
+            AgentTaskRuleId::new("wide-value").expect("rule id should be valid"),
+            AgentTaskResultCheck::OneOf {
+                pointer: "/status".to_string(),
+                values: [format!("v{}", "x".repeat(AGENT_TASK_RULE_VALUE_MAX_LENGTH))]
+                    .into_iter()
+                    .collect(),
+            },
+        )),
+    );
+}
+
+/// Pads the definition with bounded one-of rules, roughly 250 bytes per value,
+/// so a sweep over `values` walks the materialized record across the admission
+/// bound in bounded steps.
+fn padded_definition(values: usize) -> AgentTaskDefinition {
+    let mut definition = task_definition();
+    let mut added = 0;
+    let mut rule = 0;
+    while added < values {
+        let take = (values - added).min(AGENT_TASK_RULE_ONE_OF_MAX_VALUES);
+        let set: BTreeSet<String> = (0..take)
+            .map(|value| format!("{rule:02}-{value:02}-{}", "x".repeat(240)))
+            .collect();
+        definition = definition.with_result_rule(AgentTaskResultRule::new(
+            AgentTaskRuleId::new(format!("pad-{rule}")).expect("rule id should be valid"),
+            AgentTaskResultCheck::OneOf {
+                pointer: "/status".to_string(),
+                values: set,
+            },
+        ));
+        added += take;
+        rule += 1;
+    }
+    definition
+}
+
+#[tokio::test]
+async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
+    // The identity bound closes "admitted, then unassignable" for run ids; the
+    // growth reserve closes it for the record itself. A creation whose record
+    // sits inside the reserve window is refused at admission, where the caller
+    // can still slim the definition — never admitted and then refused its own
+    // assignment, rejection, or terminal reason for want of room.
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let mut admitted = 0usize;
+    let mut refused = 0usize;
+    for step in 0..28usize {
+        let id = format!("headroom-{step}");
+        let scope = AgentTaskScope::new(
+            tenant(),
+            AgentTaskId::new(&id).expect("the task id should be valid"),
+        )
+        .expect("the task scope should be valid");
+        let upstream =
+            AgentTaskId::new(format!("upstream-{step}")).expect("the task id should be valid");
+
+        let mut entity = AgentTaskEntityStore::new(
+            scope.clone(),
+            fx.tasks.clone(),
+            fx.agents.clone(),
+            fx.history.clone(),
+        );
+        entity
+            .recover(fx.now())
+            .await
+            .expect("the task entity should recover");
+        let created = entity
+            .apply(
+                AgentTaskEntityCommand::Create {
+                    operation_id: AgentOperationId::new(
+                        AgentOperationKind::TaskCreation,
+                        [TENANT, &id, "1"],
+                    )
+                    .expect("operation id should be derivable"),
+                    creation: Box::new(AgentTaskCreation {
+                        definition: padded_definition(80 + step * 5),
+                        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                            .expect("the input is inline-bounded"),
+                        assignee: Some(agent_id()),
+                        goal: None,
+                        parent: None,
+                        // The dependency keeps the creation from deciding its
+                        // own assignment, which is exactly the window where an
+                        // unreserved record used to be admitted and later found
+                        // too large to assign.
+                        dependencies: vec![AgentTaskDependencyDeclaration::new(upstream.clone())],
+                    }),
+                },
+                &fx.task_router,
+                fx.now(),
+            )
+            .await;
+
+        match created {
+            Err(error) => {
+                assert_eq!(error.code(), "task-state-too-large");
+                refused += 1;
+            }
+            Ok(_) => {
+                admitted += 1;
+                let state = rakka_agent::load_agent_task_state(
+                    &fx.tasks,
+                    &scope,
+                    &AgentSchemaPolicy::default(),
+                )
+                .await
+                .expect("the durable read should succeed")
+                .expect("the task exists");
+                let size = state
+                    .task()
+                    .expect("the task is created")
+                    .materialized_size_bytes();
+                assert!(
+                    size + AGENT_TASK_STATE_GROWTH_RESERVE_BYTES
+                        <= AGENT_TASK_MATERIALIZED_MAX_BYTES,
+                    "an admitted record leaves the whole growth reserve, got {size} bytes"
+                );
+
+                // The admitted task must survive its own lifecycle: resolving
+                // the dependency decides the assignment in the same
+                // transition, and that decision can never be refused for the
+                // size of a record admission accepted.
+                entity
+                    .apply(
+                        AgentTaskEntityCommand::RecordDependencyOutcome {
+                            operation_id: AgentOperationId::new(
+                                AgentOperationKind::Command,
+                                [TENANT, &id, "resolve"],
+                            )
+                            .expect("operation id should be derivable"),
+                            dependency: upstream,
+                            outcome: AgentTaskDependencyOutcome::Completed,
+                        },
+                        &fx.task_router,
+                        fx.now(),
+                    )
+                    .await
+                    .expect("an admitted task is never too large to assign");
+                let state = rakka_agent::load_agent_task_state(
+                    &fx.tasks,
+                    &scope,
+                    &AgentSchemaPolicy::default(),
+                )
+                .await
+                .expect("the durable read should succeed")
+                .expect("the task exists");
+                assert_eq!(
+                    state.task().expect("the task is created").status,
+                    AgentTaskStatus::InProgress
+                );
+            }
+        }
+    }
+
+    assert!(admitted > 0, "the sweep starts below the admission bound");
+    assert!(refused > 0, "the sweep crosses the admission bound");
 }

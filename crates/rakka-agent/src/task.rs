@@ -150,8 +150,31 @@ pub const AGENT_TASK_INLINE_CONTENT_MAX_BYTES: usize = 8 * 1024;
 /// exchange journal alongside it is bounded by the substrate's own constants.
 pub const AGENT_TASK_MATERIALIZED_MAX_BYTES: usize = 32 * 1024;
 
+/// Bytes of growth headroom an admitted task record keeps below
+/// [`AGENT_TASK_MATERIALIZED_MAX_BYTES`].
+///
+/// After admission, the materialized record may still grow by at most one live
+/// assignment, one assignment refusal, one rejection decision, one terminal
+/// reason, and one resolution outcome per declared dependency — each of them
+/// individually bounded, and together under this reserve. Creation and
+/// post-creation dependency declarations therefore enforce the materialized
+/// bound *minus* this reserve: a task the entity admits can never later be
+/// refused its own assignment, rejection, or terminal reason because the
+/// record it was admitted with left no room. It is the same reservation
+/// [`AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH`] makes for derived run ids.
+pub const AGENT_TASK_STATE_GROWTH_RESERVE_BYTES: usize = 6 * 1024;
+
 /// Maximum number of deterministic result rules one task definition may carry.
 pub const AGENT_TASK_MAX_RESULT_RULES: usize = 32;
+
+/// Maximum length, in bytes, of the JSON pointer one result rule inspects.
+pub const AGENT_TASK_RULE_POINTER_MAX_LENGTH: usize = 256;
+
+/// Maximum number of permitted values one one-of result rule may carry.
+pub const AGENT_TASK_RULE_ONE_OF_MAX_VALUES: usize = 32;
+
+/// Maximum length, in bytes, of one permitted one-of value.
+pub const AGENT_TASK_RULE_VALUE_MAX_LENGTH: usize = 256;
 
 /// Maximum number of dependencies one task may declare.
 pub const AGENT_TASK_MAX_DEPENDENCIES: usize = 32;
@@ -649,6 +672,56 @@ pub enum AgentTaskResultCheck {
 }
 
 impl AgentTaskResultCheck {
+    /// Rejects a check whose content cannot be bounded.
+    ///
+    /// A rule travels inside the definition, and the definition is part of the
+    /// materialized record, so an unbounded pointer or value set would let a
+    /// definition grow the record without limit.
+    fn validate(&self) -> AgentTaskResult<()> {
+        let pointer = match self {
+            Self::Required { pointer }
+            | Self::Forbidden { pointer }
+            | Self::NonEmptyString { pointer }
+            | Self::IntegerRange { pointer, .. }
+            | Self::OneOf { pointer, .. } => Some(pointer),
+            Self::EvidenceRequired => None,
+        };
+        if let Some(pointer) = pointer {
+            if pointer.len() > AGENT_TASK_RULE_POINTER_MAX_LENGTH {
+                return Err(AgentTaskError::InvalidDefinition {
+                    detail: format!(
+                        "a result rule's JSON pointer is {} bytes, which exceeds the \
+                         {AGENT_TASK_RULE_POINTER_MAX_LENGTH} byte limit",
+                        pointer.len()
+                    ),
+                });
+            }
+        }
+        if let Self::OneOf { values, .. } = self {
+            if values.len() > AGENT_TASK_RULE_ONE_OF_MAX_VALUES {
+                return Err(AgentTaskError::InvalidDefinition {
+                    detail: format!(
+                        "a one-of result rule may permit at most \
+                         {AGENT_TASK_RULE_ONE_OF_MAX_VALUES} values"
+                    ),
+                });
+            }
+            if let Some(value) = values
+                .iter()
+                .find(|value| value.len() > AGENT_TASK_RULE_VALUE_MAX_LENGTH)
+            {
+                return Err(AgentTaskError::InvalidDefinition {
+                    detail: format!(
+                        "a permitted one-of value is {} bytes, which exceeds the \
+                         {AGENT_TASK_RULE_VALUE_MAX_LENGTH} byte limit",
+                        value.len()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Stable kebab-case label of the check, used as the rejection reason code.
     #[must_use]
     pub const fn as_label(&self) -> &'static str {
@@ -1048,6 +1121,9 @@ impl AgentTaskDefinition {
                     "a task definition may declare at most {AGENT_TASK_MAX_RESULT_RULES} result rules"
                 ),
             });
+        }
+        for rule in &self.result_rules {
+            rule.check.validate()?;
         }
         self.limits.validate()
     }
@@ -2089,8 +2165,6 @@ pub struct AgentTaskCreation {
     pub parent: Option<AgentTaskId>,
     /// Dependencies declared with the creation.
     pub dependencies: Vec<AgentTaskDependencyDeclaration>,
-    /// When the creation was accepted.
-    pub created_at: AgentTimestampMillis,
 }
 
 /// The command an [`AgentExchangeKind::Assignment`] exchange carries to the run
@@ -2158,7 +2232,9 @@ pub struct AgentTaskResultProposal {
     pub content: AgentTaskContent,
     /// Evidence artifacts supporting the result.
     pub evidence: Vec<ArtifactRef>,
-    /// What caused the proposal.
+    /// What caused the proposal. At most [`AGENT_IDENTITY_MAX_LENGTH`] bytes:
+    /// a rejection persists it, and a longer id is refused without a
+    /// validation decision.
     pub causation_id: AgentCausationId,
     /// When the run proposed it.
     pub proposed_at: AgentTimestampMillis,
@@ -2337,7 +2413,10 @@ pub struct AgentTask {
     pub last_rejection: Option<Box<AgentTaskRejection>>,
     /// Why the task reached its terminal status.
     pub terminal_reason: Option<AgentTaskTerminalReason>,
-    /// When the task was created.
+    /// When the creation committed, stamped by the owner that wrote it — never
+    /// by the initiator's clock, exactly as
+    /// [`crate::choreography::AgentExchangeParticipant::apply`] requires of
+    /// every durable timestamp.
     pub created_at: AgentTimestampMillis,
 }
 
@@ -2378,18 +2457,24 @@ impl AgentTask {
             .unwrap_or(0)
     }
 
-    fn check_bounds(&self) -> AgentTaskResult<()> {
+    /// Rejects a record that exceeds its bounds, keeping `reserve` bytes below
+    /// the materialized maximum.
+    ///
+    /// Admission-time transitions — creation and dependency declaration — pass
+    /// [`AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`], so every record they admit
+    /// still has room for the assignment, refusal, rejection, and terminal
+    /// reason its lifecycle may add; the transitions that add exactly that
+    /// reserved growth pass zero.
+    fn check_bounds(&self, reserve: usize) -> AgentTaskResult<()> {
         if self.dependencies.len() > self.definition.limits.max_dependencies {
             return Err(AgentTaskError::DependencyLimitExceeded {
                 maximum: self.definition.limits.max_dependencies,
             });
         }
         let bytes = self.materialized_size_bytes();
-        if bytes > AGENT_TASK_MATERIALIZED_MAX_BYTES {
-            return Err(AgentTaskError::MaterializedStateTooLarge {
-                bytes,
-                maximum: AGENT_TASK_MATERIALIZED_MAX_BYTES,
-            });
+        let maximum = AGENT_TASK_MATERIALIZED_MAX_BYTES.saturating_sub(reserve);
+        if bytes > maximum {
+            return Err(AgentTaskError::MaterializedStateTooLarge { bytes, maximum });
         }
         Ok(())
     }
@@ -2795,7 +2880,7 @@ fn create_task(
                 policy: declaration.policy,
                 outcome: None,
                 declared_by: operation_id.clone(),
-                declared_at: creation.created_at,
+                declared_at: now,
             },
         ) {
             // The same rule as a post-creation redeclaration: repeating an edge
@@ -2858,9 +2943,11 @@ fn create_task(
         rejection_count: 0,
         last_rejection: None,
         terminal_reason: None,
-        created_at: creation.created_at,
+        created_at: now,
     };
-    task.check_bounds()?;
+    // Admission reserves growth headroom: a record accepted here must still be
+    // able to hold everything its own lifecycle may add.
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
 
     state.task = Some(task);
     state.updated_at = now;
@@ -2946,7 +3033,9 @@ fn declare_dependency(
     if matches!(task.status, AgentTaskStatus::Created) {
         task.status = AgentTaskStatus::Blocked;
     }
-    task.check_bounds()?;
+    // A late edge grows the admitted record, so it keeps the same growth
+    // headroom the creation reserved.
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
 
     let status = task.status;
     let detail = declaration.dependency.to_string();
@@ -3210,7 +3299,9 @@ fn decide_assignment(
     task.status = AgentTaskStatus::Assigned;
     task.last_refusal = None;
     task.assignment = Some(assignment.clone());
-    task.check_bounds()?;
+    // The assignment spends growth headroom admission reserved, so it checks
+    // the full bound: it cannot fail for a record admission accepted.
+    task.check_bounds(0)?;
 
     state.updated_at = now;
     state.record_history(|sequence| {
@@ -3244,6 +3335,22 @@ fn apply_result_proposal(
         Ok(proposal) => proposal,
         Err(error) => return refuse(state, error.code(), error.to_string()),
     };
+
+    if proposal.causation_id.as_str().len() > AGENT_IDENTITY_MAX_LENGTH {
+        // The causation id is the one externally supplied field a rejection
+        // persists whose type does not bound itself, and the admission-time
+        // growth reserve is sized against bounded fields only. Refusing costs
+        // the run nothing; a corrected proposal is a new decision.
+        return refuse(
+            state,
+            "proposal-causation-too-long",
+            format!(
+                "the proposal's causation id is {} bytes, and the task persists at most \
+                 {AGENT_IDENTITY_MAX_LENGTH}",
+                proposal.causation_id.as_str().len()
+            ),
+        );
+    }
 
     let Some(task) = state.task.as_ref() else {
         return refuse(
@@ -3333,7 +3440,10 @@ fn accept_result(
     let bounded = {
         let task = state.task.as_mut().expect("the task exists on this path");
         task.accepted_result = Some(Box::new(accepted.clone()));
-        task.check_bounds()
+        // An accepted result is not covered by the admission reserve: unlike
+        // an assignment or a rejection, an oversized one has a graceful retry
+        // — the run resubmits it behind an artifact reference.
+        task.check_bounds(0)
     };
     if let Err(error) = bounded {
         // The accepted result would push the materialized record past its bound.
@@ -3743,6 +3853,15 @@ where
     /// Applies one command, then settles whatever it made possible: the
     /// assignment decision, the history the transition owes, and the exchanges it
     /// owes.
+    ///
+    /// # Errors
+    ///
+    /// An error does not prove the command was not applied. The transition
+    /// commits before the settle pass, so a settlement failure — a history-sink
+    /// outage, a delivery fault — surfaces here after the command has durably
+    /// applied. Retrying with the same operation id is always safe: a command
+    /// that committed answers [`AgentTaskEntityReply::Duplicate`] with its
+    /// original outcome rather than transitioning twice.
     pub async fn apply(
         &mut self,
         command: AgentTaskEntityCommand,
@@ -4239,6 +4358,12 @@ pub enum AgentTaskEntityReply {
         progress: AgentTaskProgress,
     },
     /// The command was rejected.
+    ///
+    /// A rejection is not proof the command did not apply: a settlement
+    /// failure after the transition committed — a history-sink outage, a
+    /// delivery fault — reaches the caller as this reply too. Retrying with
+    /// the same operation id is always safe; a command that committed answers
+    /// [`Self::Duplicate`] with its original outcome.
     Rejected {
         /// Stable machine-readable error code.
         code: String,
