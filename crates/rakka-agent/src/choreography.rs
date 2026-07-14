@@ -1342,10 +1342,16 @@ pub trait AgentExchangeParticipant: Send + Sync + 'static {
     /// has aged out of the window has to be rejected on the domain's terms (a
     /// stale generation, a lifecycle that has moved on) rather than applied a
     /// second time. See the module documentation.
+    ///
+    /// `now` is when this transition commits on the receiving owner. Durable
+    /// timestamps the transition writes come from it, never from
+    /// [`AgentExchangeEnvelope::created_at`], which is the *initiator's* clock
+    /// at the earlier moment the envelope was recorded.
     fn apply(
         &self,
         state: &mut Self::State,
         envelope: &AgentExchangeEnvelope,
+        now: AgentTimestampMillis,
     ) -> AgentExchangeTransition;
 
     /// Applies the consequence of a result one of this entity's own exchanges
@@ -1353,11 +1359,13 @@ pub trait AgentExchangeParticipant: Send + Sync + 'static {
     ///
     /// It runs exactly once per operation id: the substrate settles the pending
     /// exchange in the same transition, and a duplicate reply never reaches it.
+    /// `now` is when the settlement commits, exactly as on [`Self::apply`].
     fn settle(
         &self,
         state: &mut Self::State,
         envelope: &AgentExchangeEnvelope,
         result: &AgentExchangeResult,
+        now: AgentTimestampMillis,
     ) -> Vec<AgentExchangeEnvelope>;
 }
 
@@ -1541,7 +1549,10 @@ where
         }
 
         let mut state = record.state.clone();
-        let (result, owed) = self.participant.apply(&mut state, envelope).into_parts();
+        let (result, owed) = self
+            .participant
+            .apply(&mut state, envelope, now)
+            .into_parts();
         state.exchange_journal_mut().record_applied(
             envelope.operation_id().clone(),
             envelope.kind(),
@@ -1587,7 +1598,7 @@ where
             return Ok(settlement);
         };
 
-        let owed = self.participant.settle(&mut state, envelope, result);
+        let owed = self.participant.settle(&mut state, envelope, result, now);
         self.record_owed(&mut state, owed, now)?;
         self.persist(state, record.revision).await?;
         Ok(settlement)
