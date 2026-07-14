@@ -378,6 +378,15 @@ impl AgentTaskScope {
         EntityId::new(self.key())
     }
 
+    /// Durable persistence id of this task's entity state.
+    #[must_use]
+    pub fn persistence_id(&self) -> PersistenceId {
+        PersistenceId::new(format!(
+            "{AGENT_TASK_ENTITY_PERSISTENCE_PREFIX}:{}",
+            self.key()
+        ))
+    }
+
     /// Parses a flattened scope key, failing closed on a malformed value.
     pub fn parse(key: &str) -> AgentIdentityResult<Self> {
         let [tenant, task] = split_segments(SCOPE_FIELD_TASK, key)?;
@@ -453,6 +462,15 @@ impl AgentRunScope {
     #[must_use]
     pub fn entity_id(&self) -> EntityId {
         EntityId::new(self.key())
+    }
+
+    /// Durable persistence id of this run's entity state.
+    #[must_use]
+    pub fn persistence_id(&self) -> PersistenceId {
+        PersistenceId::new(format!(
+            "{AGENT_RUN_ENTITY_PERSISTENCE_PREFIX}:{}",
+            self.key()
+        ))
     }
 
     /// Parses a flattened scope key, failing closed on a malformed value.
@@ -557,6 +575,12 @@ impl Display for AgentMemoryNamespace {
 
 /// Prefix of the durable persistence id of an agent entity's state.
 pub const AGENT_ENTITY_PERSISTENCE_PREFIX: &str = "agent-entity";
+
+/// Prefix of the durable persistence id of a task entity's state.
+pub const AGENT_TASK_ENTITY_PERSISTENCE_PREFIX: &str = "agent-task-entity";
+
+/// Prefix of the durable persistence id of a run entity's state.
+pub const AGENT_RUN_ENTITY_PERSISTENCE_PREFIX: &str = "agent-run-entity";
 
 /// Prefix of an agent-private memory namespace.
 pub const AGENT_MEMORY_NAMESPACE_PREFIX: &str = "agent-memory";

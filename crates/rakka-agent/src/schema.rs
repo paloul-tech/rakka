@@ -32,6 +32,18 @@ pub const CURRENT_AGENT_SETTINGS_SCHEMA_VERSION: StateSchemaVersion = StateSchem
 /// Current schema version of a persisted [`crate::definition::AgentSetupRevision`].
 pub const CURRENT_AGENT_SETUP_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
+/// Current schema version of a durable [`crate::choreography::AgentExchangeJournal`].
+pub const CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of an [`crate::choreography::AgentExchangeEnvelope`].
+pub const CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of an [`crate::choreography::AgentExchangeReply`].
+pub const CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Result type for schema compatibility checks.
 pub type AgentSchemaResult<T> = Result<T, AgentSchemaError>;
 
@@ -51,9 +63,28 @@ pub enum AgentRecordKind {
     SettingsRevision,
     /// Versioned per-run agent setup revision.
     SetupRevision,
+    /// Durable inter-entity exchange journal carried inside a participant's
+    /// own state.
+    ExchangeJournal,
+    /// Inter-entity exchange envelope, which is both persisted by the initiator
+    /// and sent across a node boundary.
+    ExchangeEnvelope,
+    /// Reply to an inter-entity exchange.
+    ExchangeReply,
 }
 
 impl AgentRecordKind {
+    /// Every record kind this binary versions.
+    pub const ALL: [Self; 7] = [
+        Self::EntityState,
+        Self::DefinitionRevision,
+        Self::SettingsRevision,
+        Self::SetupRevision,
+        Self::ExchangeJournal,
+        Self::ExchangeEnvelope,
+        Self::ExchangeReply,
+    ];
+
     /// Stable kebab-case label for errors, logs, and metrics.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
@@ -62,6 +93,35 @@ impl AgentRecordKind {
             Self::DefinitionRevision => "agent-definition-revision",
             Self::SettingsRevision => "agent-settings-revision",
             Self::SetupRevision => "agent-setup-revision",
+            Self::ExchangeJournal => "agent-exchange-journal",
+            Self::ExchangeEnvelope => "agent-exchange-envelope",
+            Self::ExchangeReply => "agent-exchange-reply",
+        }
+    }
+
+    /// Version of this record kind that the running binary writes.
+    #[must_use]
+    pub const fn current_schema_version(self) -> StateSchemaVersion {
+        match self {
+            Self::EntityState => CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
+            Self::DefinitionRevision => CURRENT_AGENT_DEFINITION_SCHEMA_VERSION,
+            Self::SettingsRevision => CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
+            Self::SetupRevision => CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+            Self::ExchangeJournal => CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
+            Self::ExchangeEnvelope => CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
+            Self::ExchangeReply => CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::EntityState => 0,
+            Self::DefinitionRevision => 1,
+            Self::SettingsRevision => 2,
+            Self::SetupRevision => 3,
+            Self::ExchangeJournal => 4,
+            Self::ExchangeEnvelope => 5,
+            Self::ExchangeReply => 6,
         }
     }
 }
@@ -150,40 +210,46 @@ impl AgentSchemaCompatibility {
 }
 
 /// Schema-compatibility policy for every durable record this crate writes.
+///
+/// The policy carries one window per [`AgentRecordKind`], so a milestone that
+/// introduces a record kind widens this type without disturbing the windows
+/// already in force.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSchemaPolicy {
-    entity_state: AgentSchemaCompatibility,
-    definition_revision: AgentSchemaCompatibility,
-    settings_revision: AgentSchemaCompatibility,
-    setup_revision: AgentSchemaCompatibility,
+    windows: [AgentSchemaCompatibility; AgentRecordKind::ALL.len()],
 }
 
 impl AgentSchemaPolicy {
-    /// Creates a policy from explicit per-record windows.
+    /// Creates the default N/N+1 policy: for every record kind, the version this
+    /// binary writes and the version immediately before it.
     #[must_use]
-    pub const fn new(
-        entity_state: AgentSchemaCompatibility,
-        definition_revision: AgentSchemaCompatibility,
-        settings_revision: AgentSchemaCompatibility,
-        setup_revision: AgentSchemaCompatibility,
-    ) -> Self {
-        Self {
-            entity_state,
-            definition_revision,
-            settings_revision,
-            setup_revision,
+    pub const fn n_plus_one() -> Self {
+        let mut windows = [AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(1));
+            AgentRecordKind::ALL.len()];
+        let mut index = 0;
+        while index < AgentRecordKind::ALL.len() {
+            let record = AgentRecordKind::ALL[index];
+            windows[index] = AgentSchemaCompatibility::n_plus_one(record.current_schema_version());
+            index += 1;
         }
+        Self { windows }
+    }
+
+    /// Replaces the accepted window for one record kind.
+    #[must_use]
+    pub const fn with_compatibility(
+        mut self,
+        record: AgentRecordKind,
+        compatibility: AgentSchemaCompatibility,
+    ) -> Self {
+        self.windows[record.index()] = compatibility;
+        self
     }
 
     /// Accepted window for one record kind.
     #[must_use]
     pub const fn compatibility(&self, record: AgentRecordKind) -> AgentSchemaCompatibility {
-        match record {
-            AgentRecordKind::EntityState => self.entity_state,
-            AgentRecordKind::DefinitionRevision => self.definition_revision,
-            AgentRecordKind::SettingsRevision => self.settings_revision,
-            AgentRecordKind::SetupRevision => self.setup_revision,
-        }
+        self.windows[record.index()]
     }
 
     /// Accepts a persisted version for one record kind, or fails closed.
@@ -206,12 +272,7 @@ impl AgentSchemaPolicy {
 
 impl Default for AgentSchemaPolicy {
     fn default() -> Self {
-        Self::new(
-            AgentSchemaCompatibility::n_plus_one(CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION),
-            AgentSchemaCompatibility::n_plus_one(CURRENT_AGENT_DEFINITION_SCHEMA_VERSION),
-            AgentSchemaCompatibility::n_plus_one(CURRENT_AGENT_SETTINGS_SCHEMA_VERSION),
-            AgentSchemaCompatibility::n_plus_one(CURRENT_AGENT_SETUP_SCHEMA_VERSION),
-        )
+        Self::n_plus_one()
     }
 }
 

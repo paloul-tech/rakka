@@ -82,24 +82,10 @@ async fn store_with(state: AgentEntityState) -> Store {
 fn the_default_policy_reads_the_version_it_writes_and_the_one_before_it() {
     let policy = AgentSchemaPolicy::default();
 
-    for (kind, current) in [
-        (
-            AgentRecordKind::EntityState,
-            CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
-        ),
-        (
-            AgentRecordKind::DefinitionRevision,
-            CURRENT_AGENT_DEFINITION_SCHEMA_VERSION,
-        ),
-        (
-            AgentRecordKind::SettingsRevision,
-            CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
-        ),
-        (
-            AgentRecordKind::SetupRevision,
-            CURRENT_AGENT_SETUP_SCHEMA_VERSION,
-        ),
-    ] {
+    // Every record kind, so a milestone that adds one cannot forget to give it a
+    // window.
+    for kind in AgentRecordKind::ALL {
+        let current = kind.current_schema_version();
         assert!(
             policy.check(kind, current).is_ok(),
             "{kind} must read the version it writes"
@@ -112,16 +98,31 @@ fn the_default_policy_reads_the_version_it_writes_and_the_one_before_it() {
             "schema-version-ahead"
         );
     }
+
+    assert_eq!(
+        CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
+        AgentRecordKind::EntityState.current_schema_version()
+    );
+    assert_eq!(
+        CURRENT_AGENT_DEFINITION_SCHEMA_VERSION,
+        AgentRecordKind::DefinitionRevision.current_schema_version()
+    );
+    assert_eq!(
+        CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
+        AgentRecordKind::SettingsRevision.current_schema_version()
+    );
+    assert_eq!(
+        CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+        AgentRecordKind::SetupRevision.current_schema_version()
+    );
 }
 
 #[test]
 fn a_record_older_than_the_supported_window_fails_closed() {
     // A binary at version 3 reads 3 and 2. A record still at version 1 must be
     // backfilled before this deployment rolls, not read with guessed semantics.
-    let policy = AgentSchemaPolicy::new(
-        AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(3)),
-        AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(3)),
-        AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(3)),
+    let policy = AgentSchemaPolicy::default().with_compatibility(
+        AgentRecordKind::EntityState,
         AgentSchemaCompatibility::n_plus_one(StateSchemaVersion::new(3)),
     );
     let window = policy.compatibility(AgentRecordKind::EntityState);
