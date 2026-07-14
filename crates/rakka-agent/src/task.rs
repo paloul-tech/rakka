@@ -3084,11 +3084,6 @@ fn terminate(
     Ok(())
 }
 
-/// Decides one assignment against the agent facts the entity read from durable
-/// state, and returns the run-creation exchange the decision owes.
-///
-/// The transition is idempotent on the task's own state: a task that already has
-/// an assignment is not assignable, so a replay produces no second generation.
 /// Whether the refusal on record already states what `readiness` would refuse
 /// with, so deciding again would record no new fact.
 fn assignment_refusal_is_current(task: &AgentTask, readiness: &AgentAssignmentReadiness) -> bool {
@@ -3102,6 +3097,11 @@ fn assignment_refusal_is_current(task: &AgentTask, readiness: &AgentAssignmentRe
     })
 }
 
+/// Decides one assignment against the agent facts the entity read from durable
+/// state, and returns the run-creation exchange the decision owes.
+///
+/// The transition is idempotent on the task's own state: a task that already has
+/// an assignment is not assignable, so a replay produces no second generation.
 fn decide_assignment(
     state: &mut AgentTaskState,
     readiness: &AgentAssignmentReadiness,
@@ -3613,7 +3613,15 @@ fn settle_assignment(
         .to_string();
     let assignment = assignment.clone();
     task.assignment = None;
-    task.status = AgentTaskStatus::Created;
+    // A dependency may have been declared while the assignment was
+    // outstanding, so the retired task is only assignable again if the
+    // dependency summary still permits it.
+    task.status = if task.dependencies_satisfied() {
+        AgentTaskStatus::Created
+    } else {
+        AgentTaskStatus::Blocked
+    };
+    let status = task.status;
     task.last_refusal = Some(AgentAssignmentRefusal {
         agent: assignment.agent.clone(),
         reason: AgentAssignmentRefusalReason::RunRefusedAssignment,
@@ -3626,7 +3634,7 @@ fn settle_assignment(
             sequence,
             AgentTaskHistoryKind::AssignmentReleased,
             operation_id.clone(),
-            AgentTaskStatus::Created,
+            status,
             now,
         )
         .with_assignment(&assignment)

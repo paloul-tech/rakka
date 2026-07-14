@@ -720,6 +720,44 @@ async fn a_run_that_refuses_its_assignment_retires_the_generation_and_leaves_the
 }
 
 #[tokio::test]
+async fn a_dependency_declared_during_an_outstanding_assignment_blocks_the_refused_task() {
+    let fx = Fixture::new(RunAcceptanceProbe::refusing());
+    fx.instantiate_agent().await;
+
+    // The assignment exchange is lost in flight, so the offer stays
+    // outstanding and the task is still `Assigned` when the next command lands.
+    fx.run_transport.inject(ExchangeFault::LoseEnvelope);
+    applied(fx.apply(create_command(Vec::new())).await);
+    let offered = fx.snapshot().await;
+    assert_eq!(offered.status, AgentTaskStatus::Assigned);
+    assert!(offered.assignment.is_some());
+
+    // The edge lands while the assignment is outstanding; the same command's
+    // settle pass re-drives the exchange, and the run refuses it.
+    applied(
+        fx.apply(AgentTaskEntityCommand::DeclareDependency {
+            operation_id: operation(AgentOperationKind::Command, "declare-late"),
+            declaration: Box::new(dependency("upstream")),
+        })
+        .await,
+    );
+
+    // The retired task is not assignable until the dependency resolves, and
+    // its public status must say so rather than reporting `Created`.
+    let released = fx.snapshot().await;
+    assert!(released.assignment.is_none());
+    assert_eq!(released.status, AgentTaskStatus::Blocked);
+    assert!(!released.dependencies_satisfied);
+
+    // A settle sweep over the blocked task must not consume another
+    // generation.
+    fx.settle().await;
+    let settled = fx.snapshot().await;
+    assert_eq!(settled.status, AgentTaskStatus::Blocked);
+    assert_eq!(settled.assignment_generation.get(), 1);
+}
+
+#[tokio::test]
 async fn a_failed_dependency_cancels_its_dependents_by_default() {
     let fx = Fixture::new(RunAcceptanceProbe::accepting());
     fx.instantiate_agent().await;
