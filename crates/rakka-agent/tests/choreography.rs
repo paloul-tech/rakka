@@ -876,3 +876,43 @@ async fn a_duplicate_reply_settles_nothing_and_an_unknown_reply_is_refused() {
         .expect("an unknown reply is reported, not applied");
     assert_eq!(settlement, AgentExchangeSettlement::Unknown);
 }
+
+#[tokio::test]
+async fn an_oversized_reply_payload_is_refused_before_it_enters_durable_state() {
+    // A reply is decoded from the wire like an envelope, but serde does not run
+    // the payload bound. Settlement must re-validate it, or a misbehaving peer
+    // could push an unbounded result payload into the initiator's journal.
+    let fx = Fixture::new();
+    let mut initiator = fx.host(run_address()).await;
+
+    let envelope = fx.envelope(AgentExchangeKind::Creation, "creation");
+    let operation_id = envelope.operation_id().clone();
+    initiate(&mut initiator, envelope.clone(), fx.now()).await;
+
+    let reply = AgentExchangeReply::applied(
+        &envelope,
+        rakka_agent::AgentExchangeResult::accepted(AgentExchangePayload::empty("rakka.agent.None")),
+        fx.now(),
+    );
+    let mut tampered = serde_json::to_value(&reply).expect("the reply should serialize");
+    tampered["result"]["payload"]["bytes"] =
+        serde_json::to_value(vec![0_u8; AGENT_EXCHANGE_PAYLOAD_MAX_BYTES + 1])
+            .expect("the oversized bytes should serialize");
+    let oversized: AgentExchangeReply = serde_json::from_value(tampered)
+        .expect("decoding alone does not enforce the bound, which is the point");
+
+    let error = initiator
+        .settle(&oversized, fx.now())
+        .await
+        .expect_err("an oversized reply payload must be refused");
+    assert_eq!(error.code(), "exchange-payload-too-large");
+
+    // Refusing the reply settles nothing: the exchange stays owed under the
+    // same operation id, exactly like a delivery failure.
+    assert!(initiator
+        .state()
+        .expect("recovered")
+        .journal()
+        .pending_exchange(&operation_id)
+        .is_some());
+}

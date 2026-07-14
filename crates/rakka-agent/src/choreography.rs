@@ -164,12 +164,16 @@ use crate::schema::{
     CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
 };
 
-/// Largest exchange payload that may travel in an envelope, in bytes.
+/// Largest exchange payload that may travel in an envelope or a reply, in
+/// bytes.
 ///
 /// Exchange payloads are commands and results, not content. Anything larger
 /// belongs behind an artifact reference, so that durable state, mailboxes, and
 /// remote envelopes all stay bounded
-/// ([specification 9.6](../../../docs/plans/rakka-agent/spec.md)).
+/// ([specification 9.6](../../../docs/plans/rakka-agent/spec.md)). The bound is
+/// enforced at encoding, and re-enforced when an envelope is accepted and when
+/// a reply is settled, because a value decoded from the wire has not passed
+/// through [`AgentExchangePayload::encode`].
 pub const AGENT_EXCHANGE_PAYLOAD_MAX_BYTES: usize = 32 * 1024;
 
 /// How many exchanges one participant may owe at once.
@@ -817,6 +821,10 @@ impl AgentExchangeReply {
     #[must_use]
     pub const fn replied_at(&self) -> AgentTimestampMillis {
         self.replied_at
+    }
+
+    fn validate(&self) -> AgentChoreographyResult<()> {
+        self.result.payload.validate()
     }
 }
 
@@ -1552,13 +1560,17 @@ where
     /// compare-and-set.
     ///
     /// A duplicate reply settles nothing and applies no consequence; an unknown
-    /// one is refused without a write.
+    /// one is refused without a write. The reply's result payload is
+    /// re-validated before anything is read from it, exactly as an envelope is
+    /// on [`Self::accept`]: a reply decoded from the wire must not carry an
+    /// unbounded payload into durable state.
     pub async fn settle(
         &mut self,
         reply: &AgentExchangeReply,
         now: AgentTimestampMillis,
     ) -> AgentChoreographyResult<AgentExchangeSettlement> {
         self.policy.check_record(reply)?;
+        reply.validate()?;
 
         let record = self.recovered_record()?;
         let mut state = record.state.clone();
