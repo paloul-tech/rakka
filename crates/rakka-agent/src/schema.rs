@@ -32,6 +32,17 @@ pub const CURRENT_AGENT_SETTINGS_SCHEMA_VERSION: StateSchemaVersion = StateSchem
 /// Current schema version of a persisted [`crate::definition::AgentSetupRevision`].
 pub const CURRENT_AGENT_SETUP_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
+/// Current schema version of the durable [`crate::task::AgentTaskState`].
+pub const CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted [`crate::task::AgentTaskDefinition`].
+pub const CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted [`crate::task::AgentTaskHistoryEntry`].
+pub const CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of a durable [`crate::choreography::AgentExchangeJournal`].
 pub const CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
@@ -63,6 +74,12 @@ pub enum AgentRecordKind {
     SettingsRevision,
     /// Versioned per-run agent setup revision.
     SetupRevision,
+    /// Durable state of the sharded typed-task entity.
+    TaskState,
+    /// Versioned typed-task definition.
+    TaskDefinition,
+    /// One append-only typed-task history entry.
+    TaskHistoryEntry,
     /// Durable inter-entity exchange journal carried inside a participant's
     /// own state.
     ExchangeJournal,
@@ -75,11 +92,14 @@ pub enum AgentRecordKind {
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
         Self::SetupRevision,
+        Self::TaskState,
+        Self::TaskDefinition,
+        Self::TaskHistoryEntry,
         Self::ExchangeJournal,
         Self::ExchangeEnvelope,
         Self::ExchangeReply,
@@ -93,6 +113,9 @@ impl AgentRecordKind {
             Self::DefinitionRevision => "agent-definition-revision",
             Self::SettingsRevision => "agent-settings-revision",
             Self::SetupRevision => "agent-setup-revision",
+            Self::TaskState => "agent-task-state",
+            Self::TaskDefinition => "agent-task-definition",
+            Self::TaskHistoryEntry => "agent-task-history-entry",
             Self::ExchangeJournal => "agent-exchange-journal",
             Self::ExchangeEnvelope => "agent-exchange-envelope",
             Self::ExchangeReply => "agent-exchange-reply",
@@ -107,6 +130,9 @@ impl AgentRecordKind {
             Self::DefinitionRevision => CURRENT_AGENT_DEFINITION_SCHEMA_VERSION,
             Self::SettingsRevision => CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
             Self::SetupRevision => CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+            Self::TaskState => CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
+            Self::TaskDefinition => CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
+            Self::TaskHistoryEntry => CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION,
             Self::ExchangeJournal => CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
             Self::ExchangeEnvelope => CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
             Self::ExchangeReply => CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
@@ -119,9 +145,12 @@ impl AgentRecordKind {
             Self::DefinitionRevision => 1,
             Self::SettingsRevision => 2,
             Self::SetupRevision => 3,
-            Self::ExchangeJournal => 4,
-            Self::ExchangeEnvelope => 5,
-            Self::ExchangeReply => 6,
+            Self::TaskState => 4,
+            Self::TaskDefinition => 5,
+            Self::TaskHistoryEntry => 6,
+            Self::ExchangeJournal => 7,
+            Self::ExchangeEnvelope => 8,
+            Self::ExchangeReply => 9,
         }
     }
 }

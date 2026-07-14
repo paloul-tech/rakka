@@ -231,6 +231,75 @@ Guidance: [Typed Task Contract](technical-guidance.md#typed-task-contract),
   artifact references ([spec 9.6](spec.md#96-bounded-task-state-and-history));
   configured limits enforced.
 
+**Amended as implemented (2026-07-13):**
+
+- **Creation has two doors, one transition.** An ingress creates a task with the
+  deduplicated `AgentTaskEntityCommand::Create` (the operation id comes from the
+  ingress, per the canonical flow); a delegating run creates a child task with
+  the `AgentExchangeKind::Creation` exchange. Both reach the same bounded
+  transition, so the paths cannot diverge. The exchange envelope is also the
+  entity's *remote* ask surface, because `rakka-sharding` registers one ask pair
+  per entity type and cross-entity commands are what must cross nodes.
+- **The assignment decision is a separate read, not a separate transition.** It
+  needs the agent's durable admission state, and reading it is I/O, which
+  [spec 9.5](spec.md#95-execution-rule) forbids inside a transition. The entity
+  therefore reads `load_agent_entity_state` *before* the transition and then
+  decides on what it read, so creation, assignment, and the run-creation command
+  the assignment owes all commit in one compare-and-set. `settle_side_effects`
+  re-runs the read on recovery, which is what lets a task refused because its
+  agent was suspended be assigned later with no new command.
+- **Task history is an outbox, not a second store write.** Bounded state and
+  durable history are two records, and two records mean two compare-and-sets. The
+  entity therefore commits each history entry to a bounded outbox *inside* the
+  transition that produced it, and `flush_task_history` appends it to the
+  `AgentTaskHistoryStore` afterwards; the append is idempotent on the entry's
+  sequence. This is the same argument the slice 1.3 amendment makes for the
+  exchange journal.
+- **Dependency propagation lands here on the receiving side only.** The task
+  applies a dependency's outcome (a deduplicated command) and its failure policy.
+  The *sending* side — an upstream task notifying its dependents when it goes
+  terminal, which needs a durable dependents registry — is cancellation
+  propagation, and it belongs to slice 4.6 ([spec 8.7](spec.md#87-cancellation-failure-and-waiting))
+  and the human-owned tasks of slice 5.4.
+- **`AgentContentDigest` is a fingerprint, not a security boundary.** It
+  identifies which proposal a rejection refused
+  ([spec 9.2](spec.md#92-task-lifecycle-and-result-rules)). The digest-bound
+  authorization grants of [spec 12.3](spec.md#123-grant-binding) need a
+  cryptographic algorithm; slice 1.10 adds it to the record's existing
+  `AgentDigestAlgorithm`, whose non-exhaustive shape is there for exactly that.
+
+**Amended in review (2026-07-14):**
+
+- **An agent-owned task id reserves run-id headroom at creation.** Run ids are
+  derived as `{task}-gen-{generation}`, and the derived id must satisfy the
+  identity bound for every reachable generation. Creation refuses an
+  agent-owned id longer than `AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH`
+  (`task-id-too-long`), where the caller can still choose another — the
+  alternative was a task that is valid at creation and permanently
+  unassignable at decision time.
+- **An unchanged refusal is recorded once.** The assignment decision runs
+  inside the command transition and again on every settle pass, so the refusal
+  path deduplicates against `last_refusal`: the same agent refused for the
+  same reason is not a new fact, and neither the append-only history nor the
+  store revision moves. The settle pass also stands behind the same
+  history-headroom fence as the command and exchange doors, so a sink outage
+  cannot push the pending outbox past its bound through settlement.
+- **Duplicate dependency declarations inside one creation follow the
+  post-creation rule.** A repeated edge is idempotent; a repeat under a
+  conflicting failure policy is refused (`task-dependency-conflict`) rather
+  than collapsing last-wins, and the dependency limit counts edges, not
+  declarations.
+- **A delegated creation's accepted reply has its own payload type.**
+  `AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE` carries the `AgentTaskOutcome`;
+  `AGENT_TASK_DECISION_PAYLOAD_TYPE` keeps naming exactly the
+  `AgentTaskDecision` shape, so one type tag never names two schemas.
+- **Exchange transitions are stamped where they commit.**
+  `AgentExchangeParticipant::apply`/`settle` now receive the host's
+  commit-time `now`; the task participant previously stamped `updated_at` and
+  history rows with `envelope.created_at()` — the initiator's clock at the
+  earlier moment the envelope was recorded — which could move `updated_at`
+  backwards and put history rows out of time order.
+
 Done when: scenarios 37, 40, and 55 pass; the creation/assignment exchange
 from [spec 9.8](spec.md#98-inter-entity-choreography) replays to one task and
 one assignment per generation.

@@ -26,15 +26,21 @@ use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
 use rakka_persistence::DurableStateStore;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentEntityState;
 use crate::choreography::{
     AgentChoreographyError, AgentChoreographyResult, AgentEntityAddress,
     AgentExchangeDeliveryError, AgentExchangeDeliveryFuture, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
-    AgentExchangePayload, AgentExchangeResult, AgentExchangeState, AgentExchangeTransition,
-    AgentExchangeTransport,
+    AgentExchangePayload, AgentExchangeResult, AgentExchangeRouter, AgentExchangeState,
+    AgentExchangeTransition, AgentExchangeTransport,
 };
 use crate::identity::AgentOperationId;
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
+use crate::task::{
+    AgentRunAcceptance, AgentRunAssignment, AgentTaskEntityStore, AgentTaskError,
+    AgentTaskHistoryStore, AgentTaskState, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE,
+    AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
+};
 
 /// Payload type of a [`ProbeCreation`] command.
 pub const PROBE_CREATION_TYPE: &str = "rakka.agent.testkit.ProbeCreation";
@@ -301,6 +307,7 @@ impl AgentExchangeParticipant for ChoreographyProbe {
         &self,
         state: &mut Self::State,
         envelope: &AgentExchangeEnvelope,
+        _now: AgentTimestampMillis,
     ) -> AgentExchangeTransition {
         let kind = envelope.kind();
         let result = match kind {
@@ -325,6 +332,7 @@ impl AgentExchangeParticipant for ChoreographyProbe {
         state: &mut Self::State,
         envelope: &AgentExchangeEnvelope,
         result: &AgentExchangeResult,
+        _now: AgentTimestampMillis,
     ) -> Vec<AgentExchangeEnvelope> {
         let kind = envelope.kind();
         *state.settled.entry(kind).or_insert(0) += 1;
@@ -598,5 +606,324 @@ where
 }
 
 fn delivery_error(error: AgentChoreographyError) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
+/// A stand-in for the run entity of slice 1.5.
+///
+/// It receives the task entity's real [`AgentRunAssignment`] command and answers
+/// with a real [`AgentRunAcceptance`], so the creation → assignment →
+/// run-acceptance chain of
+/// [specification 9.8](../../../docs/plans/rakka-agent/spec.md) can be driven end
+/// to end before the run entity exists. Slice 1.5 replaces it with the entity
+/// itself; the exchange it answers does not change.
+#[derive(Debug, Clone, Copy)]
+pub struct RunAcceptanceProbe {
+    accepts: bool,
+}
+
+impl RunAcceptanceProbe {
+    /// A run that durably accepts every assignment.
+    #[must_use]
+    pub const fn accepting() -> Self {
+        Self { accepts: true }
+    }
+
+    /// A run that refuses every assignment, retiring its generation.
+    #[must_use]
+    pub const fn refusing() -> Self {
+        Self { accepts: false }
+    }
+}
+
+impl Default for RunAcceptanceProbe {
+    fn default() -> Self {
+        Self::accepting()
+    }
+}
+
+/// The durable state of one [`RunAcceptanceProbe`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAcceptanceProbeState {
+    address: AgentEntityAddress,
+    accepted_generations: Vec<u64>,
+    decisions: Vec<ProbeDecision>,
+    journal: AgentExchangeJournal,
+}
+
+impl RunAcceptanceProbeState {
+    /// Every assignment generation this run durably accepted, in order.
+    ///
+    /// A replayed assignment must not add a second entry here: that is what "one
+    /// run per assignment generation" means in durable terms.
+    #[must_use]
+    pub fn accepted_generations(&self) -> &[u64] {
+        &self.accepted_generations
+    }
+
+    /// Every decision this run settled as an initiator, oldest first.
+    #[must_use]
+    pub fn decisions(&self) -> &[ProbeDecision] {
+        &self.decisions
+    }
+
+    /// The run's durable saga record.
+    #[must_use]
+    pub const fn journal(&self) -> &AgentExchangeJournal {
+        &self.journal
+    }
+}
+
+impl AgentExchangeState for RunAcceptanceProbeState {
+    fn exchange_journal(&self) -> &AgentExchangeJournal {
+        &self.journal
+    }
+
+    fn exchange_journal_mut(&mut self) -> &mut AgentExchangeJournal {
+        &mut self.journal
+    }
+
+    fn check_schema(&self, _policy: &AgentSchemaPolicy) -> Result<(), AgentSchemaError> {
+        Ok(())
+    }
+}
+
+impl AgentExchangeParticipant for RunAcceptanceProbe {
+    type State = RunAcceptanceProbeState;
+
+    fn initialize(&self, address: &AgentEntityAddress, _now: AgentTimestampMillis) -> Self::State {
+        RunAcceptanceProbeState {
+            address: address.clone(),
+            accepted_generations: Vec::new(),
+            decisions: Vec::new(),
+            journal: AgentExchangeJournal::new(),
+        }
+    }
+
+    fn apply(
+        &self,
+        state: &mut Self::State,
+        envelope: &AgentExchangeEnvelope,
+        now: AgentTimestampMillis,
+    ) -> AgentExchangeTransition {
+        if envelope.kind() != AgentExchangeKind::Assignment {
+            return AgentExchangeTransition::new(AgentExchangeResult::rejected(
+                "unsupported-exchange",
+                format!("a run does not receive a {} exchange", envelope.kind()),
+                AgentExchangePayload::empty(AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE),
+            ));
+        }
+
+        let assignment: AgentRunAssignment =
+            match envelope.payload().decode(AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE) {
+                Ok(assignment) => assignment,
+                Err(error) => {
+                    return AgentExchangeTransition::new(AgentExchangeResult::rejected(
+                        error.code(),
+                        error.to_string(),
+                        AgentExchangePayload::empty(AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE),
+                    ))
+                }
+            };
+
+        if !self.accepts {
+            return AgentExchangeTransition::new(AgentExchangeResult::rejected(
+                "run-refused-assignment",
+                "the run refused its assignment",
+                AgentExchangePayload::empty(AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE),
+            ));
+        }
+
+        state.accepted_generations.push(assignment.generation.get());
+        let acceptance = AgentRunAcceptance {
+            run: assignment.run.clone(),
+            generation: assignment.generation,
+            accepted_at: now,
+        };
+        let payload = AgentExchangePayload::encode(AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, &acceptance)
+            .unwrap_or_else(|_| AgentExchangePayload::empty(AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE));
+        AgentExchangeTransition::new(AgentExchangeResult::accepted(payload))
+    }
+
+    fn settle(
+        &self,
+        state: &mut Self::State,
+        envelope: &AgentExchangeEnvelope,
+        result: &AgentExchangeResult,
+        _now: AgentTimestampMillis,
+    ) -> Vec<AgentExchangeEnvelope> {
+        state.decisions.push(ProbeDecision {
+            kind: envelope.kind(),
+            accepted: result.is_accepted(),
+            rejection_code: result.status().rejection_code().map(ToString::to_string),
+        });
+        while state.decisions.len() > PROBE_DECISION_CAPACITY {
+            state.decisions.remove(0);
+        }
+        Vec::new()
+    }
+}
+
+/// Delivers exchanges to a real [`AgentTaskEntityStore`] over a shared durable
+/// store.
+///
+/// Every delivery re-materializes the entity from durable state alone, which is
+/// what a shard move or a pod restart looks like from the outside, and it goes
+/// through the entity's full path — accept, decide, flush, drive — rather than
+/// poking the choreography host underneath it.
+pub struct InProcessTaskEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    store: Store,
+    agents: Agents,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, Agents, History> Clone for InProcessTaskEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            agents: self.agents.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, Agents, History> InProcessTaskEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    /// Creates a transport that delivers to task entities in one durable store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        agents: Agents,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            agents,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a task entity's durable accept path, including
+    /// the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, Agents, History> AgentExchangeTransport
+    for InProcessTaskEntityTransport<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the task entity",
+                ));
+            }
+
+            let AgentEntityAddress::Task(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves task entities only",
+                ));
+            };
+
+            let mut entity = AgentTaskEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.agents.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(task_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                // The same envelope arrives again at the same durable receiver.
+                // The reply the initiator sees is the second one, which must carry
+                // the same logical result as the first.
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(task_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the task accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn task_delivery_error(error: AgentTaskError) -> AgentExchangeDeliveryError {
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
 }
