@@ -27,11 +27,13 @@ otel = []
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
 rakka-persistence = { path = "../rakka-persistence", version = "0.1.0" }
+rakka-remote = { path = "../rakka-remote", version = "0.1.0" }
 rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 tokio.workspace = true
 
 [lints]

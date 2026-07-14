@@ -178,6 +178,18 @@ Guidance: [Inter-Entity Choreography](technical-guidance.md#inter-entity-choreog
   (`inbox.rs`, `outbox.rs`): pending-exchange record on the initiator,
   operation-ID re-drive on recovery, receiver-side dedup that returns the
   original logical result.
+  - **Amended as implemented (2026-07-13):** the saga journal
+    (`AgentExchangeJournal`) is a component of each participant's *own*
+    durable state record, not a layer over the `rakka-agent-workflow`
+    inbox/outbox. [Spec 9.8](spec.md#98-inter-entity-choreography) requires
+    the sender to persist the command intent "as part of its own transition";
+    the agent-workflow inbox/outbox is a separate `WorkflowState` record — a
+    second compare-and-set — and cannot give that atomicity. Slices 1.4, 1.5,
+    and 1.9 embed the journal in their entity state via `AgentExchangeState`
+    and host transitions through `AgentExchangeHost` (the
+    `ChoreographyProbe` in `rakka_agent::testkit` is the worked reference).
+    The agent-workflow inbox/outbox remains the substrate for external
+    effects, where Slice 1.7 lands.
 - Write the failure-window table (initiator loss before send, receiver loss
   after acceptance, reply loss, duplicate delivery) for the exchanges this
   phase implements: creation, assignment, run acceptance, result

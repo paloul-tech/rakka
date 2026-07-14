@@ -1644,8 +1644,10 @@ name = "rakka-agent"
 version = "0.1.0"
 dependencies = [
  "rakka-agent-workflow",
+ "rakka-cluster",
  "rakka-core",
  "rakka-persistence",
+ "rakka-remote",
  "rakka-sharding",
  "serde",
  "serde_json",

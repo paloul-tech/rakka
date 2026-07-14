@@ -93,6 +93,18 @@ pub use agent::{
     AgentLifecycleStatus, AgentOperationLog, AGENT_ENTITY_OPERATION_LOG_CAPACITY,
     DEFAULT_AGENT_ENTITY_TYPE,
 };
+pub use choreography::{
+    drive_pending_exchanges, register_agent_exchange_codecs, AgentChoreographyError,
+    AgentChoreographyResult, AgentEntityAddress, AgentEntityClass, AgentExchangeDeliveryError,
+    AgentExchangeDeliveryFuture, AgentExchangeDeliveryResult, AgentExchangeDriveReport,
+    AgentExchangeEnvelope, AgentExchangeHost, AgentExchangeInitiation, AgentExchangeJournal,
+    AgentExchangeKind, AgentExchangeMessage, AgentExchangeParticipant, AgentExchangePayload,
+    AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter, AgentExchangeSettlement,
+    AgentExchangeState, AgentExchangeStatus, AgentExchangeTransport, PendingExchange,
+    ShardedExchangeRoute, AGENT_EXCHANGE_CODEC_ID, AGENT_EXCHANGE_ENVELOPE_TYPE_ID,
+    AGENT_EXCHANGE_LOG_CAPACITY, AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
+    AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
+};
 pub use definition::{
     effective_settings_for_turn, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentCapabilityId,
     AgentCoordinationCapabilityKind, AgentCredentialBindingRef, AgentDefinition,
@@ -111,11 +123,14 @@ pub use identity::{
     AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId, AgentRunScope, AgentScope,
     AgentTaskId, AgentTaskScope, AgentWakeId, KnowledgeSpaceId, TenantId,
     AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_NAMESPACE_PREFIX,
-    AGENT_PERSISTENCE_SEPARATOR, AGENT_SCOPE_SEPARATOR,
+    AGENT_PERSISTENCE_SEPARATOR, AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
+    AGENT_TASK_ENTITY_PERSISTENCE_PREFIX,
 };
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
     CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_SETTINGS_SCHEMA_VERSION, CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+    CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
+    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
+    CURRENT_AGENT_SETUP_SCHEMA_VERSION,
 };
