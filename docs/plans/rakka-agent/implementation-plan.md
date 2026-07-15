@@ -329,6 +329,79 @@ Guidance: [Durable Agent Loop](technical-guidance.md#durable-agent-loop).
   `EffectIntent` machine; the Slice 1.14 regression re-proves scenario 2 on
   it.
 
+**Amended as implemented (2026-07-14):**
+
+- **The effect record is a field of the run's own state; the agent-workflow
+  outbox is its sink.** This is the third instance of the argument the slice 1.3
+  and 1.4 amendments make, and it is forced by the same fact: the run's state and
+  the agent-workflow outbox are two independent compare-and-sets.
+  [Spec 9.5](spec.md#95-execution-rule) requires the run transition to "persist
+  the next effect or wait before returning", and a run that committed
+  `AwaitingModel` and then lost its node before writing the outbox row would wait
+  forever for an effect nobody will dispatch. `AgentRunEffect` therefore lives in
+  `AgentLoopState`, committed by the transition that decided it, and
+  `AgentRunEffectSink` hands it to the agent-workflow `AgentEffect` outbox
+  afterwards — idempotently on the derived `effect_id`, which is also why shard
+  movement cannot make an effect dispatchable twice
+  ([spec 15](spec.md#15-passivation-recovery-and-shard-movement)).
+- **The loop cranks; it does not run.** `AgentRunEntityStore::settle_side_effects`
+  performs one bounded transition per compare-and-set and stops at the first
+  durable wait, then dispatches owed effects and drives owed exchanges. It reads
+  only durable state, so calling it after a transition, after recovery, or from a
+  sweep are the same operation. Both `AGENT_RUN_MAX_LOOP_STEPS_PER_PASS` and
+  `AGENT_RUN_MAX_SETTLE_ROUNDS` fence the handler's work, because a bound that
+  holds only by construction is not a bound.
+- **A run awaiting its task's decision is `Running`, not a new wait status.** The
+  waiting statuses of [spec 9.3](spec.md#93-run-status) enumerate what a run waits
+  *for* — a timer, an effect, an approval, an authorization, a reconciliation — and
+  a pending inter-entity exchange is none of them: it is the run's own durable
+  outbox, re-driven by the courier. `Running` is not a residency claim (spec 9.3
+  says so explicitly), and the entity passivates there like anywhere else. The
+  loop phase `DecidingContinuation` plus a persisted proposal is what records the
+  wait.
+- **The `WaitingForHuman` compatibility note is discharged by splitting, not by
+  aliasing.** [Spec 9.3](spec.md#93-run-status) permits keeping the substrate's
+  single `WaitingForHuman` as a compatibility representation, provided the split
+  is explicit before it happens. `AgentRunStatus` makes the split at its first
+  commit and preserves no alias, so no agent-domain record was ever written under
+  an unsplit status and there is no migration to owe.
+  `AgentRunStatus::is_waiting_for_human` is the explicit public behavior: the set
+  the substrate's variant corresponds to, and what slice 1.12 projects onto A2A.
+- **The run's own budget ledger lands here, because the loop state requires it.**
+  [Spec 9.4](spec.md#94-loop-phase) puts "remaining loop, token, cost, and time
+  budgets" in the durable loop state, so `AgentRunBudget` is part of it: charged by
+  the run's own single-entity transitions, never by reading a parent scope. Slice
+  1.9 adds the escrow hierarchy above it (allocation, settlement, return, top-up)
+  as deduplicated exchanges. Exhaustion is already structured
+  (`AgentBudgetExhaustion` names the dimension, limit, and consumed value), which
+  is what makes the later top-up a pure addition.
+- **`AgentModelTurn` is the durable half of the model contract, and it lands
+  before the adapter.** [Spec 10.2](spec.md#102-persistence-compatibility) requires
+  the Rakka-owned versioned loop representation to be the only durable format, and
+  the loop must act on *something*. The turn record therefore lands in `model.rs`
+  now, and slice 1.6 adds the adapter trait that produces one. This is also what
+  lets the loop be driven end to end before any adapter exists: a turn arrives the
+  way every effect result arrives — as a durable command from the dispatcher
+  ([spec 9.5](spec.md#95-execution-rule)) — so the scripted stub is a faithful
+  dispatcher rather than a shortcut around one.
+- **Content does not accumulate in the loop.** `RecordingTurn` is where slice 1.11
+  appends the turn to session memory; the loop's own record keeps no turn content
+  and drops resolved effects with the turn, so a run that iterates a hundred times
+  persists no more than one that iterates once
+  ([spec 9.6](spec.md#96-bounded-task-state-and-history), and content capture is
+  off by default per [spec 17.14](spec.md#1714-content-capture-and-redaction)).
+  A late result for an effect of a cleared turn is refused as unknown; one for an
+  unresolved effect of the current turn is refused as stale. Both fences are
+  proven.
+- **A refusal is not a rejection, and the run does not iterate on one.** A task
+  *rejection* is a validation decision and returns feedback plus a remaining
+  iteration count, so the run takes another bounded turn. A task *refusal* means
+  the task would not evaluate the proposal at all — the run is fenced by a newer
+  generation, or the task has moved on — so there is nothing for the run to
+  correct: it stops, mapping the task's status onto `Superseded`, `Cancelled`, or
+  `Failed`. Guessing either way would complete a task the rules may have refused,
+  or burn an iteration the task never charged.
+
 Done when: scenarios 2 and 59 pass (restart after every loop transition;
 result-exchange loss on either side converges).
 

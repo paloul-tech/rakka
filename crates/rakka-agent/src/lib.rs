@@ -93,6 +93,7 @@ pub use agent::{
     AgentLifecycleStatus, AgentOperationLog, AGENT_ENTITY_OPERATION_LOG_CAPACITY,
     DEFAULT_AGENT_ENTITY_TYPE,
 };
+pub use budget::{AgentBudgetDimension, AgentBudgetExhaustion, AgentRunBudget};
 pub use choreography::{
     drive_pending_exchanges, register_agent_exchange_codecs, AgentChoreographyError,
     AgentChoreographyResult, AgentEntityAddress, AgentEntityClass, AgentExchangeDeliveryError,
@@ -105,6 +106,36 @@ pub use choreography::{
     AGENT_EXCHANGE_LOG_CAPACITY, AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
     AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
+pub use effect::{
+    effect_id_for, AgentEffectError, AgentEffectFuture, AgentEffectGeneration, AgentEffectResult,
+    AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest,
+    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult, InMemoryAgentRunEffectSink,
+    AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES,
+};
+pub use loop_runtime::{
+    AgentLoopPhase, AgentLoopState, AgentRunProposal, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+};
+pub use memory::{AgentContextSnapshotId, AgentContextSnapshotRef};
+pub use model::{
+    AgentModelError, AgentModelResult, AgentModelTurn, AgentModelUsage, AgentToolCallId,
+    AgentToolCallRequest, AGENT_MODEL_MAX_TOOL_CALLS, AGENT_MODEL_TEXT_MAX_LENGTH,
+    AGENT_MODEL_TURN_MAX_BYTES, AGENT_TOOL_ARGUMENTS_MAX_BYTES,
+};
+pub use run::{
+    agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
+    agent_run_entity_type_key, init_agent_run_entity_remote_sharding,
+    init_agent_run_entity_sharding, load_agent_run_state, passivate_agent_run_entity,
+    proposal_operation_id, registered_agent_run_entity_ref, system_run_clock, AgentRun,
+    AgentRunClock, AgentRunEntity, AgentRunEntityCommand, AgentRunEntityMessage, AgentRunEntityRef,
+    AgentRunEntityRegistration, AgentRunEntityReply, AgentRunEntityShardingSettings,
+    AgentRunEntityStore, AgentRunEntityTypeKey, AgentRunError, AgentRunOperationLog,
+    AgentRunOutcome, AgentRunParticipant, AgentRunProgress, AgentRunResult, AgentRunSnapshot,
+    AgentRunState, AgentRunStatus, AgentRunTerminalReason, AGENT_RUN_DETAIL_MAX_LENGTH,
+    AGENT_RUN_MATERIALIZED_MAX_BYTES, AGENT_RUN_MAX_LOOP_STEPS_PER_PASS,
+    AGENT_RUN_MAX_SETTLE_ROUNDS, AGENT_RUN_OPERATION_LOG_CAPACITY,
+    AGENT_RUN_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_RUN_ENTITY_TYPE,
+};
+
 pub use definition::{
     effective_settings_for_turn, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentCapabilityId,
     AgentCoordinationCapabilityKind, AgentCredentialBindingRef, AgentDefinition,
@@ -131,7 +162,9 @@ pub use schema::{
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
     CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
-    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
+    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION, CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
+    CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
     CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
     CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
 };

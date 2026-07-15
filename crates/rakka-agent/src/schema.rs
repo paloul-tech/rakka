@@ -43,6 +43,28 @@ pub const CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION: StateSchemaVersion =
 pub const CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
+/// Current schema version of the durable [`crate::run::AgentRunState`].
+pub const CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted [`crate::loop_runtime::AgentLoopState`].
+///
+/// The loop state versions separately from the run state that carries it,
+/// because the loop is the part that evolves: a new phase or a new pending
+/// reference must not force every run record to be rewritten
+/// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
+pub const CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted [`crate::effect::AgentRunEffect`].
+pub const CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted [`crate::model::AgentModelTurn`].
+///
+/// The Rakka-owned turn is the only durable format for what a model produced, so
+/// it carries its own version: an adapter upgrade migrates *this* record, and no
+/// provider type is ever the compatibility contract
+/// ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)).
+pub const CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
 /// Current schema version of a durable [`crate::choreography::AgentExchangeJournal`].
 pub const CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
@@ -80,6 +102,14 @@ pub enum AgentRecordKind {
     TaskDefinition,
     /// One append-only typed-task history entry.
     TaskHistoryEntry,
+    /// Durable state of the sharded run entity.
+    RunState,
+    /// The versioned durable loop state one run carries.
+    LoopState,
+    /// One durable effect a run committed and is waiting on.
+    RunEffect,
+    /// The Rakka-owned versioned record of one model turn.
+    ModelTurn,
     /// Durable inter-entity exchange journal carried inside a participant's
     /// own state.
     ExchangeJournal,
@@ -92,7 +122,7 @@ pub enum AgentRecordKind {
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 14] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -100,6 +130,10 @@ impl AgentRecordKind {
         Self::TaskState,
         Self::TaskDefinition,
         Self::TaskHistoryEntry,
+        Self::RunState,
+        Self::LoopState,
+        Self::RunEffect,
+        Self::ModelTurn,
         Self::ExchangeJournal,
         Self::ExchangeEnvelope,
         Self::ExchangeReply,
@@ -116,6 +150,10 @@ impl AgentRecordKind {
             Self::TaskState => "agent-task-state",
             Self::TaskDefinition => "agent-task-definition",
             Self::TaskHistoryEntry => "agent-task-history-entry",
+            Self::RunState => "agent-run-state",
+            Self::LoopState => "agent-loop-state",
+            Self::RunEffect => "agent-run-effect",
+            Self::ModelTurn => "agent-model-turn",
             Self::ExchangeJournal => "agent-exchange-journal",
             Self::ExchangeEnvelope => "agent-exchange-envelope",
             Self::ExchangeReply => "agent-exchange-reply",
@@ -133,6 +171,10 @@ impl AgentRecordKind {
             Self::TaskState => CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
             Self::TaskDefinition => CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
             Self::TaskHistoryEntry => CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION,
+            Self::RunState => CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
+            Self::LoopState => CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
+            Self::RunEffect => CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
+            Self::ModelTurn => CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION,
             Self::ExchangeJournal => CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
             Self::ExchangeEnvelope => CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
             Self::ExchangeReply => CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
@@ -148,9 +190,13 @@ impl AgentRecordKind {
             Self::TaskState => 4,
             Self::TaskDefinition => 5,
             Self::TaskHistoryEntry => 6,
-            Self::ExchangeJournal => 7,
-            Self::ExchangeEnvelope => 8,
-            Self::ExchangeReply => 9,
+            Self::RunState => 7,
+            Self::LoopState => 8,
+            Self::RunEffect => 9,
+            Self::ModelTurn => 10,
+            Self::ExchangeJournal => 11,
+            Self::ExchangeEnvelope => 12,
+            Self::ExchangeReply => 13,
         }
     }
 }
