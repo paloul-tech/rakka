@@ -1121,6 +1121,7 @@ where
 pub struct ScriptedDispatcher {
     turns: Arc<Mutex<VecDeque<AgentModelTurn>>>,
     answered: Arc<Mutex<BTreeMap<String, AgentModelTurn>>>,
+    answered_tools: Arc<Mutex<BTreeMap<String, AgentRunEffectOutcome>>>,
     tools: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
     model_calls: Arc<AtomicUsize>,
@@ -1215,13 +1216,14 @@ impl ScriptedDispatcher {
 
     /// What this dispatcher returns for one effect.
     ///
-    /// The answer is memoized on the effect id, so re-invoking an effect whose
-    /// result was lost — because the run's owner died before it could record it —
-    /// returns *the same* turn. That is what the effect's idempotency key means
+    /// The answer — a model turn or a tool outcome alike — is memoized on the
+    /// effect id, so re-invoking an effect whose result was lost — because the
+    /// run's owner died before it could record it — returns *the same* outcome.
+    /// That is what the effect's idempotency key means
     /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)), and it is
     /// what makes a recovery test deterministic: the run resumes against the
     /// answer it would have had, not against a different one the script happened
-    /// to hand out next.
+    /// to hand out next, even if the script changed in between.
     ///
     /// The call *counters* are not memoized, because a re-invocation really is
     /// another call: it is billed again, and slice 1.9 charges it again.
@@ -1236,7 +1238,7 @@ impl ScriptedDispatcher {
             }
             AgentRunEffectRequest::Tool { call } => {
                 self.tool_calls.fetch_add(1, Ordering::SeqCst);
-                self.answer_tool(call)
+                self.answer_tool(effect, call)
             }
         }
     }
@@ -1262,32 +1264,47 @@ impl ScriptedDispatcher {
         turn
     }
 
-    fn answer_tool(&self, call: &AgentToolCallRequest) -> AgentRunEffectOutcome {
+    fn answer_tool(
+        &self,
+        effect: &AgentRunEffect,
+        call: &AgentToolCallRequest,
+    ) -> AgentRunEffectOutcome {
+        let key = effect.effect_id.as_str().to_string();
+        let mut answered = self
+            .answered_tools
+            .lock()
+            .expect("the answered script should not be poisoned");
+        if let Some(outcome) = answered.get(&key) {
+            return outcome.clone();
+        }
+
         let tool = call.tool.to_string();
-        if let Some((code, message)) = self
+        let outcome = if let Some((code, message)) = self
             .failures
             .lock()
             .expect("the failure script should not be poisoned")
             .get(&tool)
             .cloned()
         {
-            return AgentRunEffectOutcome::Failed { code, message };
-        }
-
-        let content = self
-            .tools
-            .lock()
-            .expect("the tool script should not be poisoned")
-            .get(&tool)
-            .cloned()
-            .unwrap_or_else(|| {
-                AgentTaskContent::inline(serde_json::json!({ "tool": tool }))
-                    .expect("the default tool result is inline-bounded")
-            });
-        AgentRunEffectOutcome::Tool {
-            call_id: call.call_id.clone(),
-            content,
-        }
+            AgentRunEffectOutcome::Failed { code, message }
+        } else {
+            let content = self
+                .tools
+                .lock()
+                .expect("the tool script should not be poisoned")
+                .get(&tool)
+                .cloned()
+                .unwrap_or_else(|| {
+                    AgentTaskContent::inline(serde_json::json!({ "tool": tool }))
+                        .expect("the default tool result is inline-bounded")
+                });
+            AgentRunEffectOutcome::Tool {
+                call_id: call.call_id.clone(),
+                content,
+            }
+        };
+        answered.insert(key, outcome.clone());
+        outcome
     }
 }
 
@@ -1568,5 +1585,64 @@ impl AgentExchangeTransport for DeferredExchangeRouter {
             };
             router.deliver(envelope).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::definition::AgentToolId;
+    use crate::effect::AgentRunEffectRequest;
+    use crate::identity::{AgentId, AgentRunId, TenantId};
+    use crate::model::AgentToolCallId;
+
+    fn tool_effect(scope: &AgentRunScope, slot: usize, call_id: &str) -> AgentRunEffect {
+        let call = AgentToolCallRequest::new(
+            AgentToolCallId::new(call_id).expect("the call id is valid"),
+            AgentToolId::new("search").expect("the tool id is valid"),
+            serde_json::json!({ "query": slot }),
+        )
+        .expect("the call is bounded");
+        AgentRunEffect::new(
+            scope,
+            1,
+            slot,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(call),
+            },
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives")
+    }
+
+    #[test]
+    fn a_tool_answer_is_memoized_on_the_effect_id() {
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support").expect("the agent id is valid"),
+            AgentRunId::new("t-gen-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let effect = tool_effect(&scope, 1, "call-1");
+
+        let dispatcher = ScriptedDispatcher::new();
+        let first = dispatcher.answer(&effect);
+
+        // The script changes under the dispatcher — the tool now fails — but
+        // re-invoking the same effect returns the answer already given: that is
+        // what the effect's idempotency key means, and what keeps a recovery
+        // test deterministic.
+        let dispatcher = dispatcher.with_tool_failure("search", "tool-unavailable", "down");
+        assert_eq!(first, dispatcher.answer(&effect));
+
+        // A different effect is a different invocation and sees the new script.
+        let sibling = tool_effect(&scope, 2, "call-2");
+        assert_eq!(
+            dispatcher.answer(&sibling).failure_code(),
+            Some("tool-unavailable")
+        );
+
+        // Re-invocations are still counted: each really is another call.
+        assert_eq!(dispatcher.tool_calls(), 3);
     }
 }

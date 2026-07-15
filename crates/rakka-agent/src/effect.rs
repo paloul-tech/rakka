@@ -405,12 +405,17 @@ impl AgentRunEffect {
 
     /// The stable operation id of the command that returns this effect's result.
     ///
-    /// It is derived from the effect, so a dispatcher that returns the same
-    /// result twice — because it retried, or because its own delivery was
-    /// redelivered — is deduplicated by the run's operation log rather than
-    /// advancing the loop a second time. The run's own fence backs it up:
-    /// a result for an effect it has already resolved is refused whether or not
-    /// the operation is still inside the log's bounded window
+    /// It is derived from the effect *and its dispatch generation*, so a
+    /// dispatcher that returns the same result twice — because it retried, or
+    /// because its own delivery was redelivered — is deduplicated by the run's
+    /// operation log rather than advancing the loop a second time, while the
+    /// result of a *later* generation is a different operation entirely. Slice
+    /// 1.7's reconciliation mints a new generation when an operator establishes
+    /// that an ambiguous invocation never happened; the re-dispatch's result
+    /// must not be answered from the log entry a superseded attempt left
+    /// behind. The run's own fence backs the log up: a result for an effect it
+    /// has already resolved is refused whether or not the operation is still
+    /// inside the log's bounded window
     /// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 10).
     pub fn result_operation_id(
         &self,
@@ -425,6 +430,7 @@ impl AgentRunEffect {
                 "effect-result",
                 &self.turn.to_string(),
                 &self.slot.to_string(),
+                &self.generation.to_string(),
             ],
         )
     }
@@ -805,5 +811,55 @@ impl From<AgentTaskError> for AgentEffectError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{AgentId, AgentRunId, TenantId};
+    use crate::memory::AgentContextSnapshotRef;
+
+    #[test]
+    fn the_result_operation_id_folds_in_the_dispatch_generation() {
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support").expect("the agent id is valid"),
+            AgentRunId::new("t-gen-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let context = AgentContextSnapshotRef::for_turn(&scope, 1).expect("the reference derives");
+        let mut effect = AgentRunEffect::new(
+            &scope,
+            1,
+            0,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives");
+
+        // Within one generation the derivation is pure: a redelivered result is
+        // the same operation, and the run's log answers it once.
+        let first = effect
+            .result_operation_id(&scope)
+            .expect("the operation id derives");
+        assert_eq!(
+            first,
+            effect
+                .result_operation_id(&scope)
+                .expect("the operation id derives")
+        );
+
+        // A later generation is a different operation entirely: slice 1.7's
+        // reconciliation re-dispatch must not be answered from the log entry a
+        // superseded attempt left behind.
+        effect.generation = effect.generation.next();
+        let second = effect
+            .result_operation_id(&scope)
+            .expect("the operation id derives");
+        assert_ne!(first, second);
     }
 }
