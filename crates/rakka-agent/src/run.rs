@@ -234,9 +234,12 @@ pub enum AgentRunStatus {
     /// The run is suspended by policy or by an administrative decision.
     Suspended,
     /// The run is quiescing towards a terminal status it has already recorded:
-    /// further dispatch is fenced, and it becomes terminal once nothing is
-    /// outstanding. A requested cancellation and a failed effect with
-    /// still-outstanding siblings both wind down through here
+    /// no further loop transition may commit new work, and it becomes terminal
+    /// once nothing is outstanding. An effect committed *before* the wind-down
+    /// is not new work: it still flushes to its sink — an interrupted flush may
+    /// already have reached it — and its result is recorded, never refused. A
+    /// requested cancellation and a failed effect with still-outstanding
+    /// siblings both wind down through here
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     Cancelling,
     /// The run is compensating work it already performed.
@@ -318,9 +321,10 @@ impl AgentRunStatus {
 
     /// Whether the run may still perform a bounded loop transition.
     ///
-    /// A suspended or cancelling run may not: cancellation fences further
-    /// dispatch immediately, even though the run does not become terminal until
-    /// its outstanding effects resolve
+    /// A suspended or cancelling run may not: cancellation fences *new* work
+    /// immediately — no further transition commits an effect — even though the
+    /// run does not become terminal until its outstanding effects resolve, and
+    /// an effect committed before the fence still flushes and settles
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     #[must_use]
     pub const fn permits_progress(self) -> bool {
@@ -1087,17 +1091,23 @@ fn evaluate_model_output(
         return Ok(());
     }
 
-    for call in calls {
-        {
-            let run = state.run_mut()?;
-            if let Err(exhaustion) = run.loop_state.budget_mut().charge_tool_call(now) {
-                return terminate(
-                    state,
-                    AgentRunTerminalReason::BudgetExhausted { exhaustion },
-                    now,
-                );
-            }
+    // The whole fan-out is charged before any effect is recorded: a turn either
+    // fits its budget or terminates having committed nothing, so the terminal
+    // record never holds a pending effect that a settle pass would otherwise
+    // hand to the sink on behalf of a run that has already failed — external
+    // work whose result the run could only refuse.
+    for _call in &calls {
+        let run = state.run_mut()?;
+        if let Err(exhaustion) = run.loop_state.budget_mut().charge_tool_call(now) {
+            return terminate(
+                state,
+                AgentRunTerminalReason::BudgetExhausted { exhaustion },
+                now,
+            );
         }
+    }
+
+    for call in calls {
         let slot = state.run_mut()?.loop_state.next_effect_slot();
         let effect = AgentRunEffect::new(
             scope,
@@ -1357,11 +1367,14 @@ fn record_effect_result(
 
 /// Requests cancellation.
 ///
-/// Cancellation fences further dispatch immediately, but a run with outstanding
-/// effects — or a result proposal awaiting the task's decision — does not
-/// become terminal until they settle
+/// Cancellation fences new work immediately — no further loop transition
+/// commits an effect — but a run with outstanding effects, or a result proposal
+/// awaiting the task's decision, does not become terminal until they settle
 /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): work whose
-/// outcome is unknown must not be abandoned as though it never happened.
+/// outcome is unknown must not be abandoned as though it never happened. That
+/// includes an effect committed but not yet flushed when the cancel arrived: it
+/// was decided and paid for before the fence, and may already have reached the
+/// sink, so it is flushed and settled rather than stranded.
 fn cancel(
     state: &mut AgentRunState,
     reason: String,
@@ -1835,7 +1848,26 @@ where
     /// Neither loses an effect, and neither dispatches one twice — which is why
     /// shard movement cannot make an effect dispatchable twice
     /// ([specification 15](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A **terminal** run dispatches nothing: every terminating transition either
+    /// quiesced first or committed no pending effect, so this fence is defense in
+    /// depth against a pending effect surviving into a terminal record — external
+    /// work whose result the run could only refuse. A **cancelling** run, by
+    /// contrast, still flushes here: an effect it committed before the wind-down
+    /// was decided and paid for then, and an interrupted flush may already have
+    /// reached the sink, so completing the idempotent dispatch and recording its
+    /// result is the only path to quiescence that neither abandons work nor
+    /// loses its outcome ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// What cancellation fences is *new* effects, which
+    /// [`AgentRunStatus::permits_progress`] denies to every loop transition.
     async fn dispatch_effects(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
+        if self
+            .state()?
+            .status()
+            .is_some_and(AgentRunStatus::is_terminal)
+        {
+            return Ok(0);
+        }
         let pending = self
             .state()?
             .loop_state()

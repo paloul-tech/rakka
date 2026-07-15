@@ -256,6 +256,12 @@ impl Fixture {
     /// Creates the task. Its assignment decision commits with the creation, and
     /// the run-creation exchange it owes is driven to the run entity.
     async fn create_task(&self) {
+        self.create_task_with(task_definition()).await;
+    }
+
+    /// Creates the task under an explicit definition, for tests that need their
+    /// own budget ceilings.
+    async fn create_task_with(&self, definition: AgentTaskDefinition) {
         let mut task = AgentTaskEntityStore::new(
             task_scope(),
             self.tasks.clone(),
@@ -273,7 +279,7 @@ impl Fixture {
                     )
                     .expect("operation id should be derivable"),
                     creation: Box::new(AgentTaskCreation {
-                        definition: task_definition(),
+                        definition,
                         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
@@ -740,6 +746,62 @@ async fn an_exhausted_iteration_budget_stops_the_run_with_a_structured_reason() 
 }
 
 #[tokio::test]
+async fn tool_budget_exhaustion_mid_turn_commits_no_partial_fan_out() {
+    // A turn asks for two tools under a ceiling of one. The refusal must not
+    // commit the first call's effect alongside the terminal status: a run that
+    // has already failed performs no further external work, and the result of
+    // that work could only be refused as `run-terminal` anyway. The whole
+    // fan-out is charged before any effect is recorded, so the turn either fits
+    // its budget or terminates having committed nothing.
+    let turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Let me look those up.")
+        .with_tool_call(tool_call("call-1", "search"))
+        .with_tool_call(tool_call("call-2", "fetch"));
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(turn));
+    fx.instantiate_agent().await;
+    fx.create_task_with(
+        task_definition().with_budgets(rakka_agent::AgentBudgetCeilings {
+            max_loop_iterations: Some(3),
+            max_tool_calls: Some(1),
+            ..rakka_agent::AgentBudgetCeilings::unbounded()
+        }),
+    )
+    .await;
+    fx.pump().await.expect("the loop should stop on its own");
+
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Failed);
+    assert_eq!(run.phase, AgentLoopPhase::Complete);
+    let Some(AgentRunTerminalReason::BudgetExhausted { exhaustion }) = run.terminal_reason else {
+        panic!(
+            "expected a structured budget exhaustion, got {:?}",
+            run.terminal_reason
+        );
+    };
+    assert_eq!(
+        exhaustion.dimension,
+        rakka_agent::AgentBudgetDimension::ToolCalls
+    );
+    assert_eq!(exhaustion.limit, 1);
+
+    // No partial fan-out survives into the terminal record, and only the model
+    // effect ever reached the sink: the refused turn dispatched no tool.
+    assert_eq!(
+        run.outstanding_effects, 0,
+        "a terminal run must hold no pending effect"
+    );
+    assert_eq!(
+        fx.dispatched_effects(),
+        1,
+        "only the model effect dispatched"
+    );
+    assert_eq!(fx.dispatcher.tool_calls(), 0);
+
+    // The run failed; the task did not, because the run never proposed a result.
+    assert_eq!(fx.task_snapshot().await.status, AgentTaskStatus::InProgress);
+}
+
+#[tokio::test]
 async fn a_failed_effect_stops_the_run_with_the_dispatchers_reason() {
     let fx = Fixture::new(
         ScriptedDispatcher::new()
@@ -1135,6 +1197,81 @@ async fn cancelling_a_run_with_an_effect_in_flight_waits_for_it_and_does_not_res
     // It never proposed anything, so the task is still in progress: cancelling a
     // run is not completing its task.
     assert_eq!(fx.task_snapshot().await.status, AgentTaskStatus::InProgress);
+}
+
+#[tokio::test]
+async fn a_cancelled_run_still_flushes_the_effect_it_committed_before_the_cancel() {
+    // The owner dies after committing the model effect but before flushing it
+    // to the sink, and cancellation arrives before recovery re-drives the
+    // flush. The effect is durably pending — decided and paid for before the
+    // fence, and an interrupted flush may already have reached the sink — so
+    // the wind-down must complete the idempotent dispatch and settle its
+    // result rather than strand the run in `Cancelling` forever. What the
+    // fence stops is *new* effects, not this one.
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    fx.instantiate_agent().await;
+
+    // Write 1 accepts the assignment; write 2 commits the model effect and the
+    // wait. Dying after write 2 leaves the effect pending and the sink empty.
+    fx.runs.crash_at(2, CrashPoint::AfterWrite);
+    fx.create_task().await;
+    fx.runs.survive();
+
+    let stranded = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(stranded.status, AgentRunStatus::WaitingForEffect);
+    assert_eq!(stranded.outstanding_effects, 1);
+    assert_eq!(
+        fx.dispatched_effects(),
+        0,
+        "the committed effect never reached the sink"
+    );
+
+    // Cancellation arrives first. The run quiesces, and its settle pass still
+    // flushes the effect it had already committed.
+    let mut run = fx.run();
+    let now = fx.now();
+    run.recover(now).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::Cancellation,
+                [TENANT, AGENT, "1"],
+            )
+            .expect("derivable"),
+            reason: "operator stopped the work".to_string(),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("cancellation applies");
+
+    let cancelling = run.snapshot().expect("snapshot").expect("the run exists");
+    assert_eq!(cancelling.status, AgentRunStatus::Cancelling);
+    assert_eq!(
+        fx.dispatched_effects(),
+        1,
+        "the effect committed before the fence still flushes"
+    );
+
+    // Its result comes back, is recorded rather than refused, and the wind-down
+    // finishes with the operator's reason.
+    fx.dispatcher
+        .drive(&mut run, &fx.router, fx.now())
+        .await
+        .expect("the result applies");
+
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Cancelled);
+    assert_eq!(run.phase, AgentLoopPhase::Complete);
+    assert_eq!(
+        run.terminal_reason.expect("the reason is recorded").code(),
+        "cancellation-requested"
+    );
+    // The crash also lost the acceptance reply, so the task never learned the
+    // run accepted: it still holds the assignment exchange outstanding. The run
+    // being cancelled does not complete or fail the task either way.
+    assert_eq!(fx.task_snapshot().await.status, AgentTaskStatus::Assigned);
 }
 
 #[tokio::test]
