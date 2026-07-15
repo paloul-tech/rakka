@@ -120,19 +120,40 @@ pub const DEFAULT_AGENT_RUN_ENTITY_TYPE: &str = "RakkaAgentRun";
 pub const AGENT_RUN_OPERATION_LOG_CAPACITY: usize = 64;
 
 /// Largest materialized run record, in bytes, once serialized.
-pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 128 * 1024;
+///
+/// It is [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] of working-set growth on top
+/// of the admission budget acceptance enforces, so raising the reserve must
+/// raise this bound with it rather than silently shrinking what a run may be
+/// admitted with.
+pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
 
 /// Bytes of growth headroom an accepted run record keeps below
 /// [`AGENT_RUN_MATERIALIZED_MAX_BYTES`].
 ///
-/// After acceptance the record may still grow by one model turn, that turn's
-/// tool results, one result proposal, one accepted result, and one terminal
-/// reason — each of them individually bounded, and together under this reserve.
-/// Acceptance therefore enforces the materialized bound *minus* this reserve, so
-/// a run the entity admits can never later be unable to record the very turn it
-/// was created to take. It is the same reservation the task entity makes for its
-/// own lifecycle ([`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`]).
-pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 48 * 1024;
+/// After acceptance the record may still grow by the whole working set of one
+/// turn, every part of which is individually bounded — so the reserve is the
+/// sum of those bounds, not an estimate: the pending turn
+/// ([`crate::model::AGENT_MODEL_TURN_MAX_BYTES`]); the turn's tool calls copied
+/// into their effects (bounded again by the turn that carried them), plus each
+/// effect's envelope of derived identifiers, which scale with the scope's own
+/// ids ([`crate::identity::AGENT_IDENTITY_MAX_LENGTH`] per segment); one
+/// bounded tool result per effect
+/// ([`crate::effect::AGENT_TOOL_RESULT_MAX_BYTES`]); the result proposal; the
+/// accepted result ([`crate::task::AGENT_TASK_INLINE_CONTENT_MAX_BYTES`] plus
+/// its envelope); and the bounded feedback and terminal details
+/// ([`AGENT_RUN_DETAIL_MAX_LENGTH`]).
+///
+/// Acceptance therefore enforces the materialized bound *minus* this reserve,
+/// so a run the entity admits can never later be unable to record the very turn
+/// it was created to take — a record refused mid-turn would refuse the same
+/// retry forever, exactly the committed-record-bricks-its-own-recovery class
+/// the schema gate exists to prevent. It is the same reservation the task
+/// entity makes for its own lifecycle
+/// ([`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`]). The test
+/// `the_growth_reserve_covers_the_maximal_working_set` holds this constant to
+/// that claim: it materializes a superset of every reachable working set, under
+/// maximal identifiers, and measures it.
+pub const AGENT_RUN_STATE_GROWTH_RESERVE_BYTES: usize = 96 * 1024;
 
 /// Most bounded loop transitions one settle pass may perform.
 ///
@@ -2647,5 +2668,191 @@ impl From<AgentRunError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::definition::AgentTaskDefinitionId;
+    use crate::loop_runtime::CURRENT_AGENT_LOOP_ADAPTER_VERSION;
+    use crate::model::{AgentModelTurn, AgentToolCallId, AgentToolCallRequest};
+    use crate::schema::CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION;
+    use crate::task::{
+        AgentAcceptedResult, AgentSchemaId, AgentSchemaRef, AgentTaskContent, AgentTaskDefinition,
+    };
+    use crate::AgentToolId;
+
+    /// A superset of every working set one turn can hold, under maximal
+    /// identifiers, must fit the growth reserve.
+    ///
+    /// The reserve exists so a run the entity admits can never later be refused
+    /// its own turn: `record_effect_result` checks the full materialized bound,
+    /// a rejected transition never enters the operation log, and the
+    /// dispatcher's retry would be refused identically forever. This test holds
+    /// [`AGENT_RUN_STATE_GROWTH_RESERVE_BYTES`] to that claim empirically: it
+    /// materializes more than any reachable state carries at once — the maximal
+    /// pending turn, its full effect fan-out, every tool result, the proposal,
+    /// the accepted result, the feedback, and the terminal reason together —
+    /// and measures the growth over the record acceptance admitted.
+    #[test]
+    fn the_growth_reserve_covers_the_maximal_working_set() {
+        let now = AgentTimestampMillis::new(1);
+        // Maximal identifiers: every derived id in the working set — effect
+        // ids, idempotency keys, the proposal id — scales with these.
+        let long = "a".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH);
+        let scope = AgentRunScope::new(
+            TenantId::new(&long),
+            AgentId::new(&long).expect("the agent id is valid"),
+            AgentRunId::new(&long).expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let task = AgentTaskId::new(&long).expect("the task id is valid");
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("definition").expect("the definition id is valid"),
+            "The growth-reserve fixture.",
+            schema.clone(),
+            schema.clone(),
+        )
+        .expect("the definition is valid");
+
+        let budget = AgentRunBudget::allocate(definition.budgets, now);
+        let loop_state = AgentLoopState::started(
+            task.clone(),
+            None,
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            definition.version,
+            budget,
+        );
+        let mut run = AgentRun {
+            binding: AgentRunBinding::new(scope.clone(), task),
+            generation: AgentAssignmentGeneration::new(1),
+            definition: definition.clone(),
+            input: AgentTaskContent::inline(serde_json::json!({ "input": "x" }))
+                .expect("the input is inline-bounded"),
+            status: AgentRunStatus::Running,
+            loop_state,
+            terminal_reason: None,
+            accepted_at: now,
+        };
+        let baseline = run.materialized_size_bytes();
+
+        // The feedback of a rejected proposal, at its bound.
+        run.loop_state
+            .begin_turn(Some("f".repeat(AGENT_RUN_DETAIL_MAX_LENGTH)));
+        let turn = run.loop_state.turn();
+
+        // The context reference and the completed model effect of the turn.
+        let context =
+            AgentContextSnapshotRef::for_turn(&scope, turn).expect("the reference derives");
+        run.loop_state.set_context_snapshot(context.clone());
+        let mut model_effect = AgentRunEffect::new(
+            &scope,
+            turn,
+            0,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            now,
+        )
+        .expect("the model effect derives");
+        model_effect.status = AgentRunEffectStatus::Completed;
+        run.loop_state
+            .record_effect(model_effect)
+            .expect("the model effect records");
+
+        // The maximal pending turn: the full tool fan-out, with the arguments
+        // sized so the turn sits just under its own bound.
+        let calls: Vec<AgentToolCallRequest> = (0..crate::model::AGENT_MODEL_MAX_TOOL_CALLS)
+            .map(|index| {
+                AgentToolCallRequest::new(
+                    AgentToolCallId::new(format!("call-{index}")).expect("the call id is valid"),
+                    AgentToolId::new(format!("tool-{index}")).expect("the tool id is valid"),
+                    serde_json::json!("b".repeat(1850)),
+                )
+                .expect("the arguments are bounded")
+            })
+            .collect();
+        let mut pending = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION);
+        assert_eq!(
+            pending.schema_version(),
+            CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION
+        );
+        for call in &calls {
+            pending = pending.with_tool_call(call.clone());
+        }
+        pending
+            .validate()
+            .expect("the maximal turn is still bounded");
+        run.loop_state.set_pending_turn(pending);
+
+        // One outstanding effect per call — each copies its call — and one
+        // maximal tool result per call besides.
+        for (index, call) in calls.into_iter().enumerate() {
+            let effect = AgentRunEffect::new(
+                &scope,
+                turn,
+                index + 1,
+                AgentRunEffectRequest::Tool {
+                    call: Box::new(call.clone()),
+                },
+                now,
+            )
+            .expect("the tool effect derives");
+            run.loop_state
+                .record_effect(effect)
+                .expect("the tool effect records");
+            run.loop_state.record_tool_result(AgentToolResult {
+                call_id: call.call_id,
+                content: AgentTaskContent::inline(serde_json::json!("c".repeat(1900)))
+                    .expect("the result is inline-bounded"),
+                recorded_at: now,
+            });
+        }
+
+        // The proposal, the accepted result at its inline bound, and the
+        // terminal reason — none of which coexist with a full fan-out in any
+        // reachable state, which is what makes this a superset.
+        let proposal_id = proposal_operation_id(&scope, turn).expect("the proposal id derives");
+        let content = AgentTaskContent::inline(serde_json::json!("d".repeat(7900)))
+            .expect("the result is inline-bounded");
+        let digest = content.digest();
+        run.loop_state.set_proposal(AgentRunProposal {
+            proposal_id: proposal_id.clone(),
+            turn,
+            result_schema: definition.result_schema.clone(),
+            definition_id: definition.definition_id.clone(),
+            definition_version: definition.version,
+            digest: digest.clone(),
+            proposed_at: now,
+        });
+        run.loop_state.set_accepted_result(AgentAcceptedResult {
+            proposal_id,
+            run: scope.run().clone(),
+            definition_id: definition.definition_id.clone(),
+            definition_version: definition.version,
+            result_schema: definition.result_schema,
+            content,
+            digest,
+            evidence: Vec::new(),
+            accepted_at: now,
+        });
+        run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
+            reason: "r".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+        });
+
+        let growth = run.materialized_size_bytes().saturating_sub(baseline);
+        assert!(
+            growth <= AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
+            "the maximal working set grows the record by {growth} bytes, which exceeds the \
+             {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a run admitted at the bound \
+             could be refused its own turn"
+        );
     }
 }

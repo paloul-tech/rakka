@@ -33,16 +33,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::definition::AgentRevisionNumber;
 use crate::identity::{validated_id, AgentIdentityResult, AgentRunScope};
+use crate::task::AgentContentDigest;
 
 validated_id! {
     /// Stable identity of one immutable context snapshot
     /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// It is *derived* from the run and the turn, never generated, so a model
-    /// effect retried after a crash names the snapshot it was first prepared
-    /// against rather than a freshly assembled one. That is what will make index
-    /// or store drift unable to change a retried model input once slice 1.11
-    /// gives the snapshot its content.
+    /// It is *derived* from the run's full scope — tenant, agent, and run — and
+    /// the turn, never generated, so a model effect retried after a crash names
+    /// the snapshot it was first prepared against rather than a freshly
+    /// assembled one. That is what will make index or store drift unable to
+    /// change a retried model input once slice 1.11 gives the snapshot its
+    /// content.
     pub AgentContextSnapshotId, "agent_context_snapshot_id"
 }
 
@@ -74,12 +76,20 @@ impl AgentContextSnapshotRef {
 
     /// Derives the reference of the snapshot one run's turn is prepared against.
     ///
-    /// The derivation is a pure function of the run and the turn, so preparing
-    /// the same turn twice — after a crash, or on another shard owner — names
-    /// one snapshot rather than two.
+    /// The derivation is a pure function of the run's full scope and the turn,
+    /// so preparing the same turn twice — after a crash, or on another shard
+    /// owner — names one snapshot rather than two, and two tenants naming
+    /// their agents and runs alike never derive the same snapshot identity.
+    ///
+    /// The scope enters through a digest of its injective key rather than by
+    /// joining the ids literally: ids may themselves contain the join
+    /// character, which would let two different runs flatten to one name, and
+    /// three maximal ids would overflow the identity bound — a run stranded at
+    /// its first turn by the length of its own name.
     pub fn for_turn(scope: &AgentRunScope, turn: u64) -> AgentIdentityResult<Self> {
+        let scope_digest = AgentContentDigest::of_bytes(scope.key().as_bytes());
         Ok(Self::new(
-            AgentContextSnapshotId::new(format!("{}-{}-turn-{turn}", scope.agent(), scope.run()))?,
+            AgentContextSnapshotId::new(format!("run-{}-turn-{turn}", scope_digest.value))?,
             AgentRevisionNumber::INITIAL,
         ))
     }
@@ -88,5 +98,52 @@ impl AgentContextSnapshotRef {
 impl Display for AgentContextSnapshotRef {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}@{}", self.snapshot_id, self.version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{AgentId, AgentRunId, TenantId};
+
+    fn scope(tenant: &str, agent: &str, run: &str) -> AgentRunScope {
+        AgentRunScope::new(
+            TenantId::new(tenant),
+            AgentId::new(agent).expect("the agent id is valid"),
+            AgentRunId::new(run).expect("the run id is valid"),
+        )
+        .expect("the scope is valid")
+    }
+
+    #[test]
+    fn the_snapshot_identity_is_tenant_scoped_pure_and_bounded() {
+        // Run ids are derived from task ids, so two tenants holding the same
+        // task derive the same run id — their snapshots must still be distinct.
+        let acme = AgentContextSnapshotRef::for_turn(&scope("acme", "support", "t-gen-1"), 1)
+            .expect("the reference derives");
+        let globex = AgentContextSnapshotRef::for_turn(&scope("globex", "support", "t-gen-1"), 1)
+            .expect("the reference derives");
+        assert_ne!(acme, globex);
+
+        // Ids may contain the byte a literal join would use, so two different
+        // scopes must not flatten to one name.
+        let joined_left = AgentContextSnapshotRef::for_turn(&scope("t", "a-b", "c"), 1)
+            .expect("the reference derives");
+        let joined_right = AgentContextSnapshotRef::for_turn(&scope("t", "a", "b-c"), 1)
+            .expect("the reference derives");
+        assert_ne!(joined_left, joined_right);
+
+        // Three maximal ids must still derive: a run must never be stranded at
+        // its first turn by the length of its own name.
+        let long = "a".repeat(256);
+        let maximal = AgentContextSnapshotRef::for_turn(&scope(&long, &long, &long), u64::MAX)
+            .expect("a maximal scope still derives its snapshot");
+
+        // And the derivation is pure: the same scope and turn name one snapshot.
+        assert_eq!(
+            maximal,
+            AgentContextSnapshotRef::for_turn(&scope(&long, &long, &long), u64::MAX)
+                .expect("the reference derives"),
+        );
     }
 }
