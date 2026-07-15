@@ -132,6 +132,16 @@
 //! Every test above lives in `tests/choreography.rs`; the colocated and
 //! split-across-nodes exchanges of scenario 60 live in
 //! `tests/choreography_cluster.rs`.
+//!
+//! The table proves the *substrate* converges, once per exchange kind. Each
+//! exchange is proven again on the real entities that own it, because a
+//! participant's own domain fence is half of the argument (see the deduplication
+//! window note above) and only the entity has one:
+//!
+//! | Exchange | Entities | Test |
+//! | --- | --- | --- |
+//! | Creation, Assignment | ingress → task → run | `tests/task_entity.rs` |
+//! | Assignment, ResultProposal | task ⇄ run, with either side lost at every durable write | `tests/run_result_exchange.rs` (scenario 59) |
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -1354,11 +1364,28 @@ pub trait AgentExchangeParticipant: Send + Sync + 'static {
         now: AgentTimestampMillis,
     ) -> AgentExchangeTransition;
 
+    /// Validates a reply before it settles, failing closed without a write.
+    ///
+    /// [`Self::settle`] may not fail: by the time it runs, the exchange is
+    /// settled in the same compare-and-set. This hook runs first, and an error
+    /// here persists nothing — the exchange stays outstanding and is re-driven
+    /// later. It exists so a reply this binary cannot interpret (a payload
+    /// serialized by a newer binary during a rolling upgrade, for instance) is
+    /// refused where it enters rather than converted into a durable guess.
+    fn check_settle(
+        &self,
+        _envelope: &AgentExchangeEnvelope,
+        _result: &AgentExchangeResult,
+    ) -> AgentChoreographyResult<()> {
+        Ok(())
+    }
+
     /// Applies the consequence of a result one of this entity's own exchanges
     /// returned, and returns any exchange that consequence now owes.
     ///
     /// It runs exactly once per operation id: the substrate settles the pending
-    /// exchange in the same transition, and a duplicate reply never reaches it.
+    /// exchange in the same transition, and a duplicate reply never reaches it —
+    /// nor does a reply that [`Self::check_settle`] refused.
     /// `now` is when the settlement commits, exactly as on [`Self::apply`].
     fn settle(
         &self,
@@ -1426,6 +1453,12 @@ where
     pub fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// The schema-compatibility policy in force.
+    #[must_use]
+    pub const fn schema_policy(&self) -> &AgentSchemaPolicy {
+        &self.policy
     }
 
     /// Address this host serves.
@@ -1597,6 +1630,12 @@ where
             // burn a revision, and an unknown one must not touch state at all.
             return Ok(settlement);
         };
+
+        // The participant's fail-closed gate. An error here persists nothing —
+        // the journal settle above mutated only this discarded clone — so the
+        // exchange stays durably outstanding and is re-driven later, possibly
+        // by a binary that can interpret the reply.
+        self.participant.check_settle(envelope, result)?;
 
         let owed = self.participant.settle(&mut state, envelope, result, now);
         self.record_owed(&mut state, owed, now)?;

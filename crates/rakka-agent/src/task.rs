@@ -234,6 +234,15 @@ pub const AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE: &str = "rakka.agent.TaskResul
 /// Payload type of an [`AgentTaskDecision`] exchange result.
 pub const AGENT_TASK_DECISION_PAYLOAD_TYPE: &str = "rakka.agent.TaskDecision";
 
+/// Refusal code of an [`AgentTaskDecision::Refused`] fenced by a newer
+/// assignment generation.
+///
+/// It is the one refusal the run maps to a distinct terminal status
+/// ([`crate::run::AgentRunStatus::Superseded`]), so both sides name it through
+/// this constant rather than each holding its own copy of the literal. The
+/// string is wire and durable surface — it never changes.
+pub const AGENT_TASK_REFUSAL_STALE_GENERATION: &str = "stale-assignment-generation";
+
 /// Payload type of the [`AgentTaskOutcome`] an accepted
 /// [`AgentExchangeKind::Creation`] reply carries.
 ///
@@ -3381,7 +3390,7 @@ fn apply_result_proposal(
     if assignment.generation != proposal.generation || assignment.run != proposal.run {
         return refuse(
             state,
-            "stale-assignment-generation",
+            AGENT_TASK_REFUSAL_STALE_GENERATION,
             format!(
                 "generation {} is not the current generation {}",
                 proposal.generation, assignment.generation
