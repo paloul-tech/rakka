@@ -50,7 +50,7 @@ use std::fmt::Display;
 
 use rig_core::completion::{
     AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
-    GetTokenUsage, Message, ToolDefinition, Usage,
+    Message, ToolDefinition, Usage,
 };
 use rig_core::streaming::StreamingCompletionResponse;
 use rig_core::OneOrMany;
@@ -437,22 +437,11 @@ impl ScriptedCompletionModel {
     }
 }
 
-/// The streaming response type the scripted model declares.
-///
-/// The scripted model does not stream, so this carries nothing and reports no
-/// usage; it exists only to satisfy the [`CompletionModel`] associated type.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct ScriptedStreamingResponse;
-
-impl GetTokenUsage for ScriptedStreamingResponse {
-    fn token_usage(&self) -> Option<Usage> {
-        None
-    }
-}
-
 impl CompletionModel for ScriptedCompletionModel {
     type Response = ();
-    type StreamingResponse = ScriptedStreamingResponse;
+    // The scripted model does not stream, and rig implements the streaming
+    // bounds (`GetTokenUsage` included) for the unit type.
+    type StreamingResponse = ();
     type Client = ();
 
     fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {

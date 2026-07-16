@@ -384,9 +384,11 @@ pub struct AgentModelRequest {
     /// The settings revision this request resolved against.
     ///
     /// Turn-bound settings resolve against the agent's current revision at each
-    /// turn ([specification 7.2](../../../docs/plans/rakka-agent/spec.md)); the
-    /// revision is carried so an in-flight call can be reasoned about against the
-    /// exact settings it was prepared under. Slice 1.8 resolves it at dispatch.
+    /// turn ([specification 7.2](../../../docs/plans/rakka-agent/spec.md)). The
+    /// field exists so that, once slice 1.8 resolves settings at dispatch, an
+    /// in-flight call can be reasoned about against the exact settings it was
+    /// prepared under; until then the interim loop stamps
+    /// [`AgentRevisionNumber::INITIAL`] and nothing reads the value back.
     pub settings_revision: AgentRevisionNumber,
     /// The turn this request serves, counting from one.
     pub turn: u64,

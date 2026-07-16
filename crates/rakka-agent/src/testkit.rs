@@ -1309,59 +1309,6 @@ impl ScriptedDispatcher<DeterministicModelAdapter> {
         self.adapter.script_turn(turn);
         self
     }
-
-    /// Scripts the turn a model call for a specific turn number returns.
-    #[must_use]
-    pub fn with_turn_for(self, turn: u64, model_turn: AgentModelTurn) -> Self {
-        self.adapter
-            .by_turn
-            .lock()
-            .expect("the conditional turn script should not be poisoned")
-            .insert(turn, model_turn);
-        self
-    }
-
-    /// What this dispatcher returns for one effect, computed synchronously.
-    ///
-    /// This is available for the deterministic adapter, whose turns need no
-    /// awaiting; [`Self::drive`] is the general path. The answer — a model turn or
-    /// a tool outcome alike — is memoized on the effect id and its dispatch
-    /// generation, so re-invoking an effect whose result was lost returns *the
-    /// same* outcome, while a later generation — a genuine new attempt — reaches
-    /// the adapter again. That is what the effect's idempotency key means
-    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)), and it is
-    /// what makes a recovery test deterministic. The memo is checked and filled
-    /// under one lock, so concurrent re-invocations of one effect consume the
-    /// script exactly once.
-    ///
-    /// The call *counters* are not memoized, because a re-invocation really is
-    /// another call: it is billed again, and slice 1.9 charges it again.
-    #[must_use]
-    pub fn answer(&self, effect: &AgentRunEffect) -> AgentRunEffectOutcome {
-        match &effect.request {
-            AgentRunEffectRequest::Model { context, profile } => {
-                self.model_calls.fetch_add(1, Ordering::SeqCst);
-                let mut answered = self.lock_answered();
-                if let Some(outcome) = answered.get(&memo_key(effect)) {
-                    return outcome.clone();
-                }
-                let request = model_request(context, profile.as_ref(), effect.turn);
-                let outcome = model_outcome(Ok(self.adapter.produce(&request)));
-                answered.insert(memo_key(effect), outcome.clone());
-                outcome
-            }
-            AgentRunEffectRequest::Tool { call } => {
-                self.tool_calls.fetch_add(1, Ordering::SeqCst);
-                let mut answered = self.lock_answered();
-                if let Some(outcome) = answered.get(&memo_key(effect)) {
-                    return outcome.clone();
-                }
-                let outcome = self.tool_outcome(call);
-                answered.insert(memo_key(effect), outcome.clone());
-                outcome
-            }
-        }
-    }
 }
 
 /// The key one effect's answer is memoized under: the effect id and its
@@ -1477,7 +1424,7 @@ where
 
         let mut delivered = 0;
         for effect in dispatched {
-            let outcome = self.answer_effect(&effect).await;
+            let outcome = self.answer(&effect).await;
             let command = AgentRunEntityCommand::RecordEffectResult {
                 operation_id: effect.result_operation_id(&scope)?,
                 effect_id: effect.effect_id.clone(),
@@ -1489,8 +1436,20 @@ where
         Ok(delivered)
     }
 
-    /// Answers one effect, awaiting the adapter for a model call.
-    async fn answer_effect(&self, effect: &AgentRunEffect) -> AgentRunEffectOutcome {
+    /// What this dispatcher returns for one effect, awaiting the adapter for a
+    /// model call. [`Self::drive`] answers everything outstanding through this.
+    ///
+    /// The answer — a model turn or a tool outcome alike — is memoized on the
+    /// effect id and its dispatch generation, so re-invoking an effect whose
+    /// result was lost returns *the same* outcome, while a later generation — a
+    /// genuine new attempt — reaches the adapter again. That is what the
+    /// effect's idempotency key means
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)), and it
+    /// is what makes a recovery test deterministic.
+    ///
+    /// The call *counters* are not memoized, because a re-invocation really is
+    /// another call: it is billed again, and slice 1.9 charges it again.
+    pub async fn answer(&self, effect: &AgentRunEffect) -> AgentRunEffectOutcome {
         match &effect.request {
             AgentRunEffectRequest::Model { context, profile } => {
                 self.model_calls.fetch_add(1, Ordering::SeqCst);
@@ -1918,8 +1877,8 @@ mod tests {
         .expect("the effect derives")
     }
 
-    #[test]
-    fn a_tool_answer_is_memoized_on_the_effect_id() {
+    #[tokio::test]
+    async fn a_tool_answer_is_memoized_on_the_effect_id() {
         let scope = AgentRunScope::new(
             TenantId::new("acme"),
             AgentId::new("support").expect("the agent id is valid"),
@@ -1929,19 +1888,19 @@ mod tests {
         let effect = tool_effect(&scope, 1, "call-1");
 
         let dispatcher = ScriptedDispatcher::new();
-        let first = dispatcher.answer(&effect);
+        let first = dispatcher.answer(&effect).await;
 
         // The script changes under the dispatcher — the tool now fails — but
         // re-invoking the same effect returns the answer already given: that is
         // what the effect's idempotency key means, and what keeps a recovery
         // test deterministic.
         let dispatcher = dispatcher.with_tool_failure("search", "tool-unavailable", "down");
-        assert_eq!(first, dispatcher.answer(&effect));
+        assert_eq!(first, dispatcher.answer(&effect).await);
 
         // A different effect is a different invocation and sees the new script.
         let sibling = tool_effect(&scope, 2, "call-2");
         assert_eq!(
-            dispatcher.answer(&sibling).failure_code(),
+            dispatcher.answer(&sibling).await.failure_code(),
             Some("tool-unavailable")
         );
 
@@ -1982,8 +1941,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unboundable_scripted_turn_surfaces_as_a_failed_effect() {
+    #[tokio::test]
+    async fn an_unboundable_scripted_turn_surfaces_as_a_failed_effect() {
         use crate::model::AGENT_MODEL_TEXT_MAX_LENGTH;
 
         let oversized = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
@@ -1994,12 +1953,12 @@ mod tests {
         // The turn is refused where the outcome is formed, as a failed effect
         // the run records and winds down on — not as a result command the
         // entity would refuse, which would leave the effect outstanding forever.
-        let outcome = dispatcher.answer(&model_effect(&run_scope(), 0));
+        let outcome = dispatcher.answer(&model_effect(&run_scope(), 0)).await;
         assert_eq!(outcome.failure_code(), Some("model-text-too-long"));
     }
 
-    #[test]
-    fn a_later_dispatch_generation_reaches_the_adapter_again() {
+    #[tokio::test]
+    async fn a_later_dispatch_generation_reaches_the_adapter_again() {
         let first = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("first");
         let second = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("second");
         let dispatcher = ScriptedDispatcher::with_adapter(
@@ -2009,9 +1968,9 @@ mod tests {
         );
 
         let effect = model_effect(&run_scope(), 0);
-        let answered = dispatcher.answer(&effect);
+        let answered = dispatcher.answer(&effect).await;
         // The same generation replays the memoized answer without producing.
-        assert_eq!(answered, dispatcher.answer(&effect));
+        assert_eq!(answered, dispatcher.answer(&effect).await);
         assert_eq!(dispatcher.adapter().calls(), 1);
 
         // A later generation is a new attempt entirely — the retry slice 1.7
@@ -2019,7 +1978,7 @@ mod tests {
         // recorded (possibly failed) answer forever.
         let mut retried = effect;
         retried.generation = retried.generation.next();
-        let retried_answer = dispatcher.answer(&retried);
+        let retried_answer = dispatcher.answer(&retried).await;
         assert_ne!(answered, retried_answer);
         assert_eq!(dispatcher.adapter().calls(), 2);
     }
