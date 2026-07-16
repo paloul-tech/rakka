@@ -505,6 +505,66 @@ Guidance: [Effect Safety Guidance](technical-guidance.md#effect-safety-guidance)
   machine, and record a first rough per-turn durable-write count/latency
   measurement (formalized in Slice 1.14).
 
+**Amended as implemented (2026-07-16):**
+
+- **The status machine spans two durable layers, and the split is the
+  correctness argument.** The run's own effect record (the slice 1.5
+  amendment's decision, kept) owns `Pending`, `Ready`, and the five terminal
+  outcomes; the dispatch layer's durable records — the agent-workflow outbox
+  row and the dispatcher-fleet entry with its lease and fencing token — own
+  `Started` and `RetryScheduled`. Requiring the run's record to track
+  attempt-level states would add one run compare-and-set per attempt for no
+  fence the outbox row does not already provide; the outbox row's
+  `Dispatching` status *is* the durable ambiguity marker recovery reads.
+- **The flush order was inverted so `Pending` proves non-dispatch.** Slice 1.5
+  wrote the sink first and marked the record after, which meant a `Pending`
+  effect *might* be in the outbox and cancellation had to flush-and-settle it.
+  Now the transition that marks `Ready` commits before any sink write starts,
+  so a `Pending` effect has provably never reached the outbox and the
+  cancellation acceptance fences it in place atomically
+  ([spec 8.7](spec.md#87-cancellation-failure-and-waiting)'s "immediately").
+  The price — `Ready` no longer proves the sink write landed — is paid by
+  re-driving the idempotent sink write for every `Ready`-unresolved effect on
+  each settle pass. The 1.5 test that asserted the old flush-under-cancel
+  behavior was rewritten to assert the fence.
+- **Attempt-level retries never reach the run.** A result command is final for
+  its generation: `Succeeded`, `Failed`, `Exhausted`, `Indeterminate`, or
+  `Cancelled`. The outbox row's retry budget is aligned to the intent's
+  attempt bound when the ticket is scheduled, so the dispatch layer cannot
+  retry what the policy does not permit, and the run is not woken once per
+  attempt.
+- **A new generation is a new dispatch ticket.** The outbox deduplicates on a
+  generation-qualified ticket id (`{effect}#g{n}`), so `ConfirmedNotExecuted`
+  yields a fresh dispatchable row while the superseded generation's terminal
+  row can never be redispatched; the external idempotency key derives from
+  identity *and* generation for the same reason. The reconciliation decision
+  itself landed here as the run command `ResolveIndeterminateEffect` with the
+  two non-retry decisions of [spec 12.5](spec.md#125-reconciliation-decisions),
+  because scenario 57's effect half cannot be proven without a resolution
+  entry point; slice 1.10 wraps it in the checkpoint record and grant binding
+  without changing the run-side semantics.
+- **Effect specs are deployment registration until slice 1.8.**
+  `AgentEffectPolicies` on the run entity supplies the class-level declaration
+  (model calls default to one read-only attempt; unclassified tools fail safe
+  as non-idempotent, exactly because an unknown tool's ambiguous loss must
+  park rather than guess). The tool registry replaces the map without touching
+  the effect record. The model adapter's declared retry policy remains the
+  1.6 surface; open decision 4 is exercised by configuring the model spec.
+- **Recovery is the claim path, not a separate sweep.** An expired-lease fleet
+  entry is claimable, and re-claiming it under a fresh fencing token *is* the
+  recovery: the claim path reads the outbox row's status to distinguish a
+  fresh ticket from an ambiguous one, re-reads the run's durable intent (which
+  also rejects stale tickets without invocation), and applies the
+  safety-class table. The wind-down fence pass repairs only what no claim can
+  see — a ticket that never reached the outbox gets a tombstone row planted
+  before its cancelled word is delivered, so a laggard flush racing the fence
+  lands on a terminal row instead of creating dispatchable work post-fence.
+- **Measured (rough, debug build, in-memory stores):** one clean model turn —
+  accept, commit effect, ticket, claim, invoke, deliver, propose, accept —
+  costs 8 run-store compare-and-sets, 3 workflow-store writes, ~6 ms wall.
+  Recorded by `per_turn_durable_write_count_and_latency_measurement`;
+  slice 1.14 sets the budget.
+
 Done when: scenarios 5-10 pass with fault injection at each crash window
 (before `Started`, after `Started` per safety class, after external commit),
 and the effect-layer half of scenario 57 passes.

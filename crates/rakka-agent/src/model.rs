@@ -563,8 +563,11 @@ pub type AgentModelFuture<'a> =
 /// dispatcher performing the bounded I/O — never inside a run transition — and
 /// its turn returns to the loop as a durable result command
 /// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)). Its
-/// [`retry_policy`](Self::retry_policy) is the explicit policy the effect
-/// machine of slice 1.7 applies when an attempt is lost ambiguously.
+/// [`retry_policy`](Self::retry_policy) is the *declared ceiling* the dispatch
+/// pipeline of [`crate::dispatch`] re-enforces before every invocation: a
+/// committed effect whose configured policy is weaker — a laxer safety class,
+/// or more attempts — fails closed rather than letting recovery retry what the
+/// adapter declared unsafe.
 ///
 /// The Rig-backed implementation lives behind the `rig` feature in
 /// [`crate::rig`]; the deterministic implementation in [`crate::testkit`] scripts
@@ -647,9 +650,9 @@ pub enum AgentModelError {
     /// The provider, or the adapter mapping its response, failed.
     ///
     /// A provider transport failure or a response the adapter could not map onto
-    /// a bounded turn surfaces here. The dispatcher records it as a failed
-    /// effect, and the effect machine of slice 1.7 applies the adapter's
-    /// [`AgentModelRetryPolicy`] to it.
+    /// a bounded turn surfaces here. The dispatch pipeline records it as a
+    /// failed attempt and retries it under the effect's bounded policy; a spent
+    /// budget reaches the run as the generation's `Exhausted` word.
     Provider {
         /// The provider or mapping failure detail.
         message: String,

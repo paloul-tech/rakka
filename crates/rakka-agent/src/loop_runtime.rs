@@ -350,7 +350,7 @@ impl AgentLoopState {
         self.effects.iter().filter(|effect| effect.is_outstanding())
     }
 
-    /// Every effect committed by a transition but not yet handed to the sink.
+    /// Every effect committed by a transition but not yet made dispatchable.
     #[must_use]
     pub fn undispatched_effects(&self) -> Vec<AgentRunEffect> {
         self.effects
@@ -360,6 +360,35 @@ impl AgentLoopState {
             .collect()
     }
 
+    /// Every effect that is dispatchable and not yet resolved.
+    ///
+    /// The flush re-drives the sink for exactly this set: `Ready` proves the
+    /// effect was made dispatchable, not that the sink write landed, so the
+    /// idempotent write is repeated until a result resolves the effect.
+    #[must_use]
+    pub fn ready_effects(&self) -> Vec<AgentRunEffect> {
+        self.effects
+            .iter()
+            .filter(|effect| effect.status == crate::effect::AgentRunEffectStatus::Ready)
+            .cloned()
+            .collect()
+    }
+
+    /// Every effect whose generation is parked as indeterminate, awaiting an
+    /// explicit reconciliation decision
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    pub fn indeterminate_effects(&self) -> impl Iterator<Item = &AgentRunEffect> {
+        self.effects
+            .iter()
+            .filter(|effect| effect.status == crate::effect::AgentRunEffectStatus::Indeterminate)
+    }
+
+    /// Whether any effect is parked as indeterminate.
+    #[must_use]
+    pub fn has_indeterminate_effect(&self) -> bool {
+        self.indeterminate_effects().next().is_some()
+    }
+
     /// Whether the run is waiting on any effect.
     #[must_use]
     pub fn awaits_effect(&self) -> bool {
@@ -367,16 +396,38 @@ impl AgentLoopState {
     }
 
     /// Whether the run still has work in flight whose outcome must settle
-    /// before it may become terminal: an outstanding effect, or a result
-    /// proposal awaiting the task's decision.
+    /// before it may become terminal: an outstanding effect, an indeterminate
+    /// effect whose outcome is unknown, or a result proposal awaiting the
+    /// task's decision.
     ///
     /// This is the quiesce condition of
     /// [specification 8.7](../../../docs/plans/rakka-agent/spec.md): work whose
-    /// outcome is unknown must not be abandoned as though it never happened,
-    /// and a proposal the task may already have decided is exactly such work.
+    /// outcome is unknown must not be abandoned as though it never happened.
+    /// An indeterminate effect is the sharpest case — the run stays
+    /// nonterminal in reconciliation until an explicit decision resolves it,
+    /// cancellation requested or not.
     #[must_use]
     pub fn awaits_settlement(&self) -> bool {
-        self.awaits_effect() || self.proposal.is_some()
+        self.effects.iter().any(AgentRunEffect::blocks_settlement) || self.proposal.is_some()
+    }
+
+    /// Fences every effect that provably never reached the sink, marking it
+    /// cancelled in place.
+    ///
+    /// Only a `Pending` effect qualifies: the flush hands an effect to the
+    /// sink strictly after the transition that marked it `Ready` committed, so
+    /// `Pending` proves no dispatch ticket exists and no invocation can be
+    /// abandoned by the fence
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub(crate) fn fence_unsent_effects(&mut self) -> usize {
+        let mut fenced = 0;
+        for effect in &mut self.effects {
+            if effect.is_pending() {
+                effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
+                fenced += 1;
+            }
+        }
+        fenced
     }
 
     /// The turn the model produced and the loop has not yet recorded.
@@ -514,13 +565,15 @@ impl AgentLoopState {
     ///
     /// The turn's content is not kept: it belongs in session memory (slice 1.11)
     /// and in artifacts. Resolved effects of the turn leave with it, so the loop
-    /// holds only what it is still waiting on.
+    /// holds only what it is still waiting on — and what it still *owes*: an
+    /// indeterminate effect stays until its reconciliation decision, because
+    /// dropping it would drop the record that a decision is owed.
     pub(crate) fn clear_turn(&mut self) {
         self.pending_turn = None;
         self.tool_results.clear();
         let turn = self.turn;
         self.effects
-            .retain(|effect| effect.turn != turn || effect.status.is_outstanding());
+            .retain(|effect| effect.turn != turn || effect.blocks_settlement());
     }
 
     pub(crate) fn begin_turn(&mut self, feedback: Option<String>) {

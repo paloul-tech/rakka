@@ -26,14 +26,14 @@ use rakka_agent::testkit::{
 };
 use rakka_agent::{
     AgentAuthorityEnvelope, AgentBudgetCeilings, AgentDefinition, AgentDefinitionId,
-    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentExchangeRouter,
-    AgentId, AgentModelAdapter, AgentOperationId, AgentOperationKind, AgentRevisionNumber,
-    AgentRevisionProvenance, AgentRunEntityStore, AgentRunScope, AgentRunSnapshot, AgentRunState,
-    AgentRunStatus, AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent,
-    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
-    AgentTaskEntityStore, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
-    AgentTaskScope, AgentTaskSnapshot, AgentTaskState, InMemoryAgentRunEffectSink,
-    InMemoryAgentTaskHistoryStore, TenantId,
+    AgentEffectPolicies, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
+    AgentExchangeRouter, AgentId, AgentModelAdapter, AgentOperationId, AgentOperationKind,
+    AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectSink, AgentRunEntityStore,
+    AgentRunScope, AgentRunSnapshot, AgentRunState, AgentRunStatus, AgentSchemaId, AgentSchemaRef,
+    AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation, AgentTaskDefinition,
+    AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore, AgentTaskResultCheck,
+    AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
+    InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, TenantId,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
@@ -130,13 +130,17 @@ pub fn provenance(at: u64) -> AgentRevisionProvenance {
 }
 
 /// The task-and-run fixture, generic over the model adapter the dispatcher
-/// answers model calls with.
-pub struct Fixture<A: AgentModelAdapter = rakka_agent::testkit::DeterministicModelAdapter> {
+/// answers model calls with and the durable sink the run's effects flush to.
+pub struct Fixture<
+    A: AgentModelAdapter = rakka_agent::testkit::DeterministicModelAdapter,
+    S: AgentRunEffectSink = InMemoryAgentRunEffectSink,
+> {
     pub tasks: TaskStore,
     pub agents: AgentStore,
     pub runs: RunStore,
     pub history: InMemoryAgentTaskHistoryStore,
-    pub effects: InMemoryAgentRunEffectSink,
+    pub effects: S,
+    pub policies: AgentEffectPolicies,
     pub router: AgentExchangeRouter,
     pub task_transport:
         InProcessTaskEntityTransport<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>,
@@ -146,12 +150,28 @@ pub struct Fixture<A: AgentModelAdapter = rakka_agent::testkit::DeterministicMod
 
 impl<A: AgentModelAdapter> Fixture<A> {
     pub fn new(dispatcher: ScriptedDispatcher<A>) -> Self {
+        Self::with_sink(
+            dispatcher,
+            InMemoryAgentRunEffectSink::new(),
+            AgentEffectPolicies::default(),
+            Arc::new(AtomicU64::new(1)),
+        )
+    }
+}
+
+impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
+    /// Builds the fixture over an explicit effect sink, effect policies, and a
+    /// shared clock counter — what the dispatch-pipeline tests need.
+    pub fn with_sink(
+        dispatcher: ScriptedDispatcher<A>,
+        effects: S,
+        policies: AgentEffectPolicies,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
         let history = InMemoryAgentTaskHistoryStore::new();
-        let effects = InMemoryAgentRunEffectSink::new();
-        let clock = Arc::new(AtomicU64::new(1));
 
         // The task and the run exchange with each other, so each transport needs
         // the router the other lives in. The deferred router is that late binding
@@ -169,7 +189,8 @@ impl<A: AgentModelAdapter> Fixture<A> {
             effects.clone(),
             deferred.as_router(),
             clock.clone(),
-        );
+        )
+        .with_effect_policies(policies.clone());
         let router = AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
             .with_route(AgentEntityClass::Run, Arc::new(run_transport));
@@ -181,6 +202,7 @@ impl<A: AgentModelAdapter> Fixture<A> {
             runs,
             history,
             effects,
+            policies,
             router,
             task_transport,
             dispatcher,
@@ -261,8 +283,9 @@ impl<A: AgentModelAdapter> Fixture<A> {
             .await;
     }
 
-    pub fn run(&self) -> AgentRunEntityStore<RunStore, InMemoryAgentRunEffectSink> {
+    pub fn run(&self) -> AgentRunEntityStore<RunStore, S> {
         run_entity(&run_scope(), &self.runs, &self.effects)
+            .with_effect_policies(self.policies.clone())
     }
 
     /// Drives everything the task and the run owe until nothing moves.
@@ -344,7 +367,9 @@ impl<A: AgentModelAdapter> Fixture<A> {
             .expect("the snapshot should read")
             .expect("the task exists")
     }
+}
 
+impl<A: AgentModelAdapter> Fixture<A, InMemoryAgentRunEffectSink> {
     pub fn dispatched_effects(&self) -> usize {
         self.effects.len(&run_scope())
     }

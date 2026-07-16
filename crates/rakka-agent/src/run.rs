@@ -86,8 +86,9 @@ use crate::choreography::{
 };
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
-    AgentEffectError, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
+    AgentEffectError, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
+    AgentRunEffectStatus, AgentToolResult,
 };
 use crate::identity::{
     AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
@@ -345,11 +346,18 @@ impl AgentRunStatus {
     /// A suspended or cancelling run may not: cancellation fences *new* work
     /// immediately — no further transition commits an effect — even though the
     /// run does not become terminal until its outstanding effects resolve, and
-    /// an effect committed before the fence still flushes and settles
-    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// an effect that already reached the dispatch layer still settles
+    /// truthfully ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// A run waiting for reconciliation may not either: automatic progress
+    /// past an effect whose outcome is unknown is exactly what
+    /// [specification 11.5](../../../docs/plans/rakka-agent/spec.md) revokes.
     #[must_use]
     pub const fn permits_progress(self) -> bool {
-        !self.is_terminal() && !matches!(self, Self::Suspended | Self::Cancelling)
+        !self.is_terminal()
+            && !matches!(
+                self,
+                Self::Suspended | Self::Cancelling | Self::WaitingForReconciliation
+            )
     }
 }
 
@@ -993,6 +1001,7 @@ fn refuse(code: &str, message: impl Into<String>) -> AgentExchangeResult {
 /// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)).
 fn advance_once(
     state: &mut AgentRunState,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1005,10 +1014,10 @@ fn advance_once(
 
     match run.loop_state.phase() {
         AgentLoopPhase::PreparingContext => {
-            prepare_context(state, &scope, now).map(|()| Vec::new())
+            prepare_context(state, &scope, policies, now).map(|()| Vec::new())
         }
         AgentLoopPhase::EvaluatingModelOutput => {
-            evaluate_model_output(state, &scope, now).map(|()| Vec::new())
+            evaluate_model_output(state, &scope, policies, now).map(|()| Vec::new())
         }
         AgentLoopPhase::RecordingTurn => record_turn(state, now).map(|()| Vec::new()),
         AgentLoopPhase::DecidingContinuation => decide_continuation(state, &scope, now),
@@ -1028,6 +1037,7 @@ fn advance_once(
 fn prepare_context(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
@@ -1058,20 +1068,23 @@ fn prepare_context(
 
     let context = AgentContextSnapshotRef::for_turn(scope, turn)?;
     let profile = None;
-    let slot = {
+    let (slot, settings_revision) = {
         let run = state.run_mut()?;
-        run.loop_state.next_effect_slot()
+        (
+            run.loop_state.next_effect_slot(),
+            run.loop_state.agent_settings_revision(),
+        )
     };
-    let effect = AgentRunEffect::new(
-        scope,
-        turn,
-        slot,
-        AgentRunEffectRequest::Model {
-            context: context.clone(),
-            profile,
-        },
-        now,
-    )?;
+    let request = AgentRunEffectRequest::Model {
+        context: context.clone(),
+        profile,
+    };
+    // The spec — safety class, attempt bound, protocol, credential binding —
+    // is trusted deployment/definition data resolved by the run's transition,
+    // never something the model's output can choose or widen
+    // ([specification 11.2]).
+    let spec = policies.spec_for(&request).clone();
+    let effect = AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
 
     let run = state.run_mut()?;
     run.loop_state.record_effect(effect)?;
@@ -1088,6 +1101,7 @@ fn prepare_context(
 fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let (turn, calls) = {
@@ -1129,16 +1143,23 @@ fn evaluate_model_output(
     }
 
     for call in calls {
-        let slot = state.run_mut()?.loop_state.next_effect_slot();
-        let effect = AgentRunEffect::new(
-            scope,
-            turn,
-            slot,
-            AgentRunEffectRequest::Tool {
-                call: Box::new(call),
-            },
-            now,
-        )?;
+        let (slot, settings_revision) = {
+            let run = state.run_mut()?;
+            (
+                run.loop_state.next_effect_slot(),
+                run.loop_state.agent_settings_revision(),
+            )
+        };
+        let request = AgentRunEffectRequest::Tool {
+            call: Box::new(call),
+        };
+        // The tool's spec comes from its registration, defaulting to a single
+        // non-idempotent attempt for a tool the deployment has not classified:
+        // the model asked for the call, but it cannot choose how failure and
+        // ambiguity are handled ([specification 11.2]).
+        let spec = policies.spec_for(&request).clone();
+        let effect =
+            AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
         state.run_mut()?.loop_state.record_effect(effect)?;
     }
 
@@ -1264,15 +1285,21 @@ fn build_proposal(
     Ok((proposal, envelope))
 }
 
-/// Records the durable result a dispatcher returned for one effect.
+/// Records the durable result a dispatcher returned for one effect generation.
 ///
 /// It is fenced on the run's own state: a result for an effect the run does not
-/// hold, or holds as already resolved, is refused rather than applied — which is
-/// what makes a duplicate or stale completion unable to advance the loop twice
-/// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 10).
+/// hold, holds under a different generation, or holds as already resolved, is
+/// refused rather than applied — which is what makes a duplicate or stale
+/// completion unable to advance the loop twice
+/// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md);
+/// [specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 10).
+#[allow(clippy::too_many_arguments)]
 fn record_effect_result(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    attempt: u32,
+    fence: u64,
     outcome: AgentRunEffectOutcome,
     policy: &AgentSchemaPolicy,
     now: AgentTimestampMillis,
@@ -1288,90 +1315,164 @@ fn record_effect_result(
     if run.status.is_terminal() {
         return Err(AgentRunError::Terminal { status: run.status });
     }
-    // A run cancelled while an effect was in flight stays `Cancelling` while it
-    // records the result: cancellation fenced further dispatch, and recording
-    // the outcome of work already in flight is not further dispatch
-    // ([specification 8.7]). Recording it must not resume the run, so the loop
-    // phase advances but the status does not — the tail below turns the run
-    // terminal once nothing is outstanding.
-    let cancelling = run.status == AgentRunStatus::Cancelling;
 
     let Some(effect) = run.loop_state.effect_mut(effect_id) else {
         return Err(AgentRunError::UnknownEffect {
             effect_id: effect_id.clone(),
         });
     };
+    if effect.generation != generation {
+        // A result for a superseded — or fabricated future — generation must
+        // not resolve the current one: the reconciliation that minted the
+        // current generation did so precisely because the old attempt's
+        // outcome could not be trusted.
+        return Err(AgentRunError::StaleEffectGeneration {
+            effect_id: effect_id.clone(),
+            held: effect.generation,
+            received: generation,
+        });
+    }
     if !effect.is_outstanding() {
         return Err(AgentRunError::StaleEffectResult {
             effect_id: effect_id.clone(),
             status: effect.status,
         });
     }
+    effect.record_attempt(attempt, fence);
 
-    match &outcome {
-        AgentRunEffectOutcome::Failed { code, .. } => {
-            effect.status = AgentRunEffectStatus::Failed;
+    apply_effect_outcome(state, effect_id, &outcome, now)?;
+    settle_run_disposition(state, now)
+}
+
+/// Applies one established outcome to the effect that owes it and to the loop.
+///
+/// The caller has already fenced: the effect is held, at this generation, and
+/// unresolved (or being resolved by an explicit reconciliation decision).
+fn apply_effect_outcome(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    outcome: &AgentRunEffectOutcome,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    // Whether the run is already winding down: recording the outcome of work
+    // already in flight is not further dispatch, but it must not resume a run
+    // that is quiescing ([specification 8.7]).
+    let winding_down = {
+        let run = state.run_mut()?;
+        run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling
+    };
+
+    let run = state.run_mut()?;
+    let Some(effect) = run.loop_state.effect_mut(effect_id) else {
+        return Err(AgentRunError::UnknownEffect {
+            effect_id: effect_id.clone(),
+        });
+    };
+
+    match outcome {
+        AgentRunEffectOutcome::Model { turn } => {
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let turn = (**turn).clone();
+            run.loop_state.set_pending_turn(turn);
+            run.loop_state
+                .set_phase(AgentLoopPhase::EvaluatingModelOutput);
+            if !winding_down {
+                run.status = AgentRunStatus::Running;
+            }
+        }
+        AgentRunEffectOutcome::Tool { call_id, content } => {
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let result = AgentToolResult {
+                call_id: call_id.clone(),
+                content: content.clone(),
+                recorded_at: now,
+            };
+            run.loop_state.record_tool_result(result);
+            if !winding_down && !run.loop_state.awaits_effect() {
+                // The last tool of the turn came back, so the turn is complete.
+                run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+                run.status = AgentRunStatus::Running;
+            }
+        }
+        AgentRunEffectOutcome::Failed { code, .. }
+        | AgentRunEffectOutcome::Exhausted { code, .. } => {
+            // Final for the generation: the dispatch layer already applied the
+            // effect's own retry policy, so what arrives here is a definitive
+            // failure or a spent retry budget — never a retryable attempt
+            // ([specification 11.3], [11.5]). The run winds down: the failure
+            // fences new dispatch, unsent effects are cancelled in place, and
+            // work already at the dispatch layer settles truthfully.
+            effect.status = outcome.resolved_status();
             effect.last_error_code = Some(bounded_detail(code.clone()));
             let code = code.clone();
-            // The interim contract: a failed effect stops the run with a stable
-            // reason. Slice 1.7 replaces this with the safety-class machine —
-            // retry a read-only effect, reuse the idempotency key of an
-            // idempotent one, reconcile a reconcileable one, and never
-            // auto-retry an ambiguous non-idempotent one
-            // ([specification 11.5]).
-            //
-            // Stopping quiesces exactly as cancellation does: the failure
-            // fences further dispatch, but the run stays non-terminal while
-            // sibling effects are still outstanding — their results must be
-            // recordable, not refused ([specification 8.7]) — and it never
-            // overwrites the cancellation reason an operator already recorded.
-            // The tail below turns the run terminal once nothing is
-            // outstanding.
             let run = state.run_mut()?;
+            run.loop_state.fence_unsent_effects();
             if run.terminal_reason.is_none() {
                 run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
                     effect_id: effect_id.clone(),
                     code: bounded_detail(code),
                 });
             }
-            run.status = AgentRunStatus::Cancelling;
         }
-        AgentRunEffectOutcome::Model { turn } => {
-            effect.status = AgentRunEffectStatus::Completed;
-            let turn = (**turn).clone();
-            let run = state.run_mut()?;
-            run.loop_state.set_pending_turn(turn);
-            run.loop_state
-                .set_phase(AgentLoopPhase::EvaluatingModelOutput);
-            if !cancelling {
-                run.status = AgentRunStatus::Running;
-            }
+        AgentRunEffectOutcome::Indeterminate { code, .. } => {
+            // The ambiguous case of [specification 11.5]: the attempt may have
+            // invoked the target and nothing can establish its outcome. The
+            // generation parks, every automatic path to redispatch is already
+            // revoked at the dispatch layer, and the run waits for an explicit
+            // reconciliation decision. No terminal reason is recorded: parking
+            // is not a failure, and a wind-down reason an operator already
+            // recorded is preserved untouched.
+            effect.status = AgentRunEffectStatus::Indeterminate;
+            effect.last_error_code = Some(bounded_detail(code.clone()));
         }
-        AgentRunEffectOutcome::Tool { call_id, content } => {
-            effect.status = AgentRunEffectStatus::Completed;
-            let result = AgentToolResult {
-                call_id: call_id.clone(),
-                content: content.clone(),
-                recorded_at: now,
-            };
-            let run = state.run_mut()?;
-            run.loop_state.record_tool_result(result);
-            if !cancelling && !run.loop_state.awaits_effect() {
-                // The last tool of the turn came back, so the turn is complete.
-                run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
-                run.status = AgentRunStatus::Running;
-            }
+        AgentRunEffectOutcome::Cancelled { .. } => {
+            // The dispatch layer fenced and settled the generation without
+            // invocation. Recording that never resumes the run.
+            effect.status = AgentRunEffectStatus::Cancelled;
         }
     }
 
     let run = state.run_mut()?;
-    if run.status == AgentRunStatus::Cancelling && !run.loop_state.awaits_settlement() {
-        // The wind-down — a requested cancellation or a failed effect — fenced
-        // further dispatch when it was recorded; the run becomes terminal only
-        // once nothing is outstanding ([specification 8.7]). The reconciliation
-        // of an *ambiguous* effect is slice 1.7's, and it is why this is not
-        // simply "stop now". The recorded reason is preserved: a run cancelled
-        // before an effect failed is cancelled, not failed.
+    run.check_bounds(0)?;
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Recomputes where the run stands after effects settled or were resolved.
+///
+/// This is the single place the wind-down and reconciliation rules meet:
+///
+/// - an indeterminate effect parks the run in `WaitingForReconciliation`,
+///   cancellation requested or not — the run is *nonterminal* until every
+///   ambiguous outcome is explicitly resolved
+///   ([specification 8.7](../../../docs/plans/rakka-agent/spec.md),
+///   [11.5](../../../docs/plans/rakka-agent/spec.md); scenario 57);
+/// - a run that is winding down becomes terminal exactly when nothing blocks
+///   settlement, under the reason recorded when the wind-down began — a run
+///   cancelled before an effect failed is cancelled, not failed;
+/// - otherwise the run keeps whatever live status the outcome application set.
+fn settle_run_disposition(
+    state: &mut AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Ok(());
+    }
+
+    if run.loop_state.has_indeterminate_effect() {
+        run.status = AgentRunStatus::WaitingForReconciliation;
+        state.updated_at = now;
+        return Ok(());
+    }
+
+    let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
+    if winding_down {
+        if run.loop_state.awaits_settlement() {
+            run.status = AgentRunStatus::Cancelling;
+            state.updated_at = now;
+            return Ok(());
+        }
         let reason =
             run.terminal_reason
                 .clone()
@@ -1381,21 +1482,95 @@ fn record_effect_result(
         return terminate(state, reason, now);
     }
 
-    run.check_bounds(0)?;
     state.updated_at = now;
     Ok(())
 }
 
+/// Applies an explicit reconciliation decision to an indeterminate effect
+/// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md),
+/// [12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// `ConfirmedExecuted` records the established outcome exactly as a dispatcher
+/// result would have. `ConfirmedNotExecuted` authorizes a new effect
+/// generation where the run still wants the work — and settles the effect as
+/// cancelled where it does not, because a winding-down run re-invokes nothing.
+fn resolve_indeterminate_effect(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    resolution: AgentEffectResolution,
+    policy: &AgentSchemaPolicy,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    resolution.validate()?;
+    let scope = state.scope.clone();
+
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Err(AgentRunError::Terminal { status: run.status });
+    }
+    let winding_down = run.terminal_reason.is_some();
+
+    let Some(effect) = run.loop_state.effect_mut(effect_id) else {
+        return Err(AgentRunError::UnknownEffect {
+            effect_id: effect_id.clone(),
+        });
+    };
+    if effect.generation != generation {
+        return Err(AgentRunError::StaleEffectGeneration {
+            effect_id: effect_id.clone(),
+            held: effect.generation,
+            received: generation,
+        });
+    }
+    if effect.status != AgentRunEffectStatus::Indeterminate {
+        // Only an ambiguous generation takes a reconciliation decision; a
+        // duplicate decision finds the effect already resolved and is refused,
+        // so it cannot resume the run twice (scenario 11's effect-layer edge).
+        return Err(AgentRunError::StaleEffectResult {
+            effect_id: effect_id.clone(),
+            status: effect.status,
+        });
+    }
+
+    match resolution {
+        AgentEffectResolution::ConfirmedExecuted { outcome } => {
+            outcome.check_schema(policy)?;
+            apply_effect_outcome(state, effect_id, &outcome, now)?;
+        }
+        AgentEffectResolution::ConfirmedNotExecuted => {
+            if winding_down {
+                // Proven never executed, and the run wants nothing further:
+                // the fence holds and the generation settles as cancelled.
+                effect.status = AgentRunEffectStatus::Cancelled;
+                state.updated_at = now;
+            } else {
+                // A new invocation is authorized, and it is a new generation:
+                // a fresh dispatchable intent under the same identity
+                // ([specification 11.3]). The ambiguous original is never
+                // mutated back into a routine retry.
+                effect.begin_next_generation(&scope, now)?;
+                let run = state.run_mut()?;
+                run.status = AgentRunStatus::WaitingForEffect;
+                state.updated_at = now;
+            }
+        }
+    }
+
+    settle_run_disposition(state, now)
+}
+
 /// Requests cancellation.
 ///
-/// Cancellation fences new work immediately — no further loop transition
-/// commits an effect — but a run with outstanding effects, or a result proposal
-/// awaiting the task's decision, does not become terminal until they settle
-/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): work whose
-/// outcome is unknown must not be abandoned as though it never happened. That
-/// includes an effect committed but not yet flushed when the cancel arrived: it
-/// was decided and paid for before the fence, and may already have reached the
-/// sink, so it is flushed and settled rather than stranded.
+/// Acceptance fences new dispatch *in the same compare-and-set*
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): no further
+/// loop transition commits an effect, and every committed effect that provably
+/// never reached the sink — `Pending`, which the flush ordering guarantees was
+/// never handed over — is cancelled in place. What already reached the dispatch
+/// layer is not abandoned: it settles truthfully or, if its outcome turns out
+/// to be unknowable, parks the run in reconciliation. A run with such work, or
+/// a result proposal the task may already have decided, stays nonterminal
+/// until everything settles.
 fn cancel(
     state: &mut AgentRunState,
     reason: String,
@@ -1406,20 +1581,14 @@ fn cancel(
         return Err(AgentRunError::Terminal { status: run.status });
     }
 
-    let reason = AgentRunTerminalReason::CancellationRequested {
-        reason: bounded_detail(reason),
-    };
-    // A result proposal awaiting the task's decision is outstanding work too:
-    // the task may already have decided, and a run terminal before the decision
-    // settles would either drop it or be resurrected by it. The run quiesces
-    // until the decision arrives, and `settle_proposal` finishes the wind-down.
-    if run.loop_state.awaits_settlement() {
-        run.status = AgentRunStatus::Cancelling;
-        run.terminal_reason = Some(reason);
-        state.updated_at = now;
-        return Ok(());
+    run.loop_state.fence_unsent_effects();
+    if run.terminal_reason.is_none() {
+        run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
+            reason: bounded_detail(reason),
+        });
     }
-    terminate(state, reason, now)
+    run.status = AgentRunStatus::Cancelling;
+    settle_run_disposition(state, now)
 }
 
 /// Applies the task's decision on a result proposal.
@@ -1632,6 +1801,7 @@ where
     scope: AgentRunScope,
     host: AgentExchangeHost<AgentRunParticipant, Store>,
     effects: Effects,
+    policies: AgentEffectPolicies,
     recovered: bool,
 }
 
@@ -1666,6 +1836,7 @@ where
             scope,
             host,
             effects,
+            policies: AgentEffectPolicies::default(),
             recovered: false,
         }
     }
@@ -1674,6 +1845,15 @@ where
     #[must_use]
     pub fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
         self.host = self.host.with_schema_policy(policy);
+        self
+    }
+
+    /// Uses explicit effect specs for the effects the loop commits
+    /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
+    /// registration supplies the permitted safety declaration).
+    #[must_use]
+    pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
+        self.policies = policies;
         self
     }
 
@@ -1751,11 +1931,36 @@ where
             AgentRunEntityCommand::RecordEffectResult {
                 operation_id,
                 effect_id,
+                generation,
+                attempt,
+                fence,
                 outcome,
             } => {
                 let policy = *self.host.schema_policy();
                 self.transition(now, move |state| {
-                    record_effect_result(state, &effect_id, *outcome, &policy, now)?;
+                    record_effect_result(
+                        state, &effect_id, generation, attempt, fence, *outcome, &policy, now,
+                    )?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
+            AgentRunEntityCommand::ResolveIndeterminateEffect {
+                operation_id,
+                effect_id,
+                generation,
+                resolution,
+            } => {
+                let policy = *self.host.schema_policy();
+                self.transition(now, move |state| {
+                    resolve_indeterminate_effect(
+                        state,
+                        &effect_id,
+                        generation,
+                        *resolution,
+                        &policy,
+                        now,
+                    )?;
                     Ok(operation_id)
                 })
                 .await?
@@ -1840,9 +2045,10 @@ where
             }
 
             let mut rejection = None;
+            let policies = self.policies.clone();
             let committed = self
                 .host
-                .initiate(now, |state| match advance_once(state, now) {
+                .initiate(now, |state| match advance_once(state, &policies, now) {
                     Ok(owed) => Ok(owed),
                     Err(error) => {
                         let carried = AgentChoreographyError::from(error.clone());
@@ -1861,66 +2067,75 @@ where
         Ok(transitions)
     }
 
-    /// Hands every effect the loop committed to its sink, then records that it
-    /// was dispatched.
+    /// Makes the loop's committed effects dispatchable, then hands every
+    /// dispatchable, unresolved effect to the sink.
     ///
-    /// A crash between the two re-drives the dispatch, which is idempotent on the
-    /// effect id; a crash before it leaves the effect owed in durable state.
-    /// Neither loses an effect, and neither dispatches one twice — which is why
-    /// shard movement cannot make an effect dispatchable twice
+    /// The ordering is the fence's foundation: the transition that marks an
+    /// effect `Ready` commits **before** any sink write for it starts, so a
+    /// `Pending` effect has provably never reached the outbox and a
+    /// cancellation can fence it in place with nothing abandoned
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). The
+    /// price is that `Ready` does not prove the sink write landed — so the
+    /// flush re-drives the idempotent write for every `Ready` effect until a
+    /// result resolves it. The sink deduplicates on the dispatch ticket id,
+    /// which is why neither a crash between the two steps nor shard movement
+    /// can dispatch one generation twice
     /// ([specification 15](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// A **terminal** run dispatches nothing: every terminating transition either
-    /// quiesced first or committed no pending effect, so this fence is defense in
-    /// depth against a pending effect surviving into a terminal record — external
-    /// work whose result the run could only refuse. A **cancelling** run, by
-    /// contrast, still flushes here: an effect it committed before the wind-down
-    /// was decided and paid for then, and an interrupted flush may already have
-    /// reached the sink, so completing the idempotent dispatch and recording its
-    /// result is the only path to quiescence that neither abandons work nor
-    /// loses its outcome ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
-    /// What cancellation fences is *new* effects, which
-    /// [`AgentRunStatus::permits_progress`] denies to every loop transition.
+    /// A run that is winding down — cancelled, or stopped by a failed effect —
+    /// flushes nothing: handing a fenced run's effect to the outbox would be
+    /// exactly the new dispatch the fence forbids. Work that already reached
+    /// the dispatch layer settles truthfully there.
     async fn dispatch_effects(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
-        if self
-            .state()?
-            .status()
-            .is_some_and(AgentRunStatus::is_terminal)
-        {
+        let fenced = {
+            let state = self.state()?;
+            state.status().is_none_or(AgentRunStatus::is_terminal)
+                || state.run().is_some_and(|run| run.terminal_reason.is_some())
+                || state.status() == Some(AgentRunStatus::Cancelling)
+        };
+        if fenced {
             return Ok(0);
         }
+
         let pending = self
             .state()?
             .loop_state()
             .map(AgentLoopState::undispatched_effects)
             .unwrap_or_default();
-        if pending.is_empty() {
-            return Ok(0);
-        }
 
-        let mut dispatched = Vec::with_capacity(pending.len());
-        for effect in &pending {
-            let record = effect.to_workflow_effect(&self.scope);
-            self.effects.dispatch(&self.scope, &record).await?;
-            dispatched.push(effect.effect_id.clone());
-        }
-
-        self.host
-            .initiate(now, |state| {
-                if let Some(run) = state.run.as_mut() {
-                    for effect_id in &dispatched {
-                        if let Some(effect) = run.loop_state.effect_mut(effect_id) {
-                            if effect.is_pending() {
-                                effect.mark_dispatched(now);
+        if !pending.is_empty() {
+            let pending_ids: Vec<AgentEffectId> = pending
+                .iter()
+                .map(|effect| effect.effect_id.clone())
+                .collect();
+            self.host
+                .initiate(now, |state| {
+                    if let Some(run) = state.run.as_mut() {
+                        for effect_id in &pending_ids {
+                            if let Some(effect) = run.loop_state.effect_mut(effect_id) {
+                                if effect.is_pending() {
+                                    effect.mark_ready(now);
+                                }
                             }
                         }
                     }
-                }
-                state.updated_at = now;
-                Ok(Vec::new())
-            })
-            .await?;
-        Ok(dispatched.len())
+                    state.updated_at = now;
+                    Ok(Vec::new())
+                })
+                .await?;
+        }
+
+        let ready = self
+            .state()?
+            .loop_state()
+            .map(AgentLoopState::ready_effects)
+            .unwrap_or_default();
+        for effect in &ready {
+            let record = effect.to_workflow_effect(&self.scope);
+            self.effects.dispatch(&self.scope, &record).await?;
+        }
+
+        Ok(pending.len())
     }
 
     /// Runs one bounded command transition and records its resolved operation id
@@ -2006,17 +2221,41 @@ pub struct AgentRunProgress {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentRunEntityCommand {
-    /// The durable result the dispatcher returned for one effect
+    /// The durable result the dispatcher returned for one effect generation
     /// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md): the
     /// dispatcher performs bounded I/O and returns a durable result command
-    /// through the inbox).
+    /// through the inbox). It carries the effect id, generation, attempt, and
+    /// lease fence, as [specification 11.4](../../../docs/plans/rakka-agent/spec.md)
+    /// requires; the run refuses a result whose generation it has passed.
     RecordEffectResult {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
         /// The effect the result answers.
         effect_id: AgentEffectId,
+        /// The generation the result answers for.
+        generation: AgentEffectGeneration,
+        /// The dispatch attempt that produced the result.
+        attempt: u32,
+        /// The lease fencing token of that attempt; zero for an in-process
+        /// driver that holds no fleet lease.
+        fence: u64,
         /// What the dispatcher found.
         outcome: Box<AgentRunEffectOutcome>,
+    },
+    /// An explicit reconciliation decision on an indeterminate effect
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md),
+    /// [12.5](../../../docs/plans/rakka-agent/spec.md)). Slice 1.10 wraps this
+    /// command in the reconciliation checkpoint; the effect-layer semantics
+    /// live here.
+    ResolveIndeterminateEffect {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The parked effect.
+        effect_id: AgentEffectId,
+        /// The generation the decision resolves.
+        generation: AgentEffectGeneration,
+        /// The decision.
+        resolution: Box<AgentEffectResolution>,
     },
     /// Request cancellation of the run.
     Cancel {
@@ -2034,9 +2273,9 @@ impl AgentRunEntityCommand {
     #[must_use]
     pub const fn operation_id(&self) -> Option<&AgentOperationId> {
         match self {
-            Self::RecordEffectResult { operation_id, .. } | Self::Cancel { operation_id, .. } => {
-                Some(operation_id)
-            }
+            Self::RecordEffectResult { operation_id, .. }
+            | Self::ResolveIndeterminateEffect { operation_id, .. }
+            | Self::Cancel { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -2168,9 +2407,12 @@ where
         router: AgentExchangeRouter,
         clock: AgentRunClock,
         policy: AgentSchemaPolicy,
+        effect_policies: AgentEffectPolicies,
     ) -> Self {
         let entity = AgentRunScope::from_entity_id(entity_id).map(|scope| {
-            AgentRunEntityStore::new(scope, store, effects).with_schema_policy(policy)
+            AgentRunEntityStore::new(scope, store, effects)
+                .with_schema_policy(policy)
+                .with_effect_policies(effect_policies)
         });
         Self {
             entity,
@@ -2261,6 +2503,7 @@ pub struct AgentRunEntityShardingSettings {
     buffer_config: Option<ShardBufferConfig>,
     passivation_buffer_duration: Duration,
     schema_policy: AgentSchemaPolicy,
+    effect_policies: AgentEffectPolicies,
     clock: AgentRunClock,
 }
 
@@ -2286,6 +2529,7 @@ impl AgentRunEntityShardingSettings {
             buffer_config: Some(ShardBufferConfig::default()),
             passivation_buffer_duration: DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION,
             schema_policy: AgentSchemaPolicy::default(),
+            effect_policies: AgentEffectPolicies::default(),
             clock: system_run_clock(),
         }
     }
@@ -2349,6 +2593,13 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub const fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
         self.schema_policy = policy;
+        self
+    }
+
+    /// Uses explicit effect specs for the effects hosted runs commit.
+    #[must_use]
+    pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
+        self.effect_policies = policies;
         self
     }
 }
@@ -2445,6 +2696,7 @@ where
     Effects: AgentRunEffectSink,
 {
     let schema_policy = settings.schema_policy;
+    let effect_policies = settings.effect_policies.clone();
     let clock = settings.clock.clone();
     let mut entity = Entity::of(settings.key.clone(), move |context: EntityContext<_>| {
         AgentRunEntity::new(
@@ -2454,6 +2706,7 @@ where
             router.clone(),
             clock.clone(),
             schema_policy,
+            effect_policies.clone(),
         )
     })
     .with_actor_options(settings.actor_options.clone())
@@ -2537,6 +2790,15 @@ pub enum AgentRunError {
         /// The status the run holds it under.
         status: AgentRunEffectStatus,
     },
+    /// A result arrived for a generation the run does not hold.
+    StaleEffectGeneration {
+        /// The effect the result named.
+        effect_id: AgentEffectId,
+        /// The generation the run holds.
+        held: AgentEffectGeneration,
+        /// The generation the result carried.
+        received: AgentEffectGeneration,
+    },
     /// The materialized run record would exceed its bound.
     MaterializedStateTooLarge {
         /// The size of the rejected record, in bytes.
@@ -2562,6 +2824,7 @@ impl AgentRunError {
             Self::Terminal { .. } => "run-terminal",
             Self::UnknownEffect { .. } => "run-unknown-effect",
             Self::StaleEffectResult { .. } => "run-stale-effect-result",
+            Self::StaleEffectGeneration { .. } => "run-stale-effect-generation",
             Self::MaterializedStateTooLarge { .. } => "run-state-too-large",
         }
     }
@@ -2591,6 +2854,15 @@ impl Display for AgentRunError {
             Self::StaleEffectResult { effect_id, status } => write!(
                 f,
                 "a result arrived for effect {effect_id}, which this run already resolved as {status}"
+            ),
+            Self::StaleEffectGeneration {
+                effect_id,
+                held,
+                received,
+            } => write!(
+                f,
+                "a result arrived for generation {received} of effect {effect_id}, but this run \
+                 holds generation {held}"
             ),
             Self::MaterializedStateTooLarge { bytes, maximum } => write!(
                 f,
@@ -2674,7 +2946,8 @@ impl From<AgentRunError> for AgentChoreographyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definition::AgentTaskDefinitionId;
+    use crate::definition::{AgentCredentialBindingRef, AgentTaskDefinitionId};
+    use crate::effect::{AgentEffectSpec, AgentReconciliationProtocolRef};
     use crate::loop_runtime::CURRENT_AGENT_LOOP_ADAPTER_VERSION;
     use crate::model::{AgentModelTurn, AgentToolCallId, AgentToolCallRequest};
     use crate::schema::CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION;
@@ -2747,6 +3020,19 @@ mod tests {
             .begin_turn(Some("f".repeat(AGENT_RUN_DETAIL_MAX_LENGTH)));
         let turn = run.loop_state.turn();
 
+        // The spec below is deliberately maximal: a reconciliation protocol, a
+        // credential binding, and a timeout all enlarge the record, and the
+        // reserve must cover the largest intent a deployment can configure.
+        let spec = AgentEffectSpec::reconcileable(
+            AgentReconciliationProtocolRef::new("r".repeat(64)).expect("the protocol ref is valid"),
+            3,
+        )
+        .expect("the spec is valid")
+        .with_credential_binding(
+            AgentCredentialBindingRef::new("c".repeat(64)).expect("the binding ref is valid"),
+        )
+        .with_timeout_ms(60_000);
+
         // The context reference and the completed model effect of the turn.
         let context =
             AgentContextSnapshotRef::for_turn(&scope, turn).expect("the reference derives");
@@ -2759,10 +3045,12 @@ mod tests {
                 context,
                 profile: None,
             },
+            &spec,
+            AgentRevisionNumber::INITIAL,
             now,
         )
         .expect("the model effect derives");
-        model_effect.status = AgentRunEffectStatus::Completed;
+        model_effect.status = AgentRunEffectStatus::Succeeded;
         run.loop_state
             .record_effect(model_effect)
             .expect("the model effect records");
@@ -2802,6 +3090,8 @@ mod tests {
                 AgentRunEffectRequest::Tool {
                     call: Box::new(call.clone()),
                 },
+                &spec,
+                AgentRevisionNumber::INITIAL,
                 now,
             )
             .expect("the tool effect derives");

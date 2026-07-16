@@ -34,16 +34,28 @@
 //! rather than off a private script, so a turn a test scripts travels exactly the
 //! path a provider's turn travels; the dispatcher is generic over the adapter, so
 //! the Rig-backed adapter of [`crate::rig`] rides the same effect substrate under
-//! the `rig` feature. Slice 1.7 replaces this driver with the real dispatcher
-//! without changing the adapter contract.
+//! the `rig` feature.
+//!
+//! Slice 1.7 landed the real dispatch pipeline in [`crate::dispatch`] — the
+//! adapter contract did not change — plus the doubles that drive it here:
+//! [`InProcessRunResultDelivery`], [`RecordingToolExecutor`] (whose invocation
+//! log is the external system the recovery scenarios assert about),
+//! [`ScriptedReconciler`], [`ScriptedCredentialResolver`],
+//! [`SharedAtomicWorkflowClock`] for deliberate lease expiry, and
+//! [`KillSwitchProbe`], which kills a dispatch worker at an exact durable
+//! boundary. [`ScriptedDispatcher`] remains the lightweight in-process driver
+//! for tests that exercise the loop rather than the dispatch layer.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::{self, Debug};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
 use rakka_persistence::DurableStateStore;
 use serde::{Deserialize, Serialize};
+
+use rakka_agent_workflow::AgentEphemeralCredential;
 
 use crate::agent::AgentEntityState;
 use crate::choreography::{
@@ -53,10 +65,15 @@ use crate::choreography::{
     AgentExchangePayload, AgentExchangeResult, AgentExchangeRouter, AgentExchangeState,
     AgentExchangeTransition, AgentExchangeTransport,
 };
-use crate::definition::{AgentModelProfileId, AgentRevisionNumber};
+use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRevisionNumber};
+use crate::dispatch::{
+    AgentDispatchError, AgentDispatchFuture, AgentDispatchProbe, AgentDispatchToolExecutor,
+    AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
+    AgentReconciliationFinding, AgentRunResultDelivery,
+};
 use crate::effect::{
-    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
-    AgentRunEffectStatus,
+    AgentEffectPolicies, AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome,
+    AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus,
 };
 use crate::identity::{AgentOperationId, AgentRunScope};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
@@ -65,7 +82,9 @@ use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
 };
-use crate::run::{AgentRunEntityCommand, AgentRunEntityStore, AgentRunError, AgentRunState};
+use crate::run::{
+    AgentRunEntityCommand, AgentRunEntityReply, AgentRunEntityStore, AgentRunError, AgentRunState,
+};
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::{
     AgentRunAcceptance, AgentRunAssignment, AgentTaskContent, AgentTaskEntityStore, AgentTaskError,
@@ -981,6 +1000,7 @@ where
     effects: Effects,
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
+    policies: AgentEffectPolicies,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     acceptances: Arc<AtomicUsize>,
 }
@@ -996,6 +1016,7 @@ where
             effects: self.effects.clone(),
             router: self.router.clone(),
             clock: self.clock.clone(),
+            policies: self.policies.clone(),
             faults: self.faults.clone(),
             acceptances: self.acceptances.clone(),
         }
@@ -1020,9 +1041,21 @@ where
             effects,
             router,
             clock,
+            policies: AgentEffectPolicies::default(),
             faults: Arc::new(Mutex::new(VecDeque::new())),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Uses explicit effect specs for the effects hosted runs commit.
+    ///
+    /// The transport settles the entities it delivers to, and a settle pass is
+    /// what commits the loop's effects — so the policies a test configures must
+    /// reach it here as well as on the entities the test drives directly.
+    #[must_use]
+    pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
+        self.policies = policies;
+        self
     }
 
     /// Queues a fault to inject into the next delivery.
@@ -1079,7 +1112,8 @@ where
             };
 
             let mut entity =
-                AgentRunEntityStore::new(scope, self.store.clone(), self.effects.clone());
+                AgentRunEntityStore::new(scope, self.store.clone(), self.effects.clone())
+                    .with_effect_policies(self.policies.clone());
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);
             let now = self.now();
@@ -1259,8 +1293,8 @@ fn model_request(
     request
 }
 
-/// The stand-in for the dispatcher of slice 1.7, driving effects through a model
-/// adapter.
+/// The in-process stand-in for the durable dispatch pipeline of
+/// [`crate::dispatch`], driving effects through a model adapter.
 ///
 /// It plays exactly the dispatcher's role and no other
 /// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)): it reads the
@@ -1274,12 +1308,14 @@ fn model_request(
 /// exact path a provider's turn travels, so the recovery this proves is the
 /// recovery production gets. It is generic over the adapter and defaults to
 /// [`DeterministicModelAdapter`], so the Rig-backed adapter of [`crate::rig`]
-/// rides the same substrate under the `rig` feature. Slice 1.7 replaces this
-/// driver with the real dispatcher; the adapter contract does not change.
+/// rides the same substrate under the `rig` feature. What it deliberately does
+/// not model is the dispatch layer itself — leases, fences, attempt retries,
+/// ambiguity recovery — which is [`crate::dispatch::AgentRunEffectDispatcher`]'s
+/// job and is tested against the real thing.
 ///
 /// An adapter error — a provider failure, or a turn that cannot be bounded — is
-/// returned as a failed effect, exactly as a real dispatcher surfaces one to the
-/// interim loop.
+/// returned as a failed effect: final for the generation, exactly as the real
+/// pipeline reports a definitive failure.
 #[derive(Debug, Clone)]
 pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     adapter: A,
@@ -1428,6 +1464,11 @@ where
             let command = AgentRunEntityCommand::RecordEffectResult {
                 operation_id: effect.result_operation_id(&scope)?,
                 effect_id: effect.effect_id.clone(),
+                generation: effect.generation,
+                attempt: effect.attempts.saturating_add(1),
+                // The in-process driver holds no fleet lease; the fence a real
+                // dispatcher carries is its claim's fencing token.
+                fence: 0,
                 outcome: Box::new(outcome),
             };
             entity.apply(command, router, now).await?;
@@ -1535,9 +1576,416 @@ fn dispatched_effects(state: &AgentLoopState) -> Vec<AgentRunEffect> {
     state
         .effects()
         .iter()
-        .filter(|effect| effect.status == AgentRunEffectStatus::Dispatched)
+        .filter(|effect| effect.status == AgentRunEffectStatus::Ready)
         .cloned()
         .collect()
+}
+
+/// Delivers dispatch-pipeline result commands to a real run entity over a
+/// shared durable store.
+///
+/// Every delivery re-materializes the entity from durable state alone — which
+/// is what a sharded ask looks like from the outside — and applies the command
+/// through the entity's full path, so the deduplication and fencing the
+/// pipeline relies on are the entity's own.
+pub struct InProcessRunResultDelivery<Store, Effects>
+where
+    Store: DurableStateStore<AgentRunState>,
+    Effects: AgentRunEffectSink,
+{
+    store: Store,
+    effects: Effects,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    policies: AgentEffectPolicies,
+}
+
+impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
+where
+    Store: DurableStateStore<AgentRunState>,
+    Effects: AgentRunEffectSink,
+{
+    /// Creates a delivery over one durable run store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        effects: Effects,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            effects,
+            router,
+            clock,
+            policies: AgentEffectPolicies::default(),
+        }
+    }
+
+    /// Uses explicit effect specs for the effects hosted runs commit.
+    #[must_use]
+    pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
+        self.policies = policies;
+        self
+    }
+}
+
+impl<Store, Effects> AgentRunResultDelivery for InProcessRunResultDelivery<Store, Effects>
+where
+    Store: DurableStateStore<AgentRunState>,
+    Effects: AgentRunEffectSink,
+{
+    fn deliver<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        command: AgentRunEntityCommand,
+    ) -> AgentDispatchFuture<'a, AgentRunEntityReply> {
+        Box::pin(async move {
+            let mut entity =
+                AgentRunEntityStore::new(scope.clone(), self.store.clone(), self.effects.clone())
+                    .with_effect_policies(self.policies.clone());
+            let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
+            entity
+                .apply(command, &self.router, now)
+                .await
+                .map_err(AgentDispatchError::from)
+        })
+    }
+}
+
+/// A tool executor that records every external invocation it performs.
+///
+/// The invocation log *is* the external system of the recovery scenarios: how
+/// many times a target committed is exactly what scenarios 5 through 9 assert
+/// about, and the recorded idempotency keys are what proves a retry reused the
+/// generation's external key.
+#[derive(Clone, Default)]
+pub struct RecordingToolExecutor {
+    results: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
+    failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
+    invocations: Arc<Mutex<Vec<RecordedToolInvocation>>>,
+}
+
+/// One external invocation a [`RecordingToolExecutor`] performed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedToolInvocation {
+    /// The tool that was invoked.
+    pub tool: String,
+    /// The call the model asked for.
+    pub call_id: String,
+    /// The idempotency key the target was handed.
+    pub idempotency_key: String,
+    /// The generation the attempt served.
+    pub generation: u32,
+    /// Whether a resolved credential accompanied the attempt.
+    pub with_credential: bool,
+}
+
+impl RecordingToolExecutor {
+    /// An executor with no scripted results: every tool echoes its name.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scripts the result one tool returns.
+    #[must_use]
+    pub fn with_result(self, tool: &str, content: AgentTaskContent) -> Self {
+        self.results
+            .lock()
+            .expect("the result script should not be poisoned")
+            .insert(tool.to_string(), content);
+        self
+    }
+
+    /// Scripts a failure one tool returns, however often it is invoked.
+    #[must_use]
+    pub fn with_failure(self, tool: &str, code: &str, message: &str) -> Self {
+        self.failures
+            .lock()
+            .expect("the failure script should not be poisoned")
+            .insert(tool.to_string(), (code.to_string(), message.to_string()));
+        self
+    }
+
+    /// Every external invocation performed, in order.
+    #[must_use]
+    pub fn invocations(&self) -> Vec<RecordedToolInvocation> {
+        self.invocations
+            .lock()
+            .expect("the invocation log should not be poisoned")
+            .clone()
+    }
+
+    /// How many external invocations one tool has performed.
+    #[must_use]
+    pub fn invocation_count(&self, tool: &str) -> usize {
+        self.invocations
+            .lock()
+            .expect("the invocation log should not be poisoned")
+            .iter()
+            .filter(|invocation| invocation.tool == tool)
+            .count()
+    }
+}
+
+impl Debug for RecordingToolExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordingToolExecutor")
+            .field("invocations", &self.invocations())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentDispatchToolExecutor for RecordingToolExecutor {
+    fn execute<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        call: &'a AgentToolCallRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent> {
+        let with_credential = credential.is_some();
+        Box::pin(async move {
+            let tool = call.tool.to_string();
+            // The commit happens before the failure check: a tool that fails
+            // may still have touched the external system, which is exactly the
+            // ambiguity the safety classes exist for.
+            self.invocations
+                .lock()
+                .expect("the invocation log should not be poisoned")
+                .push(RecordedToolInvocation {
+                    tool: tool.clone(),
+                    call_id: call.call_id.to_string(),
+                    idempotency_key: intent.idempotency_key.as_str().to_string(),
+                    generation: intent.generation.get(),
+                    with_credential,
+                });
+
+            if let Some((code, message)) = self
+                .failures
+                .lock()
+                .expect("the failure script should not be poisoned")
+                .get(&tool)
+                .cloned()
+            {
+                return Err(AgentDispatchError::collaborator(code, message));
+            }
+            Ok(self
+                .results
+                .lock()
+                .expect("the result script should not be poisoned")
+                .get(&tool)
+                .cloned()
+                .unwrap_or_else(|| {
+                    AgentTaskContent::inline(serde_json::json!({ "tool": tool }))
+                        .expect("the default tool result is inline-bounded")
+                }))
+        })
+    }
+}
+
+/// A reconciler that answers from a script, in order, and repeats its last
+/// answer when the script is spent.
+#[derive(Clone, Default)]
+pub struct ScriptedReconciler {
+    findings: Arc<Mutex<VecDeque<AgentReconciliationFinding>>>,
+    queries: Arc<AtomicUsize>,
+}
+
+impl ScriptedReconciler {
+    /// A reconciler whose every query answers `Unknown`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scripts the next finding.
+    #[must_use]
+    pub fn with_finding(self, finding: AgentReconciliationFinding) -> Self {
+        self.findings
+            .lock()
+            .expect("the finding script should not be poisoned")
+            .push_back(finding);
+        self
+    }
+
+    /// How many times a protocol was queried.
+    #[must_use]
+    pub fn queries(&self) -> usize {
+        self.queries.load(Ordering::SeqCst)
+    }
+}
+
+impl Debug for ScriptedReconciler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScriptedReconciler")
+            .field("queries", &self.queries())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentEffectReconciler for ScriptedReconciler {
+    fn reconcile<'a>(
+        &'a self,
+        _protocol: &'a AgentReconciliationProtocolRef,
+        _scope: &'a AgentRunScope,
+        _effect: &'a AgentRunEffect,
+    ) -> AgentDispatchFuture<'a, AgentReconciliationFinding> {
+        Box::pin(async move {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let mut findings = self
+                .findings
+                .lock()
+                .expect("the finding script should not be poisoned");
+            Ok(if findings.len() > 1 {
+                findings.pop_front().expect("the script is non-empty")
+            } else {
+                findings
+                    .front()
+                    .cloned()
+                    .unwrap_or(AgentReconciliationFinding::Unknown)
+            })
+        })
+    }
+}
+
+/// A credential resolver that returns a scripted ephemeral credential and
+/// counts its resolutions.
+///
+/// The count is what proves dispatch-time resolution *only*: exactly one
+/// resolution per dispatch attempt, none at commit time, none at recovery
+/// time, and the resolved value never appears in any durable record.
+#[derive(Clone)]
+pub struct ScriptedCredentialResolver {
+    token: String,
+    resolutions: Arc<AtomicUsize>,
+}
+
+impl ScriptedCredentialResolver {
+    /// A resolver that mints bearer credentials carrying `token`.
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            resolutions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// How many bindings have been resolved.
+    #[must_use]
+    pub fn resolutions(&self) -> usize {
+        self.resolutions.load(Ordering::SeqCst)
+    }
+}
+
+impl Debug for ScriptedCredentialResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScriptedCredentialResolver")
+            .field("resolutions", &self.resolutions())
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AgentEffectCredentialResolver for ScriptedCredentialResolver {
+    fn resolve<'a>(
+        &'a self,
+        _scope: &'a AgentRunScope,
+        _binding: &'a AgentCredentialBindingRef,
+        _effect: &'a AgentRunEffect,
+    ) -> AgentDispatchFuture<'a, AgentEphemeralCredential> {
+        Box::pin(async move {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            Ok(AgentEphemeralCredential::bearer_token(self.token.clone()))
+        })
+    }
+}
+
+/// A workflow clock over a shared atomic counter, so a test can advance time
+/// past a dispatch lease deliberately.
+///
+/// Reading it never advances it, which is what a clock must do when the
+/// dispatch pipeline consults it many times within one pass.
+#[derive(Clone, Debug)]
+pub struct SharedAtomicWorkflowClock(Arc<AtomicU64>);
+
+impl SharedAtomicWorkflowClock {
+    /// A clock over the given counter, shared with whatever else stamps time.
+    #[must_use]
+    pub const fn new(counter: Arc<AtomicU64>) -> Self {
+        Self(counter)
+    }
+
+    /// Advances the clock by `millis`.
+    pub fn advance(&self, millis: u64) {
+        self.0.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+impl rakka_agent_workflow::substrate::WorkflowClock for SharedAtomicWorkflowClock {
+    fn now(&self) -> rakka_agent_workflow::substrate::WorkflowTimestamp {
+        rakka_agent_workflow::substrate::WorkflowTimestamp::from_millis(
+            self.0.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// A probe that kills the dispatch worker at one armed window, once.
+///
+/// Arming a window makes the next attempt die exactly there — between the two
+/// durable writes the window sits between — and every later attempt survive,
+/// which is what lets one test run the crash and then the recovery over the
+/// same durable stores.
+#[derive(Clone, Default)]
+pub struct KillSwitchProbe {
+    armed: Arc<Mutex<Option<AgentDispatchWindow>>>,
+    deaths: Arc<AtomicUsize>,
+}
+
+impl KillSwitchProbe {
+    /// A probe that never kills anything.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Arms the probe: the next attempt dies at this window.
+    pub fn arm(&self, window: AgentDispatchWindow) {
+        *self
+            .armed
+            .lock()
+            .expect("the kill switch should not be poisoned") = Some(window);
+    }
+
+    /// How many times the probe has killed a worker.
+    #[must_use]
+    pub fn deaths(&self) -> usize {
+        self.deaths.load(Ordering::SeqCst)
+    }
+}
+
+impl Debug for KillSwitchProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KillSwitchProbe")
+            .field("deaths", &self.deaths())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentDispatchProbe for KillSwitchProbe {
+    fn survives(&self, window: AgentDispatchWindow) -> bool {
+        let mut armed = self
+            .armed
+            .lock()
+            .expect("the kill switch should not be poisoned");
+        if *armed == Some(window) {
+            *armed = None;
+            self.deaths.fetch_add(1, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
 }
 
 /// Materializes one run entity from durable state alone, exactly as a shard owner
@@ -1872,6 +2320,8 @@ mod tests {
             AgentRunEffectRequest::Tool {
                 call: Box::new(call),
             },
+            &crate::effect::AgentEffectSpec::non_idempotent(),
+            crate::definition::AgentRevisionNumber::INITIAL,
             AgentTimestampMillis::new(1),
         )
         .expect("the effect derives")
@@ -1918,6 +2368,8 @@ mod tests {
                 context,
                 profile: None,
             },
+            &crate::effect::AgentEffectSpec::read_only(),
+            crate::definition::AgentRevisionNumber::INITIAL,
             AgentTimestampMillis::new(1),
         )
         .expect("the effect derives")
