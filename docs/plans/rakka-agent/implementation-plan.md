@@ -555,7 +555,10 @@ Guidance: [Effect Safety Guidance](technical-guidance.md#effect-safety-guidance)
   recovery: the claim path reads the outbox row's status to distinguish a
   fresh ticket from an ambiguous one, re-reads the run's durable intent (which
   also rejects stale tickets without invocation), and applies the
-  safety-class table. The wind-down fence pass repairs only what no claim can
+  safety-class table. A `Reconcileable` intent treats a retry-scheduled row as
+  still ambiguous — a burned attempt proves nothing about what the prior
+  attempt did — so every one of its retries re-queries the protocol and
+  invokes only when proven absent. The wind-down fence pass repairs only what no claim can
   see — a ticket that never reached the outbox gets a tombstone row planted
   before its cancelled word is delivered, so a laggard flush racing the fence
   lands on a terminal row instead of creating dispatchable work post-fence.

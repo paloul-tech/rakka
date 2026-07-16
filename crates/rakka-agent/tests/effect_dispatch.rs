@@ -521,6 +521,66 @@ async fn a_reconcileable_effect_proven_absent_is_retried() {
     assert_eq!(run.status, AgentRunStatus::Completed);
 }
 
+#[tokio::test]
+async fn an_unknown_reconciliation_finding_is_requeried_before_any_retry() {
+    // The tool commits externally and the worker dies without a receipt, but
+    // the protocol cannot establish the outcome yet — the ledger has not
+    // ingested the attempt — and answers `Unknown`. Burning that attempt
+    // rewrites the outbox row to a retryable failure, which must not launder
+    // the ambiguity into a routine retry: the next claim queries the protocol
+    // *again*, and only its answer decides. Here the second query proves the
+    // invocation happened, so the target is never touched twice.
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let policies =
+        tool_policies(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
+    let reconciler = ScriptedReconciler::new()
+        .with_finding(AgentReconciliationFinding::Unknown)
+        .with_finding(AgentReconciliationFinding::Executed {
+            outcome: Box::new(AgentRunEffectOutcome::Tool {
+                call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+                content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-81" }))
+                    .expect("the content is inline-bounded"),
+            }),
+        });
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        policies,
+        RecordingToolExecutor::new(),
+        reconciler,
+    );
+    fx.start().await;
+
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert_eq!(fx.tools.invocation_count(TOOL), 1, "the target committed");
+
+    fx.expire_lease();
+    fx.pump().await;
+
+    // Queried twice — the `Unknown` answer deferred the decision, it never
+    // authorized anything — and the retry-scheduled row went back to the
+    // protocol instead of the target.
+    assert_eq!(
+        fx.reconciler.queries(),
+        2,
+        "the retry-scheduled row was reconciled again, not redispatched"
+    );
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "an attempt never proven absent is never re-invoked"
+    );
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 9: dispatcher loss in the ambiguous non-idempotent window produces
 // exactly one durable Indeterminate outcome and no automatic re-invocation.

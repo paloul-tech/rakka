@@ -34,10 +34,10 @@
 //! # Crash and timeout recovery per safety class
 //!
 //! The outbox row's status is the ambiguity marker. A row still `Scheduled`
-//! (or `RetryScheduled`) proves the lost worker never reached the invocation —
-//! `Dispatching` is committed first — so redispatch is safe for every class
-//! (scenario 5). A row found `Dispatching` under an expired lease means the
-//! invocation *may* have happened, and the class decides
+//! proves the lost worker never reached the invocation — `Dispatching` is
+//! committed first — so redispatch is safe for every class (scenario 5). A
+//! row found `Dispatching` under an expired lease means the invocation *may*
+//! have happened, and the class decides
 //! ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)):
 //!
 //! | Class | Recovery |
@@ -46,6 +46,14 @@
 //! | `Idempotent` | retry, reusing the generation's external idempotency key |
 //! | `Reconcileable` | query the protocol; retry only when proven absent |
 //! | `NonIdempotent` | one durable `Indeterminate`; never auto-retry |
+//!
+//! A retry-scheduled row proves only that no attempt is in flight *now* — a
+//! prior attempt may still have reached the target. A `ReadOnly` or
+//! `Idempotent` retry is safe by class; a `Reconcileable` retry re-queries
+//! the protocol first and invokes only when proven absent, so an `Unknown`
+//! finding burns an attempt without ever converting the ambiguity into a
+//! routine retry; and a `NonIdempotent` row is never retry-scheduled, because
+//! its validated single-attempt budget exhausts on the first failure.
 //!
 //! A parked `Indeterminate` generation revokes its own dispatch eligibility:
 //! the outbox row and fleet entry settle as cancelled, so no worker can ever
@@ -618,10 +626,6 @@ where
                 .await?;
             return Ok(ClaimConclusion::Settled);
         };
-        // `Dispatching` is the durable ambiguity marker: a previous attempt
-        // wrote its `Started` and disappeared, so the invocation may have
-        // happened ([specification 11.5]).
-        let ambiguous = row.status() == OutboxStatus::Dispatching;
         let attempt = row.attempts().attempts().saturating_add(1);
 
         // The run's durable intent is the source of truth for what this ticket
@@ -669,6 +673,19 @@ where
             .and_then(AgentRunState::run)
             .is_some_and(|run| run.terminal_reason.is_some() || run.status.is_terminal());
 
+        // `Dispatching` is the durable ambiguity marker: a previous attempt
+        // wrote its `Started` and disappeared, so the invocation may have
+        // happened ([specification 11.5]). A `Reconcileable` intent is
+        // ambiguous on a retry-scheduled row too: burning an attempt — for an
+        // ambiguous loss the protocol could not yet resolve, or a failure
+        // whose report may itself be wrong about the target — rewrites the
+        // row to a retryable failure without proving anything about what the
+        // prior attempt did, and a retry of this class is only ever safe when
+        // the protocol proves absence. So every non-first attempt re-queries
+        // before it may invoke.
+        let ambiguous = row.status() == OutboxStatus::Dispatching
+            || (row.status() == OutboxStatus::Failed
+                && intent.safety.class() == AgentEffectSafetyClass::Reconcileable);
         if ambiguous {
             return self
                 .recover_ambiguous(scope, claim, &intent, attempt, winding_down, pass)
@@ -1076,8 +1093,10 @@ where
                         )
                         .await;
                 }
-                // Burn an attempt and leave the row scheduled for a later
-                // query; a spent budget parks the generation.
+                // Burn an attempt and leave the row retry-scheduled. A
+                // `Reconcileable` row re-enters recovery as ambiguous, so the
+                // later claim queries the protocol again rather than
+                // invoking; a spent budget parks the generation.
                 let message_id = OutboxMessageId::new(claim.effect_id.as_str());
                 let mut inbox = self.inbox(scope);
                 inbox.recover().await?;
