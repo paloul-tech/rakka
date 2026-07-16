@@ -61,6 +61,7 @@ pub mod client;
 pub mod coordination;
 pub mod definition;
 pub mod delegation;
+pub mod dispatch;
 pub mod effect;
 pub mod evaluation;
 pub mod goal;
@@ -106,11 +107,22 @@ pub use choreography::{
     AGENT_EXCHANGE_LOG_CAPACITY, AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
     AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
+pub use dispatch::{
+    workflow_run_id, AgentDispatchError, AgentDispatchFuture, AgentDispatchPass,
+    AgentDispatchProbe, AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
+    AgentEffectCredentialResolver, AgentEffectReconciler, AgentReconciliationFinding,
+    AgentRunEffectDispatcher, AgentRunResultDelivery, WorkflowAgentRunEffectSink,
+};
 pub use effect::{
-    effect_id_for, AgentEffectError, AgentEffectFuture, AgentEffectGeneration, AgentEffectResult,
-    AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult, InMemoryAgentRunEffectSink,
-    AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES,
+    effect_id_for, external_idempotency_key_for, AgentEffectError, AgentEffectFuture,
+    AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution, AgentEffectResult,
+    AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
+    AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
+    AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
+    InMemoryAgentRunEffectSink, AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH,
+    AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES, ATTR_AGENT_EFFECT_ARGUMENT_DIGEST,
+    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID, ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL,
+    ATTR_AGENT_EFFECT_SAFETY_CLASS, ATTR_AGENT_EFFECT_SETTINGS_REVISION,
 };
 pub use loop_runtime::{
     AgentLoopPhase, AgentLoopState, AgentRunProposal, CURRENT_AGENT_LOOP_ADAPTER_VERSION,

@@ -225,6 +225,9 @@ async fn a_duplicate_effect_result_does_not_advance_the_loop_twice() {
             .result_operation_id(&run_scope())
             .expect("the result operation id is derivable"),
         effect_id: effect.effect_id.clone(),
+        generation: effect.generation,
+        attempt: 1,
+        fence: 0,
         outcome: Box::new(outcome.clone()),
     };
 
@@ -298,6 +301,9 @@ async fn a_stale_effect_result_is_refused_by_the_runs_own_fence() {
         AgentRunEntityCommand::RecordEffectResult {
             operation_id: first.result_operation_id(&run_scope()).expect("derivable"),
             effect_id: first.effect_id.clone(),
+            generation: first.generation,
+            attempt: 1,
+            fence: 0,
             outcome: Box::new(outcome.clone()),
         },
         &fx.router,
@@ -318,6 +324,9 @@ async fn a_stale_effect_result_is_refused_by_the_runs_own_fence() {
                 )
                 .expect("derivable"),
                 effect_id: first.effect_id.clone(),
+                generation: first.generation,
+                attempt: 1,
+                fence: 0,
                 outcome: Box::new(outcome),
             },
             &fx.router,
@@ -854,6 +863,9 @@ async fn cancelling_a_run_with_an_effect_in_flight_waits_for_it_and_does_not_res
         AgentRunEntityCommand::RecordEffectResult {
             operation_id: effect.result_operation_id(&run_scope()).expect("derivable"),
             effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: 1,
+            fence: 0,
             outcome: Box::new(fx.dispatcher.answer(&effect).await),
         },
         &fx.router,
@@ -874,14 +886,15 @@ async fn cancelling_a_run_with_an_effect_in_flight_waits_for_it_and_does_not_res
 }
 
 #[tokio::test]
-async fn a_cancelled_run_still_flushes_the_effect_it_committed_before_the_cancel() {
-    // The owner dies after committing the model effect but before flushing it
-    // to the sink, and cancellation arrives before recovery re-drives the
-    // flush. The effect is durably pending — decided and paid for before the
-    // fence, and an interrupted flush may already have reached the sink — so
-    // the wind-down must complete the idempotent dispatch and settle its
-    // result rather than strand the run in `Cancelling` forever. What the
-    // fence stops is *new* effects, not this one.
+async fn cancellation_fences_a_provably_unsent_effect_in_place() {
+    // The owner dies after committing the model effect but before the flush
+    // marked it dispatchable, and cancellation arrives before recovery
+    // re-drives anything. The effect is durably `Pending` — and `Pending`
+    // *proves* it never reached the sink, because the flush hands an effect
+    // over only after the transition that marked it `Ready` committed. The
+    // acceptance of the cancellation may therefore fence it in the same
+    // compare-and-set ([specification 8.7]): nothing was invoked, nothing is
+    // abandoned, and nothing may be dispatched after the fence.
     let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
     fx.instantiate_agent().await;
 
@@ -900,8 +913,8 @@ async fn a_cancelled_run_still_flushes_the_effect_it_committed_before_the_cancel
         "the committed effect never reached the sink"
     );
 
-    // Cancellation arrives first. The run quiesces, and its settle pass still
-    // flushes the effect it had already committed.
+    // Cancellation arrives before any settle pass. The unsent effect is fenced
+    // in the same transition, so the run has nothing left to wait for.
     let mut run = fx.run();
     let now = fx.now();
     run.recover(now).await.expect("recover");
@@ -920,32 +933,34 @@ async fn a_cancelled_run_still_flushes_the_effect_it_committed_before_the_cancel
     .await
     .expect("cancellation applies");
 
-    let cancelling = run.snapshot().expect("snapshot").expect("the run exists");
-    assert_eq!(cancelling.status, AgentRunStatus::Cancelling);
+    let run_snapshot = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run_snapshot.status, AgentRunStatus::Cancelled);
+    assert_eq!(run_snapshot.phase, AgentLoopPhase::Complete);
     assert_eq!(
-        fx.dispatched_effects(),
-        1,
-        "the effect committed before the fence still flushes"
-    );
-
-    // Its result comes back, is recorded rather than refused, and the wind-down
-    // finishes with the operator's reason.
-    fx.dispatcher
-        .drive(&mut run, &fx.router, fx.now())
-        .await
-        .expect("the result applies");
-
-    let run = fx.run_snapshot().await.expect("the run exists");
-    assert_eq!(run.status, AgentRunStatus::Cancelled);
-    assert_eq!(run.phase, AgentLoopPhase::Complete);
-    assert_eq!(
-        run.terminal_reason.expect("the reason is recorded").code(),
+        run_snapshot
+            .terminal_reason
+            .expect("the reason is recorded")
+            .code(),
         "cancellation-requested"
     );
-    // The crash also lost the acceptance reply, so the task never learned the
-    // run accepted: it still holds the assignment exchange outstanding. The run
-    // being cancelled does not complete or fail the task either way.
-    assert_eq!(fx.task_snapshot().await.status, AgentTaskStatus::Assigned);
+
+    // No settle pass — before or after the fence — may hand the fenced effect
+    // to the sink: dispatching it now would be exactly the new external work
+    // the fence forbids.
+    fx.pump().await.expect("nothing further moves");
+    assert_eq!(
+        fx.dispatched_effects(),
+        0,
+        "a fenced effect is never dispatched after the cancellation"
+    );
+    assert_eq!(fx.dispatcher.model_calls(), 0, "the model was never called");
+
+    // The crash lost the acceptance reply, so the task re-drives its
+    // assignment exchange during the pump and the run answers with the
+    // acceptance it already recorded. The run being cancelled neither
+    // completes nor fails the task: that consequence belongs to a later
+    // decision, not to the cancellation.
+    assert_eq!(fx.task_snapshot().await.status, AgentTaskStatus::InProgress);
 }
 
 #[tokio::test]

@@ -14,20 +14,11 @@
 //! its outcome is resolved, so cancellation is never terminal before then.
 //!
 //! Specification: sections 11.1 through 11.6, with the cancellation clauses of
-//! 8.7. The full state machine is filled by slice 1.7 over the
-//! `rakka-agent-workflow` dispatcher and effect bridge.
+//! 8.7. Slice 1.5 landed the interim record; slice 1.7 filled the machine and
+//! integrated it with the `rakka-agent-workflow` dispatcher through
+//! [`crate::dispatch`].
 //!
-//! # The interim effect, landed by slice 1.5
-//!
-//! The durable loop cannot exist without *some* durable effect, because
-//! [specification 9.5](../../../docs/plans/rakka-agent/spec.md) requires a run
-//! transition to persist the next effect or wait before it returns. Slice 1.5
-//! lands exactly that much and no more: [`AgentRunEffect`], the record a run
-//! commits when it decides to call a model or a tool, and
-//! [`AgentRunEffectSink`], which hands it to the existing agent-workflow
-//! `AgentEffect` outbox for dispatch.
-//!
-//! ## Why the record lives in the run's own state
+//! # Why the record lives in the run's own state
 //!
 //! The effect is a field of the run's durable state, committed by the very
 //! transition that decided it — *not* a second write to the agent-workflow
@@ -39,23 +30,27 @@
 //! effect nobody will ever dispatch. With the effect in the run's own record
 //! there is no such window — recovery finds it in [`AgentRunEffect::is_pending`]
 //! and re-drives the dispatch, which is idempotent on
-//! [`AgentRunEffect::effect_id`].
+//! [`AgentRunEffect::dispatch_ticket_id`].
 //!
 //! The agent-workflow outbox stays exactly where it belongs: the *sink* that
-//! performs the bounded external I/O and returns a durable result command
-//! through the inbox.
+//! carries the dispatch ticket for the bounded external I/O, whose result
+//! returns as a durable command.
 //!
-//! ## What slice 1.7 adds
+//! # The machine, as landed by slice 1.7
 //!
-//! [`AgentRunEffectStatus`] is deliberately the smallest status set a durable
-//! wait needs, and it is *not* the effect state machine of
-//! [specification 11.3](../../../docs/plans/rakka-agent/spec.md). Slice 1.7
-//! retrofits that machine onto this record: the safety classes, the durable
-//! `Started` with its lease and fence, the `Indeterminate` outcome and its
-//! transition to `WaitingForReconciliation`, and stale-result rejection by
-//! generation. [`AgentRunEffect::generation`] and
-//! [`AgentRunEffect::attempts`] are here from the first commit so that machine
-//! is an addition to the record rather than a rewrite of it.
+//! [`AgentRunEffect`] is the durable effect intent of
+//! [specification 11.1](../../../docs/plans/rakka-agent/spec.md): identity and
+//! generation, safety record with external idempotency key or reconciliation
+//! protocol, canonical argument digest, settings revision, timeout, credential
+//! *binding* (never a resolved value), and the request itself.
+//! [`AgentRunEffectStatus`] is the run-side half of the
+//! [specification 11.3](../../../docs/plans/rakka-agent/spec.md) status
+//! machine — see its documentation for the exact split with the dispatch
+//! layer, which owns durable `Started` (outbox `Dispatching` plus the fleet
+//! lease and fencing token) and `RetryScheduled`. Crash and timeout recovery
+//! per safety class, and the reconciliation that resolves an
+//! [`AgentRunEffectStatus::Indeterminate`] generation, live in
+//! [`crate::dispatch`] and [`crate::run`].
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -67,12 +62,15 @@ use std::sync::{Arc, Mutex};
 use rakka_agent_workflow::{
     AgentCausationId, AgentCorrelationId, AgentEffect, AgentEffectKind, AgentEffectStatus,
     AgentEffectTarget, AgentIdempotencyKey, AgentTelemetryContext, AgentTimestampMillis,
-    StateSchemaVersion,
+    StateSchemaVersion, AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
 use rakka_agent_workflow::{AgentDeduplicationKey, AgentEffectId};
 use serde::{Deserialize, Serialize};
 
-use crate::definition::AgentModelProfileId;
+use crate::definition::{
+    AgentCredentialBindingRef, AgentEffectSafetyClass, AgentModelProfileId, AgentRevisionNumber,
+    AgentToolId,
+};
 use crate::identity::{AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunScope};
 use crate::memory::AgentContextSnapshotRef;
 use crate::model::{AgentModelTurn, AgentToolCallId, AgentToolCallRequest};
@@ -80,7 +78,7 @@ use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
 };
-use crate::task::{AgentTaskContent, AgentTaskError};
+use crate::task::{AgentContentDigest, AgentTaskContent, AgentTaskError};
 
 /// Most effects one run may have outstanding at once.
 ///
@@ -105,11 +103,12 @@ pub type AgentEffectFuture<'a, T> = Pin<Box<dyn Future<Output = AgentEffectResul
 /// Monotonic dispatch generation of one effect
 /// ([specification 11.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// Slice 1.5 only ever mints the first generation. It is persisted from the
-/// first commit because slice 1.7's reconciliation depends on it: an operator
-/// who proves that an ambiguous invocation never happened causes a *new*
-/// generation, and a result carrying a generation the run has passed is refused
-/// rather than applied.
+/// A generation is one authorization to invoke: retries stay within it, and
+/// only a reconciliation decision that proves the previous invocation never
+/// happened mints the next one ([`AgentEffectResolution::ConfirmedNotExecuted`]).
+/// A result carrying a generation the run has passed is refused rather than
+/// applied, and each generation is its own dispatch ticket, attempt budget,
+/// and — for an idempotent effect — external idempotency key.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -143,6 +142,446 @@ impl Display for AgentEffectGeneration {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         Display::fmt(&self.0, f)
     }
+}
+
+/// Largest external idempotency key, in bytes.
+pub const AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH: usize = 512;
+
+/// The idempotency key handed to an external target so a repeated invocation is
+/// safe ([specification 11.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It is derived from the effect's identity *and its generation*: every retry
+/// within one generation reuses it — which is the whole point of the
+/// `Idempotent` safety class ([specification 11.4](../../../docs/plans/rakka-agent/spec.md))
+/// — while a new generation, minted only when an operator proves the previous
+/// invocation never happened, presents a fresh key for what is genuinely a new
+/// invocation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AgentExternalIdempotencyKey(String);
+
+impl AgentExternalIdempotencyKey {
+    /// Creates a key, rejecting an empty or oversized value.
+    pub fn new(value: impl Into<String>) -> AgentEffectResult<Self> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(AgentEffectError::InvalidPolicy {
+                message: "an external idempotency key must not be empty".to_string(),
+            });
+        }
+        if value.len() > AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH {
+            return Err(AgentEffectError::InvalidPolicy {
+                message: format!(
+                    "an external idempotency key may hold at most \
+                     {AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH} bytes"
+                ),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// The key value handed to the target.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for AgentExternalIdempotencyKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentExternalIdempotencyKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+crate::identity::validated_id! {
+    /// Opaque reference to the application-owned protocol that can establish
+    /// the authoritative outcome of an ambiguous `Reconcileable` attempt
+    /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Rakka persists and routes the reference; the application owns the
+    /// protocol behind it. The dispatch pipeline resolves it through an
+    /// [`crate::dispatch::AgentEffectReconciler`].
+    pub AgentReconciliationProtocolRef, "agent_reconciliation_protocol_ref"
+}
+
+/// The full effect-safety record of one effect intent
+/// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// [`crate::definition::AgentEffectSafetyClass`] is the bare discriminant a
+/// tool *declares*; this record is what one committed effect *carries*: the
+/// `Idempotent` class is only meaningful with the external key a retry must
+/// reuse, and the `Reconcileable` class only with the protocol that can
+/// establish an ambiguous attempt's outcome. The declaration is trusted
+/// definition/setup/deployment data — model output can never choose or
+/// downgrade it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentEffectSafety {
+    /// The effect does not change external state.
+    ReadOnly,
+    /// Re-invocation with the same external idempotency key is safe.
+    Idempotent {
+        /// The key every retry of this generation must reuse.
+        external_key: AgentExternalIdempotencyKey,
+    },
+    /// The outcome of an ambiguous attempt can be established by an
+    /// application-owned reconciliation protocol.
+    Reconcileable {
+        /// The protocol that establishes the authoritative outcome.
+        protocol: AgentReconciliationProtocolRef,
+    },
+    /// An ambiguous attempt can be neither safely retried nor mechanically
+    /// reconciled. Its recovery is a human decision.
+    NonIdempotent,
+}
+
+impl AgentEffectSafety {
+    /// The bare safety-class discriminant.
+    #[must_use]
+    pub const fn class(&self) -> AgentEffectSafetyClass {
+        match self {
+            Self::ReadOnly => AgentEffectSafetyClass::ReadOnly,
+            Self::Idempotent { .. } => AgentEffectSafetyClass::Idempotent,
+            Self::Reconcileable { .. } => AgentEffectSafetyClass::Reconcileable,
+            Self::NonIdempotent => AgentEffectSafetyClass::NonIdempotent,
+        }
+    }
+
+    /// The external idempotency key, when the class carries one.
+    #[must_use]
+    pub const fn external_key(&self) -> Option<&AgentExternalIdempotencyKey> {
+        match self {
+            Self::Idempotent { external_key } => Some(external_key),
+            _ => None,
+        }
+    }
+
+    /// The reconciliation protocol, when the class carries one.
+    #[must_use]
+    pub const fn reconciliation_protocol(&self) -> Option<&AgentReconciliationProtocolRef> {
+        match self {
+            Self::Reconcileable { protocol } => Some(protocol),
+            _ => None,
+        }
+    }
+}
+
+/// What one committed effect is permitted to do about failure and ambiguity:
+/// its safety class, its reconciliation protocol, its credential binding, its
+/// timeout, and its attempt bound
+/// ([specification 11.1](../../../docs/plans/rakka-agent/spec.md): "safety
+/// class and retry/reconciliation policy").
+///
+/// The spec is *class-level*: the constructor derives the per-generation
+/// external idempotency key when the class is `Idempotent`, because the key is
+/// a function of the effect's identity and generation, which the spec cannot
+/// know. [`Self::validate`] runs where a spec enters — construction,
+/// deserialization, and the effect constructor — so an unenforceable
+/// combination never reaches a durable record: a `NonIdempotent` spec
+/// permitting a retry would override the ambiguity rule of
+/// [specification 11.4](../../../docs/plans/rakka-agent/spec.md), and a
+/// `Reconcileable` spec without a protocol could never be reconciled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentEffectSpec {
+    /// The declared safety class.
+    pub safety_class: AgentEffectSafetyClass,
+    /// Most dispatch attempts one generation may make, its first included.
+    pub max_attempts: u32,
+    /// The reconciliation protocol; required exactly when the class is
+    /// `Reconcileable`.
+    pub reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    /// The logical credential binding a dispatch attempt may resolve. Never a
+    /// resolved value ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+    pub credential_binding: Option<AgentCredentialBindingRef>,
+    /// Timeout for one dispatch attempt, in milliseconds.
+    pub timeout_ms: Option<u64>,
+}
+
+impl AgentEffectSpec {
+    /// A single read-only attempt: the conservative default for a model call.
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            safety_class: AgentEffectSafetyClass::ReadOnly,
+            max_attempts: 1,
+            reconciliation_protocol: None,
+            credential_binding: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// A single non-idempotent attempt: the fail-closed default for a tool the
+    /// deployment has not classified.
+    #[must_use]
+    pub const fn non_idempotent() -> Self {
+        Self {
+            safety_class: AgentEffectSafetyClass::NonIdempotent,
+            max_attempts: 1,
+            reconciliation_protocol: None,
+            credential_binding: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// The spec a model retry policy declares
+    /// ([`crate::model::AgentModelRetryPolicy`]; open decision 4).
+    ///
+    /// A `Reconcileable` model policy needs the protocol that reconciles a
+    /// model call, so it must be supplied; the other classes carry nothing.
+    pub fn for_model_policy(
+        policy: crate::model::AgentModelRetryPolicy,
+        reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    ) -> AgentEffectResult<Self> {
+        let spec = Self {
+            safety_class: policy.safety_class,
+            max_attempts: policy.max_attempts,
+            reconciliation_protocol,
+            credential_binding: None,
+            timeout_ms: None,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Sets the attempt bound.
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> AgentEffectResult<Self> {
+        self.max_attempts = max_attempts;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Binds the effect's dispatch to a logical credential reference.
+    #[must_use]
+    pub fn with_credential_binding(mut self, binding: AgentCredentialBindingRef) -> Self {
+        self.credential_binding = Some(binding);
+        self
+    }
+
+    /// Sets the per-attempt timeout.
+    #[must_use]
+    pub const fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Declares a reconcileable spec with its protocol.
+    pub fn reconcileable(
+        protocol: AgentReconciliationProtocolRef,
+        max_attempts: u32,
+    ) -> AgentEffectResult<Self> {
+        let spec = Self {
+            safety_class: AgentEffectSafetyClass::Reconcileable,
+            max_attempts,
+            reconciliation_protocol: Some(protocol),
+            credential_binding: None,
+            timeout_ms: None,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Declares an idempotent spec; the external key is derived per effect
+    /// generation by the effect constructor.
+    pub fn idempotent(max_attempts: u32) -> AgentEffectResult<Self> {
+        let spec = Self {
+            safety_class: AgentEffectSafetyClass::Idempotent,
+            max_attempts,
+            reconciliation_protocol: None,
+            credential_binding: None,
+            timeout_ms: None,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Rejects a spec the crash-and-timeout rules could not honor
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md),
+    /// [11.5](../../../docs/plans/rakka-agent/spec.md)).
+    pub fn validate(&self) -> AgentEffectResult<()> {
+        if self.max_attempts == 0 {
+            return Err(AgentEffectError::InvalidPolicy {
+                message: "an effect spec must permit at least one attempt".to_string(),
+            });
+        }
+        if self.safety_class == AgentEffectSafetyClass::NonIdempotent && self.max_attempts > 1 {
+            return Err(AgentEffectError::InvalidPolicy {
+                message: "a non-idempotent effect may not be auto-retried after ambiguity"
+                    .to_string(),
+            });
+        }
+        match (self.safety_class, &self.reconciliation_protocol) {
+            (AgentEffectSafetyClass::Reconcileable, None) => {
+                return Err(AgentEffectError::InvalidPolicy {
+                    message: "a reconcileable effect must name its reconciliation protocol"
+                        .to_string(),
+                })
+            }
+            (AgentEffectSafetyClass::Reconcileable, Some(_)) => {}
+            (_, Some(_)) => {
+                return Err(AgentEffectError::InvalidPolicy {
+                    message: "only a reconcileable effect may name a reconciliation protocol"
+                        .to_string(),
+                })
+            }
+            (_, None) => {}
+        }
+        Ok(())
+    }
+
+    /// Builds the full safety record for one effect generation, deriving the
+    /// external idempotency key where the class calls for one.
+    fn safety_for(
+        &self,
+        scope: &AgentRunScope,
+        turn: u64,
+        slot: usize,
+        generation: AgentEffectGeneration,
+    ) -> AgentEffectResult<AgentEffectSafety> {
+        Ok(match self.safety_class {
+            AgentEffectSafetyClass::ReadOnly => AgentEffectSafety::ReadOnly,
+            AgentEffectSafetyClass::Idempotent => AgentEffectSafety::Idempotent {
+                external_key: external_idempotency_key_for(scope, turn, slot, generation)?,
+            },
+            AgentEffectSafetyClass::Reconcileable => AgentEffectSafety::Reconcileable {
+                protocol: self.reconciliation_protocol.clone().ok_or_else(|| {
+                    AgentEffectError::InvalidPolicy {
+                        message: "a reconcileable effect must name its reconciliation protocol"
+                            .to_string(),
+                    }
+                })?,
+            },
+            AgentEffectSafetyClass::NonIdempotent => AgentEffectSafety::NonIdempotent,
+        })
+    }
+}
+
+/// The wire shape of [`AgentEffectSpec`], validated on load.
+#[derive(Deserialize)]
+struct AgentEffectSpecRecord {
+    safety_class: AgentEffectSafetyClass,
+    max_attempts: u32,
+    #[serde(default)]
+    reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    #[serde(default)]
+    credential_binding: Option<AgentCredentialBindingRef>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for AgentEffectSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let record = AgentEffectSpecRecord::deserialize(deserializer)?;
+        let spec = Self {
+            safety_class: record.safety_class,
+            max_attempts: record.max_attempts,
+            reconciliation_protocol: record.reconciliation_protocol,
+            credential_binding: record.credential_binding,
+            timeout_ms: record.timeout_ms,
+        };
+        spec.validate().map_err(serde::de::Error::custom)?;
+        Ok(spec)
+    }
+}
+
+/// The effect specs a run stamps onto the effects its transitions commit.
+///
+/// This is the interim registration surface of
+/// [specification 11.2](../../../docs/plans/rakka-agent/spec.md) ("the
+/// registered tool or adapter supplies the permitted safety declaration"):
+/// deployment configuration on the run entity, keyed by tool. Slice 1.8's tool
+/// registry replaces the map without changing the effect record. The defaults
+/// fail safe: a model call is one read-only attempt, and a tool the deployment
+/// has not classified is non-idempotent — an ambiguous loss parks it for
+/// reconciliation rather than guessing that a retry is harmless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEffectPolicies {
+    model: AgentEffectSpec,
+    tools: BTreeMap<AgentToolId, AgentEffectSpec>,
+    default_tool: AgentEffectSpec,
+}
+
+impl AgentEffectPolicies {
+    /// The fail-safe defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            model: AgentEffectSpec::read_only(),
+            tools: BTreeMap::new(),
+            default_tool: AgentEffectSpec::non_idempotent(),
+        }
+    }
+
+    /// Sets the spec model calls dispatch under.
+    pub fn with_model_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.model = spec;
+        Ok(self)
+    }
+
+    /// Registers the spec one tool's calls dispatch under.
+    pub fn with_tool_spec(
+        mut self,
+        tool: AgentToolId,
+        spec: AgentEffectSpec,
+    ) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.tools.insert(tool, spec);
+        Ok(self)
+    }
+
+    /// Sets the spec unclassified tools dispatch under.
+    pub fn with_default_tool_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.default_tool = spec;
+        Ok(self)
+    }
+
+    /// The spec one request dispatches under.
+    #[must_use]
+    pub fn spec_for(&self, request: &AgentRunEffectRequest) -> &AgentEffectSpec {
+        match request {
+            AgentRunEffectRequest::Model { .. } => &self.model,
+            AgentRunEffectRequest::Tool { call } => {
+                self.tools.get(&call.tool).unwrap_or(&self.default_tool)
+            }
+        }
+    }
+}
+
+impl Default for AgentEffectPolicies {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Derives the external idempotency key of one effect generation.
+///
+/// Within a generation the derivation is pure, so every retry hands the target
+/// the same key ([specification 11.4](../../../docs/plans/rakka-agent/spec.md));
+/// a new generation — minted only after an operator proves the previous
+/// invocation never happened — derives a fresh one.
+pub fn external_idempotency_key_for(
+    scope: &AgentRunScope,
+    turn: u64,
+    slot: usize,
+    generation: AgentEffectGeneration,
+) -> AgentEffectResult<AgentExternalIdempotencyKey> {
+    let effect_id = effect_id_for(scope, turn, slot)?;
+    AgentExternalIdempotencyKey::new(format!("{}#g{generation}", effect_id.as_str()))
 }
 
 /// What one effect calls.
@@ -182,26 +621,56 @@ impl Display for AgentRunEffectKind {
     }
 }
 
-/// Where one effect stands in the interim dispatch cycle.
+/// Where one effect generation stands, as the run's own durable record holds
+/// it ([specification 11.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// It is the smallest status set a durable wait needs, not the effect state
-/// machine of [specification 11.3](../../../docs/plans/rakka-agent/spec.md).
-/// Notably there is no `Indeterminate` here, and there must not be: an
-/// indeterminate outcome is only *meaningful* alongside a safety class, and
-/// inventing one before slice 1.7 defines what may be retried would let an
-/// ambiguous effect look routine.
+/// The specification's effect state model spans two durable layers, and this
+/// enum is the run-side half. The run's record owns the states the *run*
+/// transitions through; the dispatch layer's durable records — the
+/// agent-workflow outbox entry and the dispatcher-fleet entry with its lease
+/// and fencing token — own the attempt-level states between `Ready` and a
+/// terminal outcome:
+///
+/// | Specification 11.3 | Durable record |
+/// | --- | --- |
+/// | `Pending` | here: committed, provably not yet handed to the sink |
+/// | `Ready` | here: handed to the durable outbox, dispatchable |
+/// | `Started` | outbox `Dispatching` + fleet lease/fence, before invocation |
+/// | `RetryScheduled` | outbox/fleet `RetryScheduled` |
+/// | `Succeeded` … `Cancelled` | here: the generation's terminal outcome |
+///
+/// `Pending` is load-bearing: an effect is handed to the sink only *after* the
+/// transition that marked it [`Self::Ready`] committed, so a `Pending` effect
+/// has provably never reached the outbox — which is what lets a cancellation
+/// fence it in place without risking the abandonment of an invocation that
+/// might already be running ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// `Succeeded`, `Failed`, `Exhausted`, `Indeterminate`, and `Cancelled` are
+/// terminal **for one generation**. `Indeterminate` alone does not release the
+/// run: the outcome is unknown, so the effect still blocks the run's
+/// settlement until an explicit reconciliation decision resolves it — and a
+/// decision that the invocation never happened mints a *new* generation rather
+/// than mutating this one back into a routine retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentRunEffectStatus {
-    /// Committed by a run transition and not yet handed to the sink.
+    /// Committed by a run transition and provably not yet handed to the sink.
     Pending,
-    /// Handed to the sink; the run is waiting for its durable result command.
-    Dispatched,
-    /// The dispatcher returned a result.
-    Completed,
-    /// The dispatcher returned a failure.
+    /// Handed to the durable outbox; the dispatch layer owns the attempt.
+    Ready,
+    /// The generation produced its bounded result.
+    Succeeded,
+    /// The generation failed definitively.
     Failed,
+    /// The generation's retry budget was spent without a result.
+    Exhausted,
+    /// The generation's outcome is unknowable mechanically; an explicit
+    /// reconciliation decision is owed
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    Indeterminate,
+    /// The generation was fenced before any invocation could have happened.
+    Cancelled,
 }
 
 impl AgentRunEffectStatus {
@@ -210,26 +679,51 @@ impl AgentRunEffectStatus {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Dispatched => "dispatched",
-            Self::Completed => "completed",
+            Self::Ready => "ready",
+            Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Exhausted => "exhausted",
+            Self::Indeterminate => "indeterminate",
+            Self::Cancelled => "cancelled",
         }
     }
 
-    /// Whether the run is still waiting on this effect.
+    /// Whether the run is still waiting on this effect's result.
     #[must_use]
     pub const fn is_outstanding(self) -> bool {
-        matches!(self, Self::Pending | Self::Dispatched)
+        matches!(self, Self::Pending | Self::Ready)
     }
 
-    /// The agent-workflow status this dispatches as.
+    /// Whether the generation has a terminal outcome.
+    #[must_use]
+    pub const fn is_resolved(self) -> bool {
+        !self.is_outstanding()
+    }
+
+    /// Whether the effect blocks the run from becoming terminal.
+    ///
+    /// An outstanding effect does, and so does an [`Self::Indeterminate`] one:
+    /// its outcome is unknown, and a run that went terminal over it would
+    /// abandon work whose consequences may be real
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md),
+    /// [11.5](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub const fn blocks_settlement(self) -> bool {
+        self.is_outstanding() || matches!(self, Self::Indeterminate)
+    }
+
+    /// The agent-workflow status this projects as.
     #[must_use]
     pub const fn workflow_status(self) -> AgentEffectStatus {
         match self {
-            Self::Pending => AgentEffectStatus::Scheduled,
-            Self::Dispatched => AgentEffectStatus::Dispatching,
-            Self::Completed => AgentEffectStatus::Completed,
-            Self::Failed => AgentEffectStatus::Failed,
+            Self::Pending | Self::Ready => AgentEffectStatus::Scheduled,
+            Self::Succeeded => AgentEffectStatus::Completed,
+            // The workflow substrate has no indeterminate status; the run's
+            // record is authoritative, and an indeterminate generation is
+            // never projected for dispatch.
+            Self::Failed | Self::Indeterminate => AgentEffectStatus::Failed,
+            Self::Exhausted => AgentEffectStatus::Exhausted,
+            Self::Cancelled => AgentEffectStatus::Cancelled,
         }
     }
 }
@@ -288,6 +782,21 @@ impl AgentRunEffectRequest {
         }
     }
 
+    /// Canonical fingerprint of the request
+    /// ([specification 11.1](../../../docs/plans/rakka-agent/spec.md): the
+    /// intent's canonical argument digest).
+    ///
+    /// The digest is computed over the request's canonical JSON encoding, so
+    /// two structurally equal requests always fingerprint alike. It is a
+    /// content fingerprint, not a security boundary; slice 1.10's digest-bound
+    /// grants add a cryptographic algorithm.
+    pub fn argument_digest(&self) -> AgentEffectResult<AgentContentDigest> {
+        let value = serde_json::to_value(self).map_err(|error| AgentEffectError::Model {
+            message: format!("the effect request could not be encoded: {error}"),
+        })?;
+        Ok(AgentContentDigest::of_json(&value))
+    }
+
     /// The dispatch target this request names.
     #[must_use]
     pub fn target(&self) -> AgentEffectTarget {
@@ -310,13 +819,21 @@ impl AgentRunEffectRequest {
     }
 }
 
-/// One effect a run committed and is waiting on
-/// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md): the loop
-/// state's pending effect references).
+/// One effect a run committed: its durable effect intent and where its current
+/// generation stands
+/// ([specification 11.1](../../../docs/plans/rakka-agent/spec.md),
+/// [9.4](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// It is a component of the run's durable state, written by the transition that
 /// decided it. See the module documentation for why it cannot be a second write
-/// to the agent-workflow outbox instead.
+/// to the agent-workflow outbox instead. The identity fields specification 11.1
+/// requires — tenant, goal, task, agent, run — are the surrounding record's:
+/// the effect lives inside [`crate::run::AgentRunState`], whose scope and loop
+/// state carry them, and [`Self::to_workflow_effect`] stamps them onto the
+/// self-contained dispatch ticket. A resolved credential appears nowhere: the
+/// record carries only the logical binding reference, resolved inside the
+/// dispatcher's bounded attempt
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentRunEffect {
     schema_version: StateSchemaVersion,
@@ -332,15 +849,36 @@ pub struct AgentRunEffect {
     pub slot: usize,
     /// What the effect asks its target to do.
     pub request: AgentRunEffectRequest,
-    /// Where the effect stands.
+    /// The full safety record of the current generation
+    /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md)).
+    pub safety: AgentEffectSafety,
+    /// Most dispatch attempts the current generation may make.
+    pub max_attempts: u32,
+    /// Canonical fingerprint of the request, so a grant or an operator can tell
+    /// that the arguments a decision was made about are the arguments being
+    /// dispatched ([specification 11.1](../../../docs/plans/rakka-agent/spec.md)).
+    pub argument_digest: AgentContentDigest,
+    /// The settings revision the effect was committed under.
+    pub settings_revision: AgentRevisionNumber,
+    /// The logical credential binding a dispatch attempt may resolve.
+    pub credential_binding: Option<AgentCredentialBindingRef>,
+    /// Timeout for one dispatch attempt, in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Deadline after which the effect must not be dispatched.
+    pub deadline_at: Option<AgentTimestampMillis>,
+    /// Where the current generation stands.
     pub status: AgentRunEffectStatus,
-    /// The idempotency key handed to the target.
+    /// The idempotency key handed to the target: the external key when the
+    /// safety class carries one, the derived internal key otherwise.
     pub idempotency_key: AgentIdempotencyKey,
-    /// How many dispatch attempts have been made.
+    /// Dispatch attempts of the current generation, as last reported by the
+    /// dispatch layer.
     pub attempts: u32,
+    /// The lease fencing token of the last reported attempt.
+    pub last_fence: Option<u64>,
     /// When the deciding transition committed it.
     pub created_at: AgentTimestampMillis,
-    /// When it was last handed to the sink.
+    /// When the current generation was handed to the sink.
     pub dispatched_at: Option<AgentTimestampMillis>,
     /// Stable code of the last dispatch or execution failure.
     pub last_error_code: Option<String>,
@@ -358,20 +896,34 @@ impl AgentRunEffect {
         turn: u64,
         slot: usize,
         request: AgentRunEffectRequest,
+        spec: &AgentEffectSpec,
+        settings_revision: AgentRevisionNumber,
         created_at: AgentTimestampMillis,
     ) -> AgentEffectResult<Self> {
+        spec.validate()?;
         let effect_id = effect_id_for(scope, turn, slot)?;
-        let idempotency_key = AgentIdempotencyKey::new(effect_id.as_str());
+        let generation = AgentEffectGeneration::FIRST;
+        let safety = spec.safety_for(scope, turn, slot, generation)?;
+        let idempotency_key = idempotency_key_for(&effect_id, &safety);
+        let argument_digest = request.argument_digest()?;
         Ok(Self {
             schema_version: CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
             effect_id,
-            generation: AgentEffectGeneration::FIRST,
+            generation,
             turn,
             slot,
             request,
+            safety,
+            max_attempts: spec.max_attempts,
+            argument_digest,
+            settings_revision,
+            credential_binding: spec.credential_binding.clone(),
+            timeout_ms: spec.timeout_ms,
+            deadline_at: None,
             status: AgentRunEffectStatus::Pending,
             idempotency_key,
             attempts: 0,
+            last_fence: None,
             created_at,
             dispatched_at: None,
             last_error_code: None,
@@ -396,11 +948,62 @@ impl AgentRunEffect {
         self.status.is_outstanding()
     }
 
-    /// Records that the effect was handed to the sink.
-    pub fn mark_dispatched(&mut self, now: AgentTimestampMillis) {
-        self.status = AgentRunEffectStatus::Dispatched;
-        self.attempts = self.attempts.saturating_add(1);
+    /// Whether this effect blocks the run from becoming terminal.
+    #[must_use]
+    pub const fn blocks_settlement(&self) -> bool {
+        self.status.blocks_settlement()
+    }
+
+    /// Marks the effect dispatchable, *before* any sink write for it may start.
+    ///
+    /// The ordering is the invariant: the sink is written only after the
+    /// transition that committed `Ready`, so a `Pending` effect has provably
+    /// never reached the outbox and can be fenced in place by a cancellation.
+    pub fn mark_ready(&mut self, now: AgentTimestampMillis) {
+        self.status = AgentRunEffectStatus::Ready;
         self.dispatched_at = Some(now);
+    }
+
+    /// Records the attempt and fence a durable result command carried
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)).
+    pub fn record_attempt(&mut self, attempt: u32, fence: u64) {
+        self.attempts = self.attempts.max(attempt);
+        self.last_fence = Some(fence);
+    }
+
+    /// Begins the next generation after an operator proved the previous
+    /// invocation never happened
+    /// ([specification 11.3](../../../docs/plans/rakka-agent/spec.md): "if a
+    /// new invocation is authorized, it uses a new effect generation").
+    ///
+    /// The generation is a fresh dispatchable intent: attempts reset, the
+    /// external idempotency key is re-derived, and the superseded generation's
+    /// result operation can never answer for it.
+    pub fn begin_next_generation(
+        &mut self,
+        scope: &AgentRunScope,
+        now: AgentTimestampMillis,
+    ) -> AgentEffectResult<()> {
+        self.generation = self.generation.next();
+        self.safety = match &self.safety {
+            AgentEffectSafety::Idempotent { .. } => AgentEffectSafety::Idempotent {
+                external_key: external_idempotency_key_for(
+                    scope,
+                    self.turn,
+                    self.slot,
+                    self.generation,
+                )?,
+            },
+            other => other.clone(),
+        };
+        self.idempotency_key = idempotency_key_for(&self.effect_id, &self.safety);
+        self.status = AgentRunEffectStatus::Pending;
+        self.attempts = 0;
+        self.last_fence = None;
+        self.dispatched_at = None;
+        self.last_error_code = None;
+        self.created_at = now;
+        Ok(())
     }
 
     /// The stable operation id of the command that returns this effect's result.
@@ -435,27 +1038,80 @@ impl AgentRunEffect {
         )
     }
 
-    /// Projects the effect onto the agent-workflow outbox record that dispatches
-    /// it.
+    /// The identity of the outbox row that dispatches the current generation.
     ///
-    /// The projection is deterministic and carries no credential: the outbox row
-    /// names *what* to call and under which idempotency key, and the dispatcher
-    /// resolves the credential inside its own bounded attempt
-    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)).
+    /// It folds the generation in, so a re-authorized invocation is a *new*
+    /// dispatch ticket with its own attempt lifecycle, and the superseded
+    /// generation's terminal row can never be redispatched on its behalf.
+    #[must_use]
+    pub fn dispatch_ticket_id(&self) -> AgentEffectId {
+        AgentEffectId::new(format!("{}#g{}", self.effect_id.as_str(), self.generation))
+    }
+
+    /// Projects the effect onto the agent-workflow outbox record that dispatches
+    /// it: the self-contained dispatch ticket.
+    ///
+    /// The projection is deterministic and carries no credential: the ticket
+    /// names *what* to call, under which idempotency key, and under which
+    /// logical credential binding, and the dispatcher resolves the binding
+    /// inside its own bounded attempt
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)). The
+    /// intent metadata the run's record holds — the run-side effect id, the
+    /// generation, the safety class, the settings revision, the argument
+    /// digest — rides in the target attributes, so the dispatch layer can
+    /// reject a stale ticket without reaching into the run's state format.
     #[must_use]
     pub fn to_workflow_effect(&self, scope: &AgentRunScope) -> AgentEffect {
+        let ticket_id = self.dispatch_ticket_id();
+        let mut target = self.request.target();
+        target.attributes.insert(
+            ATTR_AGENT_EFFECT_ID.to_string(),
+            self.effect_id.as_str().to_string(),
+        );
+        target.attributes.insert(
+            ATTR_AGENT_EFFECT_GENERATION.to_string(),
+            self.generation.to_string(),
+        );
+        target.attributes.insert(
+            ATTR_AGENT_EFFECT_SAFETY_CLASS.to_string(),
+            self.safety.class().as_label().to_string(),
+        );
+        target.attributes.insert(
+            ATTR_AGENT_EFFECT_SETTINGS_REVISION.to_string(),
+            self.settings_revision.to_string(),
+        );
+        target.attributes.insert(
+            ATTR_AGENT_EFFECT_MAX_ATTEMPTS.to_string(),
+            self.max_attempts.to_string(),
+        );
+        target.attributes.insert(
+            ATTR_AGENT_EFFECT_ARGUMENT_DIGEST.to_string(),
+            self.argument_digest.to_string(),
+        );
+        if let Some(protocol) = self.safety.reconciliation_protocol() {
+            target.attributes.insert(
+                ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL.to_string(),
+                protocol.as_str().to_string(),
+            );
+        }
+        if let Some(binding) = &self.credential_binding {
+            target.attributes.insert(
+                AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE.to_string(),
+                binding.as_str().to_string(),
+            );
+        }
         AgentEffect {
-            effect_id: self.effect_id.clone(),
-            deduplication_key: AgentDeduplicationKey::new(self.effect_id.as_str()),
+            effect_id: ticket_id.clone(),
+            deduplication_key: AgentDeduplicationKey::new(ticket_id.as_str()),
             kind: self.kind().workflow_kind(),
-            target: self.request.target(),
+            target,
             status: self.status.workflow_status(),
             payload_ref: None,
             result_ref: None,
-            timeout_ms: None,
+            timeout_ms: self.timeout_ms,
             idempotency_key: self.idempotency_key.clone(),
             expected_result_type: Some(self.kind().as_label().to_string()),
-            causation_id: AgentCausationId::new(self.effect_id.as_str()),
+            causation_id: AgentCausationId::new(ticket_id.as_str()),
             correlation_id: AgentCorrelationId::new(scope.key()),
             telemetry_context: AgentTelemetryContext::default(),
             attempt: self.attempts,
@@ -463,6 +1119,33 @@ impl AgentRunEffect {
             due_at: None,
             last_error_code: self.last_error_code.clone(),
         }
+    }
+}
+
+/// Dispatch-ticket attribute naming the run-side effect id.
+pub const ATTR_AGENT_EFFECT_ID: &str = "agent_effect_id";
+/// Dispatch-ticket attribute naming the effect generation.
+pub const ATTR_AGENT_EFFECT_GENERATION: &str = "agent_effect_generation";
+/// Dispatch-ticket attribute naming the safety class.
+pub const ATTR_AGENT_EFFECT_SAFETY_CLASS: &str = "agent_effect_safety_class";
+/// Dispatch-ticket attribute naming the settings revision.
+pub const ATTR_AGENT_EFFECT_SETTINGS_REVISION: &str = "agent_effect_settings_revision";
+/// Dispatch-ticket attribute naming the generation's attempt bound.
+pub const ATTR_AGENT_EFFECT_MAX_ATTEMPTS: &str = "agent_effect_max_attempts";
+/// Dispatch-ticket attribute carrying the canonical argument digest.
+pub const ATTR_AGENT_EFFECT_ARGUMENT_DIGEST: &str = "agent_effect_argument_digest";
+/// Dispatch-ticket attribute naming the reconciliation protocol.
+pub const ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL: &str = "agent_effect_reconciliation_protocol";
+
+/// The idempotency key the dispatch ticket hands to the target: the external
+/// key when the safety class carries one, the derived internal key otherwise.
+fn idempotency_key_for(
+    effect_id: &AgentEffectId,
+    safety: &AgentEffectSafety,
+) -> AgentIdempotencyKey {
+    match safety.external_key() {
+        Some(external) => AgentIdempotencyKey::new(external.as_str()),
+        None => AgentIdempotencyKey::new(effect_id.as_str()),
     }
 }
 
@@ -498,12 +1181,16 @@ pub fn effect_id_for(
     Ok(AgentEffectId::new(operation.into_string()))
 }
 
-/// What a dispatcher returned for one effect.
+/// What a dispatcher returned for one effect generation — always final for
+/// that generation.
 ///
 /// It is the durable result command of
 /// [specification 9.5](../../../docs/plans/rakka-agent/spec.md): the dispatcher
 /// performs the bounded I/O and returns *this* through the inbox. The run never
-/// awaits a model or a tool inside a handler.
+/// awaits a model or a tool inside a handler. Attempt-level retries never reach
+/// the run: the dispatch layer retries under the effect's own policy and
+/// reports only the generation's terminal outcome
+/// ([specification 11.3](../../../docs/plans/rakka-agent/spec.md)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -522,27 +1209,63 @@ pub enum AgentRunEffectOutcome {
         /// The bounded result content.
         content: AgentTaskContent,
     },
-    /// The dispatcher could not complete the effect.
+    /// The generation failed definitively.
     Failed {
         /// Stable machine-readable code.
         code: String,
         /// Human-readable detail.
         message: String,
     },
+    /// The generation's retry budget was spent without a result.
+    Exhausted {
+        /// Stable machine-readable code of the last failure.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// An attempt may have invoked the target and its outcome cannot be
+    /// established mechanically. The run must park for reconciliation
+    /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    Indeterminate {
+        /// Stable machine-readable code describing the ambiguity.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// The generation was fenced and settled without invocation.
+    Cancelled {
+        /// A bounded reason.
+        reason: String,
+    },
 }
 
 impl AgentRunEffectOutcome {
-    /// Whether the effect completed rather than failed.
+    /// Whether the effect produced its bounded result.
     #[must_use]
     pub const fn is_completed(&self) -> bool {
-        !matches!(self, Self::Failed { .. })
+        matches!(self, Self::Model { .. } | Self::Tool { .. })
     }
 
-    /// Stable failure code, when the effect failed.
+    /// The run-side status this outcome resolves the generation to.
+    #[must_use]
+    pub const fn resolved_status(&self) -> AgentRunEffectStatus {
+        match self {
+            Self::Model { .. } | Self::Tool { .. } => AgentRunEffectStatus::Succeeded,
+            Self::Failed { .. } => AgentRunEffectStatus::Failed,
+            Self::Exhausted { .. } => AgentRunEffectStatus::Exhausted,
+            Self::Indeterminate { .. } => AgentRunEffectStatus::Indeterminate,
+            Self::Cancelled { .. } => AgentRunEffectStatus::Cancelled,
+        }
+    }
+
+    /// Stable failure code, when the effect failed, exhausted, or became
+    /// indeterminate.
     #[must_use]
     pub fn failure_code(&self) -> Option<&str> {
         match self {
-            Self::Failed { code, .. } => Some(code),
+            Self::Failed { code, .. }
+            | Self::Exhausted { code, .. }
+            | Self::Indeterminate { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -579,7 +1302,60 @@ impl AgentRunEffectOutcome {
                 }
                 Ok(())
             }
-            Self::Failed { .. } => Ok(()),
+            Self::Failed { .. }
+            | Self::Exhausted { .. }
+            | Self::Indeterminate { .. }
+            | Self::Cancelled { .. } => Ok(()),
+        }
+    }
+}
+
+/// An explicit decision on an [`AgentRunEffectStatus::Indeterminate`] effect
+/// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md),
+/// [12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// There is deliberately no generic `Retry`: an ambiguous effect is never
+/// mutated back into a routine attempt. The decision either records the
+/// outcome that was established, or proves the invocation never happened — and
+/// only the latter authorizes a new effect generation. Slice 1.10 wraps this
+/// decision in the reconciliation checkpoint record; the run-side semantics
+/// land here because the effect layer must already refuse to guess.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentEffectResolution {
+    /// The invocation happened, and this is its established outcome.
+    ConfirmedExecuted {
+        /// The authoritative outcome: a completed result or a definitive
+        /// failure. An indeterminate or cancelled outcome is refused — it
+        /// would not resolve anything.
+        outcome: Box<AgentRunEffectOutcome>,
+    },
+    /// The invocation provably never happened. A new effect generation is
+    /// authorized where the run still wants the work.
+    ConfirmedNotExecuted,
+}
+
+impl AgentEffectResolution {
+    /// Rejects a resolution that resolves nothing.
+    pub fn validate(&self) -> AgentEffectResult<()> {
+        match self {
+            Self::ConfirmedExecuted { outcome } => {
+                outcome.validate()?;
+                if matches!(
+                    outcome.as_ref(),
+                    AgentRunEffectOutcome::Indeterminate { .. }
+                        | AgentRunEffectOutcome::Cancelled { .. }
+                ) {
+                    return Err(AgentEffectError::InvalidPolicy {
+                        message: "a reconciliation decision must establish an outcome; an \
+                                  indeterminate or cancelled outcome resolves nothing"
+                            .to_string(),
+                    });
+                }
+                Ok(())
+            }
+            Self::ConfirmedNotExecuted => Ok(()),
         }
     }
 }
@@ -723,6 +1499,12 @@ pub enum AgentEffectError {
         /// The maximum number of outstanding effects.
         maximum: usize,
     },
+    /// An effect spec, safety record, or reconciliation decision could not be
+    /// honored by the crash-and-timeout rules.
+    InvalidPolicy {
+        /// What made it unenforceable.
+        message: String,
+    },
     /// The effect sink rejected a dispatch.
     Sink {
         /// Stable machine-readable code.
@@ -743,6 +1525,7 @@ impl AgentEffectError {
             Self::ToolResultTooLarge { .. } => "effect-tool-result-too-large",
             Self::ContentTooLarge { .. } => "effect-content-too-large",
             Self::PendingOverflow { .. } => "effect-pending-overflow",
+            Self::InvalidPolicy { .. } => "effect-policy-invalid",
             Self::Sink { .. } => "effect-sink-failed",
         }
     }
@@ -770,6 +1553,9 @@ impl Display for AgentEffectError {
                 f,
                 "a run may not hold more than {maximum} outstanding effects"
             ),
+            Self::InvalidPolicy { message } => {
+                write!(f, "the effect policy cannot be honored: {message}")
+            }
             Self::Sink { code, message } => {
                 write!(f, "the effect sink rejected a dispatch ({code}): {message}")
             }
@@ -820,16 +1606,19 @@ mod tests {
     use crate::identity::{AgentId, AgentRunId, TenantId};
     use crate::memory::AgentContextSnapshotRef;
 
-    #[test]
-    fn the_result_operation_id_folds_in_the_dispatch_generation() {
-        let scope = AgentRunScope::new(
+    fn scope() -> AgentRunScope {
+        AgentRunScope::new(
             TenantId::new("acme"),
             AgentId::new("support").expect("the agent id is valid"),
             AgentRunId::new("t-gen-1").expect("the run id is valid"),
         )
-        .expect("the scope is valid");
+        .expect("the scope is valid")
+    }
+
+    fn model_effect(spec: &AgentEffectSpec) -> AgentRunEffect {
+        let scope = scope();
         let context = AgentContextSnapshotRef::for_turn(&scope, 1).expect("the reference derives");
-        let mut effect = AgentRunEffect::new(
+        AgentRunEffect::new(
             &scope,
             1,
             0,
@@ -837,9 +1626,17 @@ mod tests {
                 context,
                 profile: None,
             },
+            spec,
+            AgentRevisionNumber::INITIAL,
             AgentTimestampMillis::new(1),
         )
-        .expect("the effect derives");
+        .expect("the effect derives")
+    }
+
+    #[test]
+    fn the_result_operation_id_folds_in_the_dispatch_generation() {
+        let scope = scope();
+        let mut effect = model_effect(&AgentEffectSpec::read_only());
 
         // Within one generation the derivation is pure: a redelivered result is
         // the same operation, and the run's log answers it once.
@@ -853,7 +1650,7 @@ mod tests {
                 .expect("the operation id derives")
         );
 
-        // A later generation is a different operation entirely: slice 1.7's
+        // A later generation is a different operation entirely: the
         // reconciliation re-dispatch must not be answered from the log entry a
         // superseded attempt left behind.
         effect.generation = effect.generation.next();
@@ -861,5 +1658,114 @@ mod tests {
             .result_operation_id(&scope)
             .expect("the operation id derives");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn an_unenforceable_effect_spec_is_refused_where_it_enters() {
+        // Zero attempts.
+        assert_eq!(
+            AgentEffectSpec::idempotent(0)
+                .expect_err("zero attempts is refused")
+                .code(),
+            "effect-policy-invalid"
+        );
+        // A retry bound never overrides the non-idempotent ambiguity rule.
+        assert_eq!(
+            AgentEffectSpec::non_idempotent()
+                .with_max_attempts(2)
+                .expect_err("a non-idempotent retry is refused")
+                .code(),
+            "effect-policy-invalid"
+        );
+        // A reconcileable spec without its protocol could never be reconciled.
+        let missing = AgentEffectSpec {
+            safety_class: AgentEffectSafetyClass::Reconcileable,
+            max_attempts: 1,
+            reconciliation_protocol: None,
+            credential_binding: None,
+            timeout_ms: None,
+        };
+        assert_eq!(
+            missing
+                .validate()
+                .expect_err("a protocol-less reconcileable spec is refused")
+                .code(),
+            "effect-policy-invalid"
+        );
+        // Deserialization applies the same gate, so an unenforceable spec can
+        // neither cross the wire nor load from a durable record.
+        let encoded = serde_json::to_value(&missing).expect("the spec serializes");
+        serde_json::from_value::<AgentEffectSpec>(encoded)
+            .expect_err("an unenforceable spec is refused on load");
+    }
+
+    #[test]
+    fn a_new_generation_is_a_fresh_dispatch_ticket_with_a_fresh_external_key() {
+        let scope = scope();
+        let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+        let mut effect = model_effect(&spec);
+        let first_ticket = effect.dispatch_ticket_id();
+        let first_key = effect
+            .safety
+            .external_key()
+            .expect("an idempotent effect carries its external key")
+            .clone();
+
+        effect.status = AgentRunEffectStatus::Indeterminate;
+        effect
+            .begin_next_generation(&scope, AgentTimestampMillis::new(2))
+            .expect("the next generation begins");
+
+        // The identity is stable; the ticket, key, and attempt budget are new.
+        assert_eq!(effect.generation, AgentEffectGeneration::new(2));
+        assert_ne!(effect.dispatch_ticket_id(), first_ticket);
+        assert_ne!(
+            effect
+                .safety
+                .external_key()
+                .expect("the new generation carries a key"),
+            &first_key
+        );
+        assert_eq!(effect.status, AgentRunEffectStatus::Pending);
+        assert_eq!(effect.attempts, 0);
+    }
+
+    #[test]
+    fn the_dispatch_ticket_carries_the_intent_metadata_and_no_credential() {
+        let scope = scope();
+        let spec = AgentEffectSpec::read_only().with_credential_binding(
+            AgentCredentialBindingRef::new("model-provider").expect("the binding ref is valid"),
+        );
+        let effect = model_effect(&spec);
+        let ticket = effect.to_workflow_effect(&scope);
+
+        let attributes = &ticket.target.attributes;
+        assert_eq!(
+            attributes.get(ATTR_AGENT_EFFECT_ID).map(String::as_str),
+            Some(effect.effect_id.as_str())
+        );
+        assert_eq!(
+            attributes
+                .get(ATTR_AGENT_EFFECT_GENERATION)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            attributes
+                .get(ATTR_AGENT_EFFECT_SAFETY_CLASS)
+                .map(String::as_str),
+            Some("read-only")
+        );
+        assert_eq!(
+            attributes
+                .get(AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE)
+                .map(String::as_str),
+            Some("model-provider")
+        );
+        // The ticket names the binding, never a resolved value: nothing in its
+        // encoding may look like secret material, and the intent record itself
+        // has no field to hold one.
+        let encoded = serde_json::to_string(&ticket).expect("the ticket serializes");
+        assert!(!encoded.contains("secret"));
     }
 }
