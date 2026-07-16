@@ -36,13 +36,19 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
 
 use rakka_agent_workflow::StateSchemaVersion;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::definition::{AgentModelProfileId, AgentRevisionNumber, AgentToolId};
+use crate::definition::{
+    AgentEffectSafetyClass, AgentModelProfileId, AgentRevisionNumber, AgentSamplingSettings,
+    AgentToolId,
+};
 use crate::identity::validated_id;
+use crate::memory::AgentContextSnapshotRef;
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, VersionedAgentRecord,
     CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION,
@@ -347,7 +353,247 @@ impl<'de> Deserialize<'de> for AgentModelTurn {
     }
 }
 
-/// Rejection of a model turn that cannot be bounded or interpreted.
+/// The bounded, provider-neutral request one model turn is computed from
+/// ([specification 10.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It is what [`AgentModelAdapter::call`] receives: the immutable context the
+/// call is prepared against, the model profile and sampling the settings
+/// revision selected, and the turn it serves. It is the "bounded model request"
+/// of the model contract — an input the adapter maps onto whatever a provider
+/// expects, never a provider type itself.
+///
+/// It carries no resolved credential and no secret material. The credential a
+/// model call may need is named by the agent's definition and resolved inside
+/// the dispatcher's bounded attempt, never here
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelRequest {
+    /// The immutable context the call is prepared against.
+    ///
+    /// It is opaque and versioned for now; slice 1.11 gives it the
+    /// `MemoryContextSnapshot` content of
+    /// [specification 13.5](../../../docs/plans/rakka-agent/spec.md) without
+    /// moving this reference. A retry of the model effect reuses the same
+    /// reference, so drift in a memory store or a retrieval index cannot change
+    /// a retried input.
+    pub context: AgentContextSnapshotRef,
+    /// The model profile the settings revision selected, when one is selected.
+    pub profile: Option<AgentModelProfileId>,
+    /// The bounded sampling parameters resolved for this turn.
+    pub sampling: AgentSamplingSettings,
+    /// The settings revision this request resolved against.
+    ///
+    /// Turn-bound settings resolve against the agent's current revision at each
+    /// turn ([specification 7.2](../../../docs/plans/rakka-agent/spec.md)). The
+    /// field exists so that, once slice 1.8 resolves settings at dispatch, an
+    /// in-flight call can be reasoned about against the exact settings it was
+    /// prepared under; until then the interim loop stamps
+    /// [`AgentRevisionNumber::INITIAL`] and nothing reads the value back.
+    pub settings_revision: AgentRevisionNumber,
+    /// The turn this request serves, counting from one.
+    pub turn: u64,
+}
+
+impl AgentModelRequest {
+    /// A request for one turn, prepared against a context snapshot.
+    ///
+    /// The profile and sampling default to unset; the interim loop prepares a
+    /// model effect with neither, and slice 1.8 fills them from the settings
+    /// resolved at dispatch.
+    #[must_use]
+    pub fn new(context: AgentContextSnapshotRef, turn: u64) -> Self {
+        Self {
+            context,
+            profile: None,
+            sampling: AgentSamplingSettings::default(),
+            settings_revision: AgentRevisionNumber::INITIAL,
+            turn,
+        }
+    }
+
+    /// Selects the model profile the request resolves against.
+    #[must_use]
+    pub fn with_profile(mut self, profile: AgentModelProfileId) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Sets the sampling parameters resolved for the turn.
+    #[must_use]
+    pub const fn with_sampling(mut self, sampling: AgentSamplingSettings) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// Records the settings revision the request resolved against.
+    #[must_use]
+    pub const fn with_settings_revision(mut self, revision: AgentRevisionNumber) -> Self {
+        self.settings_revision = revision;
+        self
+    }
+}
+
+/// The explicit policy that governs whether and how a model call is retried
+/// after an ambiguous worker loss
+/// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md);
+/// [open decision 4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// There is no implicit retry: a model call is billed on every attempt, so the
+/// bound is a deployment decision based on provider idempotency, cost, and
+/// replay tolerance — not a default the framework picks silently. An
+/// [`AgentModelAdapter`] declares its policy, and the effect machine of slice
+/// 1.7 enforces it; recording it from the first commit is what lets that
+/// enforcement be an addition rather than a change to the adapter contract.
+///
+/// [`Self::validate`] runs where a policy enters: the adapters' fallible
+/// `with_retry_policy` builders, [`Self::read_only`], and deserialization all
+/// refuse a policy the crash-and-timeout rules could not honor. The fields stay
+/// public for literal construction, so the effect machine revalidates the policy
+/// it reads rather than trusting construction alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AgentModelRetryPolicy {
+    /// The safety class the model call dispatches under.
+    ///
+    /// A completion does not change external correctness state, so
+    /// [`AgentEffectSafetyClass::ReadOnly`] is the default and an ambiguous
+    /// attempt may be retried up to [`Self::max_attempts`]. A deployment whose
+    /// provider offers an idempotency key may raise it to
+    /// [`AgentEffectSafetyClass::Idempotent`]. A retry count never overrides the
+    /// non-idempotent ambiguity rule
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)):
+    /// [`Self::validate`] refuses a [`AgentEffectSafetyClass::NonIdempotent`]
+    /// policy that permits more than one attempt.
+    pub safety_class: AgentEffectSafetyClass,
+    /// The most dispatch attempts one model call may make, its first included.
+    pub max_attempts: u32,
+}
+
+impl AgentModelRetryPolicy {
+    /// One read-only attempt, no automatic retry.
+    ///
+    /// The conservative default: an ambiguous model call is not silently retried
+    /// and re-billed. A deployment raises the bound explicitly.
+    pub const DEFAULT: Self = Self {
+        safety_class: AgentEffectSafetyClass::ReadOnly,
+        max_attempts: 1,
+    };
+
+    /// A read-only policy that retries an ambiguous call up to `max_attempts`
+    /// times, refusing a bound of zero.
+    pub fn read_only(max_attempts: u32) -> AgentModelResult<Self> {
+        let policy = Self {
+            safety_class: AgentEffectSafetyClass::ReadOnly,
+            max_attempts,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Rejects a policy the crash-and-timeout rules could not honor.
+    ///
+    /// A policy must permit at least one attempt, and a non-idempotent call must
+    /// permit exactly one: an ambiguous non-idempotent attempt is never
+    /// auto-retried ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)).
+    pub fn validate(&self) -> AgentModelResult<()> {
+        if self.max_attempts == 0 {
+            return Err(AgentModelError::InvalidRetryPolicy {
+                message: "a model retry policy must permit at least one attempt".to_string(),
+            });
+        }
+        if self.safety_class == AgentEffectSafetyClass::NonIdempotent && self.max_attempts > 1 {
+            return Err(AgentModelError::InvalidRetryPolicy {
+                message: "a non-idempotent model call may not be auto-retried after ambiguity"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for AgentModelRetryPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The wire shape of [`AgentModelRetryPolicy`], validated on load.
+///
+/// A policy may be persisted with the effect intent it governs, so it crosses a
+/// trust boundary the same way a turn does: deserializing through this shadow
+/// record means a policy the crash-and-timeout rules could not honor is refused
+/// where it enters, never handed to the effect machine.
+#[derive(Deserialize)]
+struct AgentModelRetryPolicyRecord {
+    safety_class: AgentEffectSafetyClass,
+    max_attempts: u32,
+}
+
+impl<'de> Deserialize<'de> for AgentModelRetryPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let record = AgentModelRetryPolicyRecord::deserialize(deserializer)?;
+        let policy = Self {
+            safety_class: record.safety_class,
+            max_attempts: record.max_attempts,
+        };
+        policy.validate().map_err(serde::de::Error::custom)?;
+        Ok(policy)
+    }
+}
+
+/// The future an [`AgentModelAdapter::call`] returns.
+pub type AgentModelFuture<'a> =
+    Pin<Box<dyn Future<Output = AgentModelResult<AgentModelTurn>> + Send + 'a>>;
+
+/// The Rakka-owned, provider-neutral model adapter
+/// ([specification 10.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It is the whole of the model contract: it converts an immutable context
+/// snapshot and a settings revision (an [`AgentModelRequest`]) into a bounded
+/// Rakka [`AgentModelTurn`], and it converts a provider's response into that
+/// same bounded turn. What a provider request or response looks like is the
+/// adapter's private concern; it never crosses this boundary, and it is never
+/// durable state — the turn is the only durable format
+/// ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The durable loop, the effect model, and the testkit depend on this trait and
+/// on nothing else. A model call is an effect, so the adapter is invoked by the
+/// dispatcher performing the bounded I/O — never inside a run transition — and
+/// its turn returns to the loop as a durable result command
+/// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)). Its
+/// [`retry_policy`](Self::retry_policy) is the explicit policy the effect
+/// machine of slice 1.7 applies when an attempt is lost ambiguously.
+///
+/// The Rig-backed implementation lives behind the `rig` feature in
+/// [`crate::rig`]; the deterministic implementation in [`crate::testkit`] scripts
+/// turns without any provider and exercises the same durable effect path.
+pub trait AgentModelAdapter: Send + Sync {
+    /// The version stamped onto every turn this adapter produces.
+    ///
+    /// It is persisted with the loop state, so an adapter upgrade is an explicit
+    /// migration rather than a silent reinterpretation of the turns a previous
+    /// adapter wrote ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)).
+    fn adapter_version(&self) -> AgentRevisionNumber;
+
+    /// The retry policy model calls made through this adapter dispatch under.
+    ///
+    /// The default is [`AgentModelRetryPolicy::DEFAULT`]: one attempt, no
+    /// automatic retry.
+    fn retry_policy(&self) -> AgentModelRetryPolicy {
+        AgentModelRetryPolicy::DEFAULT
+    }
+
+    /// Performs one bounded model call, producing a durable turn.
+    ///
+    /// The returned turn is validated by the effect path before it is committed,
+    /// so an adapter that assembles an out-of-bounds turn is refused where the
+    /// outcome enters rather than after the run has recorded it.
+    fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a>;
+}
+
+/// A model call that could not produce a bounded, interpretable turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentModelError {
@@ -393,6 +639,21 @@ pub enum AgentModelError {
         /// The encoding failure detail.
         message: String,
     },
+    /// A model retry policy could not be honored by the crash-and-timeout rules.
+    InvalidRetryPolicy {
+        /// What made the policy unenforceable.
+        message: String,
+    },
+    /// The provider, or the adapter mapping its response, failed.
+    ///
+    /// A provider transport failure or a response the adapter could not map onto
+    /// a bounded turn surfaces here. The dispatcher records it as a failed
+    /// effect, and the effect machine of slice 1.7 applies the adapter's
+    /// [`AgentModelRetryPolicy`] to it.
+    Provider {
+        /// The provider or mapping failure detail.
+        message: String,
+    },
 }
 
 impl AgentModelError {
@@ -407,6 +668,8 @@ impl AgentModelError {
             Self::TurnTooLarge { .. } => "model-turn-too-large",
             Self::Proposal { .. } => "model-proposal-not-bounded",
             Self::Encoding { .. } => "model-encoding-failed",
+            Self::InvalidRetryPolicy { .. } => "model-retry-policy-invalid",
+            Self::Provider { .. } => "model-provider-failed",
         }
     }
 }
@@ -441,6 +704,12 @@ impl Display for AgentModelError {
             Self::Encoding { message } => {
                 write!(f, "a model value could not be encoded: {message}")
             }
+            Self::InvalidRetryPolicy { message } => {
+                write!(f, "the model retry policy cannot be honored: {message}")
+            }
+            Self::Provider { message } => {
+                write!(f, "the model provider call failed: {message}")
+            }
         }
     }
 }
@@ -457,5 +726,84 @@ impl Error for AgentModelError {
 impl From<AgentSchemaError> for AgentModelError {
     fn from(error: AgentSchemaError) -> Self {
         Self::Schema(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_retry_policy_permits_one_read_only_attempt() {
+        let policy = AgentModelRetryPolicy::default();
+        assert_eq!(policy.safety_class, AgentEffectSafetyClass::ReadOnly);
+        assert_eq!(policy.max_attempts, 1);
+        policy.validate().expect("the default policy is valid");
+    }
+
+    #[test]
+    fn a_retry_policy_must_permit_at_least_one_attempt() {
+        let policy = AgentModelRetryPolicy {
+            safety_class: AgentEffectSafetyClass::ReadOnly,
+            max_attempts: 0,
+        };
+        assert_eq!(
+            policy
+                .validate()
+                .expect_err("zero attempts is refused")
+                .code(),
+            "model-retry-policy-invalid"
+        );
+    }
+
+    #[test]
+    fn a_non_idempotent_model_call_may_not_be_auto_retried_after_ambiguity() {
+        // The retry count never overrides the non-idempotent ambiguity rule
+        // ([specification 11.4]).
+        let auto_retry = AgentModelRetryPolicy {
+            safety_class: AgentEffectSafetyClass::NonIdempotent,
+            max_attempts: 2,
+        };
+        assert_eq!(
+            auto_retry
+                .validate()
+                .expect_err("auto-retry of a non-idempotent call is refused")
+                .code(),
+            "model-retry-policy-invalid"
+        );
+
+        // Exactly one attempt is honored: no retry, no ambiguity.
+        AgentModelRetryPolicy {
+            safety_class: AgentEffectSafetyClass::NonIdempotent,
+            max_attempts: 1,
+        }
+        .validate()
+        .expect("a single-attempt non-idempotent policy is valid");
+    }
+
+    #[test]
+    fn an_invalid_retry_policy_is_refused_where_it_enters() {
+        // The fallible constructor refuses a bound of zero.
+        assert_eq!(
+            AgentModelRetryPolicy::read_only(0)
+                .expect_err("zero attempts is refused at construction")
+                .code(),
+            "model-retry-policy-invalid"
+        );
+        AgentModelRetryPolicy::read_only(2).expect("a bounded read-only retry is valid");
+
+        // Deserialization refuses a policy validate() rejects, so an invalid
+        // policy can neither cross the wire nor load from a durable record.
+        let valid =
+            serde_json::to_value(AgentModelRetryPolicy::DEFAULT).expect("the policy serializes");
+        serde_json::from_value::<AgentModelRetryPolicy>(valid)
+            .expect("a valid policy deserializes");
+        let auto_retry = serde_json::to_value(AgentModelRetryPolicy {
+            safety_class: AgentEffectSafetyClass::NonIdempotent,
+            max_attempts: 2,
+        })
+        .expect("the policy serializes");
+        serde_json::from_value::<AgentModelRetryPolicy>(auto_retry)
+            .expect_err("a non-idempotent auto-retry policy is refused on load");
     }
 }

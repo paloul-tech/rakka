@@ -27,9 +27,24 @@ jobs:
   validation:
     name: Required Validation
     runs-on: ubuntu-latest
+    env:
+      # The full-workspace, all-features validation no longer fits the hosted
+      # runner's free disk with default debuginfo: the build dies linking with
+      # "No space left on device" (or SIGBUS from lld's mmapped output). Line
+      # tables keep file:line in test backtraces at a fraction of the size.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          # The hosted image ships ~25-30 GB of tooling this job never uses;
+          # reclaim it before the toolchain, cache, and target/ need the room.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable

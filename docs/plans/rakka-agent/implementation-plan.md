@@ -430,6 +430,54 @@ Guidance: [Durable Agent Loop](technical-guidance.md#durable-agent-loop),
   reference; Slice 1.11 formalizes it as the `MemoryContextSnapshot` of
   [spec 13.5](spec.md#135-memory-context-snapshot).
 
+**Amended as implemented (2026-07-15):**
+
+- **The "bounded model request" is a type, and the adapter is the whole
+  contract.** `AgentModelAdapter::call` takes an `AgentModelRequest` — the
+  context-snapshot reference, the model profile and sampling a settings revision
+  selected, and the turn — and returns an `AgentModelTurn`. There is no separate
+  "map the response" surface: a provider request and response are the adapter's
+  private concern, never durable state, so the turn stays the only durable
+  format ([spec 10.2](spec.md#102-persistence-compatibility)). The interim
+  request carries an `AgentRevisionNumber` settings revision that defaults to the
+  initial one; Slice 1.8 resolves settings at dispatch and fills the profile and
+  sampling from what it resolves.
+- **The retry policy is a value the adapter declares, not behavior it runs.**
+  `AgentModelRetryPolicy` carries the effect safety class (default `ReadOnly`)
+  and a bounded attempt count, and `validate` runs where a policy enters — the
+  adapters' fallible `with_retry_policy` builders, `read_only`, and
+  deserialization — so a `NonIdempotent` call permits exactly one attempt and a
+  retry count can never override the non-idempotent ambiguity rule
+  ([spec 11.4](spec.md#114-dispatch-invariants)).
+  Slice 1.7's effect machine reads and re-enforces it at dispatch; landing it
+  here is what keeps that enforcement an addition rather than a change to the
+  adapter contract.
+- **The deterministic adapter is split from the dispatcher stub.**
+  `DeterministicModelAdapter` is the trait implementation; `ScriptedDispatcher`
+  is the effect-bridge stub, now generic over the adapter it answers model calls
+  through and defaulting to the deterministic one. A scripted turn therefore
+  travels the exact effect path a provider's turn travels — the dispatcher reads
+  a dispatched effect, invokes the adapter, and returns the turn as a durable
+  result command — and an adapter error (a provider failure, or an unboundable
+  turn) surfaces as a failed effect, exactly as a real dispatcher surfaces one.
+  The `rig`-backed adapter rides the same generic stub, which is what lets one
+  end-to-end test body prove both adapters.
+- **Rig is pinned exactly (`rig-core = "=0.37.0"`) with default features off.**
+  Rakka needs
+  only Rig's provider-neutral completion contract, so the HTTP/TLS stack Rig's
+  default features pull in is disabled; the deploying application supplies the
+  concrete provider client and its credentials. A model's typed result proposal
+  is expressed as a call to a configurable *result tool* (`submit_result` by
+  default): the adapter declares that tool on every completion request it builds
+  — a provider can only call a tool it was offered — maps that one tool call
+  onto the run's result proposal,
+  and maps every other tool call onto a tool-call request. This is the interim bridge
+  from a provider's function-calling surface to Rakka's typed task result; the
+  tool registry of Slice 1.8 and the context snapshot of Slice 1.11 formalize the
+  surrounding machinery without changing the adapter contract. `rig.rs` also
+  ships `ScriptedCompletionModel`, a deterministic stub `CompletionModel`, so the
+  Rig adapter is driven with no network, credentials, or provider account.
+
 Done when: one scripted model turn runs end-to-end through the durable
 effect path under `--no-default-features`, and the same test passes with the
 `rig` feature against a stub provider.

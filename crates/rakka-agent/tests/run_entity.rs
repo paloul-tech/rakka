@@ -12,108 +12,20 @@
 //! never calls a model; it persists an effect and waits, which is the whole point
 //! of specification 9.5.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-use rakka_agent::testkit::{
-    run_entity, CrashPoint, CrashingStateStore, DeferredExchangeRouter,
-    InProcessRunEntityTransport, InProcessTaskEntityTransport, ScriptedDispatcher,
-};
+use rakka_agent::testkit::{run_entity, CrashPoint, ScriptedDispatcher};
 use rakka_agent::{load_agent_run_state, AgentSchemaPolicy};
 use rakka_agent::{
-    AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentEntityClass,
-    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentExchangeRouter, AgentId,
     AgentLoopPhase, AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind,
-    AgentRevisionNumber, AgentRevisionProvenance, AgentRunEntityCommand, AgentRunEntityReply,
-    AgentRunEntityStore, AgentRunId, AgentRunScope, AgentRunSnapshot, AgentRunState,
-    AgentRunStatus, AgentRunTerminalReason, AgentSchemaId, AgentSchemaRef, AgentScope,
-    AgentSettings, AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
-    AgentTaskEntityCommand, AgentTaskEntityStore, AgentTaskResultCheck, AgentTaskResultRule,
-    AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTaskStatus,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink,
-    InMemoryAgentTaskHistoryStore, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentRunEntityCommand, AgentRunEntityReply, AgentRunId, AgentRunScope, AgentRunState,
+    AgentRunStatus, AgentRunTerminalReason, AgentTaskContent, AgentTaskStatus, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
     CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
 };
-use rakka_agent_workflow::{
-    AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
-};
-use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
+use rakka_persistence::DurableStateStore;
 
-type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
-type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
-type RunStore = CrashingStateStore<AgentRunState>;
+mod common;
 
-const TENANT: &str = "acme";
-const AGENT: &str = "support-agent";
-const TASK: &str = "ticket-1";
-const TASK_DEFINITION: &str = "resolve-ticket";
-
-// ---------------------------------------------------------------------------
-// Fixture
-// ---------------------------------------------------------------------------
-
-fn tenant() -> TenantId {
-    TenantId::new(TENANT)
-}
-
-fn agent_id() -> AgentId {
-    AgentId::new(AGENT).expect("agent id should be valid")
-}
-
-fn agent_scope() -> AgentScope {
-    AgentScope::new(tenant(), agent_id()).expect("agent scope should be valid")
-}
-
-fn task_scope() -> AgentTaskScope {
-    AgentTaskScope::new(
-        tenant(),
-        rakka_agent::AgentTaskId::new(TASK).expect("task id should be valid"),
-    )
-    .expect("task scope should be valid")
-}
-
-fn run_scope() -> AgentRunScope {
-    let run = rakka_agent::run_id_for_assignment(
-        task_scope().task(),
-        rakka_agent::AgentAssignmentGeneration::new(1),
-    )
-    .expect("the run id should be derivable");
-    AgentRunScope::new(tenant(), agent_id(), run).expect("run scope should be valid")
-}
-
-fn task_definition_id() -> AgentTaskDefinitionId {
-    AgentTaskDefinitionId::new(TASK_DEFINITION).expect("task definition id should be valid")
-}
-
-fn schema(id: &str) -> AgentSchemaRef {
-    AgentSchemaRef::new(
-        AgentSchemaId::new(id).expect("schema id should be valid"),
-        AgentRevisionNumber::INITIAL,
-    )
-}
-
-/// The task requires a non-empty answer, and permits at most three autonomous
-/// iterations. Both are deterministic facts the run must satisfy; neither is
-/// something the model gets to decide.
-fn task_definition() -> AgentTaskDefinition {
-    AgentTaskDefinition::new(
-        task_definition_id(),
-        "Resolve one customer support ticket.",
-        schema("ticket-input"),
-        schema("ticket-result"),
-    )
-    .expect("task definition should be valid")
-    .with_result_rule(AgentTaskResultRule::new(
-        AgentTaskRuleId::new("answer-present").expect("rule id should be valid"),
-        AgentTaskResultCheck::NonEmptyString {
-            pointer: "/answer".to_string(),
-        },
-    ))
-    .with_budgets(rakka_agent::AgentBudgetCeilings {
-        max_loop_iterations: Some(3),
-        ..rakka_agent::AgentBudgetCeilings::unbounded()
-    })
-}
+use common::*;
 
 fn proposing_turn(answer: &str) -> AgentModelTurn {
     AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
@@ -142,245 +54,6 @@ fn tool_calling_turn(tool: &str) -> AgentModelTurn {
     AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
         .with_text("Let me look that up.")
         .with_tool_call(tool_call("call-1", tool))
-}
-
-fn provenance(at: u64) -> AgentRevisionProvenance {
-    AgentRevisionProvenance {
-        principal: PrincipalRef {
-            principal_type: "service".to_string(),
-            principal_id: "ingress".to_string(),
-            display_name: None,
-        },
-        accepted_at: AgentTimestampMillis::new(at),
-        causation_id: AgentCausationId::new(format!("cause-{at}")),
-        audit_ref: AgentAuditEventId::new(format!("audit-{at}")),
-    }
-}
-
-/// One durable store per entity class, one clock, and the router that carries the
-/// assignment from the task to the run and the proposal back again.
-///
-/// Entities are created on demand and thrown away, because that is what a sharded
-/// entity does: it is materialized on its owner, transitions, and passivates.
-/// Nothing but the stores survives between them — so every call below is already
-/// a restart.
-struct Fixture {
-    tasks: TaskStore,
-    agents: AgentStore,
-    runs: RunStore,
-    history: InMemoryAgentTaskHistoryStore,
-    effects: InMemoryAgentRunEffectSink,
-    router: AgentExchangeRouter,
-    task_transport:
-        InProcessTaskEntityTransport<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>,
-    dispatcher: ScriptedDispatcher,
-    clock: Arc<AtomicU64>,
-}
-
-impl Fixture {
-    fn new(dispatcher: ScriptedDispatcher) -> Self {
-        let tasks = TaskStore::new();
-        let agents = AgentStore::new();
-        let runs = RunStore::new();
-        let history = InMemoryAgentTaskHistoryStore::new();
-        let effects = InMemoryAgentRunEffectSink::new();
-        let clock = Arc::new(AtomicU64::new(1));
-
-        // The task and the run exchange with each other, so each transport needs
-        // the router the other lives in. The deferred router is that late binding
-        // and nothing more; the durable path is unchanged.
-        let deferred = DeferredExchangeRouter::new();
-        let task_transport = InProcessTaskEntityTransport::new(
-            tasks.clone(),
-            agents.clone(),
-            history.clone(),
-            deferred.as_router(),
-            clock.clone(),
-        );
-        let run_transport = InProcessRunEntityTransport::new(
-            runs.clone(),
-            effects.clone(),
-            deferred.as_router(),
-            clock.clone(),
-        );
-        let router = AgentExchangeRouter::new()
-            .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
-            .with_route(AgentEntityClass::Run, Arc::new(run_transport));
-        deferred.install(router.clone());
-
-        Self {
-            tasks,
-            agents,
-            runs,
-            history,
-            effects,
-            router,
-            task_transport,
-            dispatcher,
-            clock,
-        }
-    }
-
-    fn now(&self) -> AgentTimestampMillis {
-        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
-    }
-
-    async fn instantiate_agent(&self) {
-        let mut envelope = AgentAuthorityEnvelope::empty();
-        envelope.task_definitions.insert(task_definition_id());
-        let definition = AgentDefinition::new(
-            AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
-            "Resolves customer support tickets end to end.",
-            envelope,
-        )
-        .expect("the agent definition should be valid");
-
-        let mut agent = AgentEntityStore::new(agent_scope(), self.agents.clone());
-        agent.recover().await.expect("the agent should recover");
-        agent
-            .apply(AgentEntityCommand::Instantiate {
-                operation_id: AgentOperationId::for_agent(
-                    AgentOperationKind::DefinitionUpdate,
-                    &agent_scope(),
-                    "1",
-                )
-                .expect("operation id should be derivable"),
-                definition: Box::new(definition),
-                settings: Box::new(AgentSettings::default()),
-                provenance: Box::new(provenance(1)),
-            })
-            .await
-            .expect("the agent should instantiate");
-    }
-
-    /// Creates the task. Its assignment decision commits with the creation, and
-    /// the run-creation exchange it owes is driven to the run entity.
-    async fn create_task(&self) {
-        self.create_task_with(task_definition()).await;
-    }
-
-    /// Creates the task under an explicit definition, for tests that need their
-    /// own budget ceilings.
-    async fn create_task_with(&self, definition: AgentTaskDefinition) {
-        let mut task = AgentTaskEntityStore::new(
-            task_scope(),
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        );
-        let now = self.now();
-        task.recover(now).await.expect("the task should recover");
-        let _reply = task
-            .apply(
-                AgentTaskEntityCommand::Create {
-                    operation_id: AgentOperationId::new(
-                        AgentOperationKind::TaskCreation,
-                        [TENANT, TASK, "1"],
-                    )
-                    .expect("operation id should be derivable"),
-                    creation: Box::new(AgentTaskCreation {
-                        definition,
-                        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
-                            .expect("the input is inline-bounded"),
-                        assignee: Some(agent_id()),
-                        goal: None,
-                        parent: None,
-                        dependencies: Vec::new(),
-                    }),
-                },
-                &self.router,
-                now,
-            )
-            .await;
-    }
-
-    fn run(&self) -> AgentRunEntityStore<RunStore, InMemoryAgentRunEffectSink> {
-        run_entity(&run_scope(), &self.runs, &self.effects)
-    }
-
-    /// Drives everything the task and the run owe until nothing moves.
-    ///
-    /// This is what a recovery sweep does, and what the entity does to itself
-    /// after every transition. It reads only durable state, so calling it after a
-    /// crash is the same operation as calling it after a success.
-    ///
-    /// It returns the first error it hits, which is how an injected crash
-    /// surfaces.
-    async fn pump(&self) -> Result<(), String> {
-        for _round in 0..64 {
-            let now = self.now();
-            let mut task = AgentTaskEntityStore::new(
-                task_scope(),
-                self.tasks.clone(),
-                self.agents.clone(),
-                self.history.clone(),
-            );
-            task.recover(now)
-                .await
-                .map_err(|error| error.code().to_string())?;
-            task.settle_side_effects(&self.router, now)
-                .await
-                .map_err(|error| error.code().to_string())?;
-
-            let now = self.now();
-            let mut run = self.run();
-            run.recover(now)
-                .await
-                .map_err(|error| error.code().to_string())?;
-            let progress = run
-                .settle_side_effects(&self.router, now)
-                .await
-                .map_err(|error| error.code().to_string())?;
-            let answered = self
-                .dispatcher
-                .drive(&mut run, &self.router, self.now())
-                .await
-                .map_err(|error| error.code().to_string())?;
-
-            let terminal = run
-                .state()
-                .ok()
-                .and_then(|state| state.status())
-                .is_some_and(AgentRunStatus::is_terminal);
-            if terminal {
-                return Ok(());
-            }
-            if progress.transitions == 0
-                && progress.effects_dispatched == 0
-                && progress.settled == 0
-                && progress.failed == 0
-                && answered == 0
-            {
-                return Ok(());
-            }
-        }
-        Err("the loop did not quiesce".to_string())
-    }
-
-    async fn run_snapshot(&self) -> Option<AgentRunSnapshot> {
-        let mut run = self.run();
-        let now = self.now();
-        run.recover(now).await.expect("the run should recover");
-        run.snapshot().expect("the snapshot should read")
-    }
-
-    async fn task_snapshot(&self) -> AgentTaskSnapshot {
-        let mut task = AgentTaskEntityStore::new(
-            task_scope(),
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        );
-        let now = self.now();
-        task.recover(now).await.expect("the task should recover");
-        task.snapshot()
-            .expect("the snapshot should read")
-            .expect("the task exists")
-    }
-
-    fn dispatched_effects(&self) -> usize {
-        self.effects.len(&run_scope())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,12 +219,13 @@ async fn a_duplicate_effect_result_does_not_advance_the_loop_twice() {
 
     // The dispatcher returns the same result twice, under the same derived
     // operation id — a redelivered inbox command.
+    let outcome = fx.dispatcher.answer(&effect).await;
     let command = || AgentRunEntityCommand::RecordEffectResult {
         operation_id: effect
             .result_operation_id(&run_scope())
             .expect("the result operation id is derivable"),
         effect_id: effect.effect_id.clone(),
-        outcome: Box::new(fx.dispatcher.answer(&effect)),
+        outcome: Box::new(outcome.clone()),
     };
 
     let first = run
@@ -619,7 +293,7 @@ async fn a_stale_effect_result_is_refused_by_the_runs_own_fence() {
     assert_eq!(tool_effects.len(), 2, "both tool effects are outstanding");
 
     let first = &tool_effects[0];
-    let outcome = fx.dispatcher.answer(first);
+    let outcome = fx.dispatcher.answer(first).await;
     run.apply(
         AgentRunEntityCommand::RecordEffectResult {
             operation_id: first.result_operation_id(&run_scope()).expect("derivable"),
@@ -1180,7 +854,7 @@ async fn cancelling_a_run_with_an_effect_in_flight_waits_for_it_and_does_not_res
         AgentRunEntityCommand::RecordEffectResult {
             operation_id: effect.result_operation_id(&run_scope()).expect("derivable"),
             effect_id: effect.effect_id.clone(),
-            outcome: Box::new(fx.dispatcher.answer(&effect)),
+            outcome: Box::new(fx.dispatcher.answer(&effect).await),
         },
         &fx.router,
         fx.now(),

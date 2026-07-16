@@ -25,8 +25,17 @@
 //! result command through the entity's command surface
 //! ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)) — so the
 //! durable loop is driven end to end, and its recovery proven, over the same path
-//! production uses. Slice 1.6 replaces the script with the deterministic model
-//! adapter without changing that path.
+//! production uses.
+//!
+//! Slice 1.6 landed [`DeterministicModelAdapter`], the deterministic
+//! implementation of the Rakka-owned [`AgentModelAdapter`]
+//! ([specification 10.4](../../../docs/plans/rakka-agent/spec.md)).
+//! [`ScriptedDispatcher`] now produces its model turns *through* an adapter
+//! rather than off a private script, so a turn a test scripts travels exactly the
+//! path a provider's turn travels; the dispatcher is generic over the adapter, so
+//! the Rig-backed adapter of [`crate::rig`] rides the same effect substrate under
+//! the `rig` feature. Slice 1.7 replaces this driver with the real dispatcher
+//! without changing the adapter contract.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -44,13 +53,18 @@ use crate::choreography::{
     AgentExchangePayload, AgentExchangeResult, AgentExchangeRouter, AgentExchangeState,
     AgentExchangeTransition, AgentExchangeTransport,
 };
+use crate::definition::{AgentModelProfileId, AgentRevisionNumber};
 use crate::effect::{
     AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
     AgentRunEffectStatus,
 };
 use crate::identity::{AgentOperationId, AgentRunScope};
-use crate::loop_runtime::AgentLoopState;
-use crate::model::{AgentModelTurn, AgentToolCallRequest};
+use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
+use crate::memory::AgentContextSnapshotRef;
+use crate::model::{
+    AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
+    AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
+};
 use crate::run::{AgentRunEntityCommand, AgentRunEntityStore, AgentRunError, AgentRunState};
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::{
@@ -1098,51 +1112,259 @@ where
     }
 }
 
-/// The scripted stand-in for the dispatcher of slice 1.7.
+/// The deterministic model adapter of
+/// [specification 10.4](../../../docs/plans/rakka-agent/spec.md).
+///
+/// It implements the Rakka-owned [`AgentModelAdapter`] without any provider and
+/// without the `rig` feature. A model call returns, in order of preference: a
+/// turn scripted for that turn *number* (the interim form of a response
+/// conditional on prior progress), then the next turn in the ordered script,
+/// then — when the script is spent — an empty turn that proposes nothing and asks
+/// for nothing, which lets a test drive a run to its iteration ceiling without
+/// scripting every turn.
+///
+/// It produces turns synchronously, because a script has no I/O to await; the
+/// trait's [`call`](AgentModelAdapter::call) defers that production to the
+/// future's first poll, so a future built and dropped unpolled consumes nothing
+/// — exactly as a provider-backed call performs no I/O for a future never
+/// polled. The adapter is *not* itself idempotent — each call consumes the next
+/// scripted turn — because idempotency is the effect's job: the run's effect id
+/// and the dispatcher's per-effect memoization are what make a re-invoked call
+/// return the answer it first gave ([specification 11.4]).
+#[derive(Debug, Clone)]
+pub struct DeterministicModelAdapter {
+    adapter_version: AgentRevisionNumber,
+    retry_policy: AgentModelRetryPolicy,
+    turns: Arc<Mutex<VecDeque<AgentModelTurn>>>,
+    by_turn: Arc<Mutex<BTreeMap<u64, AgentModelTurn>>>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl DeterministicModelAdapter {
+    /// An adapter with an empty script and the default retry policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            adapter_version: CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+            retry_policy: AgentModelRetryPolicy::DEFAULT,
+            turns: Arc::new(Mutex::new(VecDeque::new())),
+            by_turn: Arc::new(Mutex::new(BTreeMap::new())),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Scripts the turn the next unconditioned model call returns.
+    #[must_use]
+    pub fn with_turn(self, turn: AgentModelTurn) -> Self {
+        self.script_turn(turn);
+        self
+    }
+
+    /// Scripts the turn a model call for a specific turn *number* returns,
+    /// regardless of order.
+    ///
+    /// This is the interim form of a response conditional on prior messages or
+    /// tool results ([specification 10.4]): until slice 1.11 gives the adapter
+    /// the context snapshot's content, the turn number is the only durable signal
+    /// of prior progress it can read.
+    #[must_use]
+    pub fn with_turn_for(self, turn: u64, model_turn: AgentModelTurn) -> Self {
+        self.by_turn
+            .lock()
+            .expect("the conditional turn script should not be poisoned")
+            .insert(turn, model_turn);
+        self
+    }
+
+    /// Declares the retry policy this adapter's model calls dispatch under,
+    /// refusing one the crash-and-timeout rules could not honor
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)).
+    pub fn with_retry_policy(mut self, policy: AgentModelRetryPolicy) -> AgentModelResult<Self> {
+        policy.validate()?;
+        self.retry_policy = policy;
+        Ok(self)
+    }
+
+    /// How many model turns the adapter has produced.
+    ///
+    /// Unlike [`ScriptedDispatcher::model_calls`], this counts *productions*, not
+    /// billed calls: a re-invoked effect whose answer the dispatcher memoized does
+    /// not reach the adapter a second time.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn script_turn(&self, turn: AgentModelTurn) {
+        self.turns
+            .lock()
+            .expect("the turn script should not be poisoned")
+            .push_back(turn);
+    }
+
+    /// Produces the turn one model request resolves to, synchronously.
+    #[must_use]
+    pub fn produce(&self, request: &AgentModelRequest) -> AgentModelTurn {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(turn) = self
+            .by_turn
+            .lock()
+            .expect("the conditional turn script should not be poisoned")
+            .get(&request.turn)
+        {
+            return turn.clone();
+        }
+        self.turns
+            .lock()
+            .expect("the turn script should not be poisoned")
+            .pop_front()
+            .unwrap_or_else(|| AgentModelTurn::new(self.adapter_version))
+    }
+}
+
+impl Default for DeterministicModelAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentModelAdapter for DeterministicModelAdapter {
+    fn adapter_version(&self) -> AgentRevisionNumber {
+        self.adapter_version
+    }
+
+    fn retry_policy(&self) -> AgentModelRetryPolicy {
+        self.retry_policy
+    }
+
+    fn call<'a>(&'a self, request: &'a AgentModelRequest) -> AgentModelFuture<'a> {
+        // Production happens when the future is polled, not when it is built:
+        // a caller that constructs and drops the future unpolled — a timeout, a
+        // cancelled race — must not consume a scripted turn, exactly as the
+        // Rig-backed adapter performs no provider call for a future never polled.
+        Box::pin(async move { Ok(self.produce(request)) })
+    }
+}
+
+/// Builds the bounded model request one model effect resolves to.
+fn model_request(
+    context: &AgentContextSnapshotRef,
+    profile: Option<&AgentModelProfileId>,
+    turn: u64,
+) -> AgentModelRequest {
+    let mut request = AgentModelRequest::new(context.clone(), turn);
+    if let Some(profile) = profile {
+        request = request.with_profile(profile.clone());
+    }
+    request
+}
+
+/// The stand-in for the dispatcher of slice 1.7, driving effects through a model
+/// adapter.
 ///
 /// It plays exactly the dispatcher's role and no other
 /// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)): it reads the
 /// effects a run durably committed and dispatched, performs the bounded work —
-/// here, reading it off a script instead of calling a provider — and returns each
-/// outcome as a durable result command through the run entity's own command
-/// surface. It never reaches into the run's state, and it never advances the loop
-/// itself.
+/// invoking the [`AgentModelAdapter`] for a model call, and a scripted tool for a
+/// tool call — and returns each outcome as a durable result command through the
+/// run entity's own command surface. It never reaches into the run's state, and
+/// it never advances the loop itself.
 ///
-/// That is what makes it a faithful stub. The path a scripted turn travels is the
-/// path a real one travels, so the recovery this proves is the recovery
-/// production gets. Slice 1.6 replaces the script with the deterministic model
-/// adapter, and slice 1.7 replaces this driver with the real dispatcher; neither
-/// changes the durable path underneath.
+/// That is what makes it a faithful stub: a turn the adapter produces travels the
+/// exact path a provider's turn travels, so the recovery this proves is the
+/// recovery production gets. It is generic over the adapter and defaults to
+/// [`DeterministicModelAdapter`], so the Rig-backed adapter of [`crate::rig`]
+/// rides the same substrate under the `rig` feature. Slice 1.7 replaces this
+/// driver with the real dispatcher; the adapter contract does not change.
 ///
-/// A model call with no script left answers with a turn that proposes nothing and
-/// asks for nothing, which lets a test drive a run to its iteration ceiling
-/// without scripting every turn.
-#[derive(Debug, Clone, Default)]
-pub struct ScriptedDispatcher {
-    turns: Arc<Mutex<VecDeque<AgentModelTurn>>>,
-    answered: Arc<Mutex<BTreeMap<String, AgentModelTurn>>>,
-    answered_tools: Arc<Mutex<BTreeMap<String, AgentRunEffectOutcome>>>,
+/// An adapter error — a provider failure, or a turn that cannot be bounded — is
+/// returned as a failed effect, exactly as a real dispatcher surfaces one to the
+/// interim loop.
+#[derive(Debug, Clone)]
+pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
+    adapter: A,
+    answered: Arc<Mutex<BTreeMap<String, AgentRunEffectOutcome>>>,
     tools: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
 
-impl ScriptedDispatcher {
-    /// A dispatcher with an empty script.
+impl Default for ScriptedDispatcher<DeterministicModelAdapter> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScriptedDispatcher<DeterministicModelAdapter> {
+    /// A dispatcher with an empty deterministic script.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_adapter(DeterministicModelAdapter::new())
     }
 
     /// Scripts the turn the next model call returns.
     #[must_use]
     pub fn with_turn(self, turn: AgentModelTurn) -> Self {
-        self.turns
-            .lock()
-            .expect("the turn script should not be poisoned")
-            .push_back(turn);
+        self.adapter.script_turn(turn);
         self
+    }
+}
+
+/// The key one effect's answer is memoized under: the effect id and its
+/// dispatch generation, matching the derivation of
+/// [`AgentRunEffect::result_operation_id`]. A re-invocation of the same
+/// generation replays the recorded answer; a later generation is a new attempt
+/// entirely — slice 1.7's retry machinery mints one precisely so a transient
+/// failure is not replayed forever — and it reaches the adapter again.
+fn memo_key(effect: &AgentRunEffect) -> String {
+    format!("{}#{}", effect.effect_id.as_str(), effect.generation)
+}
+
+/// Wraps what an adapter produced as the model effect's outcome.
+///
+/// An adapter error and an unboundable turn alike surface as a failed effect,
+/// exactly as a real dispatcher surfaces one: the turn is validated here, where
+/// the outcome is formed, so an out-of-bounds turn becomes a `Failed` outcome
+/// the run records and winds down on — never a result command the entity
+/// refuses, which would leave the effect outstanding forever.
+fn model_outcome(produced: AgentModelResult<AgentModelTurn>) -> AgentRunEffectOutcome {
+    let validated = produced.and_then(|turn| {
+        turn.validate()?;
+        Ok(turn)
+    });
+    match validated {
+        Ok(turn) => AgentRunEffectOutcome::Model {
+            turn: Box::new(turn),
+        },
+        Err(error) => AgentRunEffectOutcome::Failed {
+            code: error.code().to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+impl<A> ScriptedDispatcher<A>
+where
+    A: AgentModelAdapter,
+{
+    /// A dispatcher that answers model calls through `adapter`.
+    #[must_use]
+    pub fn with_adapter(adapter: A) -> Self {
+        Self {
+            adapter,
+            answered: Arc::new(Mutex::new(BTreeMap::new())),
+            tools: Arc::new(Mutex::new(BTreeMap::new())),
+            failures: Arc::new(Mutex::new(BTreeMap::new())),
+            model_calls: Arc::new(AtomicUsize::new(0)),
+            tool_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The model adapter this dispatcher answers model calls through.
+    #[must_use]
+    pub fn adapter(&self) -> &A {
+        &self.adapter
     }
 
     /// Scripts the result one tool returns, however often it is called.
@@ -1165,13 +1387,13 @@ impl ScriptedDispatcher {
         self
     }
 
-    /// How many model calls the dispatcher has answered.
+    /// How many model calls the dispatcher has answered, re-invocations included.
     #[must_use]
     pub fn model_calls(&self) -> usize {
         self.model_calls.load(Ordering::SeqCst)
     }
 
-    /// How many tool calls the dispatcher has answered.
+    /// How many tool calls the dispatcher has answered, re-invocations included.
     #[must_use]
     pub fn tool_calls(&self) -> usize {
         self.tool_calls.load(Ordering::SeqCst)
@@ -1202,7 +1424,7 @@ impl ScriptedDispatcher {
 
         let mut delivered = 0;
         for effect in dispatched {
-            let outcome = self.answer(&effect);
+            let outcome = self.answer(&effect).await;
             let command = AgentRunEntityCommand::RecordEffectResult {
                 operation_id: effect.result_operation_id(&scope)?,
                 effect_id: effect.effect_id.clone(),
@@ -1214,72 +1436,75 @@ impl ScriptedDispatcher {
         Ok(delivered)
     }
 
-    /// What this dispatcher returns for one effect.
+    /// What this dispatcher returns for one effect, awaiting the adapter for a
+    /// model call. [`Self::drive`] answers everything outstanding through this.
     ///
     /// The answer — a model turn or a tool outcome alike — is memoized on the
-    /// effect id, so re-invoking an effect whose result was lost — because the
-    /// run's owner died before it could record it — returns *the same* outcome.
-    /// That is what the effect's idempotency key means
-    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)), and it is
-    /// what makes a recovery test deterministic: the run resumes against the
-    /// answer it would have had, not against a different one the script happened
-    /// to hand out next, even if the script changed in between.
+    /// effect id and its dispatch generation, so re-invoking an effect whose
+    /// result was lost returns *the same* outcome, while a later generation — a
+    /// genuine new attempt — reaches the adapter again. That is what the
+    /// effect's idempotency key means
+    /// ([specification 11.4](../../../docs/plans/rakka-agent/spec.md)), and it
+    /// is what makes a recovery test deterministic.
     ///
     /// The call *counters* are not memoized, because a re-invocation really is
     /// another call: it is billed again, and slice 1.9 charges it again.
-    #[must_use]
-    pub fn answer(&self, effect: &AgentRunEffect) -> AgentRunEffectOutcome {
+    pub async fn answer(&self, effect: &AgentRunEffect) -> AgentRunEffectOutcome {
         match &effect.request {
-            AgentRunEffectRequest::Model { .. } => {
+            AgentRunEffectRequest::Model { context, profile } => {
                 self.model_calls.fetch_add(1, Ordering::SeqCst);
-                AgentRunEffectOutcome::Model {
-                    turn: Box::new(self.answer_model(effect)),
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
                 }
+                let request = model_request(context, profile.as_ref(), effect.turn);
+                // A provider failure or an unboundable turn is a failed effect,
+                // exactly as a real dispatcher surfaces one; the interim loop
+                // stops the run on it, and slice 1.7's retry policy governs
+                // whether the effect machine tries again.
+                let outcome = model_outcome(self.adapter.call(&request).await);
+                self.memoize(effect, outcome)
             }
             AgentRunEffectRequest::Tool { call } => {
                 self.tool_calls.fetch_add(1, Ordering::SeqCst);
-                self.answer_tool(effect, call)
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let outcome = self.tool_outcome(call);
+                self.memoize(effect, outcome)
             }
         }
     }
 
-    fn answer_model(&self, effect: &AgentRunEffect) -> AgentModelTurn {
-        let key = effect.effect_id.as_str().to_string();
-        let mut answered = self
-            .answered
+    fn lock_answered(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, AgentRunEffectOutcome>> {
+        self.answered
             .lock()
-            .expect("the answered script should not be poisoned");
-        if let Some(turn) = answered.get(&key) {
-            return turn.clone();
-        }
-        let turn = self
-            .turns
-            .lock()
-            .expect("the turn script should not be poisoned")
-            .pop_front()
-            .unwrap_or_else(|| {
-                AgentModelTurn::new(crate::loop_runtime::CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-            });
-        answered.insert(key, turn.clone());
-        turn
+            .expect("the answered script should not be poisoned")
     }
 
-    fn answer_tool(
+    fn cached(&self, effect: &AgentRunEffect) -> Option<AgentRunEffectOutcome> {
+        self.lock_answered().get(&memo_key(effect)).cloned()
+    }
+
+    /// Records the outcome under the effect's memo key, first writer winning.
+    ///
+    /// The lock cannot be held across the adapter's await, so two invocations
+    /// racing on one effect's *first* answer may both produce — but every caller
+    /// returns the single outcome that was recorded, so the memoized answer
+    /// stays one answer.
+    fn memoize(
         &self,
         effect: &AgentRunEffect,
-        call: &AgentToolCallRequest,
+        outcome: AgentRunEffectOutcome,
     ) -> AgentRunEffectOutcome {
-        let key = effect.effect_id.as_str().to_string();
-        let mut answered = self
-            .answered_tools
-            .lock()
-            .expect("the answered script should not be poisoned");
-        if let Some(outcome) = answered.get(&key) {
-            return outcome.clone();
-        }
+        self.lock_answered()
+            .entry(memo_key(effect))
+            .or_insert(outcome)
+            .clone()
+    }
 
+    fn tool_outcome(&self, call: &AgentToolCallRequest) -> AgentRunEffectOutcome {
         let tool = call.tool.to_string();
-        let outcome = if let Some((code, message)) = self
+        if let Some((code, message)) = self
             .failures
             .lock()
             .expect("the failure script should not be poisoned")
@@ -1302,9 +1527,7 @@ impl ScriptedDispatcher {
                 call_id: call.call_id.clone(),
                 content,
             }
-        };
-        answered.insert(key, outcome.clone());
-        outcome
+        }
     }
 }
 
@@ -1596,6 +1819,45 @@ mod tests {
     use crate::identity::{AgentId, AgentRunId, TenantId};
     use crate::model::AgentToolCallId;
 
+    fn run_scope() -> AgentRunScope {
+        AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support").expect("the agent id is valid"),
+            AgentRunId::new("t-gen-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid")
+    }
+
+    fn model_request_for(turn: u64) -> AgentModelRequest {
+        AgentModelRequest::new(
+            AgentContextSnapshotRef::for_turn(&run_scope(), turn).expect("the reference derives"),
+            turn,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_deterministic_adapter_conditions_a_turn_on_its_turn_number() {
+        let first = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("first");
+        let second = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("second");
+        let adapter = DeterministicModelAdapter::new()
+            .with_turn_for(2, second)
+            .with_turn(first);
+
+        // A call for turn 2 gets the turn scripted for that number regardless of
+        // the ordered script; a call for turn 1 falls through to the ordered
+        // script. The trait's async `call` produces the same turn as `produce`.
+        let turn_two = adapter
+            .call(&model_request_for(2))
+            .await
+            .expect("the turn is produced");
+        assert_eq!(turn_two.text.as_deref(), Some("second"));
+        assert_eq!(
+            adapter.produce(&model_request_for(1)).text.as_deref(),
+            Some("first")
+        );
+        assert_eq!(adapter.calls(), 2);
+    }
+
     fn tool_effect(scope: &AgentRunScope, slot: usize, call_id: &str) -> AgentRunEffect {
         let call = AgentToolCallRequest::new(
             AgentToolCallId::new(call_id).expect("the call id is valid"),
@@ -1615,8 +1877,8 @@ mod tests {
         .expect("the effect derives")
     }
 
-    #[test]
-    fn a_tool_answer_is_memoized_on_the_effect_id() {
+    #[tokio::test]
+    async fn a_tool_answer_is_memoized_on_the_effect_id() {
         let scope = AgentRunScope::new(
             TenantId::new("acme"),
             AgentId::new("support").expect("the agent id is valid"),
@@ -1626,23 +1888,98 @@ mod tests {
         let effect = tool_effect(&scope, 1, "call-1");
 
         let dispatcher = ScriptedDispatcher::new();
-        let first = dispatcher.answer(&effect);
+        let first = dispatcher.answer(&effect).await;
 
         // The script changes under the dispatcher — the tool now fails — but
         // re-invoking the same effect returns the answer already given: that is
         // what the effect's idempotency key means, and what keeps a recovery
         // test deterministic.
         let dispatcher = dispatcher.with_tool_failure("search", "tool-unavailable", "down");
-        assert_eq!(first, dispatcher.answer(&effect));
+        assert_eq!(first, dispatcher.answer(&effect).await);
 
         // A different effect is a different invocation and sees the new script.
         let sibling = tool_effect(&scope, 2, "call-2");
         assert_eq!(
-            dispatcher.answer(&sibling).failure_code(),
+            dispatcher.answer(&sibling).await.failure_code(),
             Some("tool-unavailable")
         );
 
         // Re-invocations are still counted: each really is another call.
         assert_eq!(dispatcher.tool_calls(), 3);
+    }
+
+    fn model_effect(scope: &AgentRunScope, slot: usize) -> AgentRunEffect {
+        let context = AgentContextSnapshotRef::for_turn(scope, 1).expect("the reference derives");
+        AgentRunEffect::new(
+            scope,
+            1,
+            slot,
+            AgentRunEffectRequest::Model {
+                context,
+                profile: None,
+            },
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives")
+    }
+
+    #[test]
+    fn a_dropped_unpolled_call_consumes_no_scripted_turn() {
+        let adapter = DeterministicModelAdapter::new()
+            .with_turn(AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("kept"));
+
+        // A future built and dropped unpolled — a timeout, a cancelled race —
+        // performs no production, exactly as the Rig adapter performs no
+        // provider call for a future never polled.
+        drop(adapter.call(&model_request_for(1)));
+        assert_eq!(adapter.calls(), 0);
+
+        assert_eq!(
+            adapter.produce(&model_request_for(1)).text.as_deref(),
+            Some("kept"),
+            "the scripted turn is still there for the call that runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unboundable_scripted_turn_surfaces_as_a_failed_effect() {
+        use crate::model::AGENT_MODEL_TEXT_MAX_LENGTH;
+
+        let oversized = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+            .with_text("x".repeat(AGENT_MODEL_TEXT_MAX_LENGTH + 1));
+        let dispatcher =
+            ScriptedDispatcher::with_adapter(DeterministicModelAdapter::new().with_turn(oversized));
+
+        // The turn is refused where the outcome is formed, as a failed effect
+        // the run records and winds down on — not as a result command the
+        // entity would refuse, which would leave the effect outstanding forever.
+        let outcome = dispatcher.answer(&model_effect(&run_scope(), 0)).await;
+        assert_eq!(outcome.failure_code(), Some("model-text-too-long"));
+    }
+
+    #[tokio::test]
+    async fn a_later_dispatch_generation_reaches_the_adapter_again() {
+        let first = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("first");
+        let second = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION).with_text("second");
+        let dispatcher = ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(first)
+                .with_turn(second),
+        );
+
+        let effect = model_effect(&run_scope(), 0);
+        let answered = dispatcher.answer(&effect).await;
+        // The same generation replays the memoized answer without producing.
+        assert_eq!(answered, dispatcher.answer(&effect).await);
+        assert_eq!(dispatcher.adapter().calls(), 1);
+
+        // A later generation is a new attempt entirely — the retry slice 1.7
+        // mints one for — so it reaches the adapter instead of replaying the
+        // recorded (possibly failed) answer forever.
+        let mut retried = effect;
+        retried.generation = retried.generation.next();
+        let retried_answer = dispatcher.answer(&retried).await;
+        assert_ne!(answered, retried_answer);
+        assert_eq!(dispatcher.adapter().calls(), 2);
     }
 }

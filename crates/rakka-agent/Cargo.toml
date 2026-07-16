@@ -16,9 +16,9 @@ name = "rakka_agent"
 [features]
 default = ["rig"]
 # Rig-backed implementation of the Rakka-owned model adapter trait. The crate
-# must build and test without it; the pinned Rig dependency lands with the
-# adapter implementation itself.
-rig = []
+# must build and test without it; the pinned Rig dependency is activated by the
+# feature and its types never appear outside the `rig` module.
+rig = ["dep:rig-core"]
 # Mapping from the Rakka telemetry domain to a pinned OpenTelemetry GenAI
 # semantic-convention revision, composed over the agent-workflow OTLP bridge.
 otel = []
@@ -31,6 +31,11 @@ rakka-remote = { path = "../rakka-remote", version = "0.1.0" }
 rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+# Pinned, reviewed Rig version for the `rig` feature. Default features are off:
+# Rakka needs only Rig's provider-neutral completion contract, and the deploying
+# application supplies the concrete provider client and its transport
+# ([specification 10.2](../../docs/plans/rakka-agent/spec.md)).
+rig-core = { version = "=0.37.0", default-features = false, optional = true }
 
 [dev-dependencies]
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
