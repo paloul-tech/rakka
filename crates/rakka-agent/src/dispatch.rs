@@ -547,9 +547,15 @@ where
         Ok(load_agent_run_state(&self.runs, scope, &self.schema_policy).await?)
     }
 
-    /// One bounded dispatch pass for one run: register its due tickets, fence
-    /// it if it is winding down, recover its ambiguous attempts, and execute
-    /// what is claimable.
+    /// One bounded dispatch pass: register the given run's due tickets and
+    /// fence it if it is winding down, then claim and execute what the fleet
+    /// has due.
+    ///
+    /// Only the registration and the wind-down fence are scoped to the given
+    /// run. The claim batch is *fleet-wide* — a worker serves every run whose
+    /// tickets are due, so a pass may execute tickets other runs registered;
+    /// each claim re-derives its own run scope and is recovered under that
+    /// run's intent.
     ///
     /// The pass reads only durable state, so calling it after a crash, after a
     /// clock advance past a lease, or twice in a row are all the same
@@ -727,32 +733,14 @@ where
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
 
-        if !self.survives(AgentDispatchWindow::BeforeStarted) {
-            return Ok(ClaimConclusion::Died);
-        }
-
-        // Durable `Started`: the outbox row turns `Dispatching` under the
-        // claim's lease and fence, before any external call
-        // ([specification 11.4]).
-        let mut inbox = self.inbox(scope);
-        inbox.recover().await?;
-        inbox
-            .inner_mut()
-            .mark_outbox_dispatching(&message_id)
-            .await
-            .map_err(AgentInboxError::from)?;
-
-        if !self.survives(AgentDispatchWindow::AfterStarted) {
-            return Ok(ClaimConclusion::Died);
-        }
-
         // The adapter's declared retry policy is re-enforced at dispatch
         // ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
         // adapter supplies the permitted safety declaration). An intent whose
         // configured policy is *weaker* — a laxer safety class, or more
-        // attempts than the adapter permits — fails closed before any
-        // invocation, because recovery would read the intent and retry what
-        // the adapter declared unsafe.
+        // attempts than the adapter permits — fails closed before durable
+        // `Started` is even written: a ticket the ceiling refuses must never
+        // be recorded as possibly in flight, and recovery would read the
+        // intent and retry what the adapter declared unsafe.
         if matches!(intent.request, AgentRunEffectRequest::Model { .. }) {
             let declared = self.model.retry_policy();
             let weaker = intent.safety.class().strictness() < declared.safety_class.strictness()
@@ -781,6 +769,25 @@ where
                     .await?;
                 return Ok(ClaimConclusion::Settled);
             }
+        }
+
+        if !self.survives(AgentDispatchWindow::BeforeStarted) {
+            return Ok(ClaimConclusion::Died);
+        }
+
+        // Durable `Started`: the outbox row turns `Dispatching` under the
+        // claim's lease and fence, before any external call
+        // ([specification 11.4]).
+        let mut inbox = self.inbox(scope);
+        inbox.recover().await?;
+        inbox
+            .inner_mut()
+            .mark_outbox_dispatching(&message_id)
+            .await
+            .map_err(AgentInboxError::from)?;
+
+        if !self.survives(AgentDispatchWindow::AfterStarted) {
+            return Ok(ClaimConclusion::Died);
         }
 
         // Dispatch-time credential resolution, inside the bounded attempt. The

@@ -562,6 +562,15 @@ Guidance: [Effect Safety Guidance](technical-guidance.md#effect-safety-guidance)
   see — a ticket that never reached the outbox gets a tombstone row planted
   before its cancelled word is delivered, so a laggard flush racing the fence
   lands on a terminal row instead of creating dispatchable work post-fence.
+- **The effect record's schema version deliberately stays at 1.** The slice
+  reshaped the persisted `AgentRunEffect` — renamed status labels, new
+  required fields — without bumping
+  `CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION`, because the record has only ever
+  existed on this unreleased phase branch: there is no released writer whose
+  records a version gate would protect, and a gate would only dignify
+  test-environment leftovers. The first reshape after a release must bump the
+  version so the spec 20 policy fails closed on the old records instead of
+  surfacing a raw decode error.
 - **Measured (rough, debug build, in-memory stores):** one clean model turn —
   accept, commit effect, ticket, claim, invoke, deliver, propose, accept —
   costs 8 run-store compare-and-sets, 3 workflow-store writes, ~6 ms wall.

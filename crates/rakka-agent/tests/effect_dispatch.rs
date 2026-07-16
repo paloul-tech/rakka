@@ -968,6 +968,17 @@ async fn credentials_are_resolved_at_dispatch_only_and_never_persisted() {
     let workflow = inbox.recover().await.expect("the workflow state loads");
     let encoded = serde_json::to_string(workflow).expect("the workflow serializes");
     assert!(!encoded.contains("live-secret-token"));
+
+    let fleet = {
+        use rakka_persistence::DurableStateStore;
+        fx.fleet_store
+            .load(&rakka_agent_workflow::agent_dispatcher_fleet_persistence_id())
+            .await
+            .expect("the fleet state loads")
+            .expect("the fleet holds the claim's entry")
+    };
+    let encoded = serde_json::to_string(&fleet.state).expect("the fleet serializes");
+    assert!(!encoded.contains("live-secret-token"));
 }
 
 // ---------------------------------------------------------------------------
