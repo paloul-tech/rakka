@@ -117,9 +117,10 @@ pub use loop_runtime::{
 };
 pub use memory::{AgentContextSnapshotId, AgentContextSnapshotRef};
 pub use model::{
-    AgentModelError, AgentModelResult, AgentModelTurn, AgentModelUsage, AgentToolCallId,
-    AgentToolCallRequest, AGENT_MODEL_MAX_TOOL_CALLS, AGENT_MODEL_TEXT_MAX_LENGTH,
-    AGENT_MODEL_TURN_MAX_BYTES, AGENT_TOOL_ARGUMENTS_MAX_BYTES,
+    AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
+    AgentModelRetryPolicy, AgentModelTurn, AgentModelUsage, AgentToolCallId, AgentToolCallRequest,
+    AGENT_MODEL_MAX_TOOL_CALLS, AGENT_MODEL_TEXT_MAX_LENGTH, AGENT_MODEL_TURN_MAX_BYTES,
+    AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
