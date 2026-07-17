@@ -31,6 +31,7 @@ rakka-remote = { path = "../rakka-remote", version = "0.1.0" }
 rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 # Pinned, reviewed Rig version for the `rig` feature. Default features are off:
 # Rakka needs only Rig's provider-neutral completion contract, and the deploying
 # application supplies the concrete provider client and its transport

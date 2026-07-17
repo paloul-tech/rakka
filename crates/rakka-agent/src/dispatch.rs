@@ -30,6 +30,21 @@
 //!   refuses stale *tickets*: a claimed ticket whose run-side intent has moved
 //!   on — resolved, superseded by a newer generation, or gone — settles as
 //!   cancelled without invoking anything.
+//! - **A dispatch grant before every attempt.** The required
+//!   [`AgentDispatchAuthority`] is consulted before durable `Started`, per
+//!   attempt, against the agent's *current* durable authority state: tool
+//!   binding, definition/setup envelope, immediate-safety revocations,
+//!   credential class, execution-policy routing, checkpoint requirements, and
+//!   the guardrail chain ([specification 11.8](../../../docs/plans/rakka-agent/spec.md),
+//!   [16](../../../docs/plans/rakka-agent/spec.md)). A refused attempt
+//!   invokes nothing. A *definitive* refusal fails the effect with the
+//!   refusal's stable code — unless a prior attempt of the generation may
+//!   already have executed, in which case the generation parks
+//!   `Indeterminate`, because "nothing was invoked" would be a lie. A
+//!   *transient* refusal — a suspension — spends nothing: the outbox row is
+//!   untouched and only the fleet entry is rescheduled, so the intent's
+//!   attempt budget keeps meaning "external invocation attempts" and a
+//!   resumed agent's next attempt rechecks and proceeds, whatever the budget.
 //!
 //! # Crash and timeout recovery per safety class
 //!
@@ -96,23 +111,32 @@ use rakka_agent_workflow::{
 };
 use rakka_persistence::DurableStateStore;
 
-use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass};
+use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
+use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision};
 use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentReconciliationProtocolRef, AgentRunEffect,
     AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, ATTR_AGENT_EFFECT_GENERATION,
     ATTR_AGENT_EFFECT_ID,
 };
-use crate::identity::AgentIdentityError;
-use crate::identity::AgentRunScope;
+use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
 use crate::run::{
-    load_agent_run_state, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError, AgentRunState,
+    load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
+    AgentRunState,
 };
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::AgentTaskContent;
+use crate::tools::{
+    AgentAuthorityContext, AgentAuthorityRefusal, AgentGrantedDispatch, AgentToolAuthority,
+};
 
 /// Result type for dispatch pipeline operations.
 pub type AgentDispatchResult<T> = Result<T, AgentDispatchError>;
+
+/// The detail carried by an `Indeterminate` outcome parked for an ambiguity
+/// the pipeline could not resolve.
+const INDETERMINATE_OUTCOME_MESSAGE: &str =
+    "the attempt's outcome could not be established; an explicit reconciliation decision is owed";
 
 /// Boxed future returned by the pipeline's pluggable collaborators.
 pub type AgentDispatchFuture<'a, T> =
@@ -330,6 +354,196 @@ pub trait AgentEffectReconciler: Send + Sync {
     ) -> AgentDispatchFuture<'a, AgentReconciliationFinding>;
 }
 
+/// What the authority decided about one dispatch attempt.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentDispatchDecision {
+    /// The attempt is authorized under the carried grant.
+    Granted(Box<AgentGrantedDispatch>),
+    /// The attempt is refused; the effect stays undispatchable.
+    Refused(AgentAuthorityRefusal),
+}
+
+/// Issues (or refuses) the dispatch grant one attempt needs, from the agent's
+/// current durable authority state
+/// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md),
+/// [16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The pipeline consults it before every attempt's durable `Started` — never
+/// once per effect — which is what makes immediate revocation and grant
+/// validity per-attempt facts rather than commit-time ones. There is no
+/// permissive default: a pipeline cannot be constructed without an authority,
+/// because a dispatcher that skips the check is exactly the universally
+/// privileged worker [specification 16](../../../docs/plans/rakka-agent/spec.md)
+/// forbids claiming isolation from.
+pub trait AgentDispatchAuthority: Send + Sync {
+    /// Authorizes one dispatch attempt of one effect intent, or refuses it.
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        now: rakka_agent_workflow::AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision>;
+}
+
+/// Resolves the setup revision one run was created under, so the dispatch
+/// gate can enforce the *right* setup for whichever run's ticket a fleet
+/// worker happens to claim
+/// ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The claim batch is fleet-wide: one worker serves every run whose tickets
+/// are due, so a setup fixed per authority instance would be enforced against
+/// runs it does not govern — a false, terminal `setup-excludes-tool` refusal
+/// for one run, and a silently skipped narrowing for another. Until runs
+/// carry a durable setup reference of their own, this resolver is the seam a
+/// deployment maps run scopes onto setups through; returning `None` means the
+/// run was created under no setup.
+pub trait AgentRunSetupResolver: Send + Sync {
+    /// The setup revision the given run was created under, when any.
+    fn setup_for(&self, scope: &AgentRunScope) -> Option<AgentSetupRevision>;
+}
+
+/// An [`AgentRunSetupResolver`] binding one setup to exactly one run.
+struct SingleRunSetup {
+    scope: AgentRunScope,
+    setup: AgentSetupRevision,
+}
+
+impl AgentRunSetupResolver for SingleRunSetup {
+    fn setup_for(&self, scope: &AgentRunScope) -> Option<AgentSetupRevision> {
+        (scope == &self.scope).then(|| self.setup.clone())
+    }
+}
+
+/// The [`AgentDispatchAuthority`] backed by the agent entity's durable state.
+///
+/// It reads the same record the [`crate::agent::AgentEntity`] transitions —
+/// definition revision, current settings revision, lifecycle status — so a
+/// suspension or an immediate-safety revocation accepted by the entity is
+/// honored by the very next dispatch attempt, with the agent fully
+/// passivated. The run's setup is resolved per claimed run through the
+/// [`AgentRunSetupResolver`] until runs carry their setup reference; a
+/// deployment that creates runs under setups wires the resolver that knows
+/// which run got which.
+pub struct AgentEntityAuthority<Agents>
+where
+    Agents: DurableStateStore<AgentEntityState>,
+{
+    agents: Agents,
+    authority: AgentToolAuthority,
+    schema_policy: AgentSchemaPolicy,
+    setups: Option<Arc<dyn AgentRunSetupResolver>>,
+}
+
+impl<Agents> AgentEntityAuthority<Agents>
+where
+    Agents: DurableStateStore<AgentEntityState>,
+{
+    /// Creates an authority gate over the agent entity store.
+    #[must_use]
+    pub fn new(agents: Agents, authority: AgentToolAuthority) -> Self {
+        Self {
+            agents,
+            authority,
+            schema_policy: AgentSchemaPolicy::default(),
+            setups: None,
+        }
+    }
+
+    /// Uses an explicit schema-compatibility policy for the agent states it
+    /// reads.
+    #[must_use]
+    pub const fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
+        self.schema_policy = policy;
+        self
+    }
+
+    /// Resolves run setups at dispatch through the given resolver
+    /// ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn with_setup_resolver(mut self, setups: Arc<dyn AgentRunSetupResolver>) -> Self {
+        self.setups = Some(setups);
+        self
+    }
+
+    /// Enforces the given run setup at dispatch, for exactly the given run —
+    /// never for the other runs a fleet worker's claim batch may carry.
+    #[must_use]
+    pub fn with_setup_for_run(self, scope: AgentRunScope, setup: AgentSetupRevision) -> Self {
+        self.with_setup_resolver(Arc::new(SingleRunSetup { scope, setup }))
+    }
+}
+
+impl<Agents> Debug for AgentEntityAuthority<Agents>
+where
+    Agents: DurableStateStore<AgentEntityState>,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentEntityAuthority")
+            .field("agents", &self.agents.backend_name())
+            .field("authority", &self.authority)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Agents> AgentDispatchAuthority for AgentEntityAuthority<Agents>
+where
+    Agents: DurableStateStore<AgentEntityState>,
+{
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        now: rakka_agent_workflow::AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        Box::pin(async move {
+            let agent_scope = AgentScope::new(scope.tenant().clone(), scope.agent().clone())?;
+            let state = load_agent_entity_state(&self.agents, &agent_scope, &self.schema_policy)
+                .await
+                .map_err(agent_state_error)?;
+            let Some(state) = state else {
+                // No durable agent, no authority to dispatch under: fail
+                // closed rather than inventing a permissive default.
+                return Ok(AgentDispatchDecision::Refused(AgentAuthorityRefusal::of(
+                    "agent-state-missing",
+                    format!("no durable agent state exists for {agent_scope:?}"),
+                )));
+            };
+
+            // The setup is a per-run fact: resolve it for the run this claim
+            // belongs to, not for whichever run the authority happened to be
+            // built beside.
+            let setup = self
+                .setups
+                .as_ref()
+                .and_then(|setups| setups.setup_for(scope));
+            let mut context = AgentAuthorityContext::for_entity(&state);
+            if let Some(setup) = &setup {
+                context = context.with_setup(setup);
+            }
+            let task = run.run().map(AgentRun::task);
+            let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
+            let decision = match self
+                .authority
+                .authorize(&context, scope, task, goal, intent, now)
+            {
+                Ok(granted) => AgentDispatchDecision::Granted(Box::new(granted)),
+                Err(refusal) => AgentDispatchDecision::Refused(refusal),
+            };
+            Ok(decision)
+        })
+    }
+}
+
+fn agent_state_error(error: AgentEntityError) -> AgentDispatchError {
+    AgentDispatchError::Collaborator {
+        code: error.code().to_string(),
+        message: error.to_string(),
+    }
+}
+
 /// The durable boundaries of one dispatch attempt, in order.
 ///
 /// Each window sits between two durable writes, so killing a worker at one
@@ -386,6 +600,8 @@ pub struct AgentDispatchPass {
     pub parked_indeterminate: usize,
     /// Attempts recorded as failed (retry scheduled or exhausted).
     pub failed_attempts: usize,
+    /// Claims deferred by a transient refusal, spending nothing durable.
+    pub deferred: usize,
     /// True when the probe killed the worker mid-pass.
     pub died: bool,
 }
@@ -426,6 +642,7 @@ where
     retry_backoff_ms: u64,
     model: Arc<dyn AgentModelAdapter>,
     tools: Arc<dyn AgentDispatchToolExecutor>,
+    authority: Arc<dyn AgentDispatchAuthority>,
     credentials: Option<Arc<dyn AgentEffectCredentialResolver>>,
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
@@ -440,6 +657,13 @@ where
     Clock: WorkflowClock,
 {
     /// Creates a dispatcher worker over the durable stores it reads.
+    ///
+    /// The authority is a required collaborator, not an option: every attempt
+    /// is authorized against it before durable `Started`
+    /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)), and a
+    /// pipeline that could skip that check would be the universally
+    /// privileged worker [specification 16](../../../docs/plans/rakka-agent/spec.md)
+    /// forbids.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -450,6 +674,7 @@ where
         clock: Clock,
         model: Arc<dyn AgentModelAdapter>,
         tools: Arc<dyn AgentDispatchToolExecutor>,
+        authority: Arc<dyn AgentDispatchAuthority>,
         delivery: Arc<dyn AgentRunResultDelivery>,
     ) -> Self {
         let fleet = AgentDispatcherFleet::with_clock_and_metrics(
@@ -470,6 +695,7 @@ where
             retry_backoff_ms: 0,
             model,
             tools,
+            authority,
             credentials: None,
             reconciler: None,
             delivery,
@@ -668,6 +894,9 @@ where
                 .await?;
             return Ok(ClaimConclusion::Settled);
         };
+        let state = run_state
+            .as_ref()
+            .expect("a resolved intent implies the run state it was read from");
         if intent.status.is_resolved() {
             self.settle_ticket_cancelled(scope, &claim, "intent-already-resolved", pass)
                 .await?;
@@ -694,7 +923,7 @@ where
                 && intent.safety.class() == AgentEffectSafetyClass::Reconcileable);
         if ambiguous {
             return self
-                .recover_ambiguous(scope, claim, &intent, attempt, winding_down, pass)
+                .recover_ambiguous(scope, claim, state, &intent, attempt, winding_down, pass)
                 .await;
         }
 
@@ -717,21 +946,33 @@ where
             return Ok(ClaimConclusion::Settled);
         }
 
-        self.attempt_invocation(scope, claim, &intent, attempt, pass)
+        self.attempt_invocation(scope, claim, state, &intent, attempt, pass)
             .await
     }
 
-    /// One fresh, unambiguous dispatch attempt: durable `Started`, bounded
-    /// invocation, result delivery, settlement.
+    /// One fresh, unambiguous dispatch attempt: authorization, durable
+    /// `Started`, bounded invocation, result delivery, settlement.
     async fn attempt_invocation(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
+        state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         let message_id = OutboxMessageId::new(claim.effect_id.as_str());
+
+        // Whether an earlier attempt of this generation may already have
+        // reached the target. For an idempotent effect every non-first
+        // attempt follows a possibly-delivered one — that is why its retries
+        // reuse the external key — so an undispatchable verdict on such an
+        // attempt must park the ambiguity, not assert that nothing was
+        // invoked. Read-only history is inconsequential, a reconcileable
+        // retry runs only once absence is proven, and a non-idempotent effect
+        // never retries.
+        let possibly_executed =
+            intent.safety.class() == AgentEffectSafetyClass::Idempotent && attempt > 1;
 
         // The adapter's declared retry policy is re-enforced at dispatch
         // ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
@@ -746,29 +987,141 @@ where
             let weaker = intent.safety.class().strictness() < declared.safety_class.strictness()
                 || intent.max_attempts > declared.max_attempts;
             if weaker {
-                self.deliver_outcome(
+                let refusal = AgentAuthorityRefusal::of(
+                    "model-policy-conflict",
+                    format!(
+                        "the effect's policy ({} class, {} attempts) is weaker than the \
+                         adapter's declaration ({} class, {} attempts)",
+                        intent.safety.class(),
+                        intent.max_attempts,
+                        declared.safety_class,
+                        declared.max_attempts
+                    ),
+                );
+                return self
+                    .settle_undispatchable(
+                        scope,
+                        &claim,
+                        intent,
+                        attempt,
+                        &refusal,
+                        possibly_executed,
+                        pass,
+                    )
+                    .await;
+            }
+        }
+
+        // Layer 4, the dispatch grant ([specification 11.8]): every attempt is
+        // authorized against the agent's *current* durable authority state
+        // before durable `Started` is written, and the issued grant is
+        // revalidated against the exact intent it must cover. A transient
+        // refusal — a suspension — defers the ticket without spending the
+        // intent's budget, so a resumed agent's next attempt rechecks and
+        // proceeds whatever that budget is; a definitive refusal — an
+        // undeclared or revoked tool, a widened intent, a missing checkpoint,
+        // an unroutable execution policy, a blocked guardrail — settles the
+        // generation (scenario 54).
+        let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
+        let decision = self.authority.authorize(scope, state, intent, now).await?;
+        let granted = match decision {
+            AgentDispatchDecision::Granted(granted) => {
+                if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {
+                    return self
+                        .settle_refusal(
+                            scope,
+                            &claim,
+                            intent,
+                            attempt,
+                            &refusal,
+                            possibly_executed,
+                            pass,
+                        )
+                        .await;
+                }
+                granted
+            }
+            AgentDispatchDecision::Refused(refusal) => {
+                return self
+                    .settle_refusal(
+                        scope,
+                        &claim,
+                        intent,
+                        attempt,
+                        &refusal,
+                        possibly_executed,
+                        pass,
+                    )
+                    .await;
+            }
+        };
+
+        // Transform determinism across the generation ([specification 16]):
+        // when a guardrail transform decides the executed payload — or a
+        // prior attempt of this generation may already have sent one — the
+        // chain evaluated now must be provably the chain the intent was
+        // committed under, or one external idempotency key could carry two
+        // different payloads.
+        if matches!(intent.request, AgentRunEffectRequest::Tool { .. })
+            && (granted.tool_call.is_some() || attempt > 1)
+            && intent.guardrail_revision != granted.grant.guardrail_revision
+        {
+            let refusal = AgentAuthorityRefusal::of(
+                "guardrail-revision-mismatch",
+                match (intent.guardrail_revision, granted.grant.guardrail_revision) {
+                    (None, _) => "the intent pins no guardrail chain revision while the \
+                                  deployment evaluates one; commit intents through the \
+                                  chain-pinned policies of AgentToolAuthority::effect_policies"
+                        .to_string(),
+                    (Some(pinned), Some(current)) => format!(
+                        "the intent was committed under guardrail chain revision {pinned} and \
+                         the deployment now evaluates revision {current}; the executed payload \
+                         could differ across attempts of one generation"
+                    ),
+                    (Some(pinned), None) => format!(
+                        "the intent was committed under guardrail chain revision {pinned} and \
+                         the deployment no longer evaluates a chain"
+                    ),
+                },
+            );
+            return self
+                .settle_refusal(
                     scope,
+                    &claim,
                     intent,
                     attempt,
-                    claim.fencing_token,
-                    AgentRunEffectOutcome::Failed {
-                        code: "model-policy-conflict".to_string(),
-                        message: format!(
-                            "the effect's policy ({} class, {} attempts) is weaker than the \
-                             adapter's declaration ({} class, {} attempts)",
-                            intent.safety.class(),
-                            intent.max_attempts,
-                            declared.safety_class,
-                            declared.max_attempts
-                        ),
-                    },
+                    &refusal,
+                    possibly_executed,
                     pass,
                 )
-                .await?;
-                self.settle_ticket_cancelled(scope, &claim, "model-policy-conflict", pass)
-                    .await?;
-                return Ok(ClaimConclusion::Settled);
-            }
+                .await;
+        }
+
+        // Applied transforms and report-only findings are recorded, not
+        // silent: they surface on the dispatch trace before the invocation.
+        for transform in &granted.transforms {
+            tracing::info!(
+                effect_id = intent.effect_id.as_str(),
+                generation = %intent.generation,
+                stage = %transform.stage,
+                stage_revision = %transform.revision,
+                reason_code = %transform.reason_code,
+                "guardrail transform applied to the dispatched call"
+            );
+        }
+        for report in &granted.reports {
+            tracing::info!(
+                effect_id = intent.effect_id.as_str(),
+                generation = %intent.generation,
+                stage = %report.stage,
+                stage_revision = %report.revision,
+                reason_code = %report.reason_code,
+                evidence = report
+                    .evidence
+                    .as_ref()
+                    .map(|artifact| artifact.artifact_id.as_str()),
+                "guardrail report-only finding"
+            );
         }
 
         if !self.survives(AgentDispatchWindow::BeforeStarted) {
@@ -798,28 +1151,21 @@ where
                 None => {
                     // Fail closed: an intent that names a binding no resolver
                     // can honor is a definitive failure, not a retry loop.
-                    self.deliver_outcome(
-                        scope,
-                        intent,
-                        attempt,
-                        claim.fencing_token,
-                        AgentRunEffectOutcome::Failed {
-                            code: "credential-resolver-missing".to_string(),
-                            message: format!(
-                                "no credential resolver is configured for binding {binding}"
-                            ),
-                        },
-                        pass,
-                    )
-                    .await?;
-                    self.settle_ticket_cancelled(
-                        scope,
-                        &claim,
+                    let refusal = AgentAuthorityRefusal::of(
                         "credential-resolver-missing",
-                        pass,
-                    )
-                    .await?;
-                    return Ok(ClaimConclusion::Settled);
+                        format!("no credential resolver is configured for binding {binding}"),
+                    );
+                    return self
+                        .settle_undispatchable(
+                            scope,
+                            &claim,
+                            intent,
+                            attempt,
+                            &refusal,
+                            possibly_executed,
+                            pass,
+                        )
+                        .await;
                 }
                 Some(resolver) => match resolver.resolve(scope, binding, intent).await {
                     Ok(credential) => Some(credential),
@@ -843,7 +1189,9 @@ where
         };
 
         pass.invoked += 1;
-        let invoked = self.invoke(scope, intent, credential.as_ref()).await;
+        let invoked = self
+            .invoke(scope, intent, &granted, credential.as_ref())
+            .await;
         drop(credential);
 
         if !self.survives(AgentDispatchWindow::AfterInvocation) {
@@ -888,10 +1236,12 @@ where
     /// Recovery of an attempt that wrote durable `Started` and disappeared,
     /// per the intent's safety class
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
+    #[allow(clippy::too_many_arguments)]
     async fn recover_ambiguous(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
+        state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
@@ -917,7 +1267,8 @@ where
                     .await?;
                     return Ok(ClaimConclusion::Settled);
                 }
-                self.retry_ambiguous(scope, claim, intent, pass).await
+                self.retry_ambiguous(scope, claim, state, intent, pass)
+                    .await
             }
             AgentEffectSafetyClass::Idempotent => {
                 // Retry with the generation's external idempotency key — the
@@ -925,10 +1276,11 @@ where
                 // generation hands the target the same one. Under a wind-down
                 // the retry still runs: it is the truthful way to learn what
                 // the ambiguous attempt did, and the target deduplicates it.
-                self.retry_ambiguous(scope, claim, intent, pass).await
+                self.retry_ambiguous(scope, claim, state, intent, pass)
+                    .await
             }
             AgentEffectSafetyClass::Reconcileable => {
-                self.reconcile_ambiguous(scope, claim, intent, attempt, winding_down, pass)
+                self.reconcile_ambiguous(scope, claim, state, intent, attempt, winding_down, pass)
                     .await
             }
             AgentEffectSafetyClass::NonIdempotent => {
@@ -965,6 +1317,7 @@ where
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
+        state: &AgentRunState,
         intent: &AgentRunEffect,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
@@ -1010,17 +1363,19 @@ where
                 .unwrap_or(0)
                 .saturating_add(1)
         };
-        self.attempt_invocation(scope, claim, intent, attempt, pass)
+        self.attempt_invocation(scope, claim, state, intent, attempt, pass)
             .await
     }
 
     /// Queries the reconciliation protocol before any retry
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md):
     /// "retry only when proven absent").
+    #[allow(clippy::too_many_arguments)]
     async fn reconcile_ambiguous(
         &mut self,
         scope: &AgentRunScope,
         claim: AgentDispatchClaim,
+        state: &AgentRunState,
         intent: &AgentRunEffect,
         attempt: u32,
         winding_down: bool,
@@ -1036,13 +1391,22 @@ where
                     intent,
                     attempt,
                     "reconciliation-protocol-missing",
+                    INDETERMINATE_OUTCOME_MESSAGE,
                     pass,
                 )
                 .await;
         };
         let Some(reconciler) = self.reconciler.clone() else {
             return self
-                .park_indeterminate(scope, claim, intent, attempt, "reconciler-missing", pass)
+                .park_indeterminate(
+                    scope,
+                    claim,
+                    intent,
+                    attempt,
+                    "reconciler-missing",
+                    INDETERMINATE_OUTCOME_MESSAGE,
+                    pass,
+                )
                 .await;
         };
 
@@ -1082,7 +1446,8 @@ where
                     return Ok(ClaimConclusion::Settled);
                 }
                 // Proven absent: a retry is a fresh invocation, under budget.
-                self.retry_ambiguous(scope, claim, intent, pass).await
+                self.retry_ambiguous(scope, claim, state, intent, pass)
+                    .await
             }
             AgentReconciliationFinding::Unknown => {
                 if winding_down {
@@ -1096,6 +1461,7 @@ where
                             intent,
                             attempt,
                             "reconciliation-unknown",
+                            INDETERMINATE_OUTCOME_MESSAGE,
                             pass,
                         )
                         .await;
@@ -1125,6 +1491,7 @@ where
                             intent,
                             attempt,
                             "reconciliation-exhausted",
+                            INDETERMINATE_OUTCOME_MESSAGE,
                             pass,
                         )
                         .await;
@@ -1137,6 +1504,7 @@ where
 
     /// Parks one generation as indeterminate and revokes its dispatch
     /// eligibility.
+    #[allow(clippy::too_many_arguments)]
     async fn park_indeterminate(
         &mut self,
         scope: &AgentRunScope,
@@ -1144,6 +1512,7 @@ where
         intent: &AgentRunEffect,
         attempt: u32,
         code: &str,
+        message: &str,
         pass: &mut AgentDispatchPass,
     ) -> AgentDispatchResult<ClaimConclusion> {
         self.deliver_outcome(
@@ -1153,9 +1522,7 @@ where
             claim.fencing_token,
             AgentRunEffectOutcome::Indeterminate {
                 code: code.to_string(),
-                message: "the attempt's outcome could not be established; an explicit \
-                          reconciliation decision is owed"
-                    .to_string(),
+                message: message.to_string(),
             },
             pass,
         )
@@ -1163,6 +1530,105 @@ where
         pass.parked_indeterminate += 1;
         self.settle_ticket_cancelled(scope, &claim, "indeterminate", pass)
             .await?;
+        Ok(ClaimConclusion::Settled)
+    }
+
+    /// Routes one authority refusal to its truthful settlement: a transient
+    /// refusal defers the ticket without spending anything durable; a
+    /// definitive one settles the generation per
+    /// [`Self::settle_undispatchable`].
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_refusal(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        refusal: &AgentAuthorityRefusal,
+        possibly_executed: bool,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        if refusal.retryable {
+            return self
+                .defer_dispatch(claim, attempt, &refusal.code, &refusal.message, pass)
+                .await;
+        }
+        self.settle_undispatchable(
+            scope,
+            claim,
+            intent,
+            attempt,
+            refusal,
+            possibly_executed,
+            pass,
+        )
+        .await
+    }
+
+    /// Settles one undispatchable attempt truthfully. When no prior attempt
+    /// of the generation can have executed, the generation fails with the
+    /// refusal's stable code and the ticket cancels — nothing was invoked.
+    /// When a prior attempt *may* have executed — the refusal arrived on the
+    /// recovery retry of an ambiguous idempotent loss — the generation parks
+    /// `Indeterminate` under the same code instead: the refusal prevented the
+    /// truth-finding retry, so "failed, nothing invoked" would erase exactly
+    /// the ambiguity [specification 11.5](../../../docs/plans/rakka-agent/spec.md)
+    /// preserves, and the explicit reconciliation decision stays owed.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_undispatchable(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        refusal: &AgentAuthorityRefusal,
+        possibly_executed: bool,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        if possibly_executed {
+            let message = format!(
+                "a prior attempt may have invoked the target, and the recovery retry was \
+                 refused ({}); an explicit reconciliation decision is owed",
+                refusal.message
+            );
+            return self
+                .park_indeterminate(
+                    scope,
+                    claim.clone(),
+                    intent,
+                    attempt,
+                    &refusal.code,
+                    &message,
+                    pass,
+                )
+                .await;
+        }
+        self.refuse_dispatch(scope, claim, intent, attempt, refusal, pass)
+            .await
+    }
+
+    /// Defers one claimed ticket without spending anything durable at the
+    /// outbox: no attempt is burned — the budget keeps meaning "external
+    /// invocation attempts" — and no `Failed` row is written that recovery
+    /// could misread as a possibly-executed attempt. Only the fleet entry is
+    /// rescheduled, so the ticket is claimable again once the transient
+    /// condition may have cleared.
+    async fn defer_dispatch(
+        &mut self,
+        claim: &AgentDispatchClaim,
+        attempt: u32,
+        code: &str,
+        message: &str,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        let event = WorkflowTelemetryEvent::OutboxDispatchRetried {
+            message_id: OutboxMessageId::new(claim.effect_id.as_str()),
+            attempt: attempt.saturating_sub(1),
+            next_retry_at: self.clock.now().add_millis(self.retry_backoff_ms),
+            message: format!("deferred: {code}: {message}"),
+        };
+        self.fleet.record_claim_failure(claim, &event).await?;
+        pass.deferred += 1;
         Ok(ClaimConclusion::Settled)
     }
 
@@ -1210,19 +1676,34 @@ where
         Ok(ClaimConclusion::Settled)
     }
 
-    /// Performs the bounded external invocation for one intent.
+    /// Performs the bounded external invocation for one authorized intent.
+    ///
+    /// The grant is where the turn-bound settings of
+    /// [specification 7.2](../../../docs/plans/rakka-agent/spec.md) reach the
+    /// model call: the authority resolved the profile and sampling the current
+    /// settings revision selects, and the request carries them along with the
+    /// revision it validated. A guardrail-transformed tool call executes the
+    /// transformed arguments, re-derived identically on every attempt of the
+    /// generation — identically because the attempt was refused upstream
+    /// unless the current chain revision matches the one the intent pinned at
+    /// commit.
     async fn invoke(
         &self,
         scope: &AgentRunScope,
         intent: &AgentRunEffect,
+        granted: &AgentGrantedDispatch,
         credential: Option<&AgentEphemeralCredential>,
     ) -> AgentDispatchResult<AgentRunEffectOutcome> {
         match &intent.request {
             AgentRunEffectRequest::Model { context, profile } => {
                 let mut request = AgentModelRequest::new(context.clone(), intent.turn)
-                    .with_settings_revision(intent.settings_revision);
+                    .with_settings_revision(granted.grant.settings_revision);
+                if let Some(sampling) = granted.sampling {
+                    request = request.with_sampling(sampling);
+                }
+                let profile = granted.model_profile.clone().or_else(|| profile.clone());
                 if let Some(profile) = profile {
-                    request = request.with_profile(profile.clone());
+                    request = request.with_profile(profile);
                 }
                 let turn = self.model.call(&request).await.map_err(|error| {
                     AgentDispatchError::Invocation {
@@ -1240,6 +1721,7 @@ where
                 })
             }
             AgentRunEffectRequest::Tool { call } => {
+                let call: &AgentToolCallRequest = granted.tool_call.as_deref().unwrap_or(call);
                 let content = self.tools.execute(scope, intent, call, credential).await?;
                 Ok(AgentRunEffectOutcome::Tool {
                     call_id: call.call_id.clone(),
@@ -1247,6 +1729,35 @@ where
                 })
             }
         }
+    }
+
+    /// Settles one definitively refused dispatch: the generation fails with
+    /// the refusal's stable code, and the ticket is cancelled so it can never
+    /// be claimed again. Nothing was invoked.
+    async fn refuse_dispatch(
+        &mut self,
+        scope: &AgentRunScope,
+        claim: &AgentDispatchClaim,
+        intent: &AgentRunEffect,
+        attempt: u32,
+        refusal: &AgentAuthorityRefusal,
+        pass: &mut AgentDispatchPass,
+    ) -> AgentDispatchResult<ClaimConclusion> {
+        self.deliver_outcome(
+            scope,
+            intent,
+            attempt,
+            claim.fencing_token,
+            AgentRunEffectOutcome::Failed {
+                code: refusal.code.clone(),
+                message: refusal.message.clone(),
+            },
+            pass,
+        )
+        .await?;
+        self.settle_ticket_cancelled(scope, claim, &refusal.code, pass)
+            .await?;
+        Ok(ClaimConclusion::Settled)
     }
 
     /// Delivers one generation-final outcome to the owning run entity.

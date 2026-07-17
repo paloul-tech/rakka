@@ -602,6 +602,123 @@ Guidance: [Tool Visibility, Authority, and Executor Isolation](technical-guidanc
   stages cannot be removed by definition/setup.
 - Enforce the Slice 1.2 setup/settings envelope at dispatch.
 
+**Amended as implemented (2026-07-16):**
+
+- **The registry replaces `AgentEffectPolicies` by projection, not deletion.**
+  `AgentToolRegistry::effect_policies` derives the run entity's commit-time
+  policies from the registered bindings, so the loop transition code and the
+  effect record are untouched (exactly what the 1.7 amendment reserved), and
+  the same registry backs the dispatch-time authority — one source, two
+  enforcement points. "Unclassified" now means *registered without a
+  declaration* (fails safe as one non-idempotent attempt); a tool with no
+  registration at all is refused outright at dispatch
+  (`tool-binding-missing`), because a binding is the only thing that can
+  vouch for what a call would execute.
+- **The authority gate is a required dispatcher collaborator, and the
+  refusal's shape follows its cause.** `AgentRunEffectDispatcher` cannot be
+  constructed without an `AgentDispatchAuthority`; a permissive default would
+  be the universally privileged worker spec 16 forbids. The gate runs before
+  every attempt's durable `Started` against the agent's *current* durable
+  state (`AgentEntityAuthority` over `load_agent_entity_state`), which is
+  what makes immediate-safety revocations and suspension per-attempt facts.
+  A *transient* refusal — suspension — spends nothing durable: the claim is
+  deferred at the fleet with the outbox row untouched, so no attempt burns
+  (the budget keeps meaning "external invocation attempts", and a suspension
+  cannot exhaust a single-attempt effect), no `Failed` row is written that
+  recovery could misread as a possibly-executed reconcileable attempt, and a
+  resumed agent's next attempt rechecks and proceeds. A *definitive* refusal
+  settles the generation as `Failed` with the refusal's stable code and
+  cancels the ticket, with nothing invoked — unless the refused attempt was
+  the truth-finding retry of an ambiguous idempotent loss, where a prior
+  attempt may already have committed externally: that generation parks
+  `Indeterminate` under the refusal's code instead, preserving the spec 11.5
+  ambiguity for the explicit reconciliation decision. The gate also
+  revalidates the intent's reconciliation protocol and per-attempt timeout
+  against the binding, and enforces the settings' guardrail-policy selection
+  (`guardrail-policy-mismatch`) — the third immediate-safety field —
+  against the policy reference the deployed chain carries.
+- **The grant is derived per attempt, not persisted.** Issuing fresh and
+  revalidating (`AgentDispatchGrant::validate_for`: exact intent and
+  generation, argument digest, safety class, expiry, use count) *is* the
+  pre-attempt revalidation spec 11.8 requires; there is no released grant a
+  store could outlive. A grant is valid *through* its expiry instant, so the
+  mint-and-spend path can never be refused by its own issuance timestamp
+  whatever the TTL; the TTL bounds a grant a holder retains, which no
+  shipped path does yet. Slice 1.10's checkpoint-bound grants add the
+  durable half without changing this seam — until then a binding or
+  guardrail that requires a checkpoint fails closed (`checkpoint-required`),
+  because no grant can exist yet.
+- **Setup enforcement rides the gate, resolved per claimed run.** Runs do
+  not yet carry a setup reference, and the dispatcher's claim batch is
+  fleet-wide — one worker serves every run whose tickets are due — so a
+  setup fixed per worker would be enforced against runs it does not govern.
+  `AgentEntityAuthority::with_setup_resolver` (and the single-run
+  `with_setup_for_run`) maps each claimed run onto the setup it was created
+  under; both the definition envelope *and* the resolved setup are checked,
+  which fails closed when a definition narrowed after the setup was
+  validated. When a later slice gives runs a durable setup reference, the
+  gate reads it from the run state instead — the resolver seam disappears,
+  not the semantics.
+- **Guardrail transforms run at dispatch, never touch the durable intent,
+  and are pinned to the chain revision the intent committed under.** Each
+  committed intent records the chain revision of the policies it was stamped
+  from (`AgentToolAuthority::effect_policies` projects the registry and the
+  configured chain together), and the pipeline refuses an attempt
+  (`guardrail-revision-mismatch`) whenever a transform would decide the
+  payload — or any retry follows a possibly-delivered attempt — under a
+  chain that no longer matches the pin. That is how "a retry reuses the
+  accepted transformed input" is honored without a second durable write:
+  re-derivation is provably under the pinned revision, one external
+  idempotency key can never carry two different payloads, and the intent's
+  argument digest stays bound to what the run committed. The chain itself is
+  deployment configuration; a definition or setup can require stages
+  (envelope `mandatory_guardrails`, enforced as `guardrail-stage-missing`
+  when the chain cannot run one) and disable optional ones (`narrowed`,
+  which mints a revision of its own — a different stage set is a different
+  evaluation), and no operation exists that removes a deployment-mandatory
+  stage. Presence in the chain is never coverage, in two steps: a stage must
+  declare at least one boundary (`guardrail-stage-unbound`, refused at
+  registration), and a *required* stage must run at a boundary the caller
+  actually evaluates (`guardrail-stage-unevaluated`, refused at dispatch —
+  the chain cannot decide this for itself, because which boundaries have
+  evaluation points is a property of the caller, so
+  `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` passes them into
+  `validate_covers`). This slice evaluates the tool-request and
+  model-request boundaries; the declared response/A2A/memory boundaries gain
+  their evaluation points — and with them, the ability of stages bound there
+  to satisfy coverage — from the slices that own those flows, which is a
+  one-line extension of that set. Until slice
+  1.11 gives context snapshots content, the model-request boundary evaluates
+  a bounded request descriptor — enough for a kill-switch or checkpoint
+  stage, which is why a transform there fails closed
+  (`guardrail-transform-unsupported`) instead of being silently ignored.
+  Block evidence rides the refusal detail, and applied transforms and
+  report-only findings surface on the dispatcher's trace.
+- **A stage is evaluated against a context, not a bare boundary.**
+  `AgentGuardrailContext` carries the boundary, the run scope, and — at the
+  tool boundaries — the tool being called, so a stage can gate *which* tool
+  is invoked or scope a policy to a tenant; a stage handed only the arguments
+  could not tell one tool's call from another's. Identity rides the context
+  rather than the content because content is exactly what a transform
+  rewrites: an envelope would make a transform responsible for reproducing
+  the identity fields and would spend the boundary's content budget on fields
+  no stage may change. The split keeps identity readable and structurally
+  unrewritable, and keeps determinism intact — everything the context carries
+  is durable identity the same intent re-derives on every attempt.
+- **The 1.6 amendment's settings note is discharged here.** The authority
+  resolves the turn-bound settings of spec 7.2 at dispatch: the granted model
+  call carries the profile and sampling the current settings revision
+  selects, validated against the definition and setup envelopes, and the
+  `AgentModelRequest` now records the settings revision it actually resolved
+  rather than the interim initial value.
+- **`EffectIntent` gained its `ExecutionPolicyRef`.** The intent persists the
+  binding's execution policy, the dispatch ticket echoes it for routing, and
+  `AgentExecutionPolicyRouter` is the application-owned hook: an intent that
+  names a trust class no configured executor accepts stays undispatchable
+  (`execution-policy-unroutable`) rather than running with ambient
+  authority. The reshape keeps the effect schema at version 1 under the same
+  unreleased-branch argument the 1.7 amendment recorded.
+
 Done when: scenarios 44 and 54 pass (widening setups rejected; a
 model-visible call stays undispatchable when binding, grant, credential,
 checkpoint, execution-policy, or immediate-safety checks fail).

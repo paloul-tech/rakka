@@ -1667,12 +1667,16 @@ pub struct RecordingToolExecutor {
 }
 
 /// One external invocation a [`RecordingToolExecutor`] performed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordedToolInvocation {
     /// The tool that was invoked.
     pub tool: String,
     /// The call the model asked for.
     pub call_id: String,
+    /// The arguments the executor was handed — after any deterministic
+    /// guardrail transform, which is how a test observes that the transformed
+    /// input, not the model's original, reached the target.
+    pub arguments: serde_json::Value,
     /// The idempotency key the target was handed.
     pub idempotency_key: String,
     /// The generation the attempt served.
@@ -1757,6 +1761,7 @@ impl AgentDispatchToolExecutor for RecordingToolExecutor {
                 .push(RecordedToolInvocation {
                     tool: tool.clone(),
                     call_id: call.call_id.to_string(),
+                    arguments: call.arguments.clone(),
                     idempotency_key: intent.idempotency_key.as_str().to_string(),
                     generation: intent.generation.get(),
                     with_credential,

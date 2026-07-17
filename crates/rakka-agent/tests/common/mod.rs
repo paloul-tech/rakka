@@ -26,14 +26,15 @@ use rakka_agent::testkit::{
 };
 use rakka_agent::{
     AgentAuthorityEnvelope, AgentBudgetCeilings, AgentDefinition, AgentDefinitionId,
-    AgentEffectPolicies, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
-    AgentExchangeRouter, AgentId, AgentModelAdapter, AgentOperationId, AgentOperationKind,
-    AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectSink, AgentRunEntityStore,
-    AgentRunScope, AgentRunSnapshot, AgentRunState, AgentRunStatus, AgentSchemaId, AgentSchemaRef,
-    AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation, AgentTaskDefinition,
-    AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore, AgentTaskResultCheck,
-    AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
-    InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, TenantId,
+    AgentEffectPolicies, AgentEffectSpec, AgentEntityClass, AgentEntityCommand, AgentEntityState,
+    AgentEntityStore, AgentExchangeRouter, AgentId, AgentModelAdapter, AgentOperationId,
+    AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectSink,
+    AgentRunEntityStore, AgentRunScope, AgentRunSnapshot, AgentRunState, AgentRunStatus,
+    AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation,
+    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore,
+    AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot,
+    AgentTaskState, AgentToolBinding, AgentToolDeclaration, AgentToolDescriptor, AgentToolKind,
+    AgentToolRegistry, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, TenantId,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
@@ -114,6 +115,60 @@ pub fn task_definition() -> AgentTaskDefinition {
         max_loop_iterations: Some(3),
         ..AgentBudgetCeilings::unbounded()
     })
+}
+
+/// A bounded model-visible descriptor for one test tool.
+pub fn tool_descriptor(tool: &str) -> AgentToolDescriptor {
+    AgentToolDescriptor::new(
+        rakka_agent::AgentToolId::new(tool).expect("tool id should be valid"),
+        AgentToolKind::Function,
+        "A test tool.",
+        schema("tool-input"),
+        schema("tool-output"),
+    )
+    .expect("the descriptor should be valid")
+}
+
+/// Binds one test tool exactly as an effect spec classifies it, so the
+/// registry, the commit-time policies, and the dispatch-time authority all
+/// speak from the same declaration.
+pub fn tool_binding_for_spec(tool: &str, spec: &AgentEffectSpec) -> AgentToolBinding {
+    let mut declaration = AgentToolDeclaration::new(spec.safety_class);
+    if let Some(credential) = &spec.credential_binding {
+        declaration = declaration.with_credential_binding(credential.clone());
+    }
+    if let Some(policy) = &spec.execution_policy {
+        declaration = declaration.with_execution_policy(policy.clone());
+    }
+    let mut binding = AgentToolBinding::new(tool_descriptor(tool), declaration, spec.max_attempts);
+    if let Some(protocol) = &spec.reconciliation_protocol {
+        binding = binding.with_reconciliation_protocol(protocol.clone());
+    }
+    if let Some(timeout) = spec.timeout_ms {
+        binding = binding.with_timeout_ms(timeout);
+    }
+    binding
+}
+
+/// A registry holding one test tool under the given spec.
+pub fn tool_registry_for_spec(tool: &str, spec: &AgentEffectSpec) -> AgentToolRegistry {
+    AgentToolRegistry::new()
+        .register(tool_binding_for_spec(tool, spec))
+        .expect("the tool should register")
+}
+
+/// The definition envelope one registry's declarations imply: every registered
+/// tool declared exactly as bound, with its credential binding authorized.
+pub fn envelope_for_registry(registry: &AgentToolRegistry) -> AgentAuthorityEnvelope {
+    let mut envelope = AgentAuthorityEnvelope::empty();
+    envelope.task_definitions.insert(task_definition_id());
+    for (tool, declaration) in registry.tool_declarations() {
+        if let Some(credential) = &declaration.credential_binding {
+            envelope.credential_bindings.insert(credential.clone());
+        }
+        envelope.tools.insert(tool, declaration);
+    }
+    envelope
 }
 
 pub fn provenance(at: u64) -> AgentRevisionProvenance {
@@ -217,6 +272,12 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     pub async fn instantiate_agent(&self) {
         let mut envelope = AgentAuthorityEnvelope::empty();
         envelope.task_definitions.insert(task_definition_id());
+        self.instantiate_agent_with_envelope(envelope).await;
+    }
+
+    /// Instantiates the agent under an explicit authority envelope, for tests
+    /// whose dispatches must pass the slice 1.8 authority gate.
+    pub async fn instantiate_agent_with_envelope(&self, envelope: AgentAuthorityEnvelope) {
         let definition = AgentDefinition::new(
             AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
             "Resolves customer support tickets end to end.",
