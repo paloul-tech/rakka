@@ -61,6 +61,7 @@ use rakka_sharding::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::admission::{AgentAdmissionError, AutonomyAdmissionDecision};
 use crate::definition::{
     AgentDefinition, AgentDefinitionError, AgentDefinitionId, AgentDefinitionRevision,
     AgentPolicyRefs, AgentRevisionNumber, AgentRevisionProvenance, AgentSettings,
@@ -218,6 +219,7 @@ pub struct AgentEntityState {
     lifecycle_revision: AgentRevisionNumber,
     definition: AgentDefinitionRevision,
     settings: SettingsRevision,
+    admission: Option<AutonomyAdmissionDecision>,
     applied_operations: AgentOperationLog,
     updated_at: AgentTimestampMillis,
 }
@@ -239,6 +241,12 @@ impl AgentEntityState {
             lifecycle_revision: AgentRevisionNumber::INITIAL,
             definition,
             settings,
+            // An agent is unadmitted until an authorized evaluator says
+            // otherwise ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+            // Instantiation is not admission: the two are separate decisions
+            // precisely so that creating an agent cannot be the act that
+            // authorizes it to run unattended.
+            admission: None,
             applied_operations: AgentOperationLog::default(),
             updated_at,
         }
@@ -286,6 +294,17 @@ impl AgentEntityState {
     #[must_use]
     pub const fn settings(&self) -> &SettingsRevision {
         &self.settings
+    }
+
+    /// The autonomy admission decision on record, when there is one
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// `None` is the fail-closed default and not a transient one: an agent that
+    /// has never been admitted, and an agent whose admission was retired, are
+    /// the same thing to every enforcement point.
+    #[must_use]
+    pub const fn admission(&self) -> Option<&AutonomyAdmissionDecision> {
+        self.admission.as_ref()
     }
 
     /// Application-owned policy references this agent runs under.
@@ -433,6 +452,31 @@ pub enum AgentEntityCommand {
         /// Who accepted the update, when, and under which audit reference.
         provenance: Box<AgentRevisionProvenance>,
     },
+    /// Record an autonomy admission decision an authorized evaluator made
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Rakka owns the durable decision and the enforcement points; the
+    /// application owns the policy that authored it. The entity is not a rubber
+    /// stamp for what it is handed: it verifies the decision against the
+    /// definition it claims to admit, and refuses one that names revisions this
+    /// agent is not currently on — an admission of a definition that has since
+    /// been replaced would otherwise admit work nobody evaluated.
+    Admit {
+        /// Stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The decision the evaluator made.
+        decision: Box<AutonomyAdmissionDecision>,
+    },
+    /// Retire the autonomy admission decision on record, returning the agent to
+    /// the fail-closed default.
+    Retract {
+        /// Stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// A bounded, stable reason.
+        reason: String,
+        /// Who retracted it, when, and under which audit reference.
+        provenance: Box<AgentRevisionProvenance>,
+    },
     /// Suspend the agent. No further effect may be dispatched until it resumes.
     Suspend {
         /// Stable operation id this command deduplicates on.
@@ -475,6 +519,8 @@ impl AgentEntityCommand {
             Self::Instantiate { operation_id, .. }
             | Self::PublishDefinition { operation_id, .. }
             | Self::UpdateSettings { operation_id, .. }
+            | Self::Admit { operation_id, .. }
+            | Self::Retract { operation_id, .. }
             | Self::Suspend { operation_id, .. }
             | Self::Resume { operation_id, .. }
             | Self::Terminate { operation_id, .. } => Some(operation_id),
@@ -716,6 +762,15 @@ where
                 self.update_settings(operation_id, expected_revision, changes, *provenance)
                     .await
             }
+            AgentEntityCommand::Admit {
+                operation_id,
+                decision,
+            } => self.admit(operation_id, *decision).await,
+            AgentEntityCommand::Retract {
+                operation_id,
+                reason: _,
+                provenance,
+            } => self.retract(operation_id, *provenance).await,
             AgentEntityCommand::Suspend {
                 operation_id,
                 expected_lifecycle_revision,
@@ -809,6 +864,55 @@ where
             // running under settings its definition no longer authorizes.
             state.settings.validate_against_definition(&definition)?;
             state.definition = definition;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn admit(
+        &mut self,
+        operation_id: AgentOperationId,
+        decision: AutonomyAdmissionDecision,
+    ) -> AgentEntityResult<AgentEntityReply> {
+        let accepted_at = decision.created_at();
+        self.mutate(operation_id, accepted_at, |state| {
+            // The decision names the revisions it evaluated. If the agent has
+            // moved on, this decision evaluated something else — accepting it
+            // would admit a definition or settings nobody assessed — so it is
+            // refused and the evaluator re-runs against what is current.
+            let definition = state.definition.revision();
+            if decision.definition_revision() != definition {
+                return Err(AgentEntityError::StaleAdmissionRevision {
+                    record: "definition",
+                    admitted: decision.definition_revision(),
+                    current: definition,
+                });
+            }
+            let settings = state.settings.revision();
+            if decision.settings_revision() != settings {
+                return Err(AgentEntityError::StaleAdmissionRevision {
+                    record: "settings",
+                    admitted: decision.settings_revision(),
+                    current: settings,
+                });
+            }
+            // Rakka's half of the split: an attestation is taken on trust, and
+            // everything the definition itself answers is not.
+            decision.verify(state.definition.definition())?;
+            state.admission = Some(decision);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn retract(
+        &mut self,
+        operation_id: AgentOperationId,
+        provenance: AgentRevisionProvenance,
+    ) -> AgentEntityResult<AgentEntityReply> {
+        let accepted_at = provenance.accepted_at;
+        self.mutate(operation_id, accepted_at, |state| {
+            state.admission = None;
             Ok(())
         })
         .await
@@ -1237,6 +1341,8 @@ pub enum AgentEntityError {
     Schema(AgentSchemaError),
     /// A definition, settings, or setup revision was rejected.
     Definition(AgentDefinitionError),
+    /// An autonomy admission decision was rejected.
+    Admission(AgentAdmissionError),
     /// The durable store rejected a load or write.
     Persistence(DurableError),
     /// A command reached the entity before its state was recovered.
@@ -1275,6 +1381,16 @@ pub enum AgentEntityError {
         /// Lifecycle revision that is actually current.
         current: AgentRevisionNumber,
     },
+    /// The admission decision evaluated a revision the agent is no longer on,
+    /// so it admits something other than what would run.
+    StaleAdmissionRevision {
+        /// Which record the decision named a stale revision of.
+        record: &'static str,
+        /// Revision the decision evaluated.
+        admitted: AgentRevisionNumber,
+        /// Revision that is actually current.
+        current: AgentRevisionNumber,
+    },
 }
 
 impl AgentEntityError {
@@ -1285,6 +1401,7 @@ impl AgentEntityError {
             Self::Identity(error) => error.code(),
             Self::Schema(error) => error.code(),
             Self::Definition(error) => error.code(),
+            Self::Admission(error) => error.code(),
             Self::Persistence(error) => error.code(),
             Self::NotRecovered { .. } => "agent-not-recovered",
             Self::NotInstantiated { .. } => "agent-not-instantiated",
@@ -1292,6 +1409,7 @@ impl AgentEntityError {
             Self::Terminated { .. } => "agent-terminated",
             Self::StaleSettingsRevision { .. } => "stale-settings-revision",
             Self::StaleLifecycleRevision { .. } => "stale-lifecycle-revision",
+            Self::StaleAdmissionRevision { .. } => "stale-admission-revision",
         }
     }
 }
@@ -1302,6 +1420,7 @@ impl Display for AgentEntityError {
             Self::Identity(error) => Display::fmt(error, f),
             Self::Schema(error) => Display::fmt(error, f),
             Self::Definition(error) => Display::fmt(error, f),
+            Self::Admission(error) => Display::fmt(error, f),
             Self::Persistence(error) => Display::fmt(error, f),
             Self::NotRecovered { scope } => {
                 write!(f, "agent {scope} was commanded before its state recovered")
@@ -1324,6 +1443,14 @@ impl Display for AgentEntityError {
                 f,
                 "the lifecycle command expected lifecycle revision {expected} but revision {current} is current"
             ),
+            Self::StaleAdmissionRevision {
+                record,
+                admitted,
+                current,
+            } => write!(
+                f,
+                "the admission decision evaluated {record} revision {admitted} but revision {current} is current"
+            ),
         }
     }
 }
@@ -1334,6 +1461,7 @@ impl Error for AgentEntityError {
             Self::Identity(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::Definition(error) => Some(error),
+            Self::Admission(error) => Some(error),
             Self::Persistence(error) => Some(error),
             _ => None,
         }
@@ -1349,6 +1477,12 @@ impl From<AgentIdentityError> for AgentEntityError {
 impl From<AgentSchemaError> for AgentEntityError {
     fn from(error: AgentSchemaError) -> Self {
         Self::Schema(error)
+    }
+}
+
+impl From<AgentAdmissionError> for AgentEntityError {
+    fn from(error: AgentAdmissionError) -> Self {
+        Self::Admission(error)
     }
 }
 

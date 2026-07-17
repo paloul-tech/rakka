@@ -458,6 +458,48 @@ impl AgentRunTerminalReason {
     }
 }
 
+/// How far a run has got in handing its escrow back to its task
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The two steps are two exchanges and they are ordered, because the order is a
+/// correctness property rather than a style choice: see
+/// [`crate::budget`]. This status is what sequences them across passivation,
+/// recovery, and shard movement — the run does not hold the sequence in memory,
+/// it reads it back out of its own durable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentRunSettlementStatus {
+    /// The run has not yet reported what it consumed. A live run is always
+    /// here: settlement travels only after a known terminal outcome.
+    Owed,
+    /// The task has recorded the run's consumption. Its escrow is still
+    /// outstanding, so the parent is conservatively short of headroom until the
+    /// return lands.
+    Settled,
+    /// The task has released the run's unused escrow. The run owes its parent
+    /// nothing further, ever.
+    Returned,
+}
+
+impl AgentRunSettlementStatus {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Owed => "owed",
+            Self::Settled => "settled",
+            Self::Returned => "returned",
+        }
+    }
+}
+
+impl Display for AgentRunSettlementStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
 /// The bounded materialized record of one run.
 ///
 /// It holds what the next legal transition needs: the immutable binding to its
@@ -482,6 +524,9 @@ pub struct AgentRun {
     pub loop_state: AgentLoopState,
     /// Why the run reached its terminal status.
     pub terminal_reason: Option<AgentRunTerminalReason>,
+    /// How far the run has got in handing its escrow back to its task
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub settlement: AgentRunSettlementStatus,
     /// When the run durably accepted its assignment, stamped by the owner that
     /// wrote it.
     pub accepted_at: AgentTimestampMillis,
@@ -938,7 +983,12 @@ fn accept_assignment(
         binding = binding.with_goal(goal);
     }
 
-    let budget = AgentRunBudget::allocate(assignment.definition.budgets, now);
+    // The run credits exactly what its parent debited and carried on this
+    // command — never what the task definition's ceilings say, which is a
+    // ceiling rather than an escrow and would let every generation of a task
+    // spend the task's whole budget again
+    // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    let budget = AgentRunBudget::allocate(assignment.budget, now);
     let loop_state = AgentLoopState::started(
         assignment.task.task().clone(),
         assignment.goal.clone(),
@@ -956,6 +1006,7 @@ fn accept_assignment(
         status: AgentRunStatus::Accepted,
         loop_state,
         terminal_reason: None,
+        settlement: AgentRunSettlementStatus::Owed,
         accepted_at: now,
     };
     // Acceptance reserves growth headroom: a run admitted here must still be able
@@ -993,6 +1044,52 @@ fn refuse(code: &str, message: impl Into<String>) -> AgentExchangeResult {
     )
 }
 
+/// Derives the stable id of one ledger exchange a run owes its task.
+///
+/// The id is derived from durable identity alone, so a run lost before its
+/// settlement reached the task re-drives *the same* operation, and the task's
+/// escrow answers from what it already recorded rather than crediting twice
+/// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 61).
+/// The step is part of the id because settlement and return are two commands
+/// against one child escrow, and one id could not name both.
+pub fn ledger_operation_id(
+    scope: &AgentRunScope,
+    kind: AgentExchangeKind,
+    sequence: u64,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    let operation = match kind {
+        AgentExchangeKind::BudgetAllocation => AgentOperationKind::BudgetAllocation,
+        _ => AgentOperationKind::BudgetSettlement,
+    };
+    AgentOperationId::new(
+        operation,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            kind.as_label(),
+            &sequence.to_string(),
+        ],
+    )
+}
+
+/// Records that one ledger exchange the run owed has been acknowledged.
+fn settle_ledger_exchange(
+    state: &mut AgentRunState,
+    kind: AgentExchangeKind,
+    now: AgentTimestampMillis,
+) {
+    let Some(run) = state.run.as_mut() else {
+        return;
+    };
+    match kind {
+        AgentExchangeKind::BudgetSettlement => run.settlement = AgentRunSettlementStatus::Settled,
+        AgentExchangeKind::BudgetReturn => run.settlement = AgentRunSettlementStatus::Returned,
+        _ => return,
+    }
+    state.updated_at = now;
+}
+
 /// One bounded loop transition, and whatever it now owes.
 ///
 /// This is the execution rule in code: it advances the loop by exactly one
@@ -1012,7 +1109,7 @@ fn advance_once(
         return Ok(Vec::new());
     }
 
-    match run.loop_state.phase() {
+    let owed = match run.loop_state.phase() {
         AgentLoopPhase::PreparingContext => {
             prepare_context(state, &scope, policies, now).map(|()| Vec::new())
         }
@@ -1026,7 +1123,8 @@ fn advance_once(
         | AgentLoopPhase::AwaitingTools
         | AgentLoopPhase::Suspended
         | AgentLoopPhase::Complete => Ok(Vec::new()),
-    }
+    }?;
+    Ok(owed)
 }
 
 /// Prepares the turn's immutable context and persists the model effect it will
@@ -1767,13 +1865,26 @@ impl AgentExchangeParticipant for AgentRunParticipant {
         result: &AgentExchangeResult,
         now: AgentTimestampMillis,
     ) -> Vec<AgentExchangeEnvelope> {
-        if envelope.kind() == AgentExchangeKind::ResultProposal {
-            // A settle may not fail: the exchange is already settled in the same
-            // compare-and-set, and there is no one to report a failure to. Every
-            // path inside `settle_proposal` therefore ends in a durable decision,
-            // including the one where the decision cannot be decoded — which
-            // `check_settle` above makes unreachable in practice.
-            let _terminated = settle_proposal(state, result, now);
+        match envelope.kind() {
+            AgentExchangeKind::ResultProposal => {
+                // A settle may not fail: the exchange is already settled in the
+                // same compare-and-set, and there is no one to report a failure
+                // to. Every path inside `settle_proposal` therefore ends in a
+                // durable decision, including the one where the decision cannot
+                // be decoded — which `check_settle` above makes unreachable in
+                // practice.
+                let _terminated = settle_proposal(state, result, now);
+            }
+            kind @ (AgentExchangeKind::BudgetSettlement | AgentExchangeKind::BudgetReturn) => {
+                // A *rejected* ledger exchange is a durable decision too, and
+                // advancing on it is the point: the task refuses a settlement
+                // for an escrow it has already closed, and a run that treated
+                // that as unfinished business would re-drive it forever. Either
+                // way the parent's ledger holds the truth, and this step is
+                // done.
+                settle_ledger_exchange(state, kind, now);
+            }
+            _ => {}
         }
         Vec::new()
     }
@@ -2993,7 +3104,10 @@ mod tests {
         )
         .expect("the definition is valid");
 
-        let budget = AgentRunBudget::allocate(definition.budgets, now);
+        let budget = AgentRunBudget::allocate(
+            crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
+            now,
+        );
         let loop_state = AgentLoopState::started(
             task.clone(),
             None,
@@ -3011,6 +3125,7 @@ mod tests {
             status: AgentRunStatus::Running,
             loop_state,
             terminal_reason: None,
+            settlement: AgentRunSettlementStatus::Owed,
             accepted_at: now,
         };
         let baseline = run.materialized_size_bytes();

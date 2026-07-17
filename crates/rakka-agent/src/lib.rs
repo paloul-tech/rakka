@@ -84,6 +84,11 @@ pub mod tools;
 pub mod wake;
 pub mod workflow_tool;
 
+pub use admission::{
+    AgentAdmissionError, AgentAdmissionEvaluator, AgentAdmissionRefusal, AgentAdmissionRequirement,
+    AgentAdmissionResult, AutonomyAdmissionDecision, AGENT_ADMISSION_CONSTRAINT_CAPACITY,
+    AGENT_ADMISSION_DETAIL_MAX_LENGTH,
+};
 pub use agent::{
     agent_entity_id, agent_entity_persistence_id, agent_entity_ref, agent_entity_type_key,
     init_agent_entity_remote_sharding, init_agent_entity_sharding, load_agent_entity_state,
@@ -94,7 +99,11 @@ pub use agent::{
     AgentLifecycleStatus, AgentOperationLog, AGENT_ENTITY_OPERATION_LOG_CAPACITY,
     DEFAULT_AGENT_ENTITY_TYPE,
 };
-pub use budget::{AgentBudgetDimension, AgentBudgetExhaustion, AgentRunBudget};
+pub use budget::{
+    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension, AgentBudgetExhaustion,
+    AgentBudgetGrant, AgentBudgetLimits, AgentChildEscrow, AgentEscrowChildId, AgentEscrowError,
+    AgentEscrowLedger, AgentEscrowResult, AgentRunBudget, AGENT_ESCROW_CHILD_CAPACITY,
+};
 pub use choreography::{
     drive_pending_exchanges, register_agent_exchange_codecs, AgentChoreographyError,
     AgentChoreographyResult, AgentEntityAddress, AgentEntityClass, AgentExchangeDeliveryError,

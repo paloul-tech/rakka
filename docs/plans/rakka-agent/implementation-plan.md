@@ -740,6 +740,22 @@ Guidance: [Hierarchical Budget Ledger](technical-guidance.md#hierarchical-budget
 - `AutonomyAdmissionDecision`: fail-closed admission for unattended classes,
   recheck on widening updates, immediate-safety recheck at dispatch
   ([spec 7.4](spec.md#74-autonomy-admission)).
+  - Enforcement re-derives the decision against the definition **now in force**
+    (`admits_definition`), never a flag or the revision the decision recorded.
+    "Narrowing updates MAY reuse an admission only when policy proves them
+    monotonic" ([spec 7.4](spec.md#74-autonomy-admission)) is proven by *two*
+    checks, not one: the authority-envelope narrowing (`admits`) **and** the
+    structural requirements (`verify`, shared via `first_unmet_requirement`).
+    The second is load-bearing because an approval/authorization/escalation
+    policy is an `AgentDefinition` policy reference, not an envelope entry — a
+    republish that drops one is not an envelope widening, so the envelope check
+    alone would wave it through. Because enforcement derives from the current
+    definition, `publish_definition` deliberately does **not** retract the
+    admission: a definition that no longer satisfies a verified requirement is
+    refused at assignment (`admission-requirement-regressed`) whatever path
+    changed it, and no future call site has to remember to retract. Follow this
+    pattern for any later admission surface (setup revisions, epoch admission):
+    add the dimension to `verify`, not a new retract-on-mutation hook.
 
 Done when: scenarios 52, 53, and 61 pass, including a concurrency test that
 cannot oversubscribe a parent allocation and a replay test that never

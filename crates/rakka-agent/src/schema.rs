@@ -65,6 +65,25 @@ pub const CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION: StateSchemaVersion = StateSch
 /// ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)).
 pub const CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted [`crate::budget::AgentEscrowLedger`].
+///
+/// The ledger versions separately from the entity state that carries it: the
+/// escrow hierarchy grows a scope — a goal, an epoch — without any of that
+/// touching the records of the entities it hangs under
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+pub const CURRENT_AGENT_ESCROW_LEDGER_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::admission::AutonomyAdmissionDecision`].
+///
+/// An admission decision is immutable and outlives the definition revision it
+/// admitted, so it carries its own version rather than the agent state's: a
+/// decision recorded by an earlier binary must still be interpretable, or fail
+/// closed ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+pub const CURRENT_AGENT_ADMISSION_DECISION_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of a durable [`crate::choreography::AgentExchangeJournal`].
 pub const CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
@@ -110,6 +129,10 @@ pub enum AgentRecordKind {
     RunEffect,
     /// The Rakka-owned versioned record of one model turn.
     ModelTurn,
+    /// The escrow ledger one scope owns, carried inside its own state.
+    EscrowLedger,
+    /// One immutable autonomy admission decision.
+    AdmissionDecision,
     /// Durable inter-entity exchange journal carried inside a participant's
     /// own state.
     ExchangeJournal,
@@ -122,7 +145,7 @@ pub enum AgentRecordKind {
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -134,6 +157,8 @@ impl AgentRecordKind {
         Self::LoopState,
         Self::RunEffect,
         Self::ModelTurn,
+        Self::EscrowLedger,
+        Self::AdmissionDecision,
         Self::ExchangeJournal,
         Self::ExchangeEnvelope,
         Self::ExchangeReply,
@@ -154,6 +179,8 @@ impl AgentRecordKind {
             Self::LoopState => "agent-loop-state",
             Self::RunEffect => "agent-run-effect",
             Self::ModelTurn => "agent-model-turn",
+            Self::EscrowLedger => "agent-escrow-ledger",
+            Self::AdmissionDecision => "agent-admission-decision",
             Self::ExchangeJournal => "agent-exchange-journal",
             Self::ExchangeEnvelope => "agent-exchange-envelope",
             Self::ExchangeReply => "agent-exchange-reply",
@@ -175,6 +202,8 @@ impl AgentRecordKind {
             Self::LoopState => CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
             Self::RunEffect => CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
             Self::ModelTurn => CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION,
+            Self::EscrowLedger => CURRENT_AGENT_ESCROW_LEDGER_SCHEMA_VERSION,
+            Self::AdmissionDecision => CURRENT_AGENT_ADMISSION_DECISION_SCHEMA_VERSION,
             Self::ExchangeJournal => CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
             Self::ExchangeEnvelope => CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
             Self::ExchangeReply => CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
@@ -194,9 +223,11 @@ impl AgentRecordKind {
             Self::LoopState => 8,
             Self::RunEffect => 9,
             Self::ModelTurn => 10,
-            Self::ExchangeJournal => 11,
-            Self::ExchangeEnvelope => 12,
-            Self::ExchangeReply => 13,
+            Self::EscrowLedger => 11,
+            Self::AdmissionDecision => 12,
+            Self::ExchangeJournal => 13,
+            Self::ExchangeEnvelope => 14,
+            Self::ExchangeReply => 15,
         }
     }
 }
