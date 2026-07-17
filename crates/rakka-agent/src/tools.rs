@@ -65,7 +65,8 @@ use crate::effect::{
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectRequest,
 };
 use crate::guardrails::{
-    AgentGuardrailChain, AgentGuardrailDisposition, AgentGuardrailReport, AgentGuardrailTransform,
+    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailDisposition,
+    AgentGuardrailReport, AgentGuardrailTransform,
 };
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
 use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
@@ -82,6 +83,21 @@ pub const AGENT_TOOL_REGISTRY_MAX_TOOLS: usize = 256;
 
 /// How long an issued dispatch grant stays valid, unless configured otherwise.
 pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
+
+/// The guardrail boundaries [`AgentToolAuthority`] has evaluation points for
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A required stage that runs at none of these is refused at dispatch
+/// (`guardrail-stage-unevaluated`): it would satisfy an envelope's mandatory
+/// set while never executing, which is a fail-open dressed as a guarantee. The
+/// remaining boundaries of [`AgentGuardrailBoundary`] join this set with the
+/// slices that own those flows — extending it is how a slice declares its new
+/// evaluation point, and doing so is what makes the stages bound to that
+/// boundary start satisfying coverage.
+pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 2] = [
+    AgentGuardrailBoundary::ModelRequest,
+    AgentGuardrailBoundary::ToolRequest,
+];
 
 /// Result type for tool registry operations.
 pub type AgentToolResult<T> = Result<T, AgentToolError>;
@@ -1120,12 +1136,19 @@ impl AgentToolAuthority {
         let mut transforms = Vec::new();
         let mut reports = Vec::new();
         if let Some(chain) = &self.guardrails {
+            // The context names the tool and the run, so a stage can gate
+            // *which* tool is being called and scope a policy to a tenant.
+            // Only the arguments are the evaluated content, because only the
+            // arguments are what a transform may rewrite.
+            let guardrail_context =
+                AgentGuardrailContext::new(AgentGuardrailBoundary::ToolRequest, scope)
+                    .with_tool(&call.tool);
             // The transform-content ceiling at this boundary is the tool
             // argument bound: a transform larger than what a call can carry
             // is blocked here, deterministically, with the one stable reason
             // code — never surfaced as a different failure by a later layer.
             let decision = chain.evaluate_bounded(
-                crate::guardrails::AgentGuardrailBoundary::ToolRequest,
+                &guardrail_context,
                 &call.arguments,
                 AGENT_TOOL_ARGUMENTS_MAX_BYTES,
             );
@@ -1244,7 +1267,7 @@ impl AgentToolAuthority {
                 "turn": intent.turn,
             });
             let decision = chain.evaluate(
-                crate::guardrails::AgentGuardrailBoundary::ModelRequest,
+                &AgentGuardrailContext::new(AgentGuardrailBoundary::ModelRequest, scope),
                 &content,
             );
             refuse_guardrail_disposition(&decision.disposition, "the model call")?;
@@ -1386,7 +1409,10 @@ impl AgentToolAuthority {
         required
     }
 
-    /// Checks that every required stage is runnable by the configured chain.
+    /// Checks that every required stage is both held by the configured chain
+    /// and actually runnable — bound to a boundary this authority evaluates
+    /// ([`AGENT_EVALUATED_GUARDRAIL_BOUNDARIES`]). A stage that is present but
+    /// inert satisfies nothing.
     fn check_guardrail_coverage(
         &self,
         required: &BTreeSet<AgentGuardrailStageId>,
@@ -1401,7 +1427,7 @@ impl AgentToolAuthority {
             ));
         };
         chain
-            .validate_covers(required)
+            .validate_covers(required, &AGENT_EVALUATED_GUARDRAIL_BOUNDARIES)
             .map_err(|error| AgentAuthorityRefusal::of(error.code(), error.to_string()))
     }
 
@@ -2183,7 +2209,7 @@ mod tests {
         struct AlwaysTransform;
 
         impl AgentGuardrail for AlwaysTransform {
-            fn evaluate(&self, _: AgentGuardrailBoundary, _: &Value) -> AgentGuardrailOutcome {
+            fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
                 AgentGuardrailOutcome::Transform {
                     content: serde_json::json!({}),
                     reason_code: "redacted".to_string(),

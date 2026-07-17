@@ -27,13 +27,14 @@ use rakka_agent::{
     AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
     AgentDispatchWindow, AgentEffectSpec, AgentEntityAuthority, AgentEntityCommand,
     AgentEntityStore, AgentExecutionPolicyRef, AgentExecutionPolicyRouter, AgentGuardrail,
-    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailOutcome, AgentGuardrailStage,
-    AgentGuardrailStageId, AgentModelTurn, AgentOperationId, AgentOperationKind, AgentPolicyRef,
-    AgentReconciliationProtocolRef, AgentRevisionNumber, AgentRunEffect, AgentRunEffectDispatcher,
-    AgentRunEffectStatus, AgentRunScope, AgentRunState, AgentRunStatus, AgentRunTerminalReason,
-    AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent, AgentToolAuthority,
-    AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId, AgentToolRegistry,
-    WorkflowAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext, AgentGuardrailOutcome,
+    AgentGuardrailStage, AgentGuardrailStageId, AgentModelTurn, AgentOperationId,
+    AgentOperationKind, AgentPolicyRef, AgentReconciliationProtocolRef, AgentRevisionNumber,
+    AgentRunEffect, AgentRunEffectDispatcher, AgentRunEffectStatus, AgentRunScope, AgentRunState,
+    AgentRunStatus, AgentRunTerminalReason, AgentSettings, AgentSettingsChange, AgentSetupRevision,
+    AgentTaskContent, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest,
+    AgentToolDeclaration, AgentToolId, AgentToolRegistry, WorkflowAgentRunEffectSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::AgentTimestampMillis;
@@ -906,7 +907,7 @@ async fn a_transforming_chain_refuses_an_intent_pinned_to_another_revision() {
 struct AllowAll;
 
 impl AgentGuardrail for AllowAll {
-    fn evaluate(&self, _: AgentGuardrailBoundary, _: &Value) -> AgentGuardrailOutcome {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
         AgentGuardrailOutcome::Allow
     }
 }
@@ -928,6 +929,51 @@ async fn a_missing_mandatory_guardrail_stage_fails_closed_at_dispatch() {
 
     assert_eq!(fx.terminal_failure_code().await, "guardrail-stage-missing");
     assert_eq!(fx.adapter.calls(), 0, "the model boundary is guarded too");
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 44 / specification 16: presence is not coverage. A mandatory stage
+// that *is* in the deployment's chain but runs only at a boundary this slice
+// has no evaluation point for would satisfy the envelope while protecting
+// nothing — the exact fail-open the boundary-less-stage refusal closes at
+// registration, and the only place it can be caught is where the evaluated
+// boundaries are known.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_mandatory_stage_bound_to_an_unevaluated_boundary_fails_closed() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let mut envelope = envelope_for_registry(&registry);
+    envelope.mandatory_guardrails.insert(stage_id("pii-filter"));
+
+    // The stage is real, mandatory, and present — but bound only to the
+    // tool-*response* boundary, which slice 1.8 never evaluates.
+    let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+        .with_stage(
+            AgentGuardrailStage::new(
+                stage_id("pii-filter"),
+                AgentRevisionNumber::INITIAL,
+                Arc::new(AllowAll),
+            )
+            .at_boundary(AgentGuardrailBoundary::ToolResponse)
+            .mandatory(),
+        )
+        .expect("the stage registers");
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(chain),
+        None,
+    )
+    .with_envelope(envelope);
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "guardrail-stage-unevaluated"
+    );
+    assert_eq!(fx.adapter.calls(), 0);
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
 }
 
@@ -976,10 +1022,21 @@ async fn a_setup_narrowing_away_a_tool_is_enforced_at_dispatch() {
 // keeps the call undispatchable.
 // ---------------------------------------------------------------------------
 
-struct BlockLargeAmounts;
+/// Blocks over-limit amounts *for one named tool* — the per-tool policy the
+/// context's tool identity is what makes expressible. A stage handed only the
+/// arguments could not tell `charge-card` from any other call carrying an
+/// `amount`.
+struct BlockLargeAmounts(AgentToolId);
 
 impl AgentGuardrail for BlockLargeAmounts {
-    fn evaluate(&self, _: AgentGuardrailBoundary, content: &Value) -> AgentGuardrailOutcome {
+    fn evaluate(
+        &self,
+        context: &AgentGuardrailContext<'_>,
+        content: &Value,
+    ) -> AgentGuardrailOutcome {
+        if context.tool != Some(&self.0) {
+            return AgentGuardrailOutcome::Allow;
+        }
         // Fail closed on anything that does not parse as the expected u64: a
         // float, a negative, or an out-of-range amount must never sail past
         // the limit by collapsing to a harmless default.
@@ -1002,7 +1059,7 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
             AgentGuardrailStage::new(
                 stage_id("amount-limit"),
                 AgentRevisionNumber::INITIAL,
-                Arc::new(BlockLargeAmounts),
+                Arc::new(BlockLargeAmounts(tool_id())),
             )
             .at_boundary(AgentGuardrailBoundary::ToolRequest)
             .mandatory(),
@@ -1031,6 +1088,52 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
 }
 
 // ---------------------------------------------------------------------------
+// Specification 16: the evaluation context names the tool, so a stage can
+// carry per-tool policy. The same stage, the same over-limit arguments, and
+// the same chain — scoped to a *different* tool — allows the call through,
+// which is what proves the tool identity reaching the stage is real and
+// load-bearing rather than merely carried.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_guardrail_stage_gates_the_tool_the_context_names() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let other = AgentToolId::new("refund-card").expect("tool id should be valid");
+    let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+        .with_stage(
+            AgentGuardrailStage::new(
+                stage_id("amount-limit"),
+                AgentRevisionNumber::INITIAL,
+                // Scoped to a tool this run never calls: the amount is over
+                // the limit, but this stage is not the one gating `TOOL`.
+                Arc::new(BlockLargeAmounts(other)),
+            )
+            .at_boundary(AgentGuardrailBoundary::ToolRequest)
+            .mandatory(),
+        )
+        .expect("the stage registers");
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(chain),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    // The identical arguments that `a_guardrail_block_keeps_a_tool_call_undispatchable`
+    // blocks reach the executor here, because the stage looked at the tool.
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+    let invocations = fx.tools.invocations();
+    assert_eq!(
+        invocations[0].arguments,
+        serde_json::json!({ "amount": 42 }),
+        "the untransformed arguments reached the target"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Specification 16: a deterministic guardrail transform replaces the
 // arguments the executor sees, and the durable intent is untouched — every
 // retry re-derives the identical transformed input.
@@ -1039,7 +1142,7 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
 struct ClampAmount;
 
 impl AgentGuardrail for ClampAmount {
-    fn evaluate(&self, _: AgentGuardrailBoundary, content: &Value) -> AgentGuardrailOutcome {
+    fn evaluate(&self, _: &AgentGuardrailContext<'_>, content: &Value) -> AgentGuardrailOutcome {
         // Fail closed on anything that does not parse as the expected u64:
         // an unparseable amount clamps rather than passing unmodified.
         let amount = content.get("amount").and_then(Value::as_u64);

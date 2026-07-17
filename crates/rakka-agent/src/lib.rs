@@ -128,9 +128,9 @@ pub use effect::{
     ATTR_AGENT_EFFECT_SETTINGS_REVISION,
 };
 pub use guardrails::{
-    AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailDecision,
-    AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome, AgentGuardrailReport,
-    AgentGuardrailResult, AgentGuardrailStage, AgentGuardrailTransform,
+    AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
+    AgentGuardrailDecision, AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome,
+    AgentGuardrailReport, AgentGuardrailResult, AgentGuardrailStage, AgentGuardrailTransform,
     AGENT_GUARDRAIL_CONTENT_MAX_BYTES, AGENT_GUARDRAIL_MAX_STAGES,
     AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
@@ -180,14 +180,6 @@ pub use identity::{
     AGENT_PERSISTENCE_SEPARATOR, AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
     AGENT_TASK_ENTITY_PERSISTENCE_PREFIX,
 };
-pub use tools::{
-    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant, AgentExecutionPolicyRouter,
-    AgentGrantDescriptor, AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding,
-    AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
-    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_TOOL_DESCRIPTION_MAX_LENGTH,
-    AGENT_TOOL_PARAMETERS_MAX_BYTES, AGENT_TOOL_REGISTRY_MAX_TOOLS,
-};
-
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
@@ -232,4 +224,12 @@ pub use task::{
     AGENT_TASK_RULE_ONE_OF_MAX_VALUES, AGENT_TASK_RULE_POINTER_MAX_LENGTH,
     AGENT_TASK_RULE_VALUE_MAX_LENGTH, AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
     DEFAULT_AGENT_TASK_ENTITY_TYPE,
+};
+pub use tools::{
+    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant, AgentExecutionPolicyRouter,
+    AgentGrantDescriptor, AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding,
+    AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
+    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
+    AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
+    AGENT_TOOL_REGISTRY_MAX_TOOLS,
 };

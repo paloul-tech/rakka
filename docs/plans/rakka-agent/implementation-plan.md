@@ -675,18 +675,36 @@ Guidance: [Tool Visibility, Authority, and Executor Isolation](technical-guidanc
   (envelope `mandatory_guardrails`, enforced as `guardrail-stage-missing`
   when the chain cannot run one) and disable optional ones (`narrowed`,
   which mints a revision of its own — a different stage set is a different
-  evaluation), a stage must declare at least one boundary
-  (`guardrail-stage-unbound`) so presence-based coverage cannot be satisfied
-  by a stage that never runs, and no operation exists that removes a
-  deployment-mandatory stage. This slice evaluates the tool-request and
+  evaluation), and no operation exists that removes a deployment-mandatory
+  stage. Presence in the chain is never coverage, in two steps: a stage must
+  declare at least one boundary (`guardrail-stage-unbound`, refused at
+  registration), and a *required* stage must run at a boundary the caller
+  actually evaluates (`guardrail-stage-unevaluated`, refused at dispatch —
+  the chain cannot decide this for itself, because which boundaries have
+  evaluation points is a property of the caller, so
+  `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` passes them into
+  `validate_covers`). This slice evaluates the tool-request and
   model-request boundaries; the declared response/A2A/memory boundaries gain
-  their evaluation points with the slices that own those flows. Until slice
+  their evaluation points — and with them, the ability of stages bound there
+  to satisfy coverage — from the slices that own those flows, which is a
+  one-line extension of that set. Until slice
   1.11 gives context snapshots content, the model-request boundary evaluates
   a bounded request descriptor — enough for a kill-switch or checkpoint
   stage, which is why a transform there fails closed
   (`guardrail-transform-unsupported`) instead of being silently ignored.
   Block evidence rides the refusal detail, and applied transforms and
   report-only findings surface on the dispatcher's trace.
+- **A stage is evaluated against a context, not a bare boundary.**
+  `AgentGuardrailContext` carries the boundary, the run scope, and — at the
+  tool boundaries — the tool being called, so a stage can gate *which* tool
+  is invoked or scope a policy to a tenant; a stage handed only the arguments
+  could not tell one tool's call from another's. Identity rides the context
+  rather than the content because content is exactly what a transform
+  rewrites: an envelope would make a transform responsible for reproducing
+  the identity fields and would spend the boundary's content budget on fields
+  no stage may change. The split keeps identity readable and structurally
+  unrewritable, and keeps determinism intact — everything the context carries
+  is durable identity the same intent re-derives on every attempt.
 - **The 1.6 amendment's settings note is discharged here.** The authority
   resolves the turn-bound settings of spec 7.2 at dispatch: the granted model
   call carries the profile and sampling the current settings revision

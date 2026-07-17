@@ -19,12 +19,21 @@
 //! `Started`. The remaining boundaries — model/tool response, A2A
 //! ingress/egress, memory ingress — are declared here so chains can be
 //! configured for them, but their evaluation points arrive with the slices
-//! that own those flows; a stage bound only to a not-yet-evaluated boundary
-//! protects nothing yet.
+//! that own those flows.
+//!
+//! A stage bound only to a not-yet-evaluated boundary therefore protects
+//! nothing, and that is enforced rather than documented: an envelope whose
+//! mandatory stage runs at no boundary the caller evaluates refuses dispatch
+//! (`guardrail-stage-unevaluated`, [`AgentGuardrailChain::validate_covers`]).
+//! Presence in the chain is not coverage — the same reason a stage bound to no
+//! boundary at all is refused at registration. What the chain cannot decide for
+//! itself is which boundaries have evaluation points, because that is a
+//! property of the caller; so the caller passes them in, and this crate's set
+//! grows as the slices that own those flows land.
 //!
 //! # Determinism is structural, not aspirational
 //!
-//! [`AgentGuardrail::evaluate`] is a synchronous function of the boundary and
+//! [`AgentGuardrail::evaluate`] is a synchronous function of the context and
 //! the content: the signature has no way to await I/O, so a stage physically
 //! cannot consult a service mid-transition. What the type system cannot prove —
 //! that an implementation is a pure function for its recorded revision — is the
@@ -56,7 +65,8 @@ use rakka_agent_workflow::ArtifactRef;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::definition::{AgentGuardrailStageId, AgentPolicyRef, AgentRevisionNumber};
+use crate::definition::{AgentGuardrailStageId, AgentPolicyRef, AgentRevisionNumber, AgentToolId};
+use crate::identity::AgentRunScope;
 
 /// Most stages one guardrail chain may hold.
 pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
@@ -130,6 +140,53 @@ impl Display for AgentGuardrailBoundary {
     }
 }
 
+/// What one guardrail evaluation is about: the boundary being crossed, and the
+/// identity of whatever is crossing it.
+///
+/// The context is deliberately separate from the content a stage evaluates.
+/// Content is the exact value a [`AgentGuardrailOutcome::Transform`] replaces —
+/// tool arguments at [`AgentGuardrailBoundary::ToolRequest`] — so folding the
+/// subject's identity into it would make a transform responsible for
+/// reproducing the envelope, and would spend the boundary's content budget on
+/// fields no stage may rewrite. Identity travels here instead, where it is
+/// readable and structurally unrewritable: a stage can gate *which* tool is
+/// being called, or scope a policy to a tenant, without being handed the
+/// ability to change either.
+///
+/// A stage must remain a pure function of `(context, content)` for its
+/// recorded revision. Everything the context carries is durable identity, so
+/// keying policy off it preserves that: the same intent re-derives the same
+/// context on every attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentGuardrailContext<'a> {
+    /// The boundary being evaluated.
+    pub boundary: AgentGuardrailBoundary,
+    /// The run whose boundary is being crossed.
+    pub scope: &'a AgentRunScope,
+    /// The tool the call names, at the tool boundaries. `None` at boundaries
+    /// that name no tool.
+    pub tool: Option<&'a AgentToolId>,
+}
+
+impl<'a> AgentGuardrailContext<'a> {
+    /// The context of one evaluation at the given boundary, naming no tool.
+    #[must_use]
+    pub const fn new(boundary: AgentGuardrailBoundary, scope: &'a AgentRunScope) -> Self {
+        Self {
+            boundary,
+            scope,
+            tool: None,
+        }
+    }
+
+    /// Names the tool whose call is being evaluated.
+    #[must_use]
+    pub const fn with_tool(mut self, tool: &'a AgentToolId) -> Self {
+        self.tool = Some(tool);
+        self
+    }
+}
+
 /// What one guardrail stage decided about one piece of boundary content
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md): "a guardrail
 /// outcome MUST be one of an explicit bounded set").
@@ -177,15 +234,21 @@ pub enum AgentGuardrailOutcome {
 
 /// One deterministic guardrail rule.
 ///
-/// The signature is deliberately synchronous: a stage evaluates content it was
-/// handed and nothing else, so it can run inside a durable transition and at
-/// dispatch alike. An implementation must be a pure function of `(boundary,
-/// content)` for the revision its stage records; a rule that needs I/O — an
-/// external classifier, a moderation service — must instead be executed as an
-/// explicit durable effect whose persisted outcome a later stage reads.
+/// The signature is deliberately synchronous: a stage evaluates the content it
+/// was handed, in the context it was handed, and nothing else, so it can run
+/// inside a durable transition and at dispatch alike. An implementation must be
+/// a pure function of `(context, content)` for the revision its stage records;
+/// a rule that needs I/O — an external classifier, a moderation service — must
+/// instead be executed as an explicit durable effect whose persisted outcome a
+/// later stage reads.
 pub trait AgentGuardrail: Send + Sync {
-    /// Evaluates one piece of boundary content.
-    fn evaluate(&self, boundary: AgentGuardrailBoundary, content: &Value) -> AgentGuardrailOutcome;
+    /// Evaluates one piece of boundary content, in the context that identifies
+    /// what is crossing the boundary.
+    fn evaluate(
+        &self,
+        context: &AgentGuardrailContext<'_>,
+        content: &Value,
+    ) -> AgentGuardrailOutcome;
 }
 
 /// One ordered, versioned stage of the guardrail chain.
@@ -421,19 +484,45 @@ impl AgentGuardrailChain {
         &self.stages
     }
 
-    /// Accepts that every required stage is present, or fails closed.
+    /// Accepts that every required stage is present *and* actually runs, or
+    /// fails closed.
     ///
     /// This is the dispatch-time half of the mandatory-guardrail rule: an
     /// envelope that requires a stage the deployment's chain cannot run must
     /// not dispatch, because the alternative is silently running without a
     /// guardrail the definition promised.
+    ///
+    /// `evaluated` is the set of boundaries the caller has evaluation points
+    /// for. Presence alone is not coverage: a stage bound only to boundaries
+    /// nothing evaluates would satisfy the envelope's mandatory set while
+    /// never running, which is the same fail-open as a stage bound to no
+    /// boundary at all — that one is refused at registration
+    /// ([`Self::with_stage`]), and this one can only be caught here, because
+    /// whether a boundary has an evaluation point is a property of the caller,
+    /// not of the chain. A required stage that runs at none of them is refused
+    /// (`guardrail-stage-unevaluated`).
+    ///
+    /// A stage that runs at *some* evaluated boundary satisfies coverage even
+    /// when the evaluation in hand is at a different one: a stage bound to
+    /// [`AgentGuardrailBoundary::ToolRequest`] is doing its job, and a model
+    /// call that does not trigger it is not an escape.
     pub fn validate_covers(
         &self,
         required: &BTreeSet<AgentGuardrailStageId>,
+        evaluated: &[AgentGuardrailBoundary],
     ) -> AgentGuardrailResult<()> {
         for stage in required {
-            if !self.stages.iter().any(|held| &held.id == stage) {
+            let Some(held) = self.stages.iter().find(|held| &held.id == stage) else {
                 return Err(AgentGuardrailError::MissingRequiredStage {
+                    stage: stage.clone(),
+                });
+            };
+            if !held
+                .boundaries
+                .iter()
+                .any(|boundary| evaluated.contains(boundary))
+            {
+                return Err(AgentGuardrailError::StageNotEvaluated {
                     stage: stage.clone(),
                 });
             }
@@ -496,10 +585,10 @@ impl AgentGuardrailChain {
     #[must_use]
     pub fn evaluate(
         &self,
-        boundary: AgentGuardrailBoundary,
+        context: &AgentGuardrailContext<'_>,
         content: &Value,
     ) -> AgentGuardrailDecision {
-        self.evaluate_bounded(boundary, content, AGENT_GUARDRAIL_CONTENT_MAX_BYTES)
+        self.evaluate_bounded(context, content, AGENT_GUARDRAIL_CONTENT_MAX_BYTES)
     }
 
     /// Evaluates the chain's stages for one boundary under an explicit
@@ -513,7 +602,7 @@ impl AgentGuardrailChain {
     #[must_use]
     pub fn evaluate_bounded(
         &self,
-        boundary: AgentGuardrailBoundary,
+        context: &AgentGuardrailContext<'_>,
         content: &Value,
         max_content_bytes: usize,
     ) -> AgentGuardrailDecision {
@@ -525,10 +614,10 @@ impl AgentGuardrailChain {
         let max_content_bytes = max_content_bytes.min(AGENT_GUARDRAIL_CONTENT_MAX_BYTES);
 
         for stage in &self.stages {
-            if !stage.applies_at(boundary) {
+            if !stage.applies_at(context.boundary) {
                 continue;
             }
-            match stage.rule.evaluate(boundary, &current) {
+            match stage.rule.evaluate(context, &current) {
                 AgentGuardrailOutcome::Allow => {}
                 AgentGuardrailOutcome::Block {
                     reason_code,
@@ -663,6 +752,12 @@ pub enum AgentGuardrailError {
         /// The stage that declared no boundary.
         stage: AgentGuardrailStageId,
     },
+    /// A required stage runs only at boundaries the caller does not evaluate,
+    /// so it would protect nothing.
+    StageNotEvaluated {
+        /// The stage that would never run.
+        stage: AgentGuardrailStageId,
+    },
     /// A narrowing reused its parent chain's revision.
     NarrowedRevisionNotDistinct {
         /// The revision both chains would have shared.
@@ -680,6 +775,7 @@ impl AgentGuardrailError {
             Self::MandatoryStageRemoved { .. } => "guardrail-mandatory-stage-immutable",
             Self::MissingRequiredStage { .. } => "guardrail-stage-missing",
             Self::StageUnbound { .. } => "guardrail-stage-unbound",
+            Self::StageNotEvaluated { .. } => "guardrail-stage-unevaluated",
             Self::NarrowedRevisionNotDistinct { .. } => "guardrail-narrowed-revision-not-distinct",
         }
     }
@@ -707,6 +803,11 @@ impl Display for AgentGuardrailError {
                 f,
                 "the guardrail stage {stage} declares no boundary and could never be evaluated"
             ),
+            Self::StageNotEvaluated { stage } => write!(
+                f,
+                "the required guardrail stage {stage} runs only at boundaries this deployment \
+                 does not yet evaluate, so it would protect nothing"
+            ),
             Self::NarrowedRevisionNotDistinct { revision } => write!(
                 f,
                 "a narrowed chain must carry a revision distinct from its parent's ({revision}): \
@@ -721,11 +822,12 @@ impl Error for AgentGuardrailError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{AgentId, AgentRunId, TenantId};
 
     struct ScriptedRule(AgentGuardrailOutcome);
 
     impl AgentGuardrail for ScriptedRule {
-        fn evaluate(&self, _: AgentGuardrailBoundary, _: &Value) -> AgentGuardrailOutcome {
+        fn evaluate(&self, _: &AgentGuardrailContext<'_>, _: &Value) -> AgentGuardrailOutcome {
             self.0.clone()
         }
     }
@@ -734,7 +836,11 @@ mod tests {
     struct UppercaseQ;
 
     impl AgentGuardrail for UppercaseQ {
-        fn evaluate(&self, _: AgentGuardrailBoundary, content: &Value) -> AgentGuardrailOutcome {
+        fn evaluate(
+            &self,
+            _: &AgentGuardrailContext<'_>,
+            content: &Value,
+        ) -> AgentGuardrailOutcome {
             let transformed = content
                 .get("q")
                 .and_then(Value::as_str)
@@ -751,6 +857,19 @@ mod tests {
 
     fn stage_id(id: &str) -> AgentGuardrailStageId {
         AgentGuardrailStageId::new(id).expect("the stage id is valid")
+    }
+
+    fn scope() -> AgentRunScope {
+        AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support").expect("the agent id is valid"),
+            AgentRunId::new("run-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid")
+    }
+
+    fn tool_context(scope: &AgentRunScope) -> AgentGuardrailContext<'_> {
+        AgentGuardrailContext::new(AgentGuardrailBoundary::ToolRequest, scope)
     }
 
     fn stage(id: &str, outcome: AgentGuardrailOutcome) -> AgentGuardrailStage {
@@ -784,7 +903,7 @@ mod tests {
             .expect("the stage registers");
 
         let content = serde_json::json!({ "q": "hello" });
-        let decision = chain.evaluate(AgentGuardrailBoundary::ToolRequest, &content);
+        let decision = chain.evaluate(&tool_context(&scope()), &content);
         assert!(decision.is_allowed());
         assert!(decision.transformed);
         assert_eq!(decision.content, serde_json::json!({ "q": "HELLO" }));
@@ -792,10 +911,7 @@ mod tests {
         assert_eq!(decision.chain_revision, AgentRevisionNumber::new(3));
 
         // Determinism: the same revision and input produce the same decision.
-        assert_eq!(
-            decision,
-            chain.evaluate(AgentGuardrailBoundary::ToolRequest, &content)
-        );
+        assert_eq!(decision, chain.evaluate(&tool_context(&scope()), &content));
 
         // A block anywhere in the order wins over everything after it.
         let blocking = chain
@@ -807,7 +923,7 @@ mod tests {
                 },
             ))
             .expect("the stage registers");
-        let decision = blocking.evaluate(AgentGuardrailBoundary::ToolRequest, &content);
+        let decision = blocking.evaluate(&tool_context(&scope()), &content);
         assert!(matches!(
             decision.disposition,
             AgentGuardrailDisposition::Blocked { ref reason_code, .. }
@@ -834,7 +950,7 @@ mod tests {
             ))
             .expect("the stage registers");
 
-        let decision = chain.evaluate(AgentGuardrailBoundary::ToolRequest, &serde_json::json!({}));
+        let decision = chain.evaluate(&tool_context(&scope()), &serde_json::json!({}));
         // The checkpoint requirement stands; the report is recorded beside it,
         // granting nothing.
         assert!(matches!(
@@ -882,12 +998,70 @@ mod tests {
 
         // Coverage: a required stage missing from the chain fails closed.
         chain
-            .validate_covers(&BTreeSet::from([stage_id("required-stage")]))
+            .validate_covers(
+                &BTreeSet::from([stage_id("required-stage")]),
+                &[AgentGuardrailBoundary::ToolRequest],
+            )
             .expect("a present stage satisfies coverage");
         let error = chain
-            .validate_covers(&BTreeSet::from([stage_id("absent-stage")]))
+            .validate_covers(
+                &BTreeSet::from([stage_id("absent-stage")]),
+                &[AgentGuardrailBoundary::ToolRequest],
+            )
             .expect_err("an absent stage fails coverage");
         assert_eq!(error.code(), "guardrail-stage-missing");
+    }
+
+    #[test]
+    fn a_required_stage_the_caller_never_evaluates_fails_coverage() {
+        // The deployment believes it configured a mandatory PII filter, and
+        // the stage is genuinely in the chain — but it runs only at a boundary
+        // the caller has no evaluation point for, so it would satisfy the
+        // envelope's mandatory set while never executing. Presence is not
+        // coverage.
+        let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(
+                AgentGuardrailStage::new(
+                    stage_id("pii-filter"),
+                    AgentRevisionNumber::INITIAL,
+                    Arc::new(ScriptedRule(AgentGuardrailOutcome::Block {
+                        reason_code: "pii".to_string(),
+                        evidence: None,
+                    })),
+                )
+                .at_boundary(AgentGuardrailBoundary::MemoryIngress)
+                .mandatory(),
+            )
+            .expect("the stage registers");
+        let required = BTreeSet::from([stage_id("pii-filter")]);
+
+        let error = chain
+            .validate_covers(&required, &[AgentGuardrailBoundary::ToolRequest])
+            .expect_err("a stage that never runs cannot satisfy coverage");
+        assert_eq!(error.code(), "guardrail-stage-unevaluated");
+
+        // The same stage satisfies coverage once the caller evaluates the
+        // boundary it runs at — this is exactly what a later slice landing its
+        // memory-ingress evaluation point changes.
+        chain
+            .validate_covers(&required, &[AgentGuardrailBoundary::MemoryIngress])
+            .expect("the stage runs at a boundary the caller evaluates");
+
+        // Satisfying coverage at *some* evaluated boundary is enough: a stage
+        // that runs only at the tool boundary is doing its job, and a model
+        // call that never triggers it is not an escape.
+        let tool_bound = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(stage("tool-only", AgentGuardrailOutcome::Allow).mandatory())
+            .expect("the stage registers");
+        tool_bound
+            .validate_covers(
+                &BTreeSet::from([stage_id("tool-only")]),
+                &[
+                    AgentGuardrailBoundary::ModelRequest,
+                    AgentGuardrailBoundary::ToolRequest,
+                ],
+            )
+            .expect("a tool-boundary stage covers a chain evaluated at both");
     }
 
     #[test]
@@ -903,7 +1077,7 @@ mod tests {
             ))
             .expect("the stage registers");
 
-        let decision = chain.evaluate(AgentGuardrailBoundary::ToolRequest, &serde_json::json!({}));
+        let decision = chain.evaluate(&tool_context(&scope()), &serde_json::json!({}));
         assert!(matches!(
             decision.disposition,
             AgentGuardrailDisposition::Blocked { ref reason_code, .. }
@@ -925,11 +1099,8 @@ mod tests {
             ))
             .expect("the stage registers");
 
-        let decision = chain.evaluate_bounded(
-            AgentGuardrailBoundary::ToolRequest,
-            &serde_json::json!({}),
-            2 * 1024,
-        );
+        let decision =
+            chain.evaluate_bounded(&tool_context(&scope()), &serde_json::json!({}), 2 * 1024);
         assert!(matches!(
             decision.disposition,
             AgentGuardrailDisposition::Blocked { ref reason_code, .. }
@@ -961,7 +1132,7 @@ mod tests {
                 },
             ))
             .expect("the stage registers");
-        let decision = chain.evaluate(AgentGuardrailBoundary::ToolRequest, &serde_json::json!({}));
+        let decision = chain.evaluate(&tool_context(&scope()), &serde_json::json!({}));
         assert!(matches!(
             decision.disposition,
             AgentGuardrailDisposition::Blocked { evidence: Some(ref held), .. }
@@ -979,7 +1150,7 @@ mod tests {
             )
             .expect("the stage registers");
         let decision = chain.evaluate(
-            AgentGuardrailBoundary::ToolRequest,
+            &tool_context(&scope()),
             &serde_json::json!({ "q": "hello" }),
         );
         assert_eq!(decision.transforms.len(), 1);
