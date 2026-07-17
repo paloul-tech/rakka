@@ -23,12 +23,12 @@ use rakka_agent::testkit::{
     ScriptedCredentialResolver, ScriptedDispatcher, ScriptedReconciler, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
-    AgentCredentialBindingRef, AgentDispatchWindow, AgentEffectPolicies, AgentEffectResolution,
-    AgentEffectSpec, AgentLoopPhase, AgentModelTurn, AgentReconciliationFinding,
+    AgentCredentialBindingRef, AgentDispatchWindow, AgentEffectResolution, AgentEffectSpec,
+    AgentEntityAuthority, AgentLoopPhase, AgentModelTurn, AgentReconciliationFinding,
     AgentReconciliationProtocolRef, AgentRunEffectDispatcher, AgentRunEffectOutcome,
     AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus, AgentRunTerminalReason,
-    AgentTaskContent, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    WorkflowAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentTaskContent, AgentTaskStatus, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, AgentToolRegistry, WorkflowAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::{
@@ -80,6 +80,7 @@ fn proposing_turn(answer: &str) -> AgentModelTurn {
 struct DispatchFixture {
     fx: Fixture<DeterministicModelAdapter, WorkflowSink>,
     adapter: DeterministicModelAdapter,
+    registry: AgentToolRegistry,
     workflow_store: WorkflowStore,
     fleet_store: FleetStore,
     wf_clock: SharedAtomicWorkflowClock,
@@ -92,10 +93,22 @@ struct DispatchFixture {
 impl DispatchFixture {
     fn new(
         adapter: DeterministicModelAdapter,
-        policies: AgentEffectPolicies,
+        registry: AgentToolRegistry,
+        model_spec: Option<AgentEffectSpec>,
         tools: RecordingToolExecutor,
         reconciler: ScriptedReconciler,
     ) -> Self {
+        // The registry is the single source: the commit-time policies are its
+        // projection, and the dispatch-time authority answers from the same
+        // bindings.
+        let mut policies = registry
+            .effect_policies()
+            .expect("the registry projects valid policies");
+        if let Some(spec) = model_spec {
+            policies = policies
+                .with_model_spec(spec)
+                .expect("the model spec is valid");
+        }
         let counter = Arc::new(AtomicU64::new(1));
         let wf_clock = SharedAtomicWorkflowClock::new(counter.clone());
         let workflow_store = WorkflowStore::new();
@@ -110,6 +123,7 @@ impl DispatchFixture {
         Self {
             fx,
             adapter,
+            registry,
             workflow_store,
             fleet_store,
             wf_clock,
@@ -121,7 +135,9 @@ impl DispatchFixture {
     }
 
     async fn start(&self) {
-        self.fx.instantiate_agent().await;
+        self.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&self.registry))
+            .await;
         self.fx.create_task().await;
     }
 
@@ -135,6 +151,10 @@ impl DispatchFixture {
             self.wf_clock.clone(),
             Arc::new(self.adapter.clone()),
             Arc::new(self.tools.clone()),
+            Arc::new(AgentEntityAuthority::new(
+                self.fx.agents.clone(),
+                AgentToolAuthority::new(self.registry.clone()),
+            )),
             Arc::new(
                 InProcessRunResultDelivery::new(
                     self.fx.runs.clone(),
@@ -224,13 +244,15 @@ impl DispatchFixture {
     }
 }
 
-fn tool_policies(spec: AgentEffectSpec) -> AgentEffectPolicies {
-    AgentEffectPolicies::new()
-        .with_tool_spec(
-            AgentToolId::new(TOOL).expect("tool id should be valid"),
-            spec,
-        )
-        .expect("the tool spec is valid")
+/// A registry binding the test tool under the given spec.
+fn tool_registry(spec: AgentEffectSpec) -> AgentToolRegistry {
+    tool_registry_for_spec(TOOL, &spec)
+}
+
+/// A registry binding the test tool under the fail-safe unclassified default:
+/// one non-idempotent attempt.
+fn default_registry() -> AgentToolRegistry {
+    tool_registry(AgentEffectSpec::non_idempotent())
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +263,8 @@ fn tool_policies(spec: AgentEffectSpec) -> AgentEffectPolicies {
 async fn dispatcher_loss_before_started_safely_redispatches() {
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -284,13 +307,9 @@ async fn dispatcher_loss_before_started_safely_redispatches() {
 
 #[tokio::test]
 async fn dispatcher_loss_after_started_retries_a_read_only_effect_under_policy() {
-    let policies = AgentEffectPolicies::new()
-        .with_model_spec(
-            AgentEffectSpec::read_only()
-                .with_max_attempts(2)
-                .expect("the spec is valid"),
-        )
-        .expect("the policies are valid");
+    let model_spec = AgentEffectSpec::read_only()
+        .with_max_attempts(2)
+        .expect("the spec is valid");
     // The adapter must declare at least what the intent's policy uses: the
     // declaration is the permitted ceiling, re-enforced at dispatch.
     let adapter = DeterministicModelAdapter::new()
@@ -301,7 +320,8 @@ async fn dispatcher_loss_after_started_retries_a_read_only_effect_under_policy()
         .expect("the adapter accepts the policy");
     let fx = DispatchFixture::new(
         adapter,
-        policies,
+        default_registry(),
+        Some(model_spec),
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -340,7 +360,8 @@ async fn a_read_only_effect_whose_policy_permits_one_attempt_exhausts_instead_of
     // the run stops with a structured reason instead of silently re-billing.
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -378,12 +399,13 @@ async fn a_read_only_effect_whose_policy_permits_one_attempt_exhausts_instead_of
 
 #[tokio::test]
 async fn dispatcher_loss_after_started_reuses_the_idempotency_key_of_an_idempotent_effect() {
-    let policies = tool_policies(AgentEffectSpec::idempotent(3).expect("the spec is valid"));
+    let registry = tool_registry(AgentEffectSpec::idempotent(3).expect("the spec is valid"));
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        policies,
+        registry,
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -433,8 +455,8 @@ async fn dispatcher_loss_after_started_reconciles_before_any_retry() {
     // The protocol proves the invocation happened and returns its outcome, so
     // the target is never touched again.
     let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
-    let policies =
-        tool_policies(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
+    let registry =
+        tool_registry(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
     let established = AgentTaskContent::inline(serde_json::json!({ "receipt": "r-77" }))
         .expect("the content is inline-bounded");
     let reconciler = ScriptedReconciler::new().with_finding(AgentReconciliationFinding::Executed {
@@ -447,7 +469,8 @@ async fn dispatcher_loss_after_started_reconciles_before_any_retry() {
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        policies,
+        registry,
+        None,
         RecordingToolExecutor::new(),
         reconciler,
     );
@@ -481,15 +504,16 @@ async fn a_reconcileable_effect_proven_absent_is_retried() {
     // The loss happens before the invocation, and the protocol proves it: the
     // retry is a fresh invocation, allowed exactly because absence was proven.
     let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
-    let policies =
-        tool_policies(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
+    let registry =
+        tool_registry(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
     let reconciler =
         ScriptedReconciler::new().with_finding(AgentReconciliationFinding::NotExecuted);
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        policies,
+        registry,
+        None,
         RecordingToolExecutor::new(),
         reconciler,
     );
@@ -531,8 +555,8 @@ async fn an_unknown_reconciliation_finding_is_requeried_before_any_retry() {
     // *again*, and only its answer decides. Here the second query proves the
     // invocation happened, so the target is never touched twice.
     let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
-    let policies =
-        tool_policies(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
+    let registry =
+        tool_registry(AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"));
     let reconciler = ScriptedReconciler::new()
         .with_finding(AgentReconciliationFinding::Unknown)
         .with_finding(AgentReconciliationFinding::Executed {
@@ -546,7 +570,8 @@ async fn an_unknown_reconciliation_finding_is_requeried_before_any_retry() {
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        policies,
+        registry,
+        None,
         RecordingToolExecutor::new(),
         reconciler,
     );
@@ -594,7 +619,8 @@ async fn an_ambiguous_non_idempotent_loss_parks_exactly_one_indeterminate_outcom
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -646,7 +672,8 @@ async fn a_reconciliation_decision_resumes_the_run_and_not_executed_mints_a_new_
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -715,7 +742,8 @@ async fn a_result_for_a_superseded_generation_is_refused() {
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -797,7 +825,8 @@ async fn cancellation_with_an_ambiguous_consequential_effect_stays_in_reconcilia
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -913,7 +942,7 @@ async fn cancellation_with_an_ambiguous_consequential_effect_stays_in_reconcilia
 
 #[tokio::test]
 async fn credentials_are_resolved_at_dispatch_only_and_never_persisted() {
-    let policies = tool_policies(
+    let registry = tool_registry(
         AgentEffectSpec::idempotent(2)
             .expect("the spec is valid")
             .with_credential_binding(
@@ -924,7 +953,8 @@ async fn credentials_are_resolved_at_dispatch_only_and_never_persisted() {
         DeterministicModelAdapter::new()
             .with_turn_for(1, tool_calling_turn(TOOL))
             .with_turn_for(2, proposing_turn("charged")),
-        policies,
+        registry,
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -998,16 +1028,13 @@ async fn an_effect_policy_weaker_than_the_adapters_declaration_fails_closed_at_d
             max_attempts: 1,
         })
         .expect("the adapter policy is valid");
-    let policies = AgentEffectPolicies::new()
-        .with_model_spec(
-            AgentEffectSpec::read_only()
-                .with_max_attempts(3)
-                .expect("the spec is valid"),
-        )
-        .expect("the policies are valid");
+    let model_spec = AgentEffectSpec::read_only()
+        .with_max_attempts(3)
+        .expect("the spec is valid");
     let fx = DispatchFixture::new(
         adapter,
-        policies,
+        default_registry(),
+        Some(model_spec),
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
@@ -1035,7 +1062,8 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
     // deliver the turn, propose the result, and let the task accept it.
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
-        AgentEffectPolicies::default(),
+        default_registry(),
+        None,
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );

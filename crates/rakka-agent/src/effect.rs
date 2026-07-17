@@ -68,8 +68,8 @@ use rakka_agent_workflow::{AgentDeduplicationKey, AgentEffectId};
 use serde::{Deserialize, Serialize};
 
 use crate::definition::{
-    AgentCredentialBindingRef, AgentEffectSafetyClass, AgentModelProfileId, AgentRevisionNumber,
-    AgentToolId,
+    AgentCredentialBindingRef, AgentEffectSafetyClass, AgentExecutionPolicyRef,
+    AgentModelProfileId, AgentRevisionNumber, AgentToolId,
 };
 use crate::identity::{AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunScope};
 use crate::memory::AgentContextSnapshotRef;
@@ -306,6 +306,12 @@ pub struct AgentEffectSpec {
     pub credential_binding: Option<AgentCredentialBindingRef>,
     /// Timeout for one dispatch attempt, in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// The application-owned execution policy or trust class the effect's
+    /// dispatch is routed through
+    /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)). Rakka
+    /// persists and routes the reference; the application owns what stands
+    /// behind it.
+    pub execution_policy: Option<AgentExecutionPolicyRef>,
 }
 
 impl AgentEffectSpec {
@@ -318,6 +324,7 @@ impl AgentEffectSpec {
             reconciliation_protocol: None,
             credential_binding: None,
             timeout_ms: None,
+            execution_policy: None,
         }
     }
 
@@ -331,6 +338,7 @@ impl AgentEffectSpec {
             reconciliation_protocol: None,
             credential_binding: None,
             timeout_ms: None,
+            execution_policy: None,
         }
     }
 
@@ -349,6 +357,7 @@ impl AgentEffectSpec {
             reconciliation_protocol,
             credential_binding: None,
             timeout_ms: None,
+            execution_policy: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -375,6 +384,13 @@ impl AgentEffectSpec {
         self
     }
 
+    /// Routes the effect's dispatch through an execution policy or trust class.
+    #[must_use]
+    pub fn with_execution_policy(mut self, policy: AgentExecutionPolicyRef) -> Self {
+        self.execution_policy = Some(policy);
+        self
+    }
+
     /// Declares a reconcileable spec with its protocol.
     pub fn reconcileable(
         protocol: AgentReconciliationProtocolRef,
@@ -386,6 +402,7 @@ impl AgentEffectSpec {
             reconciliation_protocol: Some(protocol),
             credential_binding: None,
             timeout_ms: None,
+            execution_policy: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -400,6 +417,7 @@ impl AgentEffectSpec {
             reconciliation_protocol: None,
             credential_binding: None,
             timeout_ms: None,
+            execution_policy: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -477,6 +495,8 @@ struct AgentEffectSpecRecord {
     credential_binding: Option<AgentCredentialBindingRef>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    execution_policy: Option<AgentExecutionPolicyRef>,
 }
 
 impl<'de> Deserialize<'de> for AgentEffectSpec {
@@ -491,6 +511,7 @@ impl<'de> Deserialize<'de> for AgentEffectSpec {
             reconciliation_protocol: record.reconciliation_protocol,
             credential_binding: record.credential_binding,
             timeout_ms: record.timeout_ms,
+            execution_policy: record.execution_policy,
         };
         spec.validate().map_err(serde::de::Error::custom)?;
         Ok(spec)
@@ -499,14 +520,17 @@ impl<'de> Deserialize<'de> for AgentEffectSpec {
 
 /// The effect specs a run stamps onto the effects its transitions commit.
 ///
-/// This is the interim registration surface of
+/// This is the commit-time projection of
 /// [specification 11.2](../../../docs/plans/rakka-agent/spec.md) ("the
 /// registered tool or adapter supplies the permitted safety declaration"):
-/// deployment configuration on the run entity, keyed by tool. Slice 1.8's tool
-/// registry replaces the map without changing the effect record. The defaults
-/// fail safe: a model call is one read-only attempt, and a tool the deployment
-/// has not classified is non-idempotent — an ambiguous loss parks it for
-/// reconciliation rather than guessing that a retry is harmless.
+/// deployment configuration on the run entity, keyed by tool. Since slice 1.8
+/// the source of the tool entries is the registry —
+/// [`crate::tools::AgentToolRegistry::effect_policies`] projects the
+/// registered bindings onto this map, and the dispatch pipeline revalidates
+/// every intent against the same registry before durable `Started`. The
+/// defaults fail safe: a model call is one read-only attempt, and a tool the
+/// deployment has not classified is non-idempotent — an ambiguous loss parks
+/// it for reconciliation rather than guessing that a retry is harmless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEffectPolicies {
     model: AgentEffectSpec,
@@ -862,6 +886,11 @@ pub struct AgentRunEffect {
     pub settings_revision: AgentRevisionNumber,
     /// The logical credential binding a dispatch attempt may resolve.
     pub credential_binding: Option<AgentCredentialBindingRef>,
+    /// The application-owned execution policy or trust class the dispatch is
+    /// routed through
+    /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)).
+    #[serde(default)]
+    pub execution_policy: Option<AgentExecutionPolicyRef>,
     /// Timeout for one dispatch attempt, in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Deadline after which the effect must not be dispatched.
@@ -918,6 +947,7 @@ impl AgentRunEffect {
             argument_digest,
             settings_revision,
             credential_binding: spec.credential_binding.clone(),
+            execution_policy: spec.execution_policy.clone(),
             timeout_ms: spec.timeout_ms,
             deadline_at: None,
             status: AgentRunEffectStatus::Pending,
@@ -1100,6 +1130,12 @@ impl AgentRunEffect {
                 binding.as_str().to_string(),
             );
         }
+        if let Some(policy) = &self.execution_policy {
+            target.attributes.insert(
+                ATTR_AGENT_EFFECT_EXECUTION_POLICY.to_string(),
+                policy.as_str().to_string(),
+            );
+        }
         AgentEffect {
             effect_id: ticket_id.clone(),
             deduplication_key: AgentDeduplicationKey::new(ticket_id.as_str()),
@@ -1136,6 +1172,9 @@ pub const ATTR_AGENT_EFFECT_MAX_ATTEMPTS: &str = "agent_effect_max_attempts";
 pub const ATTR_AGENT_EFFECT_ARGUMENT_DIGEST: &str = "agent_effect_argument_digest";
 /// Dispatch-ticket attribute naming the reconciliation protocol.
 pub const ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL: &str = "agent_effect_reconciliation_protocol";
+/// Dispatch-ticket attribute naming the execution policy the dispatch is
+/// routed through.
+pub const ATTR_AGENT_EFFECT_EXECUTION_POLICY: &str = "agent_effect_execution_policy";
 
 /// The idempotency key the dispatch ticket hands to the target: the external
 /// key when the safety class carries one, the derived internal key otherwise.
@@ -1684,6 +1723,7 @@ mod tests {
             reconciliation_protocol: None,
             credential_binding: None,
             timeout_ms: None,
+            execution_policy: None,
         };
         assert_eq!(
             missing

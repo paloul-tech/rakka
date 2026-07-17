@@ -108,9 +108,10 @@ pub use choreography::{
     AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
 pub use dispatch::{
-    workflow_run_id, AgentDispatchError, AgentDispatchFuture, AgentDispatchPass,
-    AgentDispatchProbe, AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
-    AgentEffectCredentialResolver, AgentEffectReconciler, AgentReconciliationFinding,
+    workflow_run_id, AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError,
+    AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult,
+    AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectCredentialResolver,
+    AgentEffectReconciler, AgentEntityAuthority, AgentReconciliationFinding,
     AgentRunEffectDispatcher, AgentRunResultDelivery, WorkflowAgentRunEffectSink,
 };
 pub use effect::{
@@ -121,8 +122,15 @@ pub use effect::{
     AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
     InMemoryAgentRunEffectSink, AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH,
     AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES, ATTR_AGENT_EFFECT_ARGUMENT_DIGEST,
-    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID, ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL,
-    ATTR_AGENT_EFFECT_SAFETY_CLASS, ATTR_AGENT_EFFECT_SETTINGS_REVISION,
+    ATTR_AGENT_EFFECT_EXECUTION_POLICY, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL, ATTR_AGENT_EFFECT_SAFETY_CLASS,
+    ATTR_AGENT_EFFECT_SETTINGS_REVISION,
+};
+pub use guardrails::{
+    AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailDecision,
+    AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome, AgentGuardrailReport,
+    AgentGuardrailResult, AgentGuardrailStage, AGENT_GUARDRAIL_CONTENT_MAX_BYTES,
+    AGENT_GUARDRAIL_MAX_STAGES, AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
 pub use loop_runtime::{
     AgentLoopPhase, AgentLoopState, AgentRunProposal, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
@@ -170,6 +178,14 @@ pub use identity::{
     AGENT_PERSISTENCE_SEPARATOR, AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
     AGENT_TASK_ENTITY_PERSISTENCE_PREFIX,
 };
+pub use tools::{
+    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant, AgentExecutionPolicyRouter,
+    AgentGrantDescriptor, AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding,
+    AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
+    AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_TOOL_DESCRIPTION_MAX_LENGTH,
+    AGENT_TOOL_PARAMETERS_MAX_BYTES, AGENT_TOOL_REGISTRY_MAX_TOOLS,
+};
+
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,

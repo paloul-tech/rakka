@@ -602,6 +602,72 @@ Guidance: [Tool Visibility, Authority, and Executor Isolation](technical-guidanc
   stages cannot be removed by definition/setup.
 - Enforce the Slice 1.2 setup/settings envelope at dispatch.
 
+**Amended as implemented (2026-07-16):**
+
+- **The registry replaces `AgentEffectPolicies` by projection, not deletion.**
+  `AgentToolRegistry::effect_policies` derives the run entity's commit-time
+  policies from the registered bindings, so the loop transition code and the
+  effect record are untouched (exactly what the 1.7 amendment reserved), and
+  the same registry backs the dispatch-time authority — one source, two
+  enforcement points. "Unclassified" now means *registered without a
+  declaration* (fails safe as one non-idempotent attempt); a tool with no
+  registration at all is refused outright at dispatch
+  (`tool-binding-missing`), because a binding is the only thing that can
+  vouch for what a call would execute.
+- **The authority gate is a required dispatcher collaborator, and the
+  refusal's shape follows its cause.** `AgentRunEffectDispatcher` cannot be
+  constructed without an `AgentDispatchAuthority`; a permissive default would
+  be the universally privileged worker spec 16 forbids. The gate runs before
+  every attempt's durable `Started` against the agent's *current* durable
+  state (`AgentEntityAuthority` over `load_agent_entity_state`), which is
+  what makes immediate-safety revocations and suspension per-attempt facts.
+  A *transient* refusal — suspension — burns an attempt under the intent's
+  own policy, so the ticket stays retryable and a resumed agent's next
+  attempt proceeds; a *definitive* refusal settles the generation as `Failed`
+  with the refusal's stable code and cancels the ticket, with nothing
+  invoked.
+- **The grant is derived per attempt, not persisted.** Issuing fresh and
+  revalidating (`AgentDispatchGrant::validate_for`: exact intent and
+  generation, argument digest, safety class, expiry, use count) *is* the
+  pre-attempt revalidation spec 11.8 requires; there is no released grant a
+  store could outlive. Slice 1.10's checkpoint-bound grants add the durable
+  half without changing this seam — until then a binding or guardrail that
+  requires a checkpoint fails closed (`checkpoint-required`), because no
+  grant can exist yet.
+- **Setup enforcement rides the gate, per authority instance.** Runs do not
+  yet carry a setup reference, so `AgentEntityAuthority::with_setup` attaches
+  the run setup the gate enforces; both the definition envelope *and* the
+  setup are checked, which fails closed when a definition narrowed after the
+  setup was validated. When a later slice gives runs a durable setup
+  reference, the gate reads it from the run state instead — an argument
+  change, not a semantic one.
+- **Guardrail transforms run at dispatch and never touch the durable
+  intent.** A transform is a pure function of the intent's arguments under
+  the chain revision the grant binds, so every attempt of a generation
+  re-derives the identical transformed input — that is how "a retry reuses
+  the accepted transformed input" is honored without a second durable write,
+  and the intent's argument digest stays bound to what the run committed.
+  The chain itself is deployment configuration; a definition or setup can
+  require stages (envelope `mandatory_guardrails`, enforced as
+  `guardrail-stage-missing` when the chain cannot run one) and disable
+  optional ones (`narrowed`), but no operation exists that removes a
+  deployment-mandatory stage. Until slice 1.11 gives context snapshots
+  content, the model-request boundary evaluates a bounded request
+  descriptor — enough for a kill-switch or checkpoint stage.
+- **The 1.6 amendment's settings note is discharged here.** The authority
+  resolves the turn-bound settings of spec 7.2 at dispatch: the granted model
+  call carries the profile and sampling the current settings revision
+  selects, validated against the definition and setup envelopes, and the
+  `AgentModelRequest` now records the settings revision it actually resolved
+  rather than the interim initial value.
+- **`EffectIntent` gained its `ExecutionPolicyRef`.** The intent persists the
+  binding's execution policy, the dispatch ticket echoes it for routing, and
+  `AgentExecutionPolicyRouter` is the application-owned hook: an intent that
+  names a trust class no configured executor accepts stays undispatchable
+  (`execution-policy-unroutable`) rather than running with ambient
+  authority. The reshape keeps the effect schema at version 1 under the same
+  unreleased-branch argument the 1.7 amendment recorded.
+
 Done when: scenarios 44 and 54 pass (widening setups rejected; a
 model-visible call stays undispatchable when binding, grant, credential,
 checkpoint, execution-policy, or immediate-safety checks fail).
