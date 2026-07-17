@@ -112,7 +112,8 @@ pub use dispatch::{
     AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult,
     AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectCredentialResolver,
     AgentEffectReconciler, AgentEntityAuthority, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, WorkflowAgentRunEffectSink,
+    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
+    WorkflowAgentRunEffectSink,
 };
 pub use effect::{
     effect_id_for, external_idempotency_key_for, AgentEffectError, AgentEffectFuture,
@@ -129,8 +130,9 @@ pub use effect::{
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailDecision,
     AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome, AgentGuardrailReport,
-    AgentGuardrailResult, AgentGuardrailStage, AGENT_GUARDRAIL_CONTENT_MAX_BYTES,
-    AGENT_GUARDRAIL_MAX_STAGES, AGENT_GUARDRAIL_REASON_MAX_LENGTH,
+    AgentGuardrailResult, AgentGuardrailStage, AgentGuardrailTransform,
+    AGENT_GUARDRAIL_CONTENT_MAX_BYTES, AGENT_GUARDRAIL_MAX_STAGES,
+    AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
 pub use loop_runtime::{
     AgentLoopPhase, AgentLoopState, AgentRunProposal, CURRENT_AGENT_LOOP_ADAPTER_VERSION,

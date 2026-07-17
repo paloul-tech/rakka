@@ -64,7 +64,9 @@ use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentEffectResult, AgentEffectSpec,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectRequest,
 };
-use crate::guardrails::{AgentGuardrailChain, AgentGuardrailDisposition, AgentGuardrailReport};
+use crate::guardrails::{
+    AgentGuardrailChain, AgentGuardrailDisposition, AgentGuardrailReport, AgentGuardrailTransform,
+};
 use crate::identity::{AgentGoalId, AgentRunScope, AgentTaskId};
 use crate::model::{AgentToolCallRequest, AGENT_TOOL_ARGUMENTS_MAX_BYTES};
 use crate::task::{AgentContentDigest, AgentSchemaRef};
@@ -407,18 +409,16 @@ impl AgentToolBinding {
     /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
     /// registered tool supplies the permitted safety declaration).
     pub fn effect_spec(&self) -> AgentEffectResult<AgentEffectSpec> {
-        let mut spec = AgentEffectSpec {
+        let spec = AgentEffectSpec {
             safety_class: self.declaration.safety,
             max_attempts: self.max_attempts,
             reconciliation_protocol: self.reconciliation_protocol.clone(),
             credential_binding: self.declaration.credential_binding.clone(),
             timeout_ms: self.timeout_ms,
-            execution_policy: None,
+            execution_policy: self.declaration.execution_policy.clone(),
+            guardrail_revision: None,
         };
         spec.validate()?;
-        if let Some(policy) = &self.declaration.execution_policy {
-            spec = spec.with_execution_policy(policy.clone());
-        }
         Ok(spec)
     }
 }
@@ -446,16 +446,18 @@ impl AgentToolRegistry {
     /// Registers one tool binding, refusing a duplicate or a binding whose
     /// failure policy the crash-and-timeout rules could not honor.
     pub fn register(mut self, binding: AgentToolBinding) -> AgentToolResult<Self> {
+        binding.descriptor.validate()?;
+        binding.effect_spec()?;
+        let tool = binding.descriptor.tool.clone();
+        // The duplicate check precedes the capacity check so a re-registration
+        // at the cap names its real conflict, not a full registry.
+        if self.tools.contains_key(&tool) {
+            return Err(AgentToolError::DuplicateTool { tool });
+        }
         if self.tools.len() >= AGENT_TOOL_REGISTRY_MAX_TOOLS {
             return Err(AgentToolError::RegistryFull {
                 maximum: AGENT_TOOL_REGISTRY_MAX_TOOLS,
             });
-        }
-        binding.descriptor.validate()?;
-        binding.effect_spec()?;
-        let tool = binding.descriptor.tool.clone();
-        if self.tools.contains_key(&tool) {
-            return Err(AgentToolError::DuplicateTool { tool });
         }
         self.tools.insert(tool, binding);
         Ok(self)
@@ -665,7 +667,11 @@ impl AgentDispatchGrant {
                 "the grant binds different arguments than the intent carries",
             ));
         }
-        if now.as_millis() >= self.expires_at.as_millis() {
+        // Strictly after: a grant is valid through its expiry instant, so a
+        // grant minted and spent at the same `now` — the per-attempt derive
+        // path — is never refused by its own issuance timestamp, whatever the
+        // configured TTL.
+        if now.as_millis() > self.expires_at.as_millis() {
             return Err(AgentAuthorityRefusal::of(
                 "grant-expired",
                 "the grant expired before the attempt",
@@ -697,7 +703,12 @@ pub struct AgentGrantedDispatch {
     pub model_profile: Option<AgentModelProfileId>,
     /// The sampling parameters the current settings resolve for the turn.
     pub sampling: Option<AgentSamplingSettings>,
-    /// Report-only guardrail findings, for observability.
+    /// Every guardrail transform applied to the call, with its reason. The
+    /// dispatch pipeline surfaces these through its tracing span so an applied
+    /// transform is observable, not silent.
+    pub transforms: Vec<AgentGuardrailTransform>,
+    /// Report-only guardrail findings. The dispatch pipeline surfaces these
+    /// through its tracing span, which is what makes "recorded" true.
     pub reports: Vec<AgentGuardrailReport>,
 }
 
@@ -821,6 +832,24 @@ impl AgentToolAuthority {
         &self.registry
     }
 
+    /// The commit-time effect policies this authority's configuration
+    /// projects: the registry's bindings, pinned to the configured guardrail
+    /// chain's revision.
+    ///
+    /// Wire the run entity with *this* projection rather than
+    /// [`AgentToolRegistry::effect_policies`] whenever a chain is configured:
+    /// the pin it stamps on every committed intent is what the dispatch
+    /// pipeline holds guardrail transforms deterministic against, so one
+    /// external idempotency key can never carry two differently transformed
+    /// payloads across a chain change.
+    pub fn effect_policies(&self) -> AgentEffectResult<crate::effect::AgentEffectPolicies> {
+        let mut policies = self.registry.effect_policies()?;
+        if let Some(chain) = &self.guardrails {
+            policies = policies.with_guardrail_revision(chain.revision());
+        }
+        Ok(policies)
+    }
+
     /// Authorizes one dispatch attempt of one effect intent, or refuses it.
     ///
     /// This runs before every attempt's durable `Started`, so an
@@ -852,6 +881,12 @@ impl AgentToolAuthority {
                 "the agent is suspended; no further effect may be dispatched until it resumes",
             ));
         }
+
+        // The third immediate-safety settings field: a guardrail-policy
+        // selection is honored the same way a revocation is — the very next
+        // dispatch attempt refuses unless the deployed chain provably
+        // implements the selected policy.
+        self.check_guardrail_policy(context)?;
 
         // The grant binds the exact intent, so the intent must be internally
         // consistent before anything else is decided about it.
@@ -1023,6 +1058,34 @@ impl AgentToolAuthority {
                 ),
             ));
         }
+        // The reconciliation protocol is part of the failure policy the
+        // binding authorizes: an ambiguous loss is resolved by querying *this*
+        // protocol, so an intent naming a different one would have its
+        // "proven absent" answered by the wrong system of record.
+        if intent.safety.reconciliation_protocol() != binding.reconciliation_protocol.as_ref() {
+            return Err(AgentAuthorityRefusal::of(
+                "tool-policy-conflict",
+                format!(
+                    "the intent's reconciliation protocol does not match the binding of {}",
+                    call.tool
+                ),
+            ));
+        }
+        // The per-attempt timeout may narrow the binding's bound, never
+        // exceed or drop it: an unbounded attempt against a binding that
+        // demanded one is a widening.
+        if let Some(bound) = binding.timeout_ms {
+            if intent.timeout_ms.is_none_or(|timeout| timeout > bound) {
+                return Err(AgentAuthorityRefusal::of(
+                    "tool-policy-conflict",
+                    format!(
+                        "the intent's per-attempt timeout does not honor the {bound} ms bound \
+                         the binding of {} declares",
+                        call.tool
+                    ),
+                ));
+            }
+        }
 
         // The credential class: authorized by the envelope(s), and not revoked
         // by the current settings.
@@ -1054,48 +1117,40 @@ impl AgentToolAuthority {
         self.check_guardrail_coverage(&required)?;
 
         let mut tool_call = None;
+        let mut transforms = Vec::new();
         let mut reports = Vec::new();
         if let Some(chain) = &self.guardrails {
-            let decision = chain.evaluate(
+            // The transform-content ceiling at this boundary is the tool
+            // argument bound: a transform larger than what a call can carry
+            // is blocked here, deterministically, with the one stable reason
+            // code — never surfaced as a different failure by a later layer.
+            let decision = chain.evaluate_bounded(
                 crate::guardrails::AgentGuardrailBoundary::ToolRequest,
                 &call.arguments,
+                AGENT_TOOL_ARGUMENTS_MAX_BYTES,
             );
-            reports = decision.reports.clone();
-            match &decision.disposition {
-                AgentGuardrailDisposition::Allowed => {}
-                AgentGuardrailDisposition::Blocked { stage, reason_code } => {
-                    return Err(AgentAuthorityRefusal::of(
-                        "guardrail-blocked",
-                        format!("guardrail stage {stage} blocked the call: {reason_code}"),
-                    ));
-                }
-                AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
-                    return Err(AgentAuthorityRefusal::of(
-                        "checkpoint-required",
-                        format!(
-                            "guardrail stage {stage} requires a checkpoint grant, and none \
-                             exists: {reason_code}"
-                        ),
-                    ));
-                }
-            }
+            refuse_guardrail_disposition(&decision.disposition, "the call")?;
             if decision.transformed {
                 let transformed = AgentToolCallRequest::new(
                     call.call_id.clone(),
                     call.tool.clone(),
                     decision.content,
                 )
-                .map_err(|_| {
+                .map_err(|error| {
+                    // Size was already bounded by the evaluation; what is
+                    // left is an encoding or validation failure, reported as
+                    // what it is.
                     AgentAuthorityRefusal::of(
-                        "guardrail-transform-oversized",
+                        "guardrail-transform-invalid",
                         format!(
-                            "the transformed arguments exceed the \
-                             {AGENT_TOOL_ARGUMENTS_MAX_BYTES} byte bound"
+                            "the transformed arguments do not form a dispatchable call: {error}"
                         ),
                     )
                 })?;
                 tool_call = Some(Box::new(transformed));
             }
+            transforms = decision.transforms;
+            reports = decision.reports;
         }
 
         Ok(AgentGrantedDispatch {
@@ -1116,6 +1171,7 @@ impl AgentToolAuthority {
             tool_call,
             model_profile: None,
             sampling: None,
+            transforms,
             reports,
         })
     }
@@ -1191,25 +1247,21 @@ impl AgentToolAuthority {
                 crate::guardrails::AgentGuardrailBoundary::ModelRequest,
                 &content,
             );
-            reports = decision.reports.clone();
-            match &decision.disposition {
-                AgentGuardrailDisposition::Allowed => {}
-                AgentGuardrailDisposition::Blocked { stage, reason_code } => {
-                    return Err(AgentAuthorityRefusal::of(
-                        "guardrail-blocked",
-                        format!("guardrail stage {stage} blocked the model call: {reason_code}"),
-                    ));
-                }
-                AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
-                    return Err(AgentAuthorityRefusal::of(
-                        "checkpoint-required",
-                        format!(
-                            "guardrail stage {stage} requires a checkpoint grant, and none \
-                             exists: {reason_code}"
-                        ),
-                    ));
-                }
+            refuse_guardrail_disposition(&decision.disposition, "the model call")?;
+            if decision.transformed {
+                // The descriptor evaluated here is synthesized, so a
+                // transform of it cannot reach the model context; silently
+                // treating it as Allow would fail open relative to the
+                // transform contract, so it refuses instead — a stage that
+                // means to gate a model call blocks or requires a checkpoint.
+                return Err(AgentAuthorityRefusal::of(
+                    "guardrail-transform-unsupported",
+                    "a guardrail transform at the model-request boundary cannot be applied \
+                     until context snapshots carry content; the stage must block or require a \
+                     checkpoint instead",
+                ));
             }
+            reports = decision.reports;
         }
 
         Ok(AgentGrantedDispatch {
@@ -1226,8 +1278,35 @@ impl AgentToolAuthority {
             tool_call: None,
             model_profile: profile,
             sampling: Some(settings.sampling),
+            transforms: Vec::new(),
             reports,
         })
+    }
+
+    /// Checks that the settings' guardrail-policy selection — an
+    /// immediate-safety field — is implemented by the deployed chain.
+    fn check_guardrail_policy(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+    ) -> Result<(), AgentAuthorityRefusal> {
+        let Some(required) = &context.settings.settings().guardrail_policy else {
+            return Ok(());
+        };
+        let implemented = self
+            .guardrails
+            .as_ref()
+            .is_some_and(|chain| chain.policy_ref() == Some(required));
+        if !implemented {
+            return Err(AgentAuthorityRefusal::of(
+                "guardrail-policy-mismatch",
+                format!(
+                    "the current settings select the guardrail policy {required}, and the \
+                     deployed chain does not implement it; the effect stays undispatchable \
+                     rather than running under the wrong policy"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Checks that a credential binding is authorized and not revoked.
@@ -1376,6 +1455,41 @@ impl Debug for AgentToolAuthority {
     }
 }
 
+/// Maps one guardrail disposition onto the authority's refusal, identically
+/// at every boundary, carrying the block's protected evidence reference into
+/// the durable failure detail rather than discarding it.
+fn refuse_guardrail_disposition(
+    disposition: &AgentGuardrailDisposition,
+    what: &str,
+) -> Result<(), AgentAuthorityRefusal> {
+    match disposition {
+        AgentGuardrailDisposition::Allowed => Ok(()),
+        AgentGuardrailDisposition::Blocked {
+            stage,
+            reason_code,
+            evidence,
+        } => {
+            let evidence = evidence
+                .as_ref()
+                .map(|artifact| format!(" (evidence: {})", artifact.artifact_id))
+                .unwrap_or_default();
+            Err(AgentAuthorityRefusal::of(
+                "guardrail-blocked",
+                format!("guardrail stage {stage} blocked {what}: {reason_code}{evidence}"),
+            ))
+        }
+        AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
+            Err(AgentAuthorityRefusal::of(
+                "checkpoint-required",
+                format!(
+                    "guardrail stage {stage} requires a checkpoint grant, and none exists: \
+                     {reason_code}"
+                ),
+            ))
+        }
+    }
+}
+
 /// Rejection of a tool descriptor, binding, or registry operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1498,9 +1612,14 @@ impl From<AgentToolError> for AgentEffectError {
 mod tests {
     use super::*;
     use crate::definition::{
-        AgentDefinition, AgentDefinitionId, AgentRevisionProvenance, AgentSettingsChange,
+        AgentDefinition, AgentDefinitionId, AgentPolicyRef, AgentRevisionProvenance,
+        AgentSettingsChange,
+    };
+    use crate::guardrails::{
+        AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailOutcome, AgentGuardrailStage,
     };
     use crate::identity::{AgentId, AgentRunId, TenantId};
+    use crate::memory::AgentContextSnapshotRef;
     use crate::schema::{VersionedAgentRecord, CURRENT_AGENT_SETUP_SCHEMA_VERSION};
     use crate::task::AgentSchemaId;
     use rakka_agent_workflow::{AgentAuditEventId, AgentCausationId, PrincipalRef};
@@ -1748,9 +1867,15 @@ mod tests {
                 .code,
             "grant-uses-exhausted"
         );
+        // The grant is valid *through* its expiry instant — a grant minted
+        // and spent at the same `now` must never refuse itself — and refused
+        // strictly after it.
+        grant
+            .validate_for(&scope(), &intent, 1, AgentTimestampMillis::new(1_010))
+            .expect("the expiry instant is still covered");
         assert_eq!(
             grant
-                .validate_for(&scope(), &intent, 1, AgentTimestampMillis::new(1_010))
+                .validate_for(&scope(), &intent, 1, AgentTimestampMillis::new(1_011))
                 .expect_err("an expired grant is refused")
                 .code,
             "grant-expired"
@@ -1903,6 +2028,216 @@ mod tests {
             )
             .expect_err("a terminated agent dispatches nothing");
         assert_eq!(refusal.code, "agent-terminated");
+        assert!(!refusal.retryable);
+    }
+
+    #[test]
+    fn an_intent_naming_the_wrong_reconciliation_protocol_is_refused() {
+        // The binding's protocol is the system of record an ambiguous loss is
+        // reconciled against; an intent naming another ledger would have its
+        // "proven absent" answered by the wrong one.
+        let protocol =
+            AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Reconcileable);
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), declaration.clone(), 3)
+                    .with_reconciliation_protocol(protocol),
+            )
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("charge-card"), declaration)]));
+        let settings = settings_for(&definition);
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+        };
+
+        let authority = AgentToolAuthority::new(registry);
+        let other = AgentReconciliationProtocolRef::new("other-ledger").expect("the ref is valid");
+        let intent = tool_intent(
+            "charge-card",
+            &AgentEffectSpec::reconcileable(other, 3).expect("the spec is valid"),
+        );
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("a divergent reconciliation protocol is refused");
+        assert_eq!(refusal.code, "tool-policy-conflict");
+    }
+
+    #[test]
+    fn an_intent_that_ignores_the_bindings_timeout_bound_is_refused() {
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent);
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), declaration.clone(), 1)
+                    .with_timeout_ms(1_000),
+            )
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("charge-card"), declaration)]));
+        let settings = settings_for(&definition);
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+        };
+        let authority = AgentToolAuthority::new(registry);
+
+        // An unbounded intent against a binding that demanded a bound is a
+        // widening; a narrower timeout is a legal narrowing.
+        let unbounded = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &unbounded,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("an unbounded attempt is refused");
+        assert_eq!(refusal.code, "tool-policy-conflict");
+
+        let narrowed = tool_intent(
+            "charge-card",
+            &AgentEffectSpec::non_idempotent().with_timeout_ms(500),
+        );
+        authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &narrowed,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("a narrower timeout is granted");
+    }
+
+    #[test]
+    fn a_guardrail_policy_the_chain_does_not_implement_is_refused() {
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent);
+        let registry = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("charge-card"),
+                declaration.clone(),
+                1,
+            ))
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("charge-card"), declaration)]));
+        let policy = AgentPolicyRef::new("pii-v2").expect("the policy ref is valid");
+        let selected = AgentSettings {
+            guardrail_policy: Some(policy.clone()),
+            ..AgentSettings::default()
+        };
+        let settings = SettingsRevision::initial(&definition, selected, provenance())
+            .expect("the settings are valid");
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+        };
+        let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
+
+        // No chain at all: the selected policy is provably not implemented.
+        let refusal = AgentToolAuthority::new(registry.clone())
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("an unimplemented guardrail policy refuses dispatch");
+        assert_eq!(refusal.code, "guardrail-policy-mismatch");
+        assert!(!refusal.retryable);
+
+        // A chain labeled with the selected policy implements it.
+        let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL).with_policy_ref(policy);
+        AgentToolAuthority::new(registry)
+            .with_guardrails(chain)
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the labeled chain satisfies the selection");
+    }
+
+    #[test]
+    fn a_model_request_transform_is_refused_not_ignored() {
+        struct AlwaysTransform;
+
+        impl AgentGuardrail for AlwaysTransform {
+            fn evaluate(&self, _: AgentGuardrailBoundary, _: &Value) -> AgentGuardrailOutcome {
+                AgentGuardrailOutcome::Transform {
+                    content: serde_json::json!({}),
+                    reason_code: "redacted".to_string(),
+                }
+            }
+        }
+
+        let definition = definition_with(BTreeMap::new());
+        let settings = settings_for(&definition);
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+        };
+        let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(
+                AgentGuardrailStage::new(
+                    AgentGuardrailStageId::new("redactor").expect("the stage id is valid"),
+                    AgentRevisionNumber::INITIAL,
+                    Arc::new(AlwaysTransform),
+                )
+                .at_boundary(AgentGuardrailBoundary::ModelRequest),
+            )
+            .expect("the stage registers");
+        let authority = AgentToolAuthority::new(AgentToolRegistry::new()).with_guardrails(chain);
+
+        let scope = scope();
+        let context_ref = AgentContextSnapshotRef::for_turn(&scope, 1).expect("the ref derives");
+        let intent = AgentRunEffect::new(
+            &scope,
+            1,
+            0,
+            AgentRunEffectRequest::Model {
+                context: context_ref,
+                profile: None,
+            },
+            &AgentEffectSpec::read_only().with_guardrail_revision(AgentRevisionNumber::INITIAL),
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives");
+
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope,
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("a model-request transform cannot be applied, so it refuses");
+        assert_eq!(refusal.code, "guardrail-transform-unsupported");
         assert!(!refusal.retryable);
     }
 }

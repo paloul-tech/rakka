@@ -312,6 +312,17 @@ pub struct AgentEffectSpec {
     /// persists and routes the reference; the application owns what stands
     /// behind it.
     pub execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The guardrail chain revision the effect is committed under
+    /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The pin is what makes a guardrail transform deterministic *across*
+    /// attempts of one generation: the dispatch pipeline refuses a retry —
+    /// and any transformed execution — whose current chain revision no longer
+    /// matches it, so one external idempotency key can never carry two
+    /// different payloads. Stamp it with
+    /// [`crate::tools::AgentToolAuthority::effect_policies`], which projects
+    /// the registry and the configured chain together.
+    pub guardrail_revision: Option<AgentRevisionNumber>,
 }
 
 impl AgentEffectSpec {
@@ -325,6 +336,7 @@ impl AgentEffectSpec {
             credential_binding: None,
             timeout_ms: None,
             execution_policy: None,
+            guardrail_revision: None,
         }
     }
 
@@ -339,6 +351,7 @@ impl AgentEffectSpec {
             credential_binding: None,
             timeout_ms: None,
             execution_policy: None,
+            guardrail_revision: None,
         }
     }
 
@@ -358,6 +371,7 @@ impl AgentEffectSpec {
             credential_binding: None,
             timeout_ms: None,
             execution_policy: None,
+            guardrail_revision: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -391,6 +405,13 @@ impl AgentEffectSpec {
         self
     }
 
+    /// Pins the guardrail chain revision the effect commits under.
+    #[must_use]
+    pub const fn with_guardrail_revision(mut self, revision: AgentRevisionNumber) -> Self {
+        self.guardrail_revision = Some(revision);
+        self
+    }
+
     /// Declares a reconcileable spec with its protocol.
     pub fn reconcileable(
         protocol: AgentReconciliationProtocolRef,
@@ -403,6 +424,7 @@ impl AgentEffectSpec {
             credential_binding: None,
             timeout_ms: None,
             execution_policy: None,
+            guardrail_revision: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -418,6 +440,7 @@ impl AgentEffectSpec {
             credential_binding: None,
             timeout_ms: None,
             execution_policy: None,
+            guardrail_revision: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -497,6 +520,8 @@ struct AgentEffectSpecRecord {
     timeout_ms: Option<u64>,
     #[serde(default)]
     execution_policy: Option<AgentExecutionPolicyRef>,
+    #[serde(default)]
+    guardrail_revision: Option<AgentRevisionNumber>,
 }
 
 impl<'de> Deserialize<'de> for AgentEffectSpec {
@@ -512,6 +537,7 @@ impl<'de> Deserialize<'de> for AgentEffectSpec {
             credential_binding: record.credential_binding,
             timeout_ms: record.timeout_ms,
             execution_policy: record.execution_policy,
+            guardrail_revision: record.guardrail_revision,
         };
         spec.validate().map_err(serde::de::Error::custom)?;
         Ok(spec)
@@ -572,6 +598,22 @@ impl AgentEffectPolicies {
         spec.validate()?;
         self.default_tool = spec;
         Ok(self)
+    }
+
+    /// Pins every spec — model, registered tools, and the unclassified
+    /// default — to the guardrail chain revision the deployment evaluates at
+    /// dispatch, so each committed intent records the policy its transforms
+    /// are deterministic under. Prefer deriving policies through
+    /// [`crate::tools::AgentToolAuthority::effect_policies`], which applies
+    /// this stamp from the chain it actually holds.
+    #[must_use]
+    pub fn with_guardrail_revision(mut self, revision: AgentRevisionNumber) -> Self {
+        self.model.guardrail_revision = Some(revision);
+        self.default_tool.guardrail_revision = Some(revision);
+        for spec in self.tools.values_mut() {
+            spec.guardrail_revision = Some(revision);
+        }
+        self
     }
 
     /// The spec one request dispatches under.
@@ -891,6 +933,13 @@ pub struct AgentRunEffect {
     /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md)).
     #[serde(default)]
     pub execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The guardrail chain revision the effect was committed under
+    /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)). The
+    /// dispatch pipeline refuses an attempt whose current chain no longer
+    /// matches this pin whenever payload identity across attempts is at stake
+    /// — a transformed call, or any attempt after the first.
+    #[serde(default)]
+    pub guardrail_revision: Option<AgentRevisionNumber>,
     /// Timeout for one dispatch attempt, in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Deadline after which the effect must not be dispatched.
@@ -948,6 +997,7 @@ impl AgentRunEffect {
             settings_revision,
             credential_binding: spec.credential_binding.clone(),
             execution_policy: spec.execution_policy.clone(),
+            guardrail_revision: spec.guardrail_revision,
             timeout_ms: spec.timeout_ms,
             deadline_at: None,
             status: AgentRunEffectStatus::Pending,
@@ -1724,6 +1774,7 @@ mod tests {
             credential_binding: None,
             timeout_ms: None,
             execution_policy: None,
+            guardrail_revision: None,
         };
         assert_eq!(
             missing

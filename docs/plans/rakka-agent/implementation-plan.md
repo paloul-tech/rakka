@@ -621,39 +621,72 @@ Guidance: [Tool Visibility, Authority, and Executor Isolation](technical-guidanc
   every attempt's durable `Started` against the agent's *current* durable
   state (`AgentEntityAuthority` over `load_agent_entity_state`), which is
   what makes immediate-safety revocations and suspension per-attempt facts.
-  A *transient* refusal — suspension — burns an attempt under the intent's
-  own policy, so the ticket stays retryable and a resumed agent's next
-  attempt proceeds; a *definitive* refusal settles the generation as `Failed`
-  with the refusal's stable code and cancels the ticket, with nothing
-  invoked.
+  A *transient* refusal — suspension — spends nothing durable: the claim is
+  deferred at the fleet with the outbox row untouched, so no attempt burns
+  (the budget keeps meaning "external invocation attempts", and a suspension
+  cannot exhaust a single-attempt effect), no `Failed` row is written that
+  recovery could misread as a possibly-executed reconcileable attempt, and a
+  resumed agent's next attempt rechecks and proceeds. A *definitive* refusal
+  settles the generation as `Failed` with the refusal's stable code and
+  cancels the ticket, with nothing invoked — unless the refused attempt was
+  the truth-finding retry of an ambiguous idempotent loss, where a prior
+  attempt may already have committed externally: that generation parks
+  `Indeterminate` under the refusal's code instead, preserving the spec 11.5
+  ambiguity for the explicit reconciliation decision. The gate also
+  revalidates the intent's reconciliation protocol and per-attempt timeout
+  against the binding, and enforces the settings' guardrail-policy selection
+  (`guardrail-policy-mismatch`) — the third immediate-safety field —
+  against the policy reference the deployed chain carries.
 - **The grant is derived per attempt, not persisted.** Issuing fresh and
   revalidating (`AgentDispatchGrant::validate_for`: exact intent and
   generation, argument digest, safety class, expiry, use count) *is* the
   pre-attempt revalidation spec 11.8 requires; there is no released grant a
-  store could outlive. Slice 1.10's checkpoint-bound grants add the durable
-  half without changing this seam — until then a binding or guardrail that
-  requires a checkpoint fails closed (`checkpoint-required`), because no
-  grant can exist yet.
-- **Setup enforcement rides the gate, per authority instance.** Runs do not
-  yet carry a setup reference, so `AgentEntityAuthority::with_setup` attaches
-  the run setup the gate enforces; both the definition envelope *and* the
-  setup are checked, which fails closed when a definition narrowed after the
-  setup was validated. When a later slice gives runs a durable setup
-  reference, the gate reads it from the run state instead — an argument
-  change, not a semantic one.
-- **Guardrail transforms run at dispatch and never touch the durable
-  intent.** A transform is a pure function of the intent's arguments under
-  the chain revision the grant binds, so every attempt of a generation
-  re-derives the identical transformed input — that is how "a retry reuses
-  the accepted transformed input" is honored without a second durable write,
-  and the intent's argument digest stays bound to what the run committed.
-  The chain itself is deployment configuration; a definition or setup can
-  require stages (envelope `mandatory_guardrails`, enforced as
-  `guardrail-stage-missing` when the chain cannot run one) and disable
-  optional ones (`narrowed`), but no operation exists that removes a
-  deployment-mandatory stage. Until slice 1.11 gives context snapshots
-  content, the model-request boundary evaluates a bounded request
-  descriptor — enough for a kill-switch or checkpoint stage.
+  store could outlive. A grant is valid *through* its expiry instant, so the
+  mint-and-spend path can never be refused by its own issuance timestamp
+  whatever the TTL; the TTL bounds a grant a holder retains, which no
+  shipped path does yet. Slice 1.10's checkpoint-bound grants add the
+  durable half without changing this seam — until then a binding or
+  guardrail that requires a checkpoint fails closed (`checkpoint-required`),
+  because no grant can exist yet.
+- **Setup enforcement rides the gate, resolved per claimed run.** Runs do
+  not yet carry a setup reference, and the dispatcher's claim batch is
+  fleet-wide — one worker serves every run whose tickets are due — so a
+  setup fixed per worker would be enforced against runs it does not govern.
+  `AgentEntityAuthority::with_setup_resolver` (and the single-run
+  `with_setup_for_run`) maps each claimed run onto the setup it was created
+  under; both the definition envelope *and* the resolved setup are checked,
+  which fails closed when a definition narrowed after the setup was
+  validated. When a later slice gives runs a durable setup reference, the
+  gate reads it from the run state instead — the resolver seam disappears,
+  not the semantics.
+- **Guardrail transforms run at dispatch, never touch the durable intent,
+  and are pinned to the chain revision the intent committed under.** Each
+  committed intent records the chain revision of the policies it was stamped
+  from (`AgentToolAuthority::effect_policies` projects the registry and the
+  configured chain together), and the pipeline refuses an attempt
+  (`guardrail-revision-mismatch`) whenever a transform would decide the
+  payload — or any retry follows a possibly-delivered attempt — under a
+  chain that no longer matches the pin. That is how "a retry reuses the
+  accepted transformed input" is honored without a second durable write:
+  re-derivation is provably under the pinned revision, one external
+  idempotency key can never carry two different payloads, and the intent's
+  argument digest stays bound to what the run committed. The chain itself is
+  deployment configuration; a definition or setup can require stages
+  (envelope `mandatory_guardrails`, enforced as `guardrail-stage-missing`
+  when the chain cannot run one) and disable optional ones (`narrowed`,
+  which mints a revision of its own — a different stage set is a different
+  evaluation), a stage must declare at least one boundary
+  (`guardrail-stage-unbound`) so presence-based coverage cannot be satisfied
+  by a stage that never runs, and no operation exists that removes a
+  deployment-mandatory stage. This slice evaluates the tool-request and
+  model-request boundaries; the declared response/A2A/memory boundaries gain
+  their evaluation points with the slices that own those flows. Until slice
+  1.11 gives context snapshots content, the model-request boundary evaluates
+  a bounded request descriptor — enough for a kill-switch or checkpoint
+  stage, which is why a transform there fails closed
+  (`guardrail-transform-unsupported`) instead of being silently ignored.
+  Block evidence rides the refusal detail, and applied transforms and
+  report-only findings surface on the dispatcher's trace.
 - **The 1.6 amendment's settings note is discharged here.** The authority
   resolves the turn-bound settings of spec 7.2 at dispatch: the granted model
   call carries the profile and sampling the current settings revision

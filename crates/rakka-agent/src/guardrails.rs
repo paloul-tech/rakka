@@ -11,6 +11,17 @@
 //!
 //! Specification: section 16. Filled by slice 1.8.
 //!
+//! # Where the chain is evaluated today
+//!
+//! Slice 1.8 evaluates the chain at exactly two boundaries: the dispatch
+//! authority runs [`AgentGuardrailBoundary::ToolRequest`] and
+//! [`AgentGuardrailBoundary::ModelRequest`] before every attempt's durable
+//! `Started`. The remaining boundaries — model/tool response, A2A
+//! ingress/egress, memory ingress — are declared here so chains can be
+//! configured for them, but their evaluation points arrive with the slices
+//! that own those flows; a stage bound only to a not-yet-evaluated boundary
+//! protects nothing yet.
+//!
 //! # Determinism is structural, not aspirational
 //!
 //! [`AgentGuardrail::evaluate`] is a synchronous function of the boundary and
@@ -23,8 +34,9 @@
 //! arguments a stage transformed re-derives the identical transformed input
 //! from the identical durable intent under the identical chain revision — it
 //! never re-evaluates against changed policy, because a changed policy is a
-//! changed revision, and the dispatch grant of [`crate::tools`] binds the
-//! revision it validated.
+//! changed revision, the effect intent pins the chain revision it was
+//! committed under, and the dispatch pipeline refuses an attempt whose
+//! current chain no longer matches that pin.
 //!
 //! # What guardrails are not
 //!
@@ -44,7 +56,7 @@ use rakka_agent_workflow::ArtifactRef;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::definition::{AgentGuardrailStageId, AgentRevisionNumber};
+use crate::definition::{AgentGuardrailStageId, AgentPolicyRef, AgentRevisionNumber};
 
 /// Most stages one guardrail chain may hold.
 pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
@@ -56,9 +68,16 @@ pub const AGENT_GUARDRAIL_MAX_STAGES: usize = 32;
 /// would not itself become a policy decision.
 pub const AGENT_GUARDRAIL_REASON_MAX_LENGTH: usize = 128;
 
-/// Largest content a guardrail transform may produce, in bytes.
+/// Largest content a guardrail transform may produce, in bytes, at a boundary
+/// that declares no tighter bound of its own.
 ///
-/// A transform that exceeds it is treated as a block with the stable reason
+/// This is the *default* ceiling [`AgentGuardrailChain::evaluate`] enforces.
+/// A boundary whose downstream content is bounded tighter passes its own
+/// bound through [`AgentGuardrailChain::evaluate_bounded`] — the tool-request
+/// boundary, for example, enforces
+/// [`crate::model::AGENT_TOOL_ARGUMENTS_MAX_BYTES`], because a transformed
+/// call larger than that could never be executed anyway. A transform that
+/// exceeds the effective bound is treated as a block with the stable reason
 /// code `guardrail-transform-oversized` — fail closed, deterministically.
 pub const AGENT_GUARDRAIL_CONTENT_MAX_BYTES: usize = 8 * 1024;
 
@@ -261,6 +280,18 @@ pub struct AgentGuardrailReport {
     pub evidence: Option<ArtifactRef>,
 }
 
+/// One applied transform, recorded so the reason a stage rewrote the content
+/// is observable rather than discarded.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AgentGuardrailTransform {
+    /// The stage that transformed.
+    pub stage: AgentGuardrailStageId,
+    /// The revision the stage evaluated under.
+    pub revision: AgentRevisionNumber,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+}
+
 /// The final disposition of one chain evaluation.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -274,6 +305,10 @@ pub enum AgentGuardrailDisposition {
         stage: AgentGuardrailStageId,
         /// Stable machine-readable reason code.
         reason_code: String,
+        /// Protected evidence supporting the block, when policy requires it.
+        /// Boxed so the rare evidence-bearing block does not inflate every
+        /// disposition.
+        evidence: Option<Box<ArtifactRef>>,
     },
     /// The content may cross the boundary only under an explicit checkpoint
     /// grant. Until one exists, the effect stays undispatchable.
@@ -296,6 +331,8 @@ pub struct AgentGuardrailDecision {
     pub content: Value,
     /// Whether any stage transformed the content.
     pub transformed: bool,
+    /// Every applied transform, in stage order, with its reason.
+    pub transforms: Vec<AgentGuardrailTransform>,
     /// Every report-only finding, in stage order.
     pub reports: Vec<AgentGuardrailReport>,
 }
@@ -319,6 +356,7 @@ impl AgentGuardrailDecision {
 #[derive(Clone)]
 pub struct AgentGuardrailChain {
     revision: AgentRevisionNumber,
+    policy: Option<AgentPolicyRef>,
     stages: Vec<AgentGuardrailStage>,
 }
 
@@ -328,16 +366,35 @@ impl AgentGuardrailChain {
     pub const fn new(revision: AgentRevisionNumber) -> Self {
         Self {
             revision,
+            policy: None,
             stages: Vec::new(),
         }
     }
 
+    /// Names the guardrail policy this chain implements, so an
+    /// immediate-safety [`crate::definition::AgentSettingsChange::GuardrailPolicy`]
+    /// selection can be checked against the chain actually deployed. A
+    /// settings revision that requires a policy the chain does not carry
+    /// refuses dispatch rather than running under the wrong one.
+    #[must_use]
+    pub fn with_policy_ref(mut self, policy: AgentPolicyRef) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     /// Appends a stage, preserving order.
+    ///
+    /// A stage that declares no boundary is refused: it could never be
+    /// evaluated, so accepting it would let a required stage satisfy the
+    /// coverage check while protecting nothing.
     pub fn with_stage(mut self, stage: AgentGuardrailStage) -> AgentGuardrailResult<Self> {
         if self.stages.len() >= AGENT_GUARDRAIL_MAX_STAGES {
             return Err(AgentGuardrailError::TooManyStages {
                 maximum: AGENT_GUARDRAIL_MAX_STAGES,
             });
+        }
+        if stage.boundaries.is_empty() {
+            return Err(AgentGuardrailError::StageUnbound { stage: stage.id });
         }
         if self.stages.iter().any(|held| held.id == stage.id) {
             return Err(AgentGuardrailError::DuplicateStage { stage: stage.id });
@@ -350,6 +407,12 @@ impl AgentGuardrailChain {
     #[must_use]
     pub const fn revision(&self) -> AgentRevisionNumber {
         self.revision
+    }
+
+    /// The guardrail policy this chain implements, when one is named.
+    #[must_use]
+    pub const fn policy_ref(&self) -> Option<&AgentPolicyRef> {
+        self.policy.as_ref()
     }
 
     /// The stages, in evaluation order.
@@ -384,12 +447,22 @@ impl AgentGuardrailChain {
     /// deployment policy may add mandatory guardrails that a definition,
     /// setup, model, or settings update must not remove or weaken).
     ///
-    /// The narrowed chain keeps the parent revision: disabling optional stages
-    /// selects within the deployment's policy rather than creating a new one.
+    /// The narrowed chain carries its own revision, supplied by the caller: a
+    /// different stage set is a different evaluation, and the recorded
+    /// revision is what lets a grant, an audit, or a replay reconstruct which
+    /// evaluation actually ran. Two narrowings that share a revision with each
+    /// other — or with their parent — would make that reconstruction
+    /// impossible, so a revision equal to the parent's is refused. The policy
+    /// reference carries over: narrowing selects within the same deployment
+    /// policy.
     pub fn narrowed(
         &self,
         disabled: &BTreeSet<AgentGuardrailStageId>,
+        revision: AgentRevisionNumber,
     ) -> AgentGuardrailResult<Self> {
+        if revision == self.revision {
+            return Err(AgentGuardrailError::NarrowedRevisionNotDistinct { revision });
+        }
         for stage in &self.stages {
             if stage.mandatory && disabled.contains(&stage.id) {
                 return Err(AgentGuardrailError::MandatoryStageRemoved {
@@ -398,7 +471,8 @@ impl AgentGuardrailChain {
             }
         }
         Ok(Self {
-            revision: self.revision,
+            revision,
+            policy: self.policy.clone(),
             stages: self
                 .stages
                 .iter()
@@ -408,7 +482,9 @@ impl AgentGuardrailChain {
         })
     }
 
-    /// Evaluates the chain's stages for one boundary, in order.
+    /// Evaluates the chain's stages for one boundary, in order, under the
+    /// default transform-content ceiling
+    /// ([`AGENT_GUARDRAIL_CONTENT_MAX_BYTES`]).
     ///
     /// The fold is deterministic: a block short-circuits and wins outright; a
     /// transform replaces the content every later stage sees; a checkpoint
@@ -423,10 +499,30 @@ impl AgentGuardrailChain {
         boundary: AgentGuardrailBoundary,
         content: &Value,
     ) -> AgentGuardrailDecision {
+        self.evaluate_bounded(boundary, content, AGENT_GUARDRAIL_CONTENT_MAX_BYTES)
+    }
+
+    /// Evaluates the chain's stages for one boundary under an explicit
+    /// transform-content ceiling.
+    ///
+    /// A boundary whose downstream content is bounded tighter than the chain
+    /// default passes its own bound, so a transform that could never be
+    /// executed is blocked here — deterministically, with the single stable
+    /// reason code `guardrail-transform-oversized` — instead of surfacing a
+    /// different failure depending on which layer caught it.
+    #[must_use]
+    pub fn evaluate_bounded(
+        &self,
+        boundary: AgentGuardrailBoundary,
+        content: &Value,
+        max_content_bytes: usize,
+    ) -> AgentGuardrailDecision {
         let mut current = content.clone();
         let mut transformed = false;
+        let mut transforms = Vec::new();
         let mut reports = Vec::new();
         let mut checkpoint: Option<(AgentGuardrailStageId, String)> = None;
+        let max_content_bytes = max_content_bytes.min(AGENT_GUARDRAIL_CONTENT_MAX_BYTES);
 
         for stage in &self.stages {
             if !stage.applies_at(boundary) {
@@ -436,40 +532,49 @@ impl AgentGuardrailChain {
                 AgentGuardrailOutcome::Allow => {}
                 AgentGuardrailOutcome::Block {
                     reason_code,
-                    evidence: _,
+                    evidence,
                 } => {
                     return AgentGuardrailDecision {
                         chain_revision: self.revision,
                         disposition: AgentGuardrailDisposition::Blocked {
                             stage: stage.id.clone(),
                             reason_code: bounded_reason(reason_code),
+                            evidence: evidence.map(Box::new),
                         },
                         content: current,
                         transformed,
+                        transforms,
                         reports,
                     };
                 }
                 AgentGuardrailOutcome::Transform {
                     content: replacement,
-                    reason_code: _,
+                    reason_code,
                 } => {
                     let bytes = serde_json::to_vec(&replacement)
                         .map(|encoded| encoded.len())
                         .unwrap_or(usize::MAX);
-                    if bytes > AGENT_GUARDRAIL_CONTENT_MAX_BYTES {
+                    if bytes > max_content_bytes {
                         return AgentGuardrailDecision {
                             chain_revision: self.revision,
                             disposition: AgentGuardrailDisposition::Blocked {
                                 stage: stage.id.clone(),
                                 reason_code: "guardrail-transform-oversized".to_string(),
+                                evidence: None,
                             },
                             content: current,
                             transformed,
+                            transforms,
                             reports,
                         };
                     }
                     current = replacement;
                     transformed = true;
+                    transforms.push(AgentGuardrailTransform {
+                        stage: stage.id.clone(),
+                        revision: stage.revision,
+                        reason_code: bounded_reason(reason_code),
+                    });
                 }
                 AgentGuardrailOutcome::ReportOnly {
                     reason_code,
@@ -501,6 +606,7 @@ impl AgentGuardrailChain {
             disposition,
             content: current,
             transformed,
+            transforms,
             reports,
         }
     }
@@ -510,6 +616,7 @@ impl Debug for AgentGuardrailChain {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AgentGuardrailChain")
             .field("revision", &self.revision)
+            .field("policy", &self.policy)
             .field("stages", &self.stages)
             .finish()
     }
@@ -551,6 +658,16 @@ pub enum AgentGuardrailError {
         /// The stage the envelope or binding requires.
         stage: AgentGuardrailStageId,
     },
+    /// A stage declared no boundary, so it could never be evaluated.
+    StageUnbound {
+        /// The stage that declared no boundary.
+        stage: AgentGuardrailStageId,
+    },
+    /// A narrowing reused its parent chain's revision.
+    NarrowedRevisionNotDistinct {
+        /// The revision both chains would have shared.
+        revision: AgentRevisionNumber,
+    },
 }
 
 impl AgentGuardrailError {
@@ -562,6 +679,8 @@ impl AgentGuardrailError {
             Self::DuplicateStage { .. } => "guardrail-duplicate-stage",
             Self::MandatoryStageRemoved { .. } => "guardrail-mandatory-stage-immutable",
             Self::MissingRequiredStage { .. } => "guardrail-stage-missing",
+            Self::StageUnbound { .. } => "guardrail-stage-unbound",
+            Self::NarrowedRevisionNotDistinct { .. } => "guardrail-narrowed-revision-not-distinct",
         }
     }
 }
@@ -583,6 +702,15 @@ impl Display for AgentGuardrailError {
             Self::MissingRequiredStage { stage } => write!(
                 f,
                 "the required guardrail stage {stage} is not present in the deployment's chain"
+            ),
+            Self::StageUnbound { stage } => write!(
+                f,
+                "the guardrail stage {stage} declares no boundary and could never be evaluated"
+            ),
+            Self::NarrowedRevisionNotDistinct { revision } => write!(
+                f,
+                "a narrowed chain must carry a revision distinct from its parent's ({revision}): \
+                 a different stage set is a different evaluation"
             ),
         }
     }
@@ -724,15 +852,33 @@ mod tests {
             .with_stage(stage("required-stage", AgentGuardrailOutcome::Allow).mandatory())
             .expect("the stage registers");
 
-        // An optional stage narrows away; a mandatory one refuses.
+        // An optional stage narrows away, under a revision of its own; a
+        // mandatory one refuses.
         let narrowed = chain
-            .narrowed(&BTreeSet::from([stage_id("optional-stage")]))
+            .narrowed(
+                &BTreeSet::from([stage_id("optional-stage")]),
+                AgentRevisionNumber::new(2),
+            )
             .expect("an optional stage may be disabled");
         assert_eq!(narrowed.stages().len(), 1);
+        assert_eq!(narrowed.revision(), AgentRevisionNumber::new(2));
         let error = chain
-            .narrowed(&BTreeSet::from([stage_id("required-stage")]))
+            .narrowed(
+                &BTreeSet::from([stage_id("required-stage")]),
+                AgentRevisionNumber::new(2),
+            )
             .expect_err("a mandatory stage may not be disabled");
         assert_eq!(error.code(), "guardrail-mandatory-stage-immutable");
+
+        // A narrowed chain that reuses the parent revision would make the
+        // recorded revision unable to say which evaluation ran.
+        let error = chain
+            .narrowed(
+                &BTreeSet::from([stage_id("optional-stage")]),
+                chain.revision(),
+            )
+            .expect_err("a narrowing must mint its own revision");
+        assert_eq!(error.code(), "guardrail-narrowed-revision-not-distinct");
 
         // Coverage: a required stage missing from the chain fails closed.
         chain
@@ -763,6 +909,98 @@ mod tests {
             AgentGuardrailDisposition::Blocked { ref reason_code, .. }
                 if reason_code == "guardrail-transform-oversized"
         ));
+    }
+
+    #[test]
+    fn a_bounded_evaluation_blocks_a_transform_the_boundary_could_never_carry() {
+        // The transform fits the chain's default ceiling but not the tighter
+        // bound the boundary declares: one stable code, wherever it is caught.
+        let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(stage(
+                "inflator",
+                AgentGuardrailOutcome::Transform {
+                    content: Value::String("x".repeat(3 * 1024)),
+                    reason_code: "inflate".to_string(),
+                },
+            ))
+            .expect("the stage registers");
+
+        let decision = chain.evaluate_bounded(
+            AgentGuardrailBoundary::ToolRequest,
+            &serde_json::json!({}),
+            2 * 1024,
+        );
+        assert!(matches!(
+            decision.disposition,
+            AgentGuardrailDisposition::Blocked { ref reason_code, .. }
+                if reason_code == "guardrail-transform-oversized"
+        ));
+    }
+
+    #[test]
+    fn a_block_keeps_its_evidence_and_a_transform_keeps_its_reason() {
+        let evidence = ArtifactRef {
+            artifact_id: "evidence-1".to_string(),
+            kind: rakka_agent_workflow::ArtifactKind::File,
+            uri: "s3://evidence/evidence-1".to_string(),
+            checksum: Some("sha256:evidence-1".to_string()),
+            content_type: Some("application/json".to_string()),
+            byte_len: Some(12),
+            retention_class: Some("protected".to_string()),
+            encryption: None,
+            redaction: rakka_agent_workflow::RedactionStatus::Unredacted,
+            created_at: rakka_agent_workflow::AgentTimestampMillis::new(1),
+            metadata: rakka_agent_workflow::AgentAttributes::default(),
+        };
+        let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(stage(
+                "deny",
+                AgentGuardrailOutcome::Block {
+                    reason_code: "denied-term".to_string(),
+                    evidence: Some(evidence.clone()),
+                },
+            ))
+            .expect("the stage registers");
+        let decision = chain.evaluate(AgentGuardrailBoundary::ToolRequest, &serde_json::json!({}));
+        assert!(matches!(
+            decision.disposition,
+            AgentGuardrailDisposition::Blocked { evidence: Some(ref held), .. }
+                if held.as_ref() == &evidence
+        ));
+
+        let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(
+                AgentGuardrailStage::new(
+                    stage_id("normalize"),
+                    AgentRevisionNumber::new(4),
+                    Arc::new(UppercaseQ),
+                )
+                .at_boundary(AgentGuardrailBoundary::ToolRequest),
+            )
+            .expect("the stage registers");
+        let decision = chain.evaluate(
+            AgentGuardrailBoundary::ToolRequest,
+            &serde_json::json!({ "q": "hello" }),
+        );
+        assert_eq!(decision.transforms.len(), 1);
+        assert_eq!(decision.transforms[0].stage, stage_id("normalize"));
+        assert_eq!(decision.transforms[0].revision, AgentRevisionNumber::new(4));
+        assert_eq!(decision.transforms[0].reason_code, "normalized");
+    }
+
+    #[test]
+    fn a_stage_without_a_boundary_is_refused_at_registration() {
+        // A boundary-less stage would satisfy presence-based coverage while
+        // never being evaluated — the exact fail-open the refusal prevents.
+        let unbound = AgentGuardrailStage::new(
+            stage_id("pii-filter"),
+            AgentRevisionNumber::INITIAL,
+            Arc::new(ScriptedRule(AgentGuardrailOutcome::Allow)),
+        );
+        let error = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+            .with_stage(unbound)
+            .expect_err("a stage that runs at no boundary is refused");
+        assert_eq!(error.code(), "guardrail-stage-unbound");
     }
 
     #[test]

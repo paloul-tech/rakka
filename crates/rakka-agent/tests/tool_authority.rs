@@ -19,21 +19,24 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    DeterministicModelAdapter, InProcessRunResultDelivery, RecordingToolExecutor,
+    DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe, RecordingToolExecutor,
     ScriptedDispatcher, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
     AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentDefinitionRevision,
-    AgentDispatchPass, AgentEffectSpec, AgentEntityAuthority, AgentEntityCommand, AgentEntityStore,
-    AgentExecutionPolicyRef, AgentExecutionPolicyRouter, AgentGuardrail, AgentGuardrailBoundary,
-    AgentGuardrailChain, AgentGuardrailOutcome, AgentGuardrailStage, AgentGuardrailStageId,
-    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRevisionNumber,
-    AgentRunEffectDispatcher, AgentRunStatus, AgentRunTerminalReason, AgentSettings,
-    AgentSettingsChange, AgentSetupRevision, AgentTaskContent, AgentToolAuthority, AgentToolCallId,
-    AgentToolCallRequest, AgentToolDeclaration, AgentToolId, AgentToolRegistry,
+    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchFuture, AgentDispatchPass,
+    AgentDispatchWindow, AgentEffectSpec, AgentEntityAuthority, AgentEntityCommand,
+    AgentEntityStore, AgentExecutionPolicyRef, AgentExecutionPolicyRouter, AgentGuardrail,
+    AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailOutcome, AgentGuardrailStage,
+    AgentGuardrailStageId, AgentModelTurn, AgentOperationId, AgentOperationKind, AgentPolicyRef,
+    AgentReconciliationProtocolRef, AgentRevisionNumber, AgentRunEffect, AgentRunEffectDispatcher,
+    AgentRunEffectStatus, AgentRunScope, AgentRunState, AgentRunStatus, AgentRunTerminalReason,
+    AgentSettings, AgentSettingsChange, AgentSetupRevision, AgentTaskContent, AgentToolAuthority,
+    AgentToolCallId, AgentToolCallRequest, AgentToolDeclaration, AgentToolId, AgentToolRegistry,
     WorkflowAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::WorkflowState;
+use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_agent_workflow::{
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId,
 };
@@ -83,9 +86,37 @@ fn stage_id(id: &str) -> AgentGuardrailStageId {
     AgentGuardrailStageId::new(id).expect("the stage id is valid")
 }
 
+/// An [`AgentDispatchAuthority`] decorator that backdates every issued
+/// grant's expiry, so the dispatcher's own pre-attempt revalidation — not the
+/// authority — is what refuses the attempt.
+struct ExpiredGrantAuthority<Inner>(Inner);
+
+impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAuthority<Inner> {
+    fn authorize<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        run: &'a AgentRunState,
+        intent: &'a AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
+        let inner = self.0.authorize(scope, run, intent, now);
+        Box::pin(async move {
+            match inner.await? {
+                AgentDispatchDecision::Granted(mut granted) => {
+                    granted.grant.expires_at =
+                        AgentTimestampMillis::new(now.as_millis().saturating_sub(1));
+                    Ok(AgentDispatchDecision::Granted(granted))
+                }
+                refused => Ok(refused),
+            }
+        })
+    }
+}
+
 /// The authority fixture: the common task-and-run fixture over the durable
-/// workflow-outbox sink, plus the fleet, the executor, and a configurable
-/// [`AgentToolAuthority`] behind the pipeline's required gate.
+/// workflow-outbox sink, plus the fleet, the executor, the kill-switch probe,
+/// and a configurable [`AgentToolAuthority`] behind the pipeline's required
+/// gate.
 struct AuthorityFixture {
     fx: Fixture<DeterministicModelAdapter, WorkflowSink>,
     adapter: DeterministicModelAdapter,
@@ -97,17 +128,24 @@ struct AuthorityFixture {
     fleet_store: FleetStore,
     wf_clock: SharedAtomicWorkflowClock,
     tools: RecordingToolExecutor,
+    probe: KillSwitchProbe,
+    expire_grants: bool,
 }
 
 impl AuthorityFixture {
+    /// A fixture whose commit-time policies are the given authority's own
+    /// projection ([`AgentToolAuthority::effect_policies`]), so the intents
+    /// the run commits carry the guardrail-revision pin the dispatch gate
+    /// validates.
     fn new(
         adapter: DeterministicModelAdapter,
-        registry: AgentToolRegistry,
+        authority: AgentToolAuthority,
         model_spec: Option<AgentEffectSpec>,
     ) -> Self {
-        let mut policies = registry
+        let registry = authority.registry().clone();
+        let mut policies = authority
             .effect_policies()
-            .expect("the registry projects valid policies");
+            .expect("the authority projects valid policies");
         if let Some(spec) = model_spec {
             policies = policies
                 .with_model_spec(spec)
@@ -125,7 +163,6 @@ impl AuthorityFixture {
             counter,
         );
         let envelope = envelope_for_registry(&registry);
-        let authority = AgentToolAuthority::new(registry.clone());
         Self {
             fx,
             adapter,
@@ -137,12 +174,32 @@ impl AuthorityFixture {
             fleet_store,
             wf_clock,
             tools: RecordingToolExecutor::new(),
+            probe: KillSwitchProbe::new(),
+            expire_grants: false,
         }
     }
 
-    /// Replaces the authority the pipeline consults.
-    fn with_authority(mut self, authority: AgentToolAuthority) -> Self {
+    /// A fixture over the plain authority of one registry.
+    fn over(
+        adapter: DeterministicModelAdapter,
+        registry: AgentToolRegistry,
+        model_spec: Option<AgentEffectSpec>,
+    ) -> Self {
+        Self::new(adapter, AgentToolAuthority::new(registry), model_spec)
+    }
+
+    /// Replaces the dispatch-gate authority *without* recomputing the
+    /// commit-time policies — the deliberate commit/dispatch drift the
+    /// guardrail-revision pin must catch.
+    fn with_gate_authority(mut self, authority: AgentToolAuthority) -> Self {
         self.authority = authority;
+        self
+    }
+
+    /// Backdates every issued grant's expiry, so the dispatcher's
+    /// pre-attempt revalidation refuses it.
+    fn with_expired_grants(mut self) -> Self {
+        self.expire_grants = true;
         self
     }
 
@@ -152,7 +209,7 @@ impl AuthorityFixture {
         self
     }
 
-    /// Enforces the given run setup at dispatch.
+    /// Enforces the given run setup at dispatch, for this fixture's run.
     fn with_setup(mut self, setup: AgentSetupRevision) -> Self {
         self.setup = Some(setup);
         self
@@ -169,8 +226,13 @@ impl AuthorityFixture {
     fn pipeline(&self) -> Pipeline {
         let mut gate = AgentEntityAuthority::new(self.fx.agents.clone(), self.authority.clone());
         if let Some(setup) = &self.setup {
-            gate = gate.with_setup(setup.clone());
+            gate = gate.with_setup_for_run(run_scope(), setup.clone());
         }
+        let gate: Arc<dyn AgentDispatchAuthority> = if self.expire_grants {
+            Arc::new(ExpiredGrantAuthority(gate))
+        } else {
+            Arc::new(gate)
+        };
         AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new("worker-1"),
             self.workflow_store.clone(),
@@ -179,7 +241,7 @@ impl AuthorityFixture {
             self.wf_clock.clone(),
             Arc::new(self.adapter.clone()),
             Arc::new(self.tools.clone()),
-            Arc::new(gate),
+            gate,
             Arc::new(
                 InProcessRunResultDelivery::new(
                     self.fx.runs.clone(),
@@ -191,6 +253,49 @@ impl AuthorityFixture {
             ),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
+        .with_probe(Arc::new(self.probe.clone()))
+    }
+
+    /// Advances the shared clock past the fleet lease.
+    fn expire_lease(&self) {
+        self.wf_clock.advance(LEASE_MS + 1);
+    }
+
+    /// The durable status of the effect at one slot of the run's loop state.
+    async fn effect_status(&self, slot: usize) -> Option<AgentRunEffectStatus> {
+        let state = rakka_agent::load_agent_run_state(
+            &self.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")?;
+        state
+            .loop_state()?
+            .effects()
+            .iter()
+            .find(|effect| effect.slot == slot)
+            .map(|effect| effect.status)
+    }
+
+    /// Drives the run until its tool ticket is flushed and ready to claim.
+    async fn pump_until_tool_ticket(&self) {
+        for _round in 0..8 {
+            self.settle().await;
+            let ready = self.effect_status(1).await == Some(AgentRunEffectStatus::Ready);
+            if ready {
+                // Flush the ticket to the outbox once more (idempotent), so
+                // the pipeline can register it.
+                self.settle().await;
+                return;
+            }
+            let _pass = self
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .expect("the pass runs");
+        }
+        panic!("the tool ticket never became ready");
     }
 
     /// Settles the entities from durable state: the task drives its owed
@@ -347,7 +452,7 @@ async fn an_unregistered_tool_call_is_undispatchable() {
         tool_id(),
         AgentToolDeclaration::new(rakka_agent::AgentEffectSafetyClass::NonIdempotent),
     );
-    let fx = AuthorityFixture::new(tool_then_proposal(), AgentToolRegistry::new(), None)
+    let fx = AuthorityFixture::over(tool_then_proposal(), AgentToolRegistry::new(), None)
         .with_envelope(envelope);
     fx.start().await;
     fx.pump().await;
@@ -367,7 +472,7 @@ async fn a_registered_but_undeclared_tool_is_undispatchable() {
     let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
     let mut envelope = AgentAuthorityEnvelope::empty();
     envelope.task_definitions.insert(task_definition_id());
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None).with_envelope(envelope);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None).with_envelope(envelope);
     fx.start().await;
     fx.pump().await;
 
@@ -383,7 +488,7 @@ async fn a_registered_but_undeclared_tool_is_undispatchable() {
 #[tokio::test]
 async fn a_model_visible_tool_is_undispatchable_once_revoked() {
     let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
 
     // The tool is model-visible before the revocation: declared, registered,
     // and unrevoked. Visibility is exactly what scenario 54 says is not
@@ -420,7 +525,7 @@ async fn a_revoked_credential_binding_is_undispatchable() {
         .expect("the spec is valid")
         .with_credential_binding(credential.clone());
     let registry = tool_registry_for_spec(TOOL, &spec);
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
     fx.start().await;
     fx.apply_settings(
         "revoke-credential",
@@ -447,7 +552,7 @@ async fn a_checkpoint_requiring_tool_is_undispatchable_without_a_grant() {
                 .with_checkpoint_required(),
         )
         .expect("the tool registers");
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
     fx.start().await;
     fx.pump().await;
 
@@ -477,7 +582,7 @@ async fn an_execution_policy_no_executor_accepts_is_undispatchable() {
 
     // No router configured: fail closed rather than run with ambient
     // authority.
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry.clone(), None);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry.clone(), None);
     fx.start().await;
     fx.pump().await;
     assert_eq!(
@@ -487,11 +592,11 @@ async fn an_execution_policy_no_executor_accepts_is_undispatchable() {
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
 
     // A router that accepts the class routes the same intent to execution.
-    let routed = AuthorityFixture::new(tool_then_proposal(), registry.clone(), None)
-        .with_authority(
-            AgentToolAuthority::new(registry)
-                .with_execution_router(Arc::new(AcceptClass("sandboxed"))),
-        );
+    let routed = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_execution_router(Arc::new(AcceptClass("sandboxed"))),
+        None,
+    );
     routed.start().await;
     routed.pump().await;
     let run = routed.fx.run_snapshot().await.expect("the run exists");
@@ -501,51 +606,75 @@ async fn an_execution_policy_no_executor_accepts_is_undispatchable() {
 
 // ---------------------------------------------------------------------------
 // Scenario 54: grant validity. A grant whose window has already closed is
-// rechecked — and refused — before the attempt.
+// rechecked — and refused — before the attempt, by the dispatcher itself.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn an_expired_grant_is_undispatchable() {
     let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry.clone(), None)
-        .with_authority(AgentToolAuthority::new(registry).with_grant_ttl_ms(0));
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None).with_expired_grants();
     fx.start().await;
     fx.pump().await;
 
-    // The model call is the first dispatch the zero-width grant window
-    // refuses; nothing external was ever invoked.
+    // The model call is the first dispatch whose backdated grant the
+    // dispatcher's pre-attempt revalidation refuses; nothing external was
+    // ever invoked.
     assert_eq!(fx.terminal_failure_code().await, "grant-expired");
     assert_eq!(fx.adapter.calls(), 0);
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
 }
 
 // ---------------------------------------------------------------------------
+// The grant TTL knob: a grant minted and spent at the same instant — the
+// per-attempt derive path — is valid whatever the TTL, including zero. TTL
+// enforcement over elapsed time is the unit-level validate_for contract; it
+// must never refuse a grant at its own issuing instant.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_zero_ttl_grant_still_covers_its_issuing_instant() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_grant_ttl_ms(0),
+        None,
+    );
+    fx.start().await;
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Scenario 54 / 53: the immediate-safety suspension. A suspended agent
-// dispatches nothing — the refusal burns an attempt rather than failing the
-// effect, so resuming the agent lets the very next attempt proceed.
+// dispatches nothing — the refusal defers the ticket without spending the
+// intent's budget, so resuming lets the very next attempt proceed even under
+// the fail-safe single-attempt defaults.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_suspended_agent_dispatches_nothing_until_resumed() {
-    let adapter = DeterministicModelAdapter::new()
-        .with_turn(proposing_turn("resolved"))
-        .with_retry_policy(
-            rakka_agent::AgentModelRetryPolicy::read_only(3).expect("the policy is valid"),
-        )
-        .expect("the adapter accepts the policy");
-    let model_spec = AgentEffectSpec::read_only()
-        .with_max_attempts(3)
-        .expect("the spec is valid");
+    // Deliberately the shipped defaults: the model effect permits exactly one
+    // attempt. If suspension spent budget, this run could never recover.
+    let adapter = DeterministicModelAdapter::new().with_turn(proposing_turn("resolved"));
     let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
-    let fx = AuthorityFixture::new(adapter, registry, Some(model_spec));
+    let fx = AuthorityFixture::over(adapter, registry, None);
     fx.start().await;
     fx.set_suspended(true, "suspend-1").await;
 
     // One pass under suspension: the ticket is claimed, the authority refuses
-    // before durable `Started`, and nothing is invoked.
+    // before durable `Started`, nothing is invoked, and nothing durable is
+    // spent — the claim is only deferred at the fleet.
     let pass = fx.one_pass().await;
     assert!(pass.claimed >= 1, "the ticket was claimed");
     assert_eq!(pass.invoked, 0, "nothing was invoked under suspension");
+    assert!(
+        pass.deferred >= 1,
+        "the refusal deferred instead of spending"
+    );
+    assert_eq!(pass.failed_attempts, 0, "no outbox attempt was burned");
     assert_eq!(fx.adapter.calls(), 0);
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert!(
@@ -553,12 +682,233 @@ async fn a_suspended_agent_dispatches_nothing_until_resumed() {
         "a transient refusal does not fail the run"
     );
 
-    // Resuming clears the condition; the next attempt rechecks and proceeds.
+    // Resuming clears the condition; the next attempt rechecks and proceeds
+    // on the untouched single-attempt budget.
     fx.set_suspended(false, "resume-1").await;
     fx.pump().await;
     assert_eq!(fx.adapter.calls(), 1, "exactly one model invocation");
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+// ---------------------------------------------------------------------------
+// A suspension while a reconcileable ticket is due must not be misread by
+// recovery as a possibly-executed attempt: nothing durable is written, so
+// after resume the effect completes without any reconciliation — with no
+// reconciler wired, a misclassification would park the run indeterminate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_suspended_reconcileable_effect_is_not_misread_as_ambiguous() {
+    let protocol = AgentReconciliationProtocolRef::new("payment-ledger").expect("the ref is valid");
+    let registry = tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::reconcileable(protocol, 3).expect("the spec is valid"),
+    );
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
+    fx.start().await;
+
+    // Turn one runs; the tool ticket reaches the outbox. Then the agent is
+    // suspended before any tool attempt.
+    fx.pump_until_tool_ticket().await;
+    fx.set_suspended(true, "suspend-1").await;
+    let pass = fx.one_pass().await;
+    assert!(pass.deferred >= 1, "the tool ticket was deferred");
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+
+    // Resume: the ticket dispatches as a *fresh* first attempt. No reconciler
+    // is configured, so completing proves recovery never classified the
+    // deferred ticket as a possibly-executed ambiguity.
+    fx.set_suspended(false, "resume-1").await;
+    fx.pump().await;
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Specification 11.5: an undispatchable verdict on the recovery retry of an
+// ambiguous idempotent loss parks the generation indeterminate — the prior
+// attempt may have committed externally, so "failed, nothing invoked" would
+// erase exactly the ambiguity an operator must resolve.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_undispatchable_recovery_retry_parks_the_ambiguity() {
+    let registry = tool_registry_for_spec(
+        TOOL,
+        &AgentEffectSpec::idempotent(3).expect("the spec is valid"),
+    );
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
+    fx.start().await;
+
+    // The tool attempt invokes the target — the external system commits —
+    // and the worker dies before any receipt is recorded: ambiguous.
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    assert!(pass.died);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1, "the target committed");
+
+    // The tool is revoked before recovery, so the truth-finding retry is
+    // refused definitively.
+    fx.apply_settings(
+        "revoke-tool",
+        vec![AgentSettingsChange::RevokeTool(tool_id())],
+    )
+    .await;
+    fx.expire_lease();
+    fx.pump().await;
+
+    // The generation parks indeterminate under the refusal's code instead of
+    // failing as if nothing was invoked, and the run awaits the explicit
+    // reconciliation decision.
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::WaitingForReconciliation);
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Indeterminate),
+        "the ambiguity is preserved, not rewritten as a clean failure"
+    );
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "the refused retry never re-invoked the target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Specification 7.2: the guardrail-policy selection is an immediate-safety
+// settings field. A selection the deployed chain does not implement refuses
+// dispatch on the very next attempt; a chain that carries the selected
+// policy reference proceeds.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_guardrail_policy_selection_is_enforced_at_dispatch() {
+    let policy = AgentPolicyRef::new("pii-v2").expect("the policy ref is valid");
+
+    // The deployed chain does not implement the selected policy: refused.
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry.clone(), None);
+    fx.start().await;
+    fx.apply_settings(
+        "select-guardrail-policy",
+        vec![AgentSettingsChange::GuardrailPolicy(policy.clone())],
+    )
+    .await;
+    fx.pump().await;
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "guardrail-policy-mismatch"
+    );
+    assert_eq!(fx.adapter.calls(), 0);
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+
+    // A chain labeled with the selected policy implements it: the same
+    // selection dispatches.
+    let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
+        .with_policy_ref(policy.clone())
+        .with_stage(
+            AgentGuardrailStage::new(
+                stage_id("allow-all"),
+                AgentRevisionNumber::INITIAL,
+                Arc::new(AllowAll),
+            )
+            .at_boundary(AgentGuardrailBoundary::ToolRequest),
+        )
+        .expect("the stage registers");
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(chain),
+        None,
+    );
+    fx.start().await;
+    fx.apply_settings(
+        "select-guardrail-policy",
+        vec![AgentSettingsChange::GuardrailPolicy(policy)],
+    )
+    .await;
+    fx.pump().await;
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Specification 16: the guardrail-revision pin. An intent committed without
+// the pin — or under a different chain revision — is refused whenever a
+// transform decides the payload, so one external idempotency key can never
+// carry two differently transformed payloads across a chain change.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_transforming_chain_refuses_an_intent_pinned_to_another_revision() {
+    let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+    let transforming = |revision: AgentRevisionNumber| {
+        AgentGuardrailChain::new(revision)
+            .with_stage(
+                AgentGuardrailStage::new(
+                    stage_id("amount-clamp"),
+                    AgentRevisionNumber::INITIAL,
+                    Arc::new(ClampAmount),
+                )
+                .at_boundary(AgentGuardrailBoundary::ToolRequest),
+            )
+            .expect("the stage registers")
+    };
+
+    // Policies are pinned to chain revision 1; the dispatch gate evaluates
+    // revision 2 — the rolling-upgrade drift the pin exists to catch.
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry.clone())
+            .with_guardrails(transforming(AgentRevisionNumber::INITIAL)),
+        None,
+    )
+    .with_gate_authority(
+        AgentToolAuthority::new(registry.clone())
+            .with_guardrails(transforming(AgentRevisionNumber::new(2))),
+    );
+    fx.start().await;
+    fx.pump().await;
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "guardrail-revision-mismatch"
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+
+    // An intent committed with no pin at all is refused the same way when a
+    // transform would decide the payload.
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry.clone()),
+        None,
+    )
+    .with_gate_authority(
+        AgentToolAuthority::new(registry)
+            .with_guardrails(transforming(AgentRevisionNumber::new(2))),
+    );
+    fx.start().await;
+    fx.pump().await;
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "guardrail-revision-mismatch"
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+/// A stage that allows everything, for chains whose identity is the point.
+struct AllowAll;
+
+impl AgentGuardrail for AllowAll {
+    fn evaluate(&self, _: AgentGuardrailBoundary, _: &Value) -> AgentGuardrailOutcome {
+        AgentGuardrailOutcome::Allow
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +922,7 @@ async fn a_missing_mandatory_guardrail_stage_fails_closed_at_dispatch() {
     let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
     let mut envelope = envelope_for_registry(&registry);
     envelope.mandatory_guardrails.insert(stage_id("pii-filter"));
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None).with_envelope(envelope);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None).with_envelope(envelope);
     fx.start().await;
     fx.pump().await;
 
@@ -611,7 +961,7 @@ async fn a_setup_narrowing_away_a_tool_is_enforced_at_dispatch() {
     )
     .expect("the narrowing is legal");
 
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None)
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None)
         .with_envelope(envelope)
         .with_setup(setup);
     fx.start().await;
@@ -630,14 +980,16 @@ struct BlockLargeAmounts;
 
 impl AgentGuardrail for BlockLargeAmounts {
     fn evaluate(&self, _: AgentGuardrailBoundary, content: &Value) -> AgentGuardrailOutcome {
-        let amount = content.get("amount").and_then(Value::as_u64).unwrap_or(0);
-        if amount > 10 {
-            AgentGuardrailOutcome::Block {
+        // Fail closed on anything that does not parse as the expected u64: a
+        // float, a negative, or an out-of-range amount must never sail past
+        // the limit by collapsing to a harmless default.
+        let amount = content.get("amount").and_then(Value::as_u64);
+        match amount {
+            Some(amount) if amount <= 10 => AgentGuardrailOutcome::Allow,
+            _ => AgentGuardrailOutcome::Block {
                 reason_code: "amount-over-limit".to_string(),
                 evidence: None,
-            }
-        } else {
-            AgentGuardrailOutcome::Allow
+            },
         }
     }
 }
@@ -656,8 +1008,11 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
             .mandatory(),
         )
         .expect("the stage registers");
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry.clone(), None)
-        .with_authority(AgentToolAuthority::new(registry).with_guardrails(chain.clone()));
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(chain.clone()),
+        None,
+    );
     fx.start().await;
     fx.pump().await;
 
@@ -667,7 +1022,10 @@ async fn a_guardrail_block_keeps_a_tool_call_undispatchable() {
     // The deployment-mandatory stage cannot be narrowed away by any
     // definition or setup: the removal operation itself refuses.
     let error = chain
-        .narrowed(&BTreeSet::from([stage_id("amount-limit")]))
+        .narrowed(
+            &BTreeSet::from([stage_id("amount-limit")]),
+            AgentRevisionNumber::new(2),
+        )
         .expect_err("a mandatory stage cannot be removed");
     assert_eq!(error.code(), "guardrail-mandatory-stage-immutable");
 }
@@ -682,14 +1040,15 @@ struct ClampAmount;
 
 impl AgentGuardrail for ClampAmount {
     fn evaluate(&self, _: AgentGuardrailBoundary, content: &Value) -> AgentGuardrailOutcome {
-        let amount = content.get("amount").and_then(Value::as_u64).unwrap_or(0);
-        if amount > 10 {
-            AgentGuardrailOutcome::Transform {
+        // Fail closed on anything that does not parse as the expected u64:
+        // an unparseable amount clamps rather than passing unmodified.
+        let amount = content.get("amount").and_then(Value::as_u64);
+        match amount {
+            Some(amount) if amount <= 10 => AgentGuardrailOutcome::Allow,
+            _ => AgentGuardrailOutcome::Transform {
                 content: serde_json::json!({ "amount": 10 }),
                 reason_code: "amount-clamped".to_string(),
-            }
-        } else {
-            AgentGuardrailOutcome::Allow
+            },
         }
     }
 }
@@ -707,8 +1066,11 @@ async fn a_guardrail_transform_reaches_the_executor_deterministically() {
             .at_boundary(AgentGuardrailBoundary::ToolRequest),
         )
         .expect("the stage registers");
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry.clone(), None)
-        .with_authority(AgentToolAuthority::new(registry).with_guardrails(chain));
+    let fx = AuthorityFixture::new(
+        tool_then_proposal(),
+        AgentToolAuthority::new(registry).with_guardrails(chain),
+        None,
+    );
     fx.start().await;
     fx.pump().await;
 
@@ -734,7 +1096,7 @@ async fn a_fully_authorized_tool_call_executes_exactly_once() {
         TOOL,
         &AgentEffectSpec::idempotent(2).expect("the spec is valid"),
     );
-    let fx = AuthorityFixture::new(tool_then_proposal(), registry, None);
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
     fx.start().await;
     fx.pump().await;
 
