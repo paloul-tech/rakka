@@ -260,6 +260,22 @@ pub enum AgentOperationClass {
 }
 
 impl AgentOperationClass {
+    /// Whether the class runs unattended, and so must be admitted before it may
+    /// run at all ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This is the line the fail-closed rule is drawn on, and it is drawn here
+    /// rather than at each enforcement point so that adding a class cannot
+    /// quietly add an unattended one that nothing gates.
+    ///
+    /// Attended execution is not autonomy: a human is in the loop of the
+    /// session, which is what [`Self::Interactive`] means, so it needs neither
+    /// an admission decision nor an autonomy declaration in the definition's
+    /// envelope. Everything else does, and does not run without both.
+    #[must_use]
+    pub const fn is_unattended(self) -> bool {
+        !matches!(self, Self::Interactive)
+    }
+
     /// Stable kebab-case label.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
@@ -388,6 +404,14 @@ pub struct AgentBudgetCeilings {
     pub max_tool_calls: Option<u32>,
     /// Maximum durable effects.
     pub max_effects: Option<u32>,
+    /// Maximum external dispatch attempts.
+    ///
+    /// An effect and its attempts are two ceilings, not one: an effect the
+    /// dispatch layer retries costs one effect and several attempts, and an
+    /// attempt that reached durable `Started` counts even when its outcome
+    /// became `Indeterminate`
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub max_effect_attempts: Option<u32>,
     /// Maximum model tokens.
     pub max_tokens: Option<u64>,
     /// Maximum cost, in micro-units of currency.
@@ -407,6 +431,7 @@ impl AgentBudgetCeilings {
             max_model_calls: None,
             max_tool_calls: None,
             max_effects: None,
+            max_effect_attempts: None,
             max_tokens: None,
             max_cost_micros: None,
             max_wall_clock_millis: None,
@@ -416,7 +441,7 @@ impl AgentBudgetCeilings {
 
     fn narrowing_violations(&self, candidate: &Self) -> Vec<AgentEnvelopeViolation> {
         let mut violations = Vec::new();
-        let dimensions: [(&str, Option<u64>, Option<u64>); 8] = [
+        let dimensions: [(&str, Option<u64>, Option<u64>); 9] = [
             (
                 "max_loop_iterations",
                 self.max_loop_iterations.map(u64::from),
@@ -436,6 +461,11 @@ impl AgentBudgetCeilings {
                 "max_effects",
                 self.max_effects.map(u64::from),
                 candidate.max_effects.map(u64::from),
+            ),
+            (
+                "max_effect_attempts",
+                self.max_effect_attempts.map(u64::from),
+                candidate.max_effect_attempts.map(u64::from),
             ),
             ("max_tokens", self.max_tokens, candidate.max_tokens),
             (

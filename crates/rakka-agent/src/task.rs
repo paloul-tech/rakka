@@ -100,7 +100,12 @@ use rakka_sharding::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::admission::AgentAdmissionRefusal;
 use crate::agent::{load_agent_entity_state, AgentEntityState, AgentLifecycleStatus};
+use crate::budget::{
+    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetExhaustion, AgentBudgetGrant,
+    AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger, AGENT_ESCROW_CHILD_CAPACITY,
+};
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
@@ -108,8 +113,8 @@ use crate::choreography::{
     AgentExchangeState, AgentExchangeTransition,
 };
 use crate::definition::{
-    AgentBudgetCeilings, AgentCapabilityId, AgentPolicyRefs, AgentRevisionNumber,
-    AgentTaskDefinitionId,
+    AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
+    AgentRevisionNumber, AgentTaskDefinitionId,
 };
 use crate::identity::{
     validated_id, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
@@ -1021,11 +1026,34 @@ pub struct AgentTaskDefinition {
     /// Bounds on the task's own durable state.
     pub limits: AgentTaskLimits,
     /// Per-task budget ceilings, which a run allocation may only narrow.
+    ///
+    /// This is the escrow the task holds: every run it assigns is debited from
+    /// it, and a run's settlement and return are credited back to it
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
     pub budgets: AgentBudgetCeilings,
+    /// What each run is escrowed when the task assigns it, or `None` to escrow
+    /// everything the task can still afford.
+    ///
+    /// Declaring a portion is what makes a top-up meaningful: a task that hands
+    /// its whole escrow to one run has nothing left to grant when that run
+    /// exhausts, so the run can only stop. Reserving the rest lets the task
+    /// answer a top-up request under the same ceilings, which is exactly the
+    /// parent-local allocation decision
+    /// [specification 9.7](../../../docs/plans/rakka-agent/spec.md) describes.
+    pub run_allocation: Option<AgentBudgetAllocation>,
     /// What happens to this task when a dependency does not complete.
     pub dependency_policy: AgentDependencyFailurePolicy,
     /// Who may complete the task.
     pub ownership: AgentTaskOwnership,
+    /// The operating behavior the task's runs execute under
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is a property of the work, not of the agent: the same agent may serve
+    /// an interactive task with a human in the loop and an unattended one that
+    /// must be admitted first. The agent's envelope declares which classes it
+    /// may be given, and its admission decision declares which it may currently
+    /// run.
+    pub operation_class: AgentOperationClass,
     /// Skills an assignee agent must declare. An empty set requires none.
     pub required_skills: BTreeSet<AgentCapabilityId>,
     /// Application-owned retention, audit, guardrail, and escalation policies.
@@ -1051,8 +1079,13 @@ impl AgentTaskDefinition {
             result_rules: Vec::new(),
             limits: AgentTaskLimits::new(),
             budgets: AgentBudgetCeilings::unbounded(),
+            run_allocation: None,
             dependency_policy: AgentDependencyFailurePolicy::default(),
             ownership: AgentTaskOwnership::default(),
+            // Attended is the safe default: an unattended class is the one that
+            // must be admitted, so defaulting to it would make the fail-closed
+            // check something a caller opts *out* of.
+            operation_class: AgentOperationClass::Interactive,
             required_skills: BTreeSet::new(),
             policies: AgentPolicyRefs::default(),
         };
@@ -1081,6 +1114,25 @@ impl AgentTaskDefinition {
         self
     }
 
+    /// Sets what each run is escrowed when the task assigns it.
+    #[must_use]
+    pub const fn with_run_allocation(mut self, allocation: AgentBudgetAllocation) -> Self {
+        self.run_allocation = Some(allocation);
+        self
+    }
+
+    /// What one run should be escrowed, before the task's own headroom narrows
+    /// it.
+    ///
+    /// An undeclared per-run allocation asks for everything: the task then
+    /// escrows whatever it can still afford, which is the right default for the
+    /// one-run-at-a-time task of this phase and wastes nothing.
+    #[must_use]
+    pub fn run_allocation_request(&self) -> AgentBudgetAllocation {
+        self.run_allocation
+            .unwrap_or_else(AgentBudgetAllocation::unbounded)
+    }
+
     /// Sets the failed-dependency policy.
     #[must_use]
     pub const fn with_dependency_policy(mut self, policy: AgentDependencyFailurePolicy) -> Self {
@@ -1092,6 +1144,13 @@ impl AgentTaskDefinition {
     #[must_use]
     pub const fn with_ownership(mut self, ownership: AgentTaskOwnership) -> Self {
         self.ownership = ownership;
+        self
+    }
+
+    /// Sets the operating behavior the task's runs execute under.
+    #[must_use]
+    pub const fn with_operation_class(mut self, class: AgentOperationClass) -> Self {
+        self.operation_class = class;
         self
     }
 
@@ -1204,8 +1263,10 @@ impl<'de> Deserialize<'de> for AgentTaskDefinition {
             result_rules: Vec<AgentTaskResultRule>,
             limits: AgentTaskLimits,
             budgets: AgentBudgetCeilings,
+            run_allocation: Option<AgentBudgetAllocation>,
             dependency_policy: AgentDependencyFailurePolicy,
             ownership: AgentTaskOwnership,
+            operation_class: AgentOperationClass,
             required_skills: BTreeSet<AgentCapabilityId>,
             policies: AgentPolicyRefs,
         }
@@ -1221,8 +1282,10 @@ impl<'de> Deserialize<'de> for AgentTaskDefinition {
             result_rules: wire.result_rules,
             limits: wire.limits,
             budgets: wire.budgets,
+            run_allocation: wire.run_allocation,
             dependency_policy: wire.dependency_policy,
             ownership: wire.ownership,
+            operation_class: wire.operation_class,
             required_skills: wire.required_skills,
             policies: wire.policies,
         };
@@ -1652,9 +1715,28 @@ pub enum AgentAssignmentRefusalReason {
     AgentNotActive,
     /// The agent's definition envelope does not declare this task definition.
     TaskDefinitionNotPermitted,
+    /// The agent's definition envelope does not declare the unattended
+    /// operation class the task runs under
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is a distinct reason from [`Self::TaskDefinitionNotPermitted`]
+    /// because the remedies differ: the task definition may be fully declared
+    /// while the *class* of autonomy it asks for is not.
+    OperationClassNotDeclared,
     /// The agent's definition envelope does not declare a skill the task
     /// requires.
     SkillNotDeclared,
+    /// The agent has no autonomy admission decision that admits this work, or
+    /// the one it has no longer admits it
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This is the fail-closed default for an unattended class: an agent is
+    /// unadmitted until something says otherwise, and a widening update makes it
+    /// unadmitted again.
+    NotAdmitted,
+    /// The task cannot escrow a run from what its own ledger still holds
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    BudgetUnavailable,
     /// The run refused the assignment.
     RunRefusedAssignment,
 }
@@ -1667,7 +1749,10 @@ impl AgentAssignmentRefusalReason {
             Self::AgentNotInstantiated => "agent-not-instantiated",
             Self::AgentNotActive => "agent-not-active",
             Self::TaskDefinitionNotPermitted => "task-definition-not-permitted",
+            Self::OperationClassNotDeclared => "operation-class-not-declared",
             Self::SkillNotDeclared => "skill-not-declared",
+            Self::NotAdmitted => "agent-not-admitted",
+            Self::BudgetUnavailable => "task-budget-unavailable",
             Self::RunRefusedAssignment => "run-refused-assignment",
         }
     }
@@ -2196,6 +2281,15 @@ pub struct AgentRunAssignment {
     pub input: AgentTaskContent,
     /// The collaborative goal the run contributes to.
     pub goal: Option<AgentGoalId>,
+    /// The escrow the task debited from its own ledger for this run, carried on
+    /// the creation command exactly as
+    /// [specification 9.7](../../../docs/plans/rakka-agent/spec.md) requires.
+    ///
+    /// The grant travels *with* the command rather than being fetched by the
+    /// run, because the debit and the command commit in one transition: a run
+    /// that exists holding this grant is a run whose parent has already paid
+    /// for it.
+    pub budget: AgentBudgetGrant,
     /// The agent definition revision the assignment was decided against.
     pub agent_definition_revision: AgentRevisionNumber,
     /// The agent settings revision the assignment was decided against.
@@ -2214,6 +2308,86 @@ pub struct AgentRunAcceptance {
     /// When it durably accepted.
     pub accepted_at: AgentTimestampMillis,
 }
+
+/// A run's report of what it finally consumed, carried by an
+/// [`AgentExchangeKind::BudgetSettlement`] exchange
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It travels only after a known terminal run outcome, and it is what makes the
+/// parent's own consumption — and, in a deeper hierarchy, its parent's — the
+/// truth about what the work cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBudgetSettlement {
+    /// The run that settled.
+    pub run: AgentRunScope,
+    /// The generation it served.
+    pub generation: AgentAssignmentGeneration,
+    /// What it consumed, per conserved dimension.
+    pub consumed: AgentBudgetConsumption,
+}
+
+/// A run's release of the escrow it held and will not use, carried by an
+/// [`AgentExchangeKind::BudgetReturn`] exchange
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It carries no amount. The parent recorded what it escrowed and has already
+/// applied the settlement, so it — not the child — computes the remainder. A
+/// child that named its own refund would be asking the parent to trust the
+/// child's arithmetic about the parent's ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBudgetReturn {
+    /// The run releasing its escrow.
+    pub run: AgentRunScope,
+    /// The generation it served.
+    pub generation: AgentAssignmentGeneration,
+}
+
+/// A run's request for more escrow, carried by an
+/// [`AgentExchangeKind::BudgetAllocation`] exchange
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The run *asks*; the grant is an ordinary parent-local allocation decision
+/// under the same ceilings, and a grant of nothing is a legitimate answer. This
+/// is the one allocation that is its own exchange: a run's first allocation
+/// rides its assignment, because the debit and the command that carries it
+/// commit in the parent's one transition, and only a later top-up needs a
+/// command of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBudgetTopUpRequest {
+    /// The run asking.
+    pub run: AgentRunScope,
+    /// The generation it serves.
+    pub generation: AgentAssignmentGeneration,
+    /// Which request this is, counting from one.
+    ///
+    /// It fences the replay window the exchange journal's bounded ring cannot:
+    /// the parent's escrow records the sequence it last granted, so a re-driven
+    /// request returns the original grant and an older one is refused.
+    pub sequence: u64,
+    /// The ceiling the run reached, so the parent decides on facts.
+    pub exhaustion: AgentBudgetExhaustion,
+}
+
+/// What a ledger exchange returns to the run that initiated it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBudgetLedgerOutcome {
+    /// The escrow the parent granted, for a top-up request. It is
+    /// [`AgentBudgetAllocation::nothing`] when the parent has nothing left, and
+    /// absent for a settlement or a return, which grant nothing.
+    pub granted: Option<AgentBudgetAllocation>,
+}
+
+/// Payload type of an [`AgentBudgetSettlement`] exchange command.
+pub const AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE: &str = "rakka.agent.BudgetSettlement";
+
+/// Payload type of an [`AgentBudgetReturn`] exchange command.
+pub const AGENT_BUDGET_RETURN_PAYLOAD_TYPE: &str = "rakka.agent.BudgetReturn";
+
+/// Payload type of an [`AgentBudgetTopUpRequest`] exchange command.
+pub const AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE: &str = "rakka.agent.BudgetTopUpRequest";
+
+/// Payload type of an [`AgentBudgetLedgerOutcome`] exchange result.
+pub const AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.BudgetLedgerOutcome";
 
 /// A run's proposal of a typed task result
 /// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
@@ -2302,9 +2476,19 @@ pub struct AgentAssignmentReadiness {
     pub settings_revision: Option<AgentRevisionNumber>,
     /// Whether the agent's definition envelope declares this task definition.
     pub permits_task_definition: bool,
+    /// Whether the agent's definition envelope declares the operation class the
+    /// task runs under.
+    pub permits_operation_class: bool,
     /// Whether the agent's definition envelope declares every skill the task
     /// requires.
     pub declares_required_skills: bool,
+    /// Why the agent's autonomy admission does not admit this work, when it
+    /// does not ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is `Some` for an agent with no admission at all, which is what makes
+    /// the check fail closed: unattended work needs a decision that says it may
+    /// run, and the absence of one is not permission.
+    pub admission_refusal: Option<AgentAdmissionRefusal>,
 }
 
 impl AgentAssignmentReadiness {
@@ -2313,8 +2497,19 @@ impl AgentAssignmentReadiness {
     /// An agent whose envelope declares no task definitions is authorized for
     /// none: the check fails closed rather than treating an empty declaration as
     /// permission for everything.
+    ///
+    /// The admission answer is *derived* here rather than read from a flag: the
+    /// decision on record is asked whether it admits this task's operation class
+    /// under the agent's definition envelope as it stands now
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)). A
+    /// definition published since the admission that widened anything therefore
+    /// stops assignment without anything having had to notice the update.
     #[must_use]
-    pub fn from_agent_state(state: &AgentEntityState, definition: &AgentTaskDefinition) -> Self {
+    pub fn from_agent_state(
+        state: &AgentEntityState,
+        definition: &AgentTaskDefinition,
+        now: AgentTimestampMillis,
+    ) -> Self {
         let envelope = state.definition().envelope();
         Self {
             agent: state.scope().agent().clone(),
@@ -2324,25 +2519,56 @@ impl AgentAssignmentReadiness {
             permits_task_definition: envelope
                 .task_definitions
                 .contains(&definition.definition_id),
+            permits_operation_class: !definition.operation_class.is_unattended()
+                || envelope
+                    .operation_classes
+                    .contains(&definition.operation_class),
             declares_required_skills: definition.required_skills.iter().all(|skill| {
                 envelope
                     .tools
                     .values()
                     .any(|tool| tool.capabilities.contains(skill))
             }),
+            admission_refusal: definition
+                .operation_class
+                .is_unattended()
+                .then(|| {
+                    state
+                        .admission()
+                        .map_or(Some(AgentAdmissionRefusal::Missing), |decision| {
+                            // The full enforcement point: the decision is
+                            // re-derived against the agent definition now in
+                            // force, so a republish that dropped a verified
+                            // requirement (a policy is not in the envelope) stops
+                            // assignment even when the envelope did not widen.
+                            decision
+                                .admits_definition(
+                                    definition.operation_class,
+                                    state.definition().definition(),
+                                    now,
+                                )
+                                .err()
+                        })
+                })
+                .flatten(),
         }
     }
 
     /// The facts of an agent that has no durable state at all.
+    ///
+    /// It is refused for having no state before any of the rest is consulted,
+    /// so every other fact is the fail-closed one.
     #[must_use]
-    pub const fn not_instantiated(agent: AgentId) -> Self {
+    pub fn not_instantiated(agent: AgentId) -> Self {
         Self {
             agent,
             status: None,
             definition_revision: None,
             settings_revision: None,
             permits_task_definition: false,
+            permits_operation_class: false,
             declares_required_skills: false,
+            admission_refusal: Some(AgentAdmissionRefusal::Missing),
         }
     }
 
@@ -2370,6 +2596,15 @@ impl AgentAssignmentReadiness {
                 ),
             ));
         }
+        if !self.permits_operation_class {
+            return Some((
+                AgentAssignmentRefusalReason::OperationClassNotDeclared,
+                format!(
+                    "agent {} does not declare this task's operation class in its authority envelope",
+                    self.agent
+                ),
+            ));
+        }
         if !self.declares_required_skills {
             return Some((
                 AgentAssignmentRefusalReason::SkillNotDeclared,
@@ -2377,6 +2612,16 @@ impl AgentAssignmentReadiness {
                     "agent {} does not declare every skill this task requires",
                     self.agent
                 ),
+            ));
+        }
+        if let Some(refusal) = &self.admission_refusal {
+            // The fail-closed rule of specification 7.4. It is checked last of
+            // the envelope facts and first of nothing: an agent may be
+            // instantiated, active, and fully declared, and still not admitted
+            // to run unattended.
+            return Some((
+                AgentAssignmentRefusalReason::NotAdmitted,
+                refusal.to_string(),
             ));
         }
         None
@@ -2406,6 +2651,14 @@ pub struct AgentTask {
     pub assignee: Option<AgentId>,
     /// The bounded dependency summary.
     pub dependencies: BTreeMap<AgentTaskId, AgentTaskDependency>,
+    /// The escrow this task holds and debits every run it assigns from
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is a component of the task's own record, so an allocation is debited
+    /// in the same compare-and-set as the assignment that carries it. There is
+    /// no window in which a run exists holding budget its parent did not debit,
+    /// and no second writer that could debit it twice.
+    pub escrow: AgentEscrowLedger,
     /// The current assignment, if any.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation the task has decided.
@@ -2936,6 +3189,15 @@ fn create_task(
         AgentTaskStatus::WaitingForInput
     };
 
+    // The task with no parent scope to debit is escrowed exactly its ceilings:
+    // it is the top of the hierarchy until the goal scope of phase 4 sits above
+    // it ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)). A
+    // delegated creation will carry its escrow on the creation command instead,
+    // debited from the delegating run inside the run's own transition.
+    let escrow = AgentEscrowLedger::new(AgentBudgetGrant::from_ceilings(
+        &creation.definition.budgets,
+    ));
+
     let task = AgentTask {
         definition: creation.definition,
         input: creation.input,
@@ -2944,6 +3206,7 @@ fn create_task(
         parent: creation.parent,
         assignee: creation.assignee,
         dependencies,
+        escrow,
         assignment: None,
         assignment_generation: AgentAssignmentGeneration::UNASSIGNED,
         assignments: 0,
@@ -3182,17 +3445,119 @@ fn terminate(
     Ok(())
 }
 
-/// Whether the refusal on record already states what `readiness` would refuse
-/// with, so deciding again would record no new fact.
-fn assignment_refusal_is_current(task: &AgentTask, readiness: &AgentAssignmentReadiness) -> bool {
-    let Some((reason, detail)) = readiness.refusal() else {
-        return false;
-    };
-    task.last_refusal.as_ref().is_some_and(|last| {
-        last.agent == readiness.agent
-            && last.reason == reason
-            && last.detail == bounded_detail(detail)
-    })
+/// Why the task cannot escrow a run right now, when it cannot.
+///
+/// The affordability answer is derived from the ledger without touching it, so
+/// both the decision and the settle pass that predicts the decision ask the same
+/// question of the same record. It predicts *every* way `open_child` can refuse
+/// — an exhausted dimension and a full child set alike — so the decision path
+/// records a stable refusal and stays assignable rather than failing the
+/// transition on an error the prediction never saw.
+fn task_budget_refusal(task: &AgentTask) -> Option<(AgentAssignmentRefusalReason, String)> {
+    if task.escrow.outstanding().count() >= AGENT_ESCROW_CHILD_CAPACITY {
+        return Some((
+            AgentAssignmentRefusalReason::BudgetUnavailable,
+            format!(
+                "the task cannot escrow a run: its ledger already holds \
+                 {AGENT_ESCROW_CHILD_CAPACITY} outstanding children"
+            ),
+        ));
+    }
+    let request = task.definition.run_allocation_request();
+    let affordable = request.narrowed_to(&task.escrow.available_allocation());
+    let dimension = affordable.first_empty_for(&request)?;
+    // The exhaustion reports what is *spoken for* — consumption and
+    // still-outstanding child escrow together — because that is what the
+    // headroom is measured against. Reporting consumption alone would tell an
+    // operator "consumed 0 of 10" about a ledger whose 10 are all escrowed to
+    // a child that has not settled yet.
+    let limit = task.escrow.allocation().get(dimension).unwrap_or(0);
+    let available = task.escrow.available(dimension).unwrap_or(0);
+    let exhaustion = AgentBudgetExhaustion::new(dimension, limit, limit.saturating_sub(available));
+    Some((
+        AgentAssignmentRefusalReason::BudgetUnavailable,
+        format!("the task cannot escrow a run: {exhaustion}"),
+    ))
+}
+
+/// The refusal one assignment decision would record now, if it would record
+/// one.
+///
+/// It mirrors [`decide_assignment`]'s order, so the settle pass can predict the
+/// decision without running it. It deliberately reports nothing when the
+/// decision would *terminate* the task: an exhausted assignment limit is a
+/// change worth a transition, not a refusal to deduplicate against.
+fn pending_assignment_refusal(
+    task: &AgentTask,
+    readiness: &AgentAssignmentReadiness,
+) -> Option<(AgentAssignmentRefusalReason, String)> {
+    if let Some(refusal) = readiness.refusal() {
+        return Some(refusal);
+    }
+    if task.assignments >= task.definition.limits.max_assignments {
+        return None;
+    }
+    task_budget_refusal(task)
+}
+
+/// Whether the refusal on record already states this fact, so recording it
+/// again would add nothing.
+fn assignment_refusal_is_current(
+    task: &AgentTask,
+    agent: &AgentId,
+    reason: AgentAssignmentRefusalReason,
+    detail: &str,
+) -> bool {
+    task.last_refusal
+        .as_ref()
+        .is_some_and(|last| last.agent == *agent && last.reason == reason && last.detail == detail)
+}
+
+/// Records one assignment refusal and stays assignable.
+///
+/// Failing closed here is not failing the task: resuming the agent, widening
+/// its envelope, re-admitting it, or an earlier generation settling its escrow
+/// all let the next decision succeed without re-creating anything. The refusal
+/// deduplicates against the one on record, because the decision runs inside the
+/// command transition and again on every settle pass, and the same agent
+/// refused for the same reason is not a new fact.
+fn refuse_assignment(
+    state: &mut AgentTaskState,
+    readiness: &AgentAssignmentReadiness,
+    reason: AgentAssignmentRefusalReason,
+    detail: impl Into<String>,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let detail = bounded_detail(detail);
+    let task = state.task_mut()?;
+    if assignment_refusal_is_current(task, &readiness.agent, reason, &detail) {
+        // Re-recording it — on the settle pass of the same command, or on every
+        // recovery sweep while the agent stays refused — would grow the
+        // append-only history without a new fact.
+        return Ok(None);
+    }
+
+    task.last_refusal = Some(AgentAssignmentRefusal {
+        agent: readiness.agent.clone(),
+        reason,
+        detail: detail.clone(),
+        refused_at: now,
+    });
+    let status = task.status;
+    let operation_id = assignment_operation_id(&scope, task.assignment_generation.next())?;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::AssignmentRefused,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(format!("{}: {detail}", reason.code()))
+    });
+    Ok(None)
 }
 
 /// Decides one assignment against the agent facts the entity read from durable
@@ -3212,35 +3577,7 @@ fn decide_assignment(
     }
 
     if let Some((reason, detail)) = readiness.refusal() {
-        if assignment_refusal_is_current(task, readiness) {
-            // The refusal on record already states this fact. Re-recording it —
-            // on the settle pass of the same command, or on every recovery
-            // sweep while the agent stays refused — would grow the append-only
-            // history without a new fact.
-            return Ok(None);
-        }
-        // Fail closed, and stay assignable: resuming the agent or widening its
-        // envelope lets the next attempt succeed without re-creating the task.
-        task.last_refusal = Some(AgentAssignmentRefusal {
-            agent: readiness.agent.clone(),
-            reason,
-            detail: bounded_detail(detail.clone()),
-            refused_at: now,
-        });
-        let status = task.status;
-        let operation_id = assignment_operation_id(&scope, task.assignment_generation.next())?;
-        state.updated_at = now;
-        state.record_history(|sequence| {
-            AgentTaskHistoryEntry::new(
-                sequence,
-                AgentTaskHistoryKind::AssignmentRefused,
-                operation_id.clone(),
-                status,
-                now,
-            )
-            .with_detail(format!("{}: {detail}", reason.code()))
-        });
-        return Ok(None);
+        return refuse_assignment(state, readiness, reason, detail, now);
     }
 
     if task.assignments >= task.definition.limits.max_assignments {
@@ -3267,6 +3604,27 @@ fn decide_assignment(
         AgentRunScope::new(scope.tenant().clone(), readiness.agent.clone(), run.clone())?;
     let operation_id = assignment_operation_id(&scope, generation)?;
 
+    // The escrow debit, inside the creating transition
+    // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)). It is
+    // decided against the same record it is written to, which is what makes
+    // oversubscription impossible without any distributed transaction: the task
+    // is the ledger's only writer, and the assignment that carries the grant
+    // commits with the debit.
+    //
+    // Affordability is settled before anything is debited, so the refusal path
+    // leaves the ledger exactly as it found it. Refusing is not failing: the
+    // task stays assignable, and an earlier generation's settlement may restore
+    // the headroom, so this takes the same path a suspended agent's refusal
+    // takes.
+    if let Some((reason, detail)) = task_budget_refusal(task) {
+        return refuse_assignment(state, readiness, reason, detail, now);
+    }
+    let request = task.definition.run_allocation_request();
+    let allocation = task
+        .escrow
+        .open_child(AgentEscrowChildId::for_run(&run)?, &request)?;
+    let budget = AgentBudgetGrant::new(allocation, *task.escrow.limits());
+
     let assignment = AgentTaskAssignment {
         generation,
         agent: readiness.agent.clone(),
@@ -3285,6 +3643,7 @@ fn decide_assignment(
         definition: task.definition.clone(),
         input: task.input.clone(),
         goal: task.goal.clone(),
+        budget,
         agent_definition_revision,
         agent_settings_revision,
         assigned_at: now,
@@ -3581,6 +3940,106 @@ fn reject_result(
     AgentExchangeResult::rejected(code, "the proposed result was refused", payload)
 }
 
+/// The task's half of the three ledger exchanges
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Each is idempotent on the task's own escrow record rather than on the
+/// journal's bounded ring, which is what makes a replay that has outlived the
+/// window still safe: the ledger answers from what it already holds
+/// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 61).
+fn apply_ledger_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let kind = envelope.kind();
+    let outcome = match kind {
+        AgentExchangeKind::BudgetSettlement => {
+            match envelope
+                .payload()
+                .decode::<AgentBudgetSettlement>(AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE)
+            {
+                Ok(settlement) => apply_settlement(state, &settlement),
+                Err(error) => return refuse(state, error.code(), error.to_string()),
+            }
+        }
+        AgentExchangeKind::BudgetReturn => {
+            match envelope
+                .payload()
+                .decode::<AgentBudgetReturn>(AGENT_BUDGET_RETURN_PAYLOAD_TYPE)
+            {
+                Ok(release) => apply_return(state, &release),
+                Err(error) => return refuse(state, error.code(), error.to_string()),
+            }
+        }
+        AgentExchangeKind::BudgetAllocation => {
+            match envelope
+                .payload()
+                .decode::<AgentBudgetTopUpRequest>(AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE)
+            {
+                Ok(request) => apply_top_up(state, &request),
+                Err(error) => return refuse(state, error.code(), error.to_string()),
+            }
+        }
+        other => Err(AgentTaskError::InvalidDefinition {
+            detail: format!("{other} is not a ledger exchange"),
+        }),
+    };
+
+    match outcome {
+        Ok(granted) => {
+            state.updated_at = now;
+            ledger_outcome(granted)
+        }
+        Err(error) => refuse(state, error.code(), error.to_string()),
+    }
+}
+
+fn apply_settlement(
+    state: &mut AgentTaskState,
+    settlement: &AgentBudgetSettlement,
+) -> AgentTaskResult<Option<AgentBudgetAllocation>> {
+    let child = AgentEscrowChildId::for_run(settlement.run.run())?;
+    let task = state.task_mut()?;
+    task.escrow.settle_child(&child, &settlement.consumed)?;
+    Ok(None)
+}
+
+fn apply_return(
+    state: &mut AgentTaskState,
+    release: &AgentBudgetReturn,
+) -> AgentTaskResult<Option<AgentBudgetAllocation>> {
+    let child = AgentEscrowChildId::for_run(release.run.run())?;
+    let task = state.task_mut()?;
+    // The ledger refuses a return the settlement has not preceded, so a lost or
+    // reordered settlement can never release headroom that was already spent.
+    task.escrow.return_child(&child)?;
+    Ok(None)
+}
+
+fn apply_top_up(
+    state: &mut AgentTaskState,
+    request: &AgentBudgetTopUpRequest,
+) -> AgentTaskResult<Option<AgentBudgetAllocation>> {
+    let child = AgentEscrowChildId::for_run(request.run.run())?;
+    let task = state.task_mut()?;
+    // The grant is the parent-local decision of specification 9.7: what the run
+    // asks for, narrowed to what this task can still afford under its own
+    // ceilings. Nothing here reads another scope's ledger.
+    let wanted = task.definition.run_allocation_request();
+    let granted = task
+        .escrow
+        .top_up_child(&child, request.sequence, &wanted)?;
+    Ok(Some(granted))
+}
+
+fn ledger_outcome(granted: Option<AgentBudgetAllocation>) -> AgentExchangeResult {
+    let outcome = AgentBudgetLedgerOutcome { granted };
+    let payload = AgentExchangePayload::encode(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, &outcome)
+        .unwrap_or_else(|_| AgentExchangePayload::empty(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE));
+    AgentExchangeResult::accepted(payload)
+}
+
 /// Refuses an exchange without making a validation decision.
 fn refuse(state: &AgentTaskState, code: &str, message: String) -> AgentExchangeResult {
     let status = state.status().unwrap_or(AgentTaskStatus::Created);
@@ -3633,6 +4092,9 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         let result = match envelope.kind() {
             AgentExchangeKind::Creation => apply_creation_exchange(state, envelope, now),
             AgentExchangeKind::ResultProposal => apply_result_proposal(state, envelope, now),
+            AgentExchangeKind::BudgetAllocation
+            | AgentExchangeKind::BudgetSettlement
+            | AgentExchangeKind::BudgetReturn => apply_ledger_exchange(state, envelope, now),
             kind => refuse(
                 state,
                 "unsupported-exchange",
@@ -3907,7 +4369,7 @@ where
         // compare-and-set. Reading it is I/O, and a transition may not do I/O
         // ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)); deciding
         // on what was read is pure.
-        let readiness = self.resolve_readiness(&command).await?;
+        let readiness = self.resolve_readiness(&command, now).await?;
 
         let reply = match command {
             AgentTaskEntityCommand::Describe => unreachable!("handled above"),
@@ -3973,6 +4435,7 @@ where
     async fn resolve_readiness(
         &self,
         command: &AgentTaskEntityCommand,
+        now: AgentTimestampMillis,
     ) -> AgentTaskResult<Option<AgentAssignmentReadiness>> {
         let (assignee, definition) = match command {
             AgentTaskEntityCommand::Create { creation, .. } => (
@@ -4004,7 +4467,9 @@ where
         let (Some(assignee), Some(definition)) = (assignee, definition) else {
             return Ok(None);
         };
-        self.read_readiness(&assignee, &definition).await.map(Some)
+        self.read_readiness(&assignee, &definition, now)
+            .await
+            .map(Some)
     }
 
     /// The bounded durable read of [specification 9.8](../../../docs/plans/rakka-agent/spec.md):
@@ -4014,6 +4479,7 @@ where
         &self,
         assignee: &AgentId,
         definition: &AgentTaskDefinition,
+        now: AgentTimestampMillis,
     ) -> AgentTaskResult<AgentAssignmentReadiness> {
         let agent_scope = AgentScope::new(self.scope.tenant().clone(), assignee.clone())?;
         let agent_state = load_agent_entity_state(&self.agents, &agent_scope, &self.policy)
@@ -4025,7 +4491,7 @@ where
 
         Ok(agent_state.as_ref().map_or_else(
             || AgentAssignmentReadiness::not_instantiated(assignee.clone()),
-            |state| AgentAssignmentReadiness::from_agent_state(state, definition),
+            |state| AgentAssignmentReadiness::from_agent_state(state, definition, now),
         ))
     }
 
@@ -4046,8 +4512,35 @@ where
         // which re-drives it once the sink is back.
         self.require_history_headroom(now).await?;
         let reply = self.host.accept(envelope, now).await?;
-        self.settle_side_effects(router, now).await?;
+        // Accepting a delivered exchange makes *local* progress only: it may
+        // decide an assignment freed escrow now permits and flush the history it
+        // owes, both of which touch only the task's own state and its history
+        // sink. It does **not** deliver the cross-entity exchanges that decision
+        // committed (the assignment to the run). Those are drained by the
+        // courier — a command's settle pass, a recovery sweep, `pump` — never
+        // synchronously from inside a delivery.
+        //
+        // The initiator of `envelope` is mid-delivery to this task right now, so
+        // driving an owed exchange back to it here would re-enter its `accept`
+        // before this reply settles. A run that owes this task a settlement, and
+        // a task that re-drives that run's still-outstanding assignment, would
+        // otherwise recurse without bound (see [`crate::run`]'s `accept`).
+        let _ = router;
+        self.make_local_progress(now).await?;
         Ok(reply)
+    }
+
+    /// Decides an assignment the task now permits and flushes owed history,
+    /// without delivering any owed cross-entity exchange.
+    ///
+    /// This is the half of [`Self::settle_side_effects`] that touches only the
+    /// task's own state and its history sink. It is what a delivered exchange is
+    /// allowed to trigger; see [`Self::accept`] for why the drive half is not.
+    async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
+        self.require_history_headroom(now).await?;
+        self.decide_assignment(now).await?;
+        self.flush_history(now).await?;
+        Ok(())
     }
 
     /// Flushes whatever history the task owes, and fails closed if the outbox
@@ -4110,12 +4603,17 @@ where
         let Some((assignee, definition)) = self.pending_assignment()? else {
             return Ok(false);
         };
-        let readiness = self.read_readiness(&assignee, &definition).await?;
-        if self
-            .state()?
-            .task()
-            .is_some_and(|task| assignment_refusal_is_current(task, &readiness))
-        {
+        let readiness = self.read_readiness(&assignee, &definition, now).await?;
+        if self.state()?.task().is_some_and(|task| {
+            pending_assignment_refusal(task, &readiness).is_some_and(|(reason, detail)| {
+                assignment_refusal_is_current(
+                    task,
+                    &readiness.agent,
+                    reason,
+                    &bounded_detail(detail),
+                )
+            })
+        }) {
             // Deciding would record nothing new, so the pass skips the write:
             // a settle sweep over a still-refused task must not burn a
             // revision per pass.
@@ -4833,6 +5331,8 @@ pub enum AgentTaskError {
     Schema(AgentSchemaError),
     /// The choreography substrate rejected an exchange.
     Choreography(Box<AgentChoreographyError>),
+    /// The task's escrow ledger rejected an allocation, settlement, or return.
+    Escrow(AgentEscrowError),
     /// The durable store rejected a load or write.
     Persistence(DurableError),
     /// A task definition could not be bounded.
@@ -4966,6 +5466,7 @@ impl AgentTaskError {
             Self::Identity(error) => error.code(),
             Self::Schema(error) => error.code(),
             Self::Choreography(error) => error.code(),
+            Self::Escrow(error) => error.code(),
             Self::Persistence(error) => error.code(),
             Self::InvalidDefinition { .. } => "invalid-task-definition",
             Self::NotCreated { .. } => "task-not-created",
@@ -4999,6 +5500,7 @@ impl Display for AgentTaskError {
             Self::Identity(error) => Display::fmt(error, f),
             Self::Schema(error) => Display::fmt(error, f),
             Self::Choreography(error) => Display::fmt(error, f),
+            Self::Escrow(error) => Display::fmt(error, f),
             Self::Persistence(error) => Display::fmt(error, f),
             Self::InvalidDefinition { detail } => {
                 write!(f, "the task definition is not bounded: {detail}")
@@ -5084,6 +5586,7 @@ impl Error for AgentTaskError {
             Self::Identity(error) => Some(error),
             Self::Schema(error) => Some(error),
             Self::Choreography(error) => Some(error),
+            Self::Escrow(error) => Some(error),
             Self::Persistence(error) => Some(error),
             _ => None,
         }
@@ -5105,6 +5608,12 @@ impl From<AgentSchemaError> for AgentTaskError {
 impl From<AgentChoreographyError> for AgentTaskError {
     fn from(error: AgentChoreographyError) -> Self {
         Self::Choreography(Box::new(error))
+    }
+}
+
+impl From<AgentEscrowError> for AgentTaskError {
+    fn from(error: AgentEscrowError) -> Self {
+        Self::Escrow(error)
     }
 }
 

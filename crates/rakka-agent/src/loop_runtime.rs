@@ -77,7 +77,7 @@ use rakka_agent_workflow::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::budget::AgentRunBudget;
+use crate::budget::{AgentBudgetExhaustion, AgentRunBudget};
 use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId};
 use crate::effect::{
     AgentEffectError, AgentRunEffect, AgentToolResult, AGENT_RUN_MAX_PENDING_EFFECTS,
@@ -206,6 +206,30 @@ pub struct AgentRunProposal {
     pub proposed_at: AgentTimestampMillis,
 }
 
+/// The top-up a run is waiting on after it exhausted its escrowed allocation
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A run that exhausts its budget parks with this record rather than failing at
+/// once: it asks its parent for more allocation through a deduplicated
+/// `BudgetAllocation` exchange, and resumes if the grant relieves the ceiling it
+/// hit. The record carries the exhaustion so the run can terminate with the
+/// original structured reason if the parent has nothing to give, and the
+/// sequence so a re-driven request returns the parent's original grant rather
+/// than debiting it twice.
+///
+/// The run's status stays `Running` while it holds this: a pending inter-entity
+/// exchange is the run's own durable outbox, re-driven by the courier, not a
+/// residency wait — the same argument the result-proposal exchange makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPendingTopUp {
+    /// Which top-up this is for the run, counting from one. It fences the
+    /// replay window the exchange journal's bounded ring cannot.
+    pub sequence: u64,
+    /// The ceiling the run reached, carried to the parent so it decides on
+    /// facts and kept so the run can fail with the original reason.
+    pub exhaustion: AgentBudgetExhaustion,
+}
+
 /// The durable, versioned loop state of one run
 /// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -239,6 +263,8 @@ pub struct AgentLoopState {
     accepted_result: Option<Box<AgentAcceptedResult>>,
     feedback: Option<String>,
     budget: AgentRunBudget,
+    #[serde(default)]
+    pending_top_up: Option<AgentPendingTopUp>,
     pending_checkpoint: Option<HumanCheckpointId>,
     pending_timer: Option<AgentTimerId>,
 }
@@ -272,6 +298,7 @@ impl AgentLoopState {
             accepted_result: None,
             feedback: None,
             budget,
+            pending_top_up: None,
             pending_checkpoint: None,
             pending_timer: None,
         }
@@ -467,6 +494,14 @@ impl AgentLoopState {
         &self.budget
     }
 
+    /// The top-up the run is parked waiting on, when it has exhausted its
+    /// budget and asked its parent for more
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub const fn pending_top_up(&self) -> Option<&AgentPendingTopUp> {
+        self.pending_top_up.as_ref()
+    }
+
     /// The checkpoint the run is waiting on. Filled by slice 1.10.
     #[must_use]
     pub const fn pending_checkpoint(&self) -> Option<&HumanCheckpointId> {
@@ -498,6 +533,24 @@ impl AgentLoopState {
 
     pub(crate) fn budget_mut(&mut self) -> &mut AgentRunBudget {
         &mut self.budget
+    }
+
+    /// Parks the run on a top-up request after a charge exhausted a ceiling.
+    ///
+    /// The phase is deliberately left where it was, so the transition that hit
+    /// the ceiling re-runs and re-attempts the *same* charge once the parent's
+    /// grant relieves it — the charge that failed never mutated the budget, so
+    /// there is nothing to undo.
+    pub(crate) fn park_for_top_up(&mut self, exhaustion: AgentBudgetExhaustion) {
+        let sequence = self.budget.top_ups().saturating_add(1);
+        self.pending_top_up = Some(AgentPendingTopUp {
+            sequence,
+            exhaustion,
+        });
+    }
+
+    pub(crate) fn clear_pending_top_up(&mut self) {
+        self.pending_top_up = None;
     }
 
     pub(crate) fn set_context_snapshot(&mut self, context: AgentContextSnapshotRef) {

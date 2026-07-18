@@ -740,6 +740,80 @@ Guidance: [Hierarchical Budget Ledger](technical-guidance.md#hierarchical-budget
 - `AutonomyAdmissionDecision`: fail-closed admission for unattended classes,
   recheck on widening updates, immediate-safety recheck at dispatch
   ([spec 7.4](spec.md#74-autonomy-admission)).
+  - Enforcement re-derives the decision against the definition **now in force**
+    (`admits_definition`), never a flag or the revision the decision recorded.
+    "Narrowing updates MAY reuse an admission only when policy proves them
+    monotonic" ([spec 7.4](spec.md#74-autonomy-admission)) is proven by *two*
+    checks, not one: the authority-envelope narrowing (`admits`) **and** the
+    structural requirements (`verify`, shared via `first_unmet_requirement`).
+    The second is load-bearing because an approval/authorization/escalation
+    policy is an `AgentDefinition` policy reference, not an envelope entry — a
+    republish that drops one is not an envelope widening, so the envelope check
+    alone would wave it through. Because enforcement derives from the current
+    definition, `publish_definition` deliberately does **not** retract the
+    admission: a definition that no longer satisfies a verified requirement is
+    refused at assignment (`admission-requirement-regressed`) whatever path
+    changed it, and no future call site has to remember to retract. Follow this
+    pattern for any later admission surface (setup revisions, epoch admission):
+    add the dimension to `verify`, not a new retract-on-mutation hook.
+
+**Amended as implemented:**
+
+- **The run emits its escrow exchanges from its own transitions; delivery never
+  drives them.** A terminal run commits its settlement/return, and a parked run
+  its top-up request, into its own exchange journal in the transition that owed
+  it; the courier drains the journal. `accept` of an incoming exchange makes
+  *local* progress only and never drives an owed cross-entity exchange, because
+  the initiator of the exchange being accepted is mid-delivery and driving an
+  exchange back to it would re-enter a transition whose reply has not settled —
+  a run owing its task a settlement, and the task re-driving that run's
+  still-outstanding assignment, otherwise recurse without bound. This made the
+  accept/settle split a uniform property of both entities (the durable-outbox
+  discipline), not a ledger special case.
+- **Exhaustion parks and asks before it fails.** A run that exhausts a *conserved*
+  ceiling records `AgentPendingTopUp` (status stays `Running` — a pending
+  exchange is the run's own outbox, the slice 1.5 argument for the result
+  proposal) and sends a deduplicated `BudgetAllocation` request. The charge that
+  exhausted is made all-or-nothing (`reserve_model_turn`, `reserve_tool_turn`) so
+  a re-attempt after the grant double-counts nothing. The run resumes iff the
+  parent granted *something* in the exhausted dimension; a grant of nothing stops
+  it with the *original* exhaustion. The relieve test is "did the grant add
+  room," not "does one more unit fit" — the latter is wrong for a multi-unit tool
+  fan-out, where a zero grant on a limit-1 budget would otherwise read as
+  relieved and re-park forever. Because each grant strictly reduces the parent's
+  headroom, the asking always terminates. A *non-conserved* exhaustion (a
+  wall-clock deadline, a concurrency ceiling) is not a quantity a parent can
+  grant, so it terminates the run rather than parking — `park_or_terminate`
+  branches on `AgentBudgetDimension::is_conserved`.
+- **Effect and attempt budgets are reserved at commit and settled at
+  resolution.** Every effect a run commits reserves one durable `effect` and its
+  whole attempt bound from the run's own ledger before dispatch, folded into the
+  all-or-nothing per-turn reservation with a concurrency check; `settle_effect`
+  at each generation's resolution consumes the attempts that reached `Started`
+  (an `Indeterminate` attempt included) and releases the rest. Reserving the max
+  up front is what denies a run work it could not afford to finish retrying, and
+  what makes the `effects`/`effect_attempts`/`concurrent-effects` dimensions
+  real rather than declared. The settle runs exactly once, on the generation's
+  first resolution — a reconciliation that confirms an `Indeterminate`
+  generation executed bills nothing further — and a reconciliation-authorized
+  re-invocation reserves the *new* generation's attempt bound the same way
+  (`reserve_attempts`): a run that cannot afford it refuses the resolution
+  (`run-redispatch-unaffordable`) rather than dispatching unreserved work, and
+  the operator's remaining decision is a cancellation, whose wind-down settles
+  the generation without invocation.
+- **The `rakka-agent-workflow` autonomy counters are superseded, not extended.**
+  The slice text said to "extend the existing `autonomy.rs` counters into the
+  ledger dimensions." `rakka-agent-workflow`'s `AgentAutonomyUsage`/
+  `AgentAutonomyPolicy` are a pre-existing workflow-*dispatcher* policy subsystem
+  (target-class routing, per-target step/call/token budgets) that lives entirely
+  inside that crate and that the agent domain never consumed. Rather than graft
+  the agent's escrow hierarchy onto that flat per-target counter, the slice
+  built the richer, product-neutral `AgentRunBudget`/`AgentEscrowLedger` in
+  `rakka-agent`: a conserved/non-conserved dimension split, up-front escrow with
+  settlement and return, and per-run reservation. The workflow autonomy policy
+  stays where it is (the workflow dispatcher still uses it); the agent domain's
+  budget accounting is the new ledger. No agent-domain code depends on the
+  workflow counters, so there is nothing to migrate.
 
 Done when: scenarios 52, 53, and 61 pass, including a concurrency test that
 cannot oversubscribe a parent allocation and a replay test that never

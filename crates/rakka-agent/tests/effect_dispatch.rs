@@ -23,12 +23,13 @@ use rakka_agent::testkit::{
     ScriptedCredentialResolver, ScriptedDispatcher, ScriptedReconciler, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
-    AgentCredentialBindingRef, AgentDispatchWindow, AgentEffectResolution, AgentEffectSpec,
-    AgentEntityAuthority, AgentLoopPhase, AgentModelTurn, AgentReconciliationFinding,
-    AgentReconciliationProtocolRef, AgentRunEffectDispatcher, AgentRunEffectOutcome,
-    AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus, AgentRunTerminalReason,
-    AgentTaskContent, AgentTaskStatus, AgentToolAuthority, AgentToolCallId, AgentToolCallRequest,
-    AgentToolId, AgentToolRegistry, WorkflowAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentBudgetCeilings, AgentCredentialBindingRef, AgentDispatchWindow, AgentEffectResolution,
+    AgentEffectSpec, AgentEntityAuthority, AgentLoopPhase, AgentModelTurn,
+    AgentReconciliationFinding, AgentReconciliationProtocolRef, AgentRunEffectDispatcher,
+    AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunStatus,
+    AgentRunTerminalReason, AgentTaskContent, AgentTaskStatus, AgentToolAuthority, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, AgentToolRegistry, WorkflowAgentRunEffectSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::{
@@ -729,6 +730,162 @@ async fn a_reconciliation_decision_resumes_the_run_and_not_executed_mints_a_new_
         fx.fx.task_snapshot().await.status,
         AgentTaskStatus::Completed
     );
+}
+
+#[tokio::test]
+async fn a_reconciled_indeterminate_generation_settles_its_attempts_exactly_once() {
+    // The run's ledger settles a generation's attempt reservation at its
+    // *first* resolution ([specification 9.7]) — for an ambiguous attempt, the
+    // moment the `Indeterminate` outcome is recorded, because ambiguity does
+    // not make an attempt free. A reconciliation that later confirms the
+    // invocation executed changes what is *known*, not what was *attempted*,
+    // so it must not bill the same attempts a second time: inflated
+    // consumption would spuriously exhaust the run's `effect-attempts`
+    // ceiling and travel upward in its settlement as spend nobody made.
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    fx.expire_lease();
+    fx.pump().await;
+
+    // The generation parked, and its one `Started` attempt is already
+    // consumed: one for the first model turn, one for the ambiguous tool call.
+    let parked = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(parked.status, AgentRunStatus::WaitingForReconciliation);
+    assert_eq!(parked.budget.consumption().effect_attempts, 2);
+
+    let (effect_id, generation) = fx.parked_effect().await;
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                [TENANT, AGENT, "resolve-52"],
+            )
+            .expect("the operation id derives"),
+            effect_id,
+            generation,
+            resolution: Box::new(AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(AgentRunEffectOutcome::Tool {
+                    call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+                    content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-1" }))
+                        .expect("the content is inline-bounded"),
+                }),
+            }),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("the resolution applies");
+
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    let consumed = run.budget.consumption();
+    // Three effects reached dispatch — the first model turn, the reconciled
+    // tool call, and the proposing model turn — and each made exactly one
+    // attempt. The reconciliation itself billed nothing.
+    assert_eq!(consumed.effects, 3);
+    assert_eq!(
+        consumed.effect_attempts, 3,
+        "confirming an executed attempt must not bill it a second time"
+    );
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "resolution recorded the outcome without re-invoking"
+    );
+}
+
+#[tokio::test]
+async fn a_redispatch_the_run_cannot_afford_is_refused() {
+    // The redispatch half of the reservation discipline: a reconciliation that
+    // proves an ambiguous generation never executed authorizes a *new*
+    // generation with a fresh attempt budget, and that budget is reserved
+    // before the generation becomes dispatchable — exactly as the original
+    // turn's was ([specification 9.7]). A run whose attempt budget is already
+    // spent cannot afford the re-invocation, so the resolution is refused, the
+    // effect stays parked, and the operator's remaining decision is to cancel
+    // the run, whose wind-down settles the generation without invocation.
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    );
+    fx.fx
+        .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+        .await;
+    // Exactly the two attempts the first turn spends: one for its model call,
+    // one for the ambiguous tool call. Nothing is left for a re-invocation.
+    fx.fx
+        .create_task_with(task_definition().with_budgets(AgentBudgetCeilings {
+            max_effect_attempts: Some(2),
+            ..AgentBudgetCeilings::unbounded()
+        }))
+        .await;
+
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    fx.expire_lease();
+    fx.pump().await;
+
+    let (effect_id, generation) = fx.parked_effect().await;
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    let refusal = run
+        .apply(
+            AgentRunEntityCommand::ResolveIndeterminateEffect {
+                operation_id: rakka_agent::AgentOperationId::new(
+                    rakka_agent::AgentOperationKind::CheckpointResolution,
+                    [TENANT, AGENT, "resolve-unaffordable"],
+                )
+                .expect("the operation id derives"),
+                effect_id,
+                generation,
+                resolution: Box::new(AgentEffectResolution::ConfirmedNotExecuted),
+            },
+            &fx.fx.router,
+            fx.fx.now(),
+        )
+        .await
+        .expect_err("a re-invocation the run cannot afford is refused");
+    assert_eq!(refusal.code(), "run-redispatch-unaffordable");
+
+    // Nothing changed durably: the effect stays parked for a decision the run
+    // can afford, and the target was never re-invoked.
+    assert_eq!(
+        fx.effect_status(1).await,
+        Some(AgentRunEffectStatus::Indeterminate)
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
 
 // ---------------------------------------------------------------------------

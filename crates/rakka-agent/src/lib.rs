@@ -84,17 +84,27 @@ pub mod tools;
 pub mod wake;
 pub mod workflow_tool;
 
+pub use admission::{
+    AgentAdmissionError, AgentAdmissionEvaluator, AgentAdmissionRefusal, AgentAdmissionRequirement,
+    AgentAdmissionResult, AutonomyAdmissionDecision, AGENT_ADMISSION_CONSTRAINT_CAPACITY,
+    AGENT_ADMISSION_DETAIL_MAX_LENGTH,
+};
 pub use agent::{
     agent_entity_id, agent_entity_persistence_id, agent_entity_ref, agent_entity_type_key,
     init_agent_entity_remote_sharding, init_agent_entity_sharding, load_agent_entity_state,
-    passivate_agent_entity, registered_agent_entity_ref, AgentEntity, AgentEntityCommand,
-    AgentEntityError, AgentEntityMessage, AgentEntityOutcome, AgentEntityRef,
+    passivate_agent_entity, registered_agent_entity_ref, AgentAdmissionRetraction, AgentEntity,
+    AgentEntityCommand, AgentEntityError, AgentEntityMessage, AgentEntityOutcome, AgentEntityRef,
     AgentEntityRegistration, AgentEntityReply, AgentEntityResult, AgentEntityShardingSettings,
     AgentEntitySnapshot, AgentEntityState, AgentEntityStore, AgentEntityTypeKey,
     AgentLifecycleStatus, AgentOperationLog, AGENT_ENTITY_OPERATION_LOG_CAPACITY,
     DEFAULT_AGENT_ENTITY_TYPE,
 };
-pub use budget::{AgentBudgetDimension, AgentBudgetExhaustion, AgentRunBudget};
+pub use budget::{
+    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension, AgentBudgetExhaustion,
+    AgentBudgetGrant, AgentBudgetLimits, AgentChildEscrow, AgentEscrowChildId, AgentEscrowError,
+    AgentEscrowLedger, AgentEscrowResult, AgentRunBudget, AGENT_ESCROW_CHILD_CAPACITY,
+    AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
+};
 pub use choreography::{
     drive_pending_exchanges, register_agent_exchange_codecs, AgentChoreographyError,
     AgentChoreographyResult, AgentEntityAddress, AgentEntityClass, AgentExchangeDeliveryError,
@@ -135,7 +145,8 @@ pub use guardrails::{
     AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
 pub use loop_runtime::{
-    AgentLoopPhase, AgentLoopState, AgentRunProposal, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 pub use memory::{AgentContextSnapshotId, AgentContextSnapshotRef};
 pub use model::{
@@ -147,16 +158,17 @@ pub use model::{
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
     agent_run_entity_type_key, init_agent_run_entity_remote_sharding,
-    init_agent_run_entity_sharding, load_agent_run_state, passivate_agent_run_entity,
-    proposal_operation_id, registered_agent_run_entity_ref, system_run_clock, AgentRun,
-    AgentRunClock, AgentRunEntity, AgentRunEntityCommand, AgentRunEntityMessage, AgentRunEntityRef,
-    AgentRunEntityRegistration, AgentRunEntityReply, AgentRunEntityShardingSettings,
-    AgentRunEntityStore, AgentRunEntityTypeKey, AgentRunError, AgentRunOperationLog,
-    AgentRunOutcome, AgentRunParticipant, AgentRunProgress, AgentRunResult, AgentRunSnapshot,
-    AgentRunState, AgentRunStatus, AgentRunTerminalReason, AGENT_RUN_DETAIL_MAX_LENGTH,
-    AGENT_RUN_MATERIALIZED_MAX_BYTES, AGENT_RUN_MAX_LOOP_STEPS_PER_PASS,
-    AGENT_RUN_MAX_SETTLE_ROUNDS, AGENT_RUN_OPERATION_LOG_CAPACITY,
-    AGENT_RUN_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_RUN_ENTITY_TYPE,
+    init_agent_run_entity_sharding, ledger_operation_id, load_agent_run_state,
+    passivate_agent_run_entity, proposal_operation_id, registered_agent_run_entity_ref,
+    system_run_clock, AgentRun, AgentRunClock, AgentRunEntity, AgentRunEntityCommand,
+    AgentRunEntityMessage, AgentRunEntityRef, AgentRunEntityRegistration, AgentRunEntityReply,
+    AgentRunEntityShardingSettings, AgentRunEntityStore, AgentRunEntityTypeKey, AgentRunError,
+    AgentRunOperationLog, AgentRunOutcome, AgentRunParticipant, AgentRunProgress, AgentRunResult,
+    AgentRunSettlementStatus, AgentRunSnapshot, AgentRunState, AgentRunStatus,
+    AgentRunTerminalReason, AGENT_RUN_DETAIL_MAX_LENGTH, AGENT_RUN_MATERIALIZED_MAX_BYTES,
+    AGENT_RUN_MAX_LOOP_STEPS_PER_PASS, AGENT_RUN_MAX_SETTLE_ROUNDS,
+    AGENT_RUN_OPERATION_LOG_CAPACITY, AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
+    DEFAULT_AGENT_RUN_ENTITY_TYPE,
 };
 
 pub use definition::{
@@ -198,6 +210,7 @@ pub use task::{
     registered_agent_task_entity_ref, run_id_for_assignment, system_task_clock,
     AgentAcceptedResult, AgentAssignmentGeneration, AgentAssignmentReadiness,
     AgentAssignmentRefusal, AgentAssignmentRefusalReason, AgentAssignmentStatus,
+    AgentBudgetLedgerOutcome, AgentBudgetReturn, AgentBudgetSettlement, AgentBudgetTopUpRequest,
     AgentContentDigest, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentRunAcceptance,
     AgentRunAssignment, AgentSchemaId, AgentSchemaRef, AgentTask, AgentTaskClock, AgentTaskContent,
     AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition, AgentTaskDependency,
@@ -211,7 +224,9 @@ pub use task::{
     AgentTaskRejection, AgentTaskRejectionCause, AgentTaskResult, AgentTaskResultCheck,
     AgentTaskResultProposal, AgentTaskResultRule, AgentTaskRuleId, AgentTaskSnapshot,
     AgentTaskState, AgentTaskStatus, AgentTaskTerminalReason, InMemoryAgentTaskHistoryStore,
-    TypedTask, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
+    TypedTask, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
+    AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE, AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
+    AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
     AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH, AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE,
     AGENT_TASK_CREATION_PAYLOAD_TYPE, AGENT_TASK_DECISION_PAYLOAD_TYPE,
     AGENT_TASK_DESCRIPTION_MAX_LENGTH, AGENT_TASK_DETAIL_MAX_LENGTH,
