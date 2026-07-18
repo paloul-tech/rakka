@@ -61,7 +61,9 @@ use rakka_sharding::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::admission::{AgentAdmissionError, AutonomyAdmissionDecision};
+use crate::admission::{
+    AgentAdmissionError, AutonomyAdmissionDecision, AGENT_ADMISSION_DETAIL_MAX_LENGTH,
+};
 use crate::definition::{
     AgentDefinition, AgentDefinitionError, AgentDefinitionId, AgentDefinitionRevision,
     AgentPolicyRefs, AgentRevisionNumber, AgentRevisionProvenance, AgentSettings,
@@ -206,6 +208,23 @@ pub struct AgentEntityOutcome {
     pub settings_revision: AgentRevisionNumber,
 }
 
+/// The durable record of the retraction that returned an agent to the
+/// fail-closed default
+/// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It answers "why is this agent not admitted" from the entity's own state,
+/// bounded like every admission detail. It survives only while the agent stays
+/// unadmitted: the next accepted admission replaces the fail-closed default
+/// this record explains, so it clears the record with it — the full trail
+/// lives in the audit stream the provenance references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAdmissionRetraction {
+    /// The bounded, stable reason the retracting principal gave.
+    pub reason: String,
+    /// Who retracted the admission, when, and under which audit reference.
+    pub provenance: AgentRevisionProvenance,
+}
+
 /// Durable state of one agent entity.
 ///
 /// It carries no credential material: `credential_bindings` are logical
@@ -220,6 +239,8 @@ pub struct AgentEntityState {
     definition: AgentDefinitionRevision,
     settings: SettingsRevision,
     admission: Option<AutonomyAdmissionDecision>,
+    #[serde(default)]
+    admission_retraction: Option<Box<AgentAdmissionRetraction>>,
     applied_operations: AgentOperationLog,
     updated_at: AgentTimestampMillis,
 }
@@ -247,6 +268,7 @@ impl AgentEntityState {
             // precisely so that creating an agent cannot be the act that
             // authorizes it to run unattended.
             admission: None,
+            admission_retraction: None,
             applied_operations: AgentOperationLog::default(),
             updated_at,
         }
@@ -305,6 +327,19 @@ impl AgentEntityState {
     #[must_use]
     pub const fn admission(&self) -> Option<&AutonomyAdmissionDecision> {
         self.admission.as_ref()
+    }
+
+    /// Why the admission on record was retired, when the agent is unadmitted
+    /// because someone retired it
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Enforcement never reads this — a retracted admission and a never-granted
+    /// one are the same fail-closed default — but an operator asking why an
+    /// agent stopped running unattended deserves the answer from the entity
+    /// itself. The next accepted admission clears it.
+    #[must_use]
+    pub fn admission_retraction(&self) -> Option<&AgentAdmissionRetraction> {
+        self.admission_retraction.as_deref()
     }
 
     /// Application-owned policy references this agent runs under.
@@ -472,7 +507,8 @@ pub enum AgentEntityCommand {
     Retract {
         /// Stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
-        /// A bounded, stable reason.
+        /// A bounded, stable reason, recorded on the entity as
+        /// [`AgentAdmissionRetraction`] while the agent stays unadmitted.
         reason: String,
         /// Who retracted it, when, and under which audit reference.
         provenance: Box<AgentRevisionProvenance>,
@@ -768,9 +804,9 @@ where
             } => self.admit(operation_id, *decision).await,
             AgentEntityCommand::Retract {
                 operation_id,
-                reason: _,
+                reason,
                 provenance,
-            } => self.retract(operation_id, *provenance).await,
+            } => self.retract(operation_id, reason, *provenance).await,
             AgentEntityCommand::Suspend {
                 operation_id,
                 expected_lifecycle_revision,
@@ -900,6 +936,9 @@ where
             // everything the definition itself answers is not.
             decision.verify(state.definition.definition())?;
             state.admission = Some(decision);
+            // A new admission replaces the fail-closed default the retraction
+            // record explained, so the record retires with it.
+            state.admission_retraction = None;
             Ok(())
         })
         .await
@@ -908,11 +947,25 @@ where
     async fn retract(
         &mut self,
         operation_id: AgentOperationId,
+        reason: String,
         provenance: AgentRevisionProvenance,
     ) -> AgentEntityResult<AgentEntityReply> {
+        // The reason becomes part of a durable record, so it is held to the
+        // same bound every admission detail is.
+        if reason.len() > AGENT_ADMISSION_DETAIL_MAX_LENGTH {
+            return Err(AgentEntityError::Admission(
+                AgentAdmissionError::DetailTooLong {
+                    field: "retraction reason",
+                    length: reason.len(),
+                    maximum: AGENT_ADMISSION_DETAIL_MAX_LENGTH,
+                },
+            ));
+        }
         let accepted_at = provenance.accepted_at;
         self.mutate(operation_id, accepted_at, |state| {
             state.admission = None;
+            state.admission_retraction =
+                Some(Box::new(AgentAdmissionRetraction { reason, provenance }));
             Ok(())
         })
         .await

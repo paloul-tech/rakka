@@ -1940,6 +1940,31 @@ fn resolve_indeterminate_effect(
                 // a fresh dispatchable intent under the same identity
                 // ([specification 11.3]). The ambiguous original is never
                 // mutated back into a routine retry.
+                //
+                // The new generation's attempt bound is reserved before it
+                // becomes dispatchable, exactly as the original turn's was: the
+                // ambiguous generation's settle released its reservation and
+                // consumed only the attempts it made, so re-invocation is new
+                // spend the run must still be able to afford
+                // ([specification 9.7]). A run that cannot afford it keeps the
+                // effect parked `Indeterminate` and refuses the resolution —
+                // the operator's remaining decision is to cancel the run, whose
+                // wind-down settles the generation without invocation.
+                let max_attempts = effect.max_attempts;
+                {
+                    let run = state.run_mut()?;
+                    if let Err(exhaustion) =
+                        run.loop_state.budget_mut().reserve_attempts(max_attempts)
+                    {
+                        return Err(AgentRunError::RedispatchUnaffordable { exhaustion });
+                    }
+                }
+                let run = state.run_mut()?;
+                let Some(effect) = run.loop_state.effect_mut(effect_id) else {
+                    return Err(AgentRunError::UnknownEffect {
+                        effect_id: effect_id.clone(),
+                    });
+                };
                 effect.begin_next_generation(&scope, now)?;
                 let run = state.run_mut()?;
                 run.status = AgentRunStatus::WaitingForEffect;
@@ -3274,6 +3299,17 @@ pub enum AgentRunError {
         /// The generation the result carried.
         received: AgentEffectGeneration,
     },
+    /// A reconciliation authorized a re-invocation the run's budget cannot
+    /// afford: the new generation's attempt bound could not be reserved
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The resolution is refused and the effect stays parked `Indeterminate`;
+    /// the operator's remaining decision is to cancel the run, whose wind-down
+    /// settles the generation without invocation.
+    RedispatchUnaffordable {
+        /// The ceiling the reservation would cross.
+        exhaustion: AgentBudgetExhaustion,
+    },
     /// The materialized run record would exceed its bound.
     MaterializedStateTooLarge {
         /// The size of the rejected record, in bytes.
@@ -3300,6 +3336,7 @@ impl AgentRunError {
             Self::UnknownEffect { .. } => "run-unknown-effect",
             Self::StaleEffectResult { .. } => "run-stale-effect-result",
             Self::StaleEffectGeneration { .. } => "run-stale-effect-generation",
+            Self::RedispatchUnaffordable { .. } => "run-redispatch-unaffordable",
             Self::MaterializedStateTooLarge { .. } => "run-state-too-large",
         }
     }
@@ -3338,6 +3375,11 @@ impl Display for AgentRunError {
                 f,
                 "a result arrived for generation {received} of effect {effect_id}, but this run \
                  holds generation {held}"
+            ),
+            Self::RedispatchUnaffordable { exhaustion } => write!(
+                f,
+                "the authorized re-invocation cannot reserve its attempt bound ({exhaustion}); \
+                 cancel the run to settle the generation without invocation"
             ),
             Self::MaterializedStateTooLarge { bytes, maximum } => write!(
                 f,

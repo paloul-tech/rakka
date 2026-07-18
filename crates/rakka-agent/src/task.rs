@@ -104,7 +104,7 @@ use crate::admission::AgentAdmissionRefusal;
 use crate::agent::{load_agent_entity_state, AgentEntityState, AgentLifecycleStatus};
 use crate::budget::{
     AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetExhaustion, AgentBudgetGrant,
-    AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger,
+    AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger, AGENT_ESCROW_CHILD_CAPACITY,
 };
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
@@ -1715,6 +1715,14 @@ pub enum AgentAssignmentRefusalReason {
     AgentNotActive,
     /// The agent's definition envelope does not declare this task definition.
     TaskDefinitionNotPermitted,
+    /// The agent's definition envelope does not declare the unattended
+    /// operation class the task runs under
+    /// ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is a distinct reason from [`Self::TaskDefinitionNotPermitted`]
+    /// because the remedies differ: the task definition may be fully declared
+    /// while the *class* of autonomy it asks for is not.
+    OperationClassNotDeclared,
     /// The agent's definition envelope does not declare a skill the task
     /// requires.
     SkillNotDeclared,
@@ -1741,6 +1749,7 @@ impl AgentAssignmentRefusalReason {
             Self::AgentNotInstantiated => "agent-not-instantiated",
             Self::AgentNotActive => "agent-not-active",
             Self::TaskDefinitionNotPermitted => "task-definition-not-permitted",
+            Self::OperationClassNotDeclared => "operation-class-not-declared",
             Self::SkillNotDeclared => "skill-not-declared",
             Self::NotAdmitted => "agent-not-admitted",
             Self::BudgetUnavailable => "task-budget-unavailable",
@@ -2589,7 +2598,7 @@ impl AgentAssignmentReadiness {
         }
         if !self.permits_operation_class {
             return Some((
-                AgentAssignmentRefusalReason::TaskDefinitionNotPermitted,
+                AgentAssignmentRefusalReason::OperationClassNotDeclared,
                 format!(
                     "agent {} does not declare this task's operation class in its authority envelope",
                     self.agent
@@ -3440,16 +3449,31 @@ fn terminate(
 ///
 /// The affordability answer is derived from the ledger without touching it, so
 /// both the decision and the settle pass that predicts the decision ask the same
-/// question of the same record.
+/// question of the same record. It predicts *every* way `open_child` can refuse
+/// — an exhausted dimension and a full child set alike — so the decision path
+/// records a stable refusal and stays assignable rather than failing the
+/// transition on an error the prediction never saw.
 fn task_budget_refusal(task: &AgentTask) -> Option<(AgentAssignmentRefusalReason, String)> {
+    if task.escrow.outstanding().count() >= AGENT_ESCROW_CHILD_CAPACITY {
+        return Some((
+            AgentAssignmentRefusalReason::BudgetUnavailable,
+            format!(
+                "the task cannot escrow a run: its ledger already holds \
+                 {AGENT_ESCROW_CHILD_CAPACITY} outstanding children"
+            ),
+        ));
+    }
     let request = task.definition.run_allocation_request();
     let affordable = request.narrowed_to(&task.escrow.available_allocation());
     let dimension = affordable.first_empty_for(&request)?;
-    let exhaustion = AgentBudgetExhaustion::new(
-        dimension,
-        task.escrow.allocation().get(dimension).unwrap_or(0),
-        task.escrow.consumed().get(dimension),
-    );
+    // The exhaustion reports what is *spoken for* — consumption and
+    // still-outstanding child escrow together — because that is what the
+    // headroom is measured against. Reporting consumption alone would tell an
+    // operator "consumed 0 of 10" about a ledger whose 10 are all escrowed to
+    // a child that has not settled yet.
+    let limit = task.escrow.allocation().get(dimension).unwrap_or(0);
+    let available = task.escrow.available(dimension).unwrap_or(0);
+    let exhaustion = AgentBudgetExhaustion::new(dimension, limit, limit.saturating_sub(available));
     Some((
         AgentAssignmentRefusalReason::BudgetUnavailable,
         format!("the task cannot escrow a run: {exhaustion}"),
@@ -3916,7 +3940,6 @@ fn reject_result(
     AgentExchangeResult::rejected(code, "the proposed result was refused", payload)
 }
 
-/// Refuses an exchange without making a validation decision.
 /// The task's half of the three ledger exchanges
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -4017,6 +4040,7 @@ fn ledger_outcome(granted: Option<AgentBudgetAllocation>) -> AgentExchangeResult
     AgentExchangeResult::accepted(payload)
 }
 
+/// Refuses an exchange without making a validation decision.
 fn refuse(state: &AgentTaskState, code: &str, message: String) -> AgentExchangeResult {
     let status = state.status().unwrap_or(AgentTaskStatus::Created);
     let payload = decision_payload(&AgentTaskDecision::Refused {

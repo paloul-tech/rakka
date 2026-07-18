@@ -483,6 +483,18 @@ impl AutonomyAdmissionDecision {
                 });
             }
         }
+        if let AgentAdmissionEvaluator::Service(service) = &self.evaluator {
+            // "A stable, bounded identifier" is the promise the variant makes,
+            // and a durable record enforces the promise itself rather than
+            // trusting whoever authored the decision.
+            if service.len() > AGENT_ADMISSION_DETAIL_MAX_LENGTH {
+                return Err(AgentAdmissionError::DetailTooLong {
+                    field: "evaluator service name",
+                    length: service.len(),
+                    maximum: AGENT_ADMISSION_DETAIL_MAX_LENGTH,
+                });
+            }
+        }
         if self.unattended_classes().next().is_some() {
             // The fail-closed rule of specification 7.4, at the record itself:
             // an unattended class that does not name every requirement is not a
@@ -727,6 +739,15 @@ pub enum AgentAdmissionError {
         /// The bound in force.
         maximum: usize,
     },
+    /// A free-text field exceeds the bound one durable record may carry.
+    DetailTooLong {
+        /// Which field crossed the bound.
+        field: &'static str,
+        /// Its length in bytes.
+        length: usize,
+        /// The bound in force.
+        maximum: usize,
+    },
     /// The decision record is not interpretable under the current schema
     /// policy.
     Schema(AgentSchemaError),
@@ -742,6 +763,7 @@ impl AgentAdmissionError {
             Self::RequirementUnmet { .. } => "admission-requirement-unmet",
             Self::TooManyConstraints { .. } => "admission-constraints-exceeded",
             Self::ConstraintTooLong { .. } => "admission-constraint-too-long",
+            Self::DetailTooLong { .. } => "admission-detail-too-long",
             Self::Schema(error) => error.code(),
         }
     }
@@ -768,6 +790,14 @@ impl Display for AgentAdmissionError {
             Self::ConstraintTooLong { length, maximum } => write!(
                 f,
                 "an admission constraint is {length} bytes, over the {maximum}-byte bound"
+            ),
+            Self::DetailTooLong {
+                field,
+                length,
+                maximum,
+            } => write!(
+                f,
+                "the {field} is {length} bytes, over the {maximum}-byte bound"
             ),
             Self::Schema(error) => Display::fmt(error, f),
         }
@@ -973,6 +1003,24 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unbounded_evaluator_service_name_is_refused() {
+        // The variant promises "a stable, bounded identifier", and the durable
+        // record enforces the promise itself rather than trusting whoever
+        // authored the decision.
+        let error = AutonomyAdmissionDecision::new(
+            [AgentOperationClass::BoundedAsync].into_iter().collect(),
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            envelope(),
+            AgentAdmissionEvaluator::Service("x".repeat(AGENT_ADMISSION_DETAIL_MAX_LENGTH + 1)),
+            everything(),
+            now(),
+        )
+        .expect_err("an unbounded service name must not enter a durable record");
+        assert_eq!(error.code(), "admission-detail-too-long");
     }
 
     #[test]

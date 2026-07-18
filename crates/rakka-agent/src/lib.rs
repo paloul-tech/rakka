@@ -92,8 +92,8 @@ pub use admission::{
 pub use agent::{
     agent_entity_id, agent_entity_persistence_id, agent_entity_ref, agent_entity_type_key,
     init_agent_entity_remote_sharding, init_agent_entity_sharding, load_agent_entity_state,
-    passivate_agent_entity, registered_agent_entity_ref, AgentEntity, AgentEntityCommand,
-    AgentEntityError, AgentEntityMessage, AgentEntityOutcome, AgentEntityRef,
+    passivate_agent_entity, registered_agent_entity_ref, AgentAdmissionRetraction, AgentEntity,
+    AgentEntityCommand, AgentEntityError, AgentEntityMessage, AgentEntityOutcome, AgentEntityRef,
     AgentEntityRegistration, AgentEntityReply, AgentEntityResult, AgentEntityShardingSettings,
     AgentEntitySnapshot, AgentEntityState, AgentEntityStore, AgentEntityTypeKey,
     AgentLifecycleStatus, AgentOperationLog, AGENT_ENTITY_OPERATION_LOG_CAPACITY,

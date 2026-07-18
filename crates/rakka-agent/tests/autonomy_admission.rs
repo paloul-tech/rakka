@@ -11,12 +11,13 @@ use std::collections::BTreeSet;
 
 use rakka_agent::testkit::ScriptedDispatcher;
 use rakka_agent::{
-    AgentAdmissionEvaluator, AgentAdmissionRequirement, AgentAssignmentRefusalReason,
-    AgentAuthorityEnvelope, AgentBudgetCeilings, AgentDefinition, AgentDefinitionId,
-    AgentEntityCommand, AgentEntityStore, AgentModelTurn, AgentModelUsage, AgentOperationClass,
-    AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentPolicyRefs, AgentRevisionNumber,
-    AgentRunStatus, AgentSettings, AgentTaskContent, AgentTaskDefinition, AgentTaskStatus,
-    AutonomyAdmissionDecision,
+    load_agent_entity_state, AgentAdmissionEvaluator, AgentAdmissionRequirement,
+    AgentAssignmentRefusalReason, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentDefinition,
+    AgentDefinitionId, AgentEntityCommand, AgentEntityStore, AgentModelTurn, AgentModelUsage,
+    AgentOperationClass, AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentPolicyRefs,
+    AgentRevisionNumber, AgentRunStatus, AgentSchemaPolicy, AgentSettings, AgentTaskContent,
+    AgentTaskDefinition, AgentTaskStatus, AutonomyAdmissionDecision,
+    AGENT_ADMISSION_DETAIL_MAX_LENGTH,
 };
 
 mod common;
@@ -272,4 +273,123 @@ async fn a_definition_that_widens_after_admission_stops_unattended_work() {
         .last_refusal
         .expect("a refusal is recorded");
     assert_eq!(refusal.reason, AgentAssignmentRefusalReason::NotAdmitted);
+}
+
+#[tokio::test]
+async fn a_retraction_returns_the_agent_to_the_fail_closed_default() {
+    // `Retract` end to end: an admitted agent runs unattended work; a
+    // retraction returns it to the fail-closed default, indistinguishable from
+    // never-admitted at the enforcement point — and the retraction's bounded
+    // reason lands on the entity's own durable record, so an operator asking
+    // why the agent stopped running unattended gets the answer from state
+    // rather than from a log.
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    let envelope = instantiate_admittable_agent(&fx).await;
+
+    let decision = AutonomyAdmissionDecision::new(
+        [AgentOperationClass::BoundedAsync].into_iter().collect(),
+        AgentRevisionNumber::INITIAL,
+        AgentRevisionNumber::INITIAL,
+        envelope,
+        AgentAdmissionEvaluator::Service("risk-policy-service".to_string()),
+        every_requirement(),
+        provenance(2).accepted_at,
+    )
+    .expect("a complete admission");
+    admit(&fx, decision).await;
+
+    let mut agent = AgentEntityStore::new(agent_scope(), fx.agents.clone());
+    agent.recover().await.expect("the agent should recover");
+
+    // A reason past the bound is refused before anything durable changes: the
+    // reason becomes part of a durable record, so it is held to the same bound
+    // every admission detail is.
+    let error = agent
+        .apply(AgentEntityCommand::Retract {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::Command,
+                &agent_scope(),
+                "retract-too-long",
+            )
+            .expect("operation id should be derivable"),
+            reason: "x".repeat(AGENT_ADMISSION_DETAIL_MAX_LENGTH + 1),
+            provenance: Box::new(provenance(3)),
+        })
+        .await
+        .expect_err("an unbounded reason must not enter a durable record");
+    assert_eq!(error.code(), "admission-detail-too-long");
+
+    agent
+        .apply(AgentEntityCommand::Retract {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::Command,
+                &agent_scope(),
+                "retract-1",
+            )
+            .expect("operation id should be derivable"),
+            reason: "credential rotation incident".to_string(),
+            provenance: Box::new(provenance(3)),
+        })
+        .await
+        .expect("the retraction is accepted");
+
+    let state = load_agent_entity_state(&fx.agents, &agent_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the agent state loads")
+        .expect("the agent exists");
+    assert!(
+        state.admission().is_none(),
+        "a retracted admission is gone from every enforcement point"
+    );
+    let retraction = state
+        .admission_retraction()
+        .expect("the retraction explains the fail-closed default");
+    assert_eq!(retraction.reason, "credential rotation incident");
+
+    fx.create_task_with(unattended_task()).await;
+    fx.pump()
+        .await
+        .expect("the assignment is refused, not stuck");
+
+    assert!(
+        fx.run_snapshot().await.is_none(),
+        "a retracted agent runs no unattended work"
+    );
+    let refusal = fx
+        .task_snapshot()
+        .await
+        .last_refusal
+        .expect("a refusal is recorded");
+    assert_eq!(refusal.reason, AgentAssignmentRefusalReason::NotAdmitted);
+}
+
+#[tokio::test]
+async fn an_undeclared_operation_class_is_refused_as_its_own_reason() {
+    // The envelope declares the task's definition but not the unattended
+    // class the task runs under. The refusal names the class, not the task
+    // definition, because the remedies differ: the definition is fully
+    // declared, and it is the *kind of autonomy* the envelope never granted.
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    let mut envelope = admittable_envelope();
+    envelope.operation_classes.clear();
+    fx.instantiate_agent_with_envelope(envelope).await;
+
+    fx.create_task_with(unattended_task()).await;
+    fx.pump()
+        .await
+        .expect("the assignment is refused, not stuck");
+
+    assert!(
+        fx.run_snapshot().await.is_none(),
+        "an undeclared operation class admits nothing"
+    );
+    let refusal = fx
+        .task_snapshot()
+        .await
+        .last_refusal
+        .expect("a refusal is recorded");
+    assert_eq!(
+        refusal.reason,
+        AgentAssignmentRefusalReason::OperationClassNotDeclared
+    );
 }

@@ -793,7 +793,14 @@ Guidance: [Hierarchical Budget Ledger](technical-guidance.md#hierarchical-budget
   (an `Indeterminate` attempt included) and releases the rest. Reserving the max
   up front is what denies a run work it could not afford to finish retrying, and
   what makes the `effects`/`effect_attempts`/`concurrent-effects` dimensions
-  real rather than declared.
+  real rather than declared. The settle runs exactly once, on the generation's
+  first resolution — a reconciliation that confirms an `Indeterminate`
+  generation executed bills nothing further — and a reconciliation-authorized
+  re-invocation reserves the *new* generation's attempt bound the same way
+  (`reserve_attempts`): a run that cannot afford it refuses the resolution
+  (`run-redispatch-unaffordable`) rather than dispatching unreserved work, and
+  the operator's remaining decision is a cancellation, whose wind-down settles
+  the generation without invocation.
 - **The `rakka-agent-workflow` autonomy counters are superseded, not extended.**
   The slice text said to "extend the existing `autonomy.rs` counters into the
   ledger dimensions." `rakka-agent-workflow`'s `AgentAutonomyUsage`/

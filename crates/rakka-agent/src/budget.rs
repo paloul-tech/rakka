@@ -1235,6 +1235,24 @@ impl AgentRunBudget {
         Ok(())
     }
 
+    /// Reserves the attempt bound of one redispatched generation, or reports
+    /// the ceiling it would cross.
+    ///
+    /// This is the redispatch half of the reservation discipline: a
+    /// reconciliation that proves an ambiguous generation never executed
+    /// authorizes a *new* generation with a fresh attempt budget
+    /// ([specification 11.3](../../../docs/plans/rakka-agent/spec.md)), and
+    /// that budget must be spoken for before the generation becomes
+    /// dispatchable, exactly as the original turn's reservation was. Only the
+    /// attempts are reserved — the durable effect was charged once at commit,
+    /// and a new generation of it is not a new effect.
+    pub fn reserve_attempts(&mut self, max_attempts: u32) -> Result<(), AgentBudgetExhaustion> {
+        let attempts = u64::from(max_attempts);
+        self.check_amount(AgentBudgetDimension::EffectAttempts, attempts)?;
+        self.reserved_attempts = self.reserved_attempts.saturating_add(attempts);
+        Ok(())
+    }
+
     /// Settles one effect's reservation from its durable result
     /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): settle
     /// usage from the durable accepted result).
@@ -1609,6 +1627,33 @@ mod tests {
         budget
             .reserve_tool_turn(1, 3, 0, now)
             .expect("the released attempts are spendable");
+    }
+
+    #[test]
+    fn a_redispatch_reservation_is_checked_against_what_is_spoken_for() {
+        // The redispatch half of the reservation discipline: a reconciliation
+        // that authorizes a new generation reserves its attempt bound against
+        // what is already consumed *and* reserved, exactly as a turn's
+        // reservation is.
+        let grant = AgentBudgetGrant::new(
+            AgentBudgetAllocation {
+                effect_attempts: Some(3),
+                ..AgentBudgetAllocation::unbounded()
+            },
+            AgentBudgetLimits::unbounded(),
+        );
+        let now = AgentTimestampMillis::new(1_752_451_200_000);
+        let mut budget = AgentRunBudget::allocate(grant, now);
+
+        budget
+            .reserve_tool_turn(1, 2, 0, now)
+            .expect("two of three attempts");
+        budget.reserve_attempts(1).expect("the third is free");
+        let exhaustion = budget
+            .reserve_attempts(1)
+            .expect_err("everything is spoken for");
+        assert_eq!(exhaustion.dimension, AgentBudgetDimension::EffectAttempts);
+        assert_eq!(budget.reserved_attempts(), 3);
     }
 
     #[test]
