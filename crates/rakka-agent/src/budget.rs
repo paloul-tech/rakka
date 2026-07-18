@@ -90,8 +90,8 @@
 //! parent-local allocation decision under its own ceilings, deduplicated on the
 //! child's escrow record by the request sequence. A grant that adds room in the
 //! exhausted dimension resumes the run where it parked — the failing charge was
-//! all-or-nothing ([`AgentRunBudget::charge_turn`],
-//! [`AgentRunBudget::charge_tool_calls`]), so re-attempting it double-counts
+//! all-or-nothing ([`AgentRunBudget::reserve_model_turn`],
+//! [`AgentRunBudget::reserve_tool_turn`]), so re-attempting it double-counts
 //! nothing. A grant of nothing is the parent's honest answer when it has
 //! nothing left, and the run stops with the *original* exhaustion rather than
 //! parking forever. Because each grant strictly reduces the parent's headroom,
@@ -1130,90 +1130,95 @@ impl AgentRunBudget {
         self.charge(AgentBudgetDimension::ToolCalls, 1)
     }
 
-    /// Charges one whole turn — one loop iteration and one model call — as a
-    /// single all-or-nothing operation, or reports the first ceiling it would
-    /// cross.
-    ///
-    /// A turn's two charges are checked together and committed together, so a
-    /// turn that cannot afford its model call never leaves the iteration charged.
-    /// That atomicity is what makes exhaustion *parkable*: a run that parks to
-    /// ask its parent for more budget must be able to re-attempt this exact
-    /// charge on resume without double-counting the half that already went
-    /// through ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
-    /// The dimensions are checked in the same priority the separate charges
-    /// imposed — deadline, iteration, tokens, cost, then model call — so the
-    /// reported exhaustion is unchanged.
-    pub fn charge_turn(&mut self, now: AgentTimestampMillis) -> Result<(), AgentBudgetExhaustion> {
-        self.check_deadline(now)?;
-        self.check_amount(AgentBudgetDimension::LoopIterations, 1)?;
-        self.check(AgentBudgetDimension::Tokens)?;
-        self.check(AgentBudgetDimension::Cost)?;
-        self.check_amount(AgentBudgetDimension::ModelCalls, 1)?;
-        // Every ceiling cleared, so neither charge can now fail.
-        self.consumed.add(AgentBudgetDimension::LoopIterations, 1);
-        self.consumed.add(AgentBudgetDimension::ModelCalls, 1);
-        Ok(())
-    }
-
-    /// Charges a whole tool fan-out as a single all-or-nothing operation, or
-    /// reports the ceiling it would cross without charging any of it.
-    ///
-    /// A turn's tool calls are committed together or not at all
-    /// ([specification 11] fan-out atomicity), so the charge is too: a run that
-    /// cannot afford the whole fan-out parks with none of it charged and
-    /// re-attempts this exact count on resume.
-    pub fn charge_tool_calls(
-        &mut self,
-        count: u64,
-        now: AgentTimestampMillis,
-    ) -> Result<(), AgentBudgetExhaustion> {
-        self.check_deadline(now)?;
-        self.charge(AgentBudgetDimension::ToolCalls, count)
-    }
-
-    /// Reserves one effect and the attempts its policy permits it, or reports
-    /// the ceiling it would cross
+    /// Charges everything one model turn commits — a loop iteration, a model
+    /// call, and one model effect — and reserves that effect's attempt bound, as
+    /// a single all-or-nothing operation
     /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): before
-    /// dispatch, atomically reserve the applicable budget from the run's own
-    /// durable ledger or deny the operation).
+    /// dispatch, atomically reserve the applicable budget or deny the
+    /// operation).
     ///
-    /// The reservation is the whole attempt bound rather than one attempt,
-    /// because the dispatch layer owns the attempts between `Ready` and a
-    /// terminal outcome and never wakes the run per attempt. Reserving the
-    /// maximum is what makes a run unable to start work it could not afford to
-    /// finish retrying; [`Self::settle_effect`] releases whatever the attempts
-    /// did not use.
-    ///
-    /// `outstanding` is how many effects the run already has in flight, which
-    /// is a level rather than a total and so is checked against the inherited
-    /// concurrency limit rather than debited.
-    pub fn reserve_effect(
+    /// Every ceiling is checked before anything is charged, so a turn that
+    /// cannot afford one dimension never leaves another charged. That atomicity
+    /// is what makes exhaustion *parkable*: a run that parks to ask its parent
+    /// for more budget re-attempts this exact charge on resume without
+    /// double-counting a half that already went through. The dimensions are
+    /// checked in a stable priority — deadline, concurrency, iteration, tokens,
+    /// cost, model call, effect, attempts — so the reported exhaustion is
+    /// deterministic.
+    pub fn reserve_model_turn(
         &mut self,
         max_attempts: u32,
         outstanding: usize,
         now: AgentTimestampMillis,
     ) -> Result<(), AgentBudgetExhaustion> {
-        self.check_deadline(now)?;
-
-        if let Some(maximum) = self.limits.max_concurrent_effects {
-            let outstanding = u64::try_from(outstanding).unwrap_or(u64::MAX);
-            if outstanding >= u64::from(maximum) {
-                return Err(AgentBudgetExhaustion::new(
-                    AgentBudgetDimension::ConcurrentEffects,
-                    u64::from(maximum),
-                    outstanding,
-                ));
-            }
-        }
-
         let attempts = u64::from(max_attempts);
-        // Both dimensions are checked before either is charged: a run refused
-        // its attempts must not be left holding a charge for an effect it never
-        // committed.
+        self.check_deadline(now)?;
+        self.check_concurrency(outstanding, 1)?;
+        self.check_amount(AgentBudgetDimension::LoopIterations, 1)?;
+        self.check(AgentBudgetDimension::Tokens)?;
+        self.check(AgentBudgetDimension::Cost)?;
+        self.check_amount(AgentBudgetDimension::ModelCalls, 1)?;
         self.check_amount(AgentBudgetDimension::Effects, 1)?;
         self.check_amount(AgentBudgetDimension::EffectAttempts, attempts)?;
-        self.charge(AgentBudgetDimension::Effects, 1)?;
+        // Every ceiling cleared, so no charge can now fail.
+        self.consumed.add(AgentBudgetDimension::LoopIterations, 1);
+        self.consumed.add(AgentBudgetDimension::ModelCalls, 1);
+        self.consumed.add(AgentBudgetDimension::Effects, 1);
         self.reserved_attempts = self.reserved_attempts.saturating_add(attempts);
+        Ok(())
+    }
+
+    /// Charges everything one tool fan-out commits — one tool call and one
+    /// effect per tool — and reserves the fan-out's total attempt bound, as a
+    /// single all-or-nothing operation.
+    ///
+    /// A turn's tool calls are committed together or not at all
+    /// ([specification 11] fan-out atomicity), so the reservation is too: a run
+    /// that cannot afford the whole fan-out parks with none of it charged and
+    /// re-attempts this exact fan-out on resume. `total_attempts` is the sum of
+    /// the fan-out's per-tool attempt bounds, and `outstanding` is how many
+    /// effects are already in flight, which is a level checked against the
+    /// concurrency ceiling rather than debited.
+    pub fn reserve_tool_turn(
+        &mut self,
+        count: u64,
+        total_attempts: u64,
+        outstanding: usize,
+        now: AgentTimestampMillis,
+    ) -> Result<(), AgentBudgetExhaustion> {
+        self.check_deadline(now)?;
+        self.check_concurrency(outstanding, count)?;
+        self.check_amount(AgentBudgetDimension::ToolCalls, count)?;
+        self.check_amount(AgentBudgetDimension::Effects, count)?;
+        self.check_amount(AgentBudgetDimension::EffectAttempts, total_attempts)?;
+        self.consumed.add(AgentBudgetDimension::ToolCalls, count);
+        self.consumed.add(AgentBudgetDimension::Effects, count);
+        self.reserved_attempts = self.reserved_attempts.saturating_add(total_attempts);
+        Ok(())
+    }
+
+    /// Whether `count` more effects fit under the concurrency ceiling given how
+    /// many are already `outstanding`.
+    ///
+    /// Concurrency is a *level*, not a total: it bounds how many effects run at
+    /// once, so it is checked against the in-flight count rather than debited
+    /// from a running sum ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    fn check_concurrency(
+        &self,
+        outstanding: usize,
+        count: u64,
+    ) -> Result<(), AgentBudgetExhaustion> {
+        let Some(maximum) = self.limits.max_concurrent_effects else {
+            return Ok(());
+        };
+        let outstanding = u64::try_from(outstanding).unwrap_or(u64::MAX);
+        if outstanding.saturating_add(count) > u64::from(maximum) {
+            return Err(AgentBudgetExhaustion::new(
+                AgentBudgetDimension::ConcurrentEffects,
+                u64::from(maximum),
+                outstanding,
+            ));
+        }
         Ok(())
     }
 
@@ -1574,12 +1579,12 @@ mod tests {
         let mut budget = AgentRunBudget::allocate(grant, now);
 
         budget
-            .reserve_effect(3, 0, now)
+            .reserve_tool_turn(1, 3, 0, now)
             .expect("three of four attempts");
         // The reservation is spoken for: a second effect wanting three attempts
         // cannot have the one attempt that is left.
         let exhaustion = budget
-            .reserve_effect(3, 0, now)
+            .reserve_tool_turn(1, 3, 0, now)
             .expect_err("only one attempt is unreserved");
         assert_eq!(exhaustion.dimension, AgentBudgetDimension::EffectAttempts);
 
@@ -1589,7 +1594,7 @@ mod tests {
         // Two of the three reserved attempts went unused and are the run's
         // again.
         budget
-            .reserve_effect(3, 0, now)
+            .reserve_tool_turn(1, 3, 0, now)
             .expect("the released attempts are spendable");
     }
 
@@ -1606,14 +1611,16 @@ mod tests {
         let now = AgentTimestampMillis::new(1_752_451_200_000);
         let mut budget = AgentRunBudget::allocate(grant, now);
 
-        budget.reserve_effect(1, 0, now).expect("the only attempt");
+        budget
+            .reserve_tool_turn(1, 1, 0, now)
+            .expect("the only attempt");
         // The attempt reached durable `Started` and its outcome is unknown. It
         // is settled exactly as a known one would be.
         budget.settle_effect(1, 1);
 
         assert_eq!(budget.consumption().effect_attempts, 1);
         let exhaustion = budget
-            .reserve_effect(1, 0, now)
+            .reserve_tool_turn(1, 1, 0, now)
             .expect_err("the attempt budget is spent");
         assert_eq!(exhaustion.dimension, AgentBudgetDimension::EffectAttempts);
     }
@@ -1630,9 +1637,11 @@ mod tests {
         let now = AgentTimestampMillis::new(1_752_451_200_000);
         let mut budget = AgentRunBudget::allocate(grant, now);
 
-        budget.reserve_effect(1, 1, now).expect("one in flight");
+        budget
+            .reserve_tool_turn(1, 1, 1, now)
+            .expect("one in flight");
         let exhaustion = budget
-            .reserve_effect(1, 2, now)
+            .reserve_tool_turn(1, 1, 2, now)
             .expect_err("two are already in flight");
         assert_eq!(
             exhaustion.dimension,
@@ -1640,7 +1649,7 @@ mod tests {
         );
         // The level cleared, and nothing about it was spent.
         budget
-            .reserve_effect(1, 0, now)
+            .reserve_tool_turn(1, 1, 0, now)
             .expect("the level is a level, not a total");
     }
 

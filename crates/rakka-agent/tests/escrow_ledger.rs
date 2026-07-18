@@ -12,7 +12,7 @@
 //! never a telemetry projection — so they are correct while every entity is
 //! passivated.
 
-use rakka_agent::testkit::{ExchangeFault, ScriptedDispatcher};
+use rakka_agent::testkit::{CrashPoint, ExchangeFault, ScriptedDispatcher};
 use rakka_agent::{
     load_agent_task_state, AgentBudgetAllocation, AgentBudgetCeilings, AgentBudgetDimension,
     AgentEscrowChildId, AgentModelTurn, AgentModelUsage, AgentRunSettlementStatus, AgentRunStatus,
@@ -125,10 +125,15 @@ async fn a_completed_run_settles_what_it_spent_and_returns_what_it_did_not() {
     let escrow = &task.task().expect("the task is created").escrow;
 
     // The run took exactly one model turn, which the ledger counts as one
-    // iteration and one model call, and the turn billed 15 tokens.
+    // iteration, one model call, one durable effect, and one dispatch attempt,
+    // and the turn billed 15 tokens. The effect and attempt dimensions are the
+    // proof that a real dispatched effect debits the run's ledger — not only the
+    // per-turn counters.
     let consumed = escrow.consumed();
     assert_eq!(consumed.loop_iterations, 1);
     assert_eq!(consumed.model_calls, 1);
+    assert_eq!(consumed.effects, 1);
+    assert_eq!(consumed.effect_attempts, 1);
     assert_eq!(consumed.tokens, 15);
 
     // The escrow is closed: the return removed the child, so the task's headroom
@@ -377,4 +382,262 @@ async fn a_duplicated_top_up_delivery_credits_the_run_once() {
         escrow.available(AgentBudgetDimension::LoopIterations),
         Some(2)
     );
+}
+
+#[tokio::test]
+async fn an_effect_attempt_budget_is_reserved_up_front_and_denies_an_unaffordable_turn() {
+    // Scenario 52's reservation clause: the effect and its attempts are reserved
+    // before dispatch from the run's own ledger. A run escrowed a single effect
+    // attempt takes exactly one model turn — the second turn's model effect
+    // cannot be reserved — so it stops with a structured `effect-attempts`
+    // exhaustion. The parent has nothing more to give (it escrowed its whole
+    // attempt budget to the run), so the run fails rather than looping.
+    let tight = AgentTaskDefinition::new(
+        task_definition_id(),
+        "A ticket whose run may make exactly one dispatch attempt.",
+        schema("ticket-input"),
+        schema("ticket-result"),
+    )
+    .expect("task definition should be valid")
+    .with_budgets(AgentBudgetCeilings {
+        max_effect_attempts: Some(1),
+        ..AgentBudgetCeilings::unbounded()
+    });
+
+    // The model never proposes, so the run would take a second turn — but the
+    // second turn's model effect cannot reserve an attempt.
+    let fx = Fixture::new(ScriptedDispatcher::new());
+    fx.instantiate_agent().await;
+    fx.create_task_with(tight).await;
+    fx.pump()
+        .await
+        .expect("the run stops when it cannot reserve a second attempt");
+
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Failed);
+    let Some(rakka_agent::AgentRunTerminalReason::BudgetExhausted { exhaustion }) =
+        run.terminal_reason
+    else {
+        panic!(
+            "expected an effect-attempts exhaustion, got {:?}",
+            run.terminal_reason
+        );
+    };
+    assert_eq!(exhaustion.dimension, AgentBudgetDimension::EffectAttempts);
+    assert_eq!(exhaustion.limit, 1);
+
+    // Exactly one attempt reached the dispatcher, and the ledger consumed it.
+    assert_eq!(run.budget.consumption().effect_attempts, 1);
+    assert_eq!(run.budget.consumption().effects, 1);
+
+    let task = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the task state loads")
+        .expect("the task exists");
+    let escrow = &task.task().expect("the task is created").escrow;
+    assert_eq!(escrow.consumed().effect_attempts, 1);
+    assert_eq!(
+        escrow.available(AgentBudgetDimension::EffectAttempts),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn a_run_past_its_deadline_stops_without_asking_for_a_top_up() {
+    // A wall-clock deadline is elapsed time, not a quantity a parent can grant.
+    // A run that crosses it must stop with the structured reason — never park to
+    // ask for more and re-park on a ceiling that would never move.
+    let d1 = AgentTaskDefinition::new(
+        task_definition_id(),
+        "A ticket whose run is already past its deadline.",
+        schema("ticket-input"),
+        schema("ticket-result"),
+    )
+    .expect("task definition should be valid")
+    .with_budgets(AgentBudgetCeilings {
+        // The deadline is the acceptance instant itself, so the run's first turn
+        // is already past it.
+        max_wall_clock_millis: Some(0),
+        ..AgentBudgetCeilings::unbounded()
+    });
+
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    fx.instantiate_agent().await;
+    fx.create_task_with(d1).await;
+    fx.pump()
+        .await
+        .expect("the run stops at its deadline without looping");
+
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Failed);
+    assert!(
+        run.pending_top_up.is_none(),
+        "a deadline is not a quantity to ask a parent for"
+    );
+    assert_eq!(
+        run.budget.top_ups(),
+        0,
+        "the run never asked for a top-up on a wall-clock ceiling"
+    );
+    let Some(rakka_agent::AgentRunTerminalReason::BudgetExhausted { exhaustion }) =
+        run.terminal_reason
+    else {
+        panic!(
+            "expected a wall-clock exhaustion, got {:?}",
+            run.terminal_reason
+        );
+    };
+    assert_eq!(exhaustion.dimension, AgentBudgetDimension::WallClock);
+}
+
+#[tokio::test]
+async fn concurrent_run_allocations_cannot_oversubscribe_their_parent() {
+    // The escrow ledger is a single writer, so concurrent allocation requests
+    // serialize through it and none can grant budget the parent does not hold.
+    // Ten runs race to claim four tokens each from a parent holding only ten;
+    // whatever interleaving wins, the granted total never exceeds ten and the
+    // parent's headroom never goes negative ([specification 9.7]; scenario 52's
+    // no-oversubscription clause).
+    use std::sync::{Arc, Mutex};
+
+    let ledger = Arc::new(Mutex::new(rakka_agent::AgentEscrowLedger::new(
+        rakka_agent::AgentBudgetGrant::new(
+            AgentBudgetAllocation {
+                tokens: Some(10),
+                ..AgentBudgetAllocation::unbounded()
+            },
+            rakka_agent::AgentBudgetLimits::unbounded(),
+        ),
+    )));
+
+    let mut handles = Vec::new();
+    for index in 0..10u32 {
+        let ledger = ledger.clone();
+        handles.push(tokio::spawn(async move {
+            let child = AgentEscrowChildId::new(format!("run-{index}")).expect("a valid child id");
+            let request = AgentBudgetAllocation {
+                tokens: Some(4),
+                ..AgentBudgetAllocation::unbounded()
+            };
+            let mut guard = ledger.lock().expect("the ledger mutex is not poisoned");
+            guard
+                .open_child(child, &request)
+                .expect("opening a child never errors")
+                .tokens
+                .unwrap_or(0)
+        }));
+    }
+
+    let mut granted_total = 0u64;
+    for handle in handles {
+        granted_total += handle.await.expect("the task joins");
+    }
+
+    let guard = ledger.lock().expect("the ledger mutex is not poisoned");
+    assert!(
+        granted_total <= 10,
+        "granted {granted_total} tokens from a parent holding only 10"
+    );
+    assert_eq!(
+        guard.available(AgentBudgetDimension::Tokens),
+        Some(0),
+        "the parent is fully allocated and never oversubscribed"
+    );
+    // The outstanding children hold exactly what was granted — no more than the
+    // parent ever had.
+    let outstanding: u64 = guard
+        .outstanding()
+        .map(|(_, escrow)| escrow.allocated().tokens.unwrap_or(0))
+        .sum();
+    assert_eq!(outstanding, granted_total);
+}
+
+#[tokio::test]
+async fn the_escrow_round_trip_survives_a_restart_at_every_durable_boundary() {
+    // Scenario 52's restart clause, joined to scenario 61's replay clause: kill
+    // the run's owner at each durable write of the whole escrow round trip —
+    // allocation, reservation, settlement, and return — on both sides of the
+    // compare-and-set, and re-drive from durable state alone. Every crash must
+    // converge on the same escrow: the parent debited once, the run's consumption
+    // settled once, and the remainder returned once. A re-driven settlement or
+    // return is answered from the task's escrow record, so a restart never
+    // double-debits or double-credits.
+    let reference = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    reference.instantiate_agent().await;
+    reference.runs.reset_writes();
+    reference.create_task_with(escrowed_definition()).await;
+    reference
+        .pump()
+        .await
+        .expect("the reference round trip completes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 7,
+        "the escrow round trip should make several durable writes, saw {writes}"
+    );
+
+    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
+        for nth in 1..=writes {
+            let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+            fx.instantiate_agent().await;
+
+            fx.runs.crash_at(nth, point);
+            fx.create_task_with(escrowed_definition()).await;
+            let _crashed = fx.pump().await;
+
+            // A new owner activates and finds only what was durably committed.
+            fx.runs.survive();
+            fx.pump().await.unwrap_or_else(|error| {
+                panic!("crash {point:?} at write {nth} did not converge: {error}")
+            });
+
+            let run = fx
+                .run_snapshot()
+                .await
+                .unwrap_or_else(|| panic!("crash {point:?} at write {nth}: the run was lost"));
+            assert_eq!(
+                run.status,
+                AgentRunStatus::Completed,
+                "crash {point:?} at write {nth} should still complete"
+            );
+            assert_eq!(
+                run.settlement,
+                AgentRunSettlementStatus::Returned,
+                "crash {point:?} at write {nth} should still hand its escrow back"
+            );
+
+            let task =
+                load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+                    .await
+                    .expect("the task state loads")
+                    .expect("the task exists");
+            let escrow = &task.task().expect("the task is created").escrow;
+
+            // Exactly what the crash-free run consumed — never twice.
+            let consumed = escrow.consumed();
+            assert_eq!(
+                (
+                    consumed.loop_iterations,
+                    consumed.model_calls,
+                    consumed.effects,
+                    consumed.effect_attempts,
+                    consumed.tokens
+                ),
+                (1, 1, 1, 1, 15),
+                "crash {point:?} at write {nth} settled the wrong consumption"
+            );
+            // The child returned exactly once, so the headroom is the full
+            // allocation less only what the run spent — no double-credit.
+            assert!(
+                escrow.child(&run_child()).is_none(),
+                "crash {point:?} at write {nth} left the escrow open"
+            );
+            assert_eq!(
+                escrow.available(AgentBudgetDimension::LoopIterations),
+                Some(9),
+                "crash {point:?} at write {nth} double-credited the parent"
+            );
+            assert_eq!(escrow.available(AgentBudgetDimension::Tokens), Some(985));
+        }
+    }
 }

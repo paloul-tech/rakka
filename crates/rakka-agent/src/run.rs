@@ -87,8 +87,8 @@ use crate::choreography::{
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
-    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
-    AgentRunEffectStatus, AgentToolResult,
+    AgentEffectSpec, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
+    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
 };
 use crate::identity::{
     AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
@@ -944,6 +944,30 @@ fn terminate(
     Ok(())
 }
 
+/// Responds to a budget exhaustion: park to ask the parent for more when the
+/// dimension is a conserved quantity, or stop when nothing can grant it.
+///
+/// A wall-clock deadline and a concurrency ceiling are not quantities a parent
+/// can hand over — the first is elapsed time, the second a level — so a run that
+/// hits one stops with the structured reason rather than asking for more and
+/// re-parking on a ceiling that would never move
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+fn park_or_terminate(
+    state: &mut AgentRunState,
+    exhaustion: AgentBudgetExhaustion,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    if exhaustion.dimension.is_conserved() {
+        park_for_top_up(state, exhaustion, now)
+    } else {
+        terminate(
+            state,
+            AgentRunTerminalReason::BudgetExhausted { exhaustion },
+            now,
+        )
+    }
+}
+
 /// Parks the run on a top-up request after a charge exhausted a ceiling
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -1365,27 +1389,8 @@ fn prepare_context(
         run.loop_state.turn()
     };
 
-    // The budget is charged *before* the effect is persisted: an effect that
-    // reaches durable dispatch has been paid for whether or not its outcome is
-    // ever known ([specification 9.7]). The iteration and the model call are one
-    // all-or-nothing charge, so an exhaustion parks the run with nothing charged
-    // and it re-attempts this exact charge once its parent tops it up.
-    {
-        let run = state.run_mut()?;
-        if let Err(exhaustion) = run.loop_state.budget_mut().charge_turn(now) {
-            return park_for_top_up(state, exhaustion, now);
-        }
-    }
-
     let context = AgentContextSnapshotRef::for_turn(scope, turn)?;
     let profile = None;
-    let (slot, settings_revision) = {
-        let run = state.run_mut()?;
-        (
-            run.loop_state.next_effect_slot(),
-            run.loop_state.agent_settings_revision(),
-        )
-    };
     let request = AgentRunEffectRequest::Model {
         context: context.clone(),
         profile,
@@ -1395,6 +1400,34 @@ fn prepare_context(
     // never something the model's output can choose or widen
     // ([specification 11.2]).
     let spec = policies.spec_for(&request).clone();
+
+    // Everything the turn costs is charged *before* the effect is persisted, in
+    // one all-or-nothing reservation: the iteration, the model call, the effect,
+    // and its whole attempt bound. An effect that reaches durable dispatch has
+    // been paid for whether or not its outcome is ever known, and reserving the
+    // attempt bound up front is what stops a run from starting work it could not
+    // afford to finish retrying ([specification 9.7]). A conserved-dimension
+    // exhaustion parks the run — nothing charged — to ask its parent for more; a
+    // deadline stops it.
+    {
+        let run = state.run_mut()?;
+        let outstanding = run.loop_state.outstanding_effects().count();
+        if let Err(exhaustion) =
+            run.loop_state
+                .budget_mut()
+                .reserve_model_turn(spec.max_attempts, outstanding, now)
+        {
+            return park_or_terminate(state, exhaustion, now);
+        }
+    }
+
+    let (slot, settings_revision) = {
+        let run = state.run_mut()?;
+        (
+            run.loop_state.next_effect_slot(),
+            run.loop_state.agent_settings_revision(),
+        )
+    };
     let effect = AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
 
     let run = state.run_mut()?;
@@ -1437,20 +1470,45 @@ fn evaluate_model_output(
         return Ok(());
     }
 
-    // The whole fan-out is charged before any effect is recorded, all-or-nothing:
-    // a turn either fits its budget or commits none of it, so the record never
-    // holds a partial fan-out. A run that cannot afford the fan-out parks with
-    // nothing charged and re-attempts this exact count once its parent tops it
-    // up ([specification 9.7]).
+    // Each tool's spec — safety class, attempt bound, protocol — comes from its
+    // registration, defaulting to a single non-idempotent attempt for a tool the
+    // deployment has not classified: the model asked for the call, but it cannot
+    // choose how failure and ambiguity are handled ([specification 11.2]).
+    let requests: Vec<(AgentRunEffectRequest, AgentEffectSpec)> = calls
+        .into_iter()
+        .map(|call| {
+            let request = AgentRunEffectRequest::Tool {
+                call: Box::new(call),
+            };
+            let spec = policies.spec_for(&request).clone();
+            (request, spec)
+        })
+        .collect();
+
+    // The whole fan-out is reserved before any effect is recorded, all-or-nothing:
+    // one tool call and one effect per tool, plus the sum of their attempt bounds,
+    // checked against the concurrency ceiling. A turn either fits its budget or
+    // commits none of it, so the record never holds a partial fan-out; a run that
+    // cannot afford it parks with nothing charged and re-attempts this exact
+    // fan-out once its parent tops it up ([specification 9.7]).
     {
-        let count = u64::try_from(calls.len()).unwrap_or(u64::MAX);
+        let count = u64::try_from(requests.len()).unwrap_or(u64::MAX);
+        let total_attempts = requests
+            .iter()
+            .map(|(_, spec)| u64::from(spec.max_attempts))
+            .fold(0, u64::saturating_add);
         let run = state.run_mut()?;
-        if let Err(exhaustion) = run.loop_state.budget_mut().charge_tool_calls(count, now) {
-            return park_for_top_up(state, exhaustion, now);
+        let outstanding = run.loop_state.outstanding_effects().count();
+        if let Err(exhaustion) =
+            run.loop_state
+                .budget_mut()
+                .reserve_tool_turn(count, total_attempts, outstanding, now)
+        {
+            return park_or_terminate(state, exhaustion, now);
         }
     }
 
-    for call in calls {
+    for (request, spec) in requests {
         let (slot, settings_revision) = {
             let run = state.run_mut()?;
             (
@@ -1458,14 +1516,6 @@ fn evaluate_model_output(
                 run.loop_state.agent_settings_revision(),
             )
         };
-        let request = AgentRunEffectRequest::Tool {
-            call: Box::new(call),
-        };
-        // The tool's spec comes from its registration, defaulting to a single
-        // non-idempotent attempt for a tool the deployment has not classified:
-        // the model asked for the call, but it cannot choose how failure and
-        // ambiguity are handled ([specification 11.2]).
-        let spec = policies.spec_for(&request).clone();
         let effect =
             AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
         state.run_mut()?.loop_state.record_effect(effect)?;
@@ -1738,6 +1788,24 @@ fn apply_effect_outcome(
             // invocation. Recording that never resumes the run.
             effect.status = AgentRunEffectStatus::Cancelled;
         }
+    }
+
+    // The generation has resolved — succeeded, failed, exhausted, indeterminate,
+    // or cancelled — so settle its attempt reservation from the durable result
+    // ([specification 9.7]). Every attempt that reached durable `Started`,
+    // including one now `Indeterminate`, consumes its attempt budget; the retries
+    // the generation did not use are released back to the run. A generation that
+    // never dispatched (a cancelled or fenced effect) reports zero attempts and
+    // so consumes none.
+    let reservation = {
+        let run = state.run_mut()?;
+        run.loop_state
+            .effect_mut(effect_id)
+            .map(|effect| (effect.max_attempts, effect.attempts))
+    };
+    if let Some((reserved, made)) = reservation {
+        let run = state.run_mut()?;
+        run.loop_state.budget_mut().settle_effect(reserved, made);
     }
 
     let run = state.run_mut()?;

@@ -770,18 +770,43 @@ Guidance: [Hierarchical Budget Ledger](technical-guidance.md#hierarchical-budget
   still-outstanding assignment, otherwise recurse without bound. This made the
   accept/settle split a uniform property of both entities (the durable-outbox
   discipline), not a ledger special case.
-- **Exhaustion parks and asks before it fails.** A run that exhausts a ceiling
-  records `AgentPendingTopUp` (status stays `Running` — a pending exchange is
-  the run's own outbox, the slice 1.5 argument for the result proposal) and
-  sends a deduplicated `BudgetAllocation` request. The charge that exhausted is
-  made all-or-nothing (`charge_turn`, `charge_tool_calls`) so a re-attempt after
-  the grant double-counts nothing. The run resumes iff the parent granted
-  *something* in the exhausted dimension; a grant of nothing stops it with the
-  *original* exhaustion. The relieve test is "did the grant add room," not "does
-  one more unit fit" — the latter is wrong for a multi-unit tool fan-out, where a
-  zero grant on a limit-1 budget would otherwise read as relieved and re-park
-  forever. Because each grant strictly reduces the parent's headroom, the asking
-  always terminates.
+- **Exhaustion parks and asks before it fails.** A run that exhausts a *conserved*
+  ceiling records `AgentPendingTopUp` (status stays `Running` — a pending
+  exchange is the run's own outbox, the slice 1.5 argument for the result
+  proposal) and sends a deduplicated `BudgetAllocation` request. The charge that
+  exhausted is made all-or-nothing (`reserve_model_turn`, `reserve_tool_turn`) so
+  a re-attempt after the grant double-counts nothing. The run resumes iff the
+  parent granted *something* in the exhausted dimension; a grant of nothing stops
+  it with the *original* exhaustion. The relieve test is "did the grant add
+  room," not "does one more unit fit" — the latter is wrong for a multi-unit tool
+  fan-out, where a zero grant on a limit-1 budget would otherwise read as
+  relieved and re-park forever. Because each grant strictly reduces the parent's
+  headroom, the asking always terminates. A *non-conserved* exhaustion (a
+  wall-clock deadline, a concurrency ceiling) is not a quantity a parent can
+  grant, so it terminates the run rather than parking — `park_or_terminate`
+  branches on `AgentBudgetDimension::is_conserved`.
+- **Effect and attempt budgets are reserved at commit and settled at
+  resolution.** Every effect a run commits reserves one durable `effect` and its
+  whole attempt bound from the run's own ledger before dispatch, folded into the
+  all-or-nothing per-turn reservation with a concurrency check; `settle_effect`
+  at each generation's resolution consumes the attempts that reached `Started`
+  (an `Indeterminate` attempt included) and releases the rest. Reserving the max
+  up front is what denies a run work it could not afford to finish retrying, and
+  what makes the `effects`/`effect_attempts`/`concurrent-effects` dimensions
+  real rather than declared.
+- **The `rakka-agent-workflow` autonomy counters are superseded, not extended.**
+  The slice text said to "extend the existing `autonomy.rs` counters into the
+  ledger dimensions." `rakka-agent-workflow`'s `AgentAutonomyUsage`/
+  `AgentAutonomyPolicy` are a pre-existing workflow-*dispatcher* policy subsystem
+  (target-class routing, per-target step/call/token budgets) that lives entirely
+  inside that crate and that the agent domain never consumed. Rather than graft
+  the agent's escrow hierarchy onto that flat per-target counter, the slice
+  built the richer, product-neutral `AgentRunBudget`/`AgentEscrowLedger` in
+  `rakka-agent`: a conserved/non-conserved dimension split, up-front escrow with
+  settlement and return, and per-run reservation. The workflow autonomy policy
+  stays where it is (the workflow dispatcher still uses it); the agent domain's
+  budget accounting is the new ledger. No agent-domain code depends on the
+  workflow counters, so there is nothing to migrate.
 
 Done when: scenarios 52, 53, and 61 pass, including a concurrency test that
 cannot oversubscribe a parent allocation and a replay test that never
