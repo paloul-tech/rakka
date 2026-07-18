@@ -731,6 +731,89 @@ async fn a_reconciliation_decision_resumes_the_run_and_not_executed_mints_a_new_
     );
 }
 
+#[tokio::test]
+async fn a_reconciled_indeterminate_generation_settles_its_attempts_exactly_once() {
+    // The run's ledger settles a generation's attempt reservation at its
+    // *first* resolution ([specification 9.7]) — for an ambiguous attempt, the
+    // moment the `Indeterminate` outcome is recorded, because ambiguity does
+    // not make an attempt free. A reconciliation that later confirms the
+    // invocation executed changes what is *known*, not what was *attempted*,
+    // so it must not bill the same attempts a second time: inflated
+    // consumption would spuriously exhaust the run's `effect-attempts`
+    // ceiling and travel upward in its settlement as spend nobody made.
+    let fx = DispatchFixture::new(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged")),
+        default_registry(),
+        None,
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    );
+    fx.start().await;
+    fx.pump_until_tool_ticket().await;
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _pass = fx
+        .pipeline()
+        .pump_run(&run_scope())
+        .await
+        .expect("the pass runs");
+    fx.expire_lease();
+    fx.pump().await;
+
+    // The generation parked, and its one `Started` attempt is already
+    // consumed: one for the first model turn, one for the ambiguous tool call.
+    let parked = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(parked.status, AgentRunStatus::WaitingForReconciliation);
+    assert_eq!(parked.budget.consumption().effect_attempts, 2);
+
+    let (effect_id, generation) = fx.parked_effect().await;
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::ResolveIndeterminateEffect {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::CheckpointResolution,
+                [TENANT, AGENT, "resolve-52"],
+            )
+            .expect("the operation id derives"),
+            effect_id,
+            generation,
+            resolution: Box::new(AgentEffectResolution::ConfirmedExecuted {
+                outcome: Box::new(AgentRunEffectOutcome::Tool {
+                    call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+                    content: AgentTaskContent::inline(serde_json::json!({ "receipt": "r-1" }))
+                        .expect("the content is inline-bounded"),
+                }),
+            }),
+        },
+        &fx.fx.router,
+        fx.fx.now(),
+    )
+    .await
+    .expect("the resolution applies");
+
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    let consumed = run.budget.consumption();
+    // Three effects reached dispatch — the first model turn, the reconciled
+    // tool call, and the proposing model turn — and each made exactly one
+    // attempt. The reconciliation itself billed nothing.
+    assert_eq!(consumed.effects, 3);
+    assert_eq!(
+        consumed.effect_attempts, 3,
+        "confirming an executed attempt must not bill it a second time"
+    );
+    assert_eq!(
+        fx.tools.invocation_count(TOOL),
+        1,
+        "resolution recorded the outcome without re-invoking"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scenario 10 (generation half): a result for a superseded generation is
 // refused by the run's own fence.

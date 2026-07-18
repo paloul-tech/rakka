@@ -641,3 +641,67 @@ async fn the_escrow_round_trip_survives_a_restart_at_every_durable_boundary() {
         }
     }
 }
+
+#[test]
+fn a_refusal_that_is_not_the_ledgers_answer_keeps_the_exchange_outstanding() {
+    // The version-skew edge of scenario 61: a settlement or return refused by
+    // an owner that cannot interpret it — an `unsupported-exchange` from a
+    // binary that predates the ledger, a payload it could not decode — is the
+    // receiver's inability, not the ledger answering. Settling on it would
+    // mark the run `Settled`/`Returned` while the task never recorded the
+    // consumption, leaking the child's escrow forever. Only the ledger's own
+    // replay answer — `escrow-child-unknown`, proof the escrow already closed
+    // — settles a rejected ledger exchange; everything else stays outstanding
+    // and is re-driven until an owner that can answer it does.
+    use rakka_agent::{
+        ledger_operation_id, AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind,
+        AgentExchangeParticipant, AgentExchangePayload, AgentExchangeResult, AgentRunParticipant,
+        AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
+    };
+    use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
+
+    let participant = AgentRunParticipant;
+    let now = AgentTimestampMillis::new(1_752_451_200_000);
+
+    for kind in [
+        AgentExchangeKind::BudgetSettlement,
+        AgentExchangeKind::BudgetReturn,
+    ] {
+        let operation_id = ledger_operation_id(&run_scope(), kind, 0).expect("the id derives");
+        let envelope = AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            kind,
+            AgentEntityAddress::Run(run_scope()),
+            AgentEntityAddress::Task(task_scope()),
+            AgentExchangePayload::empty("rakka.agent.Test"),
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )
+        .expect("the envelope is valid");
+
+        let unsupported = AgentExchangeResult::rejected(
+            "unsupported-exchange",
+            "a task entity does not receive this exchange",
+            AgentExchangePayload::empty("rakka.agent.Test"),
+        );
+        let held = participant
+            .check_settle(&envelope, &unsupported)
+            .expect_err("a refusal that is not the ledger's answer must not settle");
+        assert_eq!(held.code(), "exchange-unsettleable-refusal");
+
+        let closed = AgentExchangeResult::rejected(
+            AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
+            "no escrow exists for the child",
+            AgentExchangePayload::empty("rakka.agent.Test"),
+        );
+        participant
+            .check_settle(&envelope, &closed)
+            .expect("the ledger's replay answer for a closed escrow settles the step");
+
+        let accepted =
+            AgentExchangeResult::accepted(AgentExchangePayload::empty("rakka.agent.Test"));
+        participant
+            .check_settle(&envelope, &accepted)
+            .expect("an accepted ledger exchange settles");
+    }
+}

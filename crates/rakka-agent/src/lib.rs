@@ -103,6 +103,7 @@ pub use budget::{
     AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension, AgentBudgetExhaustion,
     AgentBudgetGrant, AgentBudgetLimits, AgentChildEscrow, AgentEscrowChildId, AgentEscrowError,
     AgentEscrowLedger, AgentEscrowResult, AgentRunBudget, AGENT_ESCROW_CHILD_CAPACITY,
+    AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
 };
 pub use choreography::{
     drive_pending_exchanges, register_agent_exchange_codecs, AgentChoreographyError,

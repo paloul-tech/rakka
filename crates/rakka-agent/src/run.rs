@@ -77,7 +77,10 @@ use rakka_sharding::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget};
+use crate::budget::{
+    AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget,
+    AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
+};
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
@@ -1726,6 +1729,12 @@ fn apply_effect_outcome(
             effect_id: effect_id.clone(),
         });
     };
+    // Whether this outcome is the generation's first resolution. A resolved
+    // generation re-enters here on exactly one path — the reconciliation of an
+    // `Indeterminate` one confirming it executed — and its attempts were
+    // already settled when the ambiguity was recorded, so settling again below
+    // would bill the same attempts twice.
+    let first_resolution = effect.is_outstanding();
 
     match outcome {
         AgentRunEffectOutcome::Model { turn } => {
@@ -1796,16 +1805,22 @@ fn apply_effect_outcome(
     // including one now `Indeterminate`, consumes its attempt budget; the retries
     // the generation did not use are released back to the run. A generation that
     // never dispatched (a cancelled or fenced effect) reports zero attempts and
-    // so consumes none.
-    let reservation = {
-        let run = state.run_mut()?;
-        run.loop_state
-            .effect_mut(effect_id)
-            .map(|effect| (effect.max_attempts, effect.attempts))
-    };
-    if let Some((reserved, made)) = reservation {
-        let run = state.run_mut()?;
-        run.loop_state.budget_mut().settle_effect(reserved, made);
+    // so consumes none. The settle runs exactly once, on the generation's first
+    // resolution: a reconciliation that later confirms an `Indeterminate`
+    // generation executed changes what is known, not what was attempted, and
+    // billing the same attempts again would inflate the run's consumption — and,
+    // through its settlement, its parent's — with attempts nobody made.
+    if first_resolution {
+        let reservation = {
+            let run = state.run_mut()?;
+            run.loop_state
+                .effect_mut(effect_id)
+                .map(|effect| (effect.max_attempts, effect.attempts))
+        };
+        if let Some((reserved, made)) = reservation {
+            let run = state.run_mut()?;
+            run.loop_state.budget_mut().settle_effect(reserved, made);
+        }
     }
 
     let run = state.run_mut()?;
@@ -2144,6 +2159,28 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                     .decode::<AgentBudgetLedgerOutcome>(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE)
                     .map(|_| ())
             }
+            kind @ (AgentExchangeKind::BudgetSettlement | AgentExchangeKind::BudgetReturn)
+                if !result.is_accepted() =>
+            {
+                // A rejected settlement or return settles only when the refusal
+                // is the ledger's own replay answer: `escrow-child-unknown`
+                // proves the escrow was already settled and returned, so this
+                // step is done. Any other refusal — an `unsupported-exchange`
+                // from a task owner that predates the ledger, a payload it
+                // could not decode — is the receiver's inability, not the
+                // ledger answering. Settling on it would mark the run
+                // `Settled`/`Returned` while the task never recorded the
+                // consumption, leaking the child's escrow forever; the exchange
+                // stays outstanding instead and is re-driven until an owner
+                // that can answer it does.
+                match result.status().rejection_code() {
+                    Some(AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN) => Ok(()),
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -2166,12 +2203,11 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 let _terminated = settle_proposal(state, result, now);
             }
             kind @ (AgentExchangeKind::BudgetSettlement | AgentExchangeKind::BudgetReturn) => {
-                // A *rejected* ledger exchange is a durable decision too, and
-                // advancing on it is the point: the task refuses a settlement
-                // for an escrow it has already closed, and a run that treated
-                // that as unfinished business would re-drive it forever. Either
-                // way the parent's ledger holds the truth, and this step is
-                // done.
+                // A rejection that reaches here passed `check_settle`, so it is
+                // the ledger's own replay answer — the escrow already closed —
+                // and advancing on it is the point: a run that treated it as
+                // unfinished business would re-drive it forever. Either way the
+                // parent's ledger holds the truth, and this step is done.
                 settle_ledger_exchange(state, kind, now);
             }
             AgentExchangeKind::BudgetAllocation => {

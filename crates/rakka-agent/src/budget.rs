@@ -135,6 +135,19 @@ pub const AGENT_ESCROW_CHILD_CAPACITY: usize = 64;
 /// Result type for escrow ledger operations.
 pub type AgentEscrowResult<T> = Result<T, AgentEscrowError>;
 
+/// Stable refusal code of [`AgentEscrowError::UnknownChild`]: no escrow exists
+/// for the named child.
+///
+/// It is the one refusal that proves the ledger already answered. A child the
+/// parent no longer holds is a child whose escrow was settled and returned, so
+/// a settlement or return refused with this code is a completed step the
+/// initiator may advance on. Every *other* refusal of a ledger exchange — an
+/// `unsupported-exchange` from an owner that predates the ledger, a payload it
+/// could not decode — is not the ledger answering, and the initiator must
+/// leave the exchange outstanding rather than read it as done
+/// ([`crate::run`]'s `check_settle`).
+pub const AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN: &str = "escrow-child-unknown";
+
 /// One dimension of the budget ledger
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -929,7 +942,7 @@ impl AgentEscrowError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::ChildCapacity { .. } => "escrow-child-capacity",
-            Self::UnknownChild { .. } => "escrow-child-unknown",
+            Self::UnknownChild { .. } => AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
             Self::NotSettled { .. } => "escrow-child-not-settled",
             Self::AlreadySettled { .. } => "escrow-child-already-settled",
             Self::StaleTopUp { .. } => "escrow-top-up-stale",

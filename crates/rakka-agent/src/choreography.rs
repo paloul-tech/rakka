@@ -2207,6 +2207,18 @@ pub enum AgentChoreographyError {
         /// Type the payload declared.
         actual: String,
     },
+    /// A refusal that does not carry the durable answer the initiator needs, so
+    /// settling on it would convert a receiver's inability into a decision. The
+    /// exchange stays outstanding and is re-driven until an owner that can
+    /// answer it does — the same fail-closed rule
+    /// [`AgentExchangeParticipant::check_settle`] applies to a payload this
+    /// binary cannot decode.
+    UnsettleableRefusal {
+        /// Kind of the exchange.
+        kind: AgentExchangeKind,
+        /// Refusal code the reply carried.
+        code: String,
+    },
 }
 
 impl AgentChoreographyError {
@@ -2228,6 +2240,7 @@ impl AgentChoreographyError {
             Self::PayloadEncoding { .. } => "exchange-payload-encoding",
             Self::PayloadDecoding { .. } => "exchange-payload-decoding",
             Self::PayloadTypeMismatch { .. } => "exchange-payload-type-mismatch",
+            Self::UnsettleableRefusal { .. } => "exchange-unsettleable-refusal",
         }
     }
 }
@@ -2290,6 +2303,10 @@ impl Display for AgentChoreographyError {
             Self::PayloadTypeMismatch { expected, actual } => write!(
                 f,
                 "an exchange payload declared type {actual} where {expected} was expected"
+            ),
+            Self::UnsettleableRefusal { kind, code } => write!(
+                f,
+                "a {kind} refusal carrying {code} is not the durable answer this exchange needs, so it stays outstanding"
             ),
         }
     }
