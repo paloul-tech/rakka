@@ -77,7 +77,7 @@ use rakka_sharding::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{AgentBudgetExhaustion, AgentRunBudget};
+use crate::budget::{AgentBudgetAllocation, AgentBudgetExhaustion, AgentRunBudget};
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
@@ -92,9 +92,9 @@ use crate::effect::{
 };
 use crate::identity::{
     AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
-    AgentRunScope, AgentTaskId, TenantId,
+    AgentRunScope, AgentTaskId, AgentTaskScope, TenantId,
 };
-use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentRunProposal};
+use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
 use crate::memory::AgentContextSnapshotRef;
 use crate::model::AgentModelError;
 use crate::schema::{
@@ -102,11 +102,12 @@ use crate::schema::{
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
 };
 use crate::task::{
-    AgentAcceptedResult, AgentAssignmentGeneration, AgentRunAcceptance, AgentRunAssignment,
-    AgentTaskContent, AgentTaskDecision, AgentTaskDefinition, AgentTaskError,
-    AgentTaskResultProposal, AgentTaskStatus, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE,
-    AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE, AGENT_TASK_DECISION_PAYLOAD_TYPE,
-    AGENT_TASK_REFUSAL_STALE_GENERATION, AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
+    AgentAcceptedResult, AgentAssignmentGeneration, AgentBudgetLedgerOutcome, AgentRunAcceptance,
+    AgentRunAssignment, AgentTaskContent, AgentTaskDecision, AgentTaskDefinition, AgentTaskError,
+    AgentTaskResultProposal, AgentTaskStatus, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE,
+    AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
+    AGENT_TASK_DECISION_PAYLOAD_TYPE, AGENT_TASK_REFUSAL_STALE_GENERATION,
+    AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
 };
 
 /// Default sharded entity type of the run entity.
@@ -551,6 +552,14 @@ impl AgentRun {
         if !self.status.permits_progress() {
             return false;
         }
+        if self.loop_state.pending_top_up().is_some() {
+            // The run exhausted a ceiling and is parked on a top-up request. It
+            // may not crank until the parent's grant relieves it or the run
+            // fails: cranking now would re-hit the same ceiling, or worse,
+            // proceed on budget it does not hold
+            // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+            return false;
+        }
         match self.loop_state.phase() {
             AgentLoopPhase::PreparingContext
             | AgentLoopPhase::EvaluatingModelOutput
@@ -769,6 +778,8 @@ impl AgentRunState {
             agent_definition_revision: run.loop_state.agent_definition_revision(),
             agent_settings_revision: run.loop_state.agent_settings_revision(),
             terminal_reason: run.terminal_reason.clone(),
+            settlement: run.settlement,
+            pending_top_up: run.loop_state.pending_top_up().copied(),
             accepted_at: run.accepted_at,
             updated_at: self.updated_at,
         })
@@ -846,6 +857,11 @@ pub struct AgentRunSnapshot {
     pub agent_settings_revision: AgentRevisionNumber,
     /// Why it reached its terminal status.
     pub terminal_reason: Option<AgentRunTerminalReason>,
+    /// How far it has got in handing its escrow back to its task.
+    pub settlement: AgentRunSettlementStatus,
+    /// The top-up it is parked waiting on, when it has exhausted its budget and
+    /// asked its parent for more.
+    pub pending_top_up: Option<AgentPendingTopUp>,
     /// When it durably accepted its assignment.
     pub accepted_at: AgentTimestampMillis,
     /// The time of its last accepted transition.
@@ -920,7 +936,30 @@ fn terminate(
     }
     run.status = reason.status();
     run.loop_state.set_phase(AgentLoopPhase::Complete);
+    // A terminal run owes its escrow back, not a top-up: clearing the park here
+    // means a run cancelled while waiting on a grant stops asking and settles.
+    run.loop_state.clear_pending_top_up();
     run.terminal_reason = Some(reason);
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Parks the run on a top-up request after a charge exhausted a ceiling
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The run's status stays `Running` — a pending inter-entity exchange is its
+/// own durable outbox, not a residency wait — and its phase is unchanged, so
+/// the transition that hit the ceiling re-runs and re-charges once the parent's
+/// grant relieves it. The [`owed_ledger_exchange`] that follows this transition
+/// commits the `BudgetAllocation` request the courier then drives.
+fn park_for_top_up(
+    state: &mut AgentRunState,
+    exhaustion: AgentBudgetExhaustion,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let run = state.run_mut()?;
+    run.loop_state.park_for_top_up(exhaustion);
+    run.status = AgentRunStatus::Running;
     state.updated_at = now;
     Ok(())
 }
@@ -1073,6 +1112,182 @@ pub fn ledger_operation_id(
     )
 }
 
+/// The ledger exchange a terminal run owes its task next, if it owes one.
+///
+/// A terminal run hands its escrow back in two ordered steps — settle what it
+/// consumed, then return what it did not
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)) — and its
+/// [`AgentRunSettlementStatus`] is what sequences them across passivation and
+/// recovery. Each step's envelope is derived from durable identity alone, so a
+/// run lost mid-exchange re-drives *the same* operation id and the task's escrow
+/// answers it from what it already recorded, never crediting the parent twice
+/// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 61).
+///
+/// The return carries no amount: the task recorded what it escrowed and has
+/// already applied the settlement, so it computes the remainder. The run only
+/// says "I am done with this escrow."
+fn owed_ledger_exchange(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let Some(run) = state.run.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let task = AgentTaskScope::new(scope.tenant().clone(), run.task().clone())?;
+
+    // A parked run owes its parent a top-up request. A run is never both parked
+    // and terminal: `terminate` clears the park, so these two branches never
+    // both fire.
+    if let Some(top_up) = run.loop_state.pending_top_up() {
+        if !run.status.is_terminal() {
+            let request = crate::task::AgentBudgetTopUpRequest {
+                run: scope.clone(),
+                generation: run.generation,
+                sequence: top_up.sequence,
+                exhaustion: top_up.exhaustion,
+            };
+            let payload = AgentExchangePayload::encode(
+                crate::task::AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
+                &request,
+            )?;
+            let operation_id =
+                ledger_operation_id(&scope, AgentExchangeKind::BudgetAllocation, top_up.sequence)?;
+            let envelope = AgentExchangeEnvelope::new(
+                operation_id.clone(),
+                AgentExchangeKind::BudgetAllocation,
+                AgentEntityAddress::Run(scope.clone()),
+                AgentEntityAddress::Task(task),
+                payload,
+                AgentCorrelationId::new(operation_id.as_str()),
+                now,
+            )?;
+            return Ok(vec![envelope]);
+        }
+    }
+
+    // Settlement travels only after a known terminal outcome: a live run may
+    // still spend what it holds, so its consumption is not yet a fact.
+    if !run.status.is_terminal() {
+        return Ok(Vec::new());
+    }
+
+    let (kind, payload) = match run.settlement {
+        AgentRunSettlementStatus::Owed => {
+            let settlement = crate::task::AgentBudgetSettlement {
+                run: scope.clone(),
+                generation: run.generation,
+                consumed: *run.loop_state.budget().consumption(),
+            };
+            (
+                AgentExchangeKind::BudgetSettlement,
+                AgentExchangePayload::encode(
+                    crate::task::AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE,
+                    &settlement,
+                )?,
+            )
+        }
+        AgentRunSettlementStatus::Settled => {
+            let release = crate::task::AgentBudgetReturn {
+                run: scope.clone(),
+                generation: run.generation,
+            };
+            (
+                AgentExchangeKind::BudgetReturn,
+                AgentExchangePayload::encode(
+                    crate::task::AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
+                    &release,
+                )?,
+            )
+        }
+        AgentRunSettlementStatus::Returned => return Ok(Vec::new()),
+    };
+
+    let operation_id = ledger_operation_id(&scope, kind, 0)?;
+    let envelope = AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        kind,
+        AgentEntityAddress::Run(scope.clone()),
+        AgentEntityAddress::Task(task),
+        payload,
+        AgentCorrelationId::new(operation_id.as_str()),
+        now,
+    )?;
+    Ok(vec![envelope])
+}
+
+/// Applies the parent's decision on a top-up request
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A grant that relieves the exhausted ceiling clears the park, so the run
+/// re-attempts the charge it was blocked on and continues. A grant of nothing —
+/// the parent's honest answer when it has nothing left — or a durable rejection
+/// stops the run with the *original* structured exhaustion, because a run must
+/// not park on an empty answer forever.
+///
+/// A grant that arrives after the run has moved on (it was cancelled while
+/// parked) is ignored: the task's escrow already recorded the grant and frees it
+/// on the run's return, so there is nothing for the run to do.
+fn apply_top_up_grant(
+    state: &mut AgentRunState,
+    result: &AgentExchangeResult,
+    now: AgentTimestampMillis,
+) {
+    let Some(pending) = state
+        .run
+        .as_ref()
+        .and_then(|run| run.loop_state.pending_top_up().copied())
+    else {
+        return;
+    };
+
+    let granted = if result.is_accepted() {
+        result
+            .payload()
+            .decode::<AgentBudgetLedgerOutcome>(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE)
+            .ok()
+            .and_then(|outcome| outcome.granted)
+            .unwrap_or_else(AgentBudgetAllocation::nothing)
+    } else {
+        // A durable rejection is a decision too: the parent will not grant, so
+        // the run stops exactly as it would on a zero grant.
+        AgentBudgetAllocation::nothing()
+    };
+
+    // The run resumes iff the parent gave it *more* in the dimension it ran out
+    // of. A grant of nothing there cannot change whether the blocked charge
+    // succeeds, so re-attempting would re-park on the same ceiling forever —
+    // this is the "must not park on an empty answer" rule. A non-zero grant is
+    // worth re-attempting: a fan-out larger than one grant re-parks and asks
+    // again, and since each grant strictly reduces the parent's headroom, the
+    // asking terminates when the parent finally has nothing left.
+    let relieved = granted.get(pending.exhaustion.dimension) != Some(0);
+    {
+        let Some(run) = state.run.as_mut() else {
+            return;
+        };
+        run.loop_state
+            .budget_mut()
+            .credit(&granted, pending.sequence);
+        run.loop_state.clear_pending_top_up();
+    }
+
+    if relieved {
+        if let Some(run) = state.run.as_mut() {
+            run.status = AgentRunStatus::Running;
+        }
+        state.updated_at = now;
+    } else {
+        let _terminated = terminate(
+            state,
+            AgentRunTerminalReason::BudgetExhausted {
+                exhaustion: pending.exhaustion,
+            },
+            now,
+        );
+    }
+}
+
 /// Records that one ledger exchange the run owed has been acknowledged.
 fn settle_ledger_exchange(
     state: &mut AgentRunState,
@@ -1109,7 +1324,7 @@ fn advance_once(
         return Ok(Vec::new());
     }
 
-    let owed = match run.loop_state.phase() {
+    let mut owed = match run.loop_state.phase() {
         AgentLoopPhase::PreparingContext => {
             prepare_context(state, &scope, policies, now).map(|()| Vec::new())
         }
@@ -1124,6 +1339,13 @@ fn advance_once(
         | AgentLoopPhase::Suspended
         | AgentLoopPhase::Complete => Ok(Vec::new()),
     }?;
+    // A transition that reached a terminal outcome — a budget exhaustion here, a
+    // rejection the loop cannot iterate past — hands the run's escrow back in the
+    // same compare-and-set that made it terminal, exactly as it persists the
+    // effect or wait it decided ([specification 9.7]). The settlement rides the
+    // run's own journal and is delivered by the courier, never from inside this
+    // transition.
+    owed.extend(owed_ledger_exchange(state, now)?);
     Ok(owed)
 }
 
@@ -1145,22 +1367,13 @@ fn prepare_context(
 
     // The budget is charged *before* the effect is persisted: an effect that
     // reaches durable dispatch has been paid for whether or not its outcome is
-    // ever known ([specification 9.7]).
+    // ever known ([specification 9.7]). The iteration and the model call are one
+    // all-or-nothing charge, so an exhaustion parks the run with nothing charged
+    // and it re-attempts this exact charge once its parent tops it up.
     {
         let run = state.run_mut()?;
-        if let Err(exhaustion) = run.loop_state.budget_mut().charge_iteration(now) {
-            return terminate(
-                state,
-                AgentRunTerminalReason::BudgetExhausted { exhaustion },
-                now,
-            );
-        }
-        if let Err(exhaustion) = run.loop_state.budget_mut().charge_model_call(now) {
-            return terminate(
-                state,
-                AgentRunTerminalReason::BudgetExhausted { exhaustion },
-                now,
-            );
+        if let Err(exhaustion) = run.loop_state.budget_mut().charge_turn(now) {
+            return park_for_top_up(state, exhaustion, now);
         }
     }
 
@@ -1224,19 +1437,16 @@ fn evaluate_model_output(
         return Ok(());
     }
 
-    // The whole fan-out is charged before any effect is recorded: a turn either
-    // fits its budget or terminates having committed nothing, so the terminal
-    // record never holds a pending effect that a settle pass would otherwise
-    // hand to the sink on behalf of a run that has already failed — external
-    // work whose result the run could only refuse.
-    for _call in &calls {
+    // The whole fan-out is charged before any effect is recorded, all-or-nothing:
+    // a turn either fits its budget or commits none of it, so the record never
+    // holds a partial fan-out. A run that cannot afford the fan-out parks with
+    // nothing charged and re-attempts this exact count once its parent tops it
+    // up ([specification 9.7]).
+    {
+        let count = u64::try_from(calls.len()).unwrap_or(u64::MAX);
         let run = state.run_mut()?;
-        if let Err(exhaustion) = run.loop_state.budget_mut().charge_tool_call(now) {
-            return terminate(
-                state,
-                AgentRunTerminalReason::BudgetExhausted { exhaustion },
-                now,
-            );
+        if let Err(exhaustion) = run.loop_state.budget_mut().charge_tool_calls(count, now) {
+            return park_for_top_up(state, exhaustion, now);
         }
     }
 
@@ -1843,18 +2053,30 @@ impl AgentExchangeParticipant for AgentRunParticipant {
         envelope: &AgentExchangeEnvelope,
         result: &AgentExchangeResult,
     ) -> Result<(), AgentChoreographyError> {
-        if envelope.kind() == AgentExchangeKind::ResultProposal {
-            // A decision this binary cannot decode is refused *before* the
-            // exchange settles, so it stays outstanding and is re-driven later
-            // — a rolling upgrade must not turn a valid durable decision into a
-            // terminally failed run. The task returns the same decision on
-            // every re-drive, so an owner that can decode it converges.
-            result
-                .payload()
-                .decode::<AgentTaskDecision>(AGENT_TASK_DECISION_PAYLOAD_TYPE)
-                .map(|_| ())
-        } else {
-            Ok(())
+        match envelope.kind() {
+            AgentExchangeKind::ResultProposal => {
+                // A decision this binary cannot decode is refused *before* the
+                // exchange settles, so it stays outstanding and is re-driven
+                // later — a rolling upgrade must not turn a valid durable
+                // decision into a terminally failed run. The task returns the
+                // same decision on every re-drive, so an owner that can decode
+                // it converges.
+                result
+                    .payload()
+                    .decode::<AgentTaskDecision>(AGENT_TASK_DECISION_PAYLOAD_TYPE)
+                    .map(|_| ())
+            }
+            AgentExchangeKind::BudgetAllocation if result.is_accepted() => {
+                // Same rule for a top-up grant: an accepted outcome this binary
+                // cannot decode stays outstanding rather than being read as a
+                // grant of nothing, which would fail a run the parent actually
+                // funded.
+                result
+                    .payload()
+                    .decode::<AgentBudgetLedgerOutcome>(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE)
+                    .map(|_| ())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1884,9 +2106,14 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 // done.
                 settle_ledger_exchange(state, kind, now);
             }
+            AgentExchangeKind::BudgetAllocation => {
+                // The reply to a top-up request: credit and resume, or stop with
+                // the original exhaustion.
+                apply_top_up_grant(state, result, now);
+            }
             _ => {}
         }
-        Vec::new()
+        owed_ledger_exchange(state, now).unwrap_or_default()
     }
 }
 
@@ -2096,13 +2323,46 @@ where
     pub async fn accept(
         &mut self,
         envelope: &AgentExchangeEnvelope,
-        router: &AgentExchangeRouter,
+        _router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentExchangeReply> {
         self.ensure_recovered(now).await?;
         let reply = self.host.accept(envelope, now).await?;
-        self.settle_side_effects(router, now).await?;
+        // Accepting a delivered exchange makes *local* progress only: it cranks
+        // the loop and hands new effects to the sink. It does **not** deliver the
+        // cross-entity exchanges that crank may have committed to the run's
+        // journal (a result proposal, a budget settlement). Those are drained by
+        // the courier — a command's settle pass, a recovery sweep, `pump` — never
+        // synchronously from inside a delivery.
+        //
+        // Deferring the delivery is what keeps the choreography acyclic. The
+        // initiator of `envelope` is, by definition, mid-delivery to this run
+        // right now; driving an owed exchange back to it here would re-enter its
+        // `accept` before this reply has settled, and a run that owes a
+        // settlement to the very task that is re-driving its assignment would
+        // recurse without bound. Committing to the journal and returning the
+        // reply lets the initiator settle first, exactly as a durable outbox
+        // drains on a later turn rather than inside the transition that filled
+        // it.
+        self.make_local_progress(now).await?;
         Ok(reply)
+    }
+
+    /// Cranks the loop and dispatches effects, without delivering any owed
+    /// cross-entity exchange.
+    ///
+    /// This is the half of [`Self::settle_side_effects`] that touches only the
+    /// run's own state and the effect sink. It is what a delivered exchange is
+    /// allowed to trigger; see [`Self::accept`] for why the drive half is not.
+    async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentRunResult<()> {
+        for _round in 0..AGENT_RUN_MAX_SETTLE_ROUNDS {
+            let advanced = self.advance_loop(now).await?;
+            let dispatched = self.dispatch_effects(now).await?;
+            if advanced == 0 && dispatched == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Cranks the loop from durable state alone: advance, dispatch, drive.
@@ -2277,7 +2537,7 @@ where
                             .record(operation_id, result.clone());
                         state.updated_at = now;
                         outcome = Some(result);
-                        Ok(Vec::new())
+                        owed_ledger_exchange(state, now)
                     };
 
                 match apply(state) {

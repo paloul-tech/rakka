@@ -757,6 +757,32 @@ Guidance: [Hierarchical Budget Ledger](technical-guidance.md#hierarchical-budget
     pattern for any later admission surface (setup revisions, epoch admission):
     add the dimension to `verify`, not a new retract-on-mutation hook.
 
+**Amended as implemented:**
+
+- **The run emits its escrow exchanges from its own transitions; delivery never
+  drives them.** A terminal run commits its settlement/return, and a parked run
+  its top-up request, into its own exchange journal in the transition that owed
+  it; the courier drains the journal. `accept` of an incoming exchange makes
+  *local* progress only and never drives an owed cross-entity exchange, because
+  the initiator of the exchange being accepted is mid-delivery and driving an
+  exchange back to it would re-enter a transition whose reply has not settled —
+  a run owing its task a settlement, and the task re-driving that run's
+  still-outstanding assignment, otherwise recurse without bound. This made the
+  accept/settle split a uniform property of both entities (the durable-outbox
+  discipline), not a ledger special case.
+- **Exhaustion parks and asks before it fails.** A run that exhausts a ceiling
+  records `AgentPendingTopUp` (status stays `Running` — a pending exchange is
+  the run's own outbox, the slice 1.5 argument for the result proposal) and
+  sends a deduplicated `BudgetAllocation` request. The charge that exhausted is
+  made all-or-nothing (`charge_turn`, `charge_tool_calls`) so a re-attempt after
+  the grant double-counts nothing. The run resumes iff the parent granted
+  *something* in the exhausted dimension; a grant of nothing stops it with the
+  *original* exhaustion. The relieve test is "did the grant add room," not "does
+  one more unit fit" — the latter is wrong for a multi-unit tool fan-out, where a
+  zero grant on a limit-1 budget would otherwise read as relieved and re-park
+  forever. Because each grant strictly reduces the parent's headroom, the asking
+  always terminates.
+
 Done when: scenarios 52, 53, and 61 pass, including a concurrency test that
 cannot oversubscribe a parent allocation and a replay test that never
 double-debits or double-credits.

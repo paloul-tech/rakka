@@ -142,6 +142,7 @@
 //! | --- | --- | --- |
 //! | Creation, Assignment | ingress → task → run | `tests/task_entity.rs` |
 //! | Assignment, ResultProposal | task ⇄ run, with either side lost at every durable write | `tests/run_result_exchange.rs` (scenario 59) |
+//! | BudgetSettlement, BudgetReturn | run → task, a terminal run handing its escrow back | `tests/escrow_ledger.rs` (scenario 61) |
 
 use std::collections::BTreeMap;
 use std::error::Error;

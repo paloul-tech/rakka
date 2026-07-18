@@ -65,12 +65,37 @@
 //! aged out ([specification 18](../../../docs/plans/rakka-agent/spec.md)
 //! scenario 61).
 //!
-//! **Not yet wired (slice 1.9, in progress):** the task's receiving half of all
-//! three ledger exchanges is implemented ([`crate::task`]), but the run does not
-//! yet *emit* its settlement and return, and the exhaustion top-up request is
-//! not yet sent. A run therefore still stops on exhaustion instead of asking,
-//! and its escrow is not yet handed back. See the slice notes in
-//! `docs/plans/rakka-agent/implementation-plan.md`.
+//! # The run emits from its own terminal transition, never from a delivery
+//!
+//! A terminal run commits the settlement it owes into its own exchange journal
+//! in the same compare-and-set that made it terminal
+//! ([`crate::run`]'s `owed_ledger_exchange`), and the courier drains it — a
+//! command's settle pass, a recovery sweep, a sweep — exactly as a durable
+//! outbox drains. It is *not* driven from inside an `accept` of an incoming
+//! exchange: the task that escrowed the run may be mid-delivery of that run's
+//! own assignment, and driving a settlement back into it there would re-enter a
+//! transition whose reply has not settled, recursing without bound. The run's
+//! [`AgentRunSettlementStatus`](crate::AgentRunSettlementStatus) sequences the
+//! settlement and the return across passivation, so the two ordered commands
+//! survive a loss between them.
+//!
+//! # Exhaustion parks and asks; it does not fail on the spot
+//!
+//! A run that exhausts a ceiling does not fail immediately: it parks with the
+//! structured exhaustion recorded in its loop state
+//! ([`AgentPendingTopUp`](crate::AgentPendingTopUp)) and asks its parent for
+//! more through a deduplicated `BudgetAllocation` exchange, committed to the
+//! run's journal by the transition that hit the ceiling and drained by the same
+//! courier that drains a settlement. The parent's grant is an ordinary
+//! parent-local allocation decision under its own ceilings, deduplicated on the
+//! child's escrow record by the request sequence. A grant that adds room in the
+//! exhausted dimension resumes the run where it parked — the failing charge was
+//! all-or-nothing ([`AgentRunBudget::charge_turn`],
+//! [`AgentRunBudget::charge_tool_calls`]), so re-attempting it double-counts
+//! nothing. A grant of nothing is the parent's honest answer when it has
+//! nothing left, and the run stops with the *original* exhaustion rather than
+//! parking forever. Because each grant strictly reduces the parent's headroom,
+//! the asking always terminates.
 //!
 //! # Over-consumption is recorded, not rejected
 //!
@@ -1105,6 +1130,47 @@ impl AgentRunBudget {
         self.charge(AgentBudgetDimension::ToolCalls, 1)
     }
 
+    /// Charges one whole turn — one loop iteration and one model call — as a
+    /// single all-or-nothing operation, or reports the first ceiling it would
+    /// cross.
+    ///
+    /// A turn's two charges are checked together and committed together, so a
+    /// turn that cannot afford its model call never leaves the iteration charged.
+    /// That atomicity is what makes exhaustion *parkable*: a run that parks to
+    /// ask its parent for more budget must be able to re-attempt this exact
+    /// charge on resume without double-counting the half that already went
+    /// through ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// The dimensions are checked in the same priority the separate charges
+    /// imposed — deadline, iteration, tokens, cost, then model call — so the
+    /// reported exhaustion is unchanged.
+    pub fn charge_turn(&mut self, now: AgentTimestampMillis) -> Result<(), AgentBudgetExhaustion> {
+        self.check_deadline(now)?;
+        self.check_amount(AgentBudgetDimension::LoopIterations, 1)?;
+        self.check(AgentBudgetDimension::Tokens)?;
+        self.check(AgentBudgetDimension::Cost)?;
+        self.check_amount(AgentBudgetDimension::ModelCalls, 1)?;
+        // Every ceiling cleared, so neither charge can now fail.
+        self.consumed.add(AgentBudgetDimension::LoopIterations, 1);
+        self.consumed.add(AgentBudgetDimension::ModelCalls, 1);
+        Ok(())
+    }
+
+    /// Charges a whole tool fan-out as a single all-or-nothing operation, or
+    /// reports the ceiling it would cross without charging any of it.
+    ///
+    /// A turn's tool calls are committed together or not at all
+    /// ([specification 11] fan-out atomicity), so the charge is too: a run that
+    /// cannot afford the whole fan-out parks with none of it charged and
+    /// re-attempts this exact count on resume.
+    pub fn charge_tool_calls(
+        &mut self,
+        count: u64,
+        now: AgentTimestampMillis,
+    ) -> Result<(), AgentBudgetExhaustion> {
+        self.check_deadline(now)?;
+        self.charge(AgentBudgetDimension::ToolCalls, count)
+    }
+
     /// Reserves one effect and the attempts its policy permits it, or reports
     /// the ceiling it would cross
     /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): before
@@ -1219,17 +1285,6 @@ impl AgentRunBudget {
             .and_then(|()| self.check(AgentBudgetDimension::Tokens))
             .and_then(|()| self.check(AgentBudgetDimension::Cost))
             .err()
-    }
-
-    /// Whether a top-up of `granted` would give this run room to proceed past
-    /// `exhaustion`.
-    ///
-    /// A zero grant is the parent's honest answer when it has nothing left, and
-    /// the run must not park on it forever: this is what tells the run to stop
-    /// with its exhaustion on record instead.
-    #[must_use]
-    pub fn top_up_relieves(&self, exhaustion: &AgentBudgetExhaustion) -> bool {
-        self.check(exhaustion.dimension).is_ok()
     }
 
     fn check(&self, dimension: AgentBudgetDimension) -> Result<(), AgentBudgetExhaustion> {
@@ -1606,7 +1661,6 @@ mod tests {
             .charge_model_call(now)
             .expect_err("the model-call budget is spent");
         assert_eq!(exhaustion.dimension, AgentBudgetDimension::ModelCalls);
-        assert!(!budget.top_up_relieves(&exhaustion));
 
         budget.credit(
             &AgentBudgetAllocation {
@@ -1615,9 +1669,9 @@ mod tests {
             },
             1,
         );
-        assert!(budget.top_up_relieves(&exhaustion));
         assert_eq!(budget.top_ups(), 1);
-        // Nothing already consumed is forgotten.
+        // Nothing already consumed is forgotten: the top-up resumes the run
+        // where its exhaustion parked it rather than starting its ledger over.
         assert_eq!(budget.consumption().model_calls, 1);
         budget.charge_model_call(now).expect("the topped-up call");
     }

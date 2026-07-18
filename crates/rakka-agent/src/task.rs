@@ -4488,8 +4488,35 @@ where
         // which re-drives it once the sink is back.
         self.require_history_headroom(now).await?;
         let reply = self.host.accept(envelope, now).await?;
-        self.settle_side_effects(router, now).await?;
+        // Accepting a delivered exchange makes *local* progress only: it may
+        // decide an assignment freed escrow now permits and flush the history it
+        // owes, both of which touch only the task's own state and its history
+        // sink. It does **not** deliver the cross-entity exchanges that decision
+        // committed (the assignment to the run). Those are drained by the
+        // courier — a command's settle pass, a recovery sweep, `pump` — never
+        // synchronously from inside a delivery.
+        //
+        // The initiator of `envelope` is mid-delivery to this task right now, so
+        // driving an owed exchange back to it here would re-enter its `accept`
+        // before this reply settles. A run that owes this task a settlement, and
+        // a task that re-drives that run's still-outstanding assignment, would
+        // otherwise recurse without bound (see [`crate::run`]'s `accept`).
+        let _ = router;
+        self.make_local_progress(now).await?;
         Ok(reply)
+    }
+
+    /// Decides an assignment the task now permits and flushes owed history,
+    /// without delivering any owed cross-entity exchange.
+    ///
+    /// This is the half of [`Self::settle_side_effects`] that touches only the
+    /// task's own state and its history sink. It is what a delivered exchange is
+    /// allowed to trigger; see [`Self::accept`] for why the drive half is not.
+    async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
+        self.require_history_headroom(now).await?;
+        self.decide_assignment(now).await?;
+        self.flush_history(now).await?;
+        Ok(())
     }
 
     /// Flushes whatever history the task owes, and fails closed if the outbox
