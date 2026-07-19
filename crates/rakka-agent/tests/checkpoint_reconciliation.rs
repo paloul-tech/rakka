@@ -14,15 +14,15 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::ScriptedDispatcher;
 use rakka_agent::{
-    AgentCheckpointDecision, AgentCheckpointKind, AgentCheckpointStatus, AgentCompensationRef,
-    AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution, AgentEffectSpec,
-    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentReconciliationDecision,
-    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus, AgentRunEntityCommand,
-    AgentRunEntityReply, AgentRunStatus, AgentRunTerminalReason, AgentTaskContent, AgentToolCallId,
-    AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentApprovalDecision, AgentCheckpointDecision, AgentCheckpointKind, AgentCheckpointStatus,
+    AgentCompensationRef, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
+    AgentEffectSpec, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentReconciliationDecision, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectStatus,
+    AgentRunEntityCommand, AgentRunEntityReply, AgentRunStatus, AgentRunTerminalReason,
+    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    InMemoryAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::{AgentEffectId, HumanCheckpointId, PrincipalRef};
+use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis, HumanCheckpointId, PrincipalRef};
 
 mod common;
 
@@ -510,4 +510,176 @@ async fn cancellation_leaves_the_reconciliation_checkpoint_resolvable() {
         AgentRunStatus::Cancelled,
         "terminal cancellation projects only after the outcome is resolved"
     );
+}
+
+#[tokio::test]
+async fn a_confirmed_not_executed_gated_effect_reparks_behind_a_fresh_approval() {
+    // The grant that authorized the ambiguous generation binds that generation
+    // exactly (specification 12.3), so `ConfirmedNotExecuted` on a
+    // checkpoint-required effect must park the new generation behind a fresh
+    // approval checkpoint — not leave it undispatchable in `WaitingForEffect`
+    // with no wait left to resolve.
+    let dispatcher = ScriptedDispatcher::new()
+        .with_turn(tool_calling_turn())
+        .with_turn(proposing_turn())
+        .with_tool_result(
+            TOOL,
+            AgentTaskContent::inline(serde_json::json!({ "charged": true }))
+                .expect("the tool result is inline-bounded"),
+        );
+    let policies = AgentEffectPolicies::new()
+        .with_tool_spec(
+            tool_id(),
+            AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+        )
+        .expect("the checkpoint-required tool spec is valid");
+    let fx = Fixture::with_sink(
+        dispatcher,
+        InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(AtomicU64::new(1)),
+    );
+
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop parks on the approval");
+
+    let first_approval = {
+        let mut store = fx.run();
+        store.recover(fx.now()).await.expect("the run recovers");
+        let state = store.state().expect("state reads");
+        let open = state
+            .loop_state()
+            .expect("the loop exists")
+            .open_checkpoints()
+            .to_vec();
+        assert_eq!(open.len(), 1, "the gated tool parks behind one approval");
+        assert_eq!(open[0].kind, AgentCheckpointKind::Approval);
+        open[0].checkpoint_id.clone()
+    };
+
+    let approve = || {
+        Box::new(AgentCheckpointDecision::Approval(
+            AgentApprovalDecision::Approve {
+                credential_binding: None,
+                expires_at: AgentTimestampMillis::new(1_000_000),
+                allowed_use_count: 1,
+            },
+        ))
+    };
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        resolve_command(first_approval.clone(), "a1", approve()),
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the first approval applies");
+
+    // The approved dispatch is reported ambiguous.
+    let (effect_id, generation, operation_id) = {
+        let state = run.state().expect("state reads");
+        let loop_state = state.loop_state().expect("the loop exists");
+        let effect = loop_state
+            .effects()
+            .iter()
+            .find(|effect| effect.request.tool_call().is_some())
+            .expect("the tool effect exists")
+            .clone();
+        let operation_id = effect
+            .result_operation_id(&run_scope())
+            .expect("the operation id derives");
+        (effect.effect_id, effect.generation, operation_id)
+    };
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id,
+            effect_id: effect_id.clone(),
+            generation,
+            attempt: 1,
+            fence: 1,
+            outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
+                code: "connection-lost".to_string(),
+                message: "the worker died mid-invocation".to_string(),
+            }),
+        },
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the ambiguity records");
+
+    let reconciliation = {
+        let state = run.state().expect("state reads");
+        let open = state
+            .loop_state()
+            .expect("the loop exists")
+            .open_checkpoints()
+            .to_vec();
+        open.iter()
+            .find(|checkpoint| {
+                checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+            })
+            .expect("the reconciliation checkpoint gates the ambiguity")
+            .checkpoint_id
+            .clone()
+    };
+    run.apply(
+        resolve_command(
+            reconciliation,
+            "d1",
+            reconcile(AgentReconciliationDecision::ConfirmedNotExecuted),
+        ),
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the reconciliation applies");
+
+    // The new generation re-parks behind a fresh approval checkpoint bound to
+    // it, rather than stranding undispatchable.
+    let snapshot = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        snapshot.status,
+        AgentRunStatus::WaitingForApproval,
+        "the redispatched gated generation parks for a fresh approval"
+    );
+    let second_approval = {
+        let mut store = fx.run();
+        store.recover(fx.now()).await.expect("the run recovers");
+        let state = store.state().expect("state reads");
+        let open = state
+            .loop_state()
+            .expect("the loop exists")
+            .open_checkpoints()
+            .to_vec();
+        assert_eq!(open.len(), 1, "exactly one fresh checkpoint gates it");
+        assert_eq!(open[0].kind, AgentCheckpointKind::Approval);
+        assert_eq!(open[0].bound_effect.effect_id, effect_id);
+        assert_eq!(
+            open[0].bound_effect.generation,
+            generation.next(),
+            "the fresh checkpoint binds the new generation"
+        );
+        assert_ne!(
+            open[0].checkpoint_id, first_approval,
+            "the fresh checkpoint is a new record, not the resolved one"
+        );
+        open[0].checkpoint_id.clone()
+    };
+
+    // The fresh approval resumes the run and the re-invocation completes.
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.apply(
+        resolve_command(second_approval, "a2", approve()),
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the second approval applies");
+    fx.pump().await.expect("the re-invoked run completes");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
 }

@@ -1975,9 +1975,12 @@ fn resolve_indeterminate_effect(
     generation: AgentEffectGeneration,
     resolution: AgentEffectResolution,
     policy: &AgentSchemaPolicy,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
-    apply_indeterminate_resolution(state, effect_id, generation, resolution, policy, now)?;
+    apply_indeterminate_resolution(
+        state, effect_id, generation, resolution, policy, policies, now,
+    )?;
     drop_reconciliation_checkpoint(state, effect_id, generation)?;
     settle_run_disposition(state, now)
 }
@@ -2015,12 +2018,18 @@ fn drop_reconciliation_checkpoint(
 /// result would have. `ConfirmedNotExecuted` authorizes a new effect
 /// generation where the run still wants the work — and settles the effect as
 /// cancelled where it does not, because a winding-down run re-invokes nothing.
+/// A checkpoint- or authorization-gated effect re-parks its new generation
+/// behind a fresh checkpoint of the matching kind: the grant that authorized
+/// the ambiguous generation binds that generation exactly, so the fresh intent
+/// needs a fresh decision
+/// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
 fn apply_indeterminate_resolution(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
     generation: AgentEffectGeneration,
     resolution: AgentEffectResolution,
     policy: &AgentSchemaPolicy,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     resolution.validate()?;
@@ -2096,8 +2105,23 @@ fn apply_indeterminate_resolution(
                     });
                 };
                 effect.begin_next_generation(&scope, now)?;
+                // A gated effect re-parks: the grant that authorized the
+                // ambiguous generation binds that generation exactly
+                // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)),
+                // so without a fresh checkpoint the new generation would sit
+                // undispatchable with no wait left to resolve.
+                let gate = if effect.authorization_required {
+                    Some(AgentCheckpointKind::SecurityAuthorization)
+                } else if effect.checkpoint_required {
+                    Some(AgentCheckpointKind::Approval)
+                } else {
+                    None
+                };
+                if let Some(kind) = gate {
+                    open_effect_checkpoint(state, policies, effect_id, kind, now)?;
+                }
                 let run = state.run_mut()?;
-                run.status = AgentRunStatus::WaitingForEffect;
+                run.status = checkpoint_wait_status(&run.loop_state);
                 state.updated_at = now;
             }
         }
@@ -2317,6 +2341,7 @@ fn resolve_checkpoint(
                 bound_generation,
                 *resolution,
                 policy,
+                policies,
                 now,
             )?;
         }
@@ -2923,6 +2948,7 @@ where
                 resolution,
             } => {
                 let policy = *self.host.schema_policy();
+                let policies = self.policies.clone();
                 self.transition(now, move |state| {
                     resolve_indeterminate_effect(
                         state,
@@ -2930,6 +2956,7 @@ where
                         generation,
                         *resolution,
                         &policy,
+                        &policies,
                         now,
                     )?;
                     Ok(operation_id)
