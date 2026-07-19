@@ -105,6 +105,18 @@ pub use budget::{
     AgentEscrowLedger, AgentEscrowResult, AgentRunBudget, AGENT_ESCROW_CHILD_CAPACITY,
     AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
 };
+pub use checkpoints::{
+    AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointDecisionOption,
+    AgentCheckpointEffectBinding, AgentCheckpointError, AgentCheckpointGrant,
+    AgentCheckpointGrantError, AgentCheckpointKind, AgentCheckpointOutcome,
+    AgentCheckpointResolutionReport, AgentCheckpointResult, AgentCheckpointSla,
+    AgentCheckpointStatus, AgentCheckpointTimerOutcome, AgentCompensationRef,
+    AgentReconciliationDecision, AgentRecordedDecision, AGENT_CHECKPOINT_APPLIED_KEY_CAPACITY,
+    AGENT_CHECKPOINT_DETAIL_MAX_LENGTH, AGENT_CHECKPOINT_MAX_AUDIT_EVENTS,
+    AGENT_CHECKPOINT_MAX_CAPABILITIES, AGENT_CHECKPOINT_MAX_CONTEXT_ARTIFACTS,
+    AGENT_CHECKPOINT_MAX_ROLES, AGENT_CHECKPOINT_ROLE_MAX_LENGTH,
+    AGENT_CHECKPOINT_SUMMARY_MAX_LENGTH,
+};
 pub use choreography::{
     drive_pending_exchanges, register_agent_exchange_codecs, AgentChoreographyError,
     AgentChoreographyResult, AgentEntityAddress, AgentEntityClass, AgentExchangeDeliveryError,
@@ -118,17 +130,17 @@ pub use choreography::{
     AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
 pub use dispatch::{
-    workflow_run_id, AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError,
-    AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult,
-    AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectCredentialResolver,
-    AgentEffectReconciler, AgentEntityAuthority, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
-    WorkflowAgentRunEffectSink,
+    workflow_run_id, AgentCompensationExecutor, AgentDispatchAuthority, AgentDispatchDecision,
+    AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe,
+    AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
+    AgentEffectCredentialResolver, AgentEffectReconciler, AgentEntityAuthority,
+    AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
+    AgentRunSetupResolver, WorkflowAgentRunEffectSink,
 };
 pub use effect::{
-    effect_id_for, external_idempotency_key_for, AgentEffectError, AgentEffectFuture,
-    AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution, AgentEffectResult,
-    AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
+    compensation_call_id, effect_id_for, external_idempotency_key_for, AgentEffectError,
+    AgentEffectFuture, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
+    AgentEffectResult, AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
     AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
     InMemoryAgentRunEffectSink, AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH,
@@ -195,13 +207,14 @@ pub use identity::{
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
     AgentSchemaPolicy, AgentSchemaResult, VersionedAgentRecord,
-    CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
-    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION, CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
-    CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
-    CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
-    CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION, CURRENT_AGENT_DEFINITION_SCHEMA_VERSION,
+    CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
+    CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
+    CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION, CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION,
+    CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION, CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_SETTINGS_SCHEMA_VERSION, CURRENT_AGENT_SETUP_SCHEMA_VERSION,
+    CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION,
+    CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
 };
 pub use task::{
     agent_task_entity_id, agent_task_entity_persistence_id, agent_task_entity_ref,

@@ -114,9 +114,9 @@ use rakka_persistence::DurableStateStore;
 use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
 use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision};
 use crate::effect::{
-    AgentEffectError, AgentEffectGeneration, AgentReconciliationProtocolRef, AgentRunEffect,
-    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, ATTR_AGENT_EFFECT_GENERATION,
-    ATTR_AGENT_EFFECT_ID,
+    compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentReconciliationProtocolRef,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
+    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
@@ -312,6 +312,24 @@ pub trait AgentDispatchToolExecutor: Send + Sync {
     ) -> AgentDispatchFuture<'a, AgentTaskContent>;
 }
 
+/// Executes one explicitly scheduled compensation inside a bounded dispatch
+/// attempt ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Rakka persists and routes the
+/// [`crate::checkpoints::AgentCompensationRef`]; the application owns the
+/// compensation behind it. The resolved credential — when the intent names a
+/// binding — lives only for the call and is never persisted.
+pub trait AgentCompensationExecutor: Send + Sync {
+    /// Performs the compensation and returns its bounded result.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        compensation: &'a crate::checkpoints::AgentCompensationRef,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent>;
+}
+
 /// Resolves a logical credential binding for one dispatch attempt
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -378,11 +396,17 @@ pub enum AgentDispatchDecision {
 /// forbids claiming isolation from.
 pub trait AgentDispatchAuthority: Send + Sync {
     /// Authorizes one dispatch attempt of one effect intent, or refuses it.
+    ///
+    /// `attempt` is the 1-based attempt number the pipeline is about to make:
+    /// a checkpoint grant's allowed use count is enforced against it, so a
+    /// spent grant does not cover a retry
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
     fn authorize<'a>(
         &'a self,
         scope: &'a AgentRunScope,
         run: &'a AgentRunState,
         intent: &'a AgentRunEffect,
+        attempt: u32,
         now: rakka_agent_workflow::AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision>;
 }
@@ -496,6 +520,7 @@ where
         scope: &'a AgentRunScope,
         run: &'a AgentRunState,
         intent: &'a AgentRunEffect,
+        attempt: u32,
         now: rakka_agent_workflow::AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
         Box::pin(async move {
@@ -523,11 +548,22 @@ where
             if let Some(setup) = &setup {
                 context = context.with_setup(setup);
             }
+            // A checkpoint-gated effect carries no grant until the run has
+            // resolved its checkpoint; the run holds the digest-bound grant in
+            // its own durable state, and the authority revalidates it against
+            // the exact intent before dispatch
+            // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+            if let Some(grant) = run
+                .loop_state()
+                .and_then(|loop_state| loop_state.grant_for(intent))
+            {
+                context = context.with_checkpoint_grant(grant);
+            }
             let task = run.run().map(AgentRun::task);
             let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
             let decision = match self
                 .authority
-                .authorize(&context, scope, task, goal, intent, now)
+                .authorize(&context, scope, task, goal, intent, attempt, now)
             {
                 Ok(granted) => AgentDispatchDecision::Granted(Box::new(granted)),
                 Err(refusal) => AgentDispatchDecision::Refused(refusal),
@@ -645,6 +681,7 @@ where
     authority: Arc<dyn AgentDispatchAuthority>,
     credentials: Option<Arc<dyn AgentEffectCredentialResolver>>,
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
+    compensations: Option<Arc<dyn AgentCompensationExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -698,6 +735,7 @@ where
             authority,
             credentials: None,
             reconciler: None,
+            compensations: None,
             delivery,
             probe: None,
         }
@@ -738,6 +776,19 @@ where
     #[must_use]
     pub fn with_reconciler(mut self, reconciler: Arc<dyn AgentEffectReconciler>) -> Self {
         self.reconciler = Some(reconciler);
+        self
+    }
+
+    /// Executes operator-scheduled compensation effects through the given
+    /// application-owned executor
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)). Without
+    /// one, a compensation dispatch fails closed with a stable code.
+    #[must_use]
+    pub fn with_compensation_executor(
+        mut self,
+        compensations: Arc<dyn AgentCompensationExecutor>,
+    ) -> Self {
+        self.compensations = Some(compensations);
         self
     }
 
@@ -1023,7 +1074,10 @@ where
         // an unroutable execution policy, a blocked guardrail — settles the
         // generation (scenario 54).
         let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
-        let decision = self.authority.authorize(scope, state, intent, now).await?;
+        let decision = self
+            .authority
+            .authorize(scope, state, intent, attempt, now)
+            .await?;
         let granted = match decision {
             AgentDispatchDecision::Granted(granted) => {
                 if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {
@@ -1725,6 +1779,25 @@ where
                 let content = self.tools.execute(scope, intent, call, credential).await?;
                 Ok(AgentRunEffectOutcome::Tool {
                     call_id: call.call_id.clone(),
+                    content,
+                })
+            }
+            AgentRunEffectRequest::Compensation { compensation, .. } => {
+                let Some(executor) = self.compensations.as_ref() else {
+                    // Fail closed, definitively: nothing was invoked, an absent
+                    // executor will not appear mid-generation, and the run's
+                    // wind-down settles truthfully on the failure.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "compensation-executor-missing".to_string(),
+                        message: "no compensation executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                let content = executor
+                    .execute(scope, intent, compensation, credential)
+                    .await?;
+                Ok(AgentRunEffectOutcome::Tool {
+                    call_id: compensation_call_id(intent),
                     content,
                 })
             }

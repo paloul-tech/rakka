@@ -840,6 +840,79 @@ Guidance: [HITL and Authorization Guidance](technical-guidance.md#hitl-and-autho
   sensitive/non-idempotent work ([spec 12.6](spec.md#126-passivation-and-timers));
   full passivation during waits.
 
+**Amended as implemented:**
+
+- **One durable substrate carries all three kinds.** `Approval`,
+  `SecurityAuthorization`, and `IndeterminateEffectReconciliation` share the
+  checkpoint record, the decision-key deduplication, the timer machinery, and
+  passivation; only the decision set and resolution semantics differ per kind.
+  The checkpoint is plain durable state on the run's loop state — it commits in
+  the *same* transition as the effect it gates (a gated effect never exists
+  without its gate) and survives serialization, so the run passivates behind the
+  wait with no live task and any later command resumes it. Entity-level
+  operation-id deduplication is the primary scenario-11 guard; the checkpoint's
+  own bounded `applied_keys` ring is defence in depth for the
+  escalate-then-resolve flow, where the checkpoint stays open across decisions.
+- **The cryptographic digest is a new algorithm, not a new type.**
+  `AgentDigestAlgorithm::Sha256` was added to the existing `AgentContentDigest`
+  (inline safe-Rust FIPS 180-4, pinned to the standard vectors, no new
+  dependency) because the FNV fingerprint the effect carries is explicitly not
+  a security boundary. Both `AgentCheckpoint::open` and
+  `AgentCheckpointGrant::validate_for` refuse a non-cryptographic digest
+  outright — defence in depth, so a grant that somehow bound the fingerprint
+  can never gate dispatch. The grant digest covers the whole canonical request
+  encoding, and the dispatcher-side authority *recomputes* it from the intent
+  on every attempt, so a changed argument invalidates a stale approval
+  (scenario 12) without trusting anything the effect recorded about itself.
+- **Declared gates park at commit; guardrail gates refuse at dispatch.** A tool
+  binding's `checkpoint_required`/`authorization_required` is projected onto
+  `AgentEffectSpec` and the durable `AgentRunEffect`, so the run knows at
+  commit time to open the checkpoint and park (`WaitingForApproval`/
+  `WaitingForAuthorization`, both fencing `permits_progress`) instead of
+  letting the effect reach the authority and fail. A guardrail-driven
+  `CheckpointRequired` disposition is discovered dynamically at dispatch, so it
+  stays a dispatch-time refusal — it is satisfied by the same grant evaluation,
+  but it cannot be a commit-time park. A tool that requires *both* gates opens
+  a single `SecurityAuthorization` checkpoint: its grant satisfies either gate,
+  and the authority enforces the grant's **kind**, so an approval-kind grant
+  never stands in for a security authorization ([spec 12.4](spec.md#124-security-authorization)).
+- **The run holds the grant; the real authority revalidates it per attempt.**
+  A resolution stores the digest-bound grant on the run's loop state, keyed by
+  effect id *and generation*; `dispatch_effects` never hands a gated effect to
+  the sink without one, and `AgentEntityAuthority` sources it into the
+  authority context, where it is revalidated against the exact intent — and
+  the actual 1-based attempt number, threaded through
+  `AgentDispatchAuthority::authorize`, so a grant's allowed use count bounds
+  retries and a spent grant refuses the next attempt
+  (`checkpoint-grant-uses-exhausted`). Revocation is an immediate-safety check
+  ordered *before* the checkpoint gate, so a valid approval cannot outrun a
+  revocation (scenario 13). Because the grant binds the generation exactly, a
+  `ConfirmedNotExecuted` re-invocation of a gated effect re-parks the *new*
+  generation behind a fresh checkpoint of the matching kind in the resolving
+  transition — without that, the new generation would sit undispatchable with
+  no wait left to resolve.
+- **Reconciliation waits are checkpoints too, and they never hard-expire.** An
+  `Indeterminate` outcome opens the reconciliation checkpoint in the transition
+  that recorded the ambiguity, so the wait carries the full spec 12.2 surface.
+  Expiry is refused for this kind whatever deadline was stamped — a timer
+  cannot make an unknown outcome known — and run cancellation cancels only
+  approval-family checkpoints, so the parked ambiguity stays resolvable and
+  terminal cancellation projects only after its decision (scenario 57).
+  Approval-family expiry denies the gated effect (`checkpoint-expired`); the
+  durable `FireCheckpointTimers` command can only escalate or expire, never
+  grant. The effect-layer `ResolveIndeterminateEffect` command remains valid
+  and retires the checkpoint it bypasses — both paths converge in one shared
+  resolution core.
+- **`Compensate` schedules a real durable effect across the wind-down fence.**
+  A new `AgentRunEffectRequest::Compensation` (target type `compensation`,
+  routed to the application-owned `AgentCompensationExecutor`; absent executor
+  fails closed) is committed *after* the fence and is the one effect kind a
+  winding-down run still flushes; the ambiguous generation settles as
+  `Compensated`, the compensation is budget-reserved like a re-authorized
+  generation (an unaffordable one refuses the decision and keeps the effect
+  parked), and the run reaches its terminal `EffectCompensated` status only
+  after the compensation's own outcome settles.
+
 Done when: scenarios 3, 11, 12, and 13 pass, and the reconciliation half of
 scenario 57 passes (terminal cancellation only after outcomes are resolved).
 

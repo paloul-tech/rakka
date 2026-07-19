@@ -426,6 +426,12 @@ pub enum AgentDigestAlgorithm {
     /// FNV-1a over canonical JSON: a stable content fingerprint, and nothing
     /// more.
     Fnv1a128,
+    /// SHA-256 over canonical JSON: a collision-resistant digest suitable for a
+    /// security decision. This is the algorithm a digest-bound authorization
+    /// grant binds ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// only a second-preimage-resistant digest can decide whether an approval
+    /// still binds the exact arguments a dispatch is about to send.
+    Sha256,
 }
 
 impl AgentDigestAlgorithm {
@@ -434,6 +440,17 @@ impl AgentDigestAlgorithm {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::Fnv1a128 => "fnv1a-128",
+            Self::Sha256 => "sha2-256",
+        }
+    }
+
+    /// Whether the algorithm is a cryptographic digest a security decision may
+    /// rely on. FNV-1a is a fingerprint and must never gate authorization.
+    #[must_use]
+    pub const fn is_cryptographic(self) -> bool {
+        match self {
+            Self::Fnv1a128 => false,
+            Self::Sha256 => true,
         }
     }
 }
@@ -452,12 +469,12 @@ impl Display for AgentDigestAlgorithm {
 /// under a stable identifier
 /// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// It is deliberately **not** a security boundary. The digest-bound
-/// authorization grants of
+/// The default [`AgentContentDigest::of_json`] fingerprint is deliberately
+/// **not** a security boundary. The digest-bound authorization grants of
 /// [specification 12.3](../../../docs/plans/rakka-agent/spec.md) need a
-/// cryptographic digest, and the checkpoint slice adds that algorithm to
-/// [`AgentDigestAlgorithm`]; this fingerprint must not be used to decide whether
-/// an approval still binds.
+/// cryptographic digest, so [`AgentContentDigest::sha256_of_json`] produces a
+/// [`AgentDigestAlgorithm::Sha256`] digest for exactly that use; the FNV
+/// fingerprint must not be used to decide whether an approval still binds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AgentContentDigest {
     /// Algorithm that produced the value.
@@ -493,6 +510,31 @@ impl AgentContentDigest {
         Self {
             algorithm: AgentDigestAlgorithm::Fnv1a128,
             value: format!("{hash:032x}"),
+        }
+    }
+
+    /// Computes the cryptographic [`AgentDigestAlgorithm::Sha256`] digest of a
+    /// JSON value over its canonical encoding.
+    ///
+    /// This is the constructor a digest-bound authorization grant uses
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)): the
+    /// canonicalization matches [`Self::of_json`], so the same structural value
+    /// always produces the same digest, and SHA-256 makes a changed argument
+    /// computationally impossible to disguise under an unchanged digest.
+    #[must_use]
+    pub fn sha256_of_json(value: &Value) -> Self {
+        let mut canonical = String::new();
+        write_canonical_json(value, &mut canonical);
+        Self::sha256_of_bytes(canonical.as_bytes())
+    }
+
+    /// Computes the cryptographic [`AgentDigestAlgorithm::Sha256`] digest of raw
+    /// bytes.
+    #[must_use]
+    pub fn sha256_of_bytes(bytes: &[u8]) -> Self {
+        Self {
+            algorithm: AgentDigestAlgorithm::Sha256,
+            value: sha256_hex(bytes),
         }
     }
 }
@@ -537,6 +579,175 @@ fn write_canonical_json(value: &Value, out: &mut String) {
         }
         other => out.push_str(&other.to_string()),
     }
+}
+
+/// Computes the SHA-256 digest of `bytes` as a lowercase hexadecimal string.
+///
+/// SHA-256 is implemented inline in safe Rust — exactly as the FNV-1a
+/// fingerprint above is — so a security-relevant digest depends on no external
+/// crate and stays fully reviewable under this crate's `forbid(unsafe_code)`.
+/// The algorithm is FIPS 180-4; the round constants and initial hash values are
+/// the standard ones, and the unit tests pin the empty-string and `"abc"`
+/// vectors.
+#[must_use]
+fn sha256_hex(bytes: &[u8]) -> String {
+    // First 32 bits of the fractional parts of the square roots of the first
+    // eight primes.
+    let mut h: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    // First 32 bits of the fractional parts of the cube roots of the first
+    // sixty-four primes.
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+
+    // Padding: 0x80, then zeros to 56 mod 64, then the 64-bit big-endian bit
+    // length.
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut message = bytes.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            let base = i * 4;
+            *word = u32::from_be_bytes([
+                chunk[base],
+                chunk[base + 1],
+                chunk[base + 2],
+                chunk[base + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut hex = String::with_capacity(64);
+    for word in h {
+        hex.push_str(&format!("{word:08x}"));
+    }
+    hex
 }
 
 /// Bounded task content: an inline value, or a reference to one.
@@ -5634,5 +5845,49 @@ impl From<AgentTaskError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::{AgentContentDigest, AgentDigestAlgorithm};
+    use serde_json::json;
+
+    #[test]
+    fn sha256_matches_the_standard_vectors() {
+        // FIPS 180-4 / RFC 6234 known-answer vectors.
+        assert_eq!(
+            AgentContentDigest::sha256_of_bytes(b"").value,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            AgentContentDigest::sha256_of_bytes(b"abc").value,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            AgentContentDigest::sha256_of_bytes(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )
+            .value,
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn the_cryptographic_digest_is_canonical_and_labelled() {
+        let a = AgentContentDigest::sha256_of_json(&json!({"a": 1, "b": 2}));
+        let b = AgentContentDigest::sha256_of_json(&json!({"b": 2, "a": 1}));
+        assert_eq!(a, b, "key order must not change the digest");
+        assert_eq!(a.algorithm, AgentDigestAlgorithm::Sha256);
+        assert!(a.algorithm.is_cryptographic());
+        assert!(!AgentDigestAlgorithm::Fnv1a128.is_cryptographic());
+        assert_eq!(a.to_string(), format!("sha2-256:{}", a.value));
+    }
+
+    #[test]
+    fn a_changed_argument_changes_the_cryptographic_digest() {
+        let before = AgentContentDigest::sha256_of_json(&json!({"amount": 100}));
+        let after = AgentContentDigest::sha256_of_json(&json!({"amount": 101}));
+        assert_ne!(before, after);
     }
 }

@@ -98,9 +98,10 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
         scope: &'a AgentRunScope,
         run: &'a AgentRunState,
         intent: &'a AgentRunEffect,
+        attempt: u32,
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
-        let inner = self.0.authorize(scope, run, intent, now);
+        let inner = self.0.authorize(scope, run, intent, attempt, now);
         Box::pin(async move {
             match inner.await? {
                 AgentDispatchDecision::Granted(mut granted) => {
@@ -540,13 +541,15 @@ async fn a_revoked_credential_binding_is_undispatchable() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 54: the checkpoint check. A binding that requires an effect-bound
-// checkpoint grant fails closed until the slice 1.10 checkpoint runtime can
-// issue one.
+// Scenario 54 / spec 12: the checkpoint gate. A binding that requires an
+// effect-bound checkpoint grant is undispatchable without one — since slice
+// 1.10's run-side wave, the run parks on an approval checkpoint rather than
+// letting the effect reach the dispatcher and fail. Either way the tool is not
+// invoked until a decision issues a grant.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_checkpoint_requiring_tool_is_undispatchable_without_a_grant() {
+async fn a_checkpoint_requiring_tool_parks_for_approval_and_is_not_invoked() {
     let registry = AgentToolRegistry::new()
         .register(
             tool_binding_for_spec(TOOL, &AgentEffectSpec::non_idempotent())
@@ -557,8 +560,84 @@ async fn a_checkpoint_requiring_tool_is_undispatchable_without_a_grant() {
     fx.start().await;
     fx.pump().await;
 
-    assert_eq!(fx.terminal_failure_code().await, "checkpoint-required");
+    // The run reaches its checkpoint wait and quiesces there — passivated, no
+    // live task — rather than becoming terminal, and the tool never runs.
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::WaitingForApproval);
+    assert!(!run.status.is_terminal());
     assert_eq!(fx.tools.invocation_count(TOOL), 0);
+}
+
+#[tokio::test]
+async fn a_resolved_checkpoint_grant_lets_the_gated_tool_dispatch() {
+    // The whole loop: the run parks, an approval stores the digest-bound grant,
+    // and the *real* dispatch authority — not a stub — sources that grant,
+    // revalidates it against the exact intent, and lets the tool execute.
+    let registry = AgentToolRegistry::new()
+        .register(
+            tool_binding_for_spec(TOOL, &AgentEffectSpec::non_idempotent())
+                .with_checkpoint_required(),
+        )
+        .expect("the tool registers");
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.fx.run_snapshot().await.expect("the run exists").status,
+        AgentRunStatus::WaitingForApproval
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0);
+
+    let checkpoint_id = {
+        let mut store = fx.fx.run();
+        store.recover(fx.fx.now()).await.expect("the run recovers");
+        store
+            .state()
+            .expect("state reads")
+            .loop_state()
+            .expect("the loop exists")
+            .open_checkpoints()[0]
+            .checkpoint_id
+            .clone()
+    };
+
+    let mut store = fx.fx.run();
+    store.recover(fx.fx.now()).await.expect("the run recovers");
+    store
+        .apply(
+            rakka_agent::AgentRunEntityCommand::ResolveCheckpoint {
+                operation_id: AgentOperationId::for_agent(
+                    AgentOperationKind::CheckpointResolution,
+                    &agent_scope(),
+                    "d1",
+                )
+                .expect("the decision key derives"),
+                checkpoint_id,
+                resolver: rakka_agent_workflow::PrincipalRef {
+                    principal_type: "user".to_string(),
+                    principal_id: "approver".to_string(),
+                    display_name: None,
+                },
+                decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
+                    rakka_agent::AgentApprovalDecision::Approve {
+                        credential_binding: None,
+                        expires_at: AgentTimestampMillis::new(1_000_000),
+                        allowed_use_count: 1,
+                    },
+                )),
+            },
+            &fx.fx.router,
+            fx.fx.now(),
+        )
+        .await
+        .expect("the approval applies");
+
+    fx.pump().await;
+
+    let run = fx.fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
+    assert_eq!(fx.tools.invocation_count(TOOL), 1);
 }
 
 // ---------------------------------------------------------------------------
