@@ -96,6 +96,15 @@ pub const CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION: StateSchemaVersion =
 pub const CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted [`crate::checkpoints::AgentCheckpoint`].
+///
+/// A checkpoint outlives the effect generation it gates — it is resolved by a
+/// human or authorization service after the run has passivated — so it carries
+/// its own version rather than the run state's: a checkpoint opened by an
+/// earlier binary must still be interpretable on resolution, or fail closed
+/// ([specification 12.2](../../../docs/plans/rakka-agent/spec.md)).
+pub const CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
 /// Result type for schema compatibility checks.
 pub type AgentSchemaResult<T> = Result<T, AgentSchemaError>;
 
@@ -141,11 +150,13 @@ pub enum AgentRecordKind {
     ExchangeEnvelope,
     /// Reply to an inter-entity exchange.
     ExchangeReply,
+    /// One durable HITL checkpoint a run is waiting on.
+    Checkpoint,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -162,6 +173,7 @@ impl AgentRecordKind {
         Self::ExchangeJournal,
         Self::ExchangeEnvelope,
         Self::ExchangeReply,
+        Self::Checkpoint,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -184,6 +196,7 @@ impl AgentRecordKind {
             Self::ExchangeJournal => "agent-exchange-journal",
             Self::ExchangeEnvelope => "agent-exchange-envelope",
             Self::ExchangeReply => "agent-exchange-reply",
+            Self::Checkpoint => "agent-checkpoint",
         }
     }
 
@@ -207,6 +220,7 @@ impl AgentRecordKind {
             Self::ExchangeJournal => CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
             Self::ExchangeEnvelope => CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
             Self::ExchangeReply => CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
+            Self::Checkpoint => CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION,
         }
     }
 
@@ -228,6 +242,7 @@ impl AgentRecordKind {
             Self::ExchangeJournal => 13,
             Self::ExchangeEnvelope => 14,
             Self::ExchangeReply => 15,
+            Self::Checkpoint => 16,
         }
     }
 }

@@ -863,6 +863,22 @@ impl AgentRunEffectRequest {
         Ok(AgentContentDigest::of_json(&value))
     }
 
+    /// Cryptographic digest of the request, for a digest-bound authorization
+    /// grant ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A checkpoint grant binds this SHA-256 digest, not the FNV fingerprint of
+    /// [`Self::argument_digest`]: only a collision-resistant digest can decide
+    /// whether a human's approval still binds the exact arguments a dispatch is
+    /// about to send. It is computed over the same canonical encoding, so an
+    /// argument that changed after approval necessarily changes the digest and
+    /// invalidates the grant.
+    pub fn cryptographic_argument_digest(&self) -> AgentEffectResult<AgentContentDigest> {
+        let value = serde_json::to_value(self).map_err(|error| AgentEffectError::Model {
+            message: format!("the effect request could not be encoded: {error}"),
+        })?;
+        Ok(AgentContentDigest::sha256_of_json(&value))
+    }
+
     /// The dispatch target this request names.
     #[must_use]
     pub fn target(&self) -> AgentEffectTarget {

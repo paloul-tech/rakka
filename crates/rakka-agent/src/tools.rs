@@ -54,6 +54,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::agent::{AgentEntityState, AgentLifecycleStatus};
+use crate::checkpoints::AgentCheckpointGrant;
 use crate::definition::{
     AgentAuthorityEnvelope, AgentCapabilityId, AgentCredentialBindingRef, AgentDefinitionRevision,
     AgentEffectSafetyClass, AgentEnvelopeDimension, AgentExecutionPolicyRef, AgentGuardrailStageId,
@@ -565,6 +566,12 @@ pub struct AgentAuthorityContext<'a> {
     pub settings: &'a SettingsRevision,
     /// The run's setup revision, when the run was created under one.
     pub setup: Option<&'a AgentSetupRevision>,
+    /// The digest-bound checkpoint grant the run holds for the intent, when a
+    /// human or authorization service has resolved a checkpoint for it. It is
+    /// what satisfies a `checkpoint_required` binding or a guardrail
+    /// `CheckpointRequired` disposition; without a valid grant, either gate
+    /// fails closed ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    pub checkpoint_grant: Option<&'a AgentCheckpointGrant>,
 }
 
 impl<'a> AgentAuthorityContext<'a> {
@@ -576,6 +583,7 @@ impl<'a> AgentAuthorityContext<'a> {
             definition: state.definition(),
             settings: state.settings(),
             setup: None,
+            checkpoint_grant: None,
         }
     }
 
@@ -583,6 +591,16 @@ impl<'a> AgentAuthorityContext<'a> {
     #[must_use]
     pub const fn with_setup(mut self, setup: &'a AgentSetupRevision) -> Self {
         self.setup = Some(setup);
+        self
+    }
+
+    /// Attaches the checkpoint grant the run holds for the intent being
+    /// authorized. The grant is revalidated against the exact intent at the
+    /// checkpoint gate, so a grant bound to a different generation, target, or
+    /// argument set never satisfies the gate.
+    #[must_use]
+    pub const fn with_checkpoint_grant(mut self, grant: &'a AgentCheckpointGrant) -> Self {
+        self.checkpoint_grant = Some(grant);
         self
     }
 }
@@ -926,6 +944,38 @@ impl AgentToolAuthority {
         }
     }
 
+    /// Evaluates the checkpoint grant the context carries against the exact
+    /// intent, before any gate consults it.
+    ///
+    /// Returns whether a valid grant is present, and — when a grant is present
+    /// but does not bind the intent — the specific refusal that invalidated it
+    /// (a changed argument digest, a superseded generation, an expired or
+    /// spent grant). A gate that requires a checkpoint surfaces that specific
+    /// refusal rather than the generic `checkpoint-required`, so an operator
+    /// sees *why* a once-valid approval no longer binds
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    fn evaluate_checkpoint_grant(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> (bool, Option<AgentAuthorityRefusal>) {
+        match context.checkpoint_grant {
+            None => (false, None),
+            // A grant is revalidated against the first attempt: it must bind the
+            // exact intent now, whatever per-attempt use count the dispatch
+            // layer later enforces on the grant it issues.
+            Some(grant) => match grant.validate_for(scope, intent, 1, now) {
+                Ok(()) => (true, None),
+                Err(error) => (
+                    false,
+                    Some(AgentAuthorityRefusal::of(error.code(), error.to_string())),
+                ),
+            },
+        }
+    }
+
     /// The tool half of [`Self::authorize`]: binding, envelope, immediate
     /// safety, credential, execution policy, checkpoint, and guardrails, in
     /// that order.
@@ -1113,17 +1163,26 @@ impl AgentToolAuthority {
         // class is only executed where the application accepted that class.
         self.check_execution_policy(intent.execution_policy.as_ref())?;
 
-        // The effect-bound checkpoint gate. Until slice 1.10 lands the
-        // checkpoint runtime, no grant can exist, so the requirement fails
-        // closed here.
-        if binding.checkpoint_required {
-            return Err(AgentAuthorityRefusal::of(
-                "checkpoint-required",
-                format!(
-                    "the tool {} requires an effect-bound checkpoint grant, and none exists",
-                    call.tool
-                ),
-            ));
+        // The effect-bound checkpoint gate: a tool that requires a checkpoint
+        // may only dispatch under a digest-bound grant that binds this exact
+        // intent. A missing grant fails closed with `checkpoint-required`; a
+        // present-but-invalid grant fails closed with the specific reason it no
+        // longer binds — a changed argument invalidates a stale approval
+        // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md);
+        // [specification 18](../../../docs/plans/rakka-agent/spec.md)
+        // scenario 12).
+        let (checkpoint_satisfied, checkpoint_grant_refusal) =
+            self.evaluate_checkpoint_grant(context, scope, intent, now);
+        if binding.checkpoint_required && !checkpoint_satisfied {
+            return Err(checkpoint_grant_refusal.unwrap_or_else(|| {
+                AgentAuthorityRefusal::of(
+                    "checkpoint-required",
+                    format!(
+                        "the tool {} requires an effect-bound checkpoint grant, and none exists",
+                        call.tool
+                    ),
+                )
+            }));
         }
 
         // Guardrails: every stage the envelopes and the binding require must
@@ -1152,7 +1211,7 @@ impl AgentToolAuthority {
                 &call.arguments,
                 AGENT_TOOL_ARGUMENTS_MAX_BYTES,
             );
-            refuse_guardrail_disposition(&decision.disposition, "the call")?;
+            refuse_guardrail_disposition(&decision.disposition, "the call", checkpoint_satisfied)?;
             if decision.transformed {
                 let transformed = AgentToolCallRequest::new(
                     call.call_id.clone(),
@@ -1270,7 +1329,13 @@ impl AgentToolAuthority {
                 &AgentGuardrailContext::new(AgentGuardrailBoundary::ModelRequest, scope),
                 &content,
             );
-            refuse_guardrail_disposition(&decision.disposition, "the model call")?;
+            let (checkpoint_satisfied, _) =
+                self.evaluate_checkpoint_grant(context, scope, intent, now);
+            refuse_guardrail_disposition(
+                &decision.disposition,
+                "the model call",
+                checkpoint_satisfied,
+            )?;
             if decision.transformed {
                 // The descriptor evaluated here is synthesized, so a
                 // transform of it cannot reach the model context; silently
@@ -1484,9 +1549,15 @@ impl Debug for AgentToolAuthority {
 /// Maps one guardrail disposition onto the authority's refusal, identically
 /// at every boundary, carrying the block's protected evidence reference into
 /// the durable failure detail rather than discarding it.
+///
+/// A `CheckpointRequired` disposition is satisfied by a valid checkpoint grant
+/// exactly as a `checkpoint_required` binding is: `checkpoint_satisfied` is the
+/// verdict of [`AgentToolAuthority::evaluate_checkpoint_grant`] against the same
+/// intent. Without a grant the disposition still fails closed.
 fn refuse_guardrail_disposition(
     disposition: &AgentGuardrailDisposition,
     what: &str,
+    checkpoint_satisfied: bool,
 ) -> Result<(), AgentAuthorityRefusal> {
     match disposition {
         AgentGuardrailDisposition::Allowed => Ok(()),
@@ -1505,11 +1576,14 @@ fn refuse_guardrail_disposition(
             ))
         }
         AgentGuardrailDisposition::CheckpointRequired { stage, reason_code } => {
+            if checkpoint_satisfied {
+                return Ok(());
+            }
             Err(AgentAuthorityRefusal::of(
                 "checkpoint-required",
                 format!(
-                    "guardrail stage {stage} requires a checkpoint grant, and none exists: \
-                     {reason_code}"
+                    "guardrail stage {stage} requires a checkpoint grant, and none binds this \
+                     intent: {reason_code}"
                 ),
             ))
         }
@@ -1637,6 +1711,10 @@ impl From<AgentToolError> for AgentEffectError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoints::{
+        AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointKind,
+        AgentCheckpointOutcome,
+    };
     use crate::definition::{
         AgentDefinition, AgentDefinitionId, AgentPolicyRef, AgentRevisionProvenance,
         AgentSettingsChange,
@@ -1644,10 +1722,11 @@ mod tests {
     use crate::guardrails::{
         AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailOutcome, AgentGuardrailStage,
     };
-    use crate::identity::{AgentId, AgentRunId, TenantId};
+    use crate::identity::{AgentId, AgentOperationId, AgentOperationKind, AgentRunId, TenantId};
     use crate::memory::AgentContextSnapshotRef;
     use crate::schema::{VersionedAgentRecord, CURRENT_AGENT_SETUP_SCHEMA_VERSION};
     use crate::task::AgentSchemaId;
+    use rakka_agent_workflow::HumanCheckpointId;
     use rakka_agent_workflow::{AgentAuditEventId, AgentCausationId, PrincipalRef};
 
     fn schema(id: &str) -> AgentSchemaRef {
@@ -1824,6 +1903,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -1859,6 +1939,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
 
         let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
@@ -1919,6 +2000,222 @@ mod tests {
         );
     }
 
+    fn resolver() -> PrincipalRef {
+        PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "approver".to_string(),
+            display_name: None,
+        }
+    }
+
+    fn tool_intent_amount(tool: &str, spec: &AgentEffectSpec, amount: i64) -> AgentRunEffect {
+        let call = AgentToolCallRequest::new(
+            crate::model::AgentToolCallId::new("call-1").expect("the call id is valid"),
+            tool_id(tool),
+            serde_json::json!({ "amount": amount }),
+        )
+        .expect("the call is bounded");
+        AgentRunEffect::new(
+            &scope(),
+            1,
+            0,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(call),
+            },
+            spec,
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives")
+    }
+
+    /// Opens an approval checkpoint bound to `intent` and resolves it `Approve`,
+    /// returning the digest-bound grant the resolution issues.
+    fn approved_grant(
+        intent: &AgentRunEffect,
+        expires_at: AgentTimestampMillis,
+        allowed_use_count: u32,
+    ) -> AgentCheckpointGrant {
+        let mut checkpoint = AgentCheckpoint::open(
+            HumanCheckpointId::new("ck-1"),
+            AgentCheckpointKind::Approval,
+            scope(),
+            intent,
+            "Approve charging the card.",
+            resolver(),
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the checkpoint opens");
+        let report = checkpoint
+            .resolve(
+                AgentOperationId::new(
+                    AgentOperationKind::CheckpointResolution,
+                    ["acme", "support", "t-gen-1", "ck-1"],
+                )
+                .expect("the decision key derives"),
+                resolver(),
+                AgentCheckpointDecision::Approval(AgentApprovalDecision::Approve {
+                    credential_binding: None,
+                    expires_at,
+                    allowed_use_count,
+                }),
+                AgentTimestampMillis::new(2),
+            )
+            .expect("the checkpoint resolves");
+        match report.outcome {
+            AgentCheckpointOutcome::Granted(grant) => *grant,
+            other => panic!("expected a grant, got {other:?}"),
+        }
+    }
+
+    fn checkpoint_required_fixture() -> (AgentToolRegistry, AgentDefinitionRevision) {
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent);
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), declaration.clone(), 1)
+                    .with_checkpoint_required(),
+            )
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("charge-card"), declaration)]));
+        (registry, definition)
+    }
+
+    #[test]
+    fn a_checkpoint_required_tool_fails_closed_without_a_grant_and_dispatches_under_one() {
+        let (registry, definition) = checkpoint_required_fixture();
+        let settings = settings_for(&definition);
+        let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
+        let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
+
+        // No grant: the tool stays undispatchable.
+        let without = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+        };
+        let refusal = authority
+            .authorize(
+                &without,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect_err("a checkpoint-required tool with no grant is refused");
+        assert_eq!(refusal.code, "checkpoint-required");
+        assert!(
+            !refusal.retryable,
+            "a missing checkpoint is a definitive refusal"
+        );
+
+        // A valid digest-bound grant satisfies the gate.
+        let grant = approved_grant(&intent, AgentTimestampMillis::new(1_000), 1);
+        let with = without.with_checkpoint_grant(&grant);
+        authority
+            .authorize(
+                &with,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect("a checkpoint-required tool dispatches under a valid grant");
+    }
+
+    #[test]
+    fn a_changed_effect_digest_invalidates_an_old_approval() {
+        // Scenario 12: the human approved charging 42; the intent now charges
+        // 99 under the same effect identity. The stale grant no longer binds.
+        let (registry, definition) = checkpoint_required_fixture();
+        let settings = settings_for(&definition);
+        let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
+
+        let approved_intent =
+            tool_intent_amount("charge-card", &AgentEffectSpec::non_idempotent(), 42);
+        let grant = approved_grant(&approved_intent, AgentTimestampMillis::new(1_000), 1);
+
+        // Same effect id and generation, different arguments.
+        let changed_intent =
+            tool_intent_amount("charge-card", &AgentEffectSpec::non_idempotent(), 99);
+        assert_eq!(approved_intent.effect_id, changed_intent.effect_id);
+        assert_eq!(approved_intent.generation, changed_intent.generation);
+
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: Some(&grant),
+        };
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &changed_intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect_err("a changed argument digest invalidates the approval");
+        assert_eq!(refusal.code, "checkpoint-argument-digest-mismatch");
+
+        // The unchanged intent still dispatches under the same grant, so the
+        // invalidation is the digest change, not a broken grant.
+        let ok_context = context.with_checkpoint_grant(&grant);
+        authority
+            .authorize(
+                &ok_context,
+                &scope(),
+                None,
+                None,
+                &approved_intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect("the approved intent still binds");
+    }
+
+    #[test]
+    fn an_immediate_revocation_refuses_even_under_a_valid_checkpoint_grant() {
+        // Scenario 13: a valid approval cannot outrun an immediate revocation.
+        // The tool is revoked in the current settings; the grant is beside the
+        // point, because revocation is checked before the checkpoint gate.
+        let (registry, definition) = checkpoint_required_fixture();
+        let settings = settings_for(&definition);
+        let revoked = settings
+            .apply(
+                &definition,
+                vec![AgentSettingsChange::RevokeTool(tool_id("charge-card"))],
+                provenance(),
+            )
+            .expect("the revocation applies");
+        let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
+        let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
+        let grant = approved_grant(&intent, AgentTimestampMillis::new(1_000), 1);
+
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &revoked,
+            setup: None,
+            checkpoint_grant: Some(&grant),
+        };
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect_err("a revoked tool is refused despite a valid grant");
+        assert_eq!(refusal.code, "tool-revoked");
+    }
+
     #[test]
     fn a_setup_that_excludes_a_declared_tool_is_enforced_at_dispatch() {
         // Scenario 44's dispatch half: the definition declares the tool, the
@@ -1952,6 +2249,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: Some(&setup),
+            checkpoint_grant: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -1993,6 +2291,7 @@ mod tests {
             definition: &definition,
             settings: &revoked,
             setup: None,
+            checkpoint_grant: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2023,6 +2322,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
         let refusal = authority
             .authorize(
@@ -2042,6 +2342,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
         let refusal = authority
             .authorize(
@@ -2078,6 +2379,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2115,6 +2417,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
         let authority = AgentToolAuthority::new(registry);
 
@@ -2172,6 +2475,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
         let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
 
@@ -2224,6 +2528,7 @@ mod tests {
             definition: &definition,
             settings: &settings,
             setup: None,
+            checkpoint_grant: None,
         };
         let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
             .with_stage(
