@@ -541,6 +541,33 @@ impl AgentLoopState {
             .any(|checkpoint| checkpoint.status.is_waiting())
     }
 
+    /// The kind of approval-family wait the run is parked on, when any: an
+    /// open [`crate::checkpoints::AgentCheckpointKind::Approval`] checkpoint
+    /// wins over an open
+    /// [`crate::checkpoints::AgentCheckpointKind::SecurityAuthorization`] one,
+    /// because a pending human decision is the wait an operator can act on
+    /// first. A reconciliation checkpoint is not an approval-family wait — the
+    /// indeterminate effect it gates drives the run's status instead.
+    #[must_use]
+    pub fn approval_family_wait(&self) -> Option<crate::checkpoints::AgentCheckpointKind> {
+        let mut wait = None;
+        for checkpoint in &self.open_checkpoints {
+            if !checkpoint.status.is_waiting() {
+                continue;
+            }
+            match checkpoint.kind {
+                crate::checkpoints::AgentCheckpointKind::Approval => {
+                    return Some(crate::checkpoints::AgentCheckpointKind::Approval)
+                }
+                crate::checkpoints::AgentCheckpointKind::SecurityAuthorization => {
+                    wait = Some(crate::checkpoints::AgentCheckpointKind::SecurityAuthorization);
+                }
+                crate::checkpoints::AgentCheckpointKind::IndeterminateEffectReconciliation => {}
+            }
+        }
+        wait
+    }
+
     /// The digest-bound grant the run holds for exactly this effect intent, when
     /// a checkpoint for it has been resolved.
     #[must_use]
@@ -551,10 +578,13 @@ impl AgentLoopState {
     }
 
     /// Whether the effect may be handed to the sink: either it needs no
-    /// checkpoint, or a valid grant for its exact generation is held.
+    /// checkpoint or authorization, or a valid grant for its exact generation
+    /// is held. The grant's *kind* is enforced at the dispatch authority, not
+    /// here: the run only ever stores the grant its own checkpoint issued.
     #[must_use]
     pub fn is_dispatchable(&self, effect: &AgentRunEffect) -> bool {
-        !effect.checkpoint_required || self.grant_for(effect).is_some()
+        !(effect.checkpoint_required || effect.authorization_required)
+            || self.grant_for(effect).is_some()
     }
 
     pub(crate) fn open_checkpoint_mut(
@@ -615,11 +645,20 @@ impl AgentLoopState {
             .map(|checkpoint| checkpoint.checkpoint_id.clone());
     }
 
-    /// Cancels every waiting checkpoint the run holds, because the run itself is
-    /// winding down.
+    /// Cancels every waiting approval-family checkpoint the run holds, because
+    /// the run itself is winding down.
+    ///
+    /// A reconciliation checkpoint survives: cancellation does not make an
+    /// unknown outcome known, and the parked ambiguity must stay resolvable
+    /// through its checkpoint until an explicit decision settles it
+    /// ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 57).
     pub(crate) fn cancel_open_checkpoints(&mut self, now: AgentTimestampMillis) {
         for checkpoint in &mut self.open_checkpoints {
-            checkpoint.cancel(now);
+            if checkpoint.kind
+                != crate::checkpoints::AgentCheckpointKind::IndeterminateEffectReconciliation
+            {
+                checkpoint.cancel(now);
+            }
         }
         self.resync_pending_checkpoint();
     }

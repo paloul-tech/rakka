@@ -54,7 +54,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::agent::{AgentEntityState, AgentLifecycleStatus};
-use crate::checkpoints::AgentCheckpointGrant;
+use crate::checkpoints::{AgentCheckpointGrant, AgentCheckpointKind};
 use crate::definition::{
     AgentAuthorityEnvelope, AgentCapabilityId, AgentCredentialBindingRef, AgentDefinitionRevision,
     AgentEffectSafetyClass, AgentEnvelopeDimension, AgentExecutionPolicyRef, AgentGuardrailStageId,
@@ -317,6 +317,7 @@ pub struct AgentToolBinding {
     timeout_ms: Option<u64>,
     guardrails: BTreeSet<AgentGuardrailStageId>,
     checkpoint_required: bool,
+    authorization_required: bool,
 }
 
 impl AgentToolBinding {
@@ -332,6 +333,7 @@ impl AgentToolBinding {
             timeout_ms: None,
             guardrails: BTreeSet::new(),
             checkpoint_required: false,
+            authorization_required: false,
         }
     }
 
@@ -356,6 +358,7 @@ impl AgentToolBinding {
             timeout_ms: None,
             guardrails: BTreeSet::new(),
             checkpoint_required: false,
+            authorization_required: false,
         }
     }
 
@@ -397,6 +400,21 @@ impl AgentToolBinding {
         self
     }
 
+    /// Requires a security-authorization grant before this tool may dispatch
+    /// ([specification 12.4](../../../docs/plans/rakka-agent/spec.md)): a
+    /// principal or authorization service must resolve a
+    /// [`AgentCheckpointKind::SecurityAuthorization`] checkpoint that supplies
+    /// the capability or logical credential binding the effect needs.
+    ///
+    /// An ordinary approval grant does not satisfy this requirement — the gate
+    /// checks the grant's kind, so a human approval can never stand in for a
+    /// security authorization.
+    #[must_use]
+    pub const fn with_authorization_required(mut self) -> Self {
+        self.authorization_required = true;
+        self
+    }
+
     /// The bounded, model-visible descriptor.
     #[must_use]
     pub const fn descriptor(&self) -> &AgentToolDescriptor {
@@ -422,6 +440,12 @@ impl AgentToolBinding {
         self.checkpoint_required
     }
 
+    /// Whether this tool requires a security-authorization grant.
+    #[must_use]
+    pub const fn authorization_required(&self) -> bool {
+        self.authorization_required
+    }
+
     /// The effect spec calls to this tool dispatch under
     /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
     /// registered tool supplies the permitted safety declaration).
@@ -435,6 +459,7 @@ impl AgentToolBinding {
             execution_policy: self.declaration.execution_policy.clone(),
             guardrail_revision: None,
             checkpoint_required: self.checkpoint_required,
+            authorization_required: self.authorization_required,
         };
         spec.validate()?;
         Ok(spec)
@@ -942,6 +967,9 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::Model { .. } => {
                 self.authorize_model(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::Compensation { .. } => {
+                self.authorize_compensation(context, scope, task, goal, intent, now)
+            }
         }
     }
 
@@ -1186,6 +1214,38 @@ impl AgentToolAuthority {
             }));
         }
 
+        // The security-authorization gate: stricter than the checkpoint gate,
+        // because a valid grant is not enough — it must have been issued by a
+        // `SecurityAuthorization` checkpoint. A human approval can never stand
+        // in for the capability or credential binding an authorization supplies
+        // ([specification 12.4](../../../docs/plans/rakka-agent/spec.md)).
+        if binding.authorization_required {
+            if !checkpoint_satisfied {
+                return Err(checkpoint_grant_refusal.unwrap_or_else(|| {
+                    AgentAuthorityRefusal::of(
+                        "authorization-required",
+                        format!(
+                            "the tool {} requires a security-authorization grant, and none exists",
+                            call.tool
+                        ),
+                    )
+                }));
+            }
+            let authorized = context
+                .checkpoint_grant
+                .is_some_and(|grant| grant.kind == AgentCheckpointKind::SecurityAuthorization);
+            if !authorized {
+                return Err(AgentAuthorityRefusal::of(
+                    "authorization-required",
+                    format!(
+                        "the tool {} requires a security-authorization grant, but the grant it \
+                         holds was issued by an approval checkpoint",
+                        call.tool
+                    ),
+                ));
+            }
+        }
+
         // Guardrails: every stage the envelopes and the binding require must
         // be runnable, and the tool-request boundary must allow the call.
         let mut required = self.required_stages(context);
@@ -1284,7 +1344,9 @@ impl AgentToolAuthority {
             .clone()
             .or_else(|| match &intent.request {
                 AgentRunEffectRequest::Model { profile, .. } => profile.clone(),
-                AgentRunEffectRequest::Tool { .. } => None,
+                AgentRunEffectRequest::Tool { .. } | AgentRunEffectRequest::Compensation { .. } => {
+                    None
+                }
             });
 
         if let Some(profile) = &profile {
@@ -1369,6 +1431,46 @@ impl AgentToolAuthority {
             sampling: Some(settings.sampling),
             transforms: Vec::new(),
             reports,
+        })
+    }
+
+    /// The compensation half of [`Self::authorize`]
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// An explicitly scheduled compensation carries no tool binding — the
+    /// operator's reconciliation decision is its authorization — but its
+    /// credential binding and execution-policy routing are still checked
+    /// against the current envelopes and settings, so an immediate revocation
+    /// fences it exactly like any other dispatch.
+    fn authorize_compensation(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
         })
     }
 
@@ -2037,9 +2139,25 @@ mod tests {
         expires_at: AgentTimestampMillis,
         allowed_use_count: u32,
     ) -> AgentCheckpointGrant {
+        grant_of_kind(
+            AgentCheckpointKind::Approval,
+            intent,
+            expires_at,
+            allowed_use_count,
+        )
+    }
+
+    /// Opens a checkpoint of `kind` bound to `intent` and resolves it `Approve`,
+    /// returning the digest-bound grant the resolution issues.
+    fn grant_of_kind(
+        kind: AgentCheckpointKind,
+        intent: &AgentRunEffect,
+        expires_at: AgentTimestampMillis,
+        allowed_use_count: u32,
+    ) -> AgentCheckpointGrant {
         let mut checkpoint = AgentCheckpoint::open(
             HumanCheckpointId::new("ck-1"),
-            AgentCheckpointKind::Approval,
+            kind,
             scope(),
             intent,
             "Approve charging the card.",
@@ -2125,6 +2243,81 @@ mod tests {
                 AgentTimestampMillis::new(10),
             )
             .expect("a checkpoint-required tool dispatches under a valid grant");
+    }
+
+    #[test]
+    fn an_authorization_required_tool_needs_a_security_authorization_grant() {
+        // Specification 12.4: the gate is stricter than the checkpoint gate —
+        // a valid grant satisfies it only when a `SecurityAuthorization`
+        // checkpoint issued it.
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent);
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), declaration.clone(), 1)
+                    .with_authorization_required(),
+            )
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("charge-card"), declaration)]));
+        let settings = settings_for(&definition);
+        let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
+        let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
+
+        // No grant: undispatchable, with the authorization-specific code.
+        let without = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+        };
+        let refusal = authority
+            .authorize(
+                &without,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect_err("an authorization-required tool with no grant is refused");
+        assert_eq!(refusal.code, "authorization-required");
+
+        // A valid *approval* grant: still refused. A human approval can never
+        // stand in for the capability or credential a security authorization
+        // supplies.
+        let approval = approved_grant(&intent, AgentTimestampMillis::new(1_000), 1);
+        let with_approval = without.with_checkpoint_grant(&approval);
+        let refusal = authority
+            .authorize(
+                &with_approval,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect_err("an approval-kind grant does not satisfy the authorization gate");
+        assert_eq!(refusal.code, "authorization-required");
+
+        // The same grant issued by a security-authorization checkpoint
+        // dispatches.
+        let authorization = grant_of_kind(
+            AgentCheckpointKind::SecurityAuthorization,
+            &intent,
+            AgentTimestampMillis::new(1_000),
+            1,
+        );
+        let with_authorization = without.with_checkpoint_grant(&authorization);
+        authority
+            .authorize(
+                &with_authorization,
+                &scope(),
+                None,
+                None,
+                &intent,
+                AgentTimestampMillis::new(10),
+            )
+            .expect("an authorization-required tool dispatches under an authorization grant");
     }
 
     #[test]

@@ -84,7 +84,7 @@ use crate::budget::{
 };
 use crate::checkpoints::{
     AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointError, AgentCheckpointKind,
-    AgentCheckpointOutcome, AgentCheckpointTimerOutcome,
+    AgentCheckpointOutcome, AgentCheckpointTimerOutcome, AgentCompensationRef,
 };
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
@@ -95,8 +95,8 @@ use crate::choreography::{
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
-    AgentEffectSpec, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
-    AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
+    AgentEffectSpec, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
+    AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
 };
 use crate::identity::{
     AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
@@ -421,6 +421,15 @@ pub enum AgentRunTerminalReason {
         /// Its stable failure code.
         code: String,
     },
+    /// An ambiguous effect was closed by an explicitly scheduled compensation
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)); the run
+    /// winds down once the compensation settles.
+    EffectCompensated {
+        /// The effect whose ambiguous generation was compensated.
+        effect_id: AgentEffectId,
+        /// The application-defined compensation that was scheduled.
+        compensation: AgentCompensationRef,
+    },
     /// Cancellation was requested.
     CancellationRequested {
         /// A bounded, stable reason.
@@ -455,6 +464,7 @@ impl AgentRunTerminalReason {
             Self::ResultRejectionsExhausted
             | Self::BudgetExhausted { .. }
             | Self::EffectFailed { .. }
+            | Self::EffectCompensated { .. }
             | Self::UndecodableDecision { .. } => AgentRunStatus::Failed,
         }
     }
@@ -469,6 +479,7 @@ impl AgentRunTerminalReason {
             Self::Superseded => "superseded",
             Self::BudgetExhausted { .. } => "budget-exhausted",
             Self::EffectFailed { .. } => "effect-failed",
+            Self::EffectCompensated { .. } => "effect-compensated",
             Self::CancellationRequested { .. } => "cancellation-requested",
             Self::UndecodableDecision { .. } => "undecodable-decision",
         }
@@ -1537,38 +1548,55 @@ fn evaluate_model_output(
         state.run_mut()?.loop_state.record_effect(effect)?;
     }
 
-    // A tool the deployment marked checkpoint-required is not dispatched: the
-    // run opens an approval checkpoint bound to the exact effect and parks until
-    // a principal resolves it ([specification 12](../../../docs/plans/rakka-agent/spec.md)).
-    // The checkpoint and the effect commit in this one transition, so there is
-    // no instant at which a gated effect exists without its gate.
-    let gated: Vec<AgentEffectId> = {
+    // A tool the deployment marked checkpoint- or authorization-required is not
+    // dispatched: the run opens a checkpoint of the matching kind bound to the
+    // exact effect and parks until a principal resolves it
+    // ([specification 12](../../../docs/plans/rakka-agent/spec.md)). The
+    // checkpoint and the effect commit in this one transition, so there is no
+    // instant at which a gated effect exists without its gate.
+    let gated: Vec<(AgentEffectId, AgentCheckpointKind)> = {
         let run = state.run_mut()?;
         run.loop_state
             .effects()
             .iter()
             .filter(|effect| {
                 effect.turn == turn
-                    && effect.checkpoint_required
+                    && (effect.checkpoint_required || effect.authorization_required)
                     && run.loop_state.grant_for(effect).is_none()
             })
-            .map(|effect| effect.effect_id.clone())
+            .map(|effect| {
+                // A tool that requires both gates opens one security
+                // authorization: its resolution is an approval-family grant
+                // too, and the dispatch authority accepts it for either gate.
+                let kind = if effect.authorization_required {
+                    AgentCheckpointKind::SecurityAuthorization
+                } else {
+                    AgentCheckpointKind::Approval
+                };
+                (effect.effect_id.clone(), kind)
+            })
             .collect()
     };
-    for effect_id in &gated {
-        open_approval_checkpoint(state, policies, effect_id, now)?;
+    for (effect_id, kind) in &gated {
+        open_effect_checkpoint(state, policies, effect_id, *kind, now)?;
     }
 
     let run = state.run_mut()?;
     run.loop_state.set_phase(AgentLoopPhase::AwaitingTools);
-    run.status = if run.loop_state.has_open_checkpoint() {
-        AgentRunStatus::WaitingForApproval
-    } else {
-        AgentRunStatus::WaitingForEffect
-    };
+    run.status = checkpoint_wait_status(&run.loop_state);
     run.check_bounds(0)?;
     state.updated_at = now;
     Ok(())
+}
+
+/// The status of a run whose next step is dispatch: parked on whichever
+/// approval-family checkpoint wait it holds, or waiting on its effects.
+fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
+    match loop_state.approval_family_wait() {
+        Some(AgentCheckpointKind::SecurityAuthorization) => AgentRunStatus::WaitingForAuthorization,
+        Some(_) => AgentRunStatus::WaitingForApproval,
+        None => AgentRunStatus::WaitingForEffect,
+    }
 }
 
 /// Records the turn.
@@ -1702,6 +1730,7 @@ fn record_effect_result(
     fence: u64,
     outcome: AgentRunEffectOutcome,
     policy: &AgentSchemaPolicy,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     outcome.validate()?;
@@ -1741,6 +1770,21 @@ fn record_effect_result(
     effect.record_attempt(attempt, fence);
 
     apply_effect_outcome(state, effect_id, &outcome, now)?;
+    // An ambiguous outcome parks the run behind a durable reconciliation
+    // checkpoint in the same transition that recorded it, so the wait carries
+    // the full record surface — decision set, dedup key, SLA escalation,
+    // roles — a bare indeterminate effect could not
+    // ([specification 12.1](../../../docs/plans/rakka-agent/spec.md),
+    // [12.2](../../../docs/plans/rakka-agent/spec.md)).
+    if matches!(outcome, AgentRunEffectOutcome::Indeterminate { .. }) {
+        open_effect_checkpoint(
+            state,
+            policies,
+            effect_id,
+            AgentCheckpointKind::IndeterminateEffectReconciliation,
+            now,
+        )?;
+    }
     settle_run_disposition(state, now)
 }
 
@@ -1917,14 +1961,61 @@ fn settle_run_disposition(
 }
 
 /// Applies an explicit reconciliation decision to an indeterminate effect
-/// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md),
+/// through the effect-layer command, dropping the reconciliation checkpoint
+/// that was parked on it ([specification 11.5](../../../docs/plans/rakka-agent/spec.md),
 /// [12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the effect-layer twin of a
+/// [`AgentCheckpointOutcome::EffectResolution`] checkpoint decision: both end
+/// in [`apply_indeterminate_resolution`], and whichever path resolves the
+/// generation retires the wait the other would have answered.
+fn resolve_indeterminate_effect(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    resolution: AgentEffectResolution,
+    policy: &AgentSchemaPolicy,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    apply_indeterminate_resolution(state, effect_id, generation, resolution, policy, now)?;
+    drop_reconciliation_checkpoint(state, effect_id, generation)?;
+    settle_run_disposition(state, now)
+}
+
+/// Drops the reconciliation checkpoint parked on one resolved effect
+/// generation, when the run holds one: the wait is over, however its decision
+/// arrived.
+fn drop_reconciliation_checkpoint(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+) -> AgentRunResult<()> {
+    let run = state.run_mut()?;
+    let retired: Vec<HumanCheckpointId> = run
+        .loop_state
+        .open_checkpoints()
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.kind == AgentCheckpointKind::IndeterminateEffectReconciliation
+                && checkpoint.bound_effect.effect_id == *effect_id
+                && checkpoint.bound_effect.generation == generation
+        })
+        .map(|checkpoint| checkpoint.checkpoint_id.clone())
+        .collect();
+    for checkpoint_id in &retired {
+        run.loop_state.drop_checkpoint(checkpoint_id);
+    }
+    Ok(())
+}
+
+/// The shared core of both reconciliation paths
+/// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// `ConfirmedExecuted` records the established outcome exactly as a dispatcher
 /// result would have. `ConfirmedNotExecuted` authorizes a new effect
 /// generation where the run still wants the work — and settles the effect as
 /// cancelled where it does not, because a winding-down run re-invokes nothing.
-fn resolve_indeterminate_effect(
+fn apply_indeterminate_resolution(
     state: &mut AgentRunState,
     effect_id: &AgentEffectId,
     generation: AgentEffectGeneration,
@@ -2012,7 +2103,7 @@ fn resolve_indeterminate_effect(
         }
     }
 
-    settle_run_disposition(state, now)
+    Ok(())
 }
 
 /// Requests cancellation.
@@ -2057,22 +2148,31 @@ fn agent_principal(scope: &AgentRunScope) -> PrincipalRef {
     }
 }
 
-/// The stable, derived id of the checkpoint that gates one effect generation, so
-/// a re-driven transition opens the same checkpoint rather than a second one.
-fn checkpoint_id_for(effect: &AgentRunEffect) -> HumanCheckpointId {
+/// The stable, derived id of the checkpoint of one kind gating one effect
+/// generation, so a re-driven transition opens the same checkpoint rather than
+/// a second one. The kind is folded in because one generation can wait on more
+/// than one kind over its life — an approval before dispatch, a reconciliation
+/// after an ambiguous loss — and the two are different records.
+fn checkpoint_id_for(effect: &AgentRunEffect, kind: AgentCheckpointKind) -> HumanCheckpointId {
+    let tag = match kind {
+        AgentCheckpointKind::Approval => "approval",
+        AgentCheckpointKind::SecurityAuthorization => "authz",
+        AgentCheckpointKind::IndeterminateEffectReconciliation => "reconcile",
+    };
     HumanCheckpointId::new(format!(
-        "{}#ck-g{}",
+        "{}#ck-{tag}-g{}",
         effect.effect_id.as_str(),
         effect.generation.get()
     ))
 }
 
-/// Opens an approval checkpoint bound to the exact effect intent, carrying the
+/// Opens a checkpoint of `kind` bound to the exact effect intent, carrying the
 /// run's identity and pinned revisions, and records it on the loop state.
-fn open_approval_checkpoint(
+fn open_effect_checkpoint(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
     effect_id: &AgentEffectId,
+    kind: AgentCheckpointKind,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let scope = state.scope.clone();
@@ -2088,10 +2188,15 @@ fn open_approval_checkpoint(
             effect_id: effect_id.clone(),
         });
     };
-    let checkpoint_id = checkpoint_id_for(&effect);
+    let checkpoint_id = checkpoint_id_for(&effect, kind);
+    let verb = match kind {
+        AgentCheckpointKind::Approval => "Approve",
+        AgentCheckpointKind::SecurityAuthorization => "Authorize",
+        AgentCheckpointKind::IndeterminateEffectReconciliation => "Reconcile indeterminate",
+    };
     let summary = match effect.request.tool_call() {
-        Some(call) => format!("Approve tool call {} on turn {}", call.tool, effect.turn),
-        None => format!("Approve effect on turn {}", effect.turn),
+        Some(call) => format!("{verb} tool call {} on turn {}", call.tool, effect.turn),
+        None => format!("{verb} effect on turn {}", effect.turn),
     };
     let task = run.loop_state.task().clone();
     let goal = run.loop_state.goal().cloned();
@@ -2099,7 +2204,7 @@ fn open_approval_checkpoint(
     let definition_revision = run.loop_state.agent_definition_revision();
     let mut checkpoint = AgentCheckpoint::open(
         checkpoint_id,
-        AgentCheckpointKind::Approval,
+        kind,
         scope.clone(),
         &effect,
         summary,
@@ -2113,31 +2218,46 @@ fn open_approval_checkpoint(
     }
     // The deployment-configured SLA becomes durable deadlines on the record, so
     // a durable timer can escalate or expire the wait without any live task
-    // ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)).
+    // ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)). A
+    // reconciliation checkpoint never hard-expires: expiry fails the gated
+    // effect, and fabricating a definitive failure for an effect whose outcome
+    // is unknown is exactly the guess reconciliation exists to prevent — it
+    // escalates on the SLA deadline and then waits for the explicit decision.
     let sla = policies.checkpoint_sla();
     if sla.is_set() {
         let (due_at, expires_at) = sla.deadlines(now);
+        let expires_at = match kind {
+            AgentCheckpointKind::IndeterminateEffectReconciliation => None,
+            _ => expires_at,
+        };
         checkpoint = checkpoint.with_deadlines(due_at, expires_at, sla.escalation_target.clone());
     }
     run.loop_state.record_checkpoint(checkpoint)?;
     Ok(())
 }
 
-/// Applies a decision to an approval/authorization checkpoint the run is waiting
-/// on ([specification 12](../../../docs/plans/rakka-agent/spec.md)).
+/// Applies a decision to a checkpoint the run is waiting on
+/// ([specification 12](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// An `Approve`/`Grant` stores the digest-bound grant and resumes the run so the
 /// gated effect dispatches under it; a `Deny` fails the gated effect's
-/// generation. The decision is deduplicated inside the checkpoint on its
-/// decision key, so a duplicate submission never resumes the run twice
-/// (scenario 11). A decision for a checkpoint the run no longer holds, or one
-/// that does not fit the checkpoint kind, is refused.
+/// generation. A reconciliation decision resolves the ambiguous generation the
+/// checkpoint is parked on: the confirming decisions flow through the shared
+/// effect-resolution core, `Compensate` schedules the named compensation and
+/// winds the run down behind it, `Escalate` keeps the wait, and
+/// `AbandonAndFail` fails the run terminally. The decision is deduplicated
+/// inside the checkpoint on its decision key, so a duplicate submission never
+/// resumes the run twice (scenario 11). A decision for a checkpoint the run no
+/// longer holds, or one that does not fit the checkpoint kind, is refused.
+#[allow(clippy::too_many_arguments)]
 fn resolve_checkpoint(
     state: &mut AgentRunState,
     checkpoint_id: &HumanCheckpointId,
     resolver: PrincipalRef,
     decision: AgentCheckpointDecision,
     decision_key: AgentOperationId,
+    policy: &AgentSchemaPolicy,
+    policies: &AgentEffectPolicies,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     {
@@ -2147,7 +2267,7 @@ fn resolve_checkpoint(
         }
     }
 
-    let (outcome, bound_effect_id) = {
+    let (report, bound_effect_id, bound_generation) = {
         let run = state.run_mut()?;
         let Some(checkpoint) = run.loop_state.open_checkpoint_mut(checkpoint_id) else {
             return Err(AgentRunError::UnknownCheckpoint {
@@ -2155,20 +2275,28 @@ fn resolve_checkpoint(
             });
         };
         let bound_effect_id = checkpoint.bound_effect.effect_id.clone();
+        let bound_generation = checkpoint.bound_effect.generation;
         let report = checkpoint.resolve(decision_key, resolver, decision, now)?;
-        (report.outcome, bound_effect_id)
+        (report, bound_effect_id, bound_generation)
     };
 
-    match outcome {
+    if report.deduplicated {
+        // The decision was already applied and its consequences committed in
+        // the transition that first carried it; a replay makes no second
+        // transition (scenario 11).
+        state.updated_at = now;
+        return settle_run_disposition(state, now);
+    }
+
+    match report.outcome {
         AgentCheckpointOutcome::Granted(grant) => {
             let run = state.run_mut()?;
             run.loop_state.record_grant(*grant);
             run.loop_state.drop_checkpoint(checkpoint_id);
             // Resume: the gated effect is still `Pending`, and the next dispatch
-            // pass now finds its grant and hands it to the sink.
-            if !run.loop_state.has_open_checkpoint() {
-                run.status = AgentRunStatus::WaitingForEffect;
-            }
+            // pass now finds its grant and hands it to the sink. Another gated
+            // effect may still hold the run on its own wait.
+            run.status = checkpoint_wait_status(&run.loop_state);
             state.updated_at = now;
         }
         AgentCheckpointOutcome::Denied { reason } => {
@@ -2181,15 +2309,50 @@ fn resolve_checkpoint(
             };
             apply_effect_outcome(state, &bound_effect_id, &denial, now)?;
         }
+        AgentCheckpointOutcome::EffectResolution(resolution) => {
+            state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
+            apply_indeterminate_resolution(
+                state,
+                &bound_effect_id,
+                bound_generation,
+                *resolution,
+                policy,
+                now,
+            )?;
+        }
+        AgentCheckpointOutcome::Compensate { compensation } => {
+            state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
+            schedule_compensation(
+                state,
+                &bound_effect_id,
+                bound_generation,
+                compensation,
+                policies,
+                now,
+            )?;
+        }
+        AgentCheckpointOutcome::Abandoned => {
+            state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
+            // The operator abandoned the ambiguity: the generation fails under
+            // a truthful code and the run winds down — or finishes the
+            // wind-down a cancellation already began, under that earlier
+            // reason (scenario 57).
+            let abandonment = AgentRunEffectOutcome::Failed {
+                code: "reconciliation-abandoned".to_string(),
+                message: "the operator abandoned the ambiguous effect".to_string(),
+            };
+            apply_effect_outcome(state, &bound_effect_id, &abandonment, now)?;
+        }
         AgentCheckpointOutcome::Escalated => {
             // The checkpoint stays open and the run stays parked; the escalation
             // target now owns the decision. Nothing else changes.
             state.updated_at = now;
         }
         other => {
-            // A reconciliation-kind outcome cannot reach an approval checkpoint;
-            // the checkpoint's own kind check refuses the mismatched decision
-            // before this point, so this is unreachable in practice.
+            // `Expired` and `Cancelled` are produced by the timer sweep and the
+            // run's own cancellation, never by a submitted decision; `resolve`
+            // refuses a decision against a terminal checkpoint before this
+            // point, so this is unreachable in practice.
             return Err(AgentRunError::Checkpoint(Box::new(
                 AgentCheckpointError::InvalidDecision {
                     message: format!("unexpected checkpoint outcome {other:?}"),
@@ -2199,6 +2362,93 @@ fn resolve_checkpoint(
     }
 
     settle_run_disposition(state, now)
+}
+
+/// Schedules the explicitly defined compensation an operator chose for an
+/// ambiguous effect, and winds the run down behind it
+/// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The ambiguous generation settles as
+/// [`AgentRunEffectStatus::Compensated`]: its outcome was never established —
+/// what closes it is the decision that the scheduled compensation, not further
+/// evidence, settles the ambiguity. The compensation itself is a new durable
+/// effect: committed after the wind-down fence so the fence cannot cancel it,
+/// dispatched through the same sink, and blocking terminal settlement until
+/// its own outcome arrives.
+fn schedule_compensation(
+    state: &mut AgentRunState,
+    effect_id: &AgentEffectId,
+    generation: AgentEffectGeneration,
+    compensation: AgentCompensationRef,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let request = AgentRunEffectRequest::Compensation {
+        compensation: compensation.clone(),
+        compensated: effect_id.clone(),
+        compensated_generation: generation,
+    };
+    let spec = policies.spec_for(&request).clone();
+
+    let run = state.run_mut()?;
+    {
+        let Some(effect) = run.loop_state.effect_mut(effect_id) else {
+            return Err(AgentRunError::UnknownEffect {
+                effect_id: effect_id.clone(),
+            });
+        };
+        if effect.generation != generation {
+            return Err(AgentRunError::StaleEffectGeneration {
+                effect_id: effect_id.clone(),
+                held: effect.generation,
+                received: generation,
+            });
+        }
+        if effect.status != AgentRunEffectStatus::Indeterminate {
+            return Err(AgentRunError::StaleEffectResult {
+                effect_id: effect_id.clone(),
+                status: effect.status,
+            });
+        }
+    }
+
+    // The compensation is new spend, reserved exactly like a re-authorized
+    // generation's attempts ([specification 9.7](../../../docs/plans/rakka-agent/spec.md));
+    // a run that cannot afford it keeps the effect parked `Indeterminate` and
+    // refuses the decision, leaving cancellation as the operator's remaining
+    // move.
+    if let Err(exhaustion) = run
+        .loop_state
+        .budget_mut()
+        .reserve_attempts(spec.max_attempts)
+    {
+        return Err(AgentRunError::RedispatchUnaffordable { exhaustion });
+    }
+
+    if let Some(effect) = run.loop_state.effect_mut(effect_id) {
+        effect.status = AgentRunEffectStatus::Compensated;
+        effect.last_error_code = Some(bounded_detail("compensated".to_string()));
+    }
+
+    // Wind down first, then commit the compensation: the fence cancels only
+    // what was pending before it, and the effect recorded after it is exactly
+    // the one piece of new work the decision authorizes.
+    run.loop_state.fence_unsent_effects();
+    if run.terminal_reason.is_none() {
+        run.terminal_reason = Some(AgentRunTerminalReason::EffectCompensated {
+            effect_id: effect_id.clone(),
+            compensation,
+        });
+    }
+
+    let turn = run.loop_state.turn();
+    let slot = run.loop_state.next_effect_slot();
+    let settings_revision = run.loop_state.agent_settings_revision();
+    let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    run.loop_state.record_effect(effect)?;
+    state.updated_at = now;
+    Ok(())
 }
 
 /// Fires the durable SLA and expiration timers on every open checkpoint
@@ -2234,20 +2484,21 @@ fn fire_checkpoint_timers(
         .unwrap_or_default();
 
     for checkpoint_id in &checkpoint_ids {
-        let (fired, bound_effect_id) = {
+        let (fired, bound_effect_id, kind) = {
             let run = state.run_mut()?;
             let Some(checkpoint) = run.loop_state.open_checkpoint_mut(checkpoint_id) else {
                 continue;
             };
             let bound_effect_id = checkpoint.bound_effect.effect_id.clone();
-            (checkpoint.on_timer(now), bound_effect_id)
+            let kind = checkpoint.kind;
+            (checkpoint.on_timer(now), bound_effect_id, kind)
         };
         match fired {
             AgentCheckpointTimerOutcome::Expired => {
                 state.run_mut()?.loop_state.drop_checkpoint(checkpoint_id);
                 let expiry = AgentRunEffectOutcome::Failed {
                     code: "checkpoint-expired".to_string(),
-                    message: "the approval checkpoint expired without a decision".to_string(),
+                    message: format!("the {kind} checkpoint expired without a decision"),
                 };
                 apply_effect_outcome(state, &bound_effect_id, &expiry, now)?;
             }
@@ -2655,9 +2906,11 @@ where
                 outcome,
             } => {
                 let policy = *self.host.schema_policy();
+                let policies = self.policies.clone();
                 self.transition(now, move |state| {
                     record_effect_result(
-                        state, &effect_id, generation, attempt, fence, *outcome, &policy, now,
+                        state, &effect_id, generation, attempt, fence, *outcome, &policy,
+                        &policies, now,
                     )?;
                     Ok(operation_id)
                 })
@@ -2689,6 +2942,8 @@ where
                 resolver,
                 decision,
             } => {
+                let policy = *self.host.schema_policy();
+                let policies = self.policies.clone();
                 self.transition(now, move |state| {
                     resolve_checkpoint(
                         state,
@@ -2696,6 +2951,8 @@ where
                         resolver,
                         *decision,
                         operation_id.clone(),
+                        &policy,
+                        &policies,
                         now,
                     )?;
                     Ok(operation_id)
@@ -2864,13 +3121,15 @@ where
     /// exactly the new dispatch the fence forbids. Work that already reached
     /// the dispatch layer settles truthfully there.
     async fn dispatch_effects(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
-        let fenced = {
+        let (terminal, winding_down) = {
             let state = self.state()?;
-            state.status().is_none_or(AgentRunStatus::is_terminal)
-                || state.run().is_some_and(|run| run.terminal_reason.is_some())
-                || state.status() == Some(AgentRunStatus::Cancelling)
+            (
+                state.status().is_none_or(AgentRunStatus::is_terminal),
+                state.run().is_some_and(|run| run.terminal_reason.is_some())
+                    || state.status() == Some(AgentRunStatus::Cancelling),
+            )
         };
-        if fenced {
+        if terminal {
             return Ok(0);
         }
 
@@ -2878,6 +3137,12 @@ where
         // effect with no grant stays `Pending`, parked behind its approval
         // checkpoint, and never reaches the sink until a resolution stores the
         // grant ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+        //
+        // A run that is winding down flushes only a compensation effect: handing
+        // any other fenced work to the outbox would be exactly the new dispatch
+        // the fence forbids, while the compensation is the one piece of new work
+        // an operator's `Compensate` decision explicitly authorized after the
+        // fence ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
         let dispatchable: Vec<AgentEffectId> = self
             .state()?
             .loop_state()
@@ -2885,7 +3150,11 @@ where
                 loop_state
                     .undispatched_effects()
                     .into_iter()
-                    .filter(|effect| loop_state.is_dispatchable(effect))
+                    .filter(|effect| {
+                        loop_state.is_dispatchable(effect)
+                            && (!winding_down
+                                || effect.kind() == AgentRunEffectKind::CompensationCall)
+                    })
                     .map(|effect| effect.effect_id)
                     .collect()
             })
@@ -2915,6 +3184,9 @@ where
             .map(AgentLoopState::ready_effects)
             .unwrap_or_default();
         for effect in &ready {
+            if winding_down && effect.kind() != AgentRunEffectKind::CompensationCall {
+                continue;
+            }
             let record = effect.to_workflow_effect(&self.scope);
             self.effects.dispatch(&self.scope, &record).await?;
         }

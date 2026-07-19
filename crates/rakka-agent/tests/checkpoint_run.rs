@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::ScriptedDispatcher;
 use rakka_agent::{
-    AgentApprovalDecision, AgentCheckpointDecision, AgentCheckpointSla, AgentEffectPolicies,
-    AgentEffectSpec, AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRunEntityCommand,
-    AgentRunEntityReply, AgentRunStatus, AgentRunTerminalReason, AgentTaskContent, AgentToolCallId,
-    AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentApprovalDecision, AgentCheckpointDecision, AgentCheckpointKind, AgentCheckpointSla,
+    AgentEffectPolicies, AgentEffectSpec, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentRunEntityCommand, AgentRunEntityReply, AgentRunStatus, AgentRunTerminalReason,
+    AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
+    InMemoryAgentRunEffectSink, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, HumanCheckpointId, PrincipalRef};
 
@@ -232,6 +232,80 @@ async fn a_denied_checkpoint_fails_the_gated_effect() {
         }
         other => panic!("expected a denied-effect failure, found {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_authorization_required_tool_parks_then_dispatches_under_the_authorization() {
+    // Scenario 3, authorization wait: a tool the deployment marked
+    // authorization-required parks the run behind a security-authorization
+    // checkpoint — passivated, no live task — and the resolving grant resumes
+    // it. A duplicate decision is deduplicated (scenario 11, authorization
+    // flavor).
+    let policies = AgentEffectPolicies::new()
+        .with_tool_spec(
+            tool_id(),
+            AgentEffectSpec::non_idempotent().with_authorization_required(),
+        )
+        .expect("the authorization-required tool spec is valid");
+    let fx = fixture_with(policies);
+
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the loop parks on the checkpoint");
+
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(
+        run.status,
+        AgentRunStatus::WaitingForAuthorization,
+        "an authorization-required tool parks the run for authorization"
+    );
+    assert!(
+        !run.status.is_terminal(),
+        "an authorization wait is nonterminal"
+    );
+
+    // A fresh store recovery is a passivation/reactivation cycle: the wait is
+    // durable state, not a live task.
+    let mut store = fx.run();
+    store.recover(fx.now()).await.expect("the run recovers");
+    let open = store
+        .state()
+        .expect("state reads")
+        .loop_state()
+        .expect("the loop exists")
+        .open_checkpoints()
+        .to_vec();
+    assert_eq!(open.len(), 1, "exactly one checkpoint gates the tool");
+    assert_eq!(
+        open[0].kind,
+        AgentCheckpointKind::SecurityAuthorization,
+        "the gate is a security-authorization checkpoint, not an approval"
+    );
+    let checkpoint_id = open[0].checkpoint_id.clone();
+
+    let command = |cp| AgentRunEntityCommand::ResolveCheckpoint {
+        operation_id: decision_key("authz-1"),
+        checkpoint_id: cp,
+        resolver: resolver(),
+        decision: approve(),
+    };
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    let reply = run
+        .apply(command(checkpoint_id.clone()), &fx.router, fx.now())
+        .await
+        .expect("the authorization applies");
+    assert!(matches!(reply, AgentRunEntityReply::Applied { .. }));
+
+    let replay = run
+        .apply(command(checkpoint_id), &fx.router, fx.now())
+        .await
+        .expect("the replay is accepted");
+    assert!(matches!(replay, AgentRunEntityReply::Duplicate { .. }));
+
+    fx.pump().await.expect("the resumed run completes");
+    let run = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(run.status, AgentRunStatus::Completed);
 }
 
 #[tokio::test]

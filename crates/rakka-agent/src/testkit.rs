@@ -1322,6 +1322,7 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     answered: Arc<Mutex<BTreeMap<String, AgentRunEffectOutcome>>>,
     tools: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
+    compensations: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
@@ -1392,6 +1393,7 @@ where
             answered: Arc::new(Mutex::new(BTreeMap::new())),
             tools: Arc::new(Mutex::new(BTreeMap::new())),
             failures: Arc::new(Mutex::new(BTreeMap::new())),
+            compensations: Arc::new(Mutex::new(BTreeMap::new())),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1420,6 +1422,18 @@ where
             .lock()
             .expect("the failure script should not be poisoned")
             .insert(tool.to_string(), (code.to_string(), message.to_string()));
+        self
+    }
+
+    /// Scripts the result one compensation returns, keyed by its
+    /// [`crate::checkpoints::AgentCompensationRef`]. An unscripted compensation
+    /// fails with a stable `compensation-unscripted` code.
+    #[must_use]
+    pub fn with_compensation_result(self, compensation: &str, content: AgentTaskContent) -> Self {
+        self.compensations
+            .lock()
+            .expect("the compensation script should not be poisoned")
+            .insert(compensation.to_string(), content);
         self
     }
 
@@ -1511,6 +1525,29 @@ where
                     return outcome;
                 }
                 let outcome = self.tool_outcome(call);
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::Compensation { compensation, .. } => {
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let scripted = self
+                    .compensations
+                    .lock()
+                    .expect("the compensation script should not be poisoned")
+                    .get(compensation.as_str())
+                    .cloned();
+                let outcome = match scripted {
+                    Some(content) => AgentRunEffectOutcome::Tool {
+                        call_id: crate::effect::compensation_call_id(effect),
+                        content,
+                    },
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "compensation-unscripted".to_string(),
+                        message: format!("no scripted result for compensation {compensation}"),
+                    },
+                };
                 self.memoize(effect, outcome)
             }
         }

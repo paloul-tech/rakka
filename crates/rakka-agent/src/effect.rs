@@ -334,6 +334,16 @@ pub struct AgentEffectSpec {
     /// discovery.
     #[serde(default)]
     pub checkpoint_required: bool,
+    /// Whether the effect may dispatch only under a grant issued by a
+    /// [`crate::checkpoints::AgentCheckpointKind::SecurityAuthorization`]
+    /// checkpoint ([specification 12.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Projected from the tool binding's
+    /// [`crate::tools::AgentToolBinding::authorization_required`], so the run
+    /// knows at commit time to open a security-authorization checkpoint and
+    /// park rather than dispatch. An approval grant does not satisfy it.
+    #[serde(default)]
+    pub authorization_required: bool,
 }
 
 impl AgentEffectSpec {
@@ -349,6 +359,7 @@ impl AgentEffectSpec {
             execution_policy: None,
             guardrail_revision: None,
             checkpoint_required: false,
+            authorization_required: false,
         }
     }
 
@@ -365,6 +376,7 @@ impl AgentEffectSpec {
             execution_policy: None,
             guardrail_revision: None,
             checkpoint_required: false,
+            authorization_required: false,
         }
     }
 
@@ -386,6 +398,7 @@ impl AgentEffectSpec {
             execution_policy: None,
             guardrail_revision: None,
             checkpoint_required: false,
+            authorization_required: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -433,6 +446,13 @@ impl AgentEffectSpec {
         self
     }
 
+    /// Requires a security-authorization grant before the effect may dispatch.
+    #[must_use]
+    pub const fn with_authorization_required(mut self) -> Self {
+        self.authorization_required = true;
+        self
+    }
+
     /// Declares a reconcileable spec with its protocol.
     pub fn reconcileable(
         protocol: AgentReconciliationProtocolRef,
@@ -447,6 +467,7 @@ impl AgentEffectSpec {
             execution_policy: None,
             guardrail_revision: None,
             checkpoint_required: false,
+            authorization_required: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -464,6 +485,7 @@ impl AgentEffectSpec {
             execution_policy: None,
             guardrail_revision: None,
             checkpoint_required: false,
+            authorization_required: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -547,6 +569,8 @@ struct AgentEffectSpecRecord {
     guardrail_revision: Option<AgentRevisionNumber>,
     #[serde(default)]
     checkpoint_required: bool,
+    #[serde(default)]
+    authorization_required: bool,
 }
 
 impl<'de> Deserialize<'de> for AgentEffectSpec {
@@ -564,6 +588,7 @@ impl<'de> Deserialize<'de> for AgentEffectSpec {
             execution_policy: record.execution_policy,
             guardrail_revision: record.guardrail_revision,
             checkpoint_required: record.checkpoint_required,
+            authorization_required: record.authorization_required,
         };
         spec.validate().map_err(serde::de::Error::custom)?;
         Ok(spec)
@@ -588,6 +613,7 @@ pub struct AgentEffectPolicies {
     model: AgentEffectSpec,
     tools: BTreeMap<AgentToolId, AgentEffectSpec>,
     default_tool: AgentEffectSpec,
+    compensation: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
@@ -599,6 +625,7 @@ impl AgentEffectPolicies {
             model: AgentEffectSpec::read_only(),
             tools: BTreeMap::new(),
             default_tool: AgentEffectSpec::non_idempotent(),
+            compensation: AgentEffectSpec::non_idempotent(),
             checkpoint_sla: crate::checkpoints::AgentCheckpointSla::default(),
         }
     }
@@ -642,6 +669,15 @@ impl AgentEffectPolicies {
         Ok(self)
     }
 
+    /// Sets the spec compensation effects dispatch under
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is one non-idempotent attempt.
+    pub fn with_compensation_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.compensation = spec;
+        Ok(self)
+    }
+
     /// Pins every spec — model, registered tools, and the unclassified
     /// default — to the guardrail chain revision the deployment evaluates at
     /// dispatch, so each committed intent records the policy its transforms
@@ -666,6 +702,7 @@ impl AgentEffectPolicies {
             AgentRunEffectRequest::Tool { call } => {
                 self.tools.get(&call.tool).unwrap_or(&self.default_tool)
             }
+            AgentRunEffectRequest::Compensation { .. } => &self.compensation,
         }
     }
 }
@@ -701,6 +738,10 @@ pub enum AgentRunEffectKind {
     ModelCall,
     /// A tool adapter request.
     ToolCall,
+    /// An application-defined compensation request, scheduled by a
+    /// [`crate::checkpoints::AgentReconciliationDecision::Compensate`] decision
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+    CompensationCall,
 }
 
 impl AgentRunEffectKind {
@@ -710,6 +751,7 @@ impl AgentRunEffectKind {
         match self {
             Self::ModelCall => "model-call",
             Self::ToolCall => "tool-call",
+            Self::CompensationCall => "compensation-call",
         }
     }
 
@@ -718,7 +760,10 @@ impl AgentRunEffectKind {
     pub const fn workflow_kind(self) -> AgentEffectKind {
         match self {
             Self::ModelCall => AgentEffectKind::ModelCall,
-            Self::ToolCall => AgentEffectKind::ToolCall,
+            // A compensation dispatches through the same adapter surface as a
+            // tool call: the outbox ticket's `compensation` target type is what
+            // routes it to the application-owned handler.
+            Self::ToolCall | Self::CompensationCall => AgentEffectKind::ToolCall,
         }
     }
 }
@@ -777,6 +822,13 @@ pub enum AgentRunEffectStatus {
     /// reconciliation decision is owed
     /// ([specification 11.5](../../../docs/plans/rakka-agent/spec.md)).
     Indeterminate,
+    /// The generation's ambiguity was closed by an explicitly scheduled
+    /// compensation effect ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The outcome itself was never established — what resolves the generation
+    /// is the operator's decision that the scheduled compensation, not further
+    /// evidence, settles the ambiguity.
+    Compensated,
     /// The generation was fenced before any invocation could have happened.
     Cancelled,
 }
@@ -792,6 +844,7 @@ impl AgentRunEffectStatus {
             Self::Failed => "failed",
             Self::Exhausted => "exhausted",
             Self::Indeterminate => "indeterminate",
+            Self::Compensated => "compensated",
             Self::Cancelled => "cancelled",
         }
     }
@@ -826,10 +879,10 @@ impl AgentRunEffectStatus {
         match self {
             Self::Pending | Self::Ready => AgentEffectStatus::Scheduled,
             Self::Succeeded => AgentEffectStatus::Completed,
-            // The workflow substrate has no indeterminate status; the run's
-            // record is authoritative, and an indeterminate generation is
-            // never projected for dispatch.
-            Self::Failed | Self::Indeterminate => AgentEffectStatus::Failed,
+            // The workflow substrate has no indeterminate or compensated
+            // status; the run's record is authoritative, and neither
+            // generation is ever projected for dispatch.
+            Self::Failed | Self::Indeterminate | Self::Compensated => AgentEffectStatus::Failed,
             Self::Exhausted => AgentEffectStatus::Exhausted,
             Self::Cancelled => AgentEffectStatus::Cancelled,
         }
@@ -869,6 +922,21 @@ pub enum AgentRunEffectRequest {
         /// by this record.
         call: Box<AgentToolCallRequest>,
     },
+    /// Invoke the explicitly defined compensation an operator scheduled for an
+    /// ambiguous effect ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Rakka persists and routes the reference; the application owns the
+    /// compensation behind it. The record names the effect generation being
+    /// compensated, so the handler and every audit trail can tie the two
+    /// together.
+    Compensation {
+        /// The application-defined compensation to invoke.
+        compensation: crate::checkpoints::AgentCompensationRef,
+        /// The effect whose ambiguous generation is being compensated.
+        compensated: AgentEffectId,
+        /// The generation being compensated.
+        compensated_generation: AgentEffectGeneration,
+    },
 }
 
 impl AgentRunEffectRequest {
@@ -878,6 +946,7 @@ impl AgentRunEffectRequest {
         match self {
             Self::Model { .. } => AgentRunEffectKind::ModelCall,
             Self::Tool { .. } => AgentRunEffectKind::ToolCall,
+            Self::Compensation { .. } => AgentRunEffectKind::CompensationCall,
         }
     }
 
@@ -885,7 +954,7 @@ impl AgentRunEffectRequest {
     #[must_use]
     pub fn tool_call(&self) -> Option<&AgentToolCallRequest> {
         match self {
-            Self::Model { .. } => None,
+            Self::Model { .. } | Self::Compensation { .. } => None,
             Self::Tool { call } => Some(call),
         }
     }
@@ -936,6 +1005,12 @@ impl AgentRunEffectRequest {
             Self::Tool { call } => AgentEffectTarget {
                 target_type: "tool".to_string(),
                 name: call.tool.to_string(),
+                address: None,
+                attributes: BTreeMap::new(),
+            },
+            Self::Compensation { compensation, .. } => AgentEffectTarget {
+                target_type: "compensation".to_string(),
+                name: compensation.as_str().to_string(),
                 address: None,
                 attributes: BTreeMap::new(),
             },
@@ -1024,6 +1099,13 @@ pub struct AgentRunEffect {
     /// checkpoint before dispatch rather than being refused at the authority.
     #[serde(default)]
     pub checkpoint_required: bool,
+    /// Whether the effect may dispatch only under a grant issued by a
+    /// security-authorization checkpoint
+    /// ([specification 12.4](../../../docs/plans/rakka-agent/spec.md)). Projected
+    /// from the tool binding at commit time, so the run parks on a
+    /// security-authorization checkpoint before dispatch.
+    #[serde(default)]
+    pub authorization_required: bool,
 }
 
 impl AgentRunEffect {
@@ -1072,6 +1154,7 @@ impl AgentRunEffect {
             dispatched_at: None,
             last_error_code: None,
             checkpoint_required: spec.checkpoint_required,
+            authorization_required: spec.authorization_required,
         })
     }
 
@@ -1514,6 +1597,18 @@ impl AgentEffectResolution {
     }
 }
 
+/// The stable call id a compensation effect's result settles under
+/// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A compensation has no model-issued tool call, so the id is derived from the
+/// effect's own identity — pure per generation slot, like every other derived
+/// identity a re-driven dispatch must resolve to.
+#[must_use]
+pub fn compensation_call_id(effect: &AgentRunEffect) -> AgentToolCallId {
+    AgentToolCallId::new(format!("compensation-t{}-s{}", effect.turn, effect.slot))
+        .expect("the derived compensation call id is well formed")
+}
+
 /// One tool result the current turn has collected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentToolResult {
@@ -1841,6 +1936,7 @@ mod tests {
             execution_policy: None,
             guardrail_revision: None,
             checkpoint_required: false,
+            authorization_required: false,
         };
         assert_eq!(
             missing

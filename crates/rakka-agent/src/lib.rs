@@ -130,17 +130,17 @@ pub use choreography::{
     AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
 pub use dispatch::{
-    workflow_run_id, AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError,
-    AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult,
-    AgentDispatchToolExecutor, AgentDispatchWindow, AgentEffectCredentialResolver,
-    AgentEffectReconciler, AgentEntityAuthority, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
-    WorkflowAgentRunEffectSink,
+    workflow_run_id, AgentCompensationExecutor, AgentDispatchAuthority, AgentDispatchDecision,
+    AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe,
+    AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
+    AgentEffectCredentialResolver, AgentEffectReconciler, AgentEntityAuthority,
+    AgentReconciliationFinding, AgentRunEffectDispatcher, AgentRunResultDelivery,
+    AgentRunSetupResolver, WorkflowAgentRunEffectSink,
 };
 pub use effect::{
-    effect_id_for, external_idempotency_key_for, AgentEffectError, AgentEffectFuture,
-    AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution, AgentEffectResult,
-    AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
+    compensation_call_id, effect_id_for, external_idempotency_key_for, AgentEffectError,
+    AgentEffectFuture, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
+    AgentEffectResult, AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
     AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
     AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
     InMemoryAgentRunEffectSink, AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH,

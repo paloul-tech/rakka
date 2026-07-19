@@ -909,11 +909,17 @@ impl AgentCheckpoint {
         if self.status.is_terminal() {
             return AgentCheckpointTimerOutcome::Pending;
         }
-        if let Some(expires_at) = self.expires_at {
-            if now.as_millis() >= expires_at.as_millis() {
-                self.status = AgentCheckpointStatus::Expired;
-                self.updated_at = now;
-                return AgentCheckpointTimerOutcome::Expired;
+        // A reconciliation checkpoint never hard-expires, whatever deadline was
+        // written onto it: expiry closes the wait without a decision, and an
+        // ambiguous effect's outcome does not become known because a timer
+        // fired. It can still escalate below.
+        if self.kind != AgentCheckpointKind::IndeterminateEffectReconciliation {
+            if let Some(expires_at) = self.expires_at {
+                if now.as_millis() >= expires_at.as_millis() {
+                    self.status = AgentCheckpointStatus::Expired;
+                    self.updated_at = now;
+                    return AgentCheckpointTimerOutcome::Expired;
+                }
             }
         }
         if self.status == AgentCheckpointStatus::Open {

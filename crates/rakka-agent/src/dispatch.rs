@@ -114,9 +114,9 @@ use rakka_persistence::DurableStateStore;
 use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
 use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision};
 use crate::effect::{
-    AgentEffectError, AgentEffectGeneration, AgentReconciliationProtocolRef, AgentRunEffect,
-    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, ATTR_AGENT_EFFECT_GENERATION,
-    ATTR_AGENT_EFFECT_ID,
+    compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentReconciliationProtocolRef,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
+    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
 use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
@@ -308,6 +308,24 @@ pub trait AgentDispatchToolExecutor: Send + Sync {
         scope: &'a AgentRunScope,
         intent: &'a AgentRunEffect,
         call: &'a AgentToolCallRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentTaskContent>;
+}
+
+/// Executes one explicitly scheduled compensation inside a bounded dispatch
+/// attempt ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Rakka persists and routes the
+/// [`crate::checkpoints::AgentCompensationRef`]; the application owns the
+/// compensation behind it. The resolved credential — when the intent names a
+/// binding — lives only for the call and is never persisted.
+pub trait AgentCompensationExecutor: Send + Sync {
+    /// Performs the compensation and returns its bounded result.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        compensation: &'a crate::checkpoints::AgentCompensationRef,
         credential: Option<&'a AgentEphemeralCredential>,
     ) -> AgentDispatchFuture<'a, AgentTaskContent>;
 }
@@ -656,6 +674,7 @@ where
     authority: Arc<dyn AgentDispatchAuthority>,
     credentials: Option<Arc<dyn AgentEffectCredentialResolver>>,
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
+    compensations: Option<Arc<dyn AgentCompensationExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -709,6 +728,7 @@ where
             authority,
             credentials: None,
             reconciler: None,
+            compensations: None,
             delivery,
             probe: None,
         }
@@ -749,6 +769,19 @@ where
     #[must_use]
     pub fn with_reconciler(mut self, reconciler: Arc<dyn AgentEffectReconciler>) -> Self {
         self.reconciler = Some(reconciler);
+        self
+    }
+
+    /// Executes operator-scheduled compensation effects through the given
+    /// application-owned executor
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)). Without
+    /// one, a compensation dispatch fails closed with a stable code.
+    #[must_use]
+    pub fn with_compensation_executor(
+        mut self,
+        compensations: Arc<dyn AgentCompensationExecutor>,
+    ) -> Self {
+        self.compensations = Some(compensations);
         self
     }
 
@@ -1736,6 +1769,25 @@ where
                 let content = self.tools.execute(scope, intent, call, credential).await?;
                 Ok(AgentRunEffectOutcome::Tool {
                     call_id: call.call_id.clone(),
+                    content,
+                })
+            }
+            AgentRunEffectRequest::Compensation { compensation, .. } => {
+                let Some(executor) = self.compensations.as_ref() else {
+                    // Fail closed, definitively: nothing was invoked, an absent
+                    // executor will not appear mid-generation, and the run's
+                    // wind-down settles truthfully on the failure.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "compensation-executor-missing".to_string(),
+                        message: "no compensation executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                let content = executor
+                    .execute(scope, intent, compensation, credential)
+                    .await?;
+                Ok(AgentRunEffectOutcome::Tool {
+                    call_id: compensation_call_id(intent),
                     content,
                 })
             }
