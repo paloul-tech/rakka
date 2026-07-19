@@ -98,9 +98,10 @@ impl<Inner: AgentDispatchAuthority> AgentDispatchAuthority for ExpiredGrantAutho
         scope: &'a AgentRunScope,
         run: &'a AgentRunState,
         intent: &'a AgentRunEffect,
+        attempt: u32,
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
-        let inner = self.0.authorize(scope, run, intent, now);
+        let inner = self.0.authorize(scope, run, intent, attempt, now);
         Box::pin(async move {
             match inner.await? {
                 AgentDispatchDecision::Granted(mut granted) => {

@@ -396,11 +396,17 @@ pub enum AgentDispatchDecision {
 /// forbids claiming isolation from.
 pub trait AgentDispatchAuthority: Send + Sync {
     /// Authorizes one dispatch attempt of one effect intent, or refuses it.
+    ///
+    /// `attempt` is the 1-based attempt number the pipeline is about to make:
+    /// a checkpoint grant's allowed use count is enforced against it, so a
+    /// spent grant does not cover a retry
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
     fn authorize<'a>(
         &'a self,
         scope: &'a AgentRunScope,
         run: &'a AgentRunState,
         intent: &'a AgentRunEffect,
+        attempt: u32,
         now: rakka_agent_workflow::AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision>;
 }
@@ -514,6 +520,7 @@ where
         scope: &'a AgentRunScope,
         run: &'a AgentRunState,
         intent: &'a AgentRunEffect,
+        attempt: u32,
         now: rakka_agent_workflow::AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentDispatchDecision> {
         Box::pin(async move {
@@ -556,7 +563,7 @@ where
             let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
             let decision = match self
                 .authority
-                .authorize(&context, scope, task, goal, intent, now)
+                .authorize(&context, scope, task, goal, intent, attempt, now)
             {
                 Ok(granted) => AgentDispatchDecision::Granted(Box::new(granted)),
                 Err(refusal) => AgentDispatchDecision::Refused(refusal),
@@ -1067,7 +1074,10 @@ where
         // an unroutable execution policy, a blocked guardrail — settles the
         // generation (scenario 54).
         let now = rakka_agent_workflow::AgentTimestampMillis::new(self.clock.now().as_millis());
-        let decision = self.authority.authorize(scope, state, intent, now).await?;
+        let decision = self
+            .authority
+            .authorize(scope, state, intent, attempt, now)
+            .await?;
         let granted = match decision {
             AgentDispatchDecision::Granted(granted) => {
                 if let Err(refusal) = granted.grant.validate_for(scope, intent, attempt, now) {

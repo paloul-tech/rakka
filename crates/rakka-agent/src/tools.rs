@@ -918,6 +918,11 @@ impl AgentToolAuthority {
     /// ([specification 7.2](../../../docs/plans/rakka-agent/spec.md)), and the
     /// setup/settings envelope of slice 1.2 is enforced where it finally
     /// matters ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)).
+    /// `attempt` is the 1-based attempt number the dispatch pipeline is about
+    /// to make: a checkpoint grant's allowed use count is enforced against it,
+    /// so a spent grant does not cover a retry
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    #[allow(clippy::too_many_arguments)]
     pub fn authorize(
         &self,
         context: &AgentAuthorityContext<'_>,
@@ -925,6 +930,7 @@ impl AgentToolAuthority {
         task: Option<&AgentTaskId>,
         goal: Option<&AgentGoalId>,
         intent: &AgentRunEffect,
+        attempt: u32,
         now: AgentTimestampMillis,
     ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
         // Immediate safety first: a terminated agent never dispatches again,
@@ -962,10 +968,10 @@ impl AgentToolAuthority {
 
         match &intent.request {
             AgentRunEffectRequest::Tool { call } => {
-                self.authorize_tool(context, scope, task, goal, intent, call, now)
+                self.authorize_tool(context, scope, task, goal, intent, call, attempt, now)
             }
             AgentRunEffectRequest::Model { .. } => {
-                self.authorize_model(context, scope, task, goal, intent, now)
+                self.authorize_model(context, scope, task, goal, intent, attempt, now)
             }
             AgentRunEffectRequest::Compensation { .. } => {
                 self.authorize_compensation(context, scope, task, goal, intent, now)
@@ -988,14 +994,15 @@ impl AgentToolAuthority {
         context: &AgentAuthorityContext<'_>,
         scope: &AgentRunScope,
         intent: &AgentRunEffect,
+        attempt: u32,
         now: AgentTimestampMillis,
     ) -> (bool, Option<AgentAuthorityRefusal>) {
         match context.checkpoint_grant {
             None => (false, None),
-            // A grant is revalidated against the first attempt: it must bind the
-            // exact intent now, whatever per-attempt use count the dispatch
-            // layer later enforces on the grant it issues.
-            Some(grant) => match grant.validate_for(scope, intent, 1, now) {
+            // The grant is revalidated against the attempt the pipeline is
+            // about to make, so its allowed use count bounds retries: a grant
+            // that covers one attempt does not cover the second.
+            Some(grant) => match grant.validate_for(scope, intent, attempt, now) {
                 Ok(()) => (true, None),
                 Err(error) => (
                     false,
@@ -1017,6 +1024,7 @@ impl AgentToolAuthority {
         goal: Option<&AgentGoalId>,
         intent: &AgentRunEffect,
         call: &AgentToolCallRequest,
+        attempt: u32,
         now: AgentTimestampMillis,
     ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
         // Layer 2, the binding: the deployment must have registered the tool.
@@ -1201,7 +1209,7 @@ impl AgentToolAuthority {
         // [specification 18](../../../docs/plans/rakka-agent/spec.md)
         // scenario 12).
         let (checkpoint_satisfied, checkpoint_grant_refusal) =
-            self.evaluate_checkpoint_grant(context, scope, intent, now);
+            self.evaluate_checkpoint_grant(context, scope, intent, attempt, now);
         if binding.checkpoint_required && !checkpoint_satisfied {
             return Err(checkpoint_grant_refusal.unwrap_or_else(|| {
                 AgentAuthorityRefusal::of(
@@ -1329,6 +1337,7 @@ impl AgentToolAuthority {
     /// the definition (and setup) envelope so a definition narrowed after the
     /// settings were accepted still fails closed.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn authorize_model(
         &self,
         context: &AgentAuthorityContext<'_>,
@@ -1336,6 +1345,7 @@ impl AgentToolAuthority {
         task: Option<&AgentTaskId>,
         goal: Option<&AgentGoalId>,
         intent: &AgentRunEffect,
+        attempt: u32,
         now: AgentTimestampMillis,
     ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
         let settings = context.settings.settings();
@@ -1393,7 +1403,7 @@ impl AgentToolAuthority {
                 &content,
             );
             let (checkpoint_satisfied, _) =
-                self.evaluate_checkpoint_grant(context, scope, intent, now);
+                self.evaluate_checkpoint_grant(context, scope, intent, attempt, now);
             refuse_guardrail_disposition(
                 &decision.disposition,
                 "the model call",
@@ -2018,6 +2028,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("a downgraded intent is refused");
@@ -2054,6 +2065,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect("the dispatch is granted");
@@ -2221,6 +2233,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect_err("a checkpoint-required tool with no grant is refused");
@@ -2240,6 +2253,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect("a checkpoint-required tool dispatches under a valid grant");
@@ -2277,6 +2291,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect_err("an authorization-required tool with no grant is refused");
@@ -2294,6 +2309,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect_err("an approval-kind grant does not satisfy the authorization gate");
@@ -2315,6 +2331,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect("an authorization-required tool dispatches under an authorization grant");
@@ -2352,6 +2369,7 @@ mod tests {
                 None,
                 None,
                 &changed_intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect_err("a changed argument digest invalidates the approval");
@@ -2367,6 +2385,7 @@ mod tests {
                 None,
                 None,
                 &approved_intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect("the approved intent still binds");
@@ -2404,10 +2423,69 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(10),
             )
             .expect_err("a revoked tool is refused despite a valid grant");
         assert_eq!(refusal.code, "tool-revoked");
+    }
+
+    #[test]
+    fn a_spent_checkpoint_grant_does_not_cover_a_retry_attempt() {
+        // Specification 12.3: the grant's allowed use count is enforced against
+        // the attempt the pipeline is about to make — a grant covering one
+        // attempt authorizes the first and refuses the second, and a wider
+        // grant covers exactly the attempts it names.
+        let (registry, definition) = checkpoint_required_fixture();
+        let settings = settings_for(&definition);
+        let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
+        let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
+        let grant = approved_grant(&intent, AgentTimestampMillis::new(1_000), 1);
+
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: Some(&grant),
+        };
+        authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(10),
+            )
+            .expect("the first attempt dispatches under the grant");
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                2,
+                AgentTimestampMillis::new(10),
+            )
+            .expect_err("a spent grant does not cover the retry");
+        assert_eq!(refusal.code, "checkpoint-grant-uses-exhausted");
+
+        let wider = approved_grant(&intent, AgentTimestampMillis::new(1_000), 2);
+        let context = context.with_checkpoint_grant(&wider);
+        authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                2,
+                AgentTimestampMillis::new(10),
+            )
+            .expect("a two-use grant covers the retry");
     }
 
     #[test]
@@ -2455,6 +2533,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("the setup's narrowing is enforced at dispatch");
@@ -2497,6 +2576,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("a revoked tool is refused");
@@ -2525,6 +2605,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("a suspended agent dispatches nothing");
@@ -2545,6 +2626,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("a terminated agent dispatches nothing");
@@ -2589,6 +2671,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("a divergent reconciliation protocol is refused");
@@ -2625,6 +2708,7 @@ mod tests {
                 None,
                 None,
                 &unbounded,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("an unbounded attempt is refused");
@@ -2641,6 +2725,7 @@ mod tests {
                 None,
                 None,
                 &narrowed,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect("a narrower timeout is granted");
@@ -2681,6 +2766,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("an unimplemented guardrail policy refuses dispatch");
@@ -2697,6 +2783,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect("the labeled chain satisfies the selection");
@@ -2759,6 +2846,7 @@ mod tests {
                 None,
                 None,
                 &intent,
+                1,
                 AgentTimestampMillis::new(2),
             )
             .expect_err("a model-request transform cannot be applied, so it refuses");
