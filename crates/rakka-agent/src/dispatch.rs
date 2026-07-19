@@ -523,6 +523,17 @@ where
             if let Some(setup) = &setup {
                 context = context.with_setup(setup);
             }
+            // A checkpoint-gated effect carries no grant until the run has
+            // resolved its checkpoint; the run holds the digest-bound grant in
+            // its own durable state, and the authority revalidates it against
+            // the exact intent before dispatch
+            // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+            if let Some(grant) = run
+                .loop_state()
+                .and_then(|loop_state| loop_state.grant_for(intent))
+            {
+                context = context.with_checkpoint_grant(grant);
+            }
             let task = run.run().map(AgentRun::task);
             let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
             let decision = match self

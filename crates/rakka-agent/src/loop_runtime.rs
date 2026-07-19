@@ -78,6 +78,7 @@ use rakka_agent_workflow::{
 use serde::{Deserialize, Serialize};
 
 use crate::budget::{AgentBudgetExhaustion, AgentRunBudget};
+use crate::checkpoints::{AgentCheckpoint, AgentCheckpointGrant};
 use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId};
 use crate::effect::{
     AgentEffectError, AgentRunEffect, AgentToolResult, AGENT_RUN_MAX_PENDING_EFFECTS,
@@ -267,6 +268,16 @@ pub struct AgentLoopState {
     pending_top_up: Option<AgentPendingTopUp>,
     pending_checkpoint: Option<HumanCheckpointId>,
     pending_timer: Option<AgentTimerId>,
+    /// The approval/authorization checkpoints the run has opened and is waiting
+    /// on ([specification 12](../../../docs/plans/rakka-agent/spec.md)). Bounded
+    /// by [`AGENT_RUN_MAX_PENDING_EFFECTS`]: at most one per effect a turn gates.
+    #[serde(default)]
+    open_checkpoints: Vec<AgentCheckpoint>,
+    /// The digest-bound grants a resolved checkpoint issued, keyed implicitly by
+    /// the effect id and generation each binds. A grant lives only until its
+    /// effect resolves, then leaves with the turn.
+    #[serde(default)]
+    checkpoint_grants: Vec<AgentCheckpointGrant>,
 }
 
 impl AgentLoopState {
@@ -301,6 +312,8 @@ impl AgentLoopState {
             pending_top_up: None,
             pending_checkpoint: None,
             pending_timer: None,
+            open_checkpoints: Vec::new(),
+            checkpoint_grants: Vec::new(),
         }
     }
 
@@ -514,6 +527,103 @@ impl AgentLoopState {
         self.pending_timer.as_ref()
     }
 
+    /// The approval/authorization checkpoints the run is waiting on.
+    #[must_use]
+    pub fn open_checkpoints(&self) -> &[AgentCheckpoint] {
+        &self.open_checkpoints
+    }
+
+    /// Whether the run is waiting on any checkpoint that is not yet resolved.
+    #[must_use]
+    pub fn has_open_checkpoint(&self) -> bool {
+        self.open_checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.status.is_waiting())
+    }
+
+    /// The digest-bound grant the run holds for exactly this effect intent, when
+    /// a checkpoint for it has been resolved.
+    #[must_use]
+    pub fn grant_for(&self, effect: &AgentRunEffect) -> Option<&AgentCheckpointGrant> {
+        self.checkpoint_grants.iter().find(|grant| {
+            grant.effect_id == effect.effect_id && grant.generation == effect.generation
+        })
+    }
+
+    /// Whether the effect may be handed to the sink: either it needs no
+    /// checkpoint, or a valid grant for its exact generation is held.
+    #[must_use]
+    pub fn is_dispatchable(&self, effect: &AgentRunEffect) -> bool {
+        !effect.checkpoint_required || self.grant_for(effect).is_some()
+    }
+
+    pub(crate) fn open_checkpoint_mut(
+        &mut self,
+        checkpoint_id: &HumanCheckpointId,
+    ) -> Option<&mut AgentCheckpoint> {
+        self.open_checkpoints
+            .iter_mut()
+            .find(|checkpoint| &checkpoint.checkpoint_id == checkpoint_id)
+    }
+
+    /// Records a newly opened checkpoint, bounded like the effect list, and
+    /// tracks its id in [`Self::pending_checkpoint`]. A checkpoint whose id the
+    /// run already holds is a replay and adds nothing.
+    pub(crate) fn record_checkpoint(
+        &mut self,
+        checkpoint: AgentCheckpoint,
+    ) -> Result<(), AgentEffectError> {
+        if self
+            .open_checkpoints
+            .iter()
+            .any(|held| held.checkpoint_id == checkpoint.checkpoint_id)
+        {
+            return Ok(());
+        }
+        if self.open_checkpoints.len() >= AGENT_RUN_MAX_PENDING_EFFECTS {
+            return Err(AgentEffectError::PendingOverflow {
+                maximum: AGENT_RUN_MAX_PENDING_EFFECTS,
+            });
+        }
+        self.pending_checkpoint = Some(checkpoint.checkpoint_id.clone());
+        self.open_checkpoints.push(checkpoint);
+        Ok(())
+    }
+
+    /// Records the grant a resolved checkpoint issued, replacing any prior grant
+    /// bound to the same effect generation.
+    pub(crate) fn record_grant(&mut self, grant: AgentCheckpointGrant) {
+        self.checkpoint_grants.retain(|held| {
+            !(held.effect_id == grant.effect_id && held.generation == grant.generation)
+        });
+        self.checkpoint_grants.push(grant);
+    }
+
+    /// Drops the resolved (or otherwise terminal) checkpoint from the waiting
+    /// set, and points [`Self::pending_checkpoint`] at whatever remains open.
+    pub(crate) fn drop_checkpoint(&mut self, checkpoint_id: &HumanCheckpointId) {
+        self.open_checkpoints
+            .retain(|checkpoint| &checkpoint.checkpoint_id != checkpoint_id);
+        self.resync_pending_checkpoint();
+    }
+
+    fn resync_pending_checkpoint(&mut self) {
+        self.pending_checkpoint = self
+            .open_checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.status.is_waiting())
+            .map(|checkpoint| checkpoint.checkpoint_id.clone());
+    }
+
+    /// Cancels every waiting checkpoint the run holds, because the run itself is
+    /// winding down.
+    pub(crate) fn cancel_open_checkpoints(&mut self, now: AgentTimestampMillis) {
+        for checkpoint in &mut self.open_checkpoints {
+            checkpoint.cancel(now);
+        }
+        self.resync_pending_checkpoint();
+    }
+
     /// Fails closed on a loop state, or a record inside it, that this binary
     /// cannot interpret ([specification 20](../../../docs/plans/rakka-agent/spec.md)).
     pub fn check_schema(&self, policy: &AgentSchemaPolicy) -> Result<(), AgentSchemaError> {
@@ -523,6 +633,9 @@ impl AgentLoopState {
         }
         for effect in &self.effects {
             policy.check_record(effect)?;
+        }
+        for checkpoint in &self.open_checkpoints {
+            policy.check_record(checkpoint)?;
         }
         Ok(())
     }
@@ -627,6 +740,19 @@ impl AgentLoopState {
         let turn = self.turn;
         self.effects
             .retain(|effect| effect.turn != turn || effect.blocks_settlement());
+        // A grant or checkpoint outlives its effect no longer than the effect
+        // itself: once the effect leaves with the turn, the authorization it
+        // carried is spent and the checkpoint is history.
+        let held: std::collections::BTreeSet<&AgentEffectId> = self
+            .effects
+            .iter()
+            .map(|effect| &effect.effect_id)
+            .collect();
+        self.checkpoint_grants
+            .retain(|grant| held.contains(&grant.effect_id));
+        self.open_checkpoints
+            .retain(|checkpoint| held.contains(&checkpoint.bound_effect.effect_id));
+        self.resync_pending_checkpoint();
     }
 
     pub(crate) fn begin_turn(&mut self, feedback: Option<String>) {

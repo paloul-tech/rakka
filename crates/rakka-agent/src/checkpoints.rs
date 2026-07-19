@@ -109,6 +109,45 @@ crate::identity::validated_id! {
     pub AgentCompensationRef, "agent_compensation_ref"
 }
 
+/// The deployment-configured SLA and expiration deadlines a run stamps onto an
+/// approval checkpoint it opens
+/// ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The deadlines are durable: they live on the checkpoint record, survive
+/// passivation, and are enforced by [`AgentCheckpoint::on_timer`]. All fields
+/// default to `None`, which is a checkpoint that waits indefinitely for a
+/// decision and never expires — the fail-closed default, since a timeout must
+/// never auto-approve.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentCheckpointSla {
+    /// Milliseconds after opening at which the checkpoint becomes overdue and
+    /// escalates, when an escalation target is set.
+    pub due_after_ms: Option<u64>,
+    /// Milliseconds after opening at which the checkpoint hard-expires.
+    pub expire_after_ms: Option<u64>,
+    /// The escalation target notified at the SLA deadline.
+    pub escalation_target: Option<String>,
+}
+
+impl AgentCheckpointSla {
+    /// Whether any deadline is configured.
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        self.due_after_ms.is_some() || self.expire_after_ms.is_some()
+    }
+
+    /// Resolves the due and expiration instants relative to `opened_at`.
+    #[must_use]
+    pub fn deadlines(
+        &self,
+        opened_at: AgentTimestampMillis,
+    ) -> (Option<AgentTimestampMillis>, Option<AgentTimestampMillis>) {
+        let at =
+            |offset: u64| AgentTimestampMillis::new(opened_at.as_millis().saturating_add(offset));
+        (self.due_after_ms.map(at), self.expire_after_ms.map(at))
+    }
+}
+
 /// The three durable checkpoint kinds
 /// ([specification 12.1](../../../docs/plans/rakka-agent/spec.md)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

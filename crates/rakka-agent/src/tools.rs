@@ -434,6 +434,7 @@ impl AgentToolBinding {
             timeout_ms: self.timeout_ms,
             execution_policy: self.declaration.execution_policy.clone(),
             guardrail_revision: None,
+            checkpoint_required: self.checkpoint_required,
         };
         spec.validate()?;
         Ok(spec)

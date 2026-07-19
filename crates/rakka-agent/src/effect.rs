@@ -323,6 +323,17 @@ pub struct AgentEffectSpec {
     /// [`crate::tools::AgentToolAuthority::effect_policies`], which projects
     /// the registry and the configured chain together.
     pub guardrail_revision: Option<AgentRevisionNumber>,
+    /// Whether the effect may dispatch only under a durable checkpoint grant
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Projected from the tool binding's
+    /// [`crate::tools::AgentToolBinding::checkpoint_required`], so the run knows
+    /// at commit time to open an approval checkpoint and park rather than
+    /// dispatch. A model call never sets it; a guardrail stage may still require
+    /// a checkpoint dynamically at dispatch, which is a separate, dispatch-time
+    /// discovery.
+    #[serde(default)]
+    pub checkpoint_required: bool,
 }
 
 impl AgentEffectSpec {
@@ -337,6 +348,7 @@ impl AgentEffectSpec {
             timeout_ms: None,
             execution_policy: None,
             guardrail_revision: None,
+            checkpoint_required: false,
         }
     }
 
@@ -352,6 +364,7 @@ impl AgentEffectSpec {
             timeout_ms: None,
             execution_policy: None,
             guardrail_revision: None,
+            checkpoint_required: false,
         }
     }
 
@@ -372,6 +385,7 @@ impl AgentEffectSpec {
             timeout_ms: None,
             execution_policy: None,
             guardrail_revision: None,
+            checkpoint_required: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -412,6 +426,13 @@ impl AgentEffectSpec {
         self
     }
 
+    /// Requires a durable checkpoint grant before the effect may dispatch.
+    #[must_use]
+    pub const fn with_checkpoint_required(mut self) -> Self {
+        self.checkpoint_required = true;
+        self
+    }
+
     /// Declares a reconcileable spec with its protocol.
     pub fn reconcileable(
         protocol: AgentReconciliationProtocolRef,
@@ -425,6 +446,7 @@ impl AgentEffectSpec {
             timeout_ms: None,
             execution_policy: None,
             guardrail_revision: None,
+            checkpoint_required: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -441,6 +463,7 @@ impl AgentEffectSpec {
             timeout_ms: None,
             execution_policy: None,
             guardrail_revision: None,
+            checkpoint_required: false,
         };
         spec.validate()?;
         Ok(spec)
@@ -522,6 +545,8 @@ struct AgentEffectSpecRecord {
     execution_policy: Option<AgentExecutionPolicyRef>,
     #[serde(default)]
     guardrail_revision: Option<AgentRevisionNumber>,
+    #[serde(default)]
+    checkpoint_required: bool,
 }
 
 impl<'de> Deserialize<'de> for AgentEffectSpec {
@@ -538,6 +563,7 @@ impl<'de> Deserialize<'de> for AgentEffectSpec {
             timeout_ms: record.timeout_ms,
             execution_policy: record.execution_policy,
             guardrail_revision: record.guardrail_revision,
+            checkpoint_required: record.checkpoint_required,
         };
         spec.validate().map_err(serde::de::Error::custom)?;
         Ok(spec)
@@ -562,6 +588,7 @@ pub struct AgentEffectPolicies {
     model: AgentEffectSpec,
     tools: BTreeMap<AgentToolId, AgentEffectSpec>,
     default_tool: AgentEffectSpec,
+    checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
 impl AgentEffectPolicies {
@@ -572,7 +599,22 @@ impl AgentEffectPolicies {
             model: AgentEffectSpec::read_only(),
             tools: BTreeMap::new(),
             default_tool: AgentEffectSpec::non_idempotent(),
+            checkpoint_sla: crate::checkpoints::AgentCheckpointSla::default(),
         }
+    }
+
+    /// Sets the SLA and expiration deadlines a run stamps onto every approval
+    /// checkpoint it opens ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn with_checkpoint_sla(mut self, sla: crate::checkpoints::AgentCheckpointSla) -> Self {
+        self.checkpoint_sla = sla;
+        self
+    }
+
+    /// The checkpoint SLA the deployment configured.
+    #[must_use]
+    pub const fn checkpoint_sla(&self) -> &crate::checkpoints::AgentCheckpointSla {
+        &self.checkpoint_sla
     }
 
     /// Sets the spec model calls dispatch under.
@@ -976,6 +1018,12 @@ pub struct AgentRunEffect {
     pub dispatched_at: Option<AgentTimestampMillis>,
     /// Stable code of the last dispatch or execution failure.
     pub last_error_code: Option<String>,
+    /// Whether the effect may dispatch only under a durable checkpoint grant
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)). Projected
+    /// from the tool binding at commit time, so the run parks on an approval
+    /// checkpoint before dispatch rather than being refused at the authority.
+    #[serde(default)]
+    pub checkpoint_required: bool,
 }
 
 impl AgentRunEffect {
@@ -1023,6 +1071,7 @@ impl AgentRunEffect {
             created_at,
             dispatched_at: None,
             last_error_code: None,
+            checkpoint_required: spec.checkpoint_required,
         })
     }
 
@@ -1791,6 +1840,7 @@ mod tests {
             timeout_ms: None,
             execution_policy: None,
             guardrail_revision: None,
+            checkpoint_required: false,
         };
         assert_eq!(
             missing
