@@ -995,6 +995,15 @@ Guidance: [Memory Architecture Guidance](technical-guidance.md#memory-architectu
   `rakka-a2a` precedent) so concurrent test migrators cannot race the system
   catalogs, and loads fail closed on an unsupported schema version. The gated
   tests were validated against a live PostgreSQL 16.
+- **Retention, tombstone, and deletion semantics are deferred, not delivered.**
+  The session and snapshot stores ship append/persist and bounded reads only;
+  the retention, tombstone, and deletion semantics of
+  [spec 13.1](spec.md#131-general-requirements) and the terminal-run retention
+  policy of [spec 13.2](spec.md#132-short-term-session-memory) wait on open
+  decision 7 and land with the Phase 2 memory slices (slice 2.1 fixes them from
+  the first private-memory schema; slice 6.2 validates the flows). Until then a
+  deployment retains a run's session and snapshots until it deletes the rows
+  itself.
 
 Done when: scenarios 14 and 17 pass against both the in-memory and Postgres
 stores. **Done (2026-07-19):** scenarios 14 and 17 pass on both stores, and
