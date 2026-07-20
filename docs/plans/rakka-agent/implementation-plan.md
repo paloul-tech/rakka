@@ -1041,6 +1041,55 @@ Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-
   task/run event subscription reuses the existing A2A event replay
   (coordination events extend this in Phase 5).
 
+**Design decisions resolved (2026-07-20, ahead of implementation):**
+
+- **Open decision 10 is accepted as a versioned management *extension*, not a
+  skill.** Settings and administrative commands enter through an
+  `AgentExtension` declared in the card's `capabilities.extensions` under a
+  stable URI that carries the version; a command is a `message/send` whose
+  typed data part is tagged with that URI, and an unsupported or unknown
+  required version fails closed. Authorization gates per operation (new
+  `A2AOperation` variants), the authenticated principal becomes the
+  `SettingsRevision` provenance of [spec 7.2](spec.md#72-settings-revisions),
+  and deduplication rides the existing normalized-command derivation into the
+  `AgentEntity` inbox's `UpdateSettings` with its `expected_revision` fence.
+  An `AgentSkill` was rejected as the carrier because skills have no
+  version-negotiation or required semantics — fail-closed versioning would
+  move into the payload — and the extension sets the precedent
+  [spec 14.4](spec.md#144-agent-to-agent-effects) reuses for the Phase 5
+  collaboration metadata. A discovery-only skill entry can be added later
+  without changing semantics.
+- **A settings command answers with an immediate message, never an A2A task.**
+  Durable inbox acceptance and dedup precede the acknowledgement
+  ([spec 14.1](spec.md#141-public-boundary)); the response carries the
+  accepted revision or the stale-revision conflict. A settings command is not
+  a unit of work: [spec 14.2](spec.md#142-task-identity-and-projection) gives
+  every created task a distinct `AgentTaskId`, and administrative operations
+  must not enter task identity, projection, or the recovery-scenario surface.
+  Audit rides `SettingsRevision` provenance, not task history.
+- **Open decision 17 is accepted as the equal mapping.** A2A `Task.id` is the
+  `AgentTaskId` value verbatim, immutable across assignment, handoff, and
+  restart ([spec 6.4](spec.md#64-agenttaskid),
+  [spec 14.2](spec.md#142-task-identity-and-projection)); the tenant always
+  derives from the authenticated context and is never parsed from the id.
+  This does not collide with the substrate surface's existing
+  `Task.id` -> run-id mapping because the `agents` feature is a separate
+  handler surface.
+- **`contextId` is opaque on the agents surface, defaulting to the task's own
+  id.** A client-supplied `contextId` is honored as an opaque grouping key;
+  absent one, the server assigns the task id. It is documented as
+  non-authoritative, so later phases can surface `AgentGoalId` through
+  metadata without changing the field's meaning — goal semantics are not
+  baked into a public field before goals exist (Phase 3).
+- **Client placement follows the crate rule already in force.**
+  `RakkaAgentClient` is defined in `rakka-agent` (`client.rs`) over a durable
+  command port, and the `rakka-a2a` `agents` feature — which adds
+  `rakka-agent` as an optional dependency, one-directional per the
+  `crate_shape` guard — provides the A2A-backed transport. The
+  no-local-shortcut rule of [spec 14.5](spec.md#145-typed-agent-client) is a
+  property of the port's contract and its tests, not of which crate names the
+  type.
+
 Done when: scenario 1 passes (duplicate A2A task messages create one task,
 one run, one turn) and the projection table has a test row-for-row.
 
