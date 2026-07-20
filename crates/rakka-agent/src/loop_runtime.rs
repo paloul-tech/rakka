@@ -880,6 +880,35 @@ impl AgentLoopState {
         Ok(recorded)
     }
 
+    /// Records the task's bounded input as the run's opening
+    /// [`MemoryEntryRole::User`] session entry, so the first turn's context
+    /// snapshot carries the input the run was created to serve
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The entry is recorded at turn zero — turns count from one, so zero names
+    /// what preceded them all — in the same compare-and-set that prepares the
+    /// first model call. It is called only when the run entity is wired with a
+    /// session-memory backend, and it is idempotent on the entry's derived
+    /// operation id, so a re-driven transition records the same entry at the
+    /// same sequence rather than duplicating it. The input fits by
+    /// construction: task content and session entries share one inline bound.
+    pub(crate) fn record_session_input(
+        &mut self,
+        scope: &AgentRunScope,
+        input: &AgentTaskContent,
+        now: AgentTimestampMillis,
+    ) -> Result<bool, MemoryError> {
+        self.push_session_entry(
+            scope,
+            0,
+            MemoryEntryRole::User,
+            "input",
+            input.clone(),
+            None,
+            now,
+        )
+    }
+
     /// Builds one session entry and pushes it to the outbox, returning whether it
     /// was new. A slot whose derived operation id is already owed is a replay and
     /// adds nothing; a full outbox fails closed.

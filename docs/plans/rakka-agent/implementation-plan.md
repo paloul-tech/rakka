@@ -967,7 +967,13 @@ Guidance: [Memory Architecture Guidance](technical-guidance.md#memory-architectu
   idempotently on the derived `MemoryOperationId` afterward — the exact argument,
   and the exact pattern, the slice 1.4 amendment makes for task history. A
   re-driven flush after a restart re-appends the same entries at the same
-  sequences rather than duplicating them (scenario 16).
+  sequences rather than duplicating them (scenario 16). The task's bounded input
+  enters the same outbox as the session's opening `User` entry when the first
+  model call is prepared — recorded at turn zero in the same compare-and-set
+  that commits the first model effect, and always within bounds, since task
+  content and session entries share one inline limit — so the first turn's
+  snapshot carries the input the run was created to serve rather than an empty
+  session.
 - **The memory backend is an optional collaborator, not a new generic.** The run
   entity's `<Store, Effects>` parameters are threaded through the actor, the
   sharding registration, and every test; adding a required `Memory` generic would

@@ -102,9 +102,10 @@ async fn a_run_records_its_turns_to_isolated_session_memory() {
     fx.create_task().await;
     fx.pump().await.expect("the loop should run to completion");
 
-    // The run recorded exactly its two turns: turn one's assistant message and
-    // its tool result, and turn two's assistant message. A re-driven flush across
-    // the recovery restarts `pump` simulates never duplicated an entry.
+    // The run recorded its opening input and exactly its two turns: the task's
+    // input, turn one's assistant message and its tool result, and turn two's
+    // assistant message. A re-driven flush across the recovery restarts `pump`
+    // simulates never duplicated an entry.
     let scope = run_scope();
     let page = session
         .read(&scope, SessionMemoryCursor::start())
@@ -112,17 +113,24 @@ async fn a_run_records_its_turns_to_isolated_session_memory() {
         .expect("read the session");
     assert_eq!(
         page.entries.len(),
-        3,
-        "one assistant, one tool, one assistant"
+        4,
+        "the input, one assistant, one tool, one assistant"
     );
     let roles: Vec<MemoryEntryRole> = page.entries.iter().map(|entry| entry.role).collect();
     assert_eq!(
         roles,
         vec![
+            MemoryEntryRole::User,
             MemoryEntryRole::Assistant,
             MemoryEntryRole::ToolResult,
             MemoryEntryRole::Assistant,
         ]
+    );
+    // The opening entry is the task's input, verbatim.
+    assert_eq!(
+        page.entries[0].content,
+        AgentTaskContent::inline(serde_json::json!({ "ticket": 1 })).expect("the fixture input"),
+        "the session opens with the task's bounded input"
     );
     // The sequence is monotonic and dense.
     let sequences: Vec<u64> = page
@@ -130,7 +138,7 @@ async fn a_run_records_its_turns_to_isolated_session_memory() {
         .iter()
         .map(|entry| entry.sequence.get())
         .collect();
-    assert_eq!(sequences, vec![1, 2, 3]);
+    assert_eq!(sequences, vec![1, 2, 3, 4]);
 
     // Isolation: another run of the same agent, and a run of another agent, share
     // nothing with this run's session (scenario 14).
@@ -181,8 +189,9 @@ async fn a_model_effect_retry_uses_the_original_context_snapshot() {
     fx.create_task().await;
     let scope = run_scope();
 
-    // Round one: crank to the turn-one model wait (its snapshot is persisted from
-    // the empty session), then answer the model call.
+    // Round one: crank to the turn-one model wait (its snapshot is persisted
+    // from the session holding only the task's input), then answer the model
+    // call.
     let mut run = fx.run();
     let now = fx.now();
     run.recover(now).await.expect("recover");
@@ -190,15 +199,19 @@ async fn a_model_effect_retry_uses_the_original_context_snapshot() {
         .await
         .expect("crank to the turn-one wait");
     let turn_one = AgentContextSnapshotRef::for_turn(&scope, 1).expect("ref");
-    assert!(
-        snapshots
-            .load(&scope, &turn_one)
-            .await
-            .expect("load")
-            .expect("turn one snapshot exists")
+    let opening = snapshots
+        .load(&scope, &turn_one)
+        .await
+        .expect("load")
+        .expect("turn one snapshot exists");
+    assert_eq!(
+        opening
             .session
-            .is_empty(),
-        "turn one's snapshot was assembled from the empty session"
+            .iter()
+            .map(|entry| entry.role)
+            .collect::<Vec<_>>(),
+        vec![MemoryEntryRole::User],
+        "turn one's snapshot carries exactly the task's input"
     );
     fx.dispatcher
         .drive(&mut run, &fx.router, fx.now())

@@ -200,6 +200,11 @@ pub struct Fixture<
     pub router: AgentExchangeRouter,
     pub task_transport:
         InProcessTaskEntityTransport<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>,
+    /// The transport the router delivers run-bound exchanges through. Held so a
+    /// test's memory wiring reaches the run entities the transport builds — the
+    /// acceptance path advances the loop on those, not on the entity the test
+    /// drives directly.
+    pub run_transport: InProcessRunEntityTransport<RunStore, S>,
     pub dispatcher: ScriptedDispatcher<A>,
     pub clock: Arc<AtomicU64>,
     /// The session-memory backend the run entity is wired with, when a test
@@ -253,7 +258,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         .with_effect_policies(policies.clone());
         let router = AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
-            .with_route(AgentEntityClass::Run, Arc::new(run_transport));
+            .with_route(AgentEntityClass::Run, Arc::new(run_transport.clone()));
         deferred.install(router.clone());
 
         Self {
@@ -265,6 +270,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             policies,
             router,
             task_transport,
+            run_transport,
             dispatcher,
             clock,
             memory: None,
@@ -273,8 +279,13 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
 
     /// Wires the run entity with a session-memory backend, so the loop persists
     /// context snapshots and appends session memory as it cranks.
+    ///
+    /// The wiring reaches both the entities the test drives directly and the
+    /// ones the router's transport builds — a run must be wired identically by
+    /// every driver that advances its loop.
     #[must_use]
     pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.run_transport.install_memory(memory.clone());
         self.memory = Some(memory);
         self
     }

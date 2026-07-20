@@ -1381,7 +1381,7 @@ fn advance_once(
 
     let mut owed = match run.loop_state.phase() {
         AgentLoopPhase::PreparingContext => {
-            prepare_context(state, &scope, policies, now).map(|()| Vec::new())
+            prepare_context(state, &scope, policies, session_memory, now).map(|()| Vec::new())
         }
         AgentLoopPhase::EvaluatingModelOutput => {
             evaluate_model_output(state, &scope, policies, now).map(|()| Vec::new())
@@ -1410,17 +1410,28 @@ fn advance_once(
 /// wait on.
 ///
 /// The effect and the wait commit together, so there is no instant at which the
-/// run is durably waiting for an effect that was never recorded.
+/// run is durably waiting for an effect that was never recorded. When the run
+/// entity is wired with a session-memory backend, the first turn's preparation
+/// also records the task's bounded input as the run's opening `User` session
+/// entry — in this same compare-and-set — so the settle pass flushes it before
+/// the first turn's snapshot is assembled and the model's first input carries
+/// what the run was created to serve.
 fn prepare_context(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
+    session_memory: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
         let run = state.run_mut()?;
         run.loop_state.turn()
     };
+    if session_memory && turn == 1 {
+        let run = state.run_mut()?;
+        let input = run.input.clone();
+        run.loop_state.record_session_input(scope, &input, now)?;
+    }
 
     let context = AgentContextSnapshotRef::for_turn(scope, turn)?;
     let profile = None;

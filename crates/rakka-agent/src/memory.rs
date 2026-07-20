@@ -26,10 +26,12 @@
 //! durable run, inbox, outbox, timer, checkpoint, and effect records are, and a
 //! session store that is empty, lagging, or unavailable can never make a run
 //! resume incorrectly ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)).
-//! The loop keeps no turn content of its own — it hands each turn to session
-//! memory at [`crate::loop_runtime::AgentLoopPhase::RecordingTurn`] and drops it —
-//! so a run that iterates a hundred times persists no more of its own state than
-//! one that iterates once
+//! The loop keeps no turn content of its own — it records the task's bounded
+//! input once as the session's opening [`MemoryEntryRole::User`] entry when the
+//! first model call is prepared, hands each turn to session memory at
+//! [`crate::loop_runtime::AgentLoopPhase::RecordingTurn`], and drops them — so a
+//! run that iterates a hundred times persists no more of its own state than one
+//! that iterates once
 //! ([specification 9.6](../../../docs/plans/rakka-agent/spec.md)).
 //!
 //! # What slice 1.5 landed
