@@ -160,7 +160,16 @@ pub use loop_runtime::{
     AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-pub use memory::{AgentContextSnapshotId, AgentContextSnapshotRef};
+pub use memory::{
+    assemble_session_context, check_memory_schema, AgentContextSnapshotId, AgentContextSnapshotRef,
+    AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPrivateMemoryStore,
+    AgentRunMemory, ContextSnapshotStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
+    MemoryClassification, MemoryContextSnapshot, MemoryEntryId, MemoryEntryRole, MemoryError,
+    MemoryFuture, MemoryOperationId, MemorySequence, MemoryTrust, PrivateMemoryScope,
+    SessionMemoryCursor, SessionMemoryEntry, SessionMemoryPage, SessionMemoryStore,
+    SessionWindowPolicy, SnapshotBudget, SnapshotRetrieval, SnapshotSessionEntry,
+    AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+};
 pub use model::{
     AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentModelUsage, AgentToolCallId, AgentToolCallRequest,

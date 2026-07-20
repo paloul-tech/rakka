@@ -83,14 +83,17 @@ use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId};
 use crate::effect::{
     AgentEffectError, AgentRunEffect, AgentToolResult, AGENT_RUN_MAX_PENDING_EFFECTS,
 };
-use crate::identity::{AgentGoalId, AgentOperationId, AgentTaskId};
-use crate::memory::AgentContextSnapshotRef;
+use crate::identity::{AgentGoalId, AgentOperationId, AgentRunScope, AgentTaskId};
+use crate::memory::{
+    AgentContextSnapshotRef, MemoryClassification, MemoryEntryId, MemoryEntryRole, MemoryError,
+    MemoryOperationId, MemorySequence, SessionMemoryEntry,
+};
 use crate::model::AgentModelTurn;
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
 };
-use crate::task::{AgentAcceptedResult, AgentContentDigest, AgentSchemaRef};
+use crate::task::{AgentAcceptedResult, AgentContentDigest, AgentSchemaRef, AgentTaskContent};
 
 /// Version of the loop adapter whose turns a loop-state record carries.
 ///
@@ -102,6 +105,17 @@ use crate::task::{AgentAcceptedResult, AgentContentDigest, AgentSchemaRef};
 /// reinterpretation of the turns the previous adapter wrote
 /// ([specification 10.2](../../../docs/plans/rakka-agent/spec.md)).
 pub const CURRENT_AGENT_LOOP_ADAPTER_VERSION: AgentRevisionNumber = AgentRevisionNumber::INITIAL;
+
+/// Most session-memory entries a run may owe its store before a flush drains
+/// them ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A turn records at most one assistant entry plus one entry per tool result, so
+/// the outbox holds a bounded working set: it is drained on every settle pass,
+/// and a transition that would cross the bound fails closed rather than persist an
+/// unbounded record — the same discipline the effect list and the task history
+/// outbox keep. A run with no session memory configured never records into it, so
+/// it stays empty and adds nothing to the run's durable state.
+pub const AGENT_RUN_SESSION_OUTBOX_CAPACITY: usize = 32;
 
 /// Where one run stands in its durable loop
 /// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
@@ -278,6 +292,25 @@ pub struct AgentLoopState {
     /// effect resolves, then leaves with the turn.
     #[serde(default)]
     checkpoint_grants: Vec<AgentCheckpointGrant>,
+    /// The session-memory entries a recorded turn owes its store, drained by the
+    /// run entity's flush ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    /// It is populated only when the run entity is wired with a session-memory
+    /// backend; an unwired run leaves it empty, so an existing run's durable
+    /// state is unchanged. The loop keeps no turn content of its own — the outbox
+    /// holds only what it still owes the store, and it is cleared as each entry
+    /// is durably appended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_outbox: Vec<SessionMemoryEntry>,
+    /// How many session-memory entries this run has assigned a sequence, so the
+    /// next entry's monotonic order key is stable across a re-driven transition.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    session_sequence: u64,
+}
+
+/// Whether a defaulted count is zero, so it is omitted from a run's serialized
+/// state until the run actually uses session memory.
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl AgentLoopState {
@@ -314,6 +347,8 @@ impl AgentLoopState {
             pending_timer: None,
             open_checkpoints: Vec::new(),
             checkpoint_grants: Vec::new(),
+            session_outbox: Vec::new(),
+            session_sequence: 0,
         }
     }
 
@@ -676,6 +711,9 @@ impl AgentLoopState {
         for checkpoint in &self.open_checkpoints {
             policy.check_record(checkpoint)?;
         }
+        for entry in &self.session_outbox {
+            policy.check_record(entry)?;
+        }
         Ok(())
     }
 
@@ -764,6 +802,143 @@ impl AgentLoopState {
             return;
         }
         self.tool_results.push(result);
+    }
+
+    /// The session-memory entries this run still owes its store.
+    #[must_use]
+    pub fn session_outbox(&self) -> &[SessionMemoryEntry] {
+        &self.session_outbox
+    }
+
+    /// How many more session-memory entries the outbox can hold before it is
+    /// full.
+    #[must_use]
+    pub fn session_outbox_headroom(&self) -> usize {
+        AGENT_RUN_SESSION_OUTBOX_CAPACITY.saturating_sub(self.session_outbox.len())
+    }
+
+    /// Records the current turn — the assistant turn and every tool result it
+    /// collected — into the session-memory outbox, to be flushed to the store
+    /// after the transition ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This is where slice 1.11 hands a turn to session memory; the loop keeps no
+    /// content of its own. It is called only when the run entity is wired with a
+    /// session-memory backend, and it is idempotent on each entry's derived
+    /// operation id, so a re-driven `RecordingTurn` transition records the same
+    /// entries at the same sequences rather than duplicating them.
+    pub(crate) fn record_session_turn(
+        &mut self,
+        scope: &AgentRunScope,
+        now: AgentTimestampMillis,
+    ) -> Result<usize, MemoryError> {
+        let turn = self.turn;
+        let mut recorded = 0;
+
+        if let Some(model_turn) = self.pending_turn.as_deref() {
+            let tools: Vec<String> = model_turn
+                .tool_calls
+                .iter()
+                .map(|call| call.tool.to_string())
+                .collect();
+            let payload = serde_json::json!({
+                "text": model_turn.text,
+                "has_proposal": model_turn.proposal.is_some(),
+                "tool_calls": tools,
+            });
+            let content =
+                AgentTaskContent::inline(payload).map_err(|error| MemoryError::Encoding {
+                    message: error.to_string(),
+                })?;
+            if self.push_session_entry(
+                scope,
+                turn,
+                MemoryEntryRole::Assistant,
+                "assistant",
+                content,
+                None,
+                now,
+            )? {
+                recorded += 1;
+            }
+        }
+
+        for result in self.tool_results.clone() {
+            let discriminator = format!("tool-{}", result.call_id);
+            if self.push_session_entry(
+                scope,
+                turn,
+                MemoryEntryRole::ToolResult,
+                &discriminator,
+                result.content,
+                Some(result.call_id.to_string()),
+                now,
+            )? {
+                recorded += 1;
+            }
+        }
+
+        Ok(recorded)
+    }
+
+    /// Builds one session entry and pushes it to the outbox, returning whether it
+    /// was new. A slot whose derived operation id is already owed is a replay and
+    /// adds nothing; a full outbox fails closed.
+    #[allow(clippy::too_many_arguments)]
+    fn push_session_entry(
+        &mut self,
+        scope: &AgentRunScope,
+        turn: u64,
+        role: MemoryEntryRole,
+        slot: &str,
+        content: AgentTaskContent,
+        source: Option<String>,
+        now: AgentTimestampMillis,
+    ) -> Result<bool, MemoryError> {
+        let discriminator = format!("turn-{turn}-{slot}");
+        let operation_id = MemoryOperationId::derive(scope, &discriminator).map_err(|error| {
+            MemoryError::Encoding {
+                message: error.to_string(),
+            }
+        })?;
+        if self
+            .session_outbox
+            .iter()
+            .any(|entry| entry.operation_id == operation_id)
+        {
+            return Ok(false);
+        }
+        if self.session_outbox.len() >= AGENT_RUN_SESSION_OUTBOX_CAPACITY {
+            return Err(MemoryError::OutboxOverflow {
+                maximum: AGENT_RUN_SESSION_OUTBOX_CAPACITY,
+            });
+        }
+        let entry_id = MemoryEntryId::derive(scope, &discriminator).map_err(|error| {
+            MemoryError::Encoding {
+                message: error.to_string(),
+            }
+        })?;
+        let sequence = MemorySequence::new(self.session_sequence.saturating_add(1));
+        let entry = SessionMemoryEntry::new(
+            entry_id,
+            operation_id,
+            sequence,
+            role,
+            content,
+            turn,
+            source,
+            MemoryClassification::Unclassified,
+            now,
+        )?;
+        self.session_sequence = sequence.get();
+        self.session_outbox.push(entry);
+        Ok(true)
+    }
+
+    /// Drops the session-memory entries a flush has durably appended, keyed by
+    /// their operation ids.
+    pub(crate) fn clear_flushed_session_entries(&mut self, flushed: &[MemoryOperationId]) {
+        self.session_outbox
+            .retain(|entry| !flushed.contains(&entry.operation_id));
     }
 
     /// Clears the working set of the turn that has just been recorded.

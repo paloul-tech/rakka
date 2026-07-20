@@ -29,12 +29,13 @@ use rakka_agent::{
     AgentEffectPolicies, AgentEffectSpec, AgentEntityClass, AgentEntityCommand, AgentEntityState,
     AgentEntityStore, AgentExchangeRouter, AgentId, AgentModelAdapter, AgentOperationId,
     AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectSink,
-    AgentRunEntityStore, AgentRunScope, AgentRunSnapshot, AgentRunState, AgentRunStatus,
-    AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation,
-    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityStore,
-    AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot,
-    AgentTaskState, AgentToolBinding, AgentToolDeclaration, AgentToolDescriptor, AgentToolKind,
-    AgentToolRegistry, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, TenantId,
+    AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot, AgentRunState,
+    AgentRunStatus, AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent,
+    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
+    AgentTaskEntityStore, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
+    AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentToolBinding, AgentToolDeclaration,
+    AgentToolDescriptor, AgentToolKind, AgentToolRegistry, InMemoryAgentRunEffectSink,
+    InMemoryAgentTaskHistoryStore, TenantId,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
@@ -201,6 +202,10 @@ pub struct Fixture<
         InProcessTaskEntityTransport<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>,
     pub dispatcher: ScriptedDispatcher<A>,
     pub clock: Arc<AtomicU64>,
+    /// The session-memory backend the run entity is wired with, when a test
+    /// enables it. Absent by default, so the run keeps only the opaque context
+    /// reference and retains no session memory — the pre-slice-1.11 behavior.
+    pub memory: Option<AgentRunMemory>,
 }
 
 impl<A: AgentModelAdapter> Fixture<A> {
@@ -262,7 +267,16 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             task_transport,
             dispatcher,
             clock,
+            memory: None,
         }
+    }
+
+    /// Wires the run entity with a session-memory backend, so the loop persists
+    /// context snapshots and appends session memory as it cranks.
+    #[must_use]
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     pub fn now(&self) -> AgentTimestampMillis {
@@ -345,8 +359,12 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     }
 
     pub fn run(&self) -> AgentRunEntityStore<RunStore, S> {
-        run_entity(&run_scope(), &self.runs, &self.effects)
-            .with_effect_policies(self.policies.clone())
+        let mut entity = run_entity(&run_scope(), &self.runs, &self.effects)
+            .with_effect_policies(self.policies.clone());
+        if let Some(memory) = &self.memory {
+            entity = entity.with_memory(memory.clone());
+        }
+        entity
     }
 
     /// Drives everything the task and the run owe until nothing moves.

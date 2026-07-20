@@ -13,6 +13,7 @@ members = [
     "crates/rakka-workflow",
     "crates/rakka-agent-workflow",
     "crates/rakka-agent",
+    "crates/rakka-agent-postgres",
     "crates/rakka-a2a",
     "crates/rakka-stream",
     "crates/rakka-process",

@@ -941,8 +941,68 @@ Guidance: [Memory Architecture Guidance](technical-guidance.md#memory-architectu
 - Rig memory policies (windowing/compaction) may shape history behind the
   Rakka-owned write path only ([spec 10.3](spec.md#103-conversation-memory)).
 
+**Amended as implemented (2026-07-19):**
+
+- **The snapshot lives in a store, not the run's loop state, and the run keeps
+  only the reference.** [Spec 13.5](spec.md#135-memory-context-snapshot) requires
+  the snapshot to be *immutable* and *reused by a retry*, and the loop already
+  carries an `AgentContextSnapshotRef` from slice 1.5. Putting the snapshot
+  *content* — a bounded window of session entries — into the run's durable state
+  would grow that state per turn, which the slice 1.5 amendment forbids ("content
+  does not accumulate in the loop"). The snapshot therefore lives in a separate
+  immutable, content-addressed `ContextSnapshotStore` whose `persist` is
+  first-writer-wins: the run's transition commits only the reference (unchanged),
+  and the store facade assembles and persists the snapshot *outside* the
+  transition (I/O is forbidden in a transition, [spec 9.5](spec.md#95-execution-rule))
+  before the model effect is handed to the sink. A re-driven settle loads the
+  existing snapshot and reuses it, so a concurrent memory write cannot change a
+  retried input — scenario 17 — without ever making the durable run record grow.
+- **Session appends are an outbox on the run's own state, flushed like task
+  history.** [Spec 13.2](spec.md#132-short-term-session-memory)'s append and the
+  run's transition are two records — the session store is separate — so committing
+  a turn to session memory *inside* the transition that recorded it would be a
+  second compare-and-set. The run instead records the turn's entries into a
+  bounded `session_outbox` on its loop state at `RecordingTurn`, in the same
+  compare-and-set that advanced the phase, and the store facade flushes them
+  idempotently on the derived `MemoryOperationId` afterward — the exact argument,
+  and the exact pattern, the slice 1.4 amendment makes for task history. A
+  re-driven flush after a restart re-appends the same entries at the same
+  sequences rather than duplicating them (scenario 16).
+- **The memory backend is an optional collaborator, not a new generic.** The run
+  entity's `<Store, Effects>` parameters are threaded through the actor, the
+  sharding registration, and every test; adding a required `Memory` generic would
+  churn all of them and force every unwired run to name a null backend. Instead
+  `AgentRunEntityStore::with_memory(AgentRunMemory)` holds the session and
+  snapshot stores behind `Arc<dyn …>`, absent by default. An unwired run behaves
+  exactly as it did before this slice — it records nothing to the outbox (the flag
+  is `self.memory.is_some()`, threaded into `record_turn`), so its durable state
+  is byte-identical — which is why the ~90 existing run/effect/checkpoint tests
+  needed no change. Session-memory retention is a deployment choice: with no store
+  wired, there is no session memory, consistent with content capture being off by
+  default ([spec 17.14](spec.md#1714-content-capture-and-redaction), which governs
+  *telemetry*, not the authoritative session record).
+- **The private long-term trait is declared, and its scope is fixed, but nothing
+  implements it.** `AgentPrivateMemoryStore` scoped `(TenantId, AgentId)` and its
+  `AgentPrivateMemory` record exist so the session and snapshot identities cannot
+  bake in an incompatible scope; the `MemoryContextSnapshot`'s private and
+  communal selections are present but empty. Phase 2 delivers the stores without
+  reshaping the snapshot record.
+- **`rakka-agent-postgres` is a standalone adapter crate, like
+  `rakka-persistence-postgres`.** It depends on `rakka-agent` (default features
+  off — the stores never touch the model adapter) and is not wired through the
+  `rakka` facade, because the agent crates are not yet in the publishable set. Its
+  `migrate` takes a session advisory lock before its idempotent DDL (the
+  `rakka-a2a` precedent) so concurrent test migrators cannot race the system
+  catalogs, and loads fail closed on an unsupported schema version. The gated
+  tests were validated against a live PostgreSQL 16.
+
 Done when: scenarios 14 and 17 pass against both the in-memory and Postgres
-stores.
+stores. **Done (2026-07-19):** scenarios 14 and 17 pass on both stores, and
+scenario 16 (idempotent replayed memory writes) is proven alongside them.
+Session-store scenario 14/16 and snapshot-reuse scenario 17 have in-memory unit
+tests in `memory.rs` and PostgreSQL gated tests in `rakka-agent-postgres`;
+`crates/rakka-agent/tests/session_memory.rs` proves all three end to end through
+the run entity.
 
 ### Slice 1.12 — A2A surface and typed client
 
