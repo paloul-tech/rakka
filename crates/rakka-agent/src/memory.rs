@@ -43,9 +43,11 @@
 //! points at — persisted immutably in a [`ContextSnapshotStore`] — without moving
 //! the reference or changing what the loop persists.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -105,10 +107,10 @@ impl AgentContextSnapshotRef {
     /// their agents and runs alike never derive the same snapshot identity.
     ///
     /// The scope enters through a digest of its injective key rather than by
-    /// joining the ids literally: ids may themselves contain the join
-    /// character, which would let two different runs flatten to one name, and
-    /// three maximal ids would overflow the identity bound — a run stranded at
-    /// its first turn by the length of its own name.
+    /// joining the ids literally: three maximal ids would overflow the
+    /// identity bound — a run stranded at its first turn by the length of its
+    /// own name — and the digest keeps the derivation bounded without giving
+    /// up the key's injectivity.
     pub fn for_turn(scope: &AgentRunScope, turn: u64) -> AgentIdentityResult<Self> {
         let scope_digest = AgentContentDigest::of_bytes(scope.key().as_bytes());
         Ok(Self::new(
@@ -592,16 +594,8 @@ pub trait SessionMemoryStore: Send + Sync + 'static {
 /// An in-memory session-memory store, for tests and single-process deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemorySessionMemoryStore {
-    entries: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::BTreeMap<String, std::collections::BTreeMap<u64, SessionMemoryEntry>>,
-        >,
-    >,
-    operations: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
-        >,
-    >,
+    entries: Arc<Mutex<BTreeMap<String, BTreeMap<u64, SessionMemoryEntry>>>>,
+    operations: Arc<Mutex<BTreeMap<String, BTreeMap<String, u64>>>>,
 }
 
 impl InMemorySessionMemoryStore {
@@ -618,7 +612,7 @@ impl InMemorySessionMemoryStore {
             .lock()
             .expect("the session store should not be poisoned")
             .get(&scope.key())
-            .map_or(0, std::collections::BTreeMap::len)
+            .map_or(0, BTreeMap::len)
     }
 
     /// Whether one run's session is empty.
@@ -981,14 +975,7 @@ pub trait ContextSnapshotStore: Send + Sync + 'static {
 /// An in-memory snapshot store, for tests and single-process deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryContextSnapshotStore {
-    snapshots: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::BTreeMap<
-                String,
-                std::collections::BTreeMap<String, MemoryContextSnapshot>,
-            >,
-        >,
-    >,
+    snapshots: Arc<Mutex<BTreeMap<String, BTreeMap<String, MemoryContextSnapshot>>>>,
 }
 
 impl InMemoryContextSnapshotStore {
@@ -1005,7 +992,7 @@ impl InMemoryContextSnapshotStore {
             .lock()
             .expect("the snapshot store should not be poisoned")
             .get(&scope.key())
-            .map_or(0, std::collections::BTreeMap::len)
+            .map_or(0, BTreeMap::len)
     }
 
     /// Whether one run holds no snapshots.
@@ -1311,8 +1298,8 @@ pub trait AgentPrivateMemoryStore: Send + Sync + 'static {
 /// not change the run entity's own generic parameters.
 #[derive(Clone)]
 pub struct AgentRunMemory {
-    session: std::sync::Arc<dyn SessionMemoryStore>,
-    snapshots: std::sync::Arc<dyn ContextSnapshotStore>,
+    session: Arc<dyn SessionMemoryStore>,
+    snapshots: Arc<dyn ContextSnapshotStore>,
     window: SessionWindowPolicy,
 }
 
@@ -1320,8 +1307,8 @@ impl AgentRunMemory {
     /// Bundles a session store and a snapshot store with the default window.
     #[must_use]
     pub fn new(
-        session: std::sync::Arc<dyn SessionMemoryStore>,
-        snapshots: std::sync::Arc<dyn ContextSnapshotStore>,
+        session: Arc<dyn SessionMemoryStore>,
+        snapshots: Arc<dyn ContextSnapshotStore>,
     ) -> Self {
         Self {
             session,
