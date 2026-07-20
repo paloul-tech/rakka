@@ -129,6 +129,12 @@ pub use choreography::{
     AGENT_EXCHANGE_LOG_CAPACITY, AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
     AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
+pub use client::{
+    AgentClientAgentStatus, AgentClientError, AgentClientFuture, AgentClientManagementCommand,
+    AgentClientManagementResponse, AgentClientPollPolicy, AgentClientResult, AgentClientTaskEvent,
+    AgentClientTaskRequest, AgentClientTaskState, AgentClientTaskView, AgentClientTransport,
+    RakkaAgentClient,
+};
 pub use dispatch::{
     workflow_run_id, AgentCompensationExecutor, AgentDispatchAuthority, AgentDispatchDecision,
     AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe,

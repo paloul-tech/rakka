@@ -701,6 +701,12 @@ pub enum AgentOperationKind {
     SettingsUpdate,
     /// An administrative lifecycle command over an agent.
     LifecycleCommand,
+    /// Acceptance of an agent-suspension lifecycle command.
+    LifecycleSuspend,
+    /// Acceptance of an agent-resumption lifecycle command.
+    LifecycleResume,
+    /// Acceptance of an agent-termination lifecycle command.
+    LifecycleTerminate,
     /// A cancellation request or propagation step.
     Cancellation,
 }
@@ -735,6 +741,9 @@ impl AgentOperationKind {
             Self::DefinitionUpdate => "definition-update",
             Self::SettingsUpdate => "settings-update",
             Self::LifecycleCommand => "lifecycle-command",
+            Self::LifecycleSuspend => "lifecycle-suspend",
+            Self::LifecycleResume => "lifecycle-resume",
+            Self::LifecycleTerminate => "lifecycle-terminate",
             Self::Cancellation => "cancellation",
         }
     }

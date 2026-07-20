@@ -31,6 +31,7 @@ rakka-remote = { path = "../rakka-remote", version = "0.1.0" }
 rakka-sharding = { path = "../rakka-sharding", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 # Pinned, reviewed Rig version for the `rig` feature. Default features are off:
 # Rakka needs only Rig's provider-neutral completion contract, and the deploying
@@ -40,7 +41,6 @@ rig-core = { version = "=0.37.0", default-features = false, optional = true }
 
 [dev-dependencies]
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
-tokio.workspace = true
 
 [lints]
 workspace = true

@@ -44,6 +44,10 @@
 //! - `otel`: trace-context propagation and OpenTelemetry-compatible
 //!   attribute helpers.
 //! - `testkit`: in-memory stores, fixtures, and compatibility probes.
+//! - `agents`: typed Rakka Agent surface over `rakka-agent` entities —
+//!   `AgentTaskId` task identity, durable deduplicated ingress, the
+//!   specification 14.3 state projection, and the versioned agent-management
+//!   extension (implies `server`).
 //!
 //! # A2A SDK version policy
 //!
@@ -92,6 +96,9 @@ pub mod handler;
 pub mod routes;
 #[cfg(feature = "server")]
 pub mod stream;
+
+#[cfg(feature = "agents")]
+pub mod agents;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testing;
