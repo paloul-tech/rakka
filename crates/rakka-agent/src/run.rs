@@ -103,7 +103,10 @@ use crate::identity::{
     AgentRunScope, AgentTaskId, AgentTaskScope, TenantId,
 };
 use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
-use crate::memory::AgentContextSnapshotRef;
+use crate::memory::{
+    assemble_session_context, AgentContextSnapshotRef, AgentRunMemory, MemoryError,
+    SessionMemoryEntry,
+};
 use crate::model::AgentModelError;
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -1365,6 +1368,7 @@ fn settle_ledger_exchange(
 fn advance_once(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
+    session_memory: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1377,12 +1381,14 @@ fn advance_once(
 
     let mut owed = match run.loop_state.phase() {
         AgentLoopPhase::PreparingContext => {
-            prepare_context(state, &scope, policies, now).map(|()| Vec::new())
+            prepare_context(state, &scope, policies, session_memory, now).map(|()| Vec::new())
         }
         AgentLoopPhase::EvaluatingModelOutput => {
             evaluate_model_output(state, &scope, policies, now).map(|()| Vec::new())
         }
-        AgentLoopPhase::RecordingTurn => record_turn(state, now).map(|()| Vec::new()),
+        AgentLoopPhase::RecordingTurn => {
+            record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
+        }
         AgentLoopPhase::DecidingContinuation => decide_continuation(state, &scope, now),
         // `can_advance` already excluded these.
         AgentLoopPhase::AwaitingModel
@@ -1404,17 +1410,28 @@ fn advance_once(
 /// wait on.
 ///
 /// The effect and the wait commit together, so there is no instant at which the
-/// run is durably waiting for an effect that was never recorded.
+/// run is durably waiting for an effect that was never recorded. When the run
+/// entity is wired with a session-memory backend, the first turn's preparation
+/// also records the task's bounded input as the run's opening `User` session
+/// entry — in this same compare-and-set — so the settle pass flushes it before
+/// the first turn's snapshot is assembled and the model's first input carries
+/// what the run was created to serve.
 fn prepare_context(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
+    session_memory: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
         let run = state.run_mut()?;
         run.loop_state.turn()
     };
+    if session_memory && turn == 1 {
+        let run = state.run_mut()?;
+        let input = run.input.clone();
+        run.loop_state.record_session_input(scope, &input, now)?;
+    }
 
     let context = AgentContextSnapshotRef::for_turn(scope, turn)?;
     let profile = None;
@@ -1602,17 +1619,37 @@ fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
 /// Records the turn.
 ///
 /// The usage the provider billed is charged here, because it is only knowable
-/// from the turn itself. Slice 1.11 appends the turn and its tool results to
-/// session memory at exactly this point; the loop's own record keeps no content.
-fn record_turn(state: &mut AgentRunState, now: AgentTimestampMillis) -> AgentRunResult<()> {
+/// from the turn itself. When the run entity is wired with a session-memory
+/// backend, the turn and its tool results are recorded into the session-memory
+/// outbox here — the one point where the loop holds the turn — and the store
+/// facade's flush appends them afterward; the loop's own record keeps no content
+/// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)). The recording
+/// is idempotent on each entry's derived operation id, so a re-driven transition
+/// records the same entries rather than duplicating them, and it commits in the
+/// same compare-and-set that advances the phase — so a run cannot advance past a
+/// turn it failed to owe to session memory.
+fn record_turn(
+    state: &mut AgentRunState,
+    scope: &AgentRunScope,
+    session_memory: bool,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
     let run = state.run_mut()?;
     if let Some(turn) = run.loop_state.pending_turn() {
         let usage = turn.usage;
         run.loop_state.budget_mut().record_usage(usage);
     }
+    if session_memory {
+        run.loop_state.record_session_turn(scope, now)?;
+    }
     run.loop_state
         .set_phase(AgentLoopPhase::DecidingContinuation);
     run.status = AgentRunStatus::Running;
+    if session_memory {
+        // The session-memory outbox grew, so re-check the record's bound; a run
+        // with no session memory records nothing and keeps its prior behavior.
+        run.check_bounds(0)?;
+    }
     state.updated_at = now;
     Ok(())
 }
@@ -2796,6 +2833,7 @@ where
     host: AgentExchangeHost<AgentRunParticipant, Store>,
     effects: Effects,
     policies: AgentEffectPolicies,
+    memory: Option<AgentRunMemory>,
     recovered: bool,
 }
 
@@ -2808,6 +2846,13 @@ where
         f.debug_struct("AgentRunEntityStore")
             .field("scope", &self.scope)
             .field("effects", &self.effects.backend_name())
+            .field(
+                "memory",
+                &self
+                    .memory
+                    .as_ref()
+                    .map(|memory| memory.session().backend_name()),
+            )
             .field("recovered", &self.recovered)
             .finish_non_exhaustive()
     }
@@ -2831,6 +2876,7 @@ where
             host,
             effects,
             policies: AgentEffectPolicies::default(),
+            memory: None,
             recovered: false,
         }
     }
@@ -2839,6 +2885,25 @@ where
     #[must_use]
     pub fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
         self.host = self.host.with_schema_policy(policy);
+        self
+    }
+
+    /// Wires the run with a session-memory backend
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md),
+    /// [13.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run persists an immutable
+    /// [`crate::memory::MemoryContextSnapshot`] before every model effect and
+    /// appends each recorded turn to session memory; an unwired
+    /// run keeps only the opaque context reference and retains no session memory,
+    /// which is the interim behavior every slice before 1.11 had. Both the
+    /// snapshot persist and the session append happen in the settle pass, after
+    /// the run's own durable transition has committed, and both are idempotent —
+    /// so an interrupted flush re-drives harmlessly and a memory-backend outage
+    /// never blocks the run's correctness state.
+    #[must_use]
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -3047,8 +3112,12 @@ where
     async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentRunResult<()> {
         for _round in 0..AGENT_RUN_MAX_SETTLE_ROUNDS {
             let advanced = self.advance_loop(now).await?;
+            // Flush the turn's session memory before assembling the next turn's
+            // snapshot, so a snapshot sees the prior turn the loop just recorded.
+            let flushed = self.flush_session_memory(now).await?;
+            let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
-            if advanced == 0 && dispatched == 0 {
+            if advanced == 0 && dispatched == 0 && flushed == 0 && snapshotted == 0 {
                 break;
             }
         }
@@ -3078,21 +3147,136 @@ where
         let mut progress = AgentRunProgress::default();
         for _round in 0..AGENT_RUN_MAX_SETTLE_ROUNDS {
             let advanced = self.advance_loop(now).await?;
+            let flushed = self.flush_session_memory(now).await?;
+            let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
 
             progress.transitions += advanced;
             progress.effects_dispatched += dispatched;
+            progress.session_entries_flushed += flushed;
+            progress.snapshots_persisted += snapshotted;
             progress.settled += report.settled;
             progress.failed += report.failed;
 
-            if advanced == 0 && dispatched == 0 && report.settled == 0 {
+            if advanced == 0
+                && dispatched == 0
+                && flushed == 0
+                && snapshotted == 0
+                && report.settled == 0
+            {
                 break;
             }
         }
 
         progress.outstanding = self.host.outstanding()?.len();
         Ok(progress)
+    }
+
+    /// Appends the session-memory entries a recorded turn owes its store, then
+    /// drops the entries the store durably accepted
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is the session-memory analogue of the task entity's history flush: a
+    /// crash between the append and the clearing re-drives the append, which is
+    /// idempotent on the entry's operation id; a crash before the append leaves
+    /// the entry owed in durable state. Neither loses an entry, and neither
+    /// writes one twice. A run with no session-memory backend never owes an
+    /// entry, so this is a no-op for it.
+    async fn flush_session_memory(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
+        let Some(memory) = self.memory.clone() else {
+            return Ok(0);
+        };
+        let pending: Vec<SessionMemoryEntry> = self
+            .state()?
+            .loop_state()
+            .map(|loop_state| loop_state.session_outbox().to_vec())
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut flushed = Vec::with_capacity(pending.len());
+        for entry in &pending {
+            memory.session().append(&self.scope, entry).await?;
+            flushed.push(entry.operation_id.clone());
+        }
+
+        self.host
+            .initiate(now, |state| {
+                if let Some(run) = state.run.as_mut() {
+                    run.loop_state.clear_flushed_session_entries(&flushed);
+                }
+                state.updated_at = now;
+                Ok(Vec::new())
+            })
+            .await?;
+        Ok(flushed.len())
+    }
+
+    /// Assembles and persists the immutable context snapshot for every
+    /// outstanding model effect that does not yet have one
+    /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The snapshot is content-addressed by the effect's context reference and
+    /// persisted before the effect is dispatched, so it exists before the model
+    /// call the effect represents. It is immutable: a re-driven pass — a retry,
+    /// a recovery — finds the snapshot already stored and reuses it, even when
+    /// session memory has been appended to since, which is what stops a
+    /// dispatcher retry from silently changing the model's input. A run with no
+    /// session-memory backend keeps only the opaque reference, so this is a no-op
+    /// for it.
+    async fn persist_context_snapshots(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<usize> {
+        let Some(memory) = self.memory.clone() else {
+            return Ok(0);
+        };
+        let pending: Vec<(u64, AgentContextSnapshotRef)> = self
+            .state()?
+            .loop_state()
+            .map(|loop_state| {
+                loop_state
+                    .outstanding_effects()
+                    .filter_map(|effect| match &effect.request {
+                        AgentRunEffectRequest::Model { context, .. } => {
+                            Some((effect.turn, context.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut persisted = 0;
+        for (turn, reference) in pending {
+            if memory
+                .snapshots()
+                .load(&self.scope, &reference)
+                .await?
+                .is_some()
+            {
+                // The snapshot already exists and is immutable — reuse it.
+                continue;
+            }
+            let snapshot = assemble_session_context(
+                memory.session(),
+                &self.scope,
+                &reference,
+                turn,
+                memory.window(),
+                AgentRevisionNumber::INITIAL,
+                now,
+            )
+            .await?;
+            memory.snapshots().persist(&snapshot).await?;
+            persisted += 1;
+        }
+        Ok(persisted)
     }
 
     /// Advances the loop one bounded transition at a time until it reaches a
@@ -3107,14 +3291,17 @@ where
 
             let mut rejection = None;
             let policies = self.policies.clone();
+            let session_memory = self.memory.is_some();
             let committed = self
                 .host
-                .initiate(now, |state| match advance_once(state, &policies, now) {
-                    Ok(owed) => Ok(owed),
-                    Err(error) => {
-                        let carried = AgentChoreographyError::from(error.clone());
-                        rejection = Some(error);
-                        Err(carried)
+                .initiate(now, |state| {
+                    match advance_once(state, &policies, session_memory, now) {
+                        Ok(owed) => Ok(owed),
+                        Err(error) => {
+                            let carried = AgentChoreographyError::from(error.clone());
+                            rejection = Some(error);
+                            Err(carried)
+                        }
                     }
                 })
                 .await;
@@ -3287,6 +3474,10 @@ pub struct AgentRunProgress {
     pub transitions: usize,
     /// How many effects it handed to the sink.
     pub effects_dispatched: usize,
+    /// How many session-memory entries it flushed to the session store.
+    pub session_entries_flushed: usize,
+    /// How many immutable context snapshots it persisted.
+    pub snapshots_persisted: usize,
     /// How many exchanges it settled.
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.
@@ -3935,6 +4126,13 @@ pub enum AgentRunError {
         /// The maximum accepted size, in bytes.
         maximum: usize,
     },
+    /// A session-memory append or context-snapshot persist failed.
+    ///
+    /// Memory is application-domain context, never the correctness source
+    /// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)): a memory
+    /// backend outage surfaces here from a settle pass — the run's durable
+    /// transition already committed — and a retry re-drives the idempotent write.
+    Memory(Box<MemoryError>),
 }
 
 impl AgentRunError {
@@ -3958,6 +4156,7 @@ impl AgentRunError {
             Self::StaleEffectGeneration { .. } => "run-stale-effect-generation",
             Self::RedispatchUnaffordable { .. } => "run-redispatch-unaffordable",
             Self::MaterializedStateTooLarge { .. } => "run-state-too-large",
+            Self::Memory(error) => error.code(),
         }
     }
 }
@@ -4010,6 +4209,7 @@ impl Display for AgentRunError {
                 f,
                 "the materialized run record is {bytes} bytes, which exceeds the {maximum} byte limit"
             ),
+            Self::Memory(error) => Display::fmt(error, f),
         }
     }
 }
@@ -4025,8 +4225,15 @@ impl Error for AgentRunError {
             Self::Model(error) => Some(error),
             Self::Task(error) => Some(error),
             Self::Checkpoint(error) => Some(error),
+            Self::Memory(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<MemoryError> for AgentRunError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(Box::new(error))
     }
 }
 

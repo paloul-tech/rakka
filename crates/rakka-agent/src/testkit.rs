@@ -77,7 +77,7 @@ use crate::effect::{
 };
 use crate::identity::{AgentOperationId, AgentRunScope};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
-use crate::memory::AgentContextSnapshotRef;
+use crate::memory::{AgentContextSnapshotRef, AgentRunMemory};
 use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
@@ -1001,6 +1001,7 @@ where
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
+    memory: Arc<Mutex<Option<AgentRunMemory>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     acceptances: Arc<AtomicUsize>,
 }
@@ -1017,6 +1018,7 @@ where
             router: self.router.clone(),
             clock: self.clock.clone(),
             policies: self.policies.clone(),
+            memory: self.memory.clone(),
             faults: self.faults.clone(),
             acceptances: self.acceptances.clone(),
         }
@@ -1042,9 +1044,25 @@ where
             router,
             clock,
             policies: AgentEffectPolicies::default(),
+            memory: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Wires every run entity this transport builds with a session-memory
+    /// backend.
+    ///
+    /// The slot is shared across clones — including a clone already installed in
+    /// a router — so a test can wire memory after the router is assembled, the
+    /// way the deferred router late-binds. Every driver of a run must share one
+    /// wiring: an entity that advances the loop unwired records nothing to
+    /// session memory for the transitions it commits.
+    pub fn install_memory(&self, memory: AgentRunMemory) {
+        *self
+            .memory
+            .lock()
+            .expect("the memory slot should not be poisoned") = Some(memory);
     }
 
     /// Uses explicit effect specs for the effects hosted runs commit.
@@ -1114,6 +1132,14 @@ where
             let mut entity =
                 AgentRunEntityStore::new(scope, self.store.clone(), self.effects.clone())
                     .with_effect_policies(self.policies.clone());
+            let memory = self
+                .memory
+                .lock()
+                .expect("the memory slot should not be poisoned")
+                .clone();
+            if let Some(memory) = memory {
+                entity = entity.with_memory(memory);
+            }
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);
             let now = self.now();

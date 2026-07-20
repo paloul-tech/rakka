@@ -96,6 +96,26 @@ pub const CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION: StateSchemaVersion =
 pub const CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted
+/// [`crate::memory::SessionMemoryEntry`].
+///
+/// A session entry outlives the run that wrote it — terminal-run retention is
+/// tenant policy ([specification 13.2](../../../docs/plans/rakka-agent/spec.md))
+/// — and it is persisted in a store independent of the run's own state, so it
+/// carries its own version and fails closed on one this binary cannot read.
+pub const CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::memory::MemoryContextSnapshot`].
+///
+/// A snapshot is immutable and content-addressed, and a model-effect retry reads
+/// it back long after it was assembled
+/// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)), so it carries
+/// its own version rather than the run state's.
+pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of a persisted [`crate::checkpoints::AgentCheckpoint`].
 ///
 /// A checkpoint outlives the effect generation it gates — it is resolved by a
@@ -152,11 +172,16 @@ pub enum AgentRecordKind {
     ExchangeReply,
     /// One durable HITL checkpoint a run is waiting on.
     Checkpoint,
+    /// One ordered short-term session-memory entry.
+    SessionMemoryEntry,
+    /// One immutable memory context snapshot a model effect was prepared
+    /// against.
+    MemoryContextSnapshot,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -174,6 +199,8 @@ impl AgentRecordKind {
         Self::ExchangeEnvelope,
         Self::ExchangeReply,
         Self::Checkpoint,
+        Self::SessionMemoryEntry,
+        Self::MemoryContextSnapshot,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -197,6 +224,8 @@ impl AgentRecordKind {
             Self::ExchangeEnvelope => "agent-exchange-envelope",
             Self::ExchangeReply => "agent-exchange-reply",
             Self::Checkpoint => "agent-checkpoint",
+            Self::SessionMemoryEntry => "agent-session-memory-entry",
+            Self::MemoryContextSnapshot => "agent-memory-context-snapshot",
         }
     }
 
@@ -221,6 +250,8 @@ impl AgentRecordKind {
             Self::ExchangeEnvelope => CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION,
             Self::ExchangeReply => CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION,
             Self::Checkpoint => CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION,
+            Self::SessionMemoryEntry => CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION,
+            Self::MemoryContextSnapshot => CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
         }
     }
 
@@ -243,6 +274,8 @@ impl AgentRecordKind {
             Self::ExchangeEnvelope => 14,
             Self::ExchangeReply => 15,
             Self::Checkpoint => 16,
+            Self::SessionMemoryEntry => 17,
+            Self::MemoryContextSnapshot => 18,
         }
     }
 }
