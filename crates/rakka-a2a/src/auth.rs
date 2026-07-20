@@ -23,6 +23,10 @@ pub enum A2AOperation {
     PushConfigRead,
     /// Extended agent card retrieval.
     ExtendedAgentCard,
+    /// Agent-management extension write (settings update, lifecycle command).
+    AgentManagementWrite,
+    /// Agent-management extension read (describe).
+    AgentManagementRead,
 }
 
 impl A2AOperation {
@@ -38,6 +42,8 @@ impl A2AOperation {
             Self::PushConfigWrite => "push-config-write",
             Self::PushConfigRead => "push-config-read",
             Self::ExtendedAgentCard => "extended-agent-card",
+            Self::AgentManagementWrite => "agent-management-write",
+            Self::AgentManagementRead => "agent-management-read",
         }
     }
 }

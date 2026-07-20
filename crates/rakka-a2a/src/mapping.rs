@@ -978,7 +978,7 @@ fn telemetry_context(
         })
 }
 
-fn principal_ref_from_value(value: &Value) -> A2AMappingResult<PrincipalRef> {
+pub(crate) fn principal_ref_from_value(value: &Value) -> A2AMappingResult<PrincipalRef> {
     match value {
         Value::String(value) => {
             let parts = value.splitn(3, ':').collect::<Vec<_>>();
@@ -1031,7 +1031,7 @@ fn object_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<Stri
         .map(ToOwned::to_owned)
 }
 
-fn metadata_string(
+pub(crate) fn metadata_string(
     metadata: &HashMap<String, Value>,
     key: &'static str,
 ) -> A2AMappingResult<Option<String>> {
@@ -1083,11 +1083,11 @@ fn first_service_param(params: &ServiceParams, key: &str) -> Option<String> {
         .cloned()
 }
 
-fn derived_deduplication_key(tenant: &str, task_id: &str, command_id: &str) -> String {
+pub(crate) fn derived_deduplication_key(tenant: &str, task_id: &str, command_id: &str) -> String {
     format!("a2a:{tenant}:{task_id}:{command_id}")
 }
 
-fn generated_task_id(tenant: &str, message_id: &str) -> String {
+pub(crate) fn generated_task_id(tenant: &str, message_id: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in tenant
         .as_bytes()
@@ -1118,7 +1118,7 @@ fn reject_conflict(
     Ok(())
 }
 
-fn require_non_blank(value: &str, field: &'static str) -> A2AMappingResult<()> {
+pub(crate) fn require_non_blank(value: &str, field: &'static str) -> A2AMappingResult<()> {
     if value.trim().is_empty() {
         return Err(A2AMappingError::MissingField { field });
     }

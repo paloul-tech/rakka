@@ -1701,6 +1701,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "http-body-util",
+ "rakka-agent",
  "rakka-agent-workflow",
  "rakka-cluster",
  "rakka-core",

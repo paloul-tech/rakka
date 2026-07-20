@@ -1090,8 +1090,95 @@ Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-
   property of the port's contract and its tests, not of which crate names the
   type.
 
+**Amended as implemented (2026-07-20):**
+
+- **The agents surface is a sibling service, not a parametrization of the
+  substrate handler.** The existing request handler is hardwired to the
+  workflow substrate's run engine, so `rakka_a2a::agents` adds
+  `RakkaAgentA2AService` beside it — generic over the four durable stores
+  exactly like the entity facades it drives, holding the same
+  `AgentExchangeRouter` seam the entities use to reach each other, and
+  reusing the crate's existing trait seams unchanged (`A2ATaskProjectionStore`,
+  `A2AAuthorizer`, `A2ATenantResolver`). The `agents` feature implies
+  `server` and adds `rakka-agent` as an optional dependency; the reverse
+  direction stays forbidden by the `crate_shape` guard, and the new
+  `cargo check -p rakka-a2a --no-default-features --features agents` line in
+  `scripts/validate.sh` keeps the composition honest.
+- **Scenario 1 is the id derivation plus the entity inbox, nothing more.** A
+  send without a task id derives its `AgentTaskId` deterministically from the
+  tenant and the request's deduplication discriminator — the explicit
+  `io.rakka.command.deduplication_key` metadata, or the A2A `message_id` —
+  using the substrate surface's generated-task-id derivation, so a retried
+  send reaches the same entity with the same
+  `AgentOperationId`, and the slice 1.4 operation-id inbox answers with the
+  original outcome: one task, one assignment, one run, one turn. An explicit
+  deduplication key also converges sends whose message ids differ. The
+  end-to-end proof (`tests/agents_surface.rs`) drives the real task, agent,
+  and run entities with the deterministic adapter and asserts the run took
+  exactly one turn and the history holds one proposal and one acceptance.
+- **The projection computes from the authoritative snapshot plus the current
+  run condition, and it feeds the existing event replay.** The 14.3 table is
+  a pure function over `(AgentTaskStatus, Option<AgentRunStatus>)`: the
+  domain's three-way human-wait split (slice 1.5 amendment) drives the
+  `INPUT_REQUIRED`/`AUTH_REQUIRED` rows, `Suspended` projects `WORKING` with
+  the run condition as bounded metadata, `HandedOff`/`Superseded` never close
+  the public task, `WaitingForReconciliation` holds `INPUT_REQUIRED` with the
+  stable `indeterminate-effect` reason (which is also how terminal
+  cancellation stays unprojectable until the decision), and `UNSPECIFIED` is
+  never produced — an unknown future status projects the neutral nonterminal
+  `WORKING`. The table has a row-for-row test plus a full-cartesian
+  never-`UNSPECIFIED` sweep. Accepted commands and lagging reads project into
+  the shared `A2ATaskProjectionStore` through the same
+  bootstrap-snapshot/message-heal/status-event idiom `runsync.rs` uses, under
+  the shared no-regression rule — which is why the client's replayable
+  subscription (cursors, bounded retention, explicit
+  `ReplayWindowExpired` resync) is the existing machinery, reused unchanged.
+  A client-supplied `contextId` persists in the projection read model from
+  the bootstrap event, honoring the opaque-grouping resolution.
+- **The management extension landed exactly as resolved, plus the lifecycle
+  commands the client owes.** `urn:rakka:a2a-extension:agent-management:v1`
+  carries the version in the URI; the envelope re-checks a schema number;
+  unknown versions, malformed envelopes, and unauthenticated writes fail
+  closed. The v1 command set is `update-settings`, `suspend`, `resume`,
+  `terminate`, and `describe` — the lifecycle verbs ride the same extension
+  because [spec 14.5](spec.md#145-typed-agent-client) owes them to the typed
+  client and they enter the same durable `AgentEntity` inbox with the same
+  revision fences. Instantiation, definition publishing, and admission stay
+  off the public surface: they are provisioning, owned by the application.
+  A domain refusal — stale settings or lifecycle revision, not-instantiated,
+  terminated — answers as a structured `Refused` payload in the immediate
+  response message so the caller can rebase; only persistence/schema
+  failures surface as transport errors. Authorization gates on the new
+  `A2AOperation::AgentManagementWrite`/`AgentManagementRead`, and the card
+  builder gained a general `extensions(...)` declaration setter (it still
+  advertises nothing by default).
+- **The client port follows the crate's boxed-future idiom, and the shipped
+  transport is the service core.** `AgentClientTransport` in
+  `rakka-agent/client.rs` uses the same hand-rolled
+  `Pin<Box<dyn Future>>` shape as the crate's store traits (no `async-trait`
+  dependency), with a bounded client vocabulary that names no A2A type.
+  `A2AAgentClientTransport` implements it over `RakkaAgentA2AService`, so a
+  client call takes the identical normalize → authorize → durable-inbox →
+  settle → project path as a network caller; `run_task` polls to terminal
+  with no retained server-side residency. `rakka-agent` gained `tokio` as a
+  lib dependency for the poll timer.
+- **Two continuations are deferred with stable refusals, not silently.**
+  Input delivery to an existing task (`message/send` naming a `task_id`)
+  refuses with a stable reason until human-owned task results land
+  (Phase 5, [spec 8.12](spec.md#812-human-owned-tasks)); binary and URL
+  message parts refuse until the substrate's artifact strategy is adapted
+  for agent task input. The axum/SDK route binding for the agents surface is
+  also deferred: the service core takes and returns the A2A SDK
+  request/response types, so the `RequestHandler` wrapper is mechanical and
+  lands with the edge integration that first mounts it.
+
 Done when: scenario 1 passes (duplicate A2A task messages create one task,
 one run, one turn) and the projection table has a test row-for-row.
+**Done (2026-07-20):** scenario 1 passes end to end over the real entities
+(`crates/rakka-a2a/tests/agents_surface.rs`), the 14.3 table is proven
+row-for-row with a full-cartesian never-`UNSPECIFIED` sweep
+(`agents/projection.rs`), and the management extension, typed client, and
+cancellation projection are proven over the same wiring.
 
 ### Slice 1.13 — Observability baseline and operational queries
 
