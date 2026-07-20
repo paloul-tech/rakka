@@ -563,6 +563,85 @@ async fn management_extension_updates_settings_through_the_durable_inbox() {
     ));
 }
 
+/// Distinct lifecycle verbs that share one deduplication discriminator must
+/// not alias each other's durable operation: a `Resume` reusing a prior
+/// `Suspend`'s message id (hence discriminator) applies on its own — it is
+/// never mistaken for a duplicate of the suspend. This is a regression guard
+/// for the per-verb operation-id kinds; a single shared `LifecycleCommand`
+/// kind made the resume collapse onto the suspend's cached outcome.
+#[tokio::test]
+async fn distinct_lifecycle_verbs_do_not_alias_on_a_shared_discriminator() {
+    let fixture = Fixture::new(ScriptedDispatcher::new());
+    fixture.instantiate_agent().await;
+
+    let authenticated = || {
+        Some(std::collections::HashMap::from([(
+            META_PRINCIPAL_REF.to_string(),
+            Value::String("user:operator-7".to_string()),
+        )]))
+    };
+    // Both commands carry the same message id, so they derive the same
+    // deduplication discriminator; only the per-verb operation-id kind keeps
+    // them apart.
+    let shared_message_id = "lifecycle-1";
+
+    let suspend = AgentManagementRequest {
+        schema: AGENT_MANAGEMENT_SCHEMA_VERSION,
+        command: AgentManagementCommand::Suspend {
+            agent: AGENT.to_string(),
+            expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
+        },
+    };
+    let mut suspend_message = management_request_message(&suspend);
+    suspend_message.message_id = shared_message_id.to_string();
+    let suspend_send = SendMessageRequest {
+        message: suspend_message,
+        configuration: None,
+        metadata: authenticated(),
+        tenant: Some(TENANT.to_string()),
+    };
+    let response = fixture
+        .service
+        .manage_agent(&params(), &suspend_send)
+        .await
+        .expect("the suspend should be served");
+    let AgentManagementResponse::Applied { outcome } =
+        parse_management_response(&response).expect("the response should parse")
+    else {
+        panic!("expected the suspend to apply");
+    };
+    assert_eq!(outcome.lifecycle_revision, AgentRevisionNumber::new(2));
+    let after_suspend = outcome.lifecycle_revision;
+
+    let resume = AgentManagementRequest {
+        schema: AGENT_MANAGEMENT_SCHEMA_VERSION,
+        command: AgentManagementCommand::Resume {
+            agent: AGENT.to_string(),
+            expected_lifecycle_revision: after_suspend,
+        },
+    };
+    let mut resume_message = management_request_message(&resume);
+    resume_message.message_id = shared_message_id.to_string();
+    let resume_send = SendMessageRequest {
+        message: resume_message,
+        configuration: None,
+        metadata: authenticated(),
+        tenant: Some(TENANT.to_string()),
+    };
+    let response = fixture
+        .service
+        .manage_agent(&params(), &resume_send)
+        .await
+        .expect("the resume should be served");
+    // Before the per-verb kinds this returned `Duplicate` carrying the
+    // suspend's revision; the resume must instead apply its own transition.
+    let parsed = parse_management_response(&response).expect("the response should parse");
+    let AgentManagementResponse::Applied { outcome } = &parsed else {
+        panic!("expected the resume to apply, got {parsed:?}");
+    };
+    assert_eq!(outcome.lifecycle_revision, AgentRevisionNumber::new(3));
+}
+
 /// The typed client facade drives the same durable path: create, read,
 /// events, and management all converge with the direct A2A surface.
 #[tokio::test]

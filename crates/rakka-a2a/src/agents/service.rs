@@ -243,12 +243,27 @@ where
                     audit_ref.as_deref(),
                     now,
                 ));
+                // Each verb carries its own operation-id kind, so a reused
+                // deduplication discriminator can never make one lifecycle
+                // command alias another's durable operation — e.g. a `Resume`
+                // colliding onto a prior `Suspend`'s cached outcome.
                 let (kind, segments) = (
                     match write {
                         AgentManagementCommand::UpdateSettings { .. } => {
                             AgentOperationKind::SettingsUpdate
                         }
-                        _ => AgentOperationKind::LifecycleCommand,
+                        AgentManagementCommand::Suspend { .. } => {
+                            AgentOperationKind::LifecycleSuspend
+                        }
+                        AgentManagementCommand::Resume { .. } => {
+                            AgentOperationKind::LifecycleResume
+                        }
+                        AgentManagementCommand::Terminate { .. } => {
+                            AgentOperationKind::LifecycleTerminate
+                        }
+                        AgentManagementCommand::Describe { .. } => {
+                            unreachable!("describe is handled by the outer match")
+                        }
                     },
                     [tenant.as_str(), agent.as_str(), discriminator.as_str()],
                 );
