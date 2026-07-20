@@ -574,9 +574,12 @@ pub trait SessionMemoryStore: Send + Sync + 'static {
     /// Appends one entry, idempotently on its operation id.
     ///
     /// A replay with the same operation id returns the entry already stored
-    /// under it rather than writing a second. A store that finds a *different*
-    /// entry already under the operation id fails closed rather than overwrite
-    /// it — that would mean two logically distinct writes claimed one key.
+    /// under it rather than writing a second: the first durable append under an
+    /// operation id wins, and the store never overwrites what it holds.
+    /// Operation ids are derived purely, so two logically distinct writes never
+    /// share one; a write under a *new* operation id that claims an
+    /// already-taken sequence fails closed with
+    /// [`MemoryError::SequenceConflict`].
     fn append<'a>(
         &'a self,
         scope: &'a AgentRunScope,
