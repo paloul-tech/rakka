@@ -211,6 +211,10 @@ pub struct Fixture<
     /// enables it. Absent by default, so the run keeps only the opaque context
     /// reference and retains no session memory — the pre-slice-1.11 behavior.
     pub memory: Option<AgentRunMemory>,
+    /// The decision-event sink the run entity is wired with, when a test
+    /// enables it. Absent by default, so the run records no decision events —
+    /// the pre-slice-1.13 behavior.
+    pub decisions: Option<Arc<dyn rakka_agent::AgentDecisionEventSink>>,
 }
 
 impl<A: AgentModelAdapter> Fixture<A> {
@@ -274,6 +278,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             dispatcher,
             clock,
             memory: None,
+            decisions: None,
         }
     }
 
@@ -287,6 +292,18 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
         self.run_transport.install_memory(memory.clone());
         self.memory = Some(memory);
+        self
+    }
+
+    /// Wires the run entity with a decision-event sink, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_decision_events(
+        mut self,
+        sink: Arc<dyn rakka_agent::AgentDecisionEventSink>,
+    ) -> Self {
+        self.run_transport.install_decisions(sink.clone());
+        self.decisions = Some(sink);
         self
     }
 
@@ -374,6 +391,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             .with_effect_policies(self.policies.clone());
         if let Some(memory) = &self.memory {
             entity = entity.with_memory(memory.clone());
+        }
+        if let Some(decisions) = &self.decisions {
+            entity = entity.with_decision_events(decisions.clone());
         }
         entity
     }

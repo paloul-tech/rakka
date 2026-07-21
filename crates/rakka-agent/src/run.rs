@@ -108,6 +108,10 @@ use crate::memory::{
     SessionMemoryEntry,
 };
 use crate::model::AgentModelError;
+use crate::observability::{
+    AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind,
+    AgentDecisionSource,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
@@ -1369,6 +1373,7 @@ fn advance_once(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
     session_memory: bool,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1380,16 +1385,25 @@ fn advance_once(
     }
 
     let mut owed = match run.loop_state.phase() {
-        AgentLoopPhase::PreparingContext => {
-            prepare_context(state, &scope, policies, session_memory, now).map(|()| Vec::new())
-        }
+        AgentLoopPhase::PreparingContext => prepare_context(
+            state,
+            &scope,
+            policies,
+            session_memory,
+            decision_events,
+            now,
+        )
+        .map(|()| Vec::new()),
         AgentLoopPhase::EvaluatingModelOutput => {
-            evaluate_model_output(state, &scope, policies, now).map(|()| Vec::new())
+            evaluate_model_output(state, &scope, policies, decision_events, now)
+                .map(|()| Vec::new())
         }
         AgentLoopPhase::RecordingTurn => {
             record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
         }
-        AgentLoopPhase::DecidingContinuation => decide_continuation(state, &scope, now),
+        AgentLoopPhase::DecidingContinuation => {
+            decide_continuation(state, &scope, decision_events, now)
+        }
         // `can_advance` already excluded these.
         AgentLoopPhase::AwaitingModel
         | AgentLoopPhase::AwaitingTools
@@ -1421,6 +1435,7 @@ fn prepare_context(
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     session_memory: bool,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
@@ -1477,6 +1492,20 @@ fn prepare_context(
     let run = state.run_mut()?;
     run.loop_state.record_effect(effect)?;
     run.loop_state.set_context_snapshot(context);
+    // The opening decision: the run's deterministic policy decided to start
+    // consulting the model. Later iterations are the *model's* continuation
+    // decision and are recorded where it is made, in `decide_continuation`.
+    if decision_events && turn == 1 {
+        run.loop_state.record_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::Continue,
+                AgentDecisionSource::DeterministicPolicy,
+                "start",
+            ),
+            now,
+        );
+    }
     run.loop_state.set_phase(AgentLoopPhase::AwaitingModel);
     run.status = AgentRunStatus::WaitingForEffect;
     run.check_bounds(0)?;
@@ -1490,6 +1519,7 @@ fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let (turn, calls) = {
@@ -1513,6 +1543,8 @@ fn evaluate_model_output(
         state.updated_at = now;
         return Ok(());
     }
+
+    let selected: Vec<_> = calls.iter().map(|call| call.tool.clone()).collect();
 
     // Each tool's spec — safety class, attempt bound, protocol — comes from its
     // registration, defaulting to a single non-idempotent attempt for a tool the
@@ -1563,6 +1595,22 @@ fn evaluate_model_output(
         let effect =
             AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
         state.run_mut()?.loop_state.record_effect(effect)?;
+    }
+
+    // The model's decision, recorded in the same compare-and-set that commits
+    // the fan-out it selected ([specification 17.7]).
+    if decision_events {
+        let run = state.run_mut()?;
+        run.loop_state.record_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::CallTools,
+                AgentDecisionSource::Model,
+                "tools",
+            )
+            .with_selected_tools(selected),
+            now,
+        );
     }
 
     // A tool the deployment marked checkpoint- or authorization-required is not
@@ -1662,6 +1710,7 @@ fn record_turn(
 fn decide_continuation(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let proposed = state
@@ -1676,6 +1725,17 @@ fn decide_continuation(
         // iteration and stops the run with a structured reason if the ceiling is
         // reached.
         let run = state.run_mut()?;
+        if decision_events {
+            run.loop_state.record_decision(
+                scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::Continue,
+                    AgentDecisionSource::Model,
+                    "iterate",
+                ),
+                now,
+            );
+        }
         run.loop_state.clear_turn();
         run.loop_state.begin_turn(None);
         run.status = AgentRunStatus::Running;
@@ -1686,6 +1746,17 @@ fn decide_continuation(
     let (proposal, envelope) = build_proposal(state, scope, content, now)?;
 
     let run = state.run_mut()?;
+    if decision_events {
+        run.loop_state.record_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::SubmitResult,
+                AgentDecisionSource::Model,
+                "proposal",
+            ),
+            now,
+        );
+    }
     run.loop_state.clear_turn();
     run.loop_state.set_proposal(proposal);
     // The run is not *waiting on an effect*, a timer, or a human: it is waiting
@@ -2836,6 +2907,7 @@ where
     effects: Effects,
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
+    decisions: Option<Arc<dyn AgentDecisionEventSink>>,
     recovered: bool,
 }
 
@@ -2879,6 +2951,7 @@ where
             effects,
             policies: AgentEffectPolicies::default(),
             memory: None,
+            decisions: None,
             recovered: false,
         }
     }
@@ -2906,6 +2979,22 @@ where
     #[must_use]
     pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Wires the run with a decision-event sink
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run records a structured decision event in the same
+    /// compare-and-set as each deciding transition and flushes it to the sink
+    /// in the settle pass, after the transition committed — so an event is
+    /// emitted only for a durable transition, exactly once per derived
+    /// operation id. An unwired run records nothing. The sink is a
+    /// projection, never the correctness source: an unavailable sink leaves
+    /// events owed for the next pass and never fails the run.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.decisions = Some(sink);
         self
     }
 
@@ -3119,7 +3208,13 @@ where
             let flushed = self.flush_session_memory(now).await?;
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
-            if advanced == 0 && dispatched == 0 && flushed == 0 && snapshotted == 0 {
+            let decisions = self.flush_decision_events(now).await?;
+            if advanced == 0
+                && dispatched == 0
+                && flushed == 0
+                && snapshotted == 0
+                && decisions == 0
+            {
                 break;
             }
         }
@@ -3152,12 +3247,14 @@ where
             let flushed = self.flush_session_memory(now).await?;
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
+            let decisions = self.flush_decision_events(now).await?;
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
 
             progress.transitions += advanced;
             progress.effects_dispatched += dispatched;
             progress.session_entries_flushed += flushed;
             progress.snapshots_persisted += snapshotted;
+            progress.decisions_flushed += decisions;
             progress.settled += report.settled;
             progress.failed += report.failed;
 
@@ -3165,6 +3262,7 @@ where
                 && dispatched == 0
                 && flushed == 0
                 && snapshotted == 0
+                && decisions == 0
                 && report.settled == 0
             {
                 break;
@@ -3208,6 +3306,54 @@ where
             .initiate(now, |state| {
                 if let Some(run) = state.run.as_mut() {
                     run.loop_state.clear_flushed_session_entries(&flushed);
+                }
+                state.updated_at = now;
+                Ok(Vec::new())
+            })
+            .await?;
+        Ok(flushed.len())
+    }
+
+    /// Appends the decision events recorded transitions owe the sink, then
+    /// drops the events the sink durably accepted
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md),
+    /// [17.13](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Events are appended only after the transitions that decided them
+    /// committed — that is what the outbox *is* — and the append is idempotent
+    /// on each event's derived operation id, so a crash between the append and
+    /// the clearing re-drives harmlessly. Unlike the session flush, a sink
+    /// failure is not an error: telemetry is never a correctness input
+    /// ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)), so the
+    /// unflushed events stay owed and are retried on the next settle pass.
+    async fn flush_decision_events(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
+        let Some(sink) = self.decisions.clone() else {
+            return Ok(0);
+        };
+        let pending: Vec<AgentDecisionEvent> = self
+            .state()?
+            .loop_state()
+            .map(|loop_state| loop_state.decision_outbox().to_vec())
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut flushed = Vec::with_capacity(pending.len());
+        for event in &pending {
+            if sink.append(&self.scope, event).await.is_err() {
+                break;
+            }
+            flushed.push(event.operation_id.clone());
+        }
+        if flushed.is_empty() {
+            return Ok(0);
+        }
+
+        self.host
+            .initiate(now, |state| {
+                if let Some(run) = state.run.as_mut() {
+                    run.loop_state.clear_flushed_decisions(&flushed);
                 }
                 state.updated_at = now;
                 Ok(Vec::new())
@@ -3294,10 +3440,11 @@ where
             let mut rejection = None;
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
+            let decision_events = self.decisions.is_some();
             let committed = self
                 .host
                 .initiate(now, |state| {
-                    match advance_once(state, &policies, session_memory, now) {
+                    match advance_once(state, &policies, session_memory, decision_events, now) {
                         Ok(owed) => Ok(owed),
                         Err(error) => {
                             let carried = AgentChoreographyError::from(error.clone());
@@ -3480,6 +3627,8 @@ pub struct AgentRunProgress {
     pub session_entries_flushed: usize,
     /// How many immutable context snapshots it persisted.
     pub snapshots_persisted: usize,
+    /// How many decision events it flushed to the decision sink.
+    pub decisions_flushed: usize,
     /// How many exchanges it settled.
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.

@@ -90,6 +90,7 @@ use crate::memory::{
     MemoryOperationId, MemorySequence, SessionMemoryEntry,
 };
 use crate::model::AgentModelTurn;
+use crate::observability::{AgentDecisionDraft, AgentDecisionEvent};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
@@ -117,6 +118,18 @@ pub const CURRENT_AGENT_LOOP_ADAPTER_VERSION: AgentRevisionNumber = AgentRevisio
 /// outbox keep. A run with no session memory configured never records into it, so
 /// it stays empty and adds nothing to the run's durable state.
 pub const AGENT_RUN_SESSION_OUTBOX_CAPACITY: usize = 32;
+
+/// Most decision events a run may owe its sink before the oldest are dropped.
+///
+/// Decision events are observability, never correctness
+/// ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)): where the
+/// session-memory outbox fails a transition closed at its bound — a snapshot
+/// depends on what it holds — the decision outbox is a bounded ring that
+/// drops its *oldest unflushed* event and counts the drop, because a
+/// transition that failed over telemetry would make observability a
+/// correctness input. Drops are visible through
+/// [`AgentLoopState::decision_drops`].
+pub const AGENT_RUN_DECISION_OUTBOX_CAPACITY: usize = 32;
 
 /// Where one run stands in its durable loop
 /// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
@@ -315,6 +328,24 @@ pub struct AgentLoopState {
     /// the empty context, and no transition reads it to decide anything.
     #[serde(default)]
     telemetry: AgentTelemetryContext,
+    /// The decision events recorded transitions owe the sink, drained by the
+    /// settle pass after each transition commits
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md),
+    /// [17.13](../../../docs/plans/rakka-agent/spec.md)). Populated only when
+    /// the run entity is wired with a decision-event sink; a bounded ring, so
+    /// overflow drops the oldest owed event rather than failing the
+    /// transition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    decision_outbox: Vec<AgentDecisionEvent>,
+    /// How many decision events this run has assigned a sequence, so an
+    /// event's monotonic order key is stable across a re-driven transition.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    decision_sequence: u64,
+    /// How many owed decision events the bounded ring has dropped, which is
+    /// the bounded visibility [specification 17.1](../../../docs/plans/rakka-agent/spec.md)
+    /// requires of telemetry loss.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    decision_drops: u64,
 }
 
 /// Whether a defaulted count is zero, so it is omitted from a run's serialized
@@ -360,6 +391,9 @@ impl AgentLoopState {
             session_outbox: Vec::new(),
             session_sequence: 0,
             telemetry: AgentTelemetryContext::default(),
+            decision_outbox: Vec::new(),
+            decision_sequence: 0,
+            decision_drops: 0,
         }
     }
 
@@ -379,6 +413,75 @@ impl AgentLoopState {
     #[must_use]
     pub const fn telemetry(&self) -> &AgentTelemetryContext {
         &self.telemetry
+    }
+
+    /// Records one decision the committing transition made
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)),
+    /// returning whether it was newly owed.
+    ///
+    /// The event's identity is *derived* from the run, the turn, and the
+    /// draft's slot, so a re-driven transition records the same decision at
+    /// the same sequence rather than duplicating it. The outbox is a bounded
+    /// ring: a decision that would cross the bound drops the oldest owed
+    /// event and counts the drop, never failing the transition — telemetry is
+    /// not a correctness input. A draft whose derived identity cannot be
+    /// formed is dropped and counted the same way.
+    pub(crate) fn record_decision(
+        &mut self,
+        scope: &AgentRunScope,
+        draft: AgentDecisionDraft,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        let sequence = self.decision_sequence.saturating_add(1);
+        let Ok(event) = AgentDecisionEvent::assemble(
+            scope,
+            Some(self.task.clone()),
+            self.goal.clone(),
+            sequence,
+            self.turn,
+            self.phase,
+            self.agent_definition_revision,
+            self.agent_settings_revision,
+            self.context_snapshot.clone(),
+            self.telemetry.clone(),
+            draft,
+            now,
+        ) else {
+            self.decision_drops = self.decision_drops.saturating_add(1);
+            return false;
+        };
+        if self
+            .decision_outbox
+            .iter()
+            .any(|owed| owed.operation_id == event.operation_id)
+        {
+            return false;
+        }
+        if self.decision_outbox.len() >= AGENT_RUN_DECISION_OUTBOX_CAPACITY {
+            self.decision_outbox.remove(0);
+            self.decision_drops = self.decision_drops.saturating_add(1);
+        }
+        self.decision_sequence = sequence;
+        self.decision_outbox.push(event);
+        true
+    }
+
+    /// The decision events recorded transitions still owe the sink.
+    #[must_use]
+    pub fn decision_outbox(&self) -> &[AgentDecisionEvent] {
+        &self.decision_outbox
+    }
+
+    /// How many owed decision events the bounded ring has dropped.
+    #[must_use]
+    pub const fn decision_drops(&self) -> u64 {
+        self.decision_drops
+    }
+
+    /// Drops the owed decision events the sink durably accepted.
+    pub(crate) fn clear_flushed_decisions(&mut self, flushed: &[AgentOperationId]) {
+        self.decision_outbox
+            .retain(|owed| !flushed.contains(&owed.operation_id));
     }
 
     /// The version of the adapter whose turns this state carries.
