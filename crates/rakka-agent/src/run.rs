@@ -68,7 +68,8 @@ use rakka_agent_workflow::{
     PrincipalRef, StateSchemaVersion,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ReplyTo,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
+    NoopMetricsRecorder, ReplyTo,
 };
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId};
 use rakka_sharding::{
@@ -109,8 +110,10 @@ use crate::memory::{
 };
 use crate::model::AgentModelError;
 use crate::observability::{
-    AgentDecisionDraft, AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind,
-    AgentDecisionSource,
+    record_agent_domain_counter, record_agent_domain_gauge, AgentDecisionDraft,
+    AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, METRIC_AGENT_DECISIONS,
+    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -2908,6 +2911,7 @@ where
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
 
@@ -2952,6 +2956,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: None,
             decisions: None,
+            metrics: Arc::new(NoopMetricsRecorder),
             recovered: false,
         }
     }
@@ -2998,6 +3003,22 @@ where
         self
     }
 
+    /// Records the bounded `rakka.agent.*` metrics through `metrics`
+    /// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The agent domain measures its own durable transitions — decisions,
+    /// loop transitions, effect outcomes, recoveries, telemetry drops — and
+    /// the substrate keeps measuring the substrate under
+    /// `rakka.agent_workflow.*`, so one physical dispatch is never the same
+    /// concern in both vocabularies. Every label value comes from a closed
+    /// `as_label()` vocabulary; no identifier ever labels a metric. An
+    /// unwired store records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Uses explicit effect specs for the effects the loop commits
     /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
     /// registration supplies the permitted safety declaration).
@@ -3022,7 +3043,20 @@ where
     /// Loads the run's durable state, failing closed on an unsupported schema
     /// version.
     pub async fn recover(&mut self, now: AgentTimestampMillis) -> AgentRunResult<&AgentRunState> {
-        let state = self.host.recover(now).await?;
+        let result = self.host.recover(now).await;
+        let outcome = if result.is_ok() {
+            "recovered"
+        } else {
+            "failed"
+        };
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
+            METRIC_AGENT_RECOVERY_EVENTS,
+            1,
+            &[("outcome", outcome)],
+        )
+        .ok();
+        let state = result?;
         self.recovered = true;
         Ok(state)
     }
@@ -3088,14 +3122,41 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, move |state| {
-                    record_effect_result(
-                        state, &effect_id, generation, attempt, fence, *outcome, &policy,
-                        &policies, now,
-                    )?;
-                    Ok(operation_id)
-                })
-                .await?
+                let outcome_label = outcome.resolved_status().as_label();
+                let effect_labels = self.state()?.loop_state().and_then(|loop_state| {
+                    loop_state
+                        .effects()
+                        .iter()
+                        .find(|effect| effect.effect_id == effect_id)
+                        .map(|effect| (effect.kind().as_label(), effect.safety.class().as_label()))
+                });
+                let reply = self
+                    .transition(now, move |state| {
+                        record_effect_result(
+                            state, &effect_id, generation, attempt, fence, *outcome, &policy,
+                            &policies, now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                // Counted after the resolving transition committed; a replayed
+                // result answers from the operation log above and never
+                // reaches this arm, so a generation resolves in the metric at
+                // most once.
+                if let Some((effect_kind, safety_class)) = effect_labels {
+                    record_agent_domain_counter(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_EFFECT_OUTCOMES,
+                        1,
+                        &[
+                            ("effect_kind", effect_kind),
+                            ("safety_class", safety_class),
+                            ("outcome", outcome_label),
+                        ],
+                    )
+                    .ok();
+                }
+                reply
             }
             AgentRunEntityCommand::ResolveIndeterminateEffect {
                 operation_id,
@@ -3330,19 +3391,63 @@ where
         let Some(sink) = self.decisions.clone() else {
             return Ok(0);
         };
-        let pending: Vec<AgentDecisionEvent> = self
-            .state()?
-            .loop_state()
-            .map(|loop_state| loop_state.decision_outbox().to_vec())
-            .unwrap_or_default();
+        let (pending, drops) = {
+            let loop_state = self.state()?.loop_state();
+            (
+                loop_state
+                    .map(|loop_state| loop_state.decision_outbox().to_vec())
+                    .unwrap_or_default(),
+                loop_state.map_or(0, AgentLoopState::decision_drops),
+            )
+        };
+        if drops > 0 {
+            // The durable drop counter is the bounded visibility telemetry
+            // loss owes ([specification 17.1]); a gauge is idempotent, so a
+            // re-driven flush cannot inflate it.
+            record_agent_domain_gauge(
+                self.metrics.as_ref(),
+                METRIC_AGENT_DECISION_DROPS,
+                drops as f64,
+                &[],
+            )
+            .ok();
+        }
         if pending.is_empty() {
             return Ok(0);
         }
 
         let mut flushed = Vec::with_capacity(pending.len());
         for event in &pending {
-            if sink.append(&self.scope, event).await.is_err() {
-                break;
+            match sink.append(&self.scope, event).await {
+                Ok(status) => {
+                    if matches!(
+                        status,
+                        crate::observability::AgentDecisionWriteStatus::Accepted
+                    ) {
+                        // Counted on first durable acceptance, so a re-driven
+                        // flush of an already-retained event counts nothing.
+                        record_agent_domain_counter(
+                            self.metrics.as_ref(),
+                            METRIC_AGENT_DECISIONS,
+                            1,
+                            &[
+                                ("decision_kind", event.kind.as_label()),
+                                ("decision_source", event.source.as_label()),
+                            ],
+                        )
+                        .ok();
+                    }
+                }
+                Err(_) => {
+                    record_agent_domain_counter(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+                        1,
+                        &[("signal", "decision-events")],
+                    )
+                    .ok();
+                    break;
+                }
             }
             flushed.push(event.operation_id.clone());
         }
@@ -3441,6 +3546,10 @@ where
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
             let decision_events = self.decisions.is_some();
+            let phase = self
+                .state()?
+                .loop_state()
+                .map_or("none", |loop_state| loop_state.phase().as_label());
             let committed = self
                 .host
                 .initiate(now, |state| {
@@ -3460,6 +3569,13 @@ where
             }
             committed?;
             transitions += 1;
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_RUN_TRANSITIONS,
+                1,
+                &[("phase", phase)],
+            )
+            .ok();
         }
         Ok(transitions)
     }

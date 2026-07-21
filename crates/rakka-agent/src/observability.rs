@@ -24,6 +24,7 @@ use rakka_agent_workflow::{
     validate_agent_span_link, validate_agent_telemetry_context, AgentCausationId,
     AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
 };
+use rakka_core::{MetricAttributes, MetricsRecorder};
 use serde::{Deserialize, Serialize};
 
 use crate::definition::{AgentEffectSafetyClass, AgentRevisionNumber, AgentToolId};
@@ -445,6 +446,11 @@ pub enum AgentObservabilityError {
         /// Human-readable detail.
         message: String,
     },
+    /// A metric label key is outside both bounded vocabularies, or forbidden.
+    UnboundedMetricLabel {
+        /// The offending key.
+        key: String,
+    },
 }
 
 impl AgentObservabilityError {
@@ -454,6 +460,7 @@ impl AgentObservabilityError {
         match self {
             Self::ReplayWindowExpired { .. } => "decision-replay-window-expired",
             Self::Sink { code, .. } => code,
+            Self::UnboundedMetricLabel { .. } => "metric-label-unbounded",
         }
     }
 }
@@ -466,6 +473,10 @@ impl Display for AgentObservabilityError {
                 "the decision-event cursor predates the retained window (oldest retained: {oldest_retained:?}); resync from authoritative state"
             ),
             Self::Sink { code, message } => write!(f, "decision-event sink failed ({code}): {message}"),
+            Self::UnboundedMetricLabel { key } => write!(
+                f,
+                "metric label key {key:?} is outside the bounded vocabularies; identifiers and content never label a metric"
+            ),
         }
     }
 }
@@ -569,6 +580,99 @@ impl AgentDecisionEventSink for InMemoryAgentDecisionEventSink {
     }
 }
 
+/// Counter: agent-loop decisions, labeled by bounded kind and source.
+pub const METRIC_AGENT_DECISIONS: &str = "rakka.agent.decisions";
+
+/// Counter: committed loop transitions, labeled by the phase they advanced
+/// from.
+pub const METRIC_AGENT_RUN_TRANSITIONS: &str = "rakka.agent.run.transitions";
+
+/// Counter: resolved effect generations, labeled by effect kind, safety
+/// class, and terminal outcome — `indeterminate` included, which is the
+/// alerting signal [specification 17.9](../../../docs/plans/rakka-agent/spec.md)
+/// requires.
+pub const METRIC_AGENT_EFFECT_OUTCOMES: &str = "rakka.agent.effect.outcomes";
+
+/// Counter: run recoveries, labeled by outcome.
+pub const METRIC_AGENT_RECOVERY_EVENTS: &str = "rakka.agent.recovery.events";
+
+/// Gauge: the run's durable count of decision events its bounded ring
+/// dropped — the visibility
+/// [specification 17.1](../../../docs/plans/rakka-agent/spec.md) requires of
+/// telemetry loss.
+pub const METRIC_AGENT_DECISION_DROPS: &str = "rakka.agent.decision.drops";
+
+/// Counter: telemetry flush attempts a sink refused, labeled by signal.
+pub const METRIC_AGENT_TELEMETRY_FLUSH_FAILURES: &str = "rakka.agent.telemetry.flush.failures";
+
+/// Label keys the agent domain adds to the substrate's bounded vocabulary.
+///
+/// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the
+/// substrate keeps measuring the substrate under `rakka.agent_workflow.*`
+/// with its own bounded keys, and the agent domain measures its durable
+/// transitions under `rakka.agent.*` with these. Every value recorded under
+/// them comes from a closed `as_label()` vocabulary, never an identifier.
+pub const AGENT_METRIC_FIELDS: &[&str] = &[
+    "decision_kind",
+    "decision_source",
+    "phase",
+    "safety_class",
+    "signal",
+];
+
+/// Accepts a label set for an agent-domain metric, or fails closed.
+///
+/// The substrate's forbidden-field guard is reused unchanged — an identifier
+/// or content field is rejected no matter what — and a key must belong to
+/// either the substrate's bounded vocabulary or [`AGENT_METRIC_FIELDS`]
+/// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)).
+pub fn validate_agent_domain_metric_attributes(
+    attributes: MetricAttributes<'_>,
+) -> AgentObservabilityResult<()> {
+    for (key, _value) in attributes {
+        if rakka_agent_workflow::is_forbidden_agent_metric_attribute(key)
+            || (!rakka_agent_workflow::is_bounded_agent_metric_attribute(key)
+                && !AGENT_METRIC_FIELDS.contains(key))
+        {
+            return Err(AgentObservabilityError::UnboundedMetricLabel {
+                key: (*key).to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Records an agent-domain counter after validating its labels.
+///
+/// A validation failure is returned, never recorded — and a call site ignores
+/// it rather than failing the run, because metrics are telemetry and telemetry
+/// is never a correctness input
+/// ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)). The real
+/// guard is the unit test that walks every instrument's label keys through
+/// the validator.
+pub fn record_agent_domain_counter(
+    metrics: &dyn MetricsRecorder,
+    name: &str,
+    value: u64,
+    attributes: MetricAttributes<'_>,
+) -> AgentObservabilityResult<()> {
+    validate_agent_domain_metric_attributes(attributes)?;
+    metrics.increment_counter(name, value, attributes);
+    Ok(())
+}
+
+/// Records an agent-domain gauge after validating its labels.
+pub fn record_agent_domain_gauge(
+    metrics: &dyn MetricsRecorder,
+    name: &str,
+    value: f64,
+    attributes: MetricAttributes<'_>,
+) -> AgentObservabilityResult<()> {
+    validate_agent_domain_metric_attributes(attributes)?;
+    metrics.record_gauge(name, value, attributes);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use rakka_agent_workflow::{AgentAttributes, AgentSpanLink};
@@ -667,5 +771,47 @@ mod tests {
             sanitize_agent_telemetry_context(AgentTelemetryContext::default()),
             AgentTelemetryContext::default()
         );
+    }
+
+    #[test]
+    fn every_instrument_label_key_passes_the_bounded_guard() {
+        // The closed set of label keys every rakka.agent.* instrument records.
+        // A key added to an instrument must be added here, and it must pass.
+        let recorded: &[&str] = &[
+            "decision_kind",
+            "decision_source",
+            "phase",
+            "effect_kind",
+            "safety_class",
+            "outcome",
+            "signal",
+        ];
+        for key in recorded {
+            assert!(
+                validate_agent_domain_metric_attributes(&[(key, "value")]).is_ok(),
+                "{key} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identifier_or_unknown_key_is_rejected() {
+        for key in ["run_id", "effect_id", "prompt_text", "tool_arguments"] {
+            let error = validate_agent_domain_metric_attributes(&[(key, "value")])
+                .expect_err("a forbidden key must be rejected");
+            assert_eq!(error.code(), "metric-label-unbounded");
+        }
+        let error = validate_agent_domain_metric_attributes(&[("free_form", "value")])
+            .expect_err("an unknown key must be rejected");
+        assert_eq!(error.code(), "metric-label-unbounded");
+    }
+
+    #[test]
+    fn a_rejected_label_set_records_nothing() {
+        let recorder = rakka_core::InMemoryMetricsRecorder::new();
+        let result =
+            record_agent_domain_counter(&recorder, METRIC_AGENT_DECISIONS, 1, &[("run_id", "r-1")]);
+        assert!(result.is_err());
+        assert!(recorder.snapshot().observations().is_empty());
     }
 }

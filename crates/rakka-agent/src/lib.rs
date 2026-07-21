@@ -184,11 +184,15 @@ pub use model::{
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
 pub use observability::{
-    sanitize_agent_telemetry_context, AgentDecisionDraft, AgentDecisionEvent,
+    record_agent_domain_counter, record_agent_domain_gauge, sanitize_agent_telemetry_context,
+    validate_agent_domain_metric_attributes, AgentDecisionDraft, AgentDecisionEvent,
     AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, AgentDecisionWriteStatus,
     AgentObservabilityError, AgentObservabilityFuture, AgentObservabilityResult,
     InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
-    AGENT_DECISION_REASON_MAX_LENGTH, AGENT_TELEMETRY_MAX_SPAN_LINKS,
+    AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,

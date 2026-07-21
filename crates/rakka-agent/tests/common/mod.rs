@@ -215,6 +215,9 @@ pub struct Fixture<
     /// enables it. Absent by default, so the run records no decision events —
     /// the pre-slice-1.13 behavior.
     pub decisions: Option<Arc<dyn rakka_agent::AgentDecisionEventSink>>,
+    /// The metrics recorder the run entity is wired with, when a test enables
+    /// it. Absent by default, so the run records no metrics.
+    pub metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
 }
 
 impl<A: AgentModelAdapter> Fixture<A> {
@@ -279,6 +282,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             clock,
             memory: None,
             decisions: None,
+            metrics: None,
         }
     }
 
@@ -304,6 +308,15 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     ) -> Self {
         self.run_transport.install_decisions(sink.clone());
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Wires the run entity with a metrics recorder, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn rakka_core::MetricsRecorder>) -> Self {
+        self.run_transport.install_metrics(metrics.clone());
+        self.metrics = Some(metrics);
         self
     }
 
@@ -394,6 +407,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(decisions) = &self.decisions {
             entity = entity.with_decision_events(decisions.clone());
+        }
+        if let Some(metrics) = &self.metrics {
+            entity = entity.with_metrics(metrics.clone());
         }
         entity
     }
