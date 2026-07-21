@@ -153,7 +153,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis, StateSchemaVersion};
+use rakka_agent_workflow::{
+    AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
+};
 use rakka_core::{Message, ReplyTo};
 use rakka_persistence::{
     DurableError, DurableState, DurableStateStore, PersistenceId, Revision, StateRecord,
@@ -566,6 +568,14 @@ pub struct AgentExchangeEnvelope {
     payload: AgentExchangePayload,
     correlation_id: AgentCorrelationId,
     created_at: AgentTimestampMillis,
+    /// Trace context of the segment that committed the exchange, so the
+    /// receiver's acceptance span can link to the initiating segment
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)). A
+    /// re-driven exchange re-sends this persisted envelope, so the original
+    /// context rides every re-drive. Observability only, never correctness:
+    /// an envelope persisted before this field decodes to the empty context.
+    #[serde(default)]
+    telemetry: AgentTelemetryContext,
 }
 
 impl AgentExchangeEnvelope {
@@ -592,9 +602,27 @@ impl AgentExchangeEnvelope {
             payload,
             correlation_id,
             created_at,
+            telemetry: AgentTelemetryContext::default(),
         };
         envelope.validate()?;
         Ok(envelope)
+    }
+
+    /// Stamps the trace context of the segment committing this exchange.
+    ///
+    /// The context is admitted through
+    /// [`crate::observability::sanitize_agent_telemetry_context`]: strict on
+    /// write so the read side never has to fail closed over telemetry.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        self.telemetry = crate::observability::sanitize_agent_telemetry_context(telemetry);
+        self
+    }
+
+    /// Trace context of the segment that committed the exchange.
+    #[must_use]
+    pub const fn telemetry(&self) -> &AgentTelemetryContext {
+        &self.telemetry
     }
 
     /// Stable operation id every side of this exchange deduplicates on.

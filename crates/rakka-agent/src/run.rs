@@ -2263,6 +2263,7 @@ fn open_effect_checkpoint(
     let goal = run.loop_state.goal().cloned();
     let settings_revision = run.loop_state.agent_settings_revision();
     let definition_revision = run.loop_state.agent_definition_revision();
+    let telemetry = run.loop_state.telemetry().clone();
     let mut checkpoint = AgentCheckpoint::open(
         checkpoint_id,
         kind,
@@ -2273,7 +2274,8 @@ fn open_effect_checkpoint(
         now,
     )?
     .with_task(task)
-    .with_revisions(settings_revision, definition_revision);
+    .with_revisions(settings_revision, definition_revision)
+    .with_telemetry(telemetry);
     if let Some(goal) = goal {
         checkpoint = checkpoint.with_goal(goal);
     }

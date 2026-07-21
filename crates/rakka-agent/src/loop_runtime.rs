@@ -73,7 +73,8 @@
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::{
-    AgentEffectId, AgentTimerId, AgentTimestampMillis, HumanCheckpointId, StateSchemaVersion,
+    AgentEffectId, AgentTelemetryContext, AgentTimerId, AgentTimestampMillis, HumanCheckpointId,
+    StateSchemaVersion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -305,6 +306,15 @@ pub struct AgentLoopState {
     /// next entry's monotonic order key is stable across a re-driven transition.
     #[serde(default, skip_serializing_if = "is_zero")]
     session_sequence: u64,
+    /// Trace context of the bounded segment that last committed this state —
+    /// what a resume after plain passivation links back to when no checkpoint,
+    /// effect, or timer holds the parked span
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)). Every
+    /// effect a transition commits is stamped from it. Observability only,
+    /// never correctness: a loop state persisted before this field decodes to
+    /// the empty context, and no transition reads it to decide anything.
+    #[serde(default)]
+    telemetry: AgentTelemetryContext,
 }
 
 /// Whether a defaulted count is zero, so it is omitted from a run's serialized
@@ -349,7 +359,26 @@ impl AgentLoopState {
             checkpoint_grants: Vec::new(),
             session_outbox: Vec::new(),
             session_sequence: 0,
+            telemetry: AgentTelemetryContext::default(),
         }
+    }
+
+    /// Records the trace context of the bounded segment committing this state.
+    ///
+    /// The context is admitted through
+    /// [`crate::observability::sanitize_agent_telemetry_context`]: strict on
+    /// write so the read side never has to fail closed over telemetry. An
+    /// entity never invents context — it records what the command that
+    /// activated it carried, or leaves the previous segment's context in
+    /// place.
+    pub fn record_telemetry(&mut self, telemetry: AgentTelemetryContext) {
+        self.telemetry = crate::observability::sanitize_agent_telemetry_context(telemetry);
+    }
+
+    /// Trace context of the bounded segment that last committed this state.
+    #[must_use]
+    pub const fn telemetry(&self) -> &AgentTelemetryContext {
+        &self.telemetry
     }
 
     /// The version of the adapter whose turns this state carries.
@@ -764,7 +793,10 @@ impl AgentLoopState {
     /// [`AGENT_RUN_MAX_PENDING_EFFECTS`]: an unbounded pending list is an
     /// unbounded durable record. A transition that would cross the bound fails
     /// closed rather than persisting a wait the run cannot hold.
-    pub(crate) fn record_effect(&mut self, effect: AgentRunEffect) -> Result<(), AgentEffectError> {
+    pub(crate) fn record_effect(
+        &mut self,
+        mut effect: AgentRunEffect,
+    ) -> Result<(), AgentEffectError> {
         if self
             .effects
             .iter()
@@ -779,6 +811,10 @@ impl AgentLoopState {
                 maximum: AGENT_RUN_MAX_PENDING_EFFECTS,
             });
         }
+        // The committing segment's context rides the effect to its dispatch
+        // ticket; a replayed transition returned above, so the stamp is
+        // first-commit-only and a re-drive cannot re-stamp a newer segment.
+        effect.telemetry = self.telemetry.clone();
         self.effects.push(effect);
         Ok(())
     }
@@ -1020,5 +1056,121 @@ impl VersionedAgentRecord for AgentLoopState {
 
     fn schema_version(&self) -> StateSchemaVersion {
         self.schema_version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rakka_agent_workflow::AgentTelemetryContext;
+
+    use super::*;
+    use crate::budget::{AgentBudgetAllocation, AgentBudgetGrant, AgentBudgetLimits};
+    use crate::definition::AgentToolId;
+    use crate::effect::{AgentEffectSpec, AgentRunEffectRequest};
+    use crate::identity::{AgentId, AgentRunId, AgentRunScope, TenantId};
+    use crate::model::{AgentToolCallId, AgentToolCallRequest};
+
+    const TRACE_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    fn scope() -> AgentRunScope {
+        AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support-agent").expect("the agent id is valid"),
+            AgentRunId::new("run-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid")
+    }
+
+    fn state() -> AgentLoopState {
+        AgentLoopState::started(
+            AgentTaskId::new("ticket-1").expect("the task id is valid"),
+            None,
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            AgentRevisionNumber::INITIAL,
+            AgentRunBudget::allocate(
+                AgentBudgetGrant::new(
+                    AgentBudgetAllocation::unbounded(),
+                    AgentBudgetLimits::unbounded(),
+                ),
+                AgentTimestampMillis::new(1),
+            ),
+        )
+    }
+
+    fn tool_effect(slot: usize) -> AgentRunEffect {
+        let call = AgentToolCallRequest::new(
+            AgentToolCallId::new(format!("call-{slot}")).expect("the call id is valid"),
+            AgentToolId::new("charge-card").expect("the tool id is valid"),
+            serde_json::json!({ "amount": 42 }),
+        )
+        .expect("the call is bounded");
+        AgentRunEffect::new(
+            &scope(),
+            1,
+            slot,
+            AgentRunEffectRequest::Tool {
+                call: Box::new(call),
+            },
+            &AgentEffectSpec::non_idempotent(),
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives")
+    }
+
+    fn stamped_context() -> AgentTelemetryContext {
+        AgentTelemetryContext {
+            trace_parent: Some(TRACE_PARENT.to_string()),
+            ..AgentTelemetryContext::default()
+        }
+    }
+
+    #[test]
+    fn a_committed_effect_is_stamped_with_the_committing_segments_context() {
+        let mut state = state();
+        state.record_telemetry(stamped_context());
+
+        state
+            .record_effect(tool_effect(0))
+            .expect("the effect commits");
+
+        assert_eq!(
+            state.effects()[0].telemetry,
+            stamped_context(),
+            "the committing segment's context rides the effect to its ticket"
+        );
+    }
+
+    #[test]
+    fn a_replayed_effect_keeps_the_context_of_its_first_commit() {
+        let mut state = state();
+        state.record_telemetry(stamped_context());
+        state
+            .record_effect(tool_effect(0))
+            .expect("the effect commits");
+
+        // The re-driven transition arrives inside a different segment.
+        state.record_telemetry(AgentTelemetryContext::default());
+        state
+            .record_effect(tool_effect(0))
+            .expect("the replay is absorbed");
+
+        assert_eq!(state.effects().len(), 1);
+        assert_eq!(
+            state.effects()[0].telemetry,
+            stamped_context(),
+            "a replay must not re-stamp a newer segment onto the first commit"
+        );
+    }
+
+    #[test]
+    fn a_malformed_recorded_context_is_dropped_before_it_is_durable() {
+        let mut state = state();
+        state.record_telemetry(AgentTelemetryContext {
+            trace_parent: Some("not-a-traceparent".to_string()),
+            ..AgentTelemetryContext::default()
+        });
+        assert_eq!(state.telemetry(), &AgentTelemetryContext::default());
     }
 }

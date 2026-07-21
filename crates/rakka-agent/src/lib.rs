@@ -153,7 +153,8 @@ pub use effect::{
     AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES, ATTR_AGENT_EFFECT_ARGUMENT_DIGEST,
     ATTR_AGENT_EFFECT_EXECUTION_POLICY, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
     ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL, ATTR_AGENT_EFFECT_SAFETY_CLASS,
-    ATTR_AGENT_EFFECT_SETTINGS_REVISION,
+    ATTR_AGENT_EFFECT_SETTINGS_REVISION, ATTR_AGENT_TELEMETRY_LINK_KIND,
+    LINK_KIND_SUPERSEDED_GENERATION,
 };
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
@@ -182,6 +183,7 @@ pub use model::{
     AGENT_MODEL_MAX_TOOL_CALLS, AGENT_MODEL_TEXT_MAX_LENGTH, AGENT_MODEL_TURN_MAX_BYTES,
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
+pub use observability::{sanitize_agent_telemetry_context, AGENT_TELEMETRY_MAX_SPAN_LINKS};
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
     agent_run_entity_type_key, init_agent_run_entity_remote_sharding,

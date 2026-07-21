@@ -60,9 +60,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentEffect, AgentEffectKind, AgentEffectStatus,
-    AgentEffectTarget, AgentIdempotencyKey, AgentTelemetryContext, AgentTimestampMillis,
-    StateSchemaVersion, AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
+    require_agent_trace_context, AgentAttributes, AgentCausationId, AgentCorrelationId,
+    AgentEffect, AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
+    AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
+    AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
 use rakka_agent_workflow::{AgentDeduplicationKey, AgentEffectId};
 use serde::{Deserialize, Serialize};
@@ -1106,6 +1107,16 @@ pub struct AgentRunEffect {
     /// security-authorization checkpoint before dispatch.
     #[serde(default)]
     pub authorization_required: bool,
+    /// Trace context of the segment that committed the current generation —
+    /// the scheduling side of the schedule -> dispatch boundary, forwarded to
+    /// the dispatch ticket so the dispatcher's consumer span can link to it
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)). A new
+    /// generation carries a span link to the superseded one instead of its
+    /// parent. Observability only, never correctness: an effect persisted
+    /// before this field decodes to the empty context, and no dispatch
+    /// decision reads it.
+    #[serde(default)]
+    pub telemetry: AgentTelemetryContext,
 }
 
 impl AgentRunEffect {
@@ -1155,6 +1166,7 @@ impl AgentRunEffect {
             last_error_code: None,
             checkpoint_required: spec.checkpoint_required,
             authorization_required: spec.authorization_required,
+            telemetry: AgentTelemetryContext::default(),
         })
     }
 
@@ -1231,6 +1243,7 @@ impl AgentRunEffect {
         self.dispatched_at = None;
         self.last_error_code = None;
         self.created_at = now;
+        self.telemetry = superseded_generation_telemetry(&self.telemetry);
         Ok(())
     }
 
@@ -1347,13 +1360,41 @@ impl AgentRunEffect {
             expected_result_type: Some(self.kind().as_label().to_string()),
             causation_id: AgentCausationId::new(ticket_id.as_str()),
             correlation_id: AgentCorrelationId::new(scope.key()),
-            telemetry_context: AgentTelemetryContext::default(),
+            telemetry_context: self.telemetry.clone(),
             attempt: self.attempts,
             created_at: self.created_at,
             due_at: None,
             last_error_code: self.last_error_code.clone(),
         }
     }
+}
+
+/// Span-link attribute naming what a persisted link points at.
+pub const ATTR_AGENT_TELEMETRY_LINK_KIND: &str = "rakka.agent.link.kind";
+/// Link-kind value: the scheduling segment of a superseded effect generation.
+pub const LINK_KIND_SUPERSEDED_GENERATION: &str = "superseded-generation";
+
+/// The telemetry context a regenerated effect starts with: no parent — the
+/// superseded generation's segment must not parent the reconciled re-dispatch —
+/// and a span link back to it, so the causal chain across generations stays
+/// walkable ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+/// The new generation starts parent-less on purpose: its dispatch is caused by
+/// a reconciliation decision, not by the segment that scheduled the attempt an
+/// operator just proved never executed.
+fn superseded_generation_telemetry(prior: &AgentTelemetryContext) -> AgentTelemetryContext {
+    let mut next = AgentTelemetryContext {
+        span_links: prior.span_links.clone(),
+        ..AgentTelemetryContext::default()
+    };
+    if let Ok(superseded) = require_agent_trace_context(prior) {
+        let mut attributes = AgentAttributes::new();
+        attributes.insert(
+            ATTR_AGENT_TELEMETRY_LINK_KIND.to_string(),
+            LINK_KIND_SUPERSEDED_GENERATION.to_string(),
+        );
+        next.span_links.push(superseded.to_span_link(attributes));
+    }
+    crate::observability::sanitize_agent_telemetry_context(next)
 }
 
 /// Dispatch-ticket attribute naming the run-side effect id.
