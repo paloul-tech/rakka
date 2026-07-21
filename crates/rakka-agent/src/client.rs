@@ -151,6 +151,11 @@ pub struct AgentClientTaskRequest {
     pub context: Option<String>,
     /// Authenticated principal submitting the request.
     pub principal: Option<PrincipalRef>,
+    /// The caller's trace context, injected into the egress request so the
+    /// created task's segments link back to the caller's
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)). An
+    /// absent context sends nothing and the session starts a root.
+    pub telemetry: Option<rakka_agent_workflow::AgentTelemetryContext>,
 }
 
 /// The bounded public view of one task.

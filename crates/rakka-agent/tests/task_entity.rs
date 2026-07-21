@@ -120,6 +120,7 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         goal: None,
         parent: None,
         dependencies,
+        telemetry: Default::default(),
     }
 }
 

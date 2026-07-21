@@ -2793,6 +2793,17 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 format!("a run entity does not receive a {kind} exchange"),
             ),
         };
+        // The accepting segment's context is the exchange's: an entity never
+        // invents one, and a context-less exchange leaves the previous
+        // segment's context in place ([specification 17.5]). Recorded in the
+        // same compare-and-set as the acceptance, so every effect the ensuing
+        // transitions commit carries the causal chain the ingress started.
+        if envelope.has_telemetry() {
+            if let Some(run) = state.run.as_mut() {
+                run.loop_state
+                    .record_telemetry(envelope.telemetry().clone());
+            }
+        }
         AgentExchangeTransition::new(result)
     }
 

@@ -364,9 +364,23 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         self.create_task_with(task_definition()).await;
     }
 
+    /// Creates the task with an ingress trace context, the way the A2A surface
+    /// stamps a traced send's creation.
+    pub async fn create_task_traced(&self, telemetry: rakka_agent_workflow::AgentTelemetryContext) {
+        self.create_task_inner(task_definition(), telemetry).await;
+    }
+
     /// Creates the task under an explicit definition, for tests that need their
     /// own budget ceilings.
     pub async fn create_task_with(&self, definition: AgentTaskDefinition) {
+        self.create_task_inner(definition, Default::default()).await;
+    }
+
+    async fn create_task_inner(
+        &self,
+        definition: AgentTaskDefinition,
+        telemetry: rakka_agent_workflow::AgentTelemetryContext,
+    ) {
         let mut task = AgentTaskEntityStore::new(
             task_scope(),
             self.tasks.clone(),
@@ -391,6 +405,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         goal: None,
                         parent: None,
                         dependencies: Vec::new(),
+                        telemetry,
                     }),
                 },
                 &self.router,

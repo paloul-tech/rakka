@@ -182,7 +182,17 @@ pub struct AgentOperationalSnapshot {
     /// The run's scope.
     pub scope: AgentRunScope,
     /// The run's bounded projection, once it has accepted an assignment.
+    ///
+    /// Content-redacted: the proposal, accepted result, and feedback the
+    /// entity's own reply surface carries are stripped here, because the
+    /// operational answer is an observability surface and content stays in
+    /// durable state and protected artifacts
+    /// ([specification 17.14](../../../docs/plans/rakka-agent/spec.md)).
+    /// [`Self::has_pending_proposal`] carries the bounded fact an operator
+    /// needs.
     pub run: Option<AgentRunSnapshot>,
+    /// Whether a result proposal is awaiting the task's decision.
+    pub has_pending_proposal: bool,
     /// The bounded label of the wait the run is in, when it is waiting.
     pub wait_reason: Option<String>,
     /// The earliest durable checkpoint deadline that will wake the run, when
@@ -267,11 +277,20 @@ impl AgentOperationalSnapshot {
                 .is_waiting()
                 .then(|| run.status.as_label().to_string())
         });
+        let run_snapshot = state.snapshot().map(|mut snapshot| {
+            snapshot.proposal = None;
+            snapshot.accepted_result = None;
+            snapshot.feedback = None;
+            snapshot
+        });
         Self {
             revision,
             observed_at,
             scope: state.scope().clone(),
-            run: state.snapshot(),
+            has_pending_proposal: state
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.proposal.is_some()),
+            run: run_snapshot,
             wait_reason,
             next_wake,
             pending_effects,

@@ -1,0 +1,385 @@
+//! The trace-context flow and the section 18 telemetry scenarios.
+//!
+//! Specification: sections 17.4, 17.5, 17.14, and 17.16; scenarios 22, 23,
+//! 24, 25, and 26. An ingress-traced creation flows its context down the
+//! whole causal chain — creation -> assignment -> run acceptance -> every
+//! effect and checkpoint the loop commits — with no participant doing
+//! per-exchange work, and:
+//!
+//! - a durable wait holds no live span (Rakka core never constructs a span
+//!   object at all — it persists serializable context) and a resume links
+//!   both the parked segment and its trigger (scenario 22);
+//! - the persisted chain survives owner loss without changing effect
+//!   behavior (scenario 23, joining the schema half in
+//!   `telemetry_context.rs`);
+//! - the sampled flag changes recording, never metrics, decisions, or
+//!   durable execution (scenario 24);
+//! - default telemetry carries no model text, tool payload, memory content,
+//!   or credential (scenario 25, joining the metric half in
+//!   `agent_metrics.rs`); and
+//! - an unavailable sink never blocks correctness and its loss is visible
+//!   through bounded counters and the authoritative snapshot (scenario 26).
+
+use std::sync::Arc;
+
+use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
+use rakka_agent::{
+    agent_operational_snapshot, assemble_agent_session_view, load_agent_run_state,
+    AgentDecisionEventSink, AgentDecisionKind, AgentModelTurn, AgentObservabilityError,
+    AgentObservabilityFuture, AgentRunStatus, AgentSchemaPolicy, AgentTaskContent, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, InMemoryAgentDecisionEventSink,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION, METRIC_AGENT_DECISIONS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+};
+use rakka_agent_workflow::{
+    agent_durable_resume_telemetry_context, AgentAttributes, AgentTelemetryContext,
+    AgentTimestampMillis,
+};
+use rakka_core::InMemoryMetricsRecorder;
+
+mod common;
+
+use common::*;
+
+const INGRESS_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+fn ingress_context(trace_parent: &str) -> AgentTelemetryContext {
+    AgentTelemetryContext {
+        trace_parent: Some(trace_parent.to_string()),
+        ..AgentTelemetryContext::default()
+    }
+}
+
+fn tool_calling_turn(tool: &str, argument: &str) -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("SENSITIVE-REASONING about the ticket.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("call-1").expect("call id"),
+                AgentToolId::new(tool).expect("tool id"),
+                serde_json::json!({ "query": argument, "token": "SECRET-TOKEN" }),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+fn proposing_turn(answer: &str) -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("SENSITIVE-REASONING toward an answer.")
+        .with_proposal(
+            AgentTaskContent::inline(serde_json::json!({ "answer": answer }))
+                .expect("the proposal is inline-bounded"),
+        )
+}
+
+fn full_run_dispatcher() -> ScriptedDispatcher {
+    ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup", "SENSITIVE-ARG"))
+            .with_turn_for(2, proposing_turn("SENSITIVE-ANSWER")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": "SENSITIVE-RESULT" }))
+            .expect("the tool result is inline-bounded"),
+    )
+}
+
+/// Scenario 23: the ingress context flows creation -> assignment -> run ->
+/// effects, survives owner loss (a fresh store over the same durable records
+/// is exactly a shard movement), and changes no effect behavior — the traced
+/// run's durable outcome is identical to the untraced run's.
+#[tokio::test]
+async fn ingress_context_flows_to_every_effect_and_survives_owner_loss() {
+    let traced = Fixture::new(full_run_dispatcher());
+    traced.instantiate_agent().await;
+    traced
+        .create_task_traced(ingress_context(INGRESS_PARENT))
+        .await;
+    traced.pump().await.expect("the traced run completes");
+
+    let untraced = Fixture::new(full_run_dispatcher());
+    untraced.instantiate_agent().await;
+    untraced.create_task().await;
+    untraced.pump().await.expect("the untraced run completes");
+
+    // Owner loss: a brand-new store facade over the surviving durable records.
+    let state = load_agent_run_state(&traced.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop exists");
+    assert_eq!(
+        loop_state.telemetry().trace_parent.as_deref(),
+        Some(INGRESS_PARENT),
+        "the run's committing segment carries the ingress chain after recovery"
+    );
+    for effect in loop_state.effects() {
+        assert_eq!(
+            effect.telemetry.trace_parent.as_deref(),
+            Some(INGRESS_PARENT),
+            "every committed effect was stamped from the committing segment"
+        );
+    }
+
+    // Without changing effect behavior: the durable outcome is identical.
+    let traced_run = state.snapshot().expect("the traced run accepted");
+    let untraced_state =
+        load_agent_run_state(&untraced.runs, &run_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the run state loads")
+            .expect("the run exists");
+    let untraced_run = untraced_state
+        .snapshot()
+        .expect("the untraced run accepted");
+    assert_eq!(traced_run.status, AgentRunStatus::Completed);
+    assert_eq!(traced_run.status, untraced_run.status);
+    assert_eq!(traced_run.turn, untraced_run.turn);
+    assert_eq!(traced_run.budget, untraced_run.budget);
+}
+
+/// Scenario 22: a run parked behind a checkpoint holds only serializable
+/// context — the parked segment rides the checkpoint record — and the resume
+/// context links both the parked span and the triggering decision's span.
+#[tokio::test]
+async fn a_parked_checkpoint_carries_the_segment_a_resume_doubly_links() {
+    let fx = checkpointed_fixture();
+    fx.instantiate_agent().await;
+    fx.create_task_traced(ingress_context(INGRESS_PARENT)).await;
+    fx.pump().await.expect("the run parks on its checkpoint");
+
+    let state = load_agent_run_state(&fx.runs, &run_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the run state loads")
+        .expect("the run exists");
+    let loop_state = state.loop_state().expect("the loop exists");
+    let checkpoint = loop_state
+        .open_checkpoints()
+        .first()
+        .expect("the approval checkpoint is open");
+    assert_eq!(
+        checkpoint.telemetry.trace_parent.as_deref(),
+        Some(INGRESS_PARENT),
+        "the parked segment is durable on the checkpoint, not held in memory"
+    );
+
+    // The resume after the human decision: a new bounded segment that links
+    // the parked span (from the checkpoint record) and the triggering
+    // request's span (from the resolution command's context).
+    let resumed = agent_durable_resume_telemetry_context(
+        &checkpoint.telemetry,
+        "00f067aa0ba902b7",
+        AgentAttributes::new(),
+    )
+    .expect("the resume context derives");
+    let trigger = ingress_context("00-1bf7651916cd43dd8448eb211c80319d-c7ad6b7169203332-01");
+    let mut resumed = resumed;
+    resumed.span_links.push(
+        rakka_agent_workflow::require_agent_trace_context(&trigger)
+            .expect("the trigger context parses")
+            .to_span_link(AgentAttributes::new()),
+    );
+    assert_eq!(resumed.span_links.len(), 2, "parked plus trigger");
+    assert!(resumed
+        .span_links
+        .iter()
+        .any(|link| link.span_id == "b7ad6b7169203331"));
+    assert!(resumed
+        .span_links
+        .iter()
+        .any(|link| link.span_id == "c7ad6b7169203332"));
+}
+
+/// Scenario 24: the W3C sampled flag changes trace recording downstream and
+/// nothing else — durable outcomes, decision events, and metrics are
+/// identical for a sampled and an unsampled ingress.
+#[tokio::test]
+async fn the_sampled_flag_changes_no_metric_event_or_durable_outcome() {
+    async fn drive(trace_parent: &str) -> (Vec<AgentDecisionKind>, usize, usize, AgentRunStatus) {
+        let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+        let metrics = Arc::new(InMemoryMetricsRecorder::new());
+        let fx = Fixture::new(full_run_dispatcher())
+            .with_decision_events(sink.clone())
+            .with_metrics(metrics.clone());
+        fx.instantiate_agent().await;
+        fx.create_task_traced(ingress_context(trace_parent)).await;
+        fx.pump().await.expect("the run completes");
+        let kinds = sink
+            .events(&run_scope())
+            .iter()
+            .map(|event| event.kind)
+            .collect();
+        let snapshot = metrics.snapshot();
+        let status = fx.run_snapshot().await.expect("the run exists").status;
+        (
+            kinds,
+            snapshot.observations_named(METRIC_AGENT_DECISIONS).len(),
+            snapshot
+                .observations_named(METRIC_AGENT_EFFECT_OUTCOMES)
+                .len(),
+            status,
+        )
+    }
+
+    let sampled = drive(INGRESS_PARENT).await;
+    let unsampled = drive("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00").await;
+    assert_eq!(sampled, unsampled);
+    assert_eq!(sampled.3, AgentRunStatus::Completed);
+}
+
+/// Scenario 25: no telemetry surface — decision events, metric observations,
+/// the authoritative snapshot, the session view — carries model text, tool
+/// arguments, tool results, proposal content, or credential material. The
+/// content lives in durable correctness state; telemetry gets bounded labels,
+/// counts, and references.
+#[tokio::test]
+async fn default_telemetry_carries_no_content_or_credentials() {
+    let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(full_run_dispatcher())
+        .with_decision_events(sink.clone())
+        .with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_task_traced(ingress_context(INGRESS_PARENT)).await;
+    fx.pump().await.expect("the run completes");
+
+    let scope = run_scope();
+    let mut telemetry_surfaces = Vec::new();
+    telemetry_surfaces
+        .push(serde_json::to_string(&sink.events(&scope)).expect("the decision events serialize"));
+    telemetry_surfaces.push(format!("{:?}", metrics.snapshot().observations()));
+    let snapshot = agent_operational_snapshot(
+        &fx.runs,
+        &scope,
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    telemetry_surfaces.push(serde_json::to_string(&snapshot).expect("the snapshot serializes"));
+    let view = assemble_agent_session_view(
+        &fx.runs,
+        &scope,
+        &AgentSchemaPolicy::default(),
+        Some(sink.as_ref()),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the view assembles")
+    .expect("the run exists");
+    telemetry_surfaces.push(serde_json::to_string(&view).expect("the view serializes"));
+
+    for surface in &telemetry_surfaces {
+        for sentinel in [
+            "SENSITIVE-REASONING",
+            "SENSITIVE-ARG",
+            "SENSITIVE-RESULT",
+            "SENSITIVE-ANSWER",
+            "SECRET-TOKEN",
+        ] {
+            assert!(
+                !surface.contains(sentinel),
+                "{sentinel} leaked into a telemetry surface"
+            );
+        }
+    }
+}
+
+/// A sink that always refuses: an unavailable telemetry backend.
+#[derive(Debug)]
+struct UnavailableSink;
+
+impl AgentDecisionEventSink for UnavailableSink {
+    fn backend_name(&self) -> &'static str {
+        "unavailable"
+    }
+
+    fn append<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _event: &'a rakka_agent::AgentDecisionEvent,
+    ) -> AgentObservabilityFuture<'a, rakka_agent::AgentDecisionWriteStatus> {
+        Box::pin(async {
+            Err(AgentObservabilityError::Sink {
+                code: "unavailable".to_string(),
+                message: "the backend is down".to_string(),
+            })
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _scope: &'a rakka_agent::AgentRunScope,
+        _after: u64,
+        _limit: usize,
+    ) -> AgentObservabilityFuture<'a, Vec<rakka_agent::AgentDecisionEvent>> {
+        Box::pin(async {
+            Err(AgentObservabilityError::Sink {
+                code: "unavailable".to_string(),
+                message: "the backend is down".to_string(),
+            })
+        })
+    }
+}
+
+/// Scenario 26: an unavailable telemetry path blocks nothing — the run
+/// completes — and its loss is visible through the bounded flush-failure
+/// counter and the authoritative snapshot's owed count.
+#[tokio::test]
+async fn an_unavailable_sink_blocks_nothing_and_its_loss_is_visible() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(full_run_dispatcher())
+        .with_decision_events(Arc::new(UnavailableSink))
+        .with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump()
+        .await
+        .expect("correctness never waits on telemetry");
+
+    let snapshot = fx.run_snapshot().await.expect("the run exists");
+    assert_eq!(snapshot.status, AgentRunStatus::Completed);
+
+    let failures = metrics
+        .snapshot()
+        .observations_named(METRIC_AGENT_TELEMETRY_FLUSH_FAILURES)
+        .len();
+    assert!(failures > 0, "the loss is visible as a bounded counter");
+
+    let operational = agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert!(
+        operational.decisions_owed > 0,
+        "the snapshot reports what the sink has not accepted"
+    );
+}
+
+/// A fixture whose tool is checkpoint-required (shared with
+/// `operational_query.rs`'s shape).
+fn checkpointed_fixture() -> Fixture {
+    use rakka_agent::{AgentEffectPolicies, AgentEffectSpec, InMemoryAgentRunEffectSink};
+    use std::sync::atomic::AtomicU64;
+
+    let policies = AgentEffectPolicies::new()
+        .with_tool_spec(
+            AgentToolId::new("charge-card").expect("tool id"),
+            AgentEffectSpec::non_idempotent().with_checkpoint_required(),
+        )
+        .expect("the checkpoint-required tool spec is valid");
+    Fixture::with_sink(
+        ScriptedDispatcher::new()
+            .with_turn(tool_calling_turn("charge-card", "SENSITIVE-ARG"))
+            .with_turn(proposing_turn("SENSITIVE-ANSWER")),
+        InMemoryAgentRunEffectSink::new(),
+        policies,
+        Arc::new(AtomicU64::new(1)),
+    )
+}

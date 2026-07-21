@@ -619,6 +619,12 @@ impl AgentExchangeEnvelope {
         self
     }
 
+    /// Whether this envelope carries any trace context at all.
+    #[must_use]
+    pub fn has_telemetry(&self) -> bool {
+        self.telemetry.trace_parent.is_some() || !self.telemetry.span_links.is_empty()
+    }
+
     /// Trace context of the segment that committed the exchange.
     #[must_use]
     pub const fn telemetry(&self) -> &AgentTelemetryContext {
@@ -685,6 +691,35 @@ impl VersionedAgentRecord for AgentExchangeEnvelope {
     fn schema_version(&self) -> StateSchemaVersion {
         self.schema_version
     }
+}
+
+/// Carries the causing exchange's trace context onto an owed envelope that
+/// has none of its own ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A consequence committed inside an acceptance is caused by the exchange
+/// being accepted, and a consequence of a settlement by the exchange that
+/// settled — so context flows down the choreography chain (creation ->
+/// assignment -> run acceptance) without any participant doing per-exchange
+/// work. An envelope the participant stamped itself is left alone: the
+/// participant knows its own segment better than the substrate does. An
+/// entity never invents context, so a chain whose ingress carried none stays
+/// context-free and every segment starts a root.
+fn propagate_exchange_telemetry(
+    cause: &AgentTelemetryContext,
+    owed: Vec<AgentExchangeEnvelope>,
+) -> Vec<AgentExchangeEnvelope> {
+    if cause.trace_parent.is_none() && cause.span_links.is_empty() {
+        return owed;
+    }
+    owed.into_iter()
+        .map(|envelope| {
+            if envelope.has_telemetry() {
+                envelope
+            } else {
+                envelope.with_telemetry(cause.clone())
+            }
+        })
+        .collect()
 }
 
 /// The receiver's decision about one exchange.
@@ -1615,6 +1650,7 @@ where
             .participant
             .apply(&mut state, envelope, now)
             .into_parts();
+        let owed = propagate_exchange_telemetry(envelope.telemetry(), owed);
         state.exchange_journal_mut().record_applied(
             envelope.operation_id().clone(),
             envelope.kind(),
@@ -1667,6 +1703,7 @@ where
         self.participant.check_settle(envelope, result)?;
 
         let owed = self.participant.settle(&mut state, envelope, result, now);
+        let owed = propagate_exchange_telemetry(envelope.telemetry(), owed);
         self.record_owed(&mut state, owed, now)?;
         self.persist(state, record.revision).await?;
         Ok(settlement)

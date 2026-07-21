@@ -233,6 +233,7 @@ impl Fixture {
             goal: None,
             parent: None,
             dependencies: Vec::new(),
+            telemetry: Default::default(),
         };
 
         let mut entity = AgentTaskEntityStore::new(

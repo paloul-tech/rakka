@@ -1357,7 +1357,41 @@ segments, signals, and queries:**
   resync) remains the public streaming surface and gains no second
   machinery.
 
+**Amended as implemented (2026-07-21):**
+
+- **Two records joined the retrofit's carrier list as the flow was wired.**
+  `AgentTaskCreation` carries the ingress context (context flows with
+  commands), and the task's materialized state holds it — an exclusion-list
+  amendment forced by a fact the resolution had not weighed: the assignment
+  is decided in a *later* transition than the creation, so the envelope it
+  owes can only carry the ingress cause if the task state kept it. Same
+  rules as every carrier: `#[serde(default)]`, no version bump, never read
+  to decide anything. The choreography host propagates the causing
+  exchange's context onto owed envelopes that have none (accept and settle),
+  so the chain creation -> assignment -> run acceptance flows with no
+  per-participant work, and the run participant records the accepted
+  exchange's context into its loop state in the same compare-and-set.
+- **The operational snapshot is content-redacted.** The scenario 25 sentinel
+  sweep caught the run projection's proposal/accepted-result/feedback riding
+  into the point answer; the query strips them and reports the bounded
+  `has_pending_proposal` fact instead — content stays in durable state and
+  artifacts, the observability surface gets labels, counts, and references.
+- **Ingress and egress are the W3C text-map keys on A2A request metadata.**
+  `normalize_agent_send`/`normalize_agent_cancel` extract
+  `traceparent`/`tracestate` case-insensitively before anything durable
+  happens, dropping malformed context whole without refusing the send; the
+  typed client's A2A transport injects the caller's context under the same
+  keys. The HTTP-header edge binding lands with the deferred route mounting
+  of slice 1.12.
+
 Done when: scenarios 21-26 and 56 pass.
+**Done (2026-07-21):** all seven scenario proofs pass — 21 and 56 over the
+real entities (`tests/decision_events.rs`, `tests/operational_query.rs`), 22,
+23, 24, 25, and 26 over the traced end-to-end flow
+(`tests/trace_scenarios.rs`, with the schema half of 23 in
+`tests/telemetry_context.rs` and the metric half of 25 in
+`tests/agent_metrics.rs`); the slice 1.14 regression re-proves the set under
+fault injection.
 
 ### Slice 1.14 — Recovery suite, fault injection, and M1 acceptance
 

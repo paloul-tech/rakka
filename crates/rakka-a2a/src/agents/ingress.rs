@@ -23,7 +23,10 @@ use rakka_agent::{
     AgentOperationId, AgentOperationKind, AgentTaskContent, AgentTaskCreation,
     AgentTaskEntityCommand, AgentTaskId, TenantId,
 };
-use rakka_agent_workflow::PrincipalRef;
+use rakka_agent_workflow::{
+    extract_agent_trace_context, AgentAttributes, AgentTelemetryContext, PrincipalRef,
+    TRACEPARENT_HEADER, TRACESTATE_HEADER,
+};
 use serde_json::Value;
 
 use crate::mapping::{
@@ -71,6 +74,12 @@ pub struct NormalizedAgentCommand {
     pub agent: Option<String>,
     /// Requested task-definition selection, when the request named one.
     pub task_definition: Option<String>,
+    /// W3C trace context extracted from the request metadata *before* durable
+    /// acceptance (specification 17.5, 17.6: the ingress `SERVER` span
+    /// extracts context first). Sanitized at extraction: a malformed
+    /// `traceparent` is dropped whole rather than entering durable state, and
+    /// an untraced ingress starts a root.
+    pub telemetry: AgentTelemetryContext,
 }
 
 impl NormalizedAgentCommand {
@@ -149,6 +158,7 @@ pub fn normalize_agent_send(
         agent: metadata_string(metadata, META_AGENT_ID).map_err(RakkaAgentA2AError::Mapping)?,
         task_definition: metadata_string(metadata, META_TASK_DEFINITION)
             .map_err(RakkaAgentA2AError::Mapping)?,
+        telemetry: extract_ingress_telemetry(metadata),
     })
 }
 
@@ -197,7 +207,35 @@ pub fn normalize_agent_cancel(
             .map_err(RakkaAgentA2AError::Mapping)?,
         agent: None,
         task_definition: None,
+        telemetry: extract_ingress_telemetry(metadata),
     })
+}
+
+/// Extracts the W3C trace context an ingress request carried, before anything
+/// durable happens (specification 17.5).
+///
+/// The request metadata is the carrier: the standard lowercase `traceparent`
+/// and `tracestate` keys, matched case-insensitively the way any W3C text-map
+/// extraction is. Malformed context is dropped whole — the public protocol
+/// policy is permissive acceptance, and a malformed value never enters
+/// durable state — and the result is sanitized exactly as every durable
+/// telemetry write is, so an untraced or untrusted ingress yields the empty
+/// context and every segment it causes starts a root.
+fn extract_ingress_telemetry(metadata: &HashMap<String, Value>) -> AgentTelemetryContext {
+    let mut carrier = AgentAttributes::new();
+    for key in [TRACEPARENT_HEADER, TRACESTATE_HEADER] {
+        if let Some(value) = metadata
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| value.as_str())
+        {
+            carrier.insert(key.to_string(), value.to_string());
+        }
+    }
+    match extract_agent_trace_context(&carrier) {
+        Ok(Some(context)) => rakka_agent::sanitize_agent_telemetry_context(context),
+        Ok(None) | Err(_) => AgentTelemetryContext::default(),
+    }
 }
 
 /// The catalog selector this request expressed.
@@ -261,6 +299,7 @@ pub fn agent_task_create_command(
             goal: None,
             parent: None,
             dependencies: Vec::new(),
+            telemetry: normalized.telemetry.clone(),
         }),
     })
 }
@@ -326,6 +365,88 @@ mod tests {
         assert_eq!(first.task, retry.task);
         assert_eq!(first.operation_id, retry.operation_id);
         assert!(matches!(first.intent, A2ATaskIntent::NewTask));
+    }
+
+    #[test]
+    fn ingress_extracts_valid_trace_context_and_drops_malformed_whole() {
+        let mut message = Message::new(Role::User, vec![Part::text("hello")]);
+        message.message_id = "msg-1".to_string();
+
+        let traced = HashMap::from([
+            (
+                // Case-insensitive, the way any W3C text-map extraction is.
+                "TraceParent".to_string(),
+                Value::String(
+                    "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+                ),
+            ),
+            (
+                "tracestate".to_string(),
+                Value::String("vendor=value".to_string()),
+            ),
+        ]);
+        let normalized = normalize_agent_send(
+            &RESOLVER,
+            Some("tenant-a"),
+            &ServiceParams::new(),
+            None,
+            &message,
+            &traced,
+        )
+        .expect("normalize");
+        assert_eq!(
+            normalized.telemetry.trace_parent.as_deref(),
+            Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+        );
+        assert_eq!(
+            normalized.telemetry.trace_state.as_deref(),
+            Some("vendor=value")
+        );
+
+        // The extracted context rides the creation command it derived.
+        let definition = rakka_agent::AgentTaskDefinition::new(
+            rakka_agent::AgentTaskDefinitionId::new("resolve-ticket").expect("definition id"),
+            "Resolve one ticket.",
+            rakka_agent::AgentSchemaRef::new(
+                rakka_agent::AgentSchemaId::new("in").expect("schema id"),
+                rakka_agent::AgentRevisionNumber::INITIAL,
+            ),
+            rakka_agent::AgentSchemaRef::new(
+                rakka_agent::AgentSchemaId::new("out").expect("schema id"),
+                rakka_agent::AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("the definition is valid");
+        let command = agent_task_create_command(
+            &normalized,
+            &A2AAgentTarget::new(
+                rakka_agent::AgentId::new("support").expect("agent id"),
+                definition,
+            ),
+            json!({ "ticket": 1 }),
+        )
+        .expect("the creation command builds");
+        let AgentTaskEntityCommand::Create { creation, .. } = command else {
+            panic!("a send builds a creation");
+        };
+        assert_eq!(creation.telemetry, normalized.telemetry);
+
+        // Malformed context is dropped whole, and the send is not refused
+        // over telemetry.
+        let malformed = HashMap::from([(
+            "traceparent".to_string(),
+            Value::String("not-a-traceparent".to_string()),
+        )]);
+        let normalized = normalize_agent_send(
+            &RESOLVER,
+            Some("tenant-a"),
+            &ServiceParams::new(),
+            None,
+            &message,
+            &malformed,
+        )
+        .expect("a malformed traceparent never fails the send");
+        assert!(normalized.telemetry.trace_parent.is_none());
     }
 
     #[test]

@@ -252,6 +252,20 @@ where
                     Self::principal_metadata(principal),
                 );
             }
+            // Egress injection (specification 17.5): the caller's context
+            // rides the standard W3C metadata keys, and the ingress extraction
+            // on the receiving side is its mirror. Invalid context injects
+            // nothing rather than failing the send — telemetry is never a
+            // correctness input.
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                let mut carrier = rakka_agent_workflow::AgentAttributes::new();
+                if rakka_agent_workflow::inject_agent_trace_context(telemetry, &mut carrier).is_ok()
+                {
+                    for (key, value) in carrier {
+                        metadata.insert(key, Value::String(value));
+                    }
+                }
+            }
             let send = SendMessageRequest {
                 message,
                 configuration: None,
