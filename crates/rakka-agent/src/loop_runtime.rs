@@ -478,6 +478,13 @@ impl AgentLoopState {
         self.decision_drops
     }
 
+    /// The durable decision-event cursor: how many decisions this run has
+    /// assigned a sequence.
+    #[must_use]
+    pub const fn decision_sequence(&self) -> u64 {
+        self.decision_sequence
+    }
+
     /// Drops the owed decision events the sink durably accepted.
     pub(crate) fn clear_flushed_decisions(&mut self, flushed: &[AgentOperationId]) {
         self.decision_outbox

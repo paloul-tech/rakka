@@ -194,6 +194,11 @@ pub use observability::{
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
+pub use query::{
+    agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
+    AgentCheckpointView, AgentOperationalSnapshot, AgentPendingEffectView,
+    AgentSessionSegmentSource, AgentSessionTraceSegment, AgentSessionView,
+};
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
     agent_run_entity_type_key, init_agent_run_entity_remote_sharding,
