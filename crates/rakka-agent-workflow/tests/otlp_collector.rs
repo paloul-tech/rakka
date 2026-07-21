@@ -283,3 +283,53 @@ fn telemetry_context() -> AgentTelemetryContext {
         span_links: Vec::new(),
     }
 }
+
+/// The span-kind/status/events/scope extension is additive: a bridge record
+/// serialized before the fields existed decodes with the defaults, and the
+/// fields round-trip once set. This is what lets the agent-domain GenAI
+/// adapter compose over the bridge without a breaking bridge revision.
+#[test]
+fn a_pre_extension_span_record_decodes_with_default_kind_status_and_events() {
+    use rakka_agent_workflow::{AgentOtelSpanEvent, AgentOtelSpanKind, AgentOtelSpanStatus};
+
+    let telemetry = AgentTelemetryContext {
+        trace_parent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string()),
+        ..AgentTelemetryContext::default()
+    };
+    let span = AgentOtelSpanExport::from_telemetry_context(
+        "rakka.agent.effect.dispatch",
+        AgentTimestampMillis::new(1),
+        AgentTimestampMillis::new(2),
+        &telemetry,
+    )
+    .expect("the span builds");
+
+    let mut raw = serde_json::to_value(&span).expect("the span serializes");
+    let object = raw.as_object_mut().expect("the span is an object");
+    assert!(object.remove("kind").is_some());
+    assert!(object.remove("status").is_some());
+    assert!(object.remove("events").is_some());
+    let decoded: AgentOtelSpanExport =
+        serde_json::from_value(raw).expect("a pre-extension record decodes");
+    assert_eq!(decoded.kind, AgentOtelSpanKind::Internal);
+    assert_eq!(decoded.status, AgentOtelSpanStatus::Unset);
+    assert!(decoded.events.is_empty());
+    assert_eq!(
+        decoded, span,
+        "the defaults are the pre-extension semantics"
+    );
+
+    let stamped = span
+        .kind(AgentOtelSpanKind::Consumer)
+        .status(AgentOtelSpanStatus::Ok)
+        .event(AgentOtelSpanEvent {
+            name: "rakka.agent.decide".to_string(),
+            time: AgentTimestampMillis::new(2),
+            attributes: AgentAttributes::new(),
+        });
+    stamped.validate().expect("the extended record validates");
+    let round_tripped: AgentOtelSpanExport =
+        serde_json::from_value(serde_json::to_value(&stamped).expect("the record serializes"))
+            .expect("the record round-trips");
+    assert_eq!(round_tripped, stamped);
+}

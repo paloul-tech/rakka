@@ -226,7 +226,8 @@ pub use migration::{
     CURRENT_AGENT_WORKFLOW_INDEX_SCHEMA_VERSION,
 };
 pub use otlp::{
-    AgentOtelResource, AgentOtelSpanExport, AgentOtlpBridgeExport, AgentOtlpBridgeReceiver,
+    AgentOtelInstrumentationScope, AgentOtelResource, AgentOtelSpanEvent, AgentOtelSpanExport,
+    AgentOtelSpanKind, AgentOtelSpanStatus, AgentOtlpBridgeExport, AgentOtlpBridgeReceiver,
     AgentOtlpError, AgentOtlpExporterConfig, AgentOtlpProtocol, AgentOtlpReceiverFuture,
     AgentOtlpResult, AgentOtlpSignal, InMemoryAgentOtlpReceiver, DEFAULT_AGENT_OTLP_GRPC_ENDPOINT,
     DEFAULT_AGENT_OTLP_HTTP_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS,
@@ -402,7 +403,8 @@ pub mod prelude {
         AgentInstrumentationScope, AgentLogEvent, AgentLogSeverity, AgentMetricError,
         AgentMetricInstrument, AgentMetricResult, AgentMigrationAssessment, AgentMigrationDecision,
         AgentMigrationReason, AgentModelAdapter, AgentModelEffectDispatcher, AgentModelRequest,
-        AgentOtelResource, AgentOtelSpanExport, AgentOtlpBridgeExport, AgentOtlpBridgeReceiver,
+        AgentOtelInstrumentationScope, AgentOtelResource, AgentOtelSpanEvent, AgentOtelSpanExport,
+        AgentOtelSpanKind, AgentOtelSpanStatus, AgentOtlpBridgeExport, AgentOtlpBridgeReceiver,
         AgentOtlpError, AgentOtlpExporterConfig, AgentOtlpProtocol, AgentOtlpReceiverFuture,
         AgentOtlpResult, AgentOtlpSignal, AgentOutboxAcceptance, AgentOutboxDuplicateReason,
         AgentOutboxError, AgentOutboxResult, AgentPayload, AgentPayloadDescriptor,

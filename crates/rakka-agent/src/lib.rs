@@ -194,6 +194,16 @@ pub use observability::{
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
+#[cfg(feature = "otel")]
+pub use otel::{
+    agent_instrumentation_scope, decision_span_event, usage_attributes, AgentGenAiIdentity,
+    AgentGenAiOperation, AGENT_DECISION_SPAN_EVENT, AGENT_GENAI_CONVENTION_REVISION,
+    AGENT_GENAI_SCHEMA_URL, AGENT_OTEL_SCOPE_NAME, AGENT_OTEL_SCOPE_VERSION, ATTR_GEN_AI_AGENT_ID,
+    ATTR_GEN_AI_AGENT_NAME, ATTR_GEN_AI_AGENT_VERSION, ATTR_GEN_AI_CONVERSATION_ID,
+    ATTR_GEN_AI_OPERATION_NAME, ATTR_GEN_AI_PROVIDER_NAME, ATTR_GEN_AI_TOOL_NAME,
+    ATTR_GEN_AI_TOOL_TYPE, ATTR_GEN_AI_USAGE_INPUT_TOKENS, ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+    ATTR_RAKKA_AGENT_DELEGATION_ID, ATTR_RAKKA_AGENT_GOAL_ID, ATTR_RAKKA_AGENT_TASK_ID,
+};
 pub use query::{
     agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
     AgentCheckpointView, AgentOperationalSnapshot, AgentPendingEffectView,
