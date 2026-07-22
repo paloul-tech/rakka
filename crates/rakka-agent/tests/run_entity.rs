@@ -344,6 +344,108 @@ async fn a_stale_effect_result_is_refused_by_the_runs_own_fence() {
 }
 
 #[tokio::test]
+async fn a_redelivered_completion_after_any_owner_loss_never_advances_twice() {
+    // Scenario 10 under the owner-kill sweep: whatever write the owner died
+    // at, the converged run has taken its turn exactly once — and a dispatcher
+    // redelivering the model completion afterward never applies again. The
+    // effect identity is deterministic, so the reference flow captures it
+    // mid-wait; the converged run has pruned the resolved record (bounded
+    // state), which is exactly the late-duplicate shape scenario 10 is about.
+    // The run store is the only store this flow's crash windows live in; the
+    // driver is the in-process dispatcher, so owner kill at every write is the
+    // complete boundary set here.
+    let reference = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    reference.instantiate_agent().await;
+    reference.runs.reset_writes();
+    reference.create_task().await;
+
+    // Pause the reference at the model wait to capture the effect identity and
+    // the outcome the dispatcher will deliver.
+    let mut run = reference.run();
+    let now = reference.now();
+    run.recover(now).await.expect("the run recovers");
+    run.settle_side_effects(&reference.router, now)
+        .await
+        .expect("the run cranks to its model wait");
+    let effect = run
+        .state()
+        .expect("state")
+        .loop_state()
+        .expect("the loop exists")
+        .effects()
+        .first()
+        .expect("the model effect is persisted")
+        .clone();
+    let outcome = reference.dispatcher.answer(&effect).await;
+    drop(run);
+    reference
+        .pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.runs.writes();
+    assert!(writes >= 5);
+
+    sweep_crash_points(writes, |nth, point| {
+        let effect = effect.clone();
+        let outcome = outcome.clone();
+        async move {
+            let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+            fx.instantiate_agent().await;
+
+            fx.runs.crash_at(nth, point);
+            fx.create_task().await;
+            let _crashed = fx.pump().await;
+
+            fx.runs.survive();
+            fx.pump().await.unwrap_or_else(|error| {
+                panic!("crash {point:?} at write {nth} did not converge: {error}")
+            });
+
+            // Redeliver the turn's model completion under the operation id the
+            // dispatcher originally minted — a late duplicate inbox command.
+            let mut run = fx.run();
+            run.recover(fx.now()).await.expect("the run recovers");
+            let redelivery = run
+                .apply(
+                    AgentRunEntityCommand::RecordEffectResult {
+                        operation_id: effect
+                            .result_operation_id(&run_scope())
+                            .expect("the result operation id is derivable"),
+                        effect_id: effect.effect_id.clone(),
+                        generation: effect.generation,
+                        attempt: 1,
+                        fence: 0,
+                        outcome: Box::new(outcome),
+                    },
+                    &fx.router,
+                    fx.now(),
+                )
+                .await;
+            match redelivery {
+                Ok(AgentRunEntityReply::Duplicate { .. }) | Err(_) => {}
+                Ok(other) => panic!(
+                    "crash {point:?} at write {nth}: a redelivered completion \
+                     must not apply, got {other:?}"
+                ),
+            }
+
+            let run = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(run.status, AgentRunStatus::Completed);
+            assert_eq!(
+                run.turn, 1,
+                "crash {point:?} at write {nth} advanced the loop twice"
+            );
+            assert_eq!(
+                run.budget.model_calls(),
+                1,
+                "crash {point:?} at write {nth} consumed a second model call"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_tool_calling_turn_waits_on_its_tools_before_it_records_the_turn() {
     let fx = Fixture::new(
         ScriptedDispatcher::new()

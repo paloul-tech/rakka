@@ -24,8 +24,8 @@ use rakka_a2a::auth::AllowAllAuthorizer;
 use rakka_a2a::mapping::{A2AHeaderTenantResolver, META_PRINCIPAL_REF};
 use rakka_a2a::projection::InMemoryA2ATaskProjectionStore;
 use rakka_agent::testkit::{
-    DeferredExchangeRouter, InProcessRunEntityTransport, InProcessTaskEntityTransport,
-    ScriptedDispatcher,
+    sweep_crash_points, CrashingStateStore, DeferredExchangeRouter, InProcessRunEntityTransport,
+    InProcessTaskEntityTransport, ScriptedDispatcher,
 };
 use rakka_agent::{
     run_id_for_assignment, AgentAssignmentGeneration, AgentAuthorityEnvelope,
@@ -44,9 +44,9 @@ use rakka_agent::{
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use rakka_persistence::InMemoryDurableStateStore;
 
-type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
+type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
-type RunStore = InMemoryDurableStateStore<AgentRunState>;
+type RunStore = CrashingStateStore<AgentRunState>;
 type Service = RakkaAgentA2AService<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore, RunStore>;
 
 const TENANT: &str = "acme";
@@ -301,6 +301,52 @@ impl Fixture {
             }
         }
         panic!("the agents surface did not converge");
+    }
+
+    /// [`Self::pump`], but surfacing the first error instead of panicking —
+    /// what a sweep needs, because an armed crash point kills an entity's
+    /// owner mid-drive and the injected loss is the point, not a failure.
+    async fn try_pump(&self, task_id: &str) -> Result<(), String> {
+        for _round in 0..64 {
+            let now = self.now();
+            let mut task = self.task(task_id);
+            task.recover(now)
+                .await
+                .map_err(|error| error.code().to_string())?;
+            task.settle_side_effects(&self.router, now)
+                .await
+                .map_err(|error| error.code().to_string())?;
+
+            let now = self.now();
+            let mut run = self.run(task_id);
+            run.recover(now)
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let progress = run
+                .settle_side_effects(&self.router, now)
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let answered = self
+                .dispatcher
+                .drive(&mut run, &self.router, self.now())
+                .await
+                .map_err(|error| error.code().to_string())?;
+
+            let terminal = run
+                .state()
+                .ok()
+                .and_then(rakka_agent::AgentRunState::status)
+                .is_some_and(AgentRunStatus::is_terminal);
+            if terminal
+                || (progress.transitions == 0
+                    && progress.effects_dispatched == 0
+                    && progress.settled == 0
+                    && answered == 0)
+            {
+                return Ok(());
+            }
+        }
+        Err("the agents surface did not converge".to_string())
     }
 
     async fn history_count(&self, task_id: &str, kind: AgentTaskHistoryKind) -> usize {
@@ -780,4 +826,124 @@ async fn cancellation_projects_the_authoritative_condition() {
     } else {
         assert!(!final_view.status.state.is_terminal());
     }
+}
+
+/// Scenario 1 under the owner-kill sweep: kill the run's owner, then the
+/// task's owner, at every durable write of the A2A accept -> assign -> run ->
+/// complete flow, on both sides of the compare-and-set — then let the ingress
+/// redeliver the same `message/send`. Every crash converges on one durable
+/// task identity, one assignment generation, one run, and one turn. The task
+/// id is derived from the deduplicated send, so the reference flow's id names
+/// the task in every iteration.
+#[tokio::test]
+async fn duplicate_sends_survive_any_owner_loss_with_one_task_one_run_one_turn() {
+    let build = || Fixture::new(ScriptedDispatcher::new().with_turn(valid_turn("resolved")));
+
+    let reference = build();
+    reference.instantiate_agent().await;
+    let message = task_message("msg-1");
+    let accepted = reference
+        .service
+        .send_message(&params(), &send_request(&message))
+        .await
+        .expect("the reference send is accepted");
+    let task_id = accepted.id.clone();
+    reference.pump(&task_id).await;
+    let run_writes = reference.runs.writes();
+    let task_writes = reference.tasks.writes();
+    assert!(
+        run_writes >= 5 && task_writes >= 3,
+        "the surface flow should write both stores, saw run {run_writes} / task {task_writes}"
+    );
+
+    let sweep = |armed: &'static str, writes: usize| {
+        let task_id = task_id.clone();
+        async move {
+            sweep_crash_points(writes, |nth, point| {
+                let task_id = task_id.clone();
+                async move {
+                    let fixture = build();
+                    fixture.instantiate_agent().await;
+                    match armed {
+                        "run" => fixture.runs.crash_at(nth, point),
+                        _ => fixture.tasks.crash_at(nth, point),
+                    }
+
+                    let message = task_message("msg-1");
+                    let _crashed = fixture
+                        .service
+                        .send_message(&params(), &send_request(&message))
+                        .await;
+                    let _crashed = fixture.try_pump(&task_id).await;
+
+                    // A new owner activates; the ingress redelivers the send.
+                    fixture.runs.survive();
+                    fixture.tasks.survive();
+                    let redelivered = fixture
+                        .service
+                        .send_message(&params(), &send_request(&message))
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{armed} crash {point:?} at write {nth}: the redelivered \
+                                 send was refused: {error:?}"
+                            )
+                        });
+                    assert_eq!(
+                        redelivered.id, task_id,
+                        "{armed} crash {point:?} at write {nth} minted a second task"
+                    );
+                    fixture.try_pump(&task_id).await.unwrap_or_else(|error| {
+                        panic!("{armed} crash {point:?} at write {nth} did not converge: {error}")
+                    });
+
+                    let mut task = fixture.task(&task_id);
+                    let now = fixture.now();
+                    task.recover(now).await.expect("the task recovers");
+                    let snapshot = task
+                        .snapshot()
+                        .expect("the snapshot reads")
+                        .expect("the task exists");
+                    assert_eq!(
+                        snapshot.status,
+                        AgentTaskStatus::Completed,
+                        "{armed} crash {point:?} at write {nth} should still complete"
+                    );
+                    assert_eq!(
+                        snapshot.assignment_generation.get(),
+                        1,
+                        "{armed} crash {point:?} at write {nth} minted a second assignment"
+                    );
+
+                    let mut run = fixture.run(&task_id);
+                    run.recover(fixture.now()).await.expect("the run recovers");
+                    let run_snapshot = run
+                        .snapshot()
+                        .expect("the snapshot reads")
+                        .expect("the run exists");
+                    assert_eq!(run_snapshot.status, AgentRunStatus::Completed);
+                    assert_eq!(
+                        run_snapshot.turn, 1,
+                        "{armed} crash {point:?} at write {nth} took a second turn"
+                    );
+
+                    for (kind, label) in [
+                        (AgentTaskHistoryKind::Created, "task"),
+                        (AgentTaskHistoryKind::AssignmentDecided, "assignment"),
+                        (AgentTaskHistoryKind::ResultAccepted, "completion"),
+                    ] {
+                        assert_eq!(
+                            fixture.history_count(&task_id, kind).await,
+                            1,
+                            "{armed} crash {point:?} at write {nth} duplicated a {label}"
+                        );
+                    }
+                }
+            })
+            .await;
+        }
+    };
+
+    sweep("run", run_writes).await;
+    sweep("task", task_writes).await;
 }

@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use rakka_agent::testkit::ScriptedDispatcher;
+use rakka_agent::testkit::{sweep_crash_points, ScriptedDispatcher};
 use rakka_agent::{
     AgentApprovalDecision, AgentCheckpointDecision, AgentCheckpointKind, AgentCheckpointSla,
     AgentEffectPolicies, AgentEffectSpec, AgentModelTurn, AgentOperationId, AgentOperationKind,
@@ -358,4 +358,151 @@ async fn an_expired_checkpoint_denies_without_auto_approving() {
         }
         other => panic!("expected an expired-effect failure, found {other:?}"),
     }
+}
+
+/// One full drive of the gated flow from durable state alone: park if not yet
+/// parked, decide if the checkpoint is still open, and pump to convergence.
+/// Every step surfaces an injected crash instead of panicking, so calling it
+/// after a loss is the same operation as calling it after a success. The
+/// checkpoint id is deterministic (derived from the gated effect), so the
+/// caller passes the one the reference flow observed.
+async fn drive_gated_flow(fx: &Fixture, checkpoint_id: &HumanCheckpointId) -> Result<(), String> {
+    fx.pump().await?;
+    let mut run = fx.run();
+    run.recover(fx.now())
+        .await
+        .map_err(|error| error.code().to_string())?;
+    let open = run
+        .state()
+        .map_err(|error| error.code().to_string())?
+        .loop_state()
+        .map(|state| !state.open_checkpoints().is_empty())
+        .unwrap_or(false);
+    if open {
+        // The approver retries the same decision after a loss, under the same
+        // operation id — Applied the first time, Duplicate on a re-drive.
+        run.apply(
+            AgentRunEntityCommand::ResolveCheckpoint {
+                operation_id: decision_key("d1"),
+                checkpoint_id: checkpoint_id.clone(),
+                resolver: resolver(),
+                decision: approve(),
+            },
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .map_err(|error| error.code().to_string())?;
+    }
+    fx.pump().await
+}
+
+#[tokio::test]
+async fn the_gated_park_decide_resume_flow_survives_any_owner_loss() {
+    // Scenarios 3, 11, and 12 under the owner-kill sweep: kill the run's owner
+    // at every durable write of park -> decide -> resume, on both sides of the
+    // compare-and-set. Every crash converges on one completion, the gated tool
+    // dispatches exactly once under the digest-bound grant, and a decision
+    // replayed after convergence resumes nothing. The run store is the only
+    // store this flow's crash windows live in; the driver is the in-process
+    // dispatcher, so owner kill at every write is the complete boundary set.
+    let reference = fixture_with(gated_policies());
+    reference.instantiate_agent().await;
+    reference.runs.reset_writes();
+    reference.create_task().await;
+    reference
+        .pump()
+        .await
+        .expect("the reference flow parks on the checkpoint");
+    let checkpoint_id = {
+        let mut store = reference.run();
+        store
+            .recover(reference.now())
+            .await
+            .expect("the run recovers");
+        let open = store
+            .state()
+            .expect("state reads")
+            .loop_state()
+            .expect("the loop exists")
+            .open_checkpoints()
+            .to_vec();
+        assert_eq!(open.len(), 1, "exactly one checkpoint gates the tool");
+        open[0].checkpoint_id.clone()
+    };
+    drive_gated_flow(&reference, &checkpoint_id)
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 6,
+        "the gated flow should make several durable writes, saw {writes}"
+    );
+    let reference_effects = reference.dispatched_effects();
+
+    sweep_crash_points(writes, |nth, point| {
+        let checkpoint_id = checkpoint_id.clone();
+        async move {
+            let fx = fixture_with(gated_policies());
+            fx.instantiate_agent().await;
+
+            fx.runs.crash_at(nth, point);
+            fx.create_task().await;
+            let _crashed = drive_gated_flow(&fx, &checkpoint_id).await;
+
+            // A new owner activates and finds only what was durably committed.
+            fx.runs.survive();
+            drive_gated_flow(&fx, &checkpoint_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("crash {point:?} at write {nth} did not converge: {error}")
+                });
+
+            let run = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(
+                run.status,
+                AgentRunStatus::Completed,
+                "crash {point:?} at write {nth} should still complete"
+            );
+            assert_eq!(
+                run.turn, 2,
+                "crash {point:?} at write {nth} replayed a turn"
+            );
+            assert_eq!(
+                fx.dispatched_effects(),
+                reference_effects,
+                "crash {point:?} at write {nth} dispatched the gated tool twice"
+            );
+
+            // Scenario 11 under the sweep: the approver replays its decision
+            // after everything settled. It must not resume anything.
+            let mut run = fx.run();
+            run.recover(fx.now()).await.expect("the run recovers");
+            let replay = run
+                .apply(
+                    AgentRunEntityCommand::ResolveCheckpoint {
+                        operation_id: decision_key("d1"),
+                        checkpoint_id,
+                        resolver: resolver(),
+                        decision: approve(),
+                    },
+                    &fx.router,
+                    fx.now(),
+                )
+                .await;
+            match replay {
+                Ok(AgentRunEntityReply::Duplicate { .. }) | Err(_) => {}
+                Ok(other) => panic!(
+                    "crash {point:?} at write {nth}: a replayed decision must \
+                     not resume, got {other:?}"
+                ),
+            }
+            let after = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(
+                after.turn, 2,
+                "crash {point:?} at write {nth}: the replayed decision advanced the run"
+            );
+        }
+    })
+    .await;
 }

@@ -1378,3 +1378,244 @@ impl DispatchFixture {
         (effect.effect_id, effect.generation)
     }
 }
+
+// ---------------------------------------------------------------------------
+// The owner-kill sweeps at the pipeline's own stores: the workflow outbox and
+// the dispatcher fleet. Scenarios 5-10 above kill the *dispatcher* at its
+// windows; these kill the *store owner* at every durable write instead, which
+// is what a pod loss looks like to the outbox and fleet records themselves.
+// ---------------------------------------------------------------------------
+
+/// A dispatch fixture whose model and tool are both idempotent, so every
+/// ambiguous window retries under the generation's single external key and
+/// every sweep iteration converges on completion.
+fn idempotent_pipeline_fixture() -> DispatchFixture {
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(1, tool_calling_turn(TOOL))
+        .with_turn_for(2, proposing_turn("charged"))
+        .with_retry_policy(rakka_agent::AgentModelRetryPolicy {
+            safety_class: rakka_agent::AgentEffectSafetyClass::Idempotent,
+            max_attempts: 3,
+        })
+        .expect("the adapter policy is valid");
+    DispatchFixture::new(
+        adapter,
+        tool_registry(AgentEffectSpec::idempotent(3).expect("the spec is valid")),
+        Some(AgentEffectSpec::idempotent(3).expect("the model spec is valid")),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+}
+
+/// The distinct external idempotency keys the tool saw.
+fn distinct_tool_keys(fx: &DispatchFixture) -> std::collections::BTreeSet<String> {
+    fx.tools
+        .invocations()
+        .into_iter()
+        .filter(|invocation| invocation.tool == TOOL)
+        .map(|invocation| invocation.idempotency_key)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_pipeline_survives_any_outbox_store_loss_under_one_idempotency_key() {
+    // Kill the workflow-outbox store's owner at every durable write of the
+    // ticket lifecycle — register, dispatch, settle — on both sides of the
+    // compare-and-set. Every crash converges on one completed run, and the
+    // external system only ever saw the one key the first attempt minted:
+    // exactly-once ticket registration is what makes that true.
+    let reference = idempotent_pipeline_fixture();
+    reference.start().await;
+    reference
+        .try_pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.workflow_store.writes();
+    assert!(
+        writes >= 4,
+        "the ticket lifecycle should make several durable writes, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let fx = idempotent_pipeline_fixture();
+        fx.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+            .await;
+
+        fx.workflow_store.crash_at(nth, point);
+        fx.fx.create_task().await;
+        let _crashed = fx.try_pump().await;
+
+        // A new owner activates; the dead pass's lease lapses.
+        fx.workflow_store.survive();
+        fx.expire_lease();
+        fx.try_pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.turn, 2,
+            "crash {point:?} at write {nth} replayed a turn"
+        );
+        assert_eq!(
+            distinct_tool_keys(&fx).len(),
+            1,
+            "crash {point:?} at write {nth} invoked under a second idempotency key"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_pipeline_survives_any_fleet_store_loss_under_one_idempotency_key() {
+    // The same sweep over the dispatcher-fleet store: worker registration,
+    // claims, and failure records. A fleet record is a fence, never proof of
+    // an external outcome — so losing its owner at any write may delay the
+    // attempt but must not duplicate the external effect.
+    let reference = idempotent_pipeline_fixture();
+    reference.start().await;
+    reference
+        .try_pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.fleet_store.writes();
+    assert!(
+        writes >= 2,
+        "the fleet lifecycle should make durable writes, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let fx = idempotent_pipeline_fixture();
+        fx.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+            .await;
+
+        fx.fleet_store.crash_at(nth, point);
+        fx.fx.create_task().await;
+        let _crashed = fx.try_pump().await;
+
+        fx.fleet_store.survive();
+        fx.expire_lease();
+        fx.try_pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            distinct_tool_keys(&fx).len(),
+            1,
+            "crash {point:?} at write {nth} invoked under a second idempotency key"
+        );
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 23's dispatcher-restart half: the persisted trace segments and the
+// durable outcome are identical across a dispatcher kill at every window.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dispatcher_restart_preserves_segments_and_outcome_at_every_window() {
+    const INGRESS_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    fn traced_fixture() -> DispatchFixture {
+        let adapter = DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged"))
+            .with_retry_policy(
+                rakka_agent::AgentModelRetryPolicy::read_only(3).expect("the policy is valid"),
+            )
+            .expect("the adapter accepts the policy");
+        DispatchFixture::new(
+            adapter,
+            tool_registry(
+                AgentEffectSpec::read_only()
+                    .with_max_attempts(3)
+                    .expect("the spec is valid"),
+            ),
+            Some(
+                AgentEffectSpec::read_only()
+                    .with_max_attempts(3)
+                    .expect("the model spec is valid"),
+            ),
+            RecordingToolExecutor::new(),
+            ScriptedReconciler::new(),
+        )
+    }
+
+    async fn drive_traced(fx: &DispatchFixture) {
+        fx.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+            .await;
+        fx.fx
+            .create_task_traced(rakka_agent_workflow::AgentTelemetryContext {
+                trace_parent: Some(INGRESS_PARENT.to_string()),
+                ..rakka_agent_workflow::AgentTelemetryContext::default()
+            })
+            .await;
+    }
+
+    async fn segments_and_outcome(fx: &DispatchFixture) -> (String, AgentRunStatus, u64) {
+        let view = rakka_agent::assemble_agent_session_view(
+            &fx.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+            None,
+            rakka_agent_workflow::AgentTimestampMillis::new(9_999),
+        )
+        .await
+        .expect("the view assembles")
+        .expect("the run exists");
+        let segments = serde_json::to_string(&view.trace_segments).expect("the segments serialize");
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        (segments, run.status, run.turn)
+    }
+
+    // The unkilled reference fixes the segments and outcome every restart
+    // must reproduce.
+    let reference = traced_fixture();
+    drive_traced(&reference).await;
+    reference.pump().await;
+    let expected = segments_and_outcome(&reference).await;
+    assert_eq!(expected.1, AgentRunStatus::Completed);
+
+    for window in [
+        AgentDispatchWindow::BeforeStarted,
+        AgentDispatchWindow::AfterStarted,
+        AgentDispatchWindow::AfterInvocation,
+    ] {
+        let fx = traced_fixture();
+        drive_traced(&fx).await;
+        fx.pump_until_tool_ticket().await;
+
+        fx.probe.arm(window);
+        let pass = fx
+            .pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+        assert!(pass.died, "the probe kills the worker at {window:?}");
+
+        // A fresh worker recovers from durable state alone.
+        fx.expire_lease();
+        fx.pump().await;
+
+        let observed = segments_and_outcome(&fx).await;
+        assert_eq!(
+            observed, expected,
+            "a dispatcher restart at {window:?} changed a segment or the outcome"
+        );
+    }
+}

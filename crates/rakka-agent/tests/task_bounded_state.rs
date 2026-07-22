@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    InProcessExchangeTransport, InProcessTaskEntityTransport, RunAcceptanceProbe,
-    RunAcceptanceProbeState,
+    sweep_crash_points, CrashingStateStore, InProcessExchangeTransport,
+    InProcessTaskEntityTransport, RunAcceptanceProbe, RunAcceptanceProbeState,
 };
 use rakka_agent::{
     drive_pending_exchanges, AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentDefinition,
@@ -43,7 +43,7 @@ use rakka_agent_workflow::{
 };
 use rakka_persistence::InMemoryDurableStateStore;
 
-type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
+type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<RunAcceptanceProbeState>;
 
@@ -910,4 +910,149 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
 
     assert!(admitted > 0, "the sweep starts below the admission bound");
     assert!(refused > 0, "the sweep crosses the admission bound");
+}
+
+/// [`Fixture::propose_rejected`], but surfacing delivery errors instead of
+/// panicking — what a sweep needs, because an armed crash point kills the
+/// task's owner mid-decision and the injected loss is the point.
+impl Fixture {
+    async fn try_propose_rejected(&self, proposal_id: &str) -> Result<(), String> {
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::ResultProposal,
+            [TENANT, TASK, proposal_id],
+        )
+        .expect("operation id should be derivable");
+
+        let definition = task_definition();
+        let proposal = AgentTaskResultProposal {
+            proposal_id: operation_id.clone(),
+            agent: agent_id(),
+            run: run_scope().run().clone(),
+            generation: AgentAssignmentGeneration::new(1),
+            definition_id: definition.definition_id.clone(),
+            definition_version: definition.version,
+            result_schema: definition.result_schema.clone(),
+            content: AgentTaskContent::inline(serde_json::json!({ "answer": "" }))
+                .expect("the result is inline-bounded"),
+            evidence: vec![artifact(&format!("evidence-{proposal_id}"), 4096)],
+            causation_id: AgentCausationId::new(format!("cause-{proposal_id}")),
+            proposed_at: self.now(),
+        };
+
+        let now = self.now();
+        let envelope = AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::ResultProposal,
+            AgentEntityAddress::Run(run_scope()),
+            AgentEntityAddress::Task(task_scope()),
+            AgentExchangePayload::encode(AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE, &proposal)
+                .expect("the proposal payload is bounded"),
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )
+        .expect("the proposal envelope should be valid");
+
+        let mut run = AgentExchangeHost::new(
+            AgentEntityAddress::Run(run_scope()),
+            RunAcceptanceProbe::accepting(),
+            self.runs.clone(),
+        );
+        run.recover(self.now())
+            .await
+            .map_err(|error| error.to_string())?;
+        run.initiate(now, move |_state| Ok(vec![envelope]))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let now = self.now();
+        drive_pending_exchanges(&mut run, &self.run_router, now)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+/// One full drive of the churn, exactly as the ingress and the run would
+/// redeliver it: the creation and every proposal carry the same operation ids
+/// on every drive, so a re-drive is a redelivery, never new work.
+async fn drive_churn(fx: &Fixture, rejections: u32) -> Result<(), String> {
+    fx.create(
+        AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+    )
+    .await?;
+    for index in 0..rejections {
+        fx.try_propose_rejected(&index.to_string()).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounded_state_and_gapless_history_survive_any_owner_loss() {
+    // Scenario 55 under the owner-kill sweep: kill the task's owner at every
+    // durable write of a rejection churn, on both sides of the compare-and-set,
+    // then redeliver the whole churn. Every crash converges on a materialized
+    // record within its byte bound, exactly one durable decision per proposal,
+    // and a gapless history sequence a cursor can never skip through. Three
+    // rejections exercise every write class the twelve-rejection clean-path
+    // test does; the task store is the only store this flow's crash windows
+    // live in.
+    const CHURN: u32 = 3;
+    let reference = Fixture::new();
+    reference.instantiate_agent().await;
+    drive_churn(&reference, CHURN)
+        .await
+        .expect("the reference churn completes");
+    let writes = reference.tasks.writes();
+    assert!(
+        writes >= 4,
+        "the churn should make several durable writes, saw {writes}"
+    );
+
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new();
+        fx.instantiate_agent().await;
+
+        fx.tasks.crash_at(nth, point);
+        let _crashed = drive_churn(&fx, CHURN).await;
+
+        // A new owner activates; everything is redelivered.
+        fx.tasks.survive();
+        drive_churn(&fx, CHURN).await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let state = fx.durable_state().await;
+        let task = state.task().expect("the task exists");
+        assert_eq!(
+            task.rejection_count, CHURN,
+            "crash {point:?} at write {nth} double-counted a rejection"
+        );
+        assert!(
+            task.materialized_size_bytes() <= AGENT_TASK_MATERIALIZED_MAX_BYTES,
+            "crash {point:?} at write {nth} grew the materialized record past its bound"
+        );
+        assert!(
+            state.pending_history().is_empty(),
+            "crash {point:?} at write {nth} left owed history unflushed after convergence"
+        );
+
+        let (entries, _pages) = fx.read_history(4).await;
+        let rejections = entries
+            .iter()
+            .filter(|entry| entry.kind == AgentTaskHistoryKind::ResultRejected)
+            .count();
+        assert_eq!(
+            rejections, CHURN as usize,
+            "crash {point:?} at write {nth} duplicated or dropped a rejection decision"
+        );
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.sequence.get(),
+                index as u64 + 1,
+                "crash {point:?} at write {nth} broke the history sequence"
+            );
+        }
+    })
+    .await;
 }

@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent::testkit::{
-    ExchangeFault, InProcessExchangeTransport, RunAcceptanceProbe, RunAcceptanceProbeState,
+    sweep_crash_points, CrashingStateStore, ExchangeFault, InProcessExchangeTransport,
+    RunAcceptanceProbe, RunAcceptanceProbeState,
 };
 use rakka_agent::{
     init_agent_task_entity_sharding, load_agent_task_state, passivate_agent_task_entity,
@@ -41,7 +42,7 @@ use rakka_core::ActorSystem;
 use rakka_persistence::InMemoryDurableStateStore;
 use rakka_sharding::{ClusterSharding, EntityTypeKey};
 
-type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
+type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<RunAcceptanceProbeState>;
 type TaskEntity = AgentTaskEntityStore<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>;
@@ -267,15 +268,55 @@ impl Fixture {
         }
     }
 
+    /// [`Self::apply`], but surfacing every error — recovery's included — so a
+    /// sweep can drive a command into an armed crash point without panicking.
+    async fn try_apply(
+        &self,
+        command: AgentTaskEntityCommand,
+    ) -> Result<AgentTaskEntityReply, String> {
+        let mut entity = AgentTaskEntityStore::new(
+            task_scope(),
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        entity
+            .recover(self.now())
+            .await
+            .map_err(|error| error.code().to_string())?;
+        entity
+            .apply(command, &self.router, self.now())
+            .await
+            .map_err(|error| error.code().to_string())
+    }
+
     /// Drives whatever the task owes: the assignment decision, the history, and
     /// the exchanges. This is what recovery does, and what a timer would do.
     async fn settle(&self) {
-        let mut entity = self.task().await;
-        let now = self.now();
-        entity
-            .settle_side_effects(&self.router, now)
+        self.try_settle()
             .await
             .expect("the task should settle what it owes");
+    }
+
+    /// [`Self::settle`], but surfacing the first error instead of panicking —
+    /// what a sweep needs, because an armed crash point kills the owner
+    /// mid-settle and the injected loss is the point, not a failure.
+    async fn try_settle(&self) -> Result<(), String> {
+        let mut entity = AgentTaskEntityStore::new(
+            task_scope(),
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        entity
+            .recover(self.now())
+            .await
+            .map_err(|error| error.code().to_string())?;
+        entity
+            .settle_side_effects(&self.router, self.now())
+            .await
+            .map_err(|error| error.code().to_string())?;
+        Ok(())
     }
 
     async fn snapshot(&self) -> AgentTaskSnapshot {
@@ -961,4 +1002,112 @@ async fn a_task_persists_passivates_and_recovers_on_another_owner() {
         .expect("the durable read should succeed")
         .expect("the task exists");
     assert_eq!(durable.status(), Some(AgentTaskStatus::InProgress));
+}
+
+/// One full drive of the scenario-37 command sequence, exactly as the ingress
+/// would redeliver it: creation, the doubly-declared dependency edge, the
+/// dependency outcome, and two settle passes. Every command carries the same
+/// operation id on every drive, so a re-drive is a redelivery, never new work.
+/// The first error — an armed crash point included — surfaces as `Err`.
+async fn drive_dependency_flow(fx: &Fixture) -> Result<(), String> {
+    let ok = |reply: AgentTaskEntityReply| match reply {
+        AgentTaskEntityReply::Rejected { code, message } => Err(format!("{code}: {message}")),
+        _ => Ok(()),
+    };
+    ok(fx
+        .try_apply(create_command(vec![dependency("upstream")]))
+        .await?)?;
+    for discriminator in ["1", "2"] {
+        ok(fx
+            .try_apply(AgentTaskEntityCommand::DeclareDependency {
+                operation_id: operation(AgentOperationKind::Command, discriminator),
+                declaration: Box::new(dependency("upstream")),
+            })
+            .await?)?;
+    }
+    ok(fx
+        .try_apply(AgentTaskEntityCommand::RecordDependencyOutcome {
+            operation_id: operation(AgentOperationKind::Command, "resolve"),
+            dependency: AgentTaskId::new("upstream").expect("task id should be valid"),
+            outcome: AgentTaskDependencyOutcome::Completed,
+        })
+        .await?)?;
+    fx.try_settle().await?;
+    fx.try_settle().await
+}
+
+#[tokio::test]
+async fn the_dependency_and_assignment_flow_survives_any_owner_loss() {
+    // Scenario 37 under the owner-kill sweep: kill the task's owner at every
+    // durable write of creation -> dependency -> resolution -> assignment, on
+    // both sides of the compare-and-set, then let the ingress redeliver the
+    // whole command sequence. Every crash converges on one task record, one
+    // dependency edge, one assignment decision, and one durably accepted run.
+    // The task store is the only store this flow's crash windows live in; the
+    // run half is the acceptance probe over its own plain store.
+    let reference = Fixture::new(RunAcceptanceProbe::accepting());
+    reference.instantiate_agent().await;
+    drive_dependency_flow(&reference)
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.tasks.writes();
+    assert!(
+        writes >= 3,
+        "the dependency flow should make several durable writes, saw {writes}"
+    );
+
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new(RunAcceptanceProbe::accepting());
+        fx.instantiate_agent().await;
+
+        fx.tasks.crash_at(nth, point);
+        let _crashed = drive_dependency_flow(&fx).await;
+
+        // A new owner activates; the ingress redelivers everything.
+        fx.tasks.survive();
+        drive_dependency_flow(&fx).await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let converged = fx.snapshot().await;
+        assert_eq!(
+            converged.status,
+            AgentTaskStatus::InProgress,
+            "crash {point:?} at write {nth} should still assign the task"
+        );
+        assert_eq!(
+            converged.assignment_generation.get(),
+            1,
+            "crash {point:?} at write {nth} minted a second assignment generation"
+        );
+        assert_eq!(
+            converged.dependencies.len(),
+            1,
+            "crash {point:?} at write {nth} duplicated the dependency edge"
+        );
+
+        let run = fx.run_state(1).await;
+        assert_eq!(
+            run.accepted_generations(),
+            &[1],
+            "crash {point:?} at write {nth} made the run accept twice"
+        );
+
+        let kinds = fx.history_kinds().await;
+        for (kind, label) in [
+            (AgentTaskHistoryKind::Created, "task"),
+            (AgentTaskHistoryKind::DependencyDeclared, "dependency edge"),
+            (
+                AgentTaskHistoryKind::AssignmentDecided,
+                "assignment decision",
+            ),
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|entry| **entry == kind).count(),
+                1,
+                "crash {point:?} at write {nth} recorded more than one {label}"
+            );
+        }
+    })
+    .await;
 }

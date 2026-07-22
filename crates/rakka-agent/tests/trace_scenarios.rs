@@ -383,3 +383,124 @@ fn checkpointed_fixture() -> Fixture {
         Arc::new(AtomicU64::new(1)),
     )
 }
+
+/// Scenarios 23, 24, and 25 under the owner-kill sweep: kill the traced run's
+/// owner at every durable write of the full flow, on both sides of the
+/// compare-and-set. However the owner died, the converged run's durable facts
+/// are identical to the untraced crash-free reference (the persisted chain
+/// changed no effect behavior, and recovery kept it that way), the committing
+/// segment still carries the ingress chain, and no telemetry surface —
+/// decision events, metric observations, snapshot, session view — carries a
+/// content or credential sentinel at the converged state. The run store is
+/// the only store this flow's crash windows live in; the driver is the
+/// in-process dispatcher, so owner kill at every write is the complete
+/// boundary set here.
+#[tokio::test]
+async fn the_traced_flow_survives_any_owner_loss_without_changing_behavior() {
+    // The untraced crash-free reference fixes the durable facts a traced,
+    // crashed, recovered run must still converge on.
+    let untraced = Fixture::new(full_run_dispatcher());
+    untraced.instantiate_agent().await;
+    untraced.runs.reset_writes();
+    untraced.create_task().await;
+    untraced.pump().await.expect("the untraced run completes");
+    let writes = untraced.runs.writes();
+    assert!(
+        writes >= 6,
+        "the full flow should make several durable writes, saw {writes}"
+    );
+    let reference = untraced.run_snapshot().await.expect("the run exists");
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| {
+        let reference = reference.clone();
+        async move {
+            let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+            let metrics = Arc::new(InMemoryMetricsRecorder::new());
+            let fx = Fixture::new(full_run_dispatcher())
+                .with_decision_events(sink.clone())
+                .with_metrics(metrics.clone());
+            fx.instantiate_agent().await;
+
+            fx.runs.crash_at(nth, point);
+            fx.create_task_traced(ingress_context(INGRESS_PARENT)).await;
+            let _crashed = fx.pump().await;
+
+            // A new owner activates and finds only what was durably committed.
+            fx.runs.survive();
+            fx.pump().await.unwrap_or_else(|error| {
+                panic!("crash {point:?} at write {nth} did not converge: {error}")
+            });
+
+            // Scenario 23/24: same durable outcome as the untraced reference.
+            let run = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(
+                (run.status, run.turn, run.budget.clone()),
+                (reference.status, reference.turn, reference.budget.clone()),
+                "crash {point:?} at write {nth}: tracing or recovery changed effect behavior"
+            );
+
+            // Scenario 23: the committing segment still carries the chain.
+            let scope = run_scope();
+            let state = load_agent_run_state(&fx.runs, &scope, &AgentSchemaPolicy::default())
+                .await
+                .expect("the run state loads")
+                .expect("the run exists");
+            let loop_state = state.loop_state().expect("the loop exists");
+            assert_eq!(
+                loop_state.telemetry().trace_parent.as_deref(),
+                Some(INGRESS_PARENT),
+                "crash {point:?} at write {nth} lost the ingress chain"
+            );
+            for effect in loop_state.effects() {
+                assert_eq!(
+                    effect.telemetry.trace_parent.as_deref(),
+                    Some(INGRESS_PARENT),
+                    "crash {point:?} at write {nth}: a retained effect lost its segment"
+                );
+            }
+
+            // Scenario 25: the converged telemetry surfaces stay content-free.
+            let mut surfaces = Vec::new();
+            surfaces.push(
+                serde_json::to_string(&sink.events(&scope)).expect("the decision events serialize"),
+            );
+            surfaces.push(format!("{:?}", metrics.snapshot().observations()));
+            let snapshot = agent_operational_snapshot(
+                &fx.runs,
+                &scope,
+                &AgentSchemaPolicy::default(),
+                AgentTimestampMillis::new(9_999),
+            )
+            .await
+            .expect("the point query answers")
+            .expect("the run exists");
+            surfaces.push(serde_json::to_string(&snapshot).expect("the snapshot serializes"));
+            let view = assemble_agent_session_view(
+                &fx.runs,
+                &scope,
+                &AgentSchemaPolicy::default(),
+                Some(sink.as_ref()),
+                AgentTimestampMillis::new(9_999),
+            )
+            .await
+            .expect("the view assembles")
+            .expect("the run exists");
+            surfaces.push(serde_json::to_string(&view).expect("the view serializes"));
+            for surface in &surfaces {
+                for sentinel in [
+                    "SENSITIVE-REASONING",
+                    "SENSITIVE-ARG",
+                    "SENSITIVE-RESULT",
+                    "SENSITIVE-ANSWER",
+                    "SECRET-TOKEN",
+                ] {
+                    assert!(
+                        !surface.contains(sentinel),
+                        "crash {point:?} at write {nth}: {sentinel} leaked into telemetry"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+}

@@ -12,7 +12,7 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use rakka_agent::testkit::ScriptedDispatcher;
+use rakka_agent::testkit::{sweep_crash_points, ScriptedDispatcher};
 use rakka_agent::{
     AgentApprovalDecision, AgentCheckpointDecision, AgentCheckpointKind, AgentCheckpointStatus,
     AgentCompensationRef, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
@@ -682,4 +682,201 @@ async fn a_confirmed_not_executed_gated_effect_reparks_behind_a_fresh_approval()
     fx.pump().await.expect("the re-invoked run completes");
     let run = fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
+}
+
+/// One full drive of the reconciliation flow from durable state alone: crank
+/// to the tool effect, report the ambiguous loss, resolve the checkpoint with
+/// `ConfirmedCompleted`, and finish the run. Every step keys off what is
+/// durably there and reuses the same derived operation ids, so calling it
+/// after a crash is the same operation as calling it after a success.
+///
+/// The ordinary pump is unsafe until the ambiguity is resolved — the scripted
+/// dispatcher would answer the outstanding tool effect and complete the run
+/// without ever parking — so this helper only pumps once the tool effect can
+/// no longer be invoked.
+async fn drive_reconciliation_flow(
+    fx: &Fixture,
+    checkpoint_id: &HumanCheckpointId,
+) -> Result<(), String> {
+    let code = |error: &dyn std::fmt::Display| error.to_string();
+
+    // Repair a lost creation/acceptance exchange first, exactly as a recovery
+    // sweep would: the task owns those, not the run.
+    let now = fx.now();
+    let mut task = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    task.recover(now)
+        .await
+        .map_err(|error| error.code().to_string())?;
+    task.settle_side_effects(&fx.router, now)
+        .await
+        .map_err(|error| error.code().to_string())?;
+
+    let now = fx.now();
+    let mut run = fx.run();
+    run.recover(now)
+        .await
+        .map_err(|error| error.code().to_string())?;
+    run.settle_side_effects(&fx.router, now)
+        .await
+        .map_err(|error| error.code().to_string())?;
+
+    let find_tool =
+        |run: &rakka_agent::AgentRunEntityStore<RunStore, InMemoryAgentRunEffectSink>| {
+            run.state().ok().and_then(|state| {
+                state.loop_state().and_then(|loop_state| {
+                    loop_state
+                        .effects()
+                        .iter()
+                        .find(|effect| effect.request.tool_call().is_some())
+                        .cloned()
+                })
+            })
+        };
+
+    // Answer the model call if the tool effect is not yet persisted.
+    let mut tool = find_tool(&run);
+    if tool.is_none() {
+        fx.dispatcher
+            .drive(&mut run, &fx.router, fx.now())
+            .await
+            .map_err(|error| error.code().to_string())?;
+        run.settle_side_effects(&fx.router, fx.now())
+            .await
+            .map_err(|error| error.code().to_string())?;
+        tool = find_tool(&run);
+    }
+
+    // Report the ambiguous loss, under the same derived operation id every
+    // re-drive — a redelivery, never a second report.
+    if let Some(effect) = tool.filter(rakka_agent::AgentRunEffect::is_outstanding) {
+        let operation_id = effect
+            .result_operation_id(&run_scope())
+            .map_err(|error| code(&error))?;
+        run.apply(
+            AgentRunEntityCommand::RecordEffectResult {
+                operation_id,
+                effect_id: effect.effect_id.clone(),
+                generation: effect.generation,
+                attempt: 1,
+                fence: 1,
+                outcome: Box::new(AgentRunEffectOutcome::Indeterminate {
+                    code: "connection-lost".to_string(),
+                    message: "the worker died mid-invocation".to_string(),
+                }),
+            },
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .map_err(|error| error.code().to_string())?;
+    }
+
+    // Resolve the reconciliation checkpoint if it is still open.
+    let open = run
+        .state()
+        .map_err(|error| error.code().to_string())?
+        .loop_state()
+        .map(|state| !state.open_checkpoints().is_empty())
+        .unwrap_or(false);
+    if open {
+        run.apply(
+            resolve_command(checkpoint_id.clone(), "d1", confirmed_completed()),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .map_err(|error| error.code().to_string())?;
+    }
+
+    // The ambiguous effect is resolved for good; the ordinary pump finishes
+    // the proposing turn.
+    fx.pump().await
+}
+
+#[tokio::test]
+async fn the_reconciliation_wait_survives_any_owner_loss_without_reinvoking() {
+    // Scenarios 3 and 11 under the owner-kill sweep, on the reconciliation
+    // wait: kill the run's owner at every durable write of crank -> ambiguous
+    // loss -> park -> decide -> resume. Every crash converges on one
+    // completion, the ambiguous non-idempotent tool is never invoked (the
+    // established outcome came from the decision), and a decision replayed
+    // after convergence resumes nothing. The run store is the only store this
+    // flow's crash windows live in; the driver is the in-process dispatcher,
+    // so owner kill at every write is the complete boundary set here.
+    let reference = fixture();
+    let (_effect_id, _generation, checkpoint_id) = park_indeterminate(&reference).await;
+    drive_reconciliation_flow(&reference, &checkpoint_id)
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 6,
+        "the reconciliation flow should make several durable writes, saw {writes}"
+    );
+
+    sweep_crash_points(writes, |nth, point| {
+        let checkpoint_id = checkpoint_id.clone();
+        async move {
+            let fx = fixture();
+            fx.instantiate_agent().await;
+
+            fx.runs.crash_at(nth, point);
+            fx.create_task().await;
+            let _crashed = drive_reconciliation_flow(&fx, &checkpoint_id).await;
+
+            // A new owner activates and finds only what was durably committed.
+            fx.runs.survive();
+            drive_reconciliation_flow(&fx, &checkpoint_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("crash {point:?} at write {nth} did not converge: {error}")
+                });
+
+            let run = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(
+                run.status,
+                AgentRunStatus::Completed,
+                "crash {point:?} at write {nth} should still complete"
+            );
+            assert_eq!(
+                fx.dispatcher.tool_calls(),
+                0,
+                "crash {point:?} at write {nth} re-invoked the ambiguous tool"
+            );
+            assert_eq!(
+                run.turn, 2,
+                "crash {point:?} at write {nth} replayed a turn"
+            );
+
+            // Scenario 11 under the sweep: the operator replays the decision
+            // after everything settled. It must not resume anything.
+            let mut store = fx.run();
+            store.recover(fx.now()).await.expect("the run recovers");
+            let replay = store
+                .apply(
+                    resolve_command(checkpoint_id, "d1", confirmed_completed()),
+                    &fx.router,
+                    fx.now(),
+                )
+                .await;
+            match replay {
+                Ok(AgentRunEntityReply::Duplicate { .. }) | Err(_) => {}
+                Ok(other) => panic!(
+                    "crash {point:?} at write {nth}: a replayed decision must \
+                     not resume, got {other:?}"
+                ),
+            }
+            let after = fx.run_snapshot().await.expect("the run exists");
+            assert_eq!(
+                after.turn, 2,
+                "crash {point:?} at write {nth}: the replayed decision advanced the run"
+            );
+        }
+    })
+    .await;
 }

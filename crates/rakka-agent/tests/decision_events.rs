@@ -126,3 +126,93 @@ async fn a_run_emits_its_decision_sequence_exactly_once() {
         .unwrap_or_default();
     assert_eq!(owed, 0, "every owed decision was flushed");
 }
+
+/// Scenario 21's decision half under the owner-kill sweep: kill the run's
+/// owner at every durable write of the two-turn flow, on both sides of the
+/// compare-and-set. However the owner died, the converged sink holds exactly
+/// the four-decision sequence once — the derived event identity deduplicates
+/// every re-driven flush — and the durable decision outbox is empty. The run
+/// store is the only store this flow's crash windows live in; the driver is
+/// the in-process dispatcher, so owner kill at every write is the complete
+/// boundary set here.
+#[tokio::test]
+async fn the_decision_sequence_survives_any_owner_loss_exactly_once() {
+    let build = || {
+        let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+        let dispatcher = ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(1, tool_calling_turn("lookup"))
+                .with_turn_for(2, proposing_turn("resolved")),
+        )
+        .with_tool_result(
+            "lookup",
+            AgentTaskContent::inline(serde_json::json!({ "found": true }))
+                .expect("the tool result is inline-bounded"),
+        );
+        let fx = Fixture::new(dispatcher).with_decision_events(sink.clone());
+        (fx, sink)
+    };
+
+    let (reference, _sink) = build();
+    reference.instantiate_agent().await;
+    reference.runs.reset_writes();
+    reference.create_task().await;
+    reference
+        .pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 6,
+        "the two-turn flow should make several durable writes, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let (fx, sink) = build();
+        fx.instantiate_agent().await;
+
+        fx.runs.crash_at(nth, point);
+        fx.create_task().await;
+        let _crashed = fx.pump().await;
+
+        // A new owner activates and finds only what was durably committed.
+        fx.runs.survive();
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let scope = run_scope();
+        let events = sink.events(&scope);
+        let kinds: Vec<AgentDecisionKind> = events.iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AgentDecisionKind::Continue,
+                AgentDecisionKind::CallTools,
+                AgentDecisionKind::Continue,
+                AgentDecisionKind::SubmitResult,
+            ],
+            "crash {point:?} at write {nth} duplicated or dropped a decision"
+        );
+        let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
+        assert_eq!(
+            sequences,
+            vec![1, 2, 3, 4],
+            "crash {point:?} at write {nth} broke the decision sequence"
+        );
+
+        let state = load_agent_run_state(&fx.runs, &scope, &AgentSchemaPolicy::default())
+            .await
+            .expect("the run state loads")
+            .expect("the run exists");
+        let owed = state
+            .loop_state()
+            .map(|loop_state| loop_state.decision_outbox().len())
+            .unwrap_or_default();
+        assert_eq!(
+            owed, 0,
+            "crash {point:?} at write {nth} left owed decisions unflushed"
+        );
+    })
+    .await;
+}
