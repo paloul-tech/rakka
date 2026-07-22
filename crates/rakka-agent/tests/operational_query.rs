@@ -326,6 +326,95 @@ async fn cancellation_progress_follows_the_durable_record() {
     assert_eq!(ambiguous.attempts, 1);
 }
 
+/// A cancelling run that has proposed a result but not yet had it accepted is
+/// still `Requested`, not `Quiesced`: the proposal exchange it owes its task is
+/// work the run started that is still resolving (the task may yet accept or
+/// reject it), so cancellation progress must read the run's own settlement gate
+/// — a pending proposal, not just its effect set (section 8.7).
+#[tokio::test]
+async fn a_cancelling_run_awaiting_its_proposal_is_still_requested() {
+    // The model proposes on its first turn, so the run reaches a pending
+    // proposal with no effect left in flight.
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn_for(1, proposing_turn("resolved")),
+    );
+    let fx = Fixture::new(dispatcher);
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+
+    // Drive the run to the point where it owes its proposal. The proposal is
+    // built through the loop and then delivered to the task as an exchange, and
+    // in this harness that round-trip is synchronous — so the run is driven
+    // under a router with no task route, modelling the real distributed window
+    // between the run proposing and the task accepting: the assignment already
+    // reached the run when the task was created, delivery of the proposal is
+    // left owed, and the proposal stands (`exchange-no-route` is a delivery
+    // failure, not a transition failure, so the run does not complete).
+    let undelivered = rakka_agent::AgentExchangeRouter::new();
+    let mut run = fx.run();
+    run.recover(fx.now()).await.expect("the run recovers");
+    run.settle_side_effects(&undelivered, fx.now())
+        .await
+        .expect("the model effect dispatches");
+    fx.dispatcher
+        .drive(&mut run, &undelivered, fx.now())
+        .await
+        .expect("the model call is answered and the loop settles to its proposal");
+
+    // Precondition: a pending, undelivered proposal on a still-active run, no
+    // blocking effect, and no cancellation yet.
+    let before = agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert!(
+        before.has_pending_proposal,
+        "the run must owe its task a result proposal before it is cancelled"
+    );
+    assert_eq!(
+        before.run.as_ref().map(|run| run.status),
+        Some(AgentRunStatus::Running),
+        "the run is still active — the proposal was never accepted"
+    );
+    assert!(before.pending_effects.is_empty(), "no effect is in flight");
+    assert_eq!(before.cancellation, AgentCancellationProgress::NotRequested);
+
+    run.apply(
+        AgentRunEntityCommand::Cancel {
+            operation_id: cancel_operation_id("cancel-proposal"),
+            reason: "operator-requested".to_string(),
+        },
+        &undelivered,
+        fx.now(),
+    )
+    .await
+    .expect("the cancellation request is accepted");
+
+    let snapshot = agent_operational_snapshot(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    assert!(
+        snapshot.has_pending_proposal,
+        "the proposal still stands after the cancellation request"
+    );
+    assert_eq!(
+        snapshot.cancellation,
+        AgentCancellationProgress::Requested,
+        "an outstanding proposal is work still resolving, never a quiesced run"
+    );
+}
+
 /// The session view joins the snapshot with the sink's decision events and is
 /// explicit about freshness; a failing sink degrades only the projection half,
 /// never the authoritative one.

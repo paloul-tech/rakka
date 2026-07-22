@@ -108,7 +108,13 @@ impl AgentCancellationProgress {
         {
             return Self::WaitingForReconciliation;
         }
-        if effects.iter().any(|effect| effect.blocks_settlement()) {
+        // "Still resolving" is the run's own settlement gate, not the effect set
+        // alone: a cancelling run whose effects have all resolved can still owe
+        // an outstanding result proposal to its task, which the task may yet
+        // accept or reject ([`AgentLoopState::awaits_settlement`]). Reading
+        // effects only would report `Quiesced` — "nothing the run started is
+        // still in flight" — while that proposal is exactly such work.
+        if run.loop_state.awaits_settlement() {
             return Self::Requested;
         }
         Self::Quiesced
