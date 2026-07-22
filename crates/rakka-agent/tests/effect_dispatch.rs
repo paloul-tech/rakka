@@ -1547,7 +1547,10 @@ async fn the_pipeline_survives_any_fleet_store_loss_under_one_idempotency_key() 
 
 // ---------------------------------------------------------------------------
 // Scenario 23's dispatcher-restart half: the persisted trace segments and the
-// durable outcome are identical across a dispatcher kill at every window.
+// durable outcome are identical across a dispatcher kill at every window —
+// including the delivered-but-unsettled one, where the fresh worker must
+// settle the row its re-read intent shows resolved, not invoke the target
+// again.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1619,6 +1622,7 @@ async fn dispatcher_restart_preserves_segments_and_outcome_at_every_window() {
         AgentDispatchWindow::BeforeStarted,
         AgentDispatchWindow::AfterStarted,
         AgentDispatchWindow::AfterInvocation,
+        AgentDispatchWindow::AfterResultDelivery,
     ] {
         let fx = traced_fixture();
         drive_traced(&fx).await;
@@ -1631,6 +1635,7 @@ async fn dispatcher_restart_preserves_segments_and_outcome_at_every_window() {
             .await
             .expect("the pass runs");
         assert!(pass.died, "the probe kills the worker at {window:?}");
+        let calls_at_death = fx.tools.invocation_count(TOOL);
 
         // A fresh worker recovers from durable state alone.
         fx.expire_lease();
@@ -1641,5 +1646,29 @@ async fn dispatcher_restart_preserves_segments_and_outcome_at_every_window() {
             observed, expected,
             "a dispatcher restart at {window:?} changed a segment or the outcome"
         );
+
+        if window == AgentDispatchWindow::AfterResultDelivery {
+            // The run already durably held the tool's word when the worker
+            // died, so segment/outcome equality alone cannot tell settlement
+            // apart from a re-invocation the run's dedup absorbed. Recovery
+            // must settle the delivered-but-unsettled row from the re-read
+            // intent without touching the target again, and must not leave
+            // the ticket claimable forever.
+            assert_eq!(
+                fx.tools.invocation_count(TOOL),
+                calls_at_death,
+                "recovery re-invoked a tool whose result the run already holds"
+            );
+            fx.expire_lease();
+            let sweep = fx
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .expect("the post-recovery pass runs");
+            assert_eq!(
+                sweep.claimed, 0,
+                "recovery left the delivered ticket claimable"
+            );
+        }
     }
 }
