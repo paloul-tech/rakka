@@ -12,7 +12,7 @@
 //! never calls a model; it persists an effect and waits, which is the whole point
 //! of specification 9.5.
 
-use rakka_agent::testkit::{run_entity, CrashPoint, ScriptedDispatcher};
+use rakka_agent::testkit::{run_entity, sweep_crash_points, CrashPoint, ScriptedDispatcher};
 use rakka_agent::{load_agent_run_state, AgentSchemaPolicy};
 use rakka_agent::{
     AgentLoopPhase, AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind,
@@ -127,65 +127,64 @@ async fn restart_after_every_loop_transition_resumes_correctly() {
 
     // Then kill the run's owner at each of those writes, on both sides of the
     // compare-and-set, and re-drive from durable state alone.
-    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
-        for nth in 1..=writes {
-            let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
-            fx.instantiate_agent().await;
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+        fx.instantiate_agent().await;
 
-            fx.runs.crash_at(nth, point);
-            fx.create_task().await;
-            // The crash may surface here or on a later pass; either way the run's
-            // owner is gone and nothing in memory survives it.
-            let _crashed = fx.pump().await;
+        fx.runs.crash_at(nth, point);
+        fx.create_task().await;
+        // The crash may surface here or on a later pass; either way the run's
+        // owner is gone and nothing in memory survives it.
+        let _crashed = fx.pump().await;
 
-            // A new owner activates and finds only what was durably committed.
-            fx.runs.survive();
-            fx.pump().await.unwrap_or_else(|error| {
-                panic!("crash {point:?} at write {nth} did not converge: {error}")
-            });
+        // A new owner activates and finds only what was durably committed.
+        fx.runs.survive();
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
 
-            let run = fx
-                .run_snapshot()
-                .await
-                .unwrap_or_else(|| panic!("crash {point:?} at write {nth}: the run was lost"));
-            assert_eq!(
-                run.status,
-                AgentRunStatus::Completed,
-                "crash {point:?} at write {nth} should still complete"
-            );
-            assert_eq!(
-                run.accepted_result
-                    .as_ref()
-                    .and_then(|result| result.content.inline_value()),
-                Some(&serde_json::json!({ "answer": "resolved" })),
-                "crash {point:?} at write {nth} should accept the same result"
-            );
+        let run = fx
+            .run_snapshot()
+            .await
+            .unwrap_or_else(|| panic!("crash {point:?} at write {nth}: the run was lost"));
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.accepted_result
+                .as_ref()
+                .and_then(|result| result.content.inline_value()),
+            Some(&serde_json::json!({ "answer": "resolved" })),
+            "crash {point:?} at write {nth} should accept the same result"
+        );
 
-            let task = fx.task_snapshot().await;
-            assert_eq!(
-                task.status,
-                AgentTaskStatus::Completed,
-                "crash {point:?} at write {nth} should complete the task exactly once"
-            );
-            assert_eq!(
-                task.rejection_count, 0,
-                "crash {point:?} at write {nth} must not re-validate the proposal"
-            );
+        let task = fx.task_snapshot().await;
+        assert_eq!(
+            task.status,
+            AgentTaskStatus::Completed,
+            "crash {point:?} at write {nth} should complete the task exactly once"
+        );
+        assert_eq!(
+            task.rejection_count, 0,
+            "crash {point:?} at write {nth} must not re-validate the proposal"
+        );
 
-            // The effect id is derived from the run and the turn, so a re-driven
-            // dispatch names the same effect. A restart therefore cannot make the
-            // model run twice ([specification 15]).
-            assert_eq!(
-                fx.dispatched_effects(),
-                1,
-                "crash {point:?} at write {nth} dispatched a duplicate effect"
-            );
-            assert_eq!(
-                run.turn, 1,
-                "crash {point:?} at write {nth} replayed a turn it had already taken"
-            );
-        }
-    }
+        // The effect id is derived from the run and the turn, so a re-driven
+        // dispatch names the same effect. A restart therefore cannot make the
+        // model run twice ([specification 15]).
+        assert_eq!(
+            fx.dispatched_effects(),
+            1,
+            "crash {point:?} at write {nth} dispatched a duplicate effect"
+        );
+        assert_eq!(
+            run.turn, 1,
+            "crash {point:?} at write {nth} replayed a turn it had already taken"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

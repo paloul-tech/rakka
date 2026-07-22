@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    run_entity, CrashPoint, CrashingStateStore, DeferredExchangeRouter, ExchangeFault,
+    run_entity, sweep_crash_points, CrashingStateStore, DeferredExchangeRouter, ExchangeFault,
     InProcessRunEntityTransport, InProcessTaskEntityTransport, ScriptedDispatcher,
 };
 use rakka_agent::{
@@ -501,42 +501,41 @@ async fn losing_the_run_at_any_write_of_the_result_exchange_converges() {
     let writes = reference.runs.writes();
     assert!(writes >= 5);
 
-    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
-        for nth in 1..=writes {
-            let fx = Fixture::new(ScriptedDispatcher::new().with_turn(valid_turn("resolved")));
-            fx.instantiate_agent().await;
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new(ScriptedDispatcher::new().with_turn(valid_turn("resolved")));
+        fx.instantiate_agent().await;
 
-            fx.runs.crash_at(nth, point);
-            fx.create_task().await;
-            let _crashed = fx.pump().await;
+        fx.runs.crash_at(nth, point);
+        fx.create_task().await;
+        let _crashed = fx.pump().await;
 
-            fx.runs.survive();
-            fx.pump().await.unwrap_or_else(|error| {
-                panic!("run crash {point:?} at write {nth} did not converge: {error}")
-            });
+        fx.runs.survive();
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("run crash {point:?} at write {nth} did not converge: {error}")
+        });
 
-            assert_eq!(
-                fx.run_snapshot().await.status,
-                AgentRunStatus::Completed,
-                "run crash {point:?} at write {nth}"
-            );
-            assert_eq!(
-                fx.task_snapshot().await.status,
-                AgentTaskStatus::Completed,
-                "run crash {point:?} at write {nth}"
-            );
-            assert_eq!(
-                fx.history_count(AgentTaskHistoryKind::ResultProposed).await,
-                1,
-                "run crash {point:?} at write {nth} caused a second validation"
-            );
-            assert_eq!(
-                fx.history_count(AgentTaskHistoryKind::ResultAccepted).await,
-                1,
-                "run crash {point:?} at write {nth} caused a duplicate completion"
-            );
-        }
-    }
+        assert_eq!(
+            fx.run_snapshot().await.status,
+            AgentRunStatus::Completed,
+            "run crash {point:?} at write {nth}"
+        );
+        assert_eq!(
+            fx.task_snapshot().await.status,
+            AgentTaskStatus::Completed,
+            "run crash {point:?} at write {nth}"
+        );
+        assert_eq!(
+            fx.history_count(AgentTaskHistoryKind::ResultProposed).await,
+            1,
+            "run crash {point:?} at write {nth} caused a second validation"
+        );
+        assert_eq!(
+            fx.history_count(AgentTaskHistoryKind::ResultAccepted).await,
+            1,
+            "run crash {point:?} at write {nth} caused a duplicate completion"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -556,49 +555,48 @@ async fn losing_the_task_at_any_write_of_the_result_exchange_converges() {
     let writes = reference.tasks.writes();
     assert!(writes >= 3);
 
-    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
-        for nth in 1..=writes {
-            let fx = Fixture::new(ScriptedDispatcher::new().with_turn(valid_turn("resolved")));
-            fx.instantiate_agent().await;
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new(ScriptedDispatcher::new().with_turn(valid_turn("resolved")));
+        fx.instantiate_agent().await;
 
-            fx.tasks.crash_at(nth, point);
-            fx.create_task().await;
-            let _crashed = fx.pump().await;
+        fx.tasks.crash_at(nth, point);
+        fx.create_task().await;
+        let _crashed = fx.pump().await;
 
-            fx.tasks.survive();
-            // The ingress re-delivers its command, because the ingress is what owns
-            // the creation exchange: a task whose owner died before the creation
-            // committed does not exist, and nothing inside the runtime can invent
-            // it. The command is deduplicated on the operation id the ingress
-            // minted, so a task that *did* commit is not created a second time
-            // ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
-            fx.create_task().await;
-            fx.pump().await.unwrap_or_else(|error| {
-                panic!("task crash {point:?} at write {nth} did not converge: {error}")
-            });
+        fx.tasks.survive();
+        // The ingress re-delivers its command, because the ingress is what owns
+        // the creation exchange: a task whose owner died before the creation
+        // committed does not exist, and nothing inside the runtime can invent
+        // it. The command is deduplicated on the operation id the ingress
+        // minted, so a task that *did* commit is not created a second time
+        // ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+        fx.create_task().await;
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("task crash {point:?} at write {nth} did not converge: {error}")
+        });
 
-            let task = fx.task_snapshot().await;
-            assert_eq!(
-                task.status,
-                AgentTaskStatus::Completed,
-                "task crash {point:?} at write {nth}"
-            );
-            assert_eq!(
-                task.rejection_count, 0,
-                "task crash {point:?} at write {nth} re-validated an accepted proposal"
-            );
-            assert_eq!(
-                fx.run_snapshot().await.status,
-                AgentRunStatus::Completed,
-                "task crash {point:?} at write {nth}"
-            );
-            assert_eq!(
-                fx.history_count(AgentTaskHistoryKind::ResultAccepted).await,
-                1,
-                "task crash {point:?} at write {nth} caused a duplicate completion"
-            );
-        }
-    }
+        let task = fx.task_snapshot().await;
+        assert_eq!(
+            task.status,
+            AgentTaskStatus::Completed,
+            "task crash {point:?} at write {nth}"
+        );
+        assert_eq!(
+            task.rejection_count, 0,
+            "task crash {point:?} at write {nth} re-validated an accepted proposal"
+        );
+        assert_eq!(
+            fx.run_snapshot().await.status,
+            AgentRunStatus::Completed,
+            "task crash {point:?} at write {nth}"
+        );
+        assert_eq!(
+            fx.history_count(AgentTaskHistoryKind::ResultAccepted).await,
+            1,
+            "task crash {point:?} at write {nth} caused a duplicate completion"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

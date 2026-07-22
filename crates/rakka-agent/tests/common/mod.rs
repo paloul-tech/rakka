@@ -8,9 +8,10 @@
 //! is already a restart.
 //!
 //! The fixture is generic over the model adapter its [`ScriptedDispatcher`]
-//! answers with, and its run store is a [`CrashingStateStore`], which behaves
-//! as a plain in-memory store until a test arms a [`CrashPoint`]
-//! (`fx.runs.crash_at(..)`) — one fixture serves the happy path, the adapter
+//! answers with, and every durable store — task, agent, and run — is a
+//! [`CrashingStateStore`], which behaves as a plain in-memory store until a
+//! test arms a [`CrashPoint`] (`fx.runs.crash_at(..)`, `fx.tasks.crash_at(..)`,
+//! `fx.agents.crash_at(..)`) — one fixture serves the happy path, the adapter
 //! matrix, and the crash matrix alike.
 
 // Each integration-test binary compiles this module independently and uses a
@@ -40,12 +41,13 @@ use rakka_agent::{
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
 };
-use rakka_persistence::InMemoryDurableStateStore;
 
-/// Durable store for the task entity class.
-pub type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
-/// Durable store for the agent entity class.
-pub type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
+/// Durable store for the task entity class; a pass-through until a crash
+/// point is armed.
+pub type TaskStore = CrashingStateStore<AgentTaskState>;
+/// Durable store for the agent entity class; a pass-through until a crash
+/// point is armed.
+pub type AgentStore = CrashingStateStore<AgentEntityState>;
 /// Durable store for the run entity class; a pass-through until a crash point
 /// is armed.
 pub type RunStore = CrashingStateStore<AgentRunState>;

@@ -19,8 +19,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe, RecordingToolExecutor,
-    ScriptedCredentialResolver, ScriptedDispatcher, ScriptedReconciler, SharedAtomicWorkflowClock,
+    CrashingStateStore, DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe,
+    RecordingToolExecutor, ScriptedCredentialResolver, ScriptedDispatcher, ScriptedReconciler,
+    SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
     AgentBudgetCeilings, AgentCredentialBindingRef, AgentDispatchWindow, AgentEffectResolution,
@@ -35,14 +36,13 @@ use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::{
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId,
 };
-use rakka_persistence::InMemoryDurableStateStore;
 
 mod common;
 
 use common::*;
 
-type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
-type FleetStore = InMemoryDurableStateStore<AgentDispatcherFleetState>;
+type WorkflowStore = CrashingStateStore<WorkflowState>;
+type FleetStore = CrashingStateStore<AgentDispatcherFleetState>;
 type WorkflowSink = WorkflowAgentRunEffectSink<WorkflowStore, SharedAtomicWorkflowClock>;
 type Pipeline =
     AgentRunEffectDispatcher<WorkflowStore, FleetStore, RunStore, SharedAtomicWorkflowClock>;
@@ -225,6 +225,70 @@ impl DispatchFixture {
             }
         }
         panic!("the dispatch pump did not quiesce");
+    }
+
+    /// [`Self::settle`], but surfacing the first error instead of panicking —
+    /// what a sweep needs, because an armed [`CrashingStateStore`] kills the
+    /// owner mid-settle and the injected loss is the point, not a failure.
+    async fn try_settle(&self) -> Result<(), String> {
+        let now = self.fx.now();
+        let mut task = rakka_agent::AgentTaskEntityStore::new(
+            task_scope(),
+            self.fx.tasks.clone(),
+            self.fx.agents.clone(),
+            self.fx.history.clone(),
+        );
+        task.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        task.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+
+        let now = self.fx.now();
+        let mut run = self.fx.run();
+        run.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        run.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        Ok(())
+    }
+
+    /// [`Self::pump`], but surfacing the first error instead of panicking,
+    /// under the same sweep contract as [`Self::try_settle`]. Reads only
+    /// durable state, so calling it after a crash is the same operation as
+    /// calling it after a success.
+    async fn try_pump(&self) -> Result<(), String> {
+        for _round in 0..16 {
+            self.try_settle().await?;
+            let pass = self
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let terminal = {
+                let mut run = self.fx.run();
+                run.recover(self.fx.now())
+                    .await
+                    .map_err(|error| error.code().to_string())?;
+                run.snapshot()
+                    .map_err(|error| error.code().to_string())?
+                    .is_some_and(|snapshot| snapshot.status.is_terminal())
+            };
+            if terminal {
+                return Ok(());
+            }
+            if pass.registered == 0
+                && pass.claimed == 0
+                && pass.delivered == 0
+                && pass.cancelled == 0
+            {
+                return Ok(());
+            }
+        }
+        Err("the dispatch pump did not quiesce".to_string())
     }
 
     /// The run-side status of the first effect of the given turn slot.

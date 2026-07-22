@@ -2136,13 +2136,45 @@ pub enum CrashPoint {
     AfterWrite,
 }
 
+/// Runs one recovery scenario once per (write, crash point): the exhaustive
+/// owner-kill sweep of the M1 acceptance suite.
+///
+/// `writes` is the durable write count a crash-free reference run of the same
+/// flow observed; the sweep then kills the owner at every one of those writes,
+/// on both sides of the compare-and-set. The closure owns everything
+/// scenario-specific: it builds a fresh fixture, arms exactly one
+/// [`CrashingStateStore`] with `crash_at(nth, point)`, drives the flow to the
+/// injected loss (ignoring the surfaced error), calls `survive()`, re-drives
+/// from durable state alone, and asserts the scenario's exactly-once
+/// invariants — including `nth` and `point` in its panic messages so a
+/// failing window names itself.
+///
+/// The harness owns only the loop skeleton. It takes no store list because a
+/// faithful sweep iteration builds its fixture *inside* the closure — the
+/// stores do not exist until then. A flow whose crash windows span several
+/// stores is swept by one call per store, each against that store's own
+/// reference write count.
+pub async fn sweep_crash_points<F, Fut>(writes: usize, scenario: F)
+where
+    F: Fn(usize, CrashPoint) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
+        for nth in 1..=writes {
+            scenario(nth, point).await;
+        }
+    }
+}
+
 /// A durable state store whose owner dies at the *n*-th write.
 ///
 /// Nothing else about it is special, and that is the point: whatever it has
 /// already committed is exactly what a real owner finds on the next activation,
 /// so re-materializing an entity over it is a faithful restart.
 ///
-/// Slice 1.14 extends these crash points across the rest of the M1 suite.
+/// Every store class in the M1 suite — run, task, agent, workflow outbox, and
+/// dispatcher fleet — is wrapped in one of these, and [`sweep_crash_points`]
+/// drives the kill through every write of a flow.
 pub struct CrashingStateStore<S>
 where
     S: rakka_persistence::DurableState,
