@@ -1876,6 +1876,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-durable-agent-acceptance"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "a2a-server-lf",
+ "rakka-a2a",
+ "rakka-agent",
+ "rakka-agent-workflow",
+ "rakka-core",
+ "rakka-persistence",
+ "rakka-sharding",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-durable-counter"
 version = "0.1.0"
 dependencies = [

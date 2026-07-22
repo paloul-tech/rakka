@@ -1276,11 +1276,33 @@ async fn an_effect_policy_weaker_than_the_adapters_declaration_fails_closed_at_d
 // 1.14).
 // ---------------------------------------------------------------------------
 
+/// The M1 per-turn durable-write budget: what one clean model turn — accept
+/// the assignment, commit the model effect, ticket it, claim it, invoke,
+/// deliver the turn, propose the result, accept it, settle the escrow —
+/// costs each durable store, measured from task creation through acceptance.
+///
+/// These are exact counts, not ceilings, and the assertions below are
+/// deliberate change-detectors: phases 3-5 multiply write load, so a
+/// legitimate pipeline change must re-derive the number consciously — update
+/// the constant *and* the recorded budget in
+/// `examples/durable-agent-acceptance/README.md` together — rather than let
+/// the per-turn cost creep silently. Wall-clock latency is printed but never
+/// asserted; the release-build numbers are recorded in the same README, with
+/// this test as the reproduction command.
+const TURN_BUDGET_RUN_STORE_WRITES: usize = 10;
+/// The task store's share of the budget: creation with its assignment
+/// decision, the run's acceptance, the result proposal's decision, and the
+/// escrow settlement and return.
+const TURN_BUDGET_TASK_STORE_WRITES: usize = 8;
+/// The workflow outbox's share: register the ticket, mark it dispatching,
+/// settle it.
+const TURN_BUDGET_WORKFLOW_STORE_WRITES: usize = 3;
+
 #[tokio::test]
 async fn per_turn_durable_write_count_and_latency_measurement() {
-    // One clean model turn, end to end over the integrated pipeline: accept
-    // the assignment, commit the model effect, ticket it, claim it, invoke,
-    // deliver the turn, propose the result, and let the task accept it.
+    // One clean model turn, end to end over the integrated pipeline. The
+    // fixture instantiates the agent first; the counters reset there, so the
+    // budget is exactly "one accepted turn, creation through acceptance".
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
         default_registry(),
@@ -1288,45 +1310,47 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
+    fx.fx
+        .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+        .await;
+    fx.fx.runs.reset_writes();
+    fx.fx.tasks.reset_writes();
+    fx.workflow_store.reset_writes();
+
     let started = std::time::Instant::now();
-    fx.start().await;
+    fx.fx.create_task().await;
     fx.pump().await;
     let elapsed = started.elapsed();
 
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
 
-    // Durable writes per store. The run and task stores count compare-and-sets
-    // directly; the workflow and fleet stores expose them as their final
-    // record revision.
+    // Every store counts its compare-and-sets directly. The fleet store is
+    // deliberately not budgeted: its lease bookkeeping scales with worker
+    // churn, not with turns.
     let run_writes = fx.fx.runs.writes();
-    let workflow_revision = {
-        use rakka_persistence::DurableStateStore;
-        let inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
-            rakka_agent::workflow_run_id(&run_scope()),
-            fx.workflow_store.clone(),
-            fx.wf_clock.clone(),
-        );
-        let persistence_id = inbox.inner().persistence_id().clone();
-        fx.workflow_store
-            .load(&persistence_id)
-            .await
-            .expect("the workflow state loads")
-            .map(|record| record.revision.get())
-            .unwrap_or(0)
-    };
+    let task_writes = fx.fx.tasks.writes();
+    let workflow_writes = fx.workflow_store.writes();
     println!(
         "one full turn (accept -> model effect -> ticket -> claim -> invoke -> deliver -> \
-         propose -> accept): run-store writes = {run_writes}, workflow-store revision = \
-         {workflow_revision}, wall time = {elapsed:?}"
+         propose -> accept): run-store writes = {run_writes}, task-store writes = \
+         {task_writes}, workflow-store writes = {workflow_writes}, wall time = {elapsed:?}"
     );
 
-    // A loose ceiling so a future change that multiplies the per-turn write
-    // count cannot land silently; the real budget is set in slice 1.14.
-    assert!(
-        run_writes <= 16,
-        "one turn made {run_writes} run-store writes; the durable-boundary design expects \
-         well under 16"
+    assert_eq!(
+        run_writes, TURN_BUDGET_RUN_STORE_WRITES,
+        "the per-turn run-store budget moved; a deliberate pipeline change must re-derive \
+         the budget constant and the example README together"
+    );
+    assert_eq!(
+        task_writes, TURN_BUDGET_TASK_STORE_WRITES,
+        "the per-turn task-store budget moved; a deliberate pipeline change must re-derive \
+         the budget constant and the example README together"
+    );
+    assert_eq!(
+        workflow_writes, TURN_BUDGET_WORKFLOW_STORE_WRITES,
+        "the per-turn workflow-store budget moved; a deliberate pipeline change must \
+         re-derive the budget constant and the example README together"
     );
 }
 
