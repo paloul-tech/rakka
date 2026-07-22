@@ -1414,6 +1414,77 @@ Spec: [15](spec.md#15-passivation-recovery-and-shard-movement),
 
 Done when: every M1 scenario passes under fault injection and the acceptance
 checklist is demonstrated by the example.
+**Done (2026-07-22):** the four owed scenarios are proven — 4
+(`tests/stale_owner_fencing.rs`: a stale owner's write is rejected by the
+revision fence on both the run and the task, then answered from the
+authoritative record; the transport half of movement remains scenario 60's
+2-node proof), 19 (`tests/terminal_run_recovery.rs`: terminal recovery is
+*writeless*, proven by arming a permanent crash point so any attempted write
+fails loudly), 35 (`tests/goal_passivation.rs`), and 46
+(`tests/idle_agent_reactivation.rs`) — and the full M1 regression re-proves
+every previously landed scenario under owner-kill injection at every durable
+write via the `sweep_crash_points` testkit harness, with every store class
+(run, task, agent, workflow outbox, dispatcher fleet) crash-armable. Notes:
+
+- **Scenario 35's M1 interpretation is pinned in the test doc.** `goal.rs`
+  stays a doc-only stub, so "an `Active` goal" is a non-terminal root task
+  carrying an `AgentGoalId` and "its waiting runs" is its run parked on the
+  durable approval wait; all three real sharded entity types passivate to a
+  local entity count of zero and one durable decision command reactivates
+  the correct owner exactly once. Timer-driven wakes stay in phase 3.
+  Scenario 46 uses the real idle timer and is open decision 20's proof: no
+  lifecycle command is issued, and the dependency-outcome command is the
+  durable trigger the later coordination couriers will inject.
+- **Scenarios 35/46 and the example run over `LocalShardedExchangeRoute`**,
+  a testkit transport mirroring exactly the local arm of the production
+  `ShardedExchangeRoute`, so the M1 gate never silently skips in sandboxes
+  the TCP route cannot run in.
+- **The sharded run factory gained `with_memory`.** The acceptance walk
+  found the gap: metrics and decision events were wired into the sharded
+  factory in slice 1.13, but session memory was not, so a sharded run —
+  the production driver — could not persist the context spec 22 requires.
+  Fixed in-slice, mirroring `with_metrics`.
+- **The per-turn durable-write budget is pinned exactly** in
+  `tests/effect_dispatch.rs`: 10 run-store, 8 task-store, and 3
+  workflow-outbox compare-and-sets per clean accepted turn (creation
+  through settled escrow; ~2 ms release-build wall time over in-memory
+  stores, recorded in the example README). The assertions are deliberate
+  change-detectors; the fleet store is unbudgeted because its lease
+  bookkeeping scales with worker churn, not turns.
+- **The acceptance statement is demonstrated end to end** by
+  `examples/durable-agent-acceptance`: one sharded Rakka Agent over real
+  `ClusterSharding` and all three entity types, the in-process A2A service
+  core, and the production dispatcher fleet, printing one stable line per
+  spec 22 bullet; the in-crate test asserts the transcript verbatim against
+  the const the README quotes. The item-by-item walk:
+
+| Spec 22 item | Status | Proof |
+| --- | --- | --- |
+| versioned settings | Met | example line 1; `agent_entity.rs` |
+| A2A task -> one `AgentTaskId` + initial run | Met | example line 2; scenario 1 swept (`agents_surface.rs`) |
+| typed result validated before completion | Met | example line 3; scenario 40 swept (`task_results.rs`) |
+| fail-closed admission; widening rejected | Met | example line 4; scenario 53 swept (`autonomy_admission.rs`) |
+| budgets reserved/settled durably | Met | example line 5; scenarios 52/61 swept (`escrow_ledger.rs`) |
+| addressable while fully passivated | Met | example line 6; scenario 35 (`goal_passivation.rs`) |
+| bounded Rig model turn through a dispatcher | Met | example line 7; `effect_dispatch.rs` |
+| correlated trace segments -> one session view | Met | example line 8; scenarios 21-23 swept (`trace_scenarios.rs`) |
+| bounded metrics, no high-cardinality IDs | Met | example line 9; scenario 25 (`agent_metrics.rs`) |
+| short-term session context persisted | Met | example line 10; scenarios 14/16/17 swept (`session_memory.rs`) |
+| each effectful tool call a separate durable effect | Met | example line 11; `run_entity.rs` |
+| pauses/passivates at an approval gate | Met | example line 12; scenario 3 swept (`checkpoint_run.rs`) |
+| recovers after owner and dispatcher pod loss | Met | example line 13; the owner-kill sweeps + scenarios 5-9 |
+| ambiguous non-idempotent -> indeterminate, no auto re-invoke | Met | example line 14; scenario 9 (`effect_dispatch.rs`) |
+| resume only after deduplicated reconciliation | Met | example line 15; scenarios 3/11 swept (`checkpoint_reconciliation.rs`) |
+| authoritative snapshot without telemetry | Met | example line 16; scenario 56 swept (`operational_query.rs`) |
+| no content/credentials in default telemetry | Met | example line 17; scenario 25 (`trace_scenarios.rs`) + example sentinels |
+| correct under unavailable export, loss visible | Met | example line 18; scenario 26 (`trace_scenarios.rs`) |
+
+  No item is deferred. The standing deferrals recorded by earlier slices are
+  unchanged: session retention/tombstones wait on open decision 7 (Phase 2,
+  slice 1.11 note), the content-capture opt-in policy object is Phase 6
+  (slice 1.13 note), and the A2A route mounting, binary/URL parts, and
+  input-to-existing-task continuations keep their stable refusals (slice
+  1.12 note).
 
 ---
 

@@ -434,8 +434,8 @@ async fn the_traced_flow_survives_any_owner_loss_without_changing_behavior() {
             // Scenario 23/24: same durable outcome as the untraced reference.
             let run = fx.run_snapshot().await.expect("the run exists");
             assert_eq!(
-                (run.status, run.turn, run.budget.clone()),
-                (reference.status, reference.turn, reference.budget.clone()),
+                (run.status, run.turn, run.budget),
+                (reference.status, reference.turn, reference.budget),
                 "crash {point:?} at write {nth}: tracing or recovery changed effect behavior"
             );
 
