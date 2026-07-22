@@ -63,8 +63,8 @@ use crate::choreography::{
     AgentChoreographyError, AgentChoreographyResult, AgentEntityAddress, AgentEntityClass,
     AgentExchangeDeliveryError, AgentExchangeDeliveryFuture, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
-    AgentExchangePayload, AgentExchangeResult, AgentExchangeRouter, AgentExchangeState,
-    AgentExchangeTransition, AgentExchangeTransport,
+    AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
+    AgentExchangeState, AgentExchangeTransition, AgentExchangeTransport,
 };
 use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRevisionNumber};
 use crate::dispatch::{
@@ -2400,6 +2400,121 @@ impl AgentExchangeTransport for DeferredExchangeRouter {
                 ));
             };
             router.deliver(envelope).await
+        })
+    }
+}
+
+/// Routes exchanges to one class of sharded entity on a single-node system —
+/// the local arm of the production `ShardedExchangeRoute`, without the
+/// `rakka-remote` ask client the other arm needs.
+///
+/// It resolves the target's shard owner exactly as the production route does
+/// and asks the local entity through the same `build` closure, delivering the
+/// same envelope to the same durable [`AgentExchangeHost::accept`] — colocation
+/// changes the transport, never the durable path. An owner that is not local
+/// is an explicit error, because a single-node test that reaches that branch
+/// has mis-wired its sharding, not discovered a remote peer.
+pub struct LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message,
+{
+    sharding: rakka_sharding::ClusterSharding,
+    key: rakka_sharding::EntityTypeKey<M>,
+    ask_timeout: std::time::Duration,
+    #[allow(clippy::type_complexity)]
+    build: Arc<
+        dyn Fn(AgentExchangeEnvelope, rakka_core::ReplyTo<AgentExchangeReply>) -> M + Send + Sync,
+    >,
+}
+
+impl<M> Debug for LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalShardedExchangeRoute")
+            .field("entity_type", self.key.entity_type())
+            .field("ask_timeout", &self.ask_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message,
+{
+    /// Creates a route to one sharded entity type on the local node.
+    ///
+    /// `build` reconstructs the entity's own message from the envelope and a
+    /// node-local reply channel, exactly as the production route's does.
+    pub fn new(
+        sharding: rakka_sharding::ClusterSharding,
+        key: rakka_sharding::EntityTypeKey<M>,
+        ask_timeout: std::time::Duration,
+        build: impl Fn(AgentExchangeEnvelope, rakka_core::ReplyTo<AgentExchangeReply>) -> M
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            sharding,
+            key,
+            ask_timeout,
+            build: Arc::new(build),
+        }
+    }
+}
+
+impl<M> AgentExchangeTransport for LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message + Sync,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        Box::pin(async move {
+            let entity = self
+                .sharding
+                .entity_ref_for(
+                    &self.key,
+                    envelope.target().entity_id().as_str().to_string(),
+                )
+                .map_err(|error| {
+                    AgentExchangeDeliveryError::new("exchange-no-route", error.to_string())
+                })?;
+            let (owner, _shard) =
+                entity
+                    .region()
+                    .resolve(entity.entity_ref())
+                    .map_err(|error| {
+                        AgentExchangeDeliveryError::new("exchange-no-route", error.to_string())
+                    })?;
+            let is_local = entity
+                .region()
+                .local_node_id()
+                .is_some_and(|local| local == &owner);
+            if !is_local {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-not-local",
+                    format!(
+                        "the shard owner of {} is {owner:?}, which is not this node; \
+                         the local route serves single-node systems only",
+                        envelope.target().entity_id().as_str()
+                    ),
+                ));
+            }
+            let envelope = envelope.clone();
+            let build = self.build.clone();
+            entity
+                .ask(
+                    move |reply_to| (build)(envelope, reply_to),
+                    self.ask_timeout,
+                )
+                .await
+                .map_err(|error| {
+                    AgentExchangeDeliveryError::new("exchange-ask-failed", error.to_string())
+                })
         })
     }
 }
