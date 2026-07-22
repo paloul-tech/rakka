@@ -86,7 +86,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentTimestampMillis, ArtifactRef, StateSchemaVersion,
+    AgentCausationId, AgentCorrelationId, AgentTelemetryContext, AgentTimestampMillis, ArtifactRef,
+    StateSchemaVersion,
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ReplyTo,
@@ -2470,6 +2471,14 @@ pub struct AgentTaskCreation {
     pub parent: Option<AgentTaskId>,
     /// Dependencies declared with the creation.
     pub dependencies: Vec<AgentTaskDependencyDeclaration>,
+    /// Trace context of the ingress that created the task — what the A2A
+    /// surface extracted before durable acceptance
+    /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+    /// Context flows with commands: the creating transition records it, and
+    /// the assignment the task later owes carries it onward. Observability
+    /// only, never correctness; a creation without one starts a root.
+    #[serde(default)]
+    pub telemetry: AgentTelemetryContext,
 }
 
 /// The command an [`AgentExchangeKind::Assignment`] exchange carries to the run
@@ -2891,6 +2900,14 @@ pub struct AgentTask {
     /// [`crate::choreography::AgentExchangeParticipant::apply`] requires of
     /// every durable timestamp.
     pub created_at: AgentTimestampMillis,
+    /// Trace context of the ingress that created the task, held so the
+    /// assignment decided in a *later* transition can carry the causal chain
+    /// onward ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
+    /// Observability only, never correctness: a task persisted before this
+    /// field decodes to the empty context, and no transition reads it to
+    /// decide anything.
+    #[serde(default)]
+    pub telemetry: AgentTelemetryContext,
 }
 
 impl AgentTask {
@@ -3427,6 +3444,7 @@ fn create_task(
         last_rejection: None,
         terminal_reason: None,
         created_at: now,
+        telemetry: crate::observability::sanitize_agent_telemetry_context(creation.telemetry),
     };
     // Admission reserves growth headroom: a record accepted here must still be
     // able to hold everything its own lifecycle may add.
@@ -3863,6 +3881,9 @@ fn decide_assignment(
     // not fit belong behind an artifact reference, and the decision fails closed
     // rather than persisting an assignment whose command can never be delivered.
     let payload = AgentExchangePayload::encode(AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE, &command)?;
+    // The assignment carries the ingress's causal chain onward: the segment
+    // that created the task is the cause of the assignment it decided
+    // ([specification 17.5]). Stamping the empty context is stamping nothing.
     let envelope = AgentExchangeEnvelope::new(
         operation_id.clone(),
         AgentExchangeKind::Assignment,
@@ -3871,7 +3892,8 @@ fn decide_assignment(
         payload,
         AgentCorrelationId::new(operation_id.as_str()),
         now,
-    )?;
+    )?
+    .with_telemetry(task.telemetry.clone());
 
     task.assignment_generation = generation;
     task.assignments += 1;

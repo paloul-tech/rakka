@@ -56,8 +56,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::{
-    AgentAuditEventId, AgentEffectId, AgentTimestampMillis, ArtifactRef, HumanCheckpointId,
-    PrincipalRef, StateSchemaVersion,
+    AgentAuditEventId, AgentEffectId, AgentTelemetryContext, AgentTimestampMillis, ArtifactRef,
+    HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -698,6 +698,14 @@ pub struct AgentCheckpoint {
     applied_keys: VecDeque<AgentOperationId>,
     /// When the record last changed.
     pub updated_at: AgentTimestampMillis,
+    /// Trace context of the segment that opened the checkpoint — the parked
+    /// span the resolution segment links back to, alongside its link to the
+    /// resolving request, which is how a resume carries both causes
+    /// ([specification 17.11](../../../docs/plans/rakka-agent/spec.md)).
+    /// Observability only, never correctness: a checkpoint persisted before
+    /// this field decodes to the empty context, and resolution never reads it.
+    #[serde(default)]
+    pub telemetry: AgentTelemetryContext,
 }
 
 impl AgentCheckpoint {
@@ -744,9 +752,21 @@ impl AgentCheckpoint {
             audit_event_ids: Vec::new(),
             applied_keys: VecDeque::new(),
             updated_at: created_at,
+            telemetry: AgentTelemetryContext::default(),
         };
         checkpoint.validate()?;
         Ok(checkpoint)
+    }
+
+    /// Stamps the trace context of the segment opening this checkpoint.
+    ///
+    /// The context is admitted through
+    /// [`crate::observability::sanitize_agent_telemetry_context`]: strict on
+    /// write so the read side never has to fail closed over telemetry.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: AgentTelemetryContext) -> Self {
+        self.telemetry = crate::observability::sanitize_agent_telemetry_context(telemetry);
+        self
     }
 
     /// Attaches the task the run serves.

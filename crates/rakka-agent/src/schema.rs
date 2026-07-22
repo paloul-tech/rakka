@@ -116,6 +116,15 @@ pub const CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
 pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted
+/// [`crate::observability::AgentDecisionEvent`].
+///
+/// A decision event is a projection record, never the correctness source, but
+/// it is persisted with bounded retention and read back by the session view,
+/// so it evolves under the same fail-closed rule as every other record.
+pub const CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of a persisted [`crate::checkpoints::AgentCheckpoint`].
 ///
 /// A checkpoint outlives the effect generation it gates — it is resolved by a
@@ -177,11 +186,13 @@ pub enum AgentRecordKind {
     /// One immutable memory context snapshot a model effect was prepared
     /// against.
     MemoryContextSnapshot,
+    /// One structured loop-decision event, retained by a bounded sink.
+    DecisionEvent,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -201,6 +212,7 @@ impl AgentRecordKind {
         Self::Checkpoint,
         Self::SessionMemoryEntry,
         Self::MemoryContextSnapshot,
+        Self::DecisionEvent,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -226,6 +238,7 @@ impl AgentRecordKind {
             Self::Checkpoint => "agent-checkpoint",
             Self::SessionMemoryEntry => "agent-session-memory-entry",
             Self::MemoryContextSnapshot => "agent-memory-context-snapshot",
+            Self::DecisionEvent => "agent-decision-event",
         }
     }
 
@@ -252,6 +265,7 @@ impl AgentRecordKind {
             Self::Checkpoint => CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION,
             Self::SessionMemoryEntry => CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION,
             Self::MemoryContextSnapshot => CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+            Self::DecisionEvent => CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
         }
     }
 
@@ -276,6 +290,7 @@ impl AgentRecordKind {
             Self::Checkpoint => 16,
             Self::SessionMemoryEntry => 17,
             Self::MemoryContextSnapshot => 18,
+            Self::DecisionEvent => 19,
         }
     }
 }

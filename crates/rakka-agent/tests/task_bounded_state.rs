@@ -242,6 +242,7 @@ impl Fixture {
             goal: None,
             parent: None,
             dependencies: Vec::new(),
+            telemetry: Default::default(),
         };
 
         let mut entity = self.entity().await;
@@ -448,6 +449,7 @@ async fn the_widest_transition_never_loses_a_history_entry() {
         goal: None,
         parent: None,
         dependencies,
+        telemetry: Default::default(),
     };
 
     let mut entity = fx.entity().await;
@@ -686,6 +688,7 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
                         goal: None,
                         parent: None,
                         dependencies: Vec::new(),
+                        telemetry: Default::default(),
                     }),
                 },
                 &fx.task_router,
@@ -836,6 +839,7 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
                         // unreserved record used to be admitted and later found
                         // too large to assign.
                         dependencies: vec![AgentTaskDependencyDeclaration::new(upstream.clone())],
+                        telemetry: Default::default(),
                     }),
                 },
                 &fx.task_router,

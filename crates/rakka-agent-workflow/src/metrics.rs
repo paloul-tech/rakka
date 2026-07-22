@@ -762,19 +762,31 @@ pub fn validate_agent_metric_attributes(attributes: MetricAttributes<'_>) -> Age
                 key: (*key).to_string(),
             });
         }
-        if value.len() > AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES {
-            return Err(AgentMetricError::AttributeValueTooLarge {
-                key: (*key).to_string(),
-                value_len: value.len(),
-                limit: AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES,
-            });
-        }
-        if label_value_contains_line_break(value) {
-            return Err(AgentMetricError::UnboundedAttributeValue {
-                key: (*key).to_string(),
-                reason: "metric label values must be single-line bounded labels",
-            });
-        }
+        validate_agent_metric_attribute_value(key, value)?;
+    }
+    Ok(())
+}
+
+/// Validates one hot-metric attribute *value* — its length bound and its
+/// single-line rule — independent of the key vocabulary.
+///
+/// A layer that adds its own bounded key set (for example the `rakka-agent`
+/// domain metrics under `rakka.agent.*`) reuses this so a bounded key can never
+/// smuggle an unbounded or multi-line value, rather than reimplementing — and
+/// drifting from — the substrate's value bound.
+pub fn validate_agent_metric_attribute_value(key: &str, value: &str) -> AgentMetricResult<()> {
+    if value.len() > AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES {
+        return Err(AgentMetricError::AttributeValueTooLarge {
+            key: key.to_string(),
+            value_len: value.len(),
+            limit: AGENT_METRIC_ATTRIBUTE_VALUE_MAX_BYTES,
+        });
+    }
+    if label_value_contains_line_break(value) {
+        return Err(AgentMetricError::UnboundedAttributeValue {
+            key: key.to_string(),
+            reason: "metric label values must be single-line bounded labels",
+        });
     }
     Ok(())
 }

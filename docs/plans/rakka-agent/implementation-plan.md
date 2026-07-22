@@ -1201,7 +1201,197 @@ Guidance: [Agent Observability Architecture Guidance](technical-guidance.md#agen
   correct with telemetry unavailable ([spec 17.18](spec.md#1718-authoritative-operational-queries-and-observability-views)),
   plus the session view assembled by `AgentRunId`.
 
+**Design decisions resolved (2026-07-20, ahead of implementation) — the
+trace-context schema retrofit:**
+
+- **Telemetry context is additive, defaulted, and never fail-closed.** No
+  observability signal is a correctness source
+  ([spec 17.1](spec.md#171-signal-roles-and-correctness-boundary)), and that
+  has a schema corollary: an absent trace context must always be a legal
+  read — "nothing recorded", never "uninterpretable record". Every
+  retrofitted record therefore gains one `#[serde(default)]`
+  `AgentTelemetryContext` field, a pre-1.13 encoding decodes to the empty
+  context, and no record kind bumps its schema version — the fail-closed
+  N/N+1 windows of `schema.rs` guard against reinterpretation of correctness
+  fields, which this is not
+  ([spec 20](spec.md#20-compatibility-and-migration)). The precedent is
+  already in force: `AgentRunEffect` gained `execution_policy` (Slice 1.8)
+  and `guardrail_revision` (Slice 1.10) as defaulted optionals inside v1.
+  Writes stay strict where reads are permissive — inbound context passes the
+  existing `trace_context.rs` validation, and a malformed remote value is
+  dropped at the boundary, never persisted
+  ([spec 17.5](spec.md#175-durable-trace-context)).
+- **Four records carry the field, and one extraction point feeds them.** Only
+  a record that crosses or parks at an asynchronous durable boundary carries
+  context. `AgentExchangeEnvelope`: the initiator stamps its current
+  segment's context when the exchange commits to its journal; a re-drive
+  re-sends the persisted envelope, so the original context rides every
+  re-drive and the receiver's acceptance span links to the initiating
+  segment — one field covering inbox acceptance for all
+  [spec 9.8](spec.md#98-inter-entity-choreography) traffic (the reply does
+  not carry it: it returns to the initiator, who still holds the journal
+  entry). `AgentRunEffect`: the schedule -> dispatch boundary — the
+  dispatch-ticket conversion stops stamping an empty context and forwards
+  the run's context plus a link to the scheduling segment into the
+  substrate's existing `AgentEffect.telemetry_context` (no workflow-crate
+  schema change), and a new generation appends a link to the prior attempt.
+  `AgentCheckpoint`: captures the `checkpoint.open` segment's context so
+  resolution produces the
+  [spec 17.11](spec.md#1711-hitl-authorization-wait-and-recovery-observability)
+  double link — parked span from this field, trigger span from the
+  resolution command's inbound context; checkpoint timers need nothing new
+  because the substrate timer entry already persists context.
+  `AgentLoopState`: the plain-passivation boundary — a run quiescent with no
+  checkpoint or effect open still owes its resume span a link to the segment
+  that persisted the wait, and the loop state is the record that versions
+  independently precisely because it is the part that evolves. A2A ingress
+  adds no record: the agents surface extracts W3C context before durable
+  acceptance and hands it to the normalized-command derivation, and the
+  typed client injects on egress. Context always flows with commands — an
+  entity never invents one, and a command without context starts a root
+  segment.
+- **The exclusions are deliberate.** `SessionMemoryEntry` and
+  `MemoryContextSnapshot` are content records, not boundaries — a snapshot
+  is content-addressed, and ambient trace context would make identical
+  content hash differently; the span carries the snapshot digest instead
+  ([spec 17.10](spec.md#1710-memory-and-retrieval-observability)).
+  `AgentModelTurn` is produced inside one bounded dispatch attempt whose
+  effect record holds the correlation. Admission decisions and the escrow
+  ledger are synchronous sub-steps of an already-open segment —
+  [spec 17.6](spec.md#176-required-span-model) gives them bounded
+  spans/events, not propagation. Definition, settings, and setup revisions
+  outlive any legitimate trace; they correlate through the accepting
+  command's ingress span, `SettingsRevision` provenance, and audit events
+  ([spec 17.13](spec.md#1713-structured-logs-runtime-events-and-audit)).
+  Task history entries and the exchange journal correlate by operation and
+  causation id, which is what the scenario-21 session view joins on.
+- **Baggage is persisted empty at M1.** The shared context type has the
+  field, but the agent domain writes no baggage:
+  [spec 17.15](spec.md#1715-baggage) restricts it to policy-approved bounded
+  classes, no M1 component consumes any, and externally received baggage is
+  untrusted and never persisted.
+- **Proof obligations.** Scenario 23's context survival comes from the four
+  persisted fields, and its "without changing effect behavior" clause falls
+  out of the never-fail-closed rule — with a direct test that a context-less
+  v1 record replays identically through the effect path. Scenario 22's
+  double link is the checkpoint field plus the resolution command's context.
+  `schema_compatibility.rs` gains cases proving pre-1.13 encodings of all
+  four retrofitted records decode under the unchanged v1 window with the
+  empty context.
+
+**Design decisions resolved (2026-07-20, ahead of implementation) —
+segments, signals, and queries:**
+
+- **Open decision 11 is accepted, with the loop's own crank as the segment
+  boundary.** A bounded trace segment is one entity activation: durable
+  command acceptance through the settle pass that dispatches owed effects
+  and drives owed exchanges — the Slice 1.5 "the loop cranks; it does not
+  run" contract already names the boundary. The A2A `SERVER` span is its own
+  protocol segment ending with durable acceptance, and the activation it
+  caused links to it. The model call is not part of the turn segment: it is
+  an asynchronously dispatched effect, so it lives in the dispatcher's
+  `CONSUMER` segment, where one logical provider operation — including the
+  provider's automatic in-call retries — stays one GenAI span with retry
+  events ([spec 17.8](spec.md#178-model-and-provider-observability)). Every
+  durable asynchronous boundary (journal commit -> receiver acceptance,
+  effect schedule -> dispatch attempt, checkpoint open -> resolution,
+  passivation -> reactivation) splits segments, joined by the context and
+  links the retrofit above persists.
+- **Open decision 12 is accepted as structurally off at M1.** Content
+  capture is not a flag defaulting to false; no M1 code path emits content.
+  Telemetry records bounded metadata only — counts, sizes,
+  `AgentContentDigest` fingerprints, `RedactionStatus`, and artifact
+  references, all vocabulary the substrate already defines. The scoped
+  opt-in policy object of
+  [spec 17.14](spec.md#1714-content-capture-and-redaction) (tenant, purpose,
+  redaction, retention, audit) is deferred to Phase 6 with the rest of
+  production telemetry validation. Deferring the hook entirely is what makes
+  scenario 25 provable by construction rather than by configuration.
+- **Open decision 13 is accepted; the sampling policy ships as pinned
+  configuration, not code.** Rakka stays SDK-neutral, so sampling belongs to
+  the application SDK and the Collector: the shipped artifact is the
+  existing pinned agent-workflow Collector topology
+  (`kubernetes-otel-collector-topology.yaml`, `otel-collector-local.yaml`,
+  already validated by the `rakka-k8s` topology test), extended where needed
+  with the [spec 17.16](spec.md#1716-sampling) retain list — errors,
+  indeterminate effects, security denials, escalations, recovery failures,
+  slow traces. What the crate owes in code: sampling-relevant bounded
+  attributes at span creation, context propagation independent of any
+  recording decision, and the scenario-24 proof that sampling changes no
+  metric, audit record, runtime event, or durable transition.
+- **The metric vocabulary splits by layer, not by crate reach.** The
+  substrate keeps measuring the substrate: the `rakka.agent_workflow.*`
+  instruments (inbox, outbox, dispatcher backlog and in-flight, timers,
+  adapters) are untouched, and an agent effect riding that dispatcher is
+  counted there as transport. `rakka-agent` adds `rakka.agent.*` instruments
+  only where an agent-domain durable transition commits — decisions, turns,
+  waits, admission, budget, effect outcomes and indeterminates, recovery,
+  residency gauges — so one physical dispatch is never the same concern in
+  both vocabularies: the substrate measures the pipe, the domain measures
+  the outcome. The substrate's bounded/forbidden label guards are reused
+  unchanged, and no instrument labels an identifier
+  ([spec 17.12](spec.md#1712-metrics)).
+- **The snapshot's cancellation vocabulary is complete from M1; its emitters
+  are not.** `AgentOperationalSnapshot` defines all six
+  [spec 17.18](spec.md#1718-authoritative-operational-queries-and-observability-views)
+  progress states as a non-exhaustive enum from the first commit — the
+  contract is fixed even where a state is not yet reachable. M1 derives
+  `NotRequested`, `Requested`, `Quiesced`, `WaitingForReconciliation` (the
+  run's `Cancelling` holding an ambiguous consequential effect,
+  scenario 57), and `Completed` from durable run/effect/checkpoint state;
+  `Propagating` becomes derivable when delegation lands (Phase 4). Per
+  [spec 8.7](spec.md#87-cancellation-failure-and-waiting), no state is ever
+  inferred from mere acceptance of a cancellation request.
+- **Decision events get their own agent-domain record and sink; the A2A
+  replay stays the public stream.** The substrate's runtime events are
+  graph-shaped — node kinds, workflow correlation — so the
+  [spec 17.7](spec.md#177-agent-decision-observability) decision events do
+  not squeeze into them. `observability.rs` defines the bounded decision
+  record (kind, source, turn index, loop phase, revisions, budget outcome,
+  safety class, stable reason code) and a sink trait mirroring the
+  substrate's contract — emitted only after the durable transition, per-run
+  monotonic sequence, deduplicated per transition — with the crate's usual
+  in-memory implementation for tests. The scenario-21 session view joins
+  durable state, decision events, and trace links by `AgentRunId`; the
+  Slice 1.12 replayable subscription (cursors, bounded retention, explicit
+  resync) remains the public streaming surface and gains no second
+  machinery.
+
+**Amended as implemented (2026-07-21):**
+
+- **Two records joined the retrofit's carrier list as the flow was wired.**
+  `AgentTaskCreation` carries the ingress context (context flows with
+  commands), and the task's materialized state holds it — an exclusion-list
+  amendment forced by a fact the resolution had not weighed: the assignment
+  is decided in a *later* transition than the creation, so the envelope it
+  owes can only carry the ingress cause if the task state kept it. Same
+  rules as every carrier: `#[serde(default)]`, no version bump, never read
+  to decide anything. The choreography host propagates the causing
+  exchange's context onto owed envelopes that have none (accept and settle),
+  so the chain creation -> assignment -> run acceptance flows with no
+  per-participant work, and the run participant records the accepted
+  exchange's context into its loop state in the same compare-and-set.
+- **The operational snapshot is content-redacted.** The scenario 25 sentinel
+  sweep caught the run projection's proposal/accepted-result/feedback riding
+  into the point answer; the query strips them and reports the bounded
+  `has_pending_proposal` fact instead — content stays in durable state and
+  artifacts, the observability surface gets labels, counts, and references.
+- **Ingress and egress are the W3C text-map keys on A2A request metadata.**
+  `normalize_agent_send`/`normalize_agent_cancel` extract
+  `traceparent`/`tracestate` case-insensitively before anything durable
+  happens, dropping malformed context whole without refusing the send; the
+  typed client's A2A transport injects the caller's context under the same
+  keys. The HTTP-header edge binding lands with the deferred route mounting
+  of slice 1.12.
+
 Done when: scenarios 21-26 and 56 pass.
+**Done (2026-07-21):** all seven scenario proofs pass — 21 and 56 over the
+real entities (`tests/decision_events.rs`, `tests/operational_query.rs`), 22,
+23, 24, 25, and 26 over the traced end-to-end flow
+(`tests/trace_scenarios.rs`, with the schema half of 23 in
+`tests/telemetry_context.rs` and the metric half of 25 in
+`tests/agent_metrics.rs`); the slice 1.14 regression re-proves the set under
+fault injection.
 
 ### Slice 1.14 — Recovery suite, fault injection, and M1 acceptance
 

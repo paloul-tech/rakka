@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
+use rakka_core::MetricsRecorder;
 use rakka_persistence::DurableStateStore;
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +83,7 @@ use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
 };
+use crate::observability::AgentDecisionEventSink;
 use crate::run::{
     AgentRunEntityCommand, AgentRunEntityReply, AgentRunEntityStore, AgentRunError, AgentRunState,
 };
@@ -1002,6 +1004,8 @@ where
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
+    decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
+    metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     acceptances: Arc<AtomicUsize>,
 }
@@ -1019,6 +1023,8 @@ where
             clock: self.clock.clone(),
             policies: self.policies.clone(),
             memory: self.memory.clone(),
+            decisions: self.decisions.clone(),
+            metrics: self.metrics.clone(),
             faults: self.faults.clone(),
             acceptances: self.acceptances.clone(),
         }
@@ -1045,6 +1051,8 @@ where
             clock,
             policies: AgentEffectPolicies::default(),
             memory: Arc::new(Mutex::new(None)),
+            decisions: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
@@ -1063,6 +1071,27 @@ where
             .memory
             .lock()
             .expect("the memory slot should not be poisoned") = Some(memory);
+    }
+
+    /// Wires every run entity this transport builds with a decision-event
+    /// sink, under the same shared-slot rule as [`Self::install_memory`]:
+    /// every driver of a run must share one wiring, because an entity that
+    /// advances the loop unwired records no decisions for the transitions it
+    /// commits.
+    pub fn install_decisions(&self, sink: Arc<dyn AgentDecisionEventSink>) {
+        *self
+            .decisions
+            .lock()
+            .expect("the decision slot should not be poisoned") = Some(sink);
+    }
+
+    /// Wires every run entity this transport builds with a metrics recorder,
+    /// under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_metrics(&self, metrics: Arc<dyn MetricsRecorder>) {
+        *self
+            .metrics
+            .lock()
+            .expect("the metrics slot should not be poisoned") = Some(metrics);
     }
 
     /// Uses explicit effect specs for the effects hosted runs commit.
@@ -1139,6 +1168,22 @@ where
                 .clone();
             if let Some(memory) = memory {
                 entity = entity.with_memory(memory);
+            }
+            let decisions = self
+                .decisions
+                .lock()
+                .expect("the decision slot should not be poisoned")
+                .clone();
+            if let Some(decisions) = decisions {
+                entity = entity.with_decision_events(decisions);
+            }
+            let metrics = self
+                .metrics
+                .lock()
+                .expect("the metrics slot should not be poisoned")
+                .clone();
+            if let Some(metrics) = metrics {
+                entity = entity.with_metrics(metrics);
             }
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);

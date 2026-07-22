@@ -68,7 +68,8 @@ use rakka_agent_workflow::{
     PrincipalRef, StateSchemaVersion,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ReplyTo,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
+    NoopMetricsRecorder, ReplyTo,
 };
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId};
 use rakka_sharding::{
@@ -108,6 +109,12 @@ use crate::memory::{
     SessionMemoryEntry,
 };
 use crate::model::AgentModelError;
+use crate::observability::{
+    record_agent_domain_counter, record_agent_domain_gauge, AgentDecisionDraft,
+    AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, METRIC_AGENT_DECISIONS,
+    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
@@ -1369,6 +1376,7 @@ fn advance_once(
     state: &mut AgentRunState,
     policies: &AgentEffectPolicies,
     session_memory: bool,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1380,16 +1388,25 @@ fn advance_once(
     }
 
     let mut owed = match run.loop_state.phase() {
-        AgentLoopPhase::PreparingContext => {
-            prepare_context(state, &scope, policies, session_memory, now).map(|()| Vec::new())
-        }
+        AgentLoopPhase::PreparingContext => prepare_context(
+            state,
+            &scope,
+            policies,
+            session_memory,
+            decision_events,
+            now,
+        )
+        .map(|()| Vec::new()),
         AgentLoopPhase::EvaluatingModelOutput => {
-            evaluate_model_output(state, &scope, policies, now).map(|()| Vec::new())
+            evaluate_model_output(state, &scope, policies, decision_events, now)
+                .map(|()| Vec::new())
         }
         AgentLoopPhase::RecordingTurn => {
             record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
         }
-        AgentLoopPhase::DecidingContinuation => decide_continuation(state, &scope, now),
+        AgentLoopPhase::DecidingContinuation => {
+            decide_continuation(state, &scope, decision_events, now)
+        }
         // `can_advance` already excluded these.
         AgentLoopPhase::AwaitingModel
         | AgentLoopPhase::AwaitingTools
@@ -1421,6 +1438,7 @@ fn prepare_context(
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     session_memory: bool,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let turn = {
@@ -1477,6 +1495,20 @@ fn prepare_context(
     let run = state.run_mut()?;
     run.loop_state.record_effect(effect)?;
     run.loop_state.set_context_snapshot(context);
+    // The opening decision: the run's deterministic policy decided to start
+    // consulting the model. Later iterations are the *model's* continuation
+    // decision and are recorded where it is made, in `decide_continuation`.
+    if decision_events && turn == 1 {
+        run.loop_state.record_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::Continue,
+                AgentDecisionSource::DeterministicPolicy,
+                "start",
+            ),
+            now,
+        );
+    }
     run.loop_state.set_phase(AgentLoopPhase::AwaitingModel);
     run.status = AgentRunStatus::WaitingForEffect;
     run.check_bounds(0)?;
@@ -1490,6 +1522,7 @@ fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let (turn, calls) = {
@@ -1513,6 +1546,8 @@ fn evaluate_model_output(
         state.updated_at = now;
         return Ok(());
     }
+
+    let selected: Vec<_> = calls.iter().map(|call| call.tool.clone()).collect();
 
     // Each tool's spec — safety class, attempt bound, protocol — comes from its
     // registration, defaulting to a single non-idempotent attempt for a tool the
@@ -1563,6 +1598,22 @@ fn evaluate_model_output(
         let effect =
             AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
         state.run_mut()?.loop_state.record_effect(effect)?;
+    }
+
+    // The model's decision, recorded in the same compare-and-set that commits
+    // the fan-out it selected ([specification 17.7]).
+    if decision_events {
+        let run = state.run_mut()?;
+        run.loop_state.record_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::CallTools,
+                AgentDecisionSource::Model,
+                "tools",
+            )
+            .with_selected_tools(selected),
+            now,
+        );
     }
 
     // A tool the deployment marked checkpoint- or authorization-required is not
@@ -1662,6 +1713,7 @@ fn record_turn(
 fn decide_continuation(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
+    decision_events: bool,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let proposed = state
@@ -1676,6 +1728,17 @@ fn decide_continuation(
         // iteration and stops the run with a structured reason if the ceiling is
         // reached.
         let run = state.run_mut()?;
+        if decision_events {
+            run.loop_state.record_decision(
+                scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::Continue,
+                    AgentDecisionSource::Model,
+                    "iterate",
+                ),
+                now,
+            );
+        }
         run.loop_state.clear_turn();
         run.loop_state.begin_turn(None);
         run.status = AgentRunStatus::Running;
@@ -1686,6 +1749,17 @@ fn decide_continuation(
     let (proposal, envelope) = build_proposal(state, scope, content, now)?;
 
     let run = state.run_mut()?;
+    if decision_events {
+        run.loop_state.record_decision(
+            scope,
+            AgentDecisionDraft::new(
+                AgentDecisionKind::SubmitResult,
+                AgentDecisionSource::Model,
+                "proposal",
+            ),
+            now,
+        );
+    }
     run.loop_state.clear_turn();
     run.loop_state.set_proposal(proposal);
     // The run is not *waiting on an effect*, a timer, or a human: it is waiting
@@ -2263,6 +2337,7 @@ fn open_effect_checkpoint(
     let goal = run.loop_state.goal().cloned();
     let settings_revision = run.loop_state.agent_settings_revision();
     let definition_revision = run.loop_state.agent_definition_revision();
+    let telemetry = run.loop_state.telemetry().clone();
     let mut checkpoint = AgentCheckpoint::open(
         checkpoint_id,
         kind,
@@ -2273,7 +2348,8 @@ fn open_effect_checkpoint(
         now,
     )?
     .with_task(task)
-    .with_revisions(settings_revision, definition_revision);
+    .with_revisions(settings_revision, definition_revision)
+    .with_telemetry(telemetry);
     if let Some(goal) = goal {
         checkpoint = checkpoint.with_goal(goal);
     }
@@ -2717,6 +2793,17 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 format!("a run entity does not receive a {kind} exchange"),
             ),
         };
+        // The accepting segment's context is the exchange's: an entity never
+        // invents one, and a context-less exchange leaves the previous
+        // segment's context in place ([specification 17.5]). Recorded in the
+        // same compare-and-set as the acceptance, so every effect the ensuing
+        // transitions commit carries the causal chain the ingress started.
+        if envelope.has_telemetry() {
+            if let Some(run) = state.run.as_mut() {
+                run.loop_state
+                    .record_telemetry(envelope.telemetry().clone());
+            }
+        }
         AgentExchangeTransition::new(result)
     }
 
@@ -2834,6 +2921,8 @@ where
     effects: Effects,
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
+    decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
 
@@ -2877,6 +2966,8 @@ where
             effects,
             policies: AgentEffectPolicies::default(),
             memory: None,
+            decisions: None,
+            metrics: Arc::new(NoopMetricsRecorder),
             recovered: false,
         }
     }
@@ -2907,6 +2998,38 @@ where
         self
     }
 
+    /// Wires the run with a decision-event sink
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run records a structured decision event in the same
+    /// compare-and-set as each deciding transition and flushes it to the sink
+    /// in the settle pass, after the transition committed — so an event is
+    /// emitted only for a durable transition, exactly once per derived
+    /// operation id. An unwired run records nothing. The sink is a
+    /// projection, never the correctness source: an unavailable sink leaves
+    /// events owed for the next pass and never fails the run.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.decisions = Some(sink);
+        self
+    }
+
+    /// Records the bounded `rakka.agent.*` metrics through `metrics`
+    /// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The agent domain measures its own durable transitions — decisions,
+    /// loop transitions, effect outcomes, recoveries, telemetry drops — and
+    /// the substrate keeps measuring the substrate under
+    /// `rakka.agent_workflow.*`, so one physical dispatch is never the same
+    /// concern in both vocabularies. Every label value comes from a closed
+    /// `as_label()` vocabulary; no identifier ever labels a metric. An
+    /// unwired store records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Uses explicit effect specs for the effects the loop commits
     /// ([specification 11.2](../../../docs/plans/rakka-agent/spec.md): the
     /// registration supplies the permitted safety declaration).
@@ -2931,7 +3054,20 @@ where
     /// Loads the run's durable state, failing closed on an unsupported schema
     /// version.
     pub async fn recover(&mut self, now: AgentTimestampMillis) -> AgentRunResult<&AgentRunState> {
-        let state = self.host.recover(now).await?;
+        let result = self.host.recover(now).await;
+        let outcome = if result.is_ok() {
+            "recovered"
+        } else {
+            "failed"
+        };
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
+            METRIC_AGENT_RECOVERY_EVENTS,
+            1,
+            &[("outcome", outcome)],
+        )
+        .ok();
+        let state = result?;
         self.recovered = true;
         Ok(state)
     }
@@ -2997,14 +3133,41 @@ where
             } => {
                 let policy = *self.host.schema_policy();
                 let policies = self.policies.clone();
-                self.transition(now, move |state| {
-                    record_effect_result(
-                        state, &effect_id, generation, attempt, fence, *outcome, &policy,
-                        &policies, now,
-                    )?;
-                    Ok(operation_id)
-                })
-                .await?
+                let outcome_label = outcome.resolved_status().as_label();
+                let effect_labels = self.state()?.loop_state().and_then(|loop_state| {
+                    loop_state
+                        .effects()
+                        .iter()
+                        .find(|effect| effect.effect_id == effect_id)
+                        .map(|effect| (effect.kind().as_label(), effect.safety.class().as_label()))
+                });
+                let reply = self
+                    .transition(now, move |state| {
+                        record_effect_result(
+                            state, &effect_id, generation, attempt, fence, *outcome, &policy,
+                            &policies, now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                // Counted after the resolving transition committed; a replayed
+                // result answers from the operation log above and never
+                // reaches this arm, so a generation resolves in the metric at
+                // most once.
+                if let Some((effect_kind, safety_class)) = effect_labels {
+                    record_agent_domain_counter(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_EFFECT_OUTCOMES,
+                        1,
+                        &[
+                            ("effect_kind", effect_kind),
+                            ("safety_class", safety_class),
+                            ("outcome", outcome_label),
+                        ],
+                    )
+                    .ok();
+                }
+                reply
             }
             AgentRunEntityCommand::ResolveIndeterminateEffect {
                 operation_id,
@@ -3117,7 +3280,13 @@ where
             let flushed = self.flush_session_memory(now).await?;
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
-            if advanced == 0 && dispatched == 0 && flushed == 0 && snapshotted == 0 {
+            let decisions = self.flush_decision_events(now).await?;
+            if advanced == 0
+                && dispatched == 0
+                && flushed == 0
+                && snapshotted == 0
+                && decisions == 0
+            {
                 break;
             }
         }
@@ -3150,12 +3319,14 @@ where
             let flushed = self.flush_session_memory(now).await?;
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
+            let decisions = self.flush_decision_events(now).await?;
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
 
             progress.transitions += advanced;
             progress.effects_dispatched += dispatched;
             progress.session_entries_flushed += flushed;
             progress.snapshots_persisted += snapshotted;
+            progress.decisions_flushed += decisions;
             progress.settled += report.settled;
             progress.failed += report.failed;
 
@@ -3163,6 +3334,7 @@ where
                 && dispatched == 0
                 && flushed == 0
                 && snapshotted == 0
+                && decisions == 0
                 && report.settled == 0
             {
                 break;
@@ -3206,6 +3378,98 @@ where
             .initiate(now, |state| {
                 if let Some(run) = state.run.as_mut() {
                     run.loop_state.clear_flushed_session_entries(&flushed);
+                }
+                state.updated_at = now;
+                Ok(Vec::new())
+            })
+            .await?;
+        Ok(flushed.len())
+    }
+
+    /// Appends the decision events recorded transitions owe the sink, then
+    /// drops the events the sink durably accepted
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md),
+    /// [17.13](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Events are appended only after the transitions that decided them
+    /// committed — that is what the outbox *is* — and the append is idempotent
+    /// on each event's derived operation id, so a crash between the append and
+    /// the clearing re-drives harmlessly. Unlike the session flush, a sink
+    /// failure is not an error: telemetry is never a correctness input
+    /// ([specification 17.1](../../../docs/plans/rakka-agent/spec.md)), so the
+    /// unflushed events stay owed and are retried on the next settle pass.
+    async fn flush_decision_events(&mut self, now: AgentTimestampMillis) -> AgentRunResult<usize> {
+        let Some(sink) = self.decisions.clone() else {
+            return Ok(0);
+        };
+        let (pending, drops) = {
+            let loop_state = self.state()?.loop_state();
+            (
+                loop_state
+                    .map(|loop_state| loop_state.decision_outbox().to_vec())
+                    .unwrap_or_default(),
+                loop_state.map_or(0, AgentLoopState::decision_drops),
+            )
+        };
+        if drops > 0 {
+            // The durable drop counter is the bounded visibility telemetry
+            // loss owes ([specification 17.1]); a gauge is idempotent, so a
+            // re-driven flush cannot inflate it.
+            record_agent_domain_gauge(
+                self.metrics.as_ref(),
+                METRIC_AGENT_DECISION_DROPS,
+                drops as f64,
+                &[],
+            )
+            .ok();
+        }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut flushed = Vec::with_capacity(pending.len());
+        for event in &pending {
+            match sink.append(&self.scope, event).await {
+                Ok(status) => {
+                    if matches!(
+                        status,
+                        crate::observability::AgentDecisionWriteStatus::Accepted
+                    ) {
+                        // Counted on first durable acceptance, so a re-driven
+                        // flush of an already-retained event counts nothing.
+                        record_agent_domain_counter(
+                            self.metrics.as_ref(),
+                            METRIC_AGENT_DECISIONS,
+                            1,
+                            &[
+                                ("decision_kind", event.kind.as_label()),
+                                ("decision_source", event.source.as_label()),
+                            ],
+                        )
+                        .ok();
+                    }
+                }
+                Err(_) => {
+                    record_agent_domain_counter(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+                        1,
+                        &[("signal", "decision-events")],
+                    )
+                    .ok();
+                    break;
+                }
+            }
+            flushed.push(event.operation_id.clone());
+        }
+        if flushed.is_empty() {
+            return Ok(0);
+        }
+
+        self.host
+            .initiate(now, |state| {
+                if let Some(run) = state.run.as_mut() {
+                    run.loop_state.clear_flushed_decisions(&flushed);
                 }
                 state.updated_at = now;
                 Ok(Vec::new())
@@ -3292,10 +3556,15 @@ where
             let mut rejection = None;
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
+            let decision_events = self.decisions.is_some();
+            let phase = self
+                .state()?
+                .loop_state()
+                .map_or("none", |loop_state| loop_state.phase().as_label());
             let committed = self
                 .host
                 .initiate(now, |state| {
-                    match advance_once(state, &policies, session_memory, now) {
+                    match advance_once(state, &policies, session_memory, decision_events, now) {
                         Ok(owed) => Ok(owed),
                         Err(error) => {
                             let carried = AgentChoreographyError::from(error.clone());
@@ -3311,6 +3580,13 @@ where
             }
             committed?;
             transitions += 1;
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_RUN_TRANSITIONS,
+                1,
+                &[("phase", phase)],
+            )
+            .ok();
         }
         Ok(transitions)
     }
@@ -3478,6 +3754,8 @@ pub struct AgentRunProgress {
     pub session_entries_flushed: usize,
     /// How many immutable context snapshots it persisted.
     pub snapshots_persisted: usize,
+    /// How many decision events it flushed to the decision sink.
+    pub decisions_flushed: usize,
     /// How many exchanges it settled.
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.
@@ -3722,6 +4000,26 @@ where
         }
     }
 
+    /// Records the hosted run's bounded `rakka.agent.*` metrics through
+    /// `metrics` ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity measures its own
+    /// durable transitions exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_metrics(metrics));
+        self
+    }
+
+    /// Wires the hosted run with a decision-event sink
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity records the same
+    /// bounded decision events a directly-driven one does.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_decision_events(sink));
+        self
+    }
+
     fn store(&mut self) -> Result<&mut AgentRunEntityStore<Store, Effects>, AgentRunError> {
         self.entity
             .as_mut()
@@ -3806,6 +4104,8 @@ pub struct AgentRunEntityShardingSettings {
     schema_policy: AgentSchemaPolicy,
     effect_policies: AgentEffectPolicies,
     clock: AgentRunClock,
+    metrics: Arc<dyn MetricsRecorder>,
+    decisions: Option<Arc<dyn AgentDecisionEventSink>>,
 }
 
 impl Debug for AgentRunEntityShardingSettings {
@@ -3832,6 +4132,8 @@ impl AgentRunEntityShardingSettings {
             schema_policy: AgentSchemaPolicy::default(),
             effect_policies: AgentEffectPolicies::default(),
             clock: system_run_clock(),
+            metrics: Arc::new(NoopMetricsRecorder),
+            decisions: None,
         }
     }
 
@@ -3901,6 +4203,35 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.effect_policies = policies;
+        self
+    }
+
+    /// Records the bounded `rakka.agent.*` metrics of every hosted run through
+    /// `metrics` ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Defaults to a no-op recorder, so a deployment opts its agent-domain
+    /// metrics in by passing its system recorder here — the same recorder the
+    /// substrate measures `rakka.agent_workflow.*` through, kept a distinct
+    /// vocabulary so one physical dispatch is never counted as the same concern
+    /// twice. Metrics never gate a transition, so an unwired deployment simply
+    /// records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Wires every hosted run with a decision-event sink
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Absent by default, so an unwired deployment records no decision events;
+    /// a wired one records one bounded event per durable decision and flushes
+    /// it to the sink in the settle pass, after the deciding transition
+    /// committed. The sink is a projection, never the correctness source: an
+    /// unavailable sink leaves events owed and never fails a run.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.decisions = Some(sink);
         self
     }
 }
@@ -3976,6 +4307,42 @@ where
     )
 }
 
+/// Builds one hosted run entity with the settings' observability wiring.
+///
+/// Every driver of a run must wire it identically, or a run that advances its
+/// loop unwired records nothing for the transitions it commits: the sharded
+/// factory is the production driver, so the settings' metrics recorder
+/// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)) and its
+/// decision sink ([17.7](../../../docs/plans/rakka-agent/spec.md)) ride onto
+/// every hosted entity through this one path, exactly as a directly-driven run
+/// is wired in tests.
+fn build_hosted_run_entity<Store, Effects>(
+    settings: &AgentRunEntityShardingSettings,
+    entity_id: &EntityId,
+    store: Store,
+    effects: Effects,
+    router: AgentExchangeRouter,
+) -> AgentRunEntity<Store, Effects>
+where
+    Store: DurableStateStore<AgentRunState>,
+    Effects: AgentRunEffectSink,
+{
+    let mut entity = AgentRunEntity::new(
+        entity_id,
+        store,
+        effects,
+        router,
+        settings.clock.clone(),
+        settings.schema_policy,
+        settings.effect_policies.clone(),
+    )
+    .with_metrics(settings.metrics.clone());
+    if let Some(decisions) = settings.decisions.clone() {
+        entity = entity.with_decision_events(decisions);
+    }
+    entity
+}
+
 // The run entity is generic over its own state store and its effect sink, so the
 // entity type it builds is unavoidably wide.
 #[allow(clippy::type_complexity)]
@@ -3996,18 +4363,14 @@ where
     Store: DurableStateStore<AgentRunState>,
     Effects: AgentRunEffectSink,
 {
-    let schema_policy = settings.schema_policy;
-    let effect_policies = settings.effect_policies.clone();
-    let clock = settings.clock.clone();
+    let hosted_settings = settings.clone();
     let mut entity = Entity::of(settings.key.clone(), move |context: EntityContext<_>| {
-        AgentRunEntity::new(
+        build_hosted_run_entity(
+            &hosted_settings,
             context.entity_id(),
             store.clone(),
             effects.clone(),
             router.clone(),
-            clock.clone(),
-            schema_policy,
-            effect_policies.clone(),
         )
     })
     .with_actor_options(settings.actor_options.clone())
@@ -4503,6 +4866,73 @@ mod tests {
             "the maximal working set grows the record by {growth} bytes, which exceeds the \
              {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a run admitted at the bound \
              could be refused its own turn"
+        );
+    }
+
+    /// The sharded factory's per-entity builder installs the settings'
+    /// observability wiring onto the hosted run's inner store — both the
+    /// metrics recorder and the decision sink — so a clustered run measures its
+    /// transitions and records its decisions exactly as a directly-driven one
+    /// does. `Describe` never makes a decision, so the sink half is proven here
+    /// rather than through the sharded actor.
+    #[test]
+    fn a_hosted_run_is_wired_with_the_settings_metrics_and_decision_sink() {
+        use std::sync::Arc;
+
+        use rakka_core::{InMemoryMetricsRecorder, MetricsRecorder};
+        use rakka_persistence::InMemoryDurableStateStore;
+
+        use crate::effect::InMemoryAgentRunEffectSink;
+        use crate::observability::InMemoryAgentDecisionEventSink;
+
+        let recorder = Arc::new(InMemoryMetricsRecorder::new());
+        let metrics: Arc<dyn MetricsRecorder> = recorder.clone();
+        let sink: Arc<dyn AgentDecisionEventSink> = Arc::new(InMemoryAgentDecisionEventSink::new());
+        let settings = AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
+            .with_metrics(metrics.clone())
+            .with_decision_events(sink);
+
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support-agent").expect("the agent id is valid"),
+            AgentRunId::new("run-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let mut entity = build_hosted_run_entity(
+            &settings,
+            &scope.entity_id(),
+            InMemoryDurableStateStore::<AgentRunState>::new(),
+            InMemoryAgentRunEffectSink::new(),
+            AgentExchangeRouter::new(),
+        );
+        let inner = entity.store().expect("the entity id is valid");
+        assert!(
+            inner.decisions.is_some(),
+            "the settings' decision sink is wired onto the hosted run"
+        );
+        assert!(
+            Arc::ptr_eq(&inner.metrics, &metrics),
+            "the settings' recorder is wired onto the hosted run, not the no-op default"
+        );
+
+        // An unwired deployment records nothing: no decision sink, and the
+        // recorder is not the one the wired run carried.
+        let bare = AgentRunEntityShardingSettings::new(agent_run_entity_type_key());
+        let mut unwired = build_hosted_run_entity(
+            &bare,
+            &scope.entity_id(),
+            InMemoryDurableStateStore::<AgentRunState>::new(),
+            InMemoryAgentRunEffectSink::new(),
+            AgentExchangeRouter::new(),
+        );
+        let unwired = unwired.store().expect("the entity id is valid");
+        assert!(
+            unwired.decisions.is_none(),
+            "an unwired deployment records no decision events"
+        );
+        assert!(
+            !Arc::ptr_eq(&unwired.metrics, &metrics),
+            "an unwired deployment measures through the no-op default"
         );
     }
 }
