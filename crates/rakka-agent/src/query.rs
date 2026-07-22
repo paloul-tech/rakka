@@ -261,6 +261,11 @@ impl AgentOperationalSnapshot {
                 loop_state
                     .open_checkpoints()
                     .iter()
+                    // Only checkpoints the run is genuinely waiting on: a
+                    // resolved-but-not-yet-dropped one is not a live wait, and
+                    // its deadline must not surface as a `next_wake` — the same
+                    // `is_waiting` gate `has_open_checkpoint` uses.
+                    .filter(|checkpoint| checkpoint.status.is_waiting())
                     .map(|checkpoint: &AgentCheckpoint| AgentCheckpointView {
                         checkpoint_id: checkpoint.checkpoint_id.clone(),
                         kind: checkpoint.kind,
@@ -283,19 +288,24 @@ impl AgentOperationalSnapshot {
                 .is_waiting()
                 .then(|| run.status.as_label().to_string())
         });
-        let run_snapshot = state.snapshot().map(|mut snapshot| {
-            snapshot.proposal = None;
-            snapshot.accepted_result = None;
-            snapshot.feedback = None;
-            snapshot
-        });
+        // One snapshot, read once: capture the bounded pending-proposal fact
+        // before the content is redacted, rather than deriving the projection
+        // twice.
+        let (run_snapshot, has_pending_proposal) = match state.snapshot() {
+            Some(mut snapshot) => {
+                let has_pending_proposal = snapshot.proposal.is_some();
+                snapshot.proposal = None;
+                snapshot.accepted_result = None;
+                snapshot.feedback = None;
+                (Some(snapshot), has_pending_proposal)
+            }
+            None => (None, false),
+        };
         Self {
             revision,
             observed_at,
             scope: state.scope().clone(),
-            has_pending_proposal: state
-                .snapshot()
-                .is_some_and(|snapshot| snapshot.proposal.is_some()),
+            has_pending_proposal,
             run: run_snapshot,
             wait_reason,
             next_wake,

@@ -629,11 +629,20 @@ pub const AGENT_METRIC_FIELDS: &[&str] = &[
 pub fn validate_agent_domain_metric_attributes(
     attributes: MetricAttributes<'_>,
 ) -> AgentObservabilityResult<()> {
-    for (key, _value) in attributes {
+    for (key, value) in attributes {
         if rakka_agent_workflow::is_forbidden_agent_metric_attribute(key)
             || (!rakka_agent_workflow::is_bounded_agent_metric_attribute(key)
                 && !AGENT_METRIC_FIELDS.contains(key))
         {
+            return Err(AgentObservabilityError::UnboundedMetricLabel {
+                key: (*key).to_string(),
+            });
+        }
+        // The substrate's *value* guard (length bound, single-line) applies to
+        // every hot metric regardless of which layer owns the key — a bounded
+        // key must not smuggle an unbounded or multi-line value — so it is
+        // reused here rather than left to the substrate's key guard alone.
+        if rakka_agent_workflow::validate_agent_metric_attribute_value(key, value).is_err() {
             return Err(AgentObservabilityError::UnboundedMetricLabel {
                 key: (*key).to_string(),
             });
@@ -804,6 +813,24 @@ mod tests {
         let error = validate_agent_domain_metric_attributes(&[("free_form", "value")])
             .expect_err("an unknown key must be rejected");
         assert_eq!(error.code(), "metric-label-unbounded");
+    }
+
+    #[test]
+    fn a_bounded_key_carrying_an_unbounded_or_multiline_value_is_rejected() {
+        // A bounded key does not license an unbounded value: the value guard
+        // applies no matter which layer owns the key.
+        let oversized = "x".repeat(200);
+        let error = validate_agent_domain_metric_attributes(&[("phase", oversized.as_str())])
+            .expect_err("an oversized value must be rejected under a bounded key");
+        assert_eq!(error.code(), "metric-label-unbounded");
+
+        let error = validate_agent_domain_metric_attributes(&[("phase", "one\ntwo")])
+            .expect_err("a multi-line value must be rejected under a bounded key");
+        assert_eq!(error.code(), "metric-label-unbounded");
+
+        // The same key with a short single-line value is accepted.
+        validate_agent_domain_metric_attributes(&[("phase", "deciding-continuation")])
+            .expect("a bounded key with a bounded value is accepted");
     }
 
     #[test]

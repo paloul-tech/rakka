@@ -205,6 +205,55 @@ async fn bridge_export_routes_metrics_spans_and_logs_to_deterministic_receiver()
         .any(|attribute| attribute.key() == OTEL_RESOURCE_K8S_NAMESPACE_NAME));
 }
 
+/// The optional instrumentation scope a batch carries is validated on the
+/// receive path, the same way its spans, exporter, and resource are — a
+/// blank-named or unversioned scope cannot ride in unchecked
+/// ([specification 17.17]).
+#[tokio::test]
+async fn a_batch_with_a_blank_scope_is_rejected_on_receive() {
+    use rakka_agent_workflow::AgentOtelInstrumentationScope;
+
+    let base = AgentOtlpBridgeExport::from_signals(
+        AgentOtlpExporterConfig::grpc("http://collector:4317"),
+        resource(),
+        &InMemoryMetricsRecorder::new().snapshot(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("the bridge export builds");
+
+    // A well-formed scope validates and is accepted.
+    let valid = base.clone().with_scope(AgentOtelInstrumentationScope {
+        name: "rakka.agent".to_string(),
+        version: "0.1.0".to_string(),
+        schema_url: Some("https://opentelemetry.io/schemas/1.36.0".to_string()),
+    });
+    valid.validate().expect("a well-formed scope validates");
+    InMemoryAgentOtlpReceiver::new()
+        .export_bridge(valid)
+        .await
+        .expect("the receiver accepts a well-formed scope");
+
+    // A blank scope name fails validation directly and on the receive path.
+    let blank = base.with_scope(AgentOtelInstrumentationScope {
+        name: String::new(),
+        version: "0.1.0".to_string(),
+        schema_url: None,
+    });
+    blank
+        .validate()
+        .expect_err("a blank scope name must fail validation");
+    let mut receiver = InMemoryAgentOtlpReceiver::new();
+    receiver
+        .export_bridge(blank)
+        .await
+        .expect_err("the receiver rejects a batch carrying a blank scope");
+    assert!(
+        receiver.exports().is_empty(),
+        "nothing was accepted from the rejected batch"
+    );
+}
+
 #[test]
 fn collector_config_example_defines_three_otlp_pipelines() {
     let config = include_str!(concat!(

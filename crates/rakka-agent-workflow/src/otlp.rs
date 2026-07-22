@@ -846,6 +846,28 @@ impl AgentOtlpBridgeExport {
         self.scope = Some(scope);
         self
     }
+
+    /// Validates every part of the export, including the optional
+    /// instrumentation scope a batch may carry
+    /// ([specification 17.17](../../docs/plans/rakka-agent/spec.md)). A receiver
+    /// runs this over an incoming — possibly deserialized — batch before
+    /// trusting it, so a blank-named or unversioned scope cannot ride in
+    /// unchecked the way the span, exporter, and resource records already
+    /// cannot.
+    pub fn validate(&self) -> AgentOtlpResult<()> {
+        self.exporter.validate()?;
+        self.resource.validate()?;
+        for span in &self.spans {
+            span.validate()?;
+        }
+        for log in &self.logs {
+            validate_agent_log_event(log, AgentRedactionPolicy::new())?;
+        }
+        if let Some(scope) = &self.scope {
+            scope.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic receiver abstraction for OTLP bridge exports.
@@ -885,14 +907,7 @@ impl AgentOtlpBridgeReceiver for InMemoryAgentOtlpReceiver {
         export: AgentOtlpBridgeExport,
     ) -> AgentOtlpReceiverFuture<'a, ()> {
         Box::pin(async move {
-            export.exporter.validate()?;
-            export.resource.validate()?;
-            for span in &export.spans {
-                span.validate()?;
-            }
-            for log in &export.logs {
-                validate_agent_log_event(log, AgentRedactionPolicy::new())?;
-            }
+            export.validate()?;
             self.exports.push(export);
             Ok(())
         })

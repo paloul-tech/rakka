@@ -38,13 +38,26 @@ use rakka_agent_workflow::{
 use crate::model::AgentModelUsage;
 use crate::observability::AgentDecisionEvent;
 
+/// The single source of the pinned revision literal, so the bare revision
+/// ([`AGENT_GENAI_CONVENTION_REVISION`]) and the schema URL
+/// ([`AGENT_GENAI_SCHEMA_URL`]) are built from one string and can never drift.
+macro_rules! genai_convention_revision {
+    () => {
+        "1.36.0"
+    };
+}
+
 /// The reviewed OpenTelemetry semantic-convention revision this adapter maps
 /// to. An upgrade requires the [specification 17.20](../../../docs/plans/rakka-agent/spec.md)
 /// compatibility review; it is never bumped as a side effect.
-pub const AGENT_GENAI_CONVENTION_REVISION: &str = "1.36.0";
+pub const AGENT_GENAI_CONVENTION_REVISION: &str = genai_convention_revision!();
 
-/// The schema URL pinning [`AGENT_GENAI_CONVENTION_REVISION`].
-pub const AGENT_GENAI_SCHEMA_URL: &str = "https://opentelemetry.io/schemas/1.36.0";
+/// The schema URL pinning [`AGENT_GENAI_CONVENTION_REVISION`], built from the
+/// same literal so the URL and the revision stay in lockstep.
+pub const AGENT_GENAI_SCHEMA_URL: &str = concat!(
+    "https://opentelemetry.io/schemas/",
+    genai_convention_revision!()
+);
 
 /// Instrumentation scope name for agent telemetry.
 pub const AGENT_OTEL_SCOPE_NAME: &str = "rakka.agent";
