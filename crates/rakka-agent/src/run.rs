@@ -4000,6 +4000,26 @@ where
         }
     }
 
+    /// Records the hosted run's bounded `rakka.agent.*` metrics through
+    /// `metrics` ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity measures its own
+    /// durable transitions exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_metrics(metrics));
+        self
+    }
+
+    /// Wires the hosted run with a decision-event sink
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity records the same
+    /// bounded decision events a directly-driven one does.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_decision_events(sink));
+        self
+    }
+
     fn store(&mut self) -> Result<&mut AgentRunEntityStore<Store, Effects>, AgentRunError> {
         self.entity
             .as_mut()
@@ -4084,6 +4104,8 @@ pub struct AgentRunEntityShardingSettings {
     schema_policy: AgentSchemaPolicy,
     effect_policies: AgentEffectPolicies,
     clock: AgentRunClock,
+    metrics: Arc<dyn MetricsRecorder>,
+    decisions: Option<Arc<dyn AgentDecisionEventSink>>,
 }
 
 impl Debug for AgentRunEntityShardingSettings {
@@ -4110,6 +4132,8 @@ impl AgentRunEntityShardingSettings {
             schema_policy: AgentSchemaPolicy::default(),
             effect_policies: AgentEffectPolicies::default(),
             clock: system_run_clock(),
+            metrics: Arc::new(NoopMetricsRecorder),
+            decisions: None,
         }
     }
 
@@ -4179,6 +4203,35 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.effect_policies = policies;
+        self
+    }
+
+    /// Records the bounded `rakka.agent.*` metrics of every hosted run through
+    /// `metrics` ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Defaults to a no-op recorder, so a deployment opts its agent-domain
+    /// metrics in by passing its system recorder here — the same recorder the
+    /// substrate measures `rakka.agent_workflow.*` through, kept a distinct
+    /// vocabulary so one physical dispatch is never counted as the same concern
+    /// twice. Metrics never gate a transition, so an unwired deployment simply
+    /// records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Wires every hosted run with a decision-event sink
+    /// ([specification 17.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Absent by default, so an unwired deployment records no decision events;
+    /// a wired one records one bounded event per durable decision and flushes
+    /// it to the sink in the settle pass, after the deciding transition
+    /// committed. The sink is a projection, never the correctness source: an
+    /// unavailable sink leaves events owed and never fails a run.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.decisions = Some(sink);
         self
     }
 }
@@ -4254,6 +4307,42 @@ where
     )
 }
 
+/// Builds one hosted run entity with the settings' observability wiring.
+///
+/// Every driver of a run must wire it identically, or a run that advances its
+/// loop unwired records nothing for the transitions it commits: the sharded
+/// factory is the production driver, so the settings' metrics recorder
+/// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)) and its
+/// decision sink ([17.7](../../../docs/plans/rakka-agent/spec.md)) ride onto
+/// every hosted entity through this one path, exactly as a directly-driven run
+/// is wired in tests.
+fn build_hosted_run_entity<Store, Effects>(
+    settings: &AgentRunEntityShardingSettings,
+    entity_id: &EntityId,
+    store: Store,
+    effects: Effects,
+    router: AgentExchangeRouter,
+) -> AgentRunEntity<Store, Effects>
+where
+    Store: DurableStateStore<AgentRunState>,
+    Effects: AgentRunEffectSink,
+{
+    let mut entity = AgentRunEntity::new(
+        entity_id,
+        store,
+        effects,
+        router,
+        settings.clock.clone(),
+        settings.schema_policy,
+        settings.effect_policies.clone(),
+    )
+    .with_metrics(settings.metrics.clone());
+    if let Some(decisions) = settings.decisions.clone() {
+        entity = entity.with_decision_events(decisions);
+    }
+    entity
+}
+
 // The run entity is generic over its own state store and its effect sink, so the
 // entity type it builds is unavoidably wide.
 #[allow(clippy::type_complexity)]
@@ -4274,18 +4363,14 @@ where
     Store: DurableStateStore<AgentRunState>,
     Effects: AgentRunEffectSink,
 {
-    let schema_policy = settings.schema_policy;
-    let effect_policies = settings.effect_policies.clone();
-    let clock = settings.clock.clone();
+    let hosted_settings = settings.clone();
     let mut entity = Entity::of(settings.key.clone(), move |context: EntityContext<_>| {
-        AgentRunEntity::new(
+        build_hosted_run_entity(
+            &hosted_settings,
             context.entity_id(),
             store.clone(),
             effects.clone(),
             router.clone(),
-            clock.clone(),
-            schema_policy,
-            effect_policies.clone(),
         )
     })
     .with_actor_options(settings.actor_options.clone())
@@ -4781,6 +4866,73 @@ mod tests {
             "the maximal working set grows the record by {growth} bytes, which exceeds the \
              {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a run admitted at the bound \
              could be refused its own turn"
+        );
+    }
+
+    /// The sharded factory's per-entity builder installs the settings'
+    /// observability wiring onto the hosted run's inner store — both the
+    /// metrics recorder and the decision sink — so a clustered run measures its
+    /// transitions and records its decisions exactly as a directly-driven one
+    /// does. `Describe` never makes a decision, so the sink half is proven here
+    /// rather than through the sharded actor.
+    #[test]
+    fn a_hosted_run_is_wired_with_the_settings_metrics_and_decision_sink() {
+        use std::sync::Arc;
+
+        use rakka_core::{InMemoryMetricsRecorder, MetricsRecorder};
+        use rakka_persistence::InMemoryDurableStateStore;
+
+        use crate::effect::InMemoryAgentRunEffectSink;
+        use crate::observability::InMemoryAgentDecisionEventSink;
+
+        let recorder = Arc::new(InMemoryMetricsRecorder::new());
+        let metrics: Arc<dyn MetricsRecorder> = recorder.clone();
+        let sink: Arc<dyn AgentDecisionEventSink> = Arc::new(InMemoryAgentDecisionEventSink::new());
+        let settings = AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
+            .with_metrics(metrics.clone())
+            .with_decision_events(sink);
+
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support-agent").expect("the agent id is valid"),
+            AgentRunId::new("run-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let mut entity = build_hosted_run_entity(
+            &settings,
+            &scope.entity_id(),
+            InMemoryDurableStateStore::<AgentRunState>::new(),
+            InMemoryAgentRunEffectSink::new(),
+            AgentExchangeRouter::new(),
+        );
+        let inner = entity.store().expect("the entity id is valid");
+        assert!(
+            inner.decisions.is_some(),
+            "the settings' decision sink is wired onto the hosted run"
+        );
+        assert!(
+            Arc::ptr_eq(&inner.metrics, &metrics),
+            "the settings' recorder is wired onto the hosted run, not the no-op default"
+        );
+
+        // An unwired deployment records nothing: no decision sink, and the
+        // recorder is not the one the wired run carried.
+        let bare = AgentRunEntityShardingSettings::new(agent_run_entity_type_key());
+        let mut unwired = build_hosted_run_entity(
+            &bare,
+            &scope.entity_id(),
+            InMemoryDurableStateStore::<AgentRunState>::new(),
+            InMemoryAgentRunEffectSink::new(),
+            AgentExchangeRouter::new(),
+        );
+        let unwired = unwired.store().expect("the entity id is valid");
+        assert!(
+            unwired.decisions.is_none(),
+            "an unwired deployment records no decision events"
+        );
+        assert!(
+            !Arc::ptr_eq(&unwired.metrics, &metrics),
+            "an unwired deployment measures through the no-op default"
         );
     }
 }
