@@ -451,6 +451,7 @@ async fn the_gated_park_decide_resume_flow_survives_any_owner_loss() {
             let _crashed = drive_gated_flow(&fx, &checkpoint_id).await;
 
             // A new owner activates and finds only what was durably committed.
+            fx.runs.assert_crash_fired(nth, point);
             fx.runs.survive();
             drive_gated_flow(&fx, &checkpoint_id)
                 .await

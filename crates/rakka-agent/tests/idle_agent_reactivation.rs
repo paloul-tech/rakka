@@ -18,34 +18,28 @@
 //! will inject it. A replayed trigger is answered from the record: one
 //! assignment generation, one run, one turn.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use rakka_agent::testkit::{DeferredExchangeRouter, LocalShardedExchangeRoute, ScriptedDispatcher};
+use rakka_agent::testkit::ScriptedDispatcher;
 use rakka_agent::{
-    agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
-    init_agent_entity_sharding, init_agent_run_entity_sharding, init_agent_task_entity_sharding,
     load_agent_entity_state, load_agent_run_state, load_agent_task_state, run_id_for_assignment,
     AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId,
-    AgentEntityClass, AgentEntityCommand, AgentEntityMessage, AgentEntityReply,
-    AgentEntityShardingSettings, AgentEntityState, AgentExchangeRouter, AgentId,
-    AgentLifecycleStatus, AgentModelTurn, AgentOperationId, AgentOperationKind,
-    AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectStatus, AgentRunEntityCommand,
-    AgentRunEntityMessage, AgentRunEntityShardingSettings, AgentRunScope, AgentRunState,
-    AgentRunStatus, AgentSchemaId, AgentSchemaPolicy, AgentSchemaRef, AgentScope, AgentSettings,
-    AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
+    AgentEntityCommand, AgentEntityMessage, AgentEntityReply, AgentId, AgentLifecycleStatus,
+    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunEffectStatus, AgentRunEntityCommand, AgentRunEntityMessage,
+    AgentRunScope, AgentRunStatus, AgentSchemaId, AgentSchemaPolicy, AgentSchemaRef, AgentScope,
+    AgentSettings, AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
     AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntityCommand,
-    AgentTaskEntityMessage, AgentTaskEntityReply, AgentTaskEntityShardingSettings, AgentTaskId,
-    AgentTaskScope, AgentTaskState, AgentTaskStatus, InMemoryAgentRunEffectSink,
-    InMemoryAgentTaskHistoryStore, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentTaskEntityMessage, AgentTaskEntityReply, AgentTaskId, AgentTaskScope, AgentTaskStatus,
+    TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
 };
-use rakka_core::ActorSystem;
-use rakka_persistence::InMemoryDurableStateStore;
-use rakka_sharding::ClusterSharding;
+
+mod common;
+
+use common::ShardedWorld;
 
 const TENANT: &str = "acme";
 const AGENT: &str = "support-agent";
@@ -121,78 +115,15 @@ fn proposing_turn() -> AgentModelTurn {
 
 #[tokio::test]
 async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
-    let system = ActorSystem::new("IdleAgentReactivation");
-    let sharding = ClusterSharding::get(&system);
-    let tasks = InMemoryDurableStateStore::<AgentTaskState>::new();
-    let agents = InMemoryDurableStateStore::<AgentEntityState>::new();
-    let runs = InMemoryDurableStateStore::<AgentRunState>::new();
-    let history = InMemoryAgentTaskHistoryStore::new();
-    let effects = InMemoryAgentRunEffectSink::new();
-    let clock = Arc::new(AtomicU64::new(1));
-    let dispatcher = ScriptedDispatcher::new().with_turn(proposing_turn());
-
-    let deferred = DeferredExchangeRouter::new();
-    let entity_clock = {
-        let clock = clock.clone();
-        Arc::new(move || AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst)))
-    };
-    let agent_registration = init_agent_entity_sharding(
-        &sharding,
-        agents.clone(),
-        AgentEntityShardingSettings::new(agent_entity_type_key()).with_idle_passivation(IDLE),
-    )
-    .expect("agent entity sharding initializes");
-    let task_registration = init_agent_task_entity_sharding(
-        &sharding,
-        tasks.clone(),
-        agents.clone(),
-        history.clone(),
-        deferred.as_router(),
-        AgentTaskEntityShardingSettings::new(agent_task_entity_type_key())
-            .with_idle_passivation(IDLE)
-            .with_clock(entity_clock.clone()),
-    )
-    .expect("task entity sharding initializes");
-    let run_registration = init_agent_run_entity_sharding(
-        &sharding,
-        runs.clone(),
-        effects,
-        deferred.as_router(),
-        AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
-            .with_idle_passivation(IDLE)
-            .with_clock(entity_clock),
-    )
-    .expect("run entity sharding initializes");
-    let router = AgentExchangeRouter::new()
-        .with_route(
-            AgentEntityClass::Task,
-            Arc::new(LocalShardedExchangeRoute::new(
-                sharding.clone(),
-                task_registration.key().clone(),
-                ASK_TIMEOUT,
-                |envelope, reply_to| AgentTaskEntityMessage::Exchange {
-                    envelope: Box::new(envelope),
-                    reply_to,
-                },
-            )),
-        )
-        .with_route(
-            AgentEntityClass::Run,
-            Arc::new(LocalShardedExchangeRoute::new(
-                sharding.clone(),
-                run_registration.key().clone(),
-                ASK_TIMEOUT,
-                |envelope, reply_to| AgentRunEntityMessage::Exchange {
-                    envelope: Box::new(envelope),
-                    reply_to,
-                },
-            )),
-        );
-    deferred.install(router);
-
-    let agent = rakka_agent::registered_agent_entity_ref(&agent_registration, &agent_scope());
-    let task = rakka_agent::registered_agent_task_entity_ref(&task_registration, &task_scope());
-    let run = rakka_agent::registered_agent_run_entity_ref(&run_registration, &run_scope());
+    let world = ShardedWorld::new(
+        "IdleAgentReactivation",
+        IDLE,
+        ScriptedDispatcher::new().with_turn(proposing_turn()),
+        None,
+    );
+    let agent = world.agent_ref(&agent_scope());
+    let task = world.task_ref(&task_scope());
+    let run = world.run_ref(&run_scope());
 
     // Instantiate the agent and create the future task: blocked behind an
     // upstream dependency, assignee already set. No admission gate applies —
@@ -267,22 +198,7 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
     let deadline = 100;
     let mut polls = 0;
     loop {
-        let resident: usize = [
-            sharding
-                .registration_state(agent_registration.key())
-                .expect("the agent registration exists")
-                .local_entity_count(),
-            sharding
-                .registration_state(task_registration.key())
-                .expect("the task registration exists")
-                .local_entity_count(),
-            sharding
-                .registration_state(run_registration.key())
-                .expect("the run registration exists")
-                .local_entity_count(),
-        ]
-        .into_iter()
-        .sum();
+        let resident = world.resident_entities();
         if resident == 0 {
             break;
         }
@@ -298,15 +214,16 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
     // is `Active`, the task is `Blocked` with its assignee — read without
     // waking anything.
     let durable_agent =
-        load_agent_entity_state(&agents, &agent_scope(), &AgentSchemaPolicy::default())
+        load_agent_entity_state(&world.agents, &agent_scope(), &AgentSchemaPolicy::default())
             .await
             .expect("the agent state loads")
             .expect("the agent exists");
     assert_eq!(durable_agent.status(), AgentLifecycleStatus::Active);
-    let durable_task = load_agent_task_state(&tasks, &task_scope(), &AgentSchemaPolicy::default())
-        .await
-        .expect("the task state loads")
-        .expect("the task exists");
+    let durable_task =
+        load_agent_task_state(&world.tasks, &task_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the task state loads")
+            .expect("the task exists");
     assert_eq!(durable_task.status(), Some(AgentTaskStatus::Blocked));
 
     // Work becomes eligible: the durable dependency-outcome trigger flips the
@@ -333,7 +250,9 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
         "the trigger applies, got {resolved:?}"
     );
 
-    // Drive to completion through the sharded surface.
+    // Drive to completion through the sharded surface. A stall must name
+    // itself rather than fall through to an opaque status assertion.
+    let mut drive_converged = false;
     for _round in 0..16 {
         let _task_settled = task
             .ask(
@@ -350,7 +269,7 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
             .await
             .expect("the run settles");
 
-        let state = load_agent_run_state(&runs, &run_scope(), &AgentSchemaPolicy::default())
+        let state = load_agent_run_state(&world.runs, &run_scope(), &AgentSchemaPolicy::default())
             .await
             .expect("the run state loads");
         let mut answered = 0;
@@ -362,7 +281,7 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
                 .cloned()
                 .collect();
             for effect in ready {
-                let outcome = dispatcher.answer(&effect).await;
+                let outcome = world.dispatcher.answer(&effect).await;
                 let _reply = run
                     .ask(
                         |reply_to| AgentRunEntityMessage::Command {
@@ -389,11 +308,13 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
             .and_then(|state| state.status())
             .is_some_and(|status| status.is_terminal());
         if terminal && answered == 0 {
+            drive_converged = true;
             break;
         }
     }
+    assert!(drive_converged, "the reactivated flow did not converge");
 
-    let run_state = load_agent_run_state(&runs, &run_scope(), &AgentSchemaPolicy::default())
+    let run_state = load_agent_run_state(&world.runs, &run_scope(), &AgentSchemaPolicy::default())
         .await
         .expect("the run state loads")
         .expect("the run exists")
@@ -419,13 +340,14 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
         matches!(replay, AgentTaskEntityReply::Duplicate { .. }),
         "a replayed trigger must not advance, got {replay:?}"
     );
-    let durable_task = load_agent_task_state(&tasks, &task_scope(), &AgentSchemaPolicy::default())
-        .await
-        .expect("the task state loads")
-        .expect("the task exists");
+    let durable_task =
+        load_agent_task_state(&world.tasks, &task_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the task state loads")
+            .expect("the task exists");
     let converged = durable_task.task().expect("the task is created");
     assert_eq!(durable_task.status(), Some(AgentTaskStatus::Completed));
     assert_eq!(converged.assignment_generation.get(), 1);
 
-    system.shutdown();
+    world.system.shutdown();
 }

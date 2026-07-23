@@ -830,6 +830,7 @@ async fn the_reconciliation_wait_survives_any_owner_loss_without_reinvoking() {
             let _crashed = drive_reconciliation_flow(&fx, &checkpoint_id).await;
 
             // A new owner activates and finds only what was durably committed.
+            fx.runs.assert_crash_fired(nth, point);
             fx.runs.survive();
             drive_reconciliation_flow(&fx, &checkpoint_id)
                 .await

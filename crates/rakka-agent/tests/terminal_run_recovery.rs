@@ -4,11 +4,12 @@
 //! ... before advancing"); scenario 19 of section 18. A run that reached a
 //! terminal status with its settlement drained is durably done: recovering
 //! it — on any owner, however many times — must dispatch no completed
-//! effect again and make *no durable write at all*. The proof arms a crash
-//! point at the first write permanently, so "writes nothing" is a hard
-//! assertion rather than an inference: any attempted write would surface as
-//! an injected loss, and the recovery pump must instead return cleanly with
-//! the write counter untouched.
+//! effect again and make *no durable write at all*, to the run store or to
+//! the task store the recovery pump settles alongside it. The proof arms a
+//! crash point at the first write of both stores permanently, so "writes
+//! nothing" is a hard assertion rather than an inference: any attempted
+//! write would surface as an injected loss, and the recovery pump must
+//! instead return cleanly with both write counters untouched.
 
 use rakka_agent::testkit::{sweep_crash_points, CrashPoint, ScriptedDispatcher};
 use rakka_agent::{
@@ -61,9 +62,12 @@ fn tool_flow_fixture() -> Fixture {
 }
 
 /// Proves the recovery of the fixture's terminal run is writeless and
-/// dispatches nothing: the run store is armed to fail the *first* write, and
-/// the pump must converge cleanly anyway with the counter at zero and the
-/// effect sink unchanged.
+/// dispatches nothing: the run *and task* stores are armed to fail their
+/// first write, and the pump must converge cleanly anyway with both counters
+/// at zero and the effect sink unchanged. The task store is held to the same
+/// bar because the recovery pump settles the task entity too — a terminal,
+/// settled task that wrote on every recovery pass would be the same defect on
+/// the other store.
 async fn assert_writeless_terminal_recovery(fx: &Fixture, context: &str) {
     let effects_before = fx.dispatched_effects();
     let before = fx.run_snapshot().await.expect("the run exists");
@@ -72,18 +76,25 @@ async fn assert_writeless_terminal_recovery(fx: &Fixture, context: &str) {
         "{context}: the run must already be terminal"
     );
 
-    // Arm the tripwire: `crash_at` resets the counter, so any write from here
-    // on both fails the pump and shows in `writes()`.
+    // Arm the tripwires: `crash_at` resets the counters, so any write from
+    // here on both fails the pump and shows in `writes()`.
     fx.runs.crash_at(1, CrashPoint::BeforeWrite);
+    fx.tasks.crash_at(1, CrashPoint::BeforeWrite);
     fx.pump()
         .await
         .unwrap_or_else(|error| panic!("{context}: terminal recovery wrote durably: {error}"));
     assert_eq!(
         fx.runs.writes(),
         0,
-        "{context}: terminal recovery attempted a durable write"
+        "{context}: terminal recovery attempted a durable run write"
+    );
+    assert_eq!(
+        fx.tasks.writes(),
+        0,
+        "{context}: terminal recovery attempted a durable task write"
     );
     fx.runs.survive();
+    fx.tasks.survive();
 
     assert_eq!(
         fx.dispatched_effects(),
@@ -147,6 +158,7 @@ async fn every_crash_converges_to_a_terminal_run_that_recovers_writeless() {
         let _crashed = fx.pump().await;
 
         // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
         fx.runs.survive();
         fx.pump().await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

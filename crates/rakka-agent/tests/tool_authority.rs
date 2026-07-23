@@ -1410,6 +1410,7 @@ async fn a_fully_authorized_tool_call_executes_once_under_any_owner_loss() {
 
         // A new owner activates and finds only what was durably committed; the
         // dead pass's fleet lease lapses before its work is re-claimable.
+        fx.fx.runs.assert_crash_fired(nth, point);
         fx.fx.runs.survive();
         fx.expire_lease();
         fx.try_pump().await.unwrap_or_else(|error| {
@@ -1505,6 +1506,7 @@ async fn a_pre_crash_revocation_blocks_dispatch_after_any_owner_loss() {
         fx.fx.create_task().await;
         let _crashed = fx.try_pump().await;
 
+        fx.fx.runs.assert_crash_fired(nth, point);
         fx.fx.runs.survive();
         fx.expire_lease();
         fx.try_pump().await.unwrap_or_else(|error| {

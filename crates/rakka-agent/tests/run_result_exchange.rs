@@ -509,6 +509,7 @@ async fn losing_the_run_at_any_write_of_the_result_exchange_converges() {
         fx.create_task().await;
         let _crashed = fx.pump().await;
 
+        fx.runs.assert_crash_fired(nth, point);
         fx.runs.survive();
         fx.pump().await.unwrap_or_else(|error| {
             panic!("run crash {point:?} at write {nth} did not converge: {error}")
@@ -563,6 +564,7 @@ async fn losing_the_task_at_any_write_of_the_result_exchange_converges() {
         fx.create_task().await;
         let _crashed = fx.pump().await;
 
+        fx.tasks.assert_crash_fired(nth, point);
         fx.tasks.survive();
         // The ingress re-delivers its command, because the ingress is what owns
         // the creation exchange: a task whose owner died before the creation

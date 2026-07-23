@@ -1998,6 +1998,57 @@ where
     }
 }
 
+/// Resolves an exchange envelope's sharded target and whether this node owns
+/// its shard. The middle element is the owning node rendered for diagnostics,
+/// since `NodeId` itself is not part of this crate's dependency surface.
+///
+/// Both [`ShardedExchangeRoute`] and the testkit's
+/// [`crate::testkit::LocalShardedExchangeRoute`] resolve through this one
+/// function, so the local arm a single-node test exercises cannot drift from
+/// the arm production takes when the owner is colocated.
+pub(crate) fn resolve_sharded_exchange_target<M>(
+    sharding: &ClusterSharding,
+    key: &EntityTypeKey<M>,
+    envelope: &AgentExchangeEnvelope,
+) -> Result<(rakka_sharding::ShardedEntityRef<M>, String, bool), AgentExchangeDeliveryError>
+where
+    M: Message,
+{
+    let entity = sharding
+        .entity_ref_for(key, envelope.target().entity_id().as_str().to_string())
+        .map_err(|error| AgentExchangeDeliveryError::new("exchange-no-route", error.to_string()))?;
+    let (owner, _shard) = entity
+        .region()
+        .resolve(entity.entity_ref())
+        .map_err(|error| AgentExchangeDeliveryError::new("exchange-no-route", error.to_string()))?;
+    let is_local = entity
+        .region()
+        .local_node_id()
+        .is_some_and(|local| local == &owner);
+    Ok((entity, format!("{owner:?}"), is_local))
+}
+
+/// Delivers the envelope to a locally owned sharded entity by ask.
+///
+/// This is the production local arm; the testkit's single-node route calls
+/// the same function, never a reimplementation of it.
+pub(crate) async fn ask_local_sharded_entity<M>(
+    entity: &rakka_sharding::ShardedEntityRef<M>,
+    build: &Arc<dyn Fn(AgentExchangeEnvelope, ReplyTo<AgentExchangeReply>) -> M + Send + Sync>,
+    envelope: &AgentExchangeEnvelope,
+    ask_timeout: Duration,
+) -> Result<AgentExchangeReply, AgentExchangeDeliveryError>
+where
+    M: Message,
+{
+    let envelope = envelope.clone();
+    let build = build.clone();
+    entity
+        .ask(move |reply_to| (build)(envelope, reply_to), ask_timeout)
+        .await
+        .map_err(|error| AgentExchangeDeliveryError::new("exchange-ask-failed", error.to_string()))
+}
+
 impl<M, T> AgentExchangeTransport for ShardedExchangeRoute<M, T>
 where
     M: Message + Sync,
@@ -2008,39 +2059,11 @@ where
         envelope: &'a AgentExchangeEnvelope,
     ) -> AgentExchangeDeliveryFuture<'a> {
         Box::pin(async move {
-            let entity = self
-                .sharding
-                .entity_ref_for(
-                    &self.key,
-                    envelope.target().entity_id().as_str().to_string(),
-                )
-                .map_err(|error| {
-                    AgentExchangeDeliveryError::new("exchange-no-route", error.to_string())
-                })?;
-            let (owner, _shard) =
-                entity
-                    .region()
-                    .resolve(entity.entity_ref())
-                    .map_err(|error| {
-                        AgentExchangeDeliveryError::new("exchange-no-route", error.to_string())
-                    })?;
-            let is_local = entity
-                .region()
-                .local_node_id()
-                .is_some_and(|local| local == &owner);
+            let (entity, _owner, is_local) =
+                resolve_sharded_exchange_target(&self.sharding, &self.key, envelope)?;
 
             if is_local {
-                let envelope = envelope.clone();
-                let build = self.build.clone();
-                entity
-                    .ask(
-                        move |reply_to| (build)(envelope, reply_to),
-                        self.ask_timeout,
-                    )
-                    .await
-                    .map_err(|error| {
-                        AgentExchangeDeliveryError::new("exchange-ask-failed", error.to_string())
-                    })
+                ask_local_sharded_entity(&entity, &self.build, envelope, self.ask_timeout).await
             } else {
                 entity
                     .remote_ask::<AgentExchangeEnvelope, AgentExchangeReply, T>(

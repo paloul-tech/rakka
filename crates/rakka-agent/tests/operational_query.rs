@@ -560,6 +560,7 @@ async fn the_snapshot_reports_the_reference_facts_after_any_owner_loss() {
         let _crashed = fx.pump().await;
 
         // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
         fx.runs.survive();
         fx.pump().await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

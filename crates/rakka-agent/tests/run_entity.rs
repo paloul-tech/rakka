@@ -138,6 +138,7 @@ async fn restart_after_every_loop_transition_resumes_correctly() {
         let _crashed = fx.pump().await;
 
         // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
         fx.runs.survive();
         fx.pump().await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")
@@ -396,6 +397,7 @@ async fn a_redelivered_completion_after_any_owner_loss_never_advances_twice() {
             fx.create_task().await;
             let _crashed = fx.pump().await;
 
+            fx.runs.assert_crash_fired(nth, point);
             fx.runs.survive();
             fx.pump().await.unwrap_or_else(|error| {
                 panic!("crash {point:?} at write {nth} did not converge: {error}")

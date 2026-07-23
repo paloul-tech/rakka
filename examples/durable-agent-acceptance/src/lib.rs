@@ -16,5 +16,5 @@ pub mod flow;
 pub mod report;
 pub mod wiring;
 
-pub use flow::run_acceptance;
+pub use flow::{run_acceptance, CONTENT_SENTINELS};
 pub use report::AcceptanceReport;

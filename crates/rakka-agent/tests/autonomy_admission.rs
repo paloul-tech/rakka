@@ -493,6 +493,7 @@ async fn an_admission_survives_any_agent_owner_loss_exactly_once() {
         let _crashed = drive_admitted_flow(&fx).await;
 
         // A new owner activates; the operator redelivers.
+        fx.agents.assert_crash_fired(nth, point);
         fx.agents.survive();
         drive_admitted_flow(&fx).await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

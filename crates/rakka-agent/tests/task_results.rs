@@ -758,6 +758,7 @@ async fn a_rejected_result_survives_any_task_owner_loss_with_one_rejection() {
             .await;
 
         // A new owner activates; the run redelivers the same proposal.
+        fx.tasks.assert_crash_fired(nth, point);
         fx.tasks.survive();
         let decision = fx
             .try_propose(

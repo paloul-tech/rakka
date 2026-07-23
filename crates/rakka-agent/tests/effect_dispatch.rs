@@ -1471,6 +1471,7 @@ async fn the_pipeline_survives_any_outbox_store_loss_under_one_idempotency_key()
         let _crashed = fx.try_pump().await;
 
         // A new owner activates; the dead pass's lease lapses.
+        fx.workflow_store.assert_crash_fired(nth, point);
         fx.workflow_store.survive();
         fx.expire_lease();
         fx.try_pump().await.unwrap_or_else(|error| {
@@ -1524,6 +1525,7 @@ async fn the_pipeline_survives_any_fleet_store_loss_under_one_idempotency_key() 
         fx.fx.create_task().await;
         let _crashed = fx.try_pump().await;
 
+        fx.fleet_store.assert_crash_fired(nth, point);
         fx.fleet_store.survive();
         fx.expire_lease();
         fx.try_pump().await.unwrap_or_else(|error| {
@@ -1535,6 +1537,10 @@ async fn the_pipeline_survives_any_fleet_store_loss_under_one_idempotency_key() 
             run.status,
             AgentRunStatus::Completed,
             "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.turn, 2,
+            "crash {point:?} at write {nth} replayed a turn"
         );
         assert_eq!(
             distinct_tool_keys(&fx).len(),

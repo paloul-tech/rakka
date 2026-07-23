@@ -585,6 +585,7 @@ async fn the_escrow_round_trip_survives_a_restart_at_every_durable_boundary() {
         let _crashed = fx.pump().await;
 
         // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
         fx.runs.survive();
         fx.pump().await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

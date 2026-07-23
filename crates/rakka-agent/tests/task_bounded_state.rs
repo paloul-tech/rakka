@@ -1017,6 +1017,7 @@ async fn bounded_state_and_gapless_history_survive_any_owner_loss() {
         let _crashed = drive_churn(&fx, CHURN).await;
 
         // A new owner activates; everything is redelivered.
+        fx.tasks.assert_crash_fired(nth, point);
         fx.tasks.survive();
         drive_churn(&fx, CHURN).await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

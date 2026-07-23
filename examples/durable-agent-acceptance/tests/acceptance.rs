@@ -4,7 +4,7 @@
 //! cannot rot.
 
 use rakka_example_durable_agent_acceptance::report::EXPECTED_TRANSCRIPT;
-use rakka_example_durable_agent_acceptance::run_acceptance;
+use rakka_example_durable_agent_acceptance::{run_acceptance, CONTENT_SENTINELS};
 
 #[tokio::test]
 async fn the_transcript_is_exactly_the_documented_one() {
@@ -32,13 +32,11 @@ async fn the_transcript_is_exactly_the_documented_one() {
         .all(|name| name.starts_with("rakka.agent.")));
 
     // Scenario 25's discipline, applied to the example: no telemetry surface
-    // carries model text, tool arguments, or credential material.
+    // carries model text, tool arguments, or credential material. The walk
+    // sweeps these itself before printing line 17; this re-sweep keeps the
+    // test independent of that in-flow assertion.
     for surface in &report.telemetry_surfaces {
-        for sentinel in [
-            "SENSITIVE-REASONING",
-            "SECRET-TOKEN",
-            "charged and resolved",
-        ] {
+        for sentinel in CONTENT_SENTINELS {
             assert!(
                 !surface.contains(sentinel),
                 "{sentinel} leaked into a telemetry surface"

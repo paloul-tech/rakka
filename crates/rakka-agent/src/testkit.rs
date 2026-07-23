@@ -2174,7 +2174,9 @@ where
 ///
 /// Every store class in the M1 suite — run, task, agent, workflow outbox, and
 /// dispatcher fleet — is wrapped in one of these, and [`sweep_crash_points`]
-/// drives the kill through every write of a flow.
+/// drives the kill through every write of a flow. Compare-and-set and delete
+/// both count as writes, so the sweep stays exhaustive for flows that delete;
+/// loads are never counted and never crash.
 pub struct CrashingStateStore<S>
 where
     S: rakka_persistence::DurableState,
@@ -2259,6 +2261,23 @@ where
     pub fn reset_writes(&self) {
         self.writes.store(0, Ordering::SeqCst);
     }
+
+    /// Asserts the crash armed at the `nth` write was actually reached.
+    ///
+    /// A sweep iteration whose flow never attempts its armed write converges
+    /// trivially and proves nothing — silent under-coverage that matters
+    /// whenever the swept flow is shaped differently from the reference run
+    /// that measured the write count. Call this after the crashed drive and
+    /// before [`Self::survive`] to make every window's firing a hard fact.
+    #[track_caller]
+    pub fn assert_crash_fired(&self, nth: usize, point: CrashPoint) {
+        let writes = self.writes();
+        assert!(
+            writes >= nth,
+            "the crash {point:?} armed at write {nth} never fired: \
+             the flow attempted only {writes} writes"
+        );
+    }
 }
 
 impl<S> rakka_persistence::DurableStateStore<S> for CrashingStateStore<S>
@@ -2312,7 +2331,29 @@ where
         persistence_id: &'a rakka_persistence::PersistenceId,
         expected_revision: rakka_persistence::Revision,
     ) -> rakka_persistence::StoreFuture<'a, rakka_persistence::Revision> {
-        self.inner.delete(persistence_id, expected_revision)
+        // A delete is a durable write too: it is counted and crash-armable
+        // exactly like a compare-and-set, so a sweep stays exhaustive the day
+        // a flow starts deleting (no M1 flow does yet).
+        let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        let crash_at = self.crash_at.load(Ordering::SeqCst);
+        let after = self.crash_after.load(Ordering::SeqCst);
+
+        Box::pin(async move {
+            if crash_at != 0 && write == crash_at && !after {
+                return Err(rakka_persistence::DurableError::store(
+                    "crashing-in-memory",
+                    "the owner was lost before the delete reached the store",
+                ));
+            }
+            let revision = self.inner.delete(persistence_id, expected_revision).await?;
+            if crash_at != 0 && write == crash_at && after {
+                return Err(rakka_persistence::DurableError::store(
+                    "crashing-in-memory",
+                    "the owner was lost after the delete committed",
+                ));
+            }
+            Ok(revision)
+        })
     }
 }
 
@@ -2408,9 +2449,9 @@ impl AgentExchangeTransport for DeferredExchangeRouter {
 /// the local arm of the production `ShardedExchangeRoute`, without the
 /// `rakka-remote` ask client the other arm needs.
 ///
-/// It resolves the target's shard owner exactly as the production route does
-/// and asks the local entity through the same `build` closure, delivering the
-/// same envelope to the same durable [`AgentExchangeHost::accept`] — colocation
+/// It resolves the target's shard owner and asks the local entity through the
+/// production route's own functions — not a copy of them — delivering the
+/// same envelope to the same durable [`AgentExchangeHost::accept`]: colocation
 /// changes the transport, never the durable path. An owner that is not local
 /// is an explicit error, because a single-node test that reaches that branch
 /// has mis-wired its sharding, not discovered a remote peer.
@@ -2474,47 +2515,28 @@ where
         envelope: &'a AgentExchangeEnvelope,
     ) -> AgentExchangeDeliveryFuture<'a> {
         Box::pin(async move {
-            let entity = self
-                .sharding
-                .entity_ref_for(
-                    &self.key,
-                    envelope.target().entity_id().as_str().to_string(),
-                )
-                .map_err(|error| {
-                    AgentExchangeDeliveryError::new("exchange-no-route", error.to_string())
-                })?;
-            let (owner, _shard) =
-                entity
-                    .region()
-                    .resolve(entity.entity_ref())
-                    .map_err(|error| {
-                        AgentExchangeDeliveryError::new("exchange-no-route", error.to_string())
-                    })?;
-            let is_local = entity
-                .region()
-                .local_node_id()
-                .is_some_and(|local| local == &owner);
+            let (entity, owner, is_local) = crate::choreography::resolve_sharded_exchange_target(
+                &self.sharding,
+                &self.key,
+                envelope,
+            )?;
             if !is_local {
                 return Err(AgentExchangeDeliveryError::new(
                     "exchange-not-local",
                     format!(
-                        "the shard owner of {} is {owner:?}, which is not this node; \
+                        "the shard owner of {} is {owner}, which is not this node; \
                          the local route serves single-node systems only",
                         envelope.target().entity_id().as_str()
                     ),
                 ));
             }
-            let envelope = envelope.clone();
-            let build = self.build.clone();
-            entity
-                .ask(
-                    move |reply_to| (build)(envelope, reply_to),
-                    self.ask_timeout,
-                )
-                .await
-                .map_err(|error| {
-                    AgentExchangeDeliveryError::new("exchange-ask-failed", error.to_string())
-                })
+            crate::choreography::ask_local_sharded_entity(
+                &entity,
+                &self.build,
+                envelope,
+                self.ask_timeout,
+            )
+            .await
         })
     }
 }

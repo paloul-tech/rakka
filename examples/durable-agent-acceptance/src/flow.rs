@@ -138,22 +138,33 @@ fn auditor_policies() -> AgentPolicyRefs {
     }
 }
 
+/// The content sentinels the walk plants in model text, tool arguments, and
+/// the proposed result: any telemetry surface containing one has leaked
+/// content that default telemetry must never carry. The scripted adapter
+/// plants from this same array, so a sentinel cannot drift away from its
+/// sweep.
+pub const CONTENT_SENTINELS: [&str; 3] = [
+    "SENSITIVE-REASONING",
+    "SECRET-TOKEN",
+    "charged and resolved",
+];
+
 /// The two scripted model turns: ask for the gated tool, then propose.
 pub fn scripted_adapter() -> DeterministicModelAdapter {
     let tool_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-        .with_text("SENSITIVE-REASONING about the charge.")
+        .with_text(format!("{} about the charge.", CONTENT_SENTINELS[0]))
         .with_tool_call(
             AgentToolCallRequest::new(
                 AgentToolCallId::new("call-1").expect("the call id is valid"),
                 AgentToolId::new(TOOL).expect("the tool id is valid"),
-                serde_json::json!({ "amount": 42, "card_token": "SECRET-TOKEN" }),
+                serde_json::json!({ "amount": 42, "card_token": CONTENT_SENTINELS[1] }),
             )
             .expect("the tool call is bounded"),
         );
     let proposing_turn = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
-        .with_text("SENSITIVE-REASONING toward the answer.")
+        .with_text(format!("{} toward the answer.", CONTENT_SENTINELS[0]))
         .with_proposal(
-            AgentTaskContent::inline(serde_json::json!({ "answer": "charged and resolved" }))
+            AgentTaskContent::inline(serde_json::json!({ "answer": CONTENT_SENTINELS[2] }))
                 .expect("the proposal is inline-bounded"),
         );
     DeterministicModelAdapter::new()
@@ -858,11 +869,21 @@ pub async fn run_acceptance() -> AcceptanceReport {
                  telemetry wired into the query"
         .to_string();
 
-    // 17/18 — the surfaces the test sweeps for content sentinels.
+    // 17/18 — every default telemetry surface, swept for the planted content
+    // sentinels here in the walk itself: `cargo run` fails on a leak, not
+    // only the test.
     let mut telemetry_surfaces = Vec::new();
     telemetry_surfaces.push(format!("{:?}", snapshot.observations()));
     telemetry_surfaces.push(serde_json::to_string(&operational).expect("the snapshot serializes"));
     telemetry_surfaces.push(serde_json::to_string(&view).expect("the view serializes"));
+    for surface in &telemetry_surfaces {
+        for sentinel in CONTENT_SENTINELS {
+            assert!(
+                !surface.contains(sentinel),
+                "{sentinel} leaked into a default telemetry surface"
+            );
+        }
+    }
     lines[16] = "ok 17/18 default telemetry carries no prompt, tool payload, memory content, \
                  or credential material"
         .to_string();

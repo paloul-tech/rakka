@@ -426,6 +426,7 @@ async fn the_traced_flow_survives_any_owner_loss_without_changing_behavior() {
             let _crashed = fx.pump().await;
 
             // A new owner activates and finds only what was durably committed.
+            fx.runs.assert_crash_fired(nth, point);
             fx.runs.survive();
             fx.pump().await.unwrap_or_else(|error| {
                 panic!("crash {point:?} at write {nth} did not converge: {error}")

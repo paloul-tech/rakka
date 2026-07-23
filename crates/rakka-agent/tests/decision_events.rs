@@ -176,6 +176,7 @@ async fn the_decision_sequence_survives_any_owner_loss_exactly_once() {
         let _crashed = fx.pump().await;
 
         // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
         fx.runs.survive();
         fx.pump().await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

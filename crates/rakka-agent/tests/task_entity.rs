@@ -1064,6 +1064,7 @@ async fn the_dependency_and_assignment_flow_survives_any_owner_loss() {
         let _crashed = drive_dependency_flow(&fx).await;
 
         // A new owner activates; the ingress redelivers everything.
+        fx.tasks.assert_crash_fired(nth, point);
         fx.tasks.survive();
         drive_dependency_flow(&fx).await.unwrap_or_else(|error| {
             panic!("crash {point:?} at write {nth} did not converge: {error}")

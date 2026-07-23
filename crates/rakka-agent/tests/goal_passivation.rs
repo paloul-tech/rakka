@@ -15,40 +15,32 @@
 //! same single advance after the trigger is redelivered. Timer-driven wakes
 //! are the phase 3 wake controller's; nothing here invents one.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use rakka_agent::testkit::{
-    CrashPoint, CrashingStateStore, DeferredExchangeRouter, LocalShardedExchangeRoute,
-    ScriptedDispatcher,
-};
+use rakka_agent::testkit::{CrashPoint, CrashingStateStore, ScriptedDispatcher};
 use rakka_agent::{
-    agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
-    init_agent_entity_sharding, init_agent_run_entity_sharding, init_agent_task_entity_sharding,
     load_agent_run_state, passivate_agent_entity, passivate_agent_run_entity,
-    passivate_agent_task_entity, registered_agent_entity_ref, registered_agent_run_entity_ref,
-    registered_agent_task_entity_ref, run_id_for_assignment, AgentApprovalDecision,
+    passivate_agent_task_entity, run_id_for_assignment, AgentApprovalDecision,
     AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentCheckpointDecision, AgentDefinition,
-    AgentDefinitionId, AgentEffectPolicies, AgentEffectSpec, AgentEntityClass, AgentEntityCommand,
-    AgentEntityMessage, AgentEntityReply, AgentEntityShardingSettings, AgentEntityState,
-    AgentExchangeRouter, AgentGoalId, AgentId, AgentModelTurn, AgentOperationId,
+    AgentDefinitionId, AgentEffectPolicies, AgentEffectSpec, AgentEntityCommand,
+    AgentEntityMessage, AgentEntityReply, AgentGoalId, AgentId, AgentModelTurn, AgentOperationId,
     AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectStatus,
     AgentRunEntityCommand, AgentRunEntityMessage, AgentRunEntityRef, AgentRunEntityReply,
-    AgentRunEntityShardingSettings, AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaId,
-    AgentSchemaPolicy, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent,
-    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
-    AgentTaskEntityMessage, AgentTaskEntityRef, AgentTaskEntityReply,
-    AgentTaskEntityShardingSettings, AgentTaskId, AgentTaskScope, AgentTaskState, AgentTaskStatus,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink,
-    InMemoryAgentTaskHistoryStore, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaId, AgentSchemaPolicy, AgentSchemaRef,
+    AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation, AgentTaskDefinition,
+    AgentTaskDefinitionId, AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef,
+    AgentTaskEntityReply, AgentTaskId, AgentTaskScope, AgentTaskStatus, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, HumanCheckpointId, PrincipalRef,
 };
 use rakka_core::ActorSystem;
-use rakka_persistence::InMemoryDurableStateStore;
 use rakka_sharding::ClusterSharding;
+
+mod common;
+
+use common::ShardedWorld;
 
 const TENANT: &str = "acme";
 const AGENT: &str = "support-agent";
@@ -138,9 +130,9 @@ fn proposing_turn() -> AgentModelTurn {
         )
 }
 
-/// The whole sharded world: real agent, task, and run entity types on one
-/// node, exchanging through the local sharded route — the same durable path
-/// production uses, minus only the TCP transport.
+/// Scenario 35's world over the shared [`common::ShardedWorld`] wiring: the
+/// checkpoint-gated dispatcher script, the goal task's scopes and refs, and
+/// the drive helpers.
 struct Sharded {
     system: ActorSystem,
     sharding: ClusterSharding,
@@ -156,14 +148,6 @@ struct Sharded {
 
 impl Sharded {
     fn new(name: &str, idle: Duration) -> Self {
-        let system = ActorSystem::new(name);
-        let sharding = ClusterSharding::get(&system);
-        let tasks = InMemoryDurableStateStore::<AgentTaskState>::new();
-        let agents = InMemoryDurableStateStore::<AgentEntityState>::new();
-        let runs = CrashingStateStore::<AgentRunState>::new();
-        let history = InMemoryAgentTaskHistoryStore::new();
-        let effects = InMemoryAgentRunEffectSink::new();
-        let clock = Arc::new(AtomicU64::new(1));
         let dispatcher = ScriptedDispatcher::new()
             .with_turn(tool_calling_turn())
             .with_turn(proposing_turn())
@@ -179,73 +163,20 @@ impl Sharded {
             )
             .expect("the checkpoint-required tool spec is valid");
 
-        // The routes need the registrations and the registrations need the
-        // router: the deferred router is that late binding and nothing more.
-        let deferred = DeferredExchangeRouter::new();
-        let entity_clock = {
-            let clock = clock.clone();
-            Arc::new(move || AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst)))
-        };
-
-        let agent_registration = init_agent_entity_sharding(
-            &sharding,
-            agents.clone(),
-            AgentEntityShardingSettings::new(agent_entity_type_key()).with_idle_passivation(idle),
-        )
-        .expect("agent entity sharding initializes");
-        let task_registration = init_agent_task_entity_sharding(
-            &sharding,
-            tasks.clone(),
-            agents.clone(),
-            history.clone(),
-            deferred.as_router(),
-            AgentTaskEntityShardingSettings::new(agent_task_entity_type_key())
-                .with_idle_passivation(idle)
-                .with_clock(entity_clock.clone()),
-        )
-        .expect("task entity sharding initializes");
-        let run_registration = init_agent_run_entity_sharding(
-            &sharding,
-            runs.clone(),
-            effects,
-            deferred.as_router(),
-            AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
-                .with_idle_passivation(idle)
-                .with_clock(entity_clock)
-                .with_effect_policies(policies),
-        )
-        .expect("run entity sharding initializes");
-
-        let router = AgentExchangeRouter::new()
-            .with_route(
-                AgentEntityClass::Task,
-                Arc::new(LocalShardedExchangeRoute::new(
-                    sharding.clone(),
-                    task_registration.key().clone(),
-                    ASK_TIMEOUT,
-                    |envelope, reply_to| AgentTaskEntityMessage::Exchange {
-                        envelope: Box::new(envelope),
-                        reply_to,
-                    },
-                )),
-            )
-            .with_route(
-                AgentEntityClass::Run,
-                Arc::new(LocalShardedExchangeRoute::new(
-                    sharding.clone(),
-                    run_registration.key().clone(),
-                    ASK_TIMEOUT,
-                    |envelope, reply_to| AgentRunEntityMessage::Exchange {
-                        envelope: Box::new(envelope),
-                        reply_to,
-                    },
-                )),
-            );
-        deferred.install(router);
-
-        let agent = registered_agent_entity_ref(&agent_registration, &agent_scope());
-        let task = registered_agent_task_entity_ref(&task_registration, &task_scope());
-        let run = registered_agent_run_entity_ref(&run_registration, &run_scope());
+        let world = ShardedWorld::new(name, idle, dispatcher, Some(policies));
+        let agent = world.agent_ref(&agent_scope());
+        let task = world.task_ref(&task_scope());
+        let run = world.run_ref(&run_scope());
+        let ShardedWorld {
+            system,
+            sharding,
+            runs,
+            dispatcher,
+            agent_registration,
+            task_registration,
+            run_registration,
+            ..
+        } = world;
 
         Self {
             system,

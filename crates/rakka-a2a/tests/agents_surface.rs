@@ -876,6 +876,11 @@ async fn duplicate_sends_survive_any_owner_loss_with_one_task_one_run_one_turn()
                         .await;
                     let _crashed = fixture.try_pump(&task_id).await;
 
+                    match armed {
+                        "run" => fixture.runs.assert_crash_fired(nth, point),
+                        _ => fixture.tasks.assert_crash_fired(nth, point),
+                    }
+
                     // A new owner activates; the ingress redelivers the send.
                     fixture.runs.survive();
                     fixture.tasks.survive();
