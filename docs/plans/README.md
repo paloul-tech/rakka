@@ -6,6 +6,16 @@ Use the product docs in `docs/` for current behavior, validation, examples, comp
 
 ## Plan Files
 
+- `rakka-agent/background-research.md`: research record for durable sharded
+  Rig-powered goal-driven agents, Akka/OpenFang implementation findings,
+  concurrent collaboration, HITL, effect ambiguity, A2A, tiered memory, and
+  OpenTelemetry observability.
+- `rakka-agent/technical-guidance.md`: opinionated architecture, technical
+  discovery defaults, typed task/run separation, coordination capabilities,
+  goal/delegation design, linked tracing, crate boundaries, and suggested
+  delivery slices.
+- `rakka-agent/spec.md`: emerging normative specification for durable,
+  goal-driven Rakka Agents.
 - `rakka-v1-implementation-plan.md`: original v1 implementation plan.
 - `rakka-phase-3-continuation-plan.md`: Phase 3 remote, cluster, and sharding continuation plan.
 - `rakka-phase-4-continuation-plan.md`: Phase 4 process actor and durable workflow continuation plan.

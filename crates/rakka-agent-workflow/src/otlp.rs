@@ -547,6 +547,112 @@ impl AgentOtelResource {
     }
 }
 
+/// OpenTelemetry span kind carried by a bridge record.
+///
+/// The kind is semantic, not cosmetic — a `PRODUCER`/`CONSUMER` pair is how a
+/// durable schedule/dispatch boundary reads in a trace — so the bridge must
+/// represent it rather than silently dropping it while claiming
+/// semantic-convention compliance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentOtelSpanKind {
+    /// An internal operation.
+    #[default]
+    Internal,
+    /// A server-side handler of a remote request.
+    Server,
+    /// A client-side remote call.
+    Client,
+    /// The producing side of an asynchronous boundary.
+    Producer,
+    /// The consuming side of an asynchronous boundary.
+    Consumer,
+}
+
+impl AgentOtelSpanKind {
+    /// Stable lowercase label matching the OTLP span-kind vocabulary.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Server => "server",
+            Self::Client => "client",
+            Self::Producer => "producer",
+            Self::Consumer => "consumer",
+        }
+    }
+}
+
+/// OpenTelemetry span status carried by a bridge record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentOtelSpanStatus {
+    /// No status was set.
+    #[default]
+    Unset,
+    /// The operation completed as intended.
+    Ok,
+    /// The operation failed. The stable `error.type` and error code ride the
+    /// span attributes, never an unbounded message.
+    Error,
+}
+
+impl AgentOtelSpanStatus {
+    /// Stable lowercase label matching the OTLP status vocabulary.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One bounded span event carried by a bridge record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOtelSpanEvent {
+    /// Stable event name.
+    pub name: String,
+    /// When the event occurred.
+    pub time: AgentTimestampMillis,
+    /// Bounded event attributes.
+    pub attributes: AgentAttributes,
+}
+
+/// The instrumentation scope and schema an export batch was produced under
+/// ([specification 17.2](../../docs/plans/rakka-agent/spec.md)): the scope
+/// name and version identify the emitter, and the schema URL pins the
+/// reviewed semantic-convention revision the attributes follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOtelInstrumentationScope {
+    /// Instrumentation scope name.
+    pub name: String,
+    /// Instrumentation scope version.
+    pub version: String,
+    /// Schema URL pinning the semantic-convention revision.
+    pub schema_url: Option<String>,
+}
+
+impl AgentOtelInstrumentationScope {
+    /// Validates the scope record.
+    pub fn validate(&self) -> AgentOtlpResult<()> {
+        if is_blank(&self.name) {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "scope.name",
+                reason: "required",
+            });
+        }
+        if is_blank(&self.version) {
+            return Err(AgentOtlpError::InvalidExporter {
+                field: "scope.version",
+                reason: "required",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// OpenTelemetry-oriented span bridge record for agent workflow traces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentOtelSpanExport {
@@ -570,6 +676,17 @@ pub struct AgentOtelSpanExport {
     pub links: Vec<AgentSpanLink>,
     /// Span attributes.
     pub attributes: AgentAttributes,
+    /// Span kind. Added for the agent-domain GenAI mapping; a record exported
+    /// before the field decodes as [`AgentOtelSpanKind::Internal`].
+    #[serde(default)]
+    pub kind: AgentOtelSpanKind,
+    /// Span status. A record exported before the field decodes as
+    /// [`AgentOtelSpanStatus::Unset`].
+    #[serde(default)]
+    pub status: AgentOtelSpanStatus,
+    /// Bounded span events. A record exported before the field decodes empty.
+    #[serde(default)]
+    pub events: Vec<AgentOtelSpanEvent>,
 }
 
 impl AgentOtelSpanExport {
@@ -602,6 +719,9 @@ impl AgentOtelSpanExport {
             end_time,
             links: telemetry_context.span_links.clone(),
             attributes: telemetry_context.baggage.clone(),
+            kind: AgentOtelSpanKind::default(),
+            status: AgentOtelSpanStatus::default(),
+            events: Vec::new(),
         })
     }
 
@@ -619,6 +739,27 @@ impl AgentOtelSpanExport {
         self
     }
 
+    /// Sets the span kind.
+    #[must_use]
+    pub const fn kind(mut self, kind: AgentOtelSpanKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Sets the span status.
+    #[must_use]
+    pub const fn status(mut self, status: AgentOtelSpanStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Adds a bounded span event.
+    #[must_use]
+    pub fn event(mut self, event: AgentOtelSpanEvent) -> Self {
+        self.events.push(event);
+        self
+    }
+
     /// Validates the span export record.
     pub fn validate(&self) -> AgentOtlpResult<()> {
         if is_blank(&self.name) {
@@ -626,6 +767,14 @@ impl AgentOtelSpanExport {
                 field: "span.name",
                 reason: "required",
             });
+        }
+        for event in &self.events {
+            if is_blank(&event.name) {
+                return Err(AgentOtlpError::InvalidExporter {
+                    field: "span.event.name",
+                    reason: "required",
+                });
+            }
         }
         AgentTraceContext::new(
             self.trace_id.clone(),
@@ -650,6 +799,11 @@ pub struct AgentOtlpBridgeExport {
     pub spans: Vec<AgentOtelSpanExport>,
     /// OpenTelemetry-compatible structured log records.
     pub logs: Vec<AgentLogEvent>,
+    /// The instrumentation scope and pinned convention schema this batch was
+    /// produced under ([specification 17.2](../../docs/plans/rakka-agent/spec.md)).
+    /// A batch exported before the field decodes without one.
+    #[serde(default)]
+    pub scope: Option<AgentOtelInstrumentationScope>,
 }
 
 impl AgentOtlpBridgeExport {
@@ -682,7 +836,37 @@ impl AgentOtlpBridgeExport {
             metrics,
             spans,
             logs,
+            scope: None,
         })
+    }
+
+    /// Stamps the instrumentation scope and pinned convention schema.
+    #[must_use]
+    pub fn with_scope(mut self, scope: AgentOtelInstrumentationScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// Validates every part of the export, including the optional
+    /// instrumentation scope a batch may carry
+    /// ([specification 17.17](../../docs/plans/rakka-agent/spec.md)). A receiver
+    /// runs this over an incoming — possibly deserialized — batch before
+    /// trusting it, so a blank-named or unversioned scope cannot ride in
+    /// unchecked the way the span, exporter, and resource records already
+    /// cannot.
+    pub fn validate(&self) -> AgentOtlpResult<()> {
+        self.exporter.validate()?;
+        self.resource.validate()?;
+        for span in &self.spans {
+            span.validate()?;
+        }
+        for log in &self.logs {
+            validate_agent_log_event(log, AgentRedactionPolicy::new())?;
+        }
+        if let Some(scope) = &self.scope {
+            scope.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -723,14 +907,7 @@ impl AgentOtlpBridgeReceiver for InMemoryAgentOtlpReceiver {
         export: AgentOtlpBridgeExport,
     ) -> AgentOtlpReceiverFuture<'a, ()> {
         Box::pin(async move {
-            export.exporter.validate()?;
-            export.resource.validate()?;
-            for span in &export.spans {
-                span.validate()?;
-            }
-            for log in &export.logs {
-                validate_agent_log_event(log, AgentRedactionPolicy::new())?;
-            }
+            export.validate()?;
             self.exports.push(export);
             Ok(())
         })

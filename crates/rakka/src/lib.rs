@@ -162,6 +162,19 @@ pub mod actor {
     pub use rakka_core::*;
 }
 
+#[cfg(feature = "agent")]
+/// Durable agent domain, loop runtime, and model adapter.
+///
+/// Enable with the `agent` facade feature, which brings the provider-neutral
+/// agent surface and its deterministic test adapter. The optional `agent-rig`
+/// and `agent-otel` passthroughs add the Rig-backed model adapter and the
+/// OpenTelemetry GenAI convention mapping. `rig` is a default feature of
+/// `rakka-agent` itself; the facade makes it opt-in so an application can run
+/// the agent runtime without the Rig dependency.
+pub mod agent {
+    pub use rakka_agent::*;
+}
+
 #[cfg(feature = "agent-workflow")]
 /// Agentic workflow orchestration facade.
 pub mod agent_workflow {

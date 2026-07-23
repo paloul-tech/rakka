@@ -32,6 +32,10 @@ k8s = ["dep:rakka-k8s"]
 otel = []
 # In-memory stores, fixtures, and compatibility probes for application tests.
 testkit = ["server"]
+# Typed Rakka Agent surface over `rakka-agent` entities: `AgentTaskId` task
+# identity, durable deduplicated ingress, the specification 14.3 state
+# projection, and the versioned agent-management extension.
+agents = ["server", "dep:rakka-agent"]
 
 [dependencies]
 a2a = { package = "a2a-lf", version = "0.3.0" }
@@ -40,6 +44,7 @@ async-trait = "0.1"
 axum = { workspace = true, optional = true }
 chrono = "0.4"
 futures-util.workspace = true
+rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false, optional = true }
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0", optional = true }
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
@@ -66,6 +71,10 @@ required-features = ["postgres"]
 [[test]]
 name = "cluster"
 required-features = ["testkit", "sharding"]
+
+[[test]]
+name = "agents_surface"
+required-features = ["agents"]
 
 [lints]
 workspace = true

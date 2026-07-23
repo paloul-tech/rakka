@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use a2a::{
-    AgentCapabilities, AgentCard, AgentInterface, AgentProvider, AgentSkill, SecurityScheme,
-    TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
+    AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentProvider, AgentSkill,
+    SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON, TRANSPORT_PROTOCOL_JSONRPC,
 };
 
 use crate::catalog::A2AWorkflowCatalog;
@@ -56,6 +56,7 @@ pub struct A2AAgentCardBuilder {
     documentation_url: Option<String>,
     security_schemes: Option<HashMap<String, SecurityScheme>>,
     skill_tags: Vec<String>,
+    extensions: Vec<AgentExtension>,
 }
 
 impl std::fmt::Debug for A2AAgentCardBuilder {
@@ -89,6 +90,7 @@ impl A2AAgentCardBuilder {
             documentation_url: None,
             security_schemes: None,
             skill_tags: vec!["rakka".to_string(), "durable-agent".to_string()],
+            extensions: Vec::new(),
         }
     }
 
@@ -186,6 +188,15 @@ impl A2AAgentCardBuilder {
         self
     }
 
+    /// Declares protocol extensions the service actually serves. The card
+    /// never advertises an extension nothing implements, so declaration is
+    /// explicit rather than defaulted.
+    #[must_use]
+    pub fn extensions(mut self, extensions: Vec<AgentExtension>) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
     /// Builds the card, projecting one skill per hosted workflow.
     #[must_use]
     pub fn build(&self, catalog: &dyn A2AWorkflowCatalog) -> AgentCard {
@@ -218,7 +229,7 @@ impl A2AAgentCardBuilder {
             capabilities: AgentCapabilities {
                 streaming: Some(self.streaming),
                 push_notifications: Some(self.push_notifications),
-                extensions: None,
+                extensions: (!self.extensions.is_empty()).then(|| self.extensions.clone()),
                 extended_agent_card: Some(self.extended_agent_card),
             },
             default_input_modes: self.default_input_modes.clone(),
