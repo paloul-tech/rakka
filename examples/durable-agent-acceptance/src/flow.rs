@@ -257,7 +257,10 @@ pub async fn run_acceptance() -> AcceptanceReport {
         outcome.settings_revision.get()
     );
 
-    // 2/18 — one deduplicated A2A task, one initial run.
+    // 2/18 — one deduplicated A2A task, one initial run. The run half of the
+    // line is proven before anything prints: the first pump below finds this
+    // *derived* initial-run scope parked WaitingForApproval, so the identity
+    // named here is the one the durable record answers for.
     let message = task_message("msg-1");
     let first = world
         .service
@@ -813,7 +816,9 @@ pub async fn run_acceptance() -> AcceptanceReport {
         view.trace_segments.len()
     );
 
-    // 9/18 — bounded metric names, no high-cardinality identifiers.
+    // 9/18 — bounded metric names, no high-cardinality identifiers: the
+    // whole observation stream, attributes included, must never carry the
+    // task or run identity.
     let snapshot = world.metrics.snapshot();
     let mut metric_names: Vec<String> = snapshot
         .observations()
@@ -825,6 +830,15 @@ pub async fn run_acceptance() -> AcceptanceReport {
     assert!(metric_names
         .iter()
         .all(|name| name.starts_with("rakka.agent.")));
+    let observation_stream = format!("{:?}", snapshot.observations());
+    assert!(
+        !observation_stream.contains(task_id.as_str()),
+        "a metric observation carries the task id"
+    );
+    assert!(
+        !observation_stream.contains(run_scope.run().as_str()),
+        "a metric observation carries the run id"
+    );
     lines[8] = format!(
         "ok  9/18 bounded metrics observed: {}",
         metric_names.join(", ")

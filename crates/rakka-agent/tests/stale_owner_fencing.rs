@@ -110,7 +110,12 @@ async fn a_stale_run_owner_write_is_rejected_and_the_new_owners_progress_survive
         .apply(completion(), &fx.router, fx.now())
         .await
         .expect("owner B records the completion");
-    assert!(matches!(applied, AgentRunEntityReply::Applied { .. }));
+    let AgentRunEntityReply::Applied {
+        outcome: authoritative,
+    } = applied
+    else {
+        panic!("owner B's completion applies, got {applied:?}");
+    };
 
     // A's write lands behind B's committed revision: rejected, not applied —
     // the turn is not taken twice.
@@ -130,9 +135,12 @@ async fn a_stale_run_owner_write_is_rejected_and_the_new_owners_progress_survive
         .apply(completion(), &fx.router, fx.now())
         .await
         .expect("the redelivered completion is absorbed");
-    assert!(
-        matches!(reply, AgentRunEntityReply::Duplicate { .. }),
-        "the reloaded owner answers from the record, got {reply:?}"
+    let AgentRunEntityReply::Duplicate { outcome } = reply else {
+        panic!("the reloaded owner answers from the record, got {reply:?}");
+    };
+    assert_eq!(
+        outcome, authoritative,
+        "the duplicate must carry the outcome the authoritative owner produced"
     );
 
     // The flow converges normally: one turn, one model call, one effect.
@@ -166,10 +174,6 @@ async fn a_stale_task_owner_write_is_rejected_and_answered_from_the_authoritativ
         .await
         .expect("owner A recovers the empty task");
 
-    // Owner B: the fixture's creation path builds a fresh entity over the
-    // same store — exactly a new owner after a movement.
-    fx.create_task().await;
-
     let creation = || AgentTaskEntityCommand::Create {
         operation_id: AgentOperationId::new(AgentOperationKind::TaskCreation, [TENANT, TASK, "1"])
             .expect("operation id should be derivable"),
@@ -183,6 +187,26 @@ async fn a_stale_task_owner_write_is_rejected_and_answered_from_the_authoritativ
             dependencies: Vec::new(),
             telemetry: Default::default(),
         }),
+    };
+
+    // Owner B: a fresh entity over the same store — exactly a new owner
+    // after a movement — commits the creation.
+    let mut owner_b = AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    owner_b.recover(fx.now()).await.expect("owner B recovers");
+    let applied = owner_b
+        .apply(creation(), &fx.router, fx.now())
+        .await
+        .expect("owner B commits the creation");
+    let AgentTaskEntityReply::Applied {
+        outcome: authoritative,
+    } = applied
+    else {
+        panic!("owner B's creation applies, got {applied:?}");
     };
 
     let error = owner_a
@@ -200,9 +224,12 @@ async fn a_stale_task_owner_write_is_rejected_and_answered_from_the_authoritativ
         .apply(creation(), &fx.router, fx.now())
         .await
         .expect("the redelivered creation is absorbed");
-    assert!(
-        matches!(reply, AgentTaskEntityReply::Duplicate { .. }),
-        "the reloaded owner answers from the record, got {reply:?}"
+    let AgentTaskEntityReply::Duplicate { outcome } = reply else {
+        panic!("the reloaded owner answers from the record, got {reply:?}");
+    };
+    assert_eq!(
+        outcome, authoritative,
+        "the duplicate must carry the outcome the authoritative owner produced"
     );
 
     // One task, one creation row, one assignment — and the flow converges.

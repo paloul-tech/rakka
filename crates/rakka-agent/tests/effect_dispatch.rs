@@ -1279,7 +1279,8 @@ async fn an_effect_policy_weaker_than_the_adapters_declaration_fails_closed_at_d
 /// The M1 per-turn durable-write budget: what one clean model turn — accept
 /// the assignment, commit the model effect, ticket it, claim it, invoke,
 /// deliver the turn, propose the result, accept it, settle the escrow —
-/// costs each durable store, measured from task creation through acceptance.
+/// costs each durable store, measured from task creation through the settled
+/// escrow.
 ///
 /// These are exact counts, not ceilings, and the assertions below are
 /// deliberate change-detectors: phases 3-5 multiply write load, so a
@@ -1302,7 +1303,7 @@ const TURN_BUDGET_WORKFLOW_STORE_WRITES: usize = 3;
 async fn per_turn_durable_write_count_and_latency_measurement() {
     // One clean model turn, end to end over the integrated pipeline. The
     // fixture instantiates the agent first; the counters reset there, so the
-    // budget is exactly "one accepted turn, creation through acceptance".
+    // budget is exactly "one accepted turn, creation through settled escrow".
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
         default_registry(),

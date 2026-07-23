@@ -787,7 +787,10 @@ async fn a_rejected_result_survives_any_task_owner_loss_with_one_rejection() {
             snapshot.rejection_count, 1,
             "crash {point:?} at write {nth} double-counted the rejection"
         );
-        assert!(snapshot.accepted_result.is_none());
+        assert!(
+            snapshot.accepted_result.is_none(),
+            "crash {point:?} at write {nth} accepted a refused result"
+        );
 
         // Redelivered once more after convergence: the original decision comes
         // back, and still exactly one rejection decision exists.

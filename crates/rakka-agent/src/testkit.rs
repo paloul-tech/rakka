@@ -2238,7 +2238,15 @@ where
     }
 
     /// Kills the owner at the `nth` write from now on, and resets the counter.
+    ///
+    /// `nth` is 1-based: the next write is write 1. Zero is the internal
+    /// "no crash armed" sentinel, so arming it would silently disarm — the
+    /// debug assertion makes that call loud instead. Write ordinals are
+    /// assigned at call time, so under concurrent writers the `nth` write is
+    /// the nth *attempted*, not the nth committed; every current harness
+    /// drives its stores sequentially, where the two orders coincide.
     pub fn crash_at(&self, nth: usize, point: CrashPoint) {
+        debug_assert!(nth >= 1, "crash_at is 1-based; 0 disarms rather than arms");
         self.writes.store(0, Ordering::SeqCst);
         self.crash_at.store(nth, Ordering::SeqCst);
         self.crash_after

@@ -588,16 +588,26 @@ async fn the_snapshot_reports_the_reference_facts_after_any_owner_loss() {
             expected_facts,
             "crash {point:?} at write {nth} changed an authoritative fact"
         );
-        assert_eq!(snapshot.wait_reason, None);
-        assert_eq!(snapshot.next_wake, None);
+        assert_eq!(
+            snapshot.wait_reason, None,
+            "crash {point:?} at write {nth} left a stale wait reason"
+        );
+        assert_eq!(
+            snapshot.next_wake, None,
+            "crash {point:?} at write {nth} left a stale wake"
+        );
         assert!(
             snapshot.pending_effects.is_empty(),
             "crash {point:?} at write {nth} left an unresolved effect behind"
         );
-        assert!(snapshot.open_checkpoints.is_empty());
+        assert!(
+            snapshot.open_checkpoints.is_empty(),
+            "crash {point:?} at write {nth} left a checkpoint open"
+        );
         assert_eq!(
             snapshot.cancellation,
-            AgentCancellationProgress::NotRequested
+            AgentCancellationProgress::NotRequested,
+            "crash {point:?} at write {nth} surfaced a cancellation"
         );
     })
     .await;

@@ -16,9 +16,10 @@ cargo test -p rakka-example-durable-agent-acceptance
 ```
 
 The integration test runs the same walk the binary prints and asserts the
-transcript below verbatim (it is a `const` the binary, the test, and this
-README all share), plus the typed facts behind every line — so this
-documented stdout cannot rot.
+transcript below verbatim against the `const` the binary prints from — and a
+second test extracts this README's fenced block and compares it to the same
+`const` — plus the typed facts behind every line, so this documented stdout
+cannot rot.
 
 ## Expected stdout
 
@@ -60,7 +61,7 @@ exhaustively under fault injection.
 | 5 | bounded budgets reserved and settled durably | `escrow_ledger.rs` (scenarios 52/61, swept) |
 | 6 | addressable while fully passivated, no resident resources | `goal_passivation.rs` (scenario 35) |
 | 7 | a bounded Rig-shaped model turn through a dispatcher | `effect_dispatch.rs` |
-| 8 | correlated trace segments assemble into one session view | `trace_scenarios.rs` (scenarios 21-23, swept) |
+| 8 | correlated trace segments assemble into one session view | `trace_scenarios.rs` (scenarios 23-25, swept); scenario 21 in `operational_query.rs`/`decision_events.rs` |
 | 9 | bounded metrics without high-cardinality IDs | `agent_metrics.rs` (scenario 25) |
 | 10 | short-term session context persisted | `session_memory.rs` (scenarios 14/16/17, swept) |
 | 11 | each effectful tool call a separate durable effect | `run_entity.rs` |

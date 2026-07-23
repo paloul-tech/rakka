@@ -1467,7 +1467,7 @@ write via the `sweep_crash_points` testkit harness, with every store class
 | budgets reserved/settled durably | Met | example line 5; scenarios 52/61 swept (`escrow_ledger.rs`) |
 | addressable while fully passivated | Met | example line 6; scenario 35 (`goal_passivation.rs`) |
 | bounded Rig model turn through a dispatcher | Met | example line 7; `effect_dispatch.rs` |
-| correlated trace segments -> one session view | Met | example line 8; scenarios 21-23 swept (`trace_scenarios.rs`) |
+| correlated trace segments -> one session view | Met | example line 8; scenarios 23-25 swept (`trace_scenarios.rs`), scenario 21 swept (`operational_query.rs`, `decision_events.rs`) |
 | bounded metrics, no high-cardinality IDs | Met | example line 9; scenario 25 (`agent_metrics.rs`) |
 | short-term session context persisted | Met | example line 10; scenarios 14/16/17 swept (`session_memory.rs`) |
 | each effectful tool call a separate durable effect | Met | example line 11; `run_entity.rs` |
