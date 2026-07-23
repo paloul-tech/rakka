@@ -494,3 +494,121 @@ fn cancel_operation_id(label: &str) -> rakka_agent::AgentOperationId {
     rakka_agent::AgentOperationId::new(rakka_agent::AgentOperationKind::Command, ["acme", label])
         .expect("the operation id derives")
 }
+
+/// Scenarios 21 and 56 under the owner-kill sweep: kill the run's owner at
+/// every durable write of the two-turn flow, on both sides of the
+/// compare-and-set. However the owner died, the converged authoritative
+/// snapshot answers from the durable record alone — nothing wired — and
+/// reports exactly the facts the crash-free reference reported: same status,
+/// same turn, same settled budget, no residual waits, effects, or
+/// checkpoints. The revision is the one durable fact allowed to differ, since
+/// recovery legitimately re-drives writes.
+#[tokio::test]
+async fn the_snapshot_reports_the_reference_facts_after_any_owner_loss() {
+    let build = || {
+        let dispatcher = ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(1, tool_calling_turn("lookup"))
+                .with_turn_for(2, proposing_turn("resolved")),
+        )
+        .with_tool_result(
+            "lookup",
+            AgentTaskContent::inline(serde_json::json!({ "found": true }))
+                .expect("the tool result is inline-bounded"),
+        );
+        Fixture::new(dispatcher)
+    };
+
+    let reference = build();
+    reference.instantiate_agent().await;
+    reference.runs.reset_writes();
+    reference.create_task().await;
+    reference
+        .pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 6,
+        "the two-turn flow should make several durable writes, saw {writes}"
+    );
+    let expected = agent_operational_snapshot(
+        &reference.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the run exists");
+    let expected_run = expected.run.as_ref().expect("the run accepted");
+    let expected_facts = (
+        expected_run.status,
+        expected_run.turn,
+        expected_run.budget.model_calls(),
+        expected_run.budget.tokens(),
+        expected_run.budget.loop_iterations(),
+        expected.decision_cursor,
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let fx = build();
+        fx.instantiate_agent().await;
+
+        fx.runs.crash_at(nth, point);
+        fx.create_task().await;
+        let _crashed = fx.pump().await;
+
+        // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
+        fx.runs.survive();
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let snapshot = agent_operational_snapshot(
+            &fx.runs,
+            &run_scope(),
+            &AgentSchemaPolicy::default(),
+            AgentTimestampMillis::new(9_999),
+        )
+        .await
+        .expect("the point query answers")
+        .expect("the run exists");
+        let run = snapshot.run.as_ref().expect("the run accepted");
+        assert_eq!(
+            (
+                run.status,
+                run.turn,
+                run.budget.model_calls(),
+                run.budget.tokens(),
+                run.budget.loop_iterations(),
+                snapshot.decision_cursor,
+            ),
+            expected_facts,
+            "crash {point:?} at write {nth} changed an authoritative fact"
+        );
+        assert_eq!(
+            snapshot.wait_reason, None,
+            "crash {point:?} at write {nth} left a stale wait reason"
+        );
+        assert_eq!(
+            snapshot.next_wake, None,
+            "crash {point:?} at write {nth} left a stale wake"
+        );
+        assert!(
+            snapshot.pending_effects.is_empty(),
+            "crash {point:?} at write {nth} left an unresolved effect behind"
+        );
+        assert!(
+            snapshot.open_checkpoints.is_empty(),
+            "crash {point:?} at write {nth} left a checkpoint open"
+        );
+        assert_eq!(
+            snapshot.cancellation,
+            AgentCancellationProgress::NotRequested,
+            "crash {point:?} at write {nth} surfaced a cancellation"
+        );
+    })
+    .await;
+}

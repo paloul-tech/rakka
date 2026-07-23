@@ -19,8 +19,8 @@ use std::sync::Arc;
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     AgentContextSnapshotRef, AgentModelTurn, AgentModelUsage, AgentRunId, AgentRunMemory,
-    AgentRunScope, AgentTaskContent, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    ContextSnapshotStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
+    AgentRunScope, AgentRunStatus, AgentTaskContent, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, ContextSnapshotStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
     MemoryClassification, MemoryEntryId, MemoryEntryRole, MemoryOperationId, MemorySequence,
     SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
     CURRENT_AGENT_LOOP_ADAPTER_VERSION,
@@ -276,4 +276,117 @@ async fn a_model_effect_retry_uses_the_original_context_snapshot() {
     );
     // Exactly two snapshots exist: newer memory did not mint a third.
     assert_eq!(snapshots.len(&scope), 2);
+}
+
+/// Scenarios 14, 16, and 17 under the owner-kill sweep: kill the run's owner
+/// at every durable write of the two-turn tool flow, on both sides of the
+/// compare-and-set. However the owner died, the converged session holds
+/// exactly one copy of each entry in dense sequence (a re-driven flush never
+/// duplicated an append), exactly one immutable snapshot exists per model
+/// effect, and a sibling run's scope still sees nothing. The run store is the
+/// only store this flow's crash windows live in; the driver is the in-process
+/// dispatcher, so owner kill at every write is the complete boundary set here.
+#[tokio::test]
+async fn session_memory_survives_any_owner_loss_without_duplicate_appends() {
+    let build = || {
+        let (session, snapshots) = stores();
+        let dispatcher = ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn_for(1, tool_calling_turn("lookup"))
+                .with_turn_for(2, proposing_turn("resolved")),
+        )
+        .with_tool_result(
+            "lookup",
+            AgentTaskContent::inline(serde_json::json!({ "found": true }))
+                .expect("the tool result is inline-bounded"),
+        );
+        let fx = Fixture::new(dispatcher)
+            .with_memory(AgentRunMemory::new(session.clone(), snapshots.clone()));
+        (fx, session, snapshots)
+    };
+
+    let (reference, _session, _snapshots) = build();
+    reference.instantiate_agent().await;
+    reference.runs.reset_writes();
+    reference.create_task().await;
+    reference
+        .pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.runs.writes();
+    assert!(
+        writes >= 6,
+        "the two-turn memory flow should make several durable writes, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let (fx, session, snapshots) = build();
+        fx.instantiate_agent().await;
+
+        fx.runs.crash_at(nth, point);
+        fx.create_task().await;
+        let _crashed = fx.pump().await;
+
+        // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
+        fx.runs.survive();
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+
+        let scope = run_scope();
+        let page = session
+            .read(&scope, SessionMemoryCursor::start())
+            .await
+            .expect("read the session");
+        let roles: Vec<MemoryEntryRole> = page.entries.iter().map(|entry| entry.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                MemoryEntryRole::User,
+                MemoryEntryRole::Assistant,
+                MemoryEntryRole::ToolResult,
+                MemoryEntryRole::Assistant,
+            ],
+            "crash {point:?} at write {nth} duplicated or dropped a session entry"
+        );
+        let sequences: Vec<u64> = page
+            .entries
+            .iter()
+            .map(|entry| entry.sequence.get())
+            .collect();
+        assert_eq!(
+            sequences,
+            vec![1, 2, 3, 4],
+            "crash {point:?} at write {nth} broke the dense session sequence"
+        );
+
+        // Isolation held through every recovery (scenario 14).
+        let other_run = AgentRunScope::new(
+            tenant(),
+            agent_id(),
+            AgentRunId::new("run-2").expect("run id"),
+        )
+        .expect("scope");
+        assert!(
+            session.is_empty(&other_run),
+            "crash {point:?} at write {nth} leaked into a sibling run's session"
+        );
+
+        // One immutable snapshot per model effect — a re-driven settle reused
+        // the original rather than minting another (scenario 17).
+        assert_eq!(
+            snapshots.len(&scope),
+            2,
+            "crash {point:?} at write {nth} minted a duplicate context snapshot"
+        );
+    })
+    .await;
 }

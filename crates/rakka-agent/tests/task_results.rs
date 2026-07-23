@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    InProcessExchangeTransport, InProcessTaskEntityTransport, RunAcceptanceProbe,
-    RunAcceptanceProbeState,
+    sweep_crash_points, CrashingStateStore, InProcessExchangeTransport,
+    InProcessTaskEntityTransport, RunAcceptanceProbe, RunAcceptanceProbeState,
 };
 use rakka_agent::{
     drive_pending_exchanges, AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentDefinition,
@@ -37,7 +37,7 @@ use rakka_agent_workflow::{
 use rakka_persistence::InMemoryDurableStateStore;
 use serde::{Deserialize, Serialize};
 
-type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
+type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<RunAcceptanceProbeState>;
 type RunHost = AgentExchangeHost<RunAcceptanceProbe, RunStore>;
@@ -348,6 +348,75 @@ impl Fixture {
         self.decision(&operation_id).await
     }
 
+    /// [`Self::propose`], but surfacing delivery errors instead of panicking,
+    /// and returning `None` when the decision has not settled — what a sweep
+    /// needs, because an armed crash point kills the task's owner mid-decision
+    /// and the injected loss is the point, not a failure.
+    async fn try_propose(
+        &self,
+        proposal_id: &str,
+        content: serde_json::Value,
+    ) -> Result<Option<AgentTaskDecision>, String> {
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::ResultProposal,
+            [TENANT, TASK, proposal_id],
+        )
+        .expect("operation id should be derivable");
+
+        let definition = task_definition();
+        let proposal = AgentTaskResultProposal {
+            proposal_id: operation_id.clone(),
+            agent: agent_id(),
+            run: run_scope().run().clone(),
+            generation: AgentAssignmentGeneration::new(1),
+            definition_id: definition.definition_id.clone(),
+            definition_version: definition.version,
+            result_schema: definition.result_schema.clone(),
+            content: AgentTaskContent::inline(content).expect("the result is inline-bounded"),
+            evidence: Vec::new(),
+            causation_id: AgentCausationId::new(format!("cause-{proposal_id}")),
+            proposed_at: self.now(),
+        };
+
+        let now = self.now();
+        let envelope = AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::ResultProposal,
+            AgentEntityAddress::Run(run_scope()),
+            AgentEntityAddress::Task(task_scope()),
+            AgentExchangePayload::encode(AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE, &proposal)
+                .expect("the proposal payload is bounded"),
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )
+        .expect("the proposal envelope should be valid");
+
+        let mut run = self.run_host().await;
+        run.initiate(now, move |_state| Ok(vec![envelope]))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let now = self.now();
+        drive_pending_exchanges(&mut run, &self.run_router, now)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let run = self.run_host().await;
+        let settled = run
+            .state()
+            .map_err(|error| error.to_string())?
+            .journal()
+            .settled_result(&operation_id, AgentExchangeKind::ResultProposal)
+            .map_err(|error| error.to_string())?
+            .cloned();
+        Ok(settled.map(|result| {
+            result
+                .payload()
+                .decode(rakka_agent::AGENT_TASK_DECISION_PAYLOAD_TYPE)
+                .expect("the decision decodes")
+        }))
+    }
+
     /// Reads the decision the run settled, from the run's own durable state.
     async fn decision(&self, operation_id: &AgentOperationId) -> AgentTaskDecision {
         let run = self.run_host().await;
@@ -649,4 +718,103 @@ async fn an_accepted_result_completes_the_task_and_decodes_to_its_rust_type() {
         .await;
     assert!(matches!(late, AgentTaskDecision::Refused { .. }));
     assert_eq!(fx.snapshot().await.status, AgentTaskStatus::Completed);
+}
+
+#[tokio::test]
+async fn a_rejected_result_survives_any_task_owner_loss_with_one_rejection() {
+    // Scenario 40 under the owner-kill sweep: kill the task's owner at every
+    // durable write of the propose -> validate -> reject decision, on both
+    // sides of the compare-and-set, then let the run redeliver the same
+    // proposal. Every crash converges on exactly one persisted rejection, the
+    // task never completes, and the original decision comes back unchanged.
+    // Only the task store is armed here: the run half of this exchange is the
+    // acceptance probe, and the real run entity's side of the result exchange
+    // is swept write-by-write in `run_result_exchange.rs` (scenario 59).
+    let reference = Fixture::running().await;
+    reference.tasks.reset_writes();
+    let _decision = reference
+        .try_propose(
+            "1",
+            serde_json::json!({ "answer": "restart the router", "confidence": 900 }),
+        )
+        .await
+        .expect("the reference proposal decides")
+        .expect("the decision settles");
+    let writes = reference.tasks.writes();
+    assert!(
+        writes >= 1,
+        "the rejection decision should make at least one durable write, saw {writes}"
+    );
+
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::running().await;
+
+        fx.tasks.crash_at(nth, point);
+        let _crashed = fx
+            .try_propose(
+                "1",
+                serde_json::json!({ "answer": "restart the router", "confidence": 900 }),
+            )
+            .await;
+
+        // A new owner activates; the run redelivers the same proposal.
+        fx.tasks.assert_crash_fired(nth, point);
+        fx.tasks.survive();
+        let decision = fx
+            .try_propose(
+                "1",
+                serde_json::json!({ "answer": "restart the router", "confidence": 900 }),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("crash {point:?} at write {nth} did not converge: {error}")
+            })
+            .unwrap_or_else(|| panic!("crash {point:?} at write {nth} never settled the decision"));
+
+        let (rejection, _remaining) = Fixture::rejected(&decision);
+        assert_eq!(
+            rejection.rejection_count, 1,
+            "crash {point:?} at write {nth} recorded a second rejection"
+        );
+
+        let snapshot = fx.snapshot().await;
+        assert_eq!(
+            snapshot.status,
+            AgentTaskStatus::InProgress,
+            "crash {point:?} at write {nth} let a refused result complete the task"
+        );
+        assert_eq!(
+            snapshot.rejection_count, 1,
+            "crash {point:?} at write {nth} double-counted the rejection"
+        );
+        assert!(
+            snapshot.accepted_result.is_none(),
+            "crash {point:?} at write {nth} accepted a refused result"
+        );
+
+        // Redelivered once more after convergence: the original decision comes
+        // back, and still exactly one rejection decision exists.
+        let replayed = fx
+            .try_propose(
+                "1",
+                serde_json::json!({ "answer": "restart the router", "confidence": 900 }),
+            )
+            .await
+            .expect("the redelivery decides")
+            .expect("the decision settles");
+        assert_eq!(
+            replayed, decision,
+            "crash {point:?} at write {nth} changed the decision on redelivery"
+        );
+        assert_eq!(
+            fx.history_kinds()
+                .await
+                .iter()
+                .filter(|kind| **kind == AgentTaskHistoryKind::ResultRejected)
+                .count(),
+            1,
+            "crash {point:?} at write {nth} persisted more than one rejection decision"
+        );
+    })
+    .await;
 }

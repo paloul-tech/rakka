@@ -22,6 +22,7 @@ members = [
     "crates/rakka-k8s",
     "crates/rakka-testkit",
     "examples/durable-counter",
+    "examples/durable-agent-acceptance",
     "examples/durable-workflow",
     "examples/external-binary-wrapper",
     "examples/edge-gateway",

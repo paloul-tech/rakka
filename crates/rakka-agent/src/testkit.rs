@@ -63,8 +63,8 @@ use crate::choreography::{
     AgentChoreographyError, AgentChoreographyResult, AgentEntityAddress, AgentEntityClass,
     AgentExchangeDeliveryError, AgentExchangeDeliveryFuture, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
-    AgentExchangePayload, AgentExchangeResult, AgentExchangeRouter, AgentExchangeState,
-    AgentExchangeTransition, AgentExchangeTransport,
+    AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
+    AgentExchangeState, AgentExchangeTransition, AgentExchangeTransport,
 };
 use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRevisionNumber};
 use crate::dispatch::{
@@ -2136,13 +2136,47 @@ pub enum CrashPoint {
     AfterWrite,
 }
 
+/// Runs one recovery scenario once per (write, crash point): the exhaustive
+/// owner-kill sweep of the M1 acceptance suite.
+///
+/// `writes` is the durable write count a crash-free reference run of the same
+/// flow observed; the sweep then kills the owner at every one of those writes,
+/// on both sides of the compare-and-set. The closure owns everything
+/// scenario-specific: it builds a fresh fixture, arms exactly one
+/// [`CrashingStateStore`] with `crash_at(nth, point)`, drives the flow to the
+/// injected loss (ignoring the surfaced error), calls `survive()`, re-drives
+/// from durable state alone, and asserts the scenario's exactly-once
+/// invariants — including `nth` and `point` in its panic messages so a
+/// failing window names itself.
+///
+/// The harness owns only the loop skeleton. It takes no store list because a
+/// faithful sweep iteration builds its fixture *inside* the closure — the
+/// stores do not exist until then. A flow whose crash windows span several
+/// stores is swept by one call per store, each against that store's own
+/// reference write count.
+pub async fn sweep_crash_points<F, Fut>(writes: usize, scenario: F)
+where
+    F: Fn(usize, CrashPoint) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
+        for nth in 1..=writes {
+            scenario(nth, point).await;
+        }
+    }
+}
+
 /// A durable state store whose owner dies at the *n*-th write.
 ///
 /// Nothing else about it is special, and that is the point: whatever it has
 /// already committed is exactly what a real owner finds on the next activation,
 /// so re-materializing an entity over it is a faithful restart.
 ///
-/// Slice 1.14 extends these crash points across the rest of the M1 suite.
+/// Every store class in the M1 suite — run, task, agent, workflow outbox, and
+/// dispatcher fleet — is wrapped in one of these, and [`sweep_crash_points`]
+/// drives the kill through every write of a flow. Compare-and-set and delete
+/// both count as writes, so the sweep stays exhaustive for flows that delete;
+/// loads are never counted and never crash.
 pub struct CrashingStateStore<S>
 where
     S: rakka_persistence::DurableState,
@@ -2204,7 +2238,15 @@ where
     }
 
     /// Kills the owner at the `nth` write from now on, and resets the counter.
+    ///
+    /// `nth` is 1-based: the next write is write 1. Zero is the internal
+    /// "no crash armed" sentinel, so arming it would silently disarm — the
+    /// debug assertion makes that call loud instead. Write ordinals are
+    /// assigned at call time, so under concurrent writers the `nth` write is
+    /// the nth *attempted*, not the nth committed; every current harness
+    /// drives its stores sequentially, where the two orders coincide.
     pub fn crash_at(&self, nth: usize, point: CrashPoint) {
+        debug_assert!(nth >= 1, "crash_at is 1-based; 0 disarms rather than arms");
         self.writes.store(0, Ordering::SeqCst);
         self.crash_at.store(nth, Ordering::SeqCst);
         self.crash_after
@@ -2226,6 +2268,23 @@ where
     /// Resets the write counter without arming a crash.
     pub fn reset_writes(&self) {
         self.writes.store(0, Ordering::SeqCst);
+    }
+
+    /// Asserts the crash armed at the `nth` write was actually reached.
+    ///
+    /// A sweep iteration whose flow never attempts its armed write converges
+    /// trivially and proves nothing — silent under-coverage that matters
+    /// whenever the swept flow is shaped differently from the reference run
+    /// that measured the write count. Call this after the crashed drive and
+    /// before [`Self::survive`] to make every window's firing a hard fact.
+    #[track_caller]
+    pub fn assert_crash_fired(&self, nth: usize, point: CrashPoint) {
+        let writes = self.writes();
+        assert!(
+            writes >= nth,
+            "the crash {point:?} armed at write {nth} never fired: \
+             the flow attempted only {writes} writes"
+        );
     }
 }
 
@@ -2280,7 +2339,29 @@ where
         persistence_id: &'a rakka_persistence::PersistenceId,
         expected_revision: rakka_persistence::Revision,
     ) -> rakka_persistence::StoreFuture<'a, rakka_persistence::Revision> {
-        self.inner.delete(persistence_id, expected_revision)
+        // A delete is a durable write too: it is counted and crash-armable
+        // exactly like a compare-and-set, so a sweep stays exhaustive the day
+        // a flow starts deleting (no M1 flow does yet).
+        let write = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        let crash_at = self.crash_at.load(Ordering::SeqCst);
+        let after = self.crash_after.load(Ordering::SeqCst);
+
+        Box::pin(async move {
+            if crash_at != 0 && write == crash_at && !after {
+                return Err(rakka_persistence::DurableError::store(
+                    "crashing-in-memory",
+                    "the owner was lost before the delete reached the store",
+                ));
+            }
+            let revision = self.inner.delete(persistence_id, expected_revision).await?;
+            if crash_at != 0 && write == crash_at && after {
+                return Err(rakka_persistence::DurableError::store(
+                    "crashing-in-memory",
+                    "the owner was lost after the delete committed",
+                ));
+            }
+            Ok(revision)
+        })
     }
 }
 
@@ -2368,6 +2449,102 @@ impl AgentExchangeTransport for DeferredExchangeRouter {
                 ));
             };
             router.deliver(envelope).await
+        })
+    }
+}
+
+/// Routes exchanges to one class of sharded entity on a single-node system —
+/// the local arm of the production `ShardedExchangeRoute`, without the
+/// `rakka-remote` ask client the other arm needs.
+///
+/// It resolves the target's shard owner and asks the local entity through the
+/// production route's own functions — not a copy of them — delivering the
+/// same envelope to the same durable [`AgentExchangeHost::accept`]: colocation
+/// changes the transport, never the durable path. An owner that is not local
+/// is an explicit error, because a single-node test that reaches that branch
+/// has mis-wired its sharding, not discovered a remote peer.
+pub struct LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message,
+{
+    sharding: rakka_sharding::ClusterSharding,
+    key: rakka_sharding::EntityTypeKey<M>,
+    ask_timeout: std::time::Duration,
+    #[allow(clippy::type_complexity)]
+    build: Arc<
+        dyn Fn(AgentExchangeEnvelope, rakka_core::ReplyTo<AgentExchangeReply>) -> M + Send + Sync,
+    >,
+}
+
+impl<M> Debug for LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalShardedExchangeRoute")
+            .field("entity_type", self.key.entity_type())
+            .field("ask_timeout", &self.ask_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message,
+{
+    /// Creates a route to one sharded entity type on the local node.
+    ///
+    /// `build` reconstructs the entity's own message from the envelope and a
+    /// node-local reply channel, exactly as the production route's does.
+    pub fn new(
+        sharding: rakka_sharding::ClusterSharding,
+        key: rakka_sharding::EntityTypeKey<M>,
+        ask_timeout: std::time::Duration,
+        build: impl Fn(AgentExchangeEnvelope, rakka_core::ReplyTo<AgentExchangeReply>) -> M
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            sharding,
+            key,
+            ask_timeout,
+            build: Arc::new(build),
+        }
+    }
+}
+
+impl<M> AgentExchangeTransport for LocalShardedExchangeRoute<M>
+where
+    M: rakka_core::Message + Sync,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        Box::pin(async move {
+            let (entity, owner, is_local) = crate::choreography::resolve_sharded_exchange_target(
+                &self.sharding,
+                &self.key,
+                envelope,
+            )?;
+            if !is_local {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-not-local",
+                    format!(
+                        "the shard owner of {} is {owner}, which is not this node; \
+                         the local route serves single-node systems only",
+                        envelope.target().entity_id().as_str()
+                    ),
+                ));
+            }
+            crate::choreography::ask_local_sharded_entity(
+                &entity,
+                &self.build,
+                envelope,
+                self.ask_timeout,
+            )
+            .await
         })
     }
 }

@@ -8,9 +8,10 @@
 //! is already a restart.
 //!
 //! The fixture is generic over the model adapter its [`ScriptedDispatcher`]
-//! answers with, and its run store is a [`CrashingStateStore`], which behaves
-//! as a plain in-memory store until a test arms a [`CrashPoint`]
-//! (`fx.runs.crash_at(..)`) — one fixture serves the happy path, the adapter
+//! answers with, and every durable store — task, agent, and run — is a
+//! [`CrashingStateStore`], which behaves as a plain in-memory store until a
+//! test arms a [`CrashPoint`] (`fx.runs.crash_at(..)`, `fx.tasks.crash_at(..)`,
+//! `fx.agents.crash_at(..)`) — one fixture serves the happy path, the adapter
 //! matrix, and the crash matrix alike.
 
 // Each integration-test binary compiles this module independently and uses a
@@ -40,12 +41,13 @@ use rakka_agent::{
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
 };
-use rakka_persistence::InMemoryDurableStateStore;
 
-/// Durable store for the task entity class.
-pub type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
-/// Durable store for the agent entity class.
-pub type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
+/// Durable store for the task entity class; a pass-through until a crash
+/// point is armed.
+pub type TaskStore = CrashingStateStore<AgentTaskState>;
+/// Durable store for the agent entity class; a pass-through until a crash
+/// point is armed.
+pub type AgentStore = CrashingStateStore<AgentEntityState>;
 /// Durable store for the run entity class; a pass-through until a crash point
 /// is armed.
 pub type RunStore = CrashingStateStore<AgentRunState>;
@@ -513,5 +515,183 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
 impl<A: AgentModelAdapter> Fixture<A, InMemoryAgentRunEffectSink> {
     pub fn dispatched_effects(&self) -> usize {
         self.effects.len(&run_scope())
+    }
+}
+
+/// The whole sharded world: real agent, task, and run entity types registered
+/// on one node's `ClusterSharding`, exchanging through the testkit's
+/// `LocalShardedExchangeRoute` — the production sharded route's own local
+/// arm, so the durable path is production's minus only the TCP transport.
+///
+/// Every durable store is a crash-armable pass-through, so a sharded test can
+/// inject owner kills exactly as the direct-drive fixtures do. The world is
+/// deliberately scope-free: a test derives its entity refs from its own
+/// scopes via [`Self::agent_ref`], [`Self::task_ref`], and [`Self::run_ref`].
+pub struct ShardedWorld {
+    /// The actor system that owns every resident entity.
+    pub system: rakka_core::ActorSystem,
+    /// The sharding fabric all three entity types are registered on.
+    pub sharding: rakka_sharding::ClusterSharding,
+    /// Durable agent-entity store.
+    pub agents: AgentStore,
+    /// Durable task-entity store.
+    pub tasks: TaskStore,
+    /// Durable run-entity store.
+    pub runs: RunStore,
+    /// The scripted model/tool answers a test drives ready effects with.
+    pub dispatcher: ScriptedDispatcher,
+    /// The agent entity type's sharding registration.
+    pub agent_registration: rakka_agent::AgentEntityRegistration,
+    /// The task entity type's sharding registration.
+    pub task_registration: rakka_agent::AgentTaskEntityRegistration,
+    /// The run entity type's sharding registration.
+    pub run_registration: rakka_agent::AgentRunEntityRegistration,
+}
+
+impl ShardedWorld {
+    /// The ask timeout of the local sharded exchange routes.
+    pub const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Wires the three sharded entity types over fresh stores.
+    ///
+    /// `idle` is every type's idle-passivation window; `policies`, when
+    /// given, become the run entity's effect policies.
+    pub fn new(
+        name: &str,
+        idle: std::time::Duration,
+        dispatcher: ScriptedDispatcher,
+        policies: Option<AgentEffectPolicies>,
+    ) -> Self {
+        use rakka_agent::testkit::LocalShardedExchangeRoute;
+        use rakka_agent::{
+            agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
+            init_agent_entity_sharding, init_agent_run_entity_sharding,
+            init_agent_task_entity_sharding, AgentEntityShardingSettings, AgentRunEntityMessage,
+            AgentRunEntityShardingSettings, AgentTaskEntityMessage,
+            AgentTaskEntityShardingSettings,
+        };
+
+        let system = rakka_core::ActorSystem::new(name);
+        let sharding = rakka_sharding::ClusterSharding::get(&system);
+        let agents = AgentStore::new();
+        let tasks = TaskStore::new();
+        let runs = RunStore::new();
+        let history = InMemoryAgentTaskHistoryStore::new();
+        let effects = InMemoryAgentRunEffectSink::new();
+        let clock = Arc::new(AtomicU64::new(1));
+
+        // The routes need the registrations and the registrations need the
+        // router: the deferred router is that late binding and nothing more.
+        let deferred = DeferredExchangeRouter::new();
+        let entity_clock = {
+            let clock = clock.clone();
+            Arc::new(move || AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst)))
+        };
+
+        let agent_registration = init_agent_entity_sharding(
+            &sharding,
+            agents.clone(),
+            AgentEntityShardingSettings::new(agent_entity_type_key()).with_idle_passivation(idle),
+        )
+        .expect("agent entity sharding initializes");
+        let task_registration = init_agent_task_entity_sharding(
+            &sharding,
+            tasks.clone(),
+            agents.clone(),
+            history,
+            deferred.as_router(),
+            AgentTaskEntityShardingSettings::new(agent_task_entity_type_key())
+                .with_idle_passivation(idle)
+                .with_clock(entity_clock.clone()),
+        )
+        .expect("task entity sharding initializes");
+        let mut run_settings = AgentRunEntityShardingSettings::new(agent_run_entity_type_key())
+            .with_idle_passivation(idle)
+            .with_clock(entity_clock);
+        if let Some(policies) = policies {
+            run_settings = run_settings.with_effect_policies(policies);
+        }
+        let run_registration = init_agent_run_entity_sharding(
+            &sharding,
+            runs.clone(),
+            effects,
+            deferred.as_router(),
+            run_settings,
+        )
+        .expect("run entity sharding initializes");
+
+        let router = AgentExchangeRouter::new()
+            .with_route(
+                AgentEntityClass::Task,
+                Arc::new(LocalShardedExchangeRoute::new(
+                    sharding.clone(),
+                    task_registration.key().clone(),
+                    Self::ASK_TIMEOUT,
+                    |envelope, reply_to| AgentTaskEntityMessage::Exchange {
+                        envelope: Box::new(envelope),
+                        reply_to,
+                    },
+                )),
+            )
+            .with_route(
+                AgentEntityClass::Run,
+                Arc::new(LocalShardedExchangeRoute::new(
+                    sharding.clone(),
+                    run_registration.key().clone(),
+                    Self::ASK_TIMEOUT,
+                    |envelope, reply_to| AgentRunEntityMessage::Exchange {
+                        envelope: Box::new(envelope),
+                        reply_to,
+                    },
+                )),
+            );
+        deferred.install(router);
+
+        Self {
+            system,
+            sharding,
+            agents,
+            tasks,
+            runs,
+            dispatcher,
+            agent_registration,
+            task_registration,
+            run_registration,
+        }
+    }
+
+    /// The sharded ref for one agent scope.
+    pub fn agent_ref(&self, scope: &AgentScope) -> rakka_agent::AgentEntityRef {
+        rakka_agent::registered_agent_entity_ref(&self.agent_registration, scope)
+    }
+
+    /// The sharded ref for one task scope.
+    pub fn task_ref(&self, scope: &AgentTaskScope) -> rakka_agent::AgentTaskEntityRef {
+        rakka_agent::registered_agent_task_entity_ref(&self.task_registration, scope)
+    }
+
+    /// The sharded ref for one run scope.
+    pub fn run_ref(&self, scope: &AgentRunScope) -> rakka_agent::AgentRunEntityRef {
+        rakka_agent::registered_agent_run_entity_ref(&self.run_registration, scope)
+    }
+
+    /// How many entity actors of any class are resident on this node.
+    pub fn resident_entities(&self) -> usize {
+        let agent = self
+            .sharding
+            .registration_state(self.agent_registration.key())
+            .expect("the agent registration exists")
+            .local_entity_count();
+        let task = self
+            .sharding
+            .registration_state(self.task_registration.key())
+            .expect("the task registration exists")
+            .local_entity_count();
+        let run = self
+            .sharding
+            .registration_state(self.run_registration.key())
+            .expect("the run registration exists")
+            .local_entity_count();
+        agent + task + run
     }
 }

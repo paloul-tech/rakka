@@ -19,8 +19,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe, RecordingToolExecutor,
-    ScriptedDispatcher, SharedAtomicWorkflowClock,
+    sweep_crash_points, DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe,
+    RecordingToolExecutor, ScriptedDispatcher, SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
     AgentAuthorityEnvelope, AgentDefinition, AgentDefinitionId, AgentDefinitionRevision,
@@ -1285,4 +1285,244 @@ async fn a_fully_authorized_tool_call_executes_exactly_once() {
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert_eq!(fx.tools.invocation_count(TOOL), 1);
+}
+
+impl AuthorityFixture {
+    /// [`Self::settle`], but surfacing the first error instead of panicking —
+    /// what a sweep needs, because an armed crash point kills the run's owner
+    /// mid-settle and the injected loss is the point, not a failure.
+    async fn try_settle(&self) -> Result<(), String> {
+        let now = self.fx.now();
+        let mut task = rakka_agent::AgentTaskEntityStore::new(
+            task_scope(),
+            self.fx.tasks.clone(),
+            self.fx.agents.clone(),
+            self.fx.history.clone(),
+        );
+        task.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        task.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+
+        let now = self.fx.now();
+        let mut run = self.fx.run();
+        run.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        run.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        Ok(())
+    }
+
+    /// [`Self::pump`], but surfacing the first error instead of panicking,
+    /// under the same sweep contract as [`Self::try_settle`].
+    async fn try_pump(&self) -> Result<(), String> {
+        for _round in 0..16 {
+            self.try_settle().await?;
+            let pass = self
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let terminal = {
+                let mut run = self.fx.run();
+                run.recover(self.fx.now())
+                    .await
+                    .map_err(|error| error.code().to_string())?;
+                run.snapshot()
+                    .map_err(|error| error.code().to_string())?
+                    .is_some_and(|snapshot| snapshot.status.is_terminal())
+            };
+            if terminal {
+                self.try_settle().await?;
+                return Ok(());
+            }
+            if pass.registered == 0
+                && pass.claimed == 0
+                && pass.delivered == 0
+                && pass.cancelled == 0
+            {
+                return Ok(());
+            }
+        }
+        Err("the dispatch pump did not quiesce".to_string())
+    }
+}
+
+#[tokio::test]
+async fn a_fully_authorized_tool_call_executes_once_under_any_owner_loss() {
+    // Scenario 54's positive edge under the owner-kill sweep: kill the run's
+    // owner at every durable write of the fully-authorized flow. However the
+    // owner died, the converged run completed, and the external system saw
+    // exactly one idempotency key — a delivery lost after the external commit
+    // may legitimately re-invoke the idempotent tool, but only ever under the
+    // key the first attempt minted (scenario 7's contract, met here by the
+    // run-owner loss rather than dispatcher loss). The model policy is
+    // declared idempotent so an ambiguous model window retries instead of
+    // failing closed — the non-idempotent model semantics are scenario 9's,
+    // proven in `effect_dispatch.rs`.
+    let build = || {
+        let adapter = tool_then_proposal()
+            .with_retry_policy(rakka_agent::AgentModelRetryPolicy {
+                safety_class: rakka_agent::AgentEffectSafetyClass::Idempotent,
+                max_attempts: 3,
+            })
+            .expect("the adapter policy is valid");
+        let registry = tool_registry_for_spec(
+            TOOL,
+            &AgentEffectSpec::idempotent(2).expect("the spec is valid"),
+        );
+        AuthorityFixture::over(
+            adapter,
+            registry,
+            Some(AgentEffectSpec::idempotent(3).expect("the model spec is valid")),
+        )
+    };
+    let reference = build();
+    reference
+        .fx
+        .instantiate_agent_with_envelope(reference.envelope.clone())
+        .await;
+    reference.fx.runs.reset_writes();
+    reference.fx.create_task().await;
+    reference
+        .try_pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.fx.runs.writes();
+    assert!(
+        writes >= 6,
+        "the authorized flow should make several durable writes, saw {writes}"
+    );
+
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = build();
+        fx.fx
+            .instantiate_agent_with_envelope(fx.envelope.clone())
+            .await;
+
+        fx.fx.runs.crash_at(nth, point);
+        fx.fx.create_task().await;
+        let _crashed = fx.try_pump().await;
+
+        // A new owner activates and finds only what was durably committed; the
+        // dead pass's fleet lease lapses before its work is re-claimable.
+        fx.fx.runs.assert_crash_fired(nth, point);
+        fx.fx.runs.survive();
+        fx.expire_lease();
+        fx.try_pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.turn, 2,
+            "crash {point:?} at write {nth} replayed a turn"
+        );
+
+        let keys: BTreeSet<String> = fx
+            .tools
+            .invocations()
+            .into_iter()
+            .filter(|invocation| invocation.tool == TOOL)
+            .map(|invocation| invocation.idempotency_key)
+            .collect();
+        assert_eq!(
+            keys.len(),
+            1,
+            "crash {point:?} at write {nth} invoked under a second idempotency key"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_pre_crash_revocation_blocks_dispatch_after_any_owner_loss() {
+    // Scenario 13 under the owner-kill sweep: the revocation committed before
+    // the crash, so no recovery path — whatever write the owner died at — may
+    // make the revoked tool dispatchable again. Zero invocations is what
+    // "immediate revocation" means, and the durable failure names the check.
+    // The model policy is declared idempotent for the same reason as the
+    // authorized sweep above: an ambiguous model window must retry so every
+    // window converges on the *tool's* refusal.
+    let build = || {
+        let adapter = tool_then_proposal()
+            .with_retry_policy(rakka_agent::AgentModelRetryPolicy {
+                safety_class: rakka_agent::AgentEffectSafetyClass::Idempotent,
+                max_attempts: 3,
+            })
+            .expect("the adapter policy is valid");
+        let registry = tool_registry_for_spec(TOOL, &AgentEffectSpec::non_idempotent());
+        AuthorityFixture::over(
+            adapter,
+            registry,
+            Some(AgentEffectSpec::idempotent(3).expect("the model spec is valid")),
+        )
+    };
+    let reference = build();
+    reference
+        .fx
+        .instantiate_agent_with_envelope(reference.envelope.clone())
+        .await;
+    reference
+        .apply_settings(
+            "revoke-tool",
+            vec![AgentSettingsChange::RevokeTool(tool_id())],
+        )
+        .await;
+    reference.fx.runs.reset_writes();
+    reference.fx.create_task().await;
+    reference
+        .try_pump()
+        .await
+        .expect("the reference flow converges");
+    assert_eq!(reference.terminal_failure_code().await, "tool-revoked");
+    let writes = reference.fx.runs.writes();
+    assert!(
+        writes >= 4,
+        "the revoked flow should make several durable writes, saw {writes}"
+    );
+
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = build();
+        fx.fx
+            .instantiate_agent_with_envelope(fx.envelope.clone())
+            .await;
+        fx.apply_settings(
+            "revoke-tool",
+            vec![AgentSettingsChange::RevokeTool(tool_id())],
+        )
+        .await;
+
+        fx.fx.runs.crash_at(nth, point);
+        fx.fx.create_task().await;
+        let _crashed = fx.try_pump().await;
+
+        fx.fx.runs.assert_crash_fired(nth, point);
+        fx.fx.runs.survive();
+        fx.expire_lease();
+        fx.try_pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        assert_eq!(
+            fx.terminal_failure_code().await,
+            "tool-revoked",
+            "crash {point:?} at write {nth} lost the revocation refusal"
+        );
+        assert_eq!(
+            fx.tools.invocation_count(TOOL),
+            0,
+            "crash {point:?} at write {nth} let a revoked tool dispatch"
+        );
+    })
+    .await;
 }

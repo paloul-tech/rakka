@@ -4020,6 +4020,16 @@ where
         self
     }
 
+    /// Wires the hosted run with a session-memory backend
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity persists session
+    /// context and immutable snapshots exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_memory(memory));
+        self
+    }
+
     fn store(&mut self) -> Result<&mut AgentRunEntityStore<Store, Effects>, AgentRunError> {
         self.entity
             .as_mut()
@@ -4106,6 +4116,7 @@ pub struct AgentRunEntityShardingSettings {
     clock: AgentRunClock,
     metrics: Arc<dyn MetricsRecorder>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    memory: Option<AgentRunMemory>,
 }
 
 impl Debug for AgentRunEntityShardingSettings {
@@ -4134,6 +4145,7 @@ impl AgentRunEntityShardingSettings {
             clock: system_run_clock(),
             metrics: Arc::new(NoopMetricsRecorder),
             decisions: None,
+            memory: None,
         }
     }
 
@@ -4232,6 +4244,20 @@ impl AgentRunEntityShardingSettings {
     #[must_use]
     pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
         self.decisions = Some(sink);
+        self
+    }
+
+    /// Wires every hosted run with a session-memory backend
+    /// ([specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Absent by default, so an unwired run keeps only the opaque context
+    /// reference; a wired one persists session entries and immutable context
+    /// snapshots as its loop cranks. The sharded factory is the production
+    /// driver of a run, so a deployment that wants session memory must wire it
+    /// here exactly as it would on a directly-driven entity.
+    #[must_use]
+    pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
+        self.memory = Some(memory);
         self
     }
 }
@@ -4339,6 +4365,9 @@ where
     .with_metrics(settings.metrics.clone());
     if let Some(decisions) = settings.decisions.clone() {
         entity = entity.with_decision_events(decisions);
+    }
+    if let Some(memory) = settings.memory.clone() {
+        entity = entity.with_memory(memory);
     }
     entity
 }

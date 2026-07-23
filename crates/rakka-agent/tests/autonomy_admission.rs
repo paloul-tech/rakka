@@ -393,3 +393,141 @@ async fn an_undeclared_operation_class_is_refused_as_its_own_reason() {
         AgentAssignmentRefusalReason::OperationClassNotDeclared
     );
 }
+
+/// One full drive of the admitted unattended flow, exactly as the operator
+/// and ingress would redeliver it: instantiate, admit, create, pump. Every
+/// command carries the same operation id on every drive, so a re-drive is a
+/// redelivery, never a second decision. The first error — an armed crash
+/// point included — surfaces as `Err`.
+async fn drive_admitted_flow(fx: &Fixture) -> Result<(), String> {
+    let envelope = admittable_envelope();
+    let mut definition = AgentDefinition::new(
+        AgentDefinitionId::new("unattended-v1").expect("definition id should be valid"),
+        "Resolves tickets unattended.",
+        envelope.clone(),
+    )
+    .expect("the agent definition should be valid");
+    definition.policies = AgentPolicyRefs {
+        approval: Some(policy("approval-v1")),
+        authorization: Some(policy("authorization-v1")),
+        escalation: Some(policy("escalation-v1")),
+        guardrail: None,
+        retention: None,
+    };
+
+    let mut agent = AgentEntityStore::new(agent_scope(), fx.agents.clone());
+    agent
+        .recover()
+        .await
+        .map_err(|error| error.code().to_string())?;
+    agent
+        .apply(AgentEntityCommand::Instantiate {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::DefinitionUpdate,
+                &agent_scope(),
+                "1",
+            )
+            .expect("operation id should be derivable"),
+            definition: Box::new(definition),
+            settings: Box::new(AgentSettings::default()),
+            provenance: Box::new(provenance(1)),
+        })
+        .await
+        .map_err(|error| error.code().to_string())?;
+
+    let decision = AutonomyAdmissionDecision::new(
+        [AgentOperationClass::BoundedAsync].into_iter().collect(),
+        AgentRevisionNumber::INITIAL,
+        AgentRevisionNumber::INITIAL,
+        envelope,
+        AgentAdmissionEvaluator::Service("risk-policy-service".to_string()),
+        every_requirement(),
+        provenance(2).accepted_at,
+    )
+    .expect("a complete admission");
+    let mut agent = AgentEntityStore::new(agent_scope(), fx.agents.clone());
+    agent
+        .recover()
+        .await
+        .map_err(|error| error.code().to_string())?;
+    agent
+        .apply(AgentEntityCommand::Admit {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::Command,
+                &agent_scope(),
+                "admit-1",
+            )
+            .expect("operation id should be derivable"),
+            decision: Box::new(decision),
+        })
+        .await
+        .map_err(|error| error.code().to_string())?;
+
+    fx.create_task_with(unattended_task()).await;
+    fx.pump().await
+}
+
+#[tokio::test]
+async fn an_admission_survives_any_agent_owner_loss_exactly_once() {
+    // Scenario 53 under the owner-kill sweep: kill the *agent entity's* owner
+    // at every durable write of instantiate -> admit, on both sides of the
+    // compare-and-set, then let the operator redeliver both commands. Every
+    // crash converges on one persisted admission, and the unattended task
+    // completes exactly once under it — a lost admission write fails closed
+    // (the assignment stays refused) until the redelivered decision commits.
+    // The agent store is the only store this flow's crash windows live in.
+    let reference = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    drive_admitted_flow(&reference)
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.agents.writes();
+    assert!(
+        writes >= 2,
+        "instantiate and admit should each write durably, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+
+        fx.agents.crash_at(nth, point);
+        let _crashed = drive_admitted_flow(&fx).await;
+
+        // A new owner activates; the operator redelivers.
+        fx.agents.assert_crash_fired(nth, point);
+        fx.agents.survive();
+        drive_admitted_flow(&fx).await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx
+            .run_snapshot()
+            .await
+            .unwrap_or_else(|| panic!("crash {point:?} at write {nth}: the admitted run was lost"));
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        let task = fx.task_snapshot().await;
+        assert_eq!(
+            task.status,
+            AgentTaskStatus::Completed,
+            "crash {point:?} at write {nth} should complete the task exactly once"
+        );
+        assert_eq!(
+            task.rejection_count, 0,
+            "crash {point:?} at write {nth} re-validated the accepted result"
+        );
+
+        let state =
+            load_agent_entity_state(&fx.agents, &agent_scope(), &AgentSchemaPolicy::default())
+                .await
+                .expect("the agent state loads")
+                .expect("the agent exists");
+        assert!(
+            state.admission().is_some(),
+            "crash {point:?} at write {nth} lost the persisted admission"
+        );
+    })
+    .await;
+}

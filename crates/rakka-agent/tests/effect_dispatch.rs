@@ -19,8 +19,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{
-    DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe, RecordingToolExecutor,
-    ScriptedCredentialResolver, ScriptedDispatcher, ScriptedReconciler, SharedAtomicWorkflowClock,
+    CrashingStateStore, DeterministicModelAdapter, InProcessRunResultDelivery, KillSwitchProbe,
+    RecordingToolExecutor, ScriptedCredentialResolver, ScriptedDispatcher, ScriptedReconciler,
+    SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
     AgentBudgetCeilings, AgentCredentialBindingRef, AgentDispatchWindow, AgentEffectResolution,
@@ -35,14 +36,13 @@ use rakka_agent_workflow::substrate::WorkflowState;
 use rakka_agent_workflow::{
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId,
 };
-use rakka_persistence::InMemoryDurableStateStore;
 
 mod common;
 
 use common::*;
 
-type WorkflowStore = InMemoryDurableStateStore<WorkflowState>;
-type FleetStore = InMemoryDurableStateStore<AgentDispatcherFleetState>;
+type WorkflowStore = CrashingStateStore<WorkflowState>;
+type FleetStore = CrashingStateStore<AgentDispatcherFleetState>;
 type WorkflowSink = WorkflowAgentRunEffectSink<WorkflowStore, SharedAtomicWorkflowClock>;
 type Pipeline =
     AgentRunEffectDispatcher<WorkflowStore, FleetStore, RunStore, SharedAtomicWorkflowClock>;
@@ -225,6 +225,70 @@ impl DispatchFixture {
             }
         }
         panic!("the dispatch pump did not quiesce");
+    }
+
+    /// [`Self::settle`], but surfacing the first error instead of panicking —
+    /// what a sweep needs, because an armed [`CrashingStateStore`] kills the
+    /// owner mid-settle and the injected loss is the point, not a failure.
+    async fn try_settle(&self) -> Result<(), String> {
+        let now = self.fx.now();
+        let mut task = rakka_agent::AgentTaskEntityStore::new(
+            task_scope(),
+            self.fx.tasks.clone(),
+            self.fx.agents.clone(),
+            self.fx.history.clone(),
+        );
+        task.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        task.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+
+        let now = self.fx.now();
+        let mut run = self.fx.run();
+        run.recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        run.settle_side_effects(&self.fx.router, now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        Ok(())
+    }
+
+    /// [`Self::pump`], but surfacing the first error instead of panicking,
+    /// under the same sweep contract as [`Self::try_settle`]. Reads only
+    /// durable state, so calling it after a crash is the same operation as
+    /// calling it after a success.
+    async fn try_pump(&self) -> Result<(), String> {
+        for _round in 0..16 {
+            self.try_settle().await?;
+            let pass = self
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .map_err(|error| error.code().to_string())?;
+            let terminal = {
+                let mut run = self.fx.run();
+                run.recover(self.fx.now())
+                    .await
+                    .map_err(|error| error.code().to_string())?;
+                run.snapshot()
+                    .map_err(|error| error.code().to_string())?
+                    .is_some_and(|snapshot| snapshot.status.is_terminal())
+            };
+            if terminal {
+                return Ok(());
+            }
+            if pass.registered == 0
+                && pass.claimed == 0
+                && pass.delivered == 0
+                && pass.cancelled == 0
+            {
+                return Ok(());
+            }
+        }
+        Err("the dispatch pump did not quiesce".to_string())
     }
 
     /// The run-side status of the first effect of the given turn slot.
@@ -1212,11 +1276,34 @@ async fn an_effect_policy_weaker_than_the_adapters_declaration_fails_closed_at_d
 // 1.14).
 // ---------------------------------------------------------------------------
 
+/// The M1 per-turn durable-write budget: what one clean model turn — accept
+/// the assignment, commit the model effect, ticket it, claim it, invoke,
+/// deliver the turn, propose the result, accept it, settle the escrow —
+/// costs each durable store, measured from task creation through the settled
+/// escrow.
+///
+/// These are exact counts, not ceilings, and the assertions below are
+/// deliberate change-detectors: phases 3-5 multiply write load, so a
+/// legitimate pipeline change must re-derive the number consciously — update
+/// the constant *and* the recorded budget in
+/// `examples/durable-agent-acceptance/README.md` together — rather than let
+/// the per-turn cost creep silently. Wall-clock latency is printed but never
+/// asserted; the release-build numbers are recorded in the same README, with
+/// this test as the reproduction command.
+const TURN_BUDGET_RUN_STORE_WRITES: usize = 10;
+/// The task store's share of the budget: creation with its assignment
+/// decision, the run's acceptance, the result proposal's decision, and the
+/// escrow settlement and return.
+const TURN_BUDGET_TASK_STORE_WRITES: usize = 8;
+/// The workflow outbox's share: register the ticket, mark it dispatching,
+/// settle it.
+const TURN_BUDGET_WORKFLOW_STORE_WRITES: usize = 3;
+
 #[tokio::test]
 async fn per_turn_durable_write_count_and_latency_measurement() {
-    // One clean model turn, end to end over the integrated pipeline: accept
-    // the assignment, commit the model effect, ticket it, claim it, invoke,
-    // deliver the turn, propose the result, and let the task accept it.
+    // One clean model turn, end to end over the integrated pipeline. The
+    // fixture instantiates the agent first; the counters reset there, so the
+    // budget is exactly "one accepted turn, creation through settled escrow".
     let fx = DispatchFixture::new(
         DeterministicModelAdapter::new().with_turn(proposing_turn("resolved")),
         default_registry(),
@@ -1224,45 +1311,47 @@ async fn per_turn_durable_write_count_and_latency_measurement() {
         RecordingToolExecutor::new(),
         ScriptedReconciler::new(),
     );
+    fx.fx
+        .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+        .await;
+    fx.fx.runs.reset_writes();
+    fx.fx.tasks.reset_writes();
+    fx.workflow_store.reset_writes();
+
     let started = std::time::Instant::now();
-    fx.start().await;
+    fx.fx.create_task().await;
     fx.pump().await;
     let elapsed = started.elapsed();
 
     let run = fx.fx.run_snapshot().await.expect("the run exists");
     assert_eq!(run.status, AgentRunStatus::Completed);
 
-    // Durable writes per store. The run and task stores count compare-and-sets
-    // directly; the workflow and fleet stores expose them as their final
-    // record revision.
+    // Every store counts its compare-and-sets directly. The fleet store is
+    // deliberately not budgeted: its lease bookkeeping scales with worker
+    // churn, not with turns.
     let run_writes = fx.fx.runs.writes();
-    let workflow_revision = {
-        use rakka_persistence::DurableStateStore;
-        let inbox = rakka_agent_workflow::AgentRunInbox::with_clock(
-            rakka_agent::workflow_run_id(&run_scope()),
-            fx.workflow_store.clone(),
-            fx.wf_clock.clone(),
-        );
-        let persistence_id = inbox.inner().persistence_id().clone();
-        fx.workflow_store
-            .load(&persistence_id)
-            .await
-            .expect("the workflow state loads")
-            .map(|record| record.revision.get())
-            .unwrap_or(0)
-    };
+    let task_writes = fx.fx.tasks.writes();
+    let workflow_writes = fx.workflow_store.writes();
     println!(
         "one full turn (accept -> model effect -> ticket -> claim -> invoke -> deliver -> \
-         propose -> accept): run-store writes = {run_writes}, workflow-store revision = \
-         {workflow_revision}, wall time = {elapsed:?}"
+         propose -> accept): run-store writes = {run_writes}, task-store writes = \
+         {task_writes}, workflow-store writes = {workflow_writes}, wall time = {elapsed:?}"
     );
 
-    // A loose ceiling so a future change that multiplies the per-turn write
-    // count cannot land silently; the real budget is set in slice 1.14.
-    assert!(
-        run_writes <= 16,
-        "one turn made {run_writes} run-store writes; the durable-boundary design expects \
-         well under 16"
+    assert_eq!(
+        run_writes, TURN_BUDGET_RUN_STORE_WRITES,
+        "the per-turn run-store budget moved; a deliberate pipeline change must re-derive \
+         the budget constant and the example README together"
+    );
+    assert_eq!(
+        task_writes, TURN_BUDGET_TASK_STORE_WRITES,
+        "the per-turn task-store budget moved; a deliberate pipeline change must re-derive \
+         the budget constant and the example README together"
+    );
+    assert_eq!(
+        workflow_writes, TURN_BUDGET_WORKFLOW_STORE_WRITES,
+        "the per-turn workflow-store budget moved; a deliberate pipeline change must \
+         re-derive the budget constant and the example README together"
     );
 }
 
@@ -1312,5 +1401,281 @@ impl DispatchFixture {
             .expect("an effect is parked")
             .clone();
         (effect.effect_id, effect.generation)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The owner-kill sweeps at the pipeline's own stores: the workflow outbox and
+// the dispatcher fleet. Scenarios 5-10 above kill the *dispatcher* at its
+// windows; these kill the *store owner* at every durable write instead, which
+// is what a pod loss looks like to the outbox and fleet records themselves.
+// ---------------------------------------------------------------------------
+
+/// A dispatch fixture whose model and tool are both idempotent, so every
+/// ambiguous window retries under the generation's single external key and
+/// every sweep iteration converges on completion.
+fn idempotent_pipeline_fixture() -> DispatchFixture {
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn_for(1, tool_calling_turn(TOOL))
+        .with_turn_for(2, proposing_turn("charged"))
+        .with_retry_policy(rakka_agent::AgentModelRetryPolicy {
+            safety_class: rakka_agent::AgentEffectSafetyClass::Idempotent,
+            max_attempts: 3,
+        })
+        .expect("the adapter policy is valid");
+    DispatchFixture::new(
+        adapter,
+        tool_registry(AgentEffectSpec::idempotent(3).expect("the spec is valid")),
+        Some(AgentEffectSpec::idempotent(3).expect("the model spec is valid")),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+}
+
+/// The distinct external idempotency keys the tool saw.
+fn distinct_tool_keys(fx: &DispatchFixture) -> std::collections::BTreeSet<String> {
+    fx.tools
+        .invocations()
+        .into_iter()
+        .filter(|invocation| invocation.tool == TOOL)
+        .map(|invocation| invocation.idempotency_key)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_pipeline_survives_any_outbox_store_loss_under_one_idempotency_key() {
+    // Kill the workflow-outbox store's owner at every durable write of the
+    // ticket lifecycle — register, dispatch, settle — on both sides of the
+    // compare-and-set. Every crash converges on one completed run, and the
+    // external system only ever saw the one key the first attempt minted:
+    // exactly-once ticket registration is what makes that true.
+    let reference = idempotent_pipeline_fixture();
+    reference.start().await;
+    reference
+        .try_pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.workflow_store.writes();
+    assert!(
+        writes >= 4,
+        "the ticket lifecycle should make several durable writes, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let fx = idempotent_pipeline_fixture();
+        fx.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+            .await;
+
+        fx.workflow_store.crash_at(nth, point);
+        fx.fx.create_task().await;
+        let _crashed = fx.try_pump().await;
+
+        // A new owner activates; the dead pass's lease lapses.
+        fx.workflow_store.assert_crash_fired(nth, point);
+        fx.workflow_store.survive();
+        fx.expire_lease();
+        fx.try_pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.turn, 2,
+            "crash {point:?} at write {nth} replayed a turn"
+        );
+        assert_eq!(
+            distinct_tool_keys(&fx).len(),
+            1,
+            "crash {point:?} at write {nth} invoked under a second idempotency key"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_pipeline_survives_any_fleet_store_loss_under_one_idempotency_key() {
+    // The same sweep over the dispatcher-fleet store: worker registration,
+    // claims, and failure records. A fleet record is a fence, never proof of
+    // an external outcome — so losing its owner at any write may delay the
+    // attempt but must not duplicate the external effect.
+    let reference = idempotent_pipeline_fixture();
+    reference.start().await;
+    reference
+        .try_pump()
+        .await
+        .expect("the reference flow completes");
+    let writes = reference.fleet_store.writes();
+    assert!(
+        writes >= 2,
+        "the fleet lifecycle should make durable writes, saw {writes}"
+    );
+
+    rakka_agent::testkit::sweep_crash_points(writes, |nth, point| async move {
+        let fx = idempotent_pipeline_fixture();
+        fx.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+            .await;
+
+        fx.fleet_store.crash_at(nth, point);
+        fx.fx.create_task().await;
+        let _crashed = fx.try_pump().await;
+
+        fx.fleet_store.assert_crash_fired(nth, point);
+        fx.fleet_store.survive();
+        fx.expire_lease();
+        fx.try_pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
+
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.turn, 2,
+            "crash {point:?} at write {nth} replayed a turn"
+        );
+        assert_eq!(
+            distinct_tool_keys(&fx).len(),
+            1,
+            "crash {point:?} at write {nth} invoked under a second idempotency key"
+        );
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 23's dispatcher-restart half: the persisted trace segments and the
+// durable outcome are identical across a dispatcher kill at every window —
+// including the delivered-but-unsettled one, where the fresh worker must
+// settle the row its re-read intent shows resolved, not invoke the target
+// again.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dispatcher_restart_preserves_segments_and_outcome_at_every_window() {
+    const INGRESS_PARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    fn traced_fixture() -> DispatchFixture {
+        let adapter = DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn(TOOL))
+            .with_turn_for(2, proposing_turn("charged"))
+            .with_retry_policy(
+                rakka_agent::AgentModelRetryPolicy::read_only(3).expect("the policy is valid"),
+            )
+            .expect("the adapter accepts the policy");
+        DispatchFixture::new(
+            adapter,
+            tool_registry(
+                AgentEffectSpec::read_only()
+                    .with_max_attempts(3)
+                    .expect("the spec is valid"),
+            ),
+            Some(
+                AgentEffectSpec::read_only()
+                    .with_max_attempts(3)
+                    .expect("the model spec is valid"),
+            ),
+            RecordingToolExecutor::new(),
+            ScriptedReconciler::new(),
+        )
+    }
+
+    async fn drive_traced(fx: &DispatchFixture) {
+        fx.fx
+            .instantiate_agent_with_envelope(envelope_for_registry(&fx.registry))
+            .await;
+        fx.fx
+            .create_task_traced(rakka_agent_workflow::AgentTelemetryContext {
+                trace_parent: Some(INGRESS_PARENT.to_string()),
+                ..rakka_agent_workflow::AgentTelemetryContext::default()
+            })
+            .await;
+    }
+
+    async fn segments_and_outcome(fx: &DispatchFixture) -> (String, AgentRunStatus, u64) {
+        let view = rakka_agent::assemble_agent_session_view(
+            &fx.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+            None,
+            rakka_agent_workflow::AgentTimestampMillis::new(9_999),
+        )
+        .await
+        .expect("the view assembles")
+        .expect("the run exists");
+        let segments = serde_json::to_string(&view.trace_segments).expect("the segments serialize");
+        let run = fx.fx.run_snapshot().await.expect("the run exists");
+        (segments, run.status, run.turn)
+    }
+
+    // The unkilled reference fixes the segments and outcome every restart
+    // must reproduce.
+    let reference = traced_fixture();
+    drive_traced(&reference).await;
+    reference.pump().await;
+    let expected = segments_and_outcome(&reference).await;
+    assert_eq!(expected.1, AgentRunStatus::Completed);
+
+    for window in [
+        AgentDispatchWindow::BeforeStarted,
+        AgentDispatchWindow::AfterStarted,
+        AgentDispatchWindow::AfterInvocation,
+        AgentDispatchWindow::AfterResultDelivery,
+    ] {
+        let fx = traced_fixture();
+        drive_traced(&fx).await;
+        fx.pump_until_tool_ticket().await;
+
+        fx.probe.arm(window);
+        let pass = fx
+            .pipeline()
+            .pump_run(&run_scope())
+            .await
+            .expect("the pass runs");
+        assert!(pass.died, "the probe kills the worker at {window:?}");
+        let calls_at_death = fx.tools.invocation_count(TOOL);
+
+        // A fresh worker recovers from durable state alone.
+        fx.expire_lease();
+        fx.pump().await;
+
+        let observed = segments_and_outcome(&fx).await;
+        assert_eq!(
+            observed, expected,
+            "a dispatcher restart at {window:?} changed a segment or the outcome"
+        );
+
+        if window == AgentDispatchWindow::AfterResultDelivery {
+            // The run already durably held the tool's word when the worker
+            // died, so segment/outcome equality alone cannot tell settlement
+            // apart from a re-invocation the run's dedup absorbed. Recovery
+            // must settle the delivered-but-unsettled row from the re-read
+            // intent without touching the target again, and must not leave
+            // the ticket claimable forever.
+            assert_eq!(
+                fx.tools.invocation_count(TOOL),
+                calls_at_death,
+                "recovery re-invoked a tool whose result the run already holds"
+            );
+            fx.expire_lease();
+            let sweep = fx
+                .pipeline()
+                .pump_run(&run_scope())
+                .await
+                .expect("the post-recovery pass runs");
+            assert_eq!(
+                sweep.claimed, 0,
+                "recovery left the delivered ticket claimable"
+            );
+        }
     }
 }

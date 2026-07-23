@@ -12,7 +12,7 @@
 //! never a telemetry projection — so they are correct while every entity is
 //! passivated.
 
-use rakka_agent::testkit::{CrashPoint, ExchangeFault, ScriptedDispatcher};
+use rakka_agent::testkit::{sweep_crash_points, ExchangeFault, ScriptedDispatcher};
 use rakka_agent::{
     load_agent_task_state, AgentBudgetAllocation, AgentBudgetCeilings, AgentBudgetDimension,
     AgentEscrowChildId, AgentModelTurn, AgentModelUsage, AgentRunSettlementStatus, AgentRunStatus,
@@ -576,70 +576,69 @@ async fn the_escrow_round_trip_survives_a_restart_at_every_durable_boundary() {
         "the escrow round trip should make several durable writes, saw {writes}"
     );
 
-    for point in [CrashPoint::AfterWrite, CrashPoint::BeforeWrite] {
-        for nth in 1..=writes {
-            let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
-            fx.instantiate_agent().await;
+    sweep_crash_points(writes, |nth, point| async move {
+        let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+        fx.instantiate_agent().await;
 
-            fx.runs.crash_at(nth, point);
-            fx.create_task_with(escrowed_definition()).await;
-            let _crashed = fx.pump().await;
+        fx.runs.crash_at(nth, point);
+        fx.create_task_with(escrowed_definition()).await;
+        let _crashed = fx.pump().await;
 
-            // A new owner activates and finds only what was durably committed.
-            fx.runs.survive();
-            fx.pump().await.unwrap_or_else(|error| {
-                panic!("crash {point:?} at write {nth} did not converge: {error}")
-            });
+        // A new owner activates and finds only what was durably committed.
+        fx.runs.assert_crash_fired(nth, point);
+        fx.runs.survive();
+        fx.pump().await.unwrap_or_else(|error| {
+            panic!("crash {point:?} at write {nth} did not converge: {error}")
+        });
 
-            let run = fx
-                .run_snapshot()
-                .await
-                .unwrap_or_else(|| panic!("crash {point:?} at write {nth}: the run was lost"));
-            assert_eq!(
-                run.status,
-                AgentRunStatus::Completed,
-                "crash {point:?} at write {nth} should still complete"
-            );
-            assert_eq!(
-                run.settlement,
-                AgentRunSettlementStatus::Returned,
-                "crash {point:?} at write {nth} should still hand its escrow back"
-            );
+        let run = fx
+            .run_snapshot()
+            .await
+            .unwrap_or_else(|| panic!("crash {point:?} at write {nth}: the run was lost"));
+        assert_eq!(
+            run.status,
+            AgentRunStatus::Completed,
+            "crash {point:?} at write {nth} should still complete"
+        );
+        assert_eq!(
+            run.settlement,
+            AgentRunSettlementStatus::Returned,
+            "crash {point:?} at write {nth} should still hand its escrow back"
+        );
 
-            let task =
-                load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
-                    .await
-                    .expect("the task state loads")
-                    .expect("the task exists");
-            let escrow = &task.task().expect("the task is created").escrow;
+        let task = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+            .await
+            .expect("the task state loads")
+            .expect("the task exists");
+        let escrow = &task.task().expect("the task is created").escrow;
 
-            // Exactly what the crash-free run consumed — never twice.
-            let consumed = escrow.consumed();
-            assert_eq!(
-                (
-                    consumed.loop_iterations,
-                    consumed.model_calls,
-                    consumed.effects,
-                    consumed.effect_attempts,
-                    consumed.tokens
-                ),
-                (1, 1, 1, 1, 15),
-                "crash {point:?} at write {nth} settled the wrong consumption"
-            );
-            // The child returned exactly once, so the headroom is the full
-            // allocation less only what the run spent — no double-credit.
-            assert!(
-                escrow.child(&run_child()).is_none(),
-                "crash {point:?} at write {nth} left the escrow open"
-            );
-            assert_eq!(
-                escrow.available(AgentBudgetDimension::LoopIterations),
-                Some(9),
-                "crash {point:?} at write {nth} double-credited the parent"
-            );
-            assert_eq!(escrow.available(AgentBudgetDimension::Tokens), Some(985));
-        }
-    }
+        // Exactly what the crash-free run consumed — never twice.
+        let consumed = escrow.consumed();
+        assert_eq!(
+            (
+                consumed.loop_iterations,
+                consumed.model_calls,
+                consumed.effects,
+                consumed.effect_attempts,
+                consumed.tokens
+            ),
+            (1, 1, 1, 1, 15),
+            "crash {point:?} at write {nth} settled the wrong consumption"
+        );
+        // The child returned exactly once, so the headroom is the full
+        // allocation less only what the run spent — no double-credit.
+        assert!(
+            escrow.child(&run_child()).is_none(),
+            "crash {point:?} at write {nth} left the escrow open"
+        );
+        assert_eq!(
+            escrow.available(AgentBudgetDimension::LoopIterations),
+            Some(9),
+            "crash {point:?} at write {nth} double-credited the parent"
+        );
+        assert_eq!(escrow.available(AgentBudgetDimension::Tokens), Some(985));
+    })
+    .await;
 }
 
 #[test]
