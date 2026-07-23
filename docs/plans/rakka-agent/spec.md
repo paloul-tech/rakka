@@ -2516,26 +2516,42 @@ A follow-up design review (2026-07-10) resolved four additional defaults:
 ### 21.3 Open Decisions
 
 These decisions remain open until accepted by maintainers and product owners.
-The current recommended default is shown after each question.
+The current recommended default is shown after each question. Decisions
+confirmed or exercised during Phase 1 (M1) carry an inline *Disposition (M1)*
+note naming the implementation-plan slice that recorded the resolution; items
+without one remain open.
 
 1. **Can an `AgentId` have concurrent active runs?** Recommended: yes, with
    independent run entities and idempotent/CAS private-memory writes.
+   *Disposition (M1): accepted structurally — every run is an independent
+   sharded entity with its own ledger and nothing serializes an agent's runs;
+   the idempotent/CAS private-memory write rule binds at M2 (slice 2.1).*
 2. **What is the default communal boundary?** Recommended: tenant or
    organization `KnowledgeSpaceId`; no implicit cross-tenant global graph.
 3. **Does every agent-written claim begin as `Proposed`?** Recommended: yes;
    policy or HITL promotes consequential claims to `Verified`.
 4. **Which model calls are safe to retry?** Recommended: an explicit
    deployment policy based on provider idempotency, cost, and replay tolerance.
+   *Disposition (M1): accepted — the adapter declares an explicit
+   `AgentModelRetryPolicy` (safety class plus bounded attempts, default
+   read-only), deployment configures it through the model effect spec, and
+   dispatch re-enforces it (slices 1.6 and 1.7).*
 5. **May a human force retry an ambiguous non-idempotent effect?** Recommended:
    no generic retry; require `ConfirmedNotExecuted` evidence and a new effect
    generation. A future unsafe override would need a distinct capability and
    conspicuous audit semantics.
+   *Disposition (M1): accepted — the reconciliation decision set ships with no
+   generic retry and `ConfirmedNotExecuted` creates a new effect generation
+   (slice 1.10); no unsafe override exists.*
 6. **How are agent cards assigned?** Recommended: stable cards/skills identify
    an `AgentId` or agent template; every created task receives a distinct
    `AgentTaskId` and its initial assignee receives a distinct `AgentRunId`.
 7. **How long is short-term memory retained after a terminal run?**
    Recommended: tenant policy with bounded default, legal hold, export, and
    deletion support.
+   *Disposition (M1): deliberately still open — deferred to Phase 2
+   slice 2.1; until then a deployment retains session rows until it deletes
+   them itself (slice 1.11 amendment).*
 8. **Which communal graph backend ships first?** Recommended: do not select one
    in the domain specification. Capture representative queries and validate
    the database-agnostic SPI against at least two structurally different
@@ -2544,21 +2560,36 @@ The current recommended default is shown after each question.
 9. **Can authorization be resolved by a service without a human?**
    Recommended: yes, if the resolver is authenticated, authorized, audited,
    and bound to the same exact effect intent.
+   *Disposition (M1): accepted — a resolution enters through the same
+   authenticated, deduplicated decision path as a human's, bound to the exact
+   intent and argument digest (slice 1.10).*
 10. **Should settings updates be ordinary A2A messages or a versioned A2A
     extension/management skill?** Recommended: define a versioned management
     skill or extension so schemas, authorization, and audit semantics are
     explicit.
+    *Disposition (M1): accepted as a versioned extension, not a skill —
+    `urn:rakka:a2a-extension:agent-management:v1` (slice 1.12).*
 11. **Where should linked trace segments split?** Recommended: split at durable
     asynchronous boundaries and long waits; keep one bounded active turn or
     logical provider operation together when doing so remains operationally
     useful.
+    *Disposition (M1): accepted — a segment is one entity activation, every
+    durable asynchronous boundary splits segments, and a model call lives in
+    the dispatcher's consumer segment (slice 1.13).*
 12. **Can production telemetry capture model/tool/memory content?**
     Recommended: disabled by default; allow only explicit scoped opt-in to
     protected artifact storage, never credentials or hidden reasoning.
+    *Disposition (M1): accepted as structurally off — no M1 code path emits
+    content; the scoped opt-in policy object is deferred to Phase 6
+    (slice 1.13).*
 13. **Which trace sampling policy ships first?** Recommended: retain errors,
     indeterminate effects, security/policy events, escalations, recovery
     failures, and slow traces; sample routine success, using trace-ID-routed
     tail sampling only when the deployment can operate it safely.
+    *Disposition (M1): accepted — sampling ships as pinned Collector
+    configuration carrying the Section 17.16 retain list; the crate owes
+    bounded attributes, recording-independent propagation, and the
+    scenario-24 proof (slice 1.13).*
 14. **Are goal, task, and run identities distinct?** Recommended: yes. Let the
     stable root task coordinate initially and optionally generate the same
     underlying value for the goal/root task/initial run, but keep
@@ -2572,15 +2603,24 @@ The current recommended default is shown after each question.
     never treat the whole workflow as one opaque retryable external effect.
 17. **What maps to A2A `Task.id`?** Recommended: `AgentTaskId`; preserve it
     across handoff while each assignee execution receives a new `AgentRunId`.
+    *Disposition (M1): accepted as the equal mapping — A2A `Task.id` is the
+    `AgentTaskId` value verbatim and the tenant always derives from the
+    authenticated context (slice 1.12).*
 18. **Which coordination patterns become first-class?** Recommended: handoff,
     delegation, team, and moderation, each compiled into typed durable state
     with bounded policy rather than prompt-only conventions.
 19. **How dynamic may run setup be?** Recommended: instructions and selected
     capabilities may vary within an authorized definition envelope; setup may
     never add undeclared tools/models/peers or weaken mandatory guardrails.
+    *Disposition (M1): accepted — narrow-only envelope validation at creation
+    (slice 1.2), enforced at dispatch against both the definition and the
+    resolved setup (slice 1.8).*
 20. **Should Rakka copy Akka's idle residency behavior?** Recommended: no.
     Every quiescent Rakka task/run auto-passivates; suspend controls admission
     and terminate controls lifecycle, not memory-resource release.
+    *Disposition (M1): accepted — no idle residency; scenario 46 proves
+    auto-passivation with no lifecycle command and one deduplicated trigger
+    reactivating the owner (slice 1.14).*
 21. **Are coordination notifications replayable?** Recommended: yes, with
     bounded retention, monotonic scoped cursor, and explicit resync on an
     expired window; authoritative task/run state remains the correctness source.
