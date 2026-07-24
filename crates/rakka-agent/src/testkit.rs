@@ -80,7 +80,7 @@ use crate::effect::{
 };
 use crate::identity::{AgentOperationId, AgentRunScope};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
-use crate::memory::{AgentContextSnapshotRef, AgentRunMemory};
+use crate::memory::{AgentContextSnapshotRef, AgentRunMemory, MemoryError};
 use crate::model::{
     AgentModelAdapter, AgentModelFuture, AgentModelRequest, AgentModelResult,
     AgentModelRetryPolicy, AgentModelTurn, AgentToolCallRequest,
@@ -2650,6 +2650,183 @@ where
                 self.ask_timeout,
             )
             .await
+        })
+    }
+}
+
+/// A deterministic [`AgentMemoryEmbedder`] for tests: a fixed-dimension
+/// token-hash bag-of-words embedding, no network, no model.
+///
+/// The same text always embeds to the same vector, related texts share
+/// components (each token increments the component its hash selects), and the
+/// declared [`crate::memory::MemoryEmbeddingRef`] identity is stable — which
+/// is exactly what retrieval and index-drift tests need. The version is
+/// configurable so a test can prove an embedder upgrade makes old vectors
+/// non-candidates.
+#[derive(Debug, Clone)]
+pub struct DeterministicEmbedder {
+    dimensions: u32,
+    version: AgentRevisionNumber,
+}
+
+impl DeterministicEmbedder {
+    /// The model name the embedder declares.
+    pub const MODEL: &'static str = "deterministic-test-embedder";
+
+    /// An embedder with eight dimensions at the initial version.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            dimensions: 8,
+            version: AgentRevisionNumber::INITIAL,
+        }
+    }
+
+    /// Uses an explicit dimension count (clamped to at least one).
+    #[must_use]
+    pub const fn with_dimensions(mut self, dimensions: u32) -> Self {
+        self.dimensions = if dimensions == 0 { 1 } else { dimensions };
+        self
+    }
+
+    /// Uses an explicit pipeline version.
+    #[must_use]
+    pub const fn with_version(mut self, version: AgentRevisionNumber) -> Self {
+        self.version = version;
+        self
+    }
+}
+
+impl Default for DeterministicEmbedder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::retrieval::AgentMemoryEmbedder for DeterministicEmbedder {
+    fn embedding_ref(&self) -> crate::memory::MemoryEmbeddingRef {
+        crate::memory::MemoryEmbeddingRef {
+            model: Self::MODEL.to_string(),
+            dimensions: self.dimensions,
+            version: self.version,
+        }
+    }
+
+    fn embed<'a>(&'a self, text: &'a str) -> crate::memory::MemoryFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            let mut vector = vec![0f32; self.dimensions as usize];
+            for token in text
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+            {
+                // FNV-1a over the lowercased token selects the component;
+                // deterministic across platforms and runs.
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in token.to_lowercase().bytes() {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                let index = (hash % u64::from(self.dimensions)) as usize;
+                vector[index] += 1.0;
+            }
+            Ok(vector)
+        })
+    }
+}
+
+/// A scripted [`AgentPrivateMemoryRetriever`] for tests: queued outcomes,
+/// answered in order, with every call recorded.
+///
+/// An exhausted script answers an empty outcome, so a test scripts only the
+/// calls it is proving. Clones share the queue and the counters, matching the
+/// testkit's shared-slot convention.
+#[derive(Clone)]
+pub struct ScriptedPrivateMemoryRetriever {
+    outcomes: Arc<Mutex<VecDeque<Result<crate::retrieval::MemoryRetrievalOutcome, MemoryError>>>>,
+    calls: Arc<AtomicUsize>,
+    version: AgentRevisionNumber,
+}
+
+impl Default for ScriptedPrivateMemoryRetriever {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScriptedPrivateMemoryRetriever {
+    /// A retriever with an empty script at the initial version.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(VecDeque::new())),
+            calls: Arc::new(AtomicUsize::new(0)),
+            version: AgentRevisionNumber::INITIAL,
+        }
+    }
+
+    /// Queues one retrieval outcome.
+    #[must_use]
+    pub fn with_outcome(self, outcome: crate::retrieval::MemoryRetrievalOutcome) -> Self {
+        self.outcomes
+            .lock()
+            .expect("the scripted retriever should not be poisoned")
+            .push_back(Ok(outcome));
+        self
+    }
+
+    /// Queues one retrieval failure — the outage the assembly path degrades
+    /// on.
+    #[must_use]
+    pub fn with_error(self, error: MemoryError) -> Self {
+        self.outcomes
+            .lock()
+            .expect("the scripted retriever should not be poisoned")
+            .push_back(Err(error));
+        self
+    }
+
+    /// Uses an explicit retriever version, so a test can bump it and prove a
+    /// retried model input does not move.
+    #[must_use]
+    pub const fn with_retriever_version(mut self, version: AgentRevisionNumber) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// How many retrievals have been asked of this retriever.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl crate::retrieval::AgentPrivateMemoryRetriever for ScriptedPrivateMemoryRetriever {
+    fn backend_name(&self) -> &'static str {
+        "scripted"
+    }
+
+    fn retriever_version(&self) -> AgentRevisionNumber {
+        self.version
+    }
+
+    fn retrieve<'a>(
+        &'a self,
+        _scope: &'a crate::identity::AgentScope,
+        _query: &'a crate::retrieval::MemoryRetrievalQuery,
+        _now: rakka_agent_workflow::AgentTimestampMillis,
+    ) -> crate::memory::MemoryFuture<'a, crate::retrieval::MemoryRetrievalOutcome> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes
+                .lock()
+                .expect("the scripted retriever should not be poisoned")
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(crate::retrieval::MemoryRetrievalOutcome {
+                        memories: Vec::new(),
+                        index_watermark: None,
+                    })
+                })
         })
     }
 }
