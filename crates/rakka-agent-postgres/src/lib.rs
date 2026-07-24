@@ -1,16 +1,25 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! PostgreSQL adapters for agent short-term session memory and immutable context
-//! snapshots.
+//! PostgreSQL adapters for agent memory: session, snapshots, private
+//! long-term records, and pgvector retrieval.
 //!
-//! This crate is the PostgreSQL binding for the agent-domain memory contracts of
-//! [`rakka_agent`]: [`SessionMemoryStore`] scoped `(TenantId, AgentId,
-//! AgentRunId)` and [`ContextSnapshotStore`] scoped by an immutable snapshot
-//! reference ([specification 13.2, 13.5, and the short-term clauses of
+//! This crate is the PostgreSQL binding for the agent-domain memory contracts
+//! of [`rakka_agent`]: [`SessionMemoryStore`] scoped `(TenantId, AgentId,
+//! AgentRunId)`, [`ContextSnapshotStore`] scoped by an immutable snapshot
+//! reference, the [`AgentPrivateMemoryStore`] of authoritative agent-private
+//! records, and the [`PgvectorPrivateMemoryRetriever`] that ranks those
+//! records by derived vectors ([specification 13.2, 13.3, 13.5,
 //! 13.6](../../../docs/plans/rakka-agent/spec.md)). It never changes the
 //! agent-domain identity, provenance, idempotency, or snapshot-reuse semantics —
 //! it only persists them.
+//!
+//! The retrieval adapter has its own migration
+//! ([`PgvectorPrivateMemoryRetriever::migrate`]) because it needs the
+//! `vector` extension; the three stores and [`MIGRATION_SQL`] stay green on
+//! databases without pgvector. See [`PgvectorPrivateMemoryRetriever`] for
+//! the recall characteristics, the derive/rebuild/retention runbook, and the
+//! extension prerequisite.
 //!
 //! Idempotency is enforced by uniqueness constraints, so a replay is harmless: a
 //! session append deduplicates on `(tenant, agent, run, operation_id)`, and a
@@ -31,6 +40,14 @@
 //! RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres \
 //!     cargo test -p rakka-agent-postgres
 //! ```
+
+pub mod retrieval;
+
+pub use retrieval::{
+    pgvector_available, IndexOutcome, PgvectorDistance, PgvectorPrivateMemoryRetriever,
+    PgvectorRetrieverConfig, ReindexPage, EMBEDDING_TABLE_NAME, PGVECTOR_MAX_DIMENSIONS,
+    PGVECTOR_RETRIEVER_NAME, PGVECTOR_RETRIEVER_VERSION, VECTOR_MIGRATION_SQL,
+};
 
 use std::sync::Arc;
 
@@ -1061,11 +1078,20 @@ impl AgentPrivateMemoryStore for PostgresAgentPrivateMemoryStore {
 /// Applies the idempotent schema under an advisory lock, so concurrent
 /// migrators do not race the system catalogs.
 async fn apply_migration(client: &Client) -> Result<(), MemoryError> {
+    apply_sql_under_migration_lock(client, MIGRATION_SQL).await
+}
+
+/// Applies one idempotent DDL batch under the crate's advisory lock.
+///
+/// One crate, one schema, one lock: the base migration and the vector
+/// migration serialize against each other harmlessly. The batch is one
+/// implicit transaction, so a failure applies nothing.
+async fn apply_sql_under_migration_lock(client: &Client, sql: &str) -> Result<(), MemoryError> {
     client
         .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
         .await
         .map_err(map_error)?;
-    let applied = client.batch_execute(MIGRATION_SQL).await;
+    let applied = client.batch_execute(sql).await;
     let unlocked = client
         .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
         .await;

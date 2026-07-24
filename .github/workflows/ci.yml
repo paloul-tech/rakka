@@ -108,7 +108,10 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_postgres }}
     services:
       postgres:
-        image: postgres:16
+        # The pgvector image is a drop-in postgres:16 with the vector
+        # extension package installed, so the rakka-agent-postgres retrieval
+        # tests run instead of probe-skipping.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
@@ -136,6 +139,7 @@ jobs:
         run: |
           cargo test -p rakka-persistence-postgres
           cargo test -p rakka-sharding-postgres
+          cargo test -p rakka-agent-postgres
 
   kubernetes-dry-run:
     name: Kubernetes Scenario Dry Run

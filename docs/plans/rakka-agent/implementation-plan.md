@@ -1627,8 +1627,115 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
   record's `MemoryEmbeddingRef` metadata is already persisted, content-free,
   for the vectors this slice derives.
 
+**Amended as implemented (2026-07-24):**
+
+- **The snapshot embeds selected content, not just ids.** The reconciliation
+  the slice text ordered went further than a type swap: `private_memory`
+  became `Vec<SnapshotPrivateMemory>` — id, revision, kind, the *exact
+  content used*, digest, classification, confidence, relevance, embedding
+  metadata, and the recorded ingress transforms/reports — because
+  [spec 13.5](spec.md#135-memory-context-snapshot) requires "selected private
+  memory IDs and exact content/references", and an id alone cannot make a
+  retried model input immune to index drift: a retry that re-read the store
+  by id would observe whatever the id points at *now*. Content in the
+  snapshot plus first-writer-wins persistence is what discharges the
+  done-when test. The reshape stayed at snapshot schema version 1 under the
+  unreleased-branch rule (every record written so far carries an empty
+  selection, which still loads); 2.1's purge-both-stores retention argument
+  now covers private content embedded in snapshots unchanged — and a memory
+  tombstoned *after* a snapshot embedded it keeps that embedded copy until
+  the run's snapshot retention purges it, immutability over withdrawal, the
+  same rule redacted session entries follow.
+- **Retrieval is a settle-pass concern with a required guardrail chain.** The
+  Rakka-owned seam (`AgentPrivateMemoryRetriever`, `AgentMemoryEmbedder`,
+  `rakka_agent::retrieval`) rides `AgentRunMemory` as an
+  `AgentMemoryRetrieval` bundle whose memory-ingress chain is a *required*
+  constructor argument — a wired retriever can never silently skip the
+  boundary; a no-stage deployment passes an empty chain explicitly. The
+  query is derived deterministically from the just-assembled session window
+  (never a second store read), every returned record is re-checked
+  fail-closed against the query's own pre-ranking filter table (the assembly
+  trusts no adapter — duplicates, out-of-scope classifications, and invalid
+  records are rejected), and the ingress evaluation runs per record with the
+  memory's identity on the guardrail context. Outcomes: block drops that
+  record only; a transform's output is what the snapshot embeds, recorded
+  with its stage revision, and a retry reuses it *structurally*;
+  report-only records the finding on the selection; require-checkpoint is a
+  fail-closed drop, because no checkpoint plumbing exists at snapshot
+  assembly and memory must never gate liveness (confirmed decision). Blocked
+  and checkpoint-refused records are deliberately absent from the snapshot —
+  absence is the decision, and a reason code for absent content would leak
+  what was blocked into model-adjacent data — so the new bounded
+  `rakka.agent.memory.retrievals` / `rakka.agent.memory.ingress.outcomes`
+  counters are their visibility. A retriever outage degrades the turn to an
+  empty selection with the attempted retrieval still recorded
+  ([spec 13.1](spec.md#131-general-requirements) over 13.5, the exact
+  argument of 2.1's failed-promotion amendment); the degraded turn keeps its
+  empty selection forever, because first-writer-wins determinism is the
+  stronger promise. Coverage note: the dispatch authority's
+  `validate_covers` cannot see the retrieval bundle's chain, so a deployment
+  must wire the same chain into both — documented on both seams; a
+  deployment with no retrieval wired is not fail-open, because nothing
+  crosses the boundary at all.
+- **Nothing stamps `AgentPrivateMemory.embedding` in this slice.** A
+  compare-and-set stamp from the indexing path would bump the revision the
+  just-derived vector was keyed to (invalidating its own `source_revision`
+  fence) and race live runs for nothing the derived row does not already
+  record. The derived row *is* the model/dimensions/version record;
+  `RetrievedPrivateMemory.embedding` carries it into the snapshot selection.
+  The record field remains for deployment writers that know their embedder
+  configuration.
+- **The pgvector adapter separates its migration and lets the join carry
+  reveal-nothing.** `VECTOR_MIGRATION_SQL` (extension + a typmod-less
+  `vector` table keyed `(tenant, agent, memory_id)` with a per-row dimension
+  check, so one shared migration serves any embedder) is applied only by the
+  retriever's `migrate()` under the crate's existing advisory lock; the
+  three 2.1 stores and `MIGRATION_SQL` are untouched and stay green on
+  databases without pgvector — which is also why the 2.1 tombstone/delete/
+  purge CTEs were *not* extended to touch the derived table. Instead the
+  retrieval statement inner-joins the authoritative row on scope,
+  `source_revision = revision`, tombstone, and expiry — every filter,
+  classification included, a `WHERE` predicate ahead of the `ORDER BY`
+  distance — so a leftover vector row is unretrievable in any scope even
+  mid-crash between a delete and its deindex, and eventual consistency
+  manifests as absence, never as ranking current content by stale geometry.
+  Deployment-invoked maintenance (`index_memory`, paged `reindex` as the
+  spec 13.3 rebuild path, `deindex_memory`/`purge_orphaned` as residual-row
+  hygiene) mirrors `purge_expired`'s no-resident-sweeper pattern. Vectors
+  bind as text literals (`$n::text::vector`, no new dependency; f32
+  shortest-round-trip formatting is exact through pgvector's parser, proven
+  server-side by zero self-distance), failing closed on non-finite or
+  wrong-length embedder output.
+- **Recall characteristics: exact scan ships; ANN is a documented opt-in.**
+  The `(tenant, agent)` primary-key prefix bounds the candidate set to one
+  agent's corpus and the distance is exact within it — recall 1.0, cost
+  linear in the agent's live indexed corpus, the right default because
+  pgvector's approximate indexes post-filter their candidates and silently
+  lose recall under exactly the scope predicate spec 13.6 makes mandatory.
+  The module rustdoc documents the expression-HNSW opt-in (deployment DDL,
+  fixed-dimension cast, pgvector ≥ 0.8 iterative scans to restore recall
+  under filters). Redacted and artifact-backed memories are not semantically
+  indexed in v1 (the adapter never loads artifact bytes); they surface as
+  visible skips in `ReindexPage`.
+- **CI now exercises the crate.** The postgres job's service image moved to
+  `pgvector/pgvector:pg16` (a drop-in postgres:16 with the extension
+  package) and gained `cargo test -p rakka-agent-postgres` — closing the
+  pre-existing gap where even 2.1's DSN-gated tests ran nowhere but
+  developer machines. The pgvector tests additionally probe
+  `pg_available_extensions` and skip with a message on a plain database, so
+  a DSN without the extension keeps the crate green.
+
 Done when: retrieval isolation tests pass and a snapshot-reuse test proves
 index drift cannot change a retried model input (extends scenario 17).
+**Done (2026-07-24):** isolation holds at the reference-retriever, run-entity
+(`crates/rakka-agent/tests/private_memory_retrieval.rs`), and pgvector
+(DSN-gated, per-tenant/per-agent with empty-scope indistinguishability)
+levels; the drift test re-drives a persisted turn after a CAS update, a
+tombstone, *and* a retriever upgrade and reloads the snapshot byte-identical;
+the ingress boundary's outcome table and the 2.1 coverage flip are proven in
+`tests/memory_ingress_guardrails.rs`; the pgvector suite passes against
+`pgvector/pgvector:pg16` and probe-skips (with the base stores green) against
+plain PostgreSQL 16.
 
 ### Slice 2.3 — Communal knowledge graph crate
 
