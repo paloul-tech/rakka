@@ -976,6 +976,9 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::Compensation { .. } => {
                 self.authorize_compensation(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::MemoryPromotion { .. } => {
+                self.authorize_memory_promotion(context, scope, task, goal, intent, now)
+            }
         }
     }
 
@@ -1354,9 +1357,9 @@ impl AgentToolAuthority {
             .clone()
             .or_else(|| match &intent.request {
                 AgentRunEffectRequest::Model { profile, .. } => profile.clone(),
-                AgentRunEffectRequest::Tool { .. } | AgentRunEffectRequest::Compensation { .. } => {
-                    None
-                }
+                AgentRunEffectRequest::Tool { .. }
+                | AgentRunEffectRequest::Compensation { .. }
+                | AgentRunEffectRequest::MemoryPromotion { .. } => None,
             });
 
         if let Some(profile) = &profile {
@@ -1453,6 +1456,48 @@ impl AgentToolAuthority {
     /// against the current envelopes and settings, so an immediate revocation
     /// fences it exactly like any other dispatch.
     fn authorize_compensation(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        })
+    }
+
+    /// Authorizes one memory-promotion attempt
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// No tool binding exists to consult: the deduplicated run command that
+    /// committed the promotion is its authorization, exactly as the
+    /// operator's decision is a compensation's. The common preamble has
+    /// already enforced termination, suspension, the guardrail-policy
+    /// selection, and the argument-digest fence; this arm checks the
+    /// credential binding and execution-policy routability the intent
+    /// carries, and issues the per-attempt grant.
+    fn authorize_memory_promotion(
         &self,
         context: &AgentAuthorityContext<'_>,
         scope: &AgentRunScope,

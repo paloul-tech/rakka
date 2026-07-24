@@ -86,8 +86,8 @@ use crate::effect::{
 };
 use crate::identity::{AgentGoalId, AgentOperationId, AgentRunScope, AgentTaskId};
 use crate::memory::{
-    AgentContextSnapshotRef, MemoryClassification, MemoryEntryId, MemoryEntryRole, MemoryError,
-    MemoryOperationId, MemorySequence, SessionMemoryEntry,
+    AgentContextSnapshotRef, AgentPromotedMemoryRef, MemoryClassification, MemoryEntryId,
+    MemoryEntryRole, MemoryError, MemoryOperationId, MemorySequence, SessionMemoryEntry,
 };
 use crate::model::AgentModelTurn;
 use crate::observability::{AgentDecisionDraft, AgentDecisionEvent};
@@ -130,6 +130,28 @@ pub const AGENT_RUN_SESSION_OUTBOX_CAPACITY: usize = 32;
 /// correctness input. Drops are visible through
 /// [`AgentLoopState::decision_drops`].
 pub const AGENT_RUN_DECISION_OUTBOX_CAPACITY: usize = 32;
+
+/// Most settled memory-promotion receipts a run's loop state retains.
+///
+/// A receipt is provenance, never correctness — the private store is the
+/// source of truth for what a promotion wrote
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)) — so the
+/// list is a bounded ring: one past the bound drops the oldest receipt rather
+/// than growing the run's durable state.
+pub const AGENT_RUN_MAX_MEMORY_PROMOTIONS: usize = 16;
+
+/// The bounded receipt of one settled memory promotion: which effect promoted,
+/// and the identities and revisions the store now holds — never content
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentMemoryPromotionRecord {
+    /// The promotion effect the receipt settles.
+    pub effect_id: AgentEffectId,
+    /// The memories the promotion wrote or converged on.
+    pub promoted: Vec<AgentPromotedMemoryRef>,
+    /// When the receipt was recorded.
+    pub recorded_at: AgentTimestampMillis,
+}
 
 /// Where one run stands in its durable loop
 /// ([specification 9.4](../../../docs/plans/rakka-agent/spec.md)).
@@ -346,6 +368,14 @@ pub struct AgentLoopState {
     /// requires of telemetry loss.
     #[serde(default, skip_serializing_if = "is_zero")]
     decision_drops: u64,
+    /// Bounded receipts of settled memory promotions
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// identities and revisions only, never content. A ring capped at
+    /// [`AGENT_RUN_MAX_MEMORY_PROMOTIONS`]; the private store is the source of
+    /// truth, so overflow drops the oldest receipt. A loop state persisted
+    /// before this field decodes to the empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_promotions: Vec<AgentMemoryPromotionRecord>,
 }
 
 /// Whether a defaulted count is zero, so it is omitted from a run's serialized
@@ -394,6 +424,7 @@ impl AgentLoopState {
             decision_outbox: Vec::new(),
             decision_sequence: 0,
             decision_drops: 0,
+            memory_promotions: Vec::new(),
         }
     }
 
@@ -961,6 +992,53 @@ impl AgentLoopState {
     #[must_use]
     pub fn session_outbox_headroom(&self) -> usize {
         AGENT_RUN_SESSION_OUTBOX_CAPACITY.saturating_sub(self.session_outbox.len())
+    }
+
+    /// The highest session-memory sequence this run has durably assigned.
+    ///
+    /// A promotion may only select sequences at or below it: an entry with a
+    /// sequence is either already in the store or owed by the outbox the
+    /// settle pass flushes before dispatching effects.
+    #[must_use]
+    pub const fn session_sequence(&self) -> u64 {
+        self.session_sequence
+    }
+
+    /// Bounded receipts of the run's settled memory promotions, newest last.
+    #[must_use]
+    pub fn memory_promotions(&self) -> &[AgentMemoryPromotionRecord] {
+        &self.memory_promotions
+    }
+
+    /// Records the bounded receipt of one settled memory promotion, returning
+    /// whether it was newly recorded.
+    ///
+    /// Idempotent on the effect id, so a redelivered result records one
+    /// receipt; a receipt past [`AGENT_RUN_MAX_MEMORY_PROMOTIONS`] drops the
+    /// oldest, because the private store — not this list — is the source of
+    /// truth for what a promotion wrote.
+    pub(crate) fn record_memory_promotion(
+        &mut self,
+        effect_id: AgentEffectId,
+        promoted: Vec<AgentPromotedMemoryRef>,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        if self
+            .memory_promotions
+            .iter()
+            .any(|receipt| receipt.effect_id == effect_id)
+        {
+            return false;
+        }
+        self.memory_promotions.push(AgentMemoryPromotionRecord {
+            effect_id,
+            promoted,
+            recorded_at: now,
+        });
+        if self.memory_promotions.len() > AGENT_RUN_MAX_MEMORY_PROMOTIONS {
+            self.memory_promotions.remove(0);
+        }
+        true
     }
 
     /// Records the current turn — the assistant turn and every tool result it

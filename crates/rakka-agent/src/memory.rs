@@ -59,7 +59,7 @@ use crate::identity::{validated_id, AgentIdentityResult, AgentRunScope, AgentSco
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
-    CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION,
+    CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION, CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION,
 };
 use crate::task::{AgentContentDigest, AgentTaskContent};
 
@@ -223,6 +223,22 @@ impl MemoryOperationId {
         discriminator: impl AsRef<str>,
     ) -> AgentIdentityResult<Self> {
         let input = format!("op|{}|{}", scope.key(), discriminator.as_ref());
+        let digest = AgentContentDigest::of_bytes(input.as_bytes());
+        Self::new(format!("mem-op-{}", digest.value))
+    }
+
+    /// Derives an agent-scoped operation key for a private-memory write no
+    /// single run owns — a tombstone, a deletion, an administrative
+    /// consolidation ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The `agent-op` salt keeps this derivation domain disjoint from the
+    /// run-scoped `op` domain above, so no discriminator, however adversarial,
+    /// can make an agent-scoped key collide with a run-scoped one.
+    pub fn derive_for_agent(
+        scope: &AgentScope,
+        discriminator: impl AsRef<str>,
+    ) -> AgentIdentityResult<Self> {
+        let input = format!("agent-op|{}|{}", scope.key(), discriminator.as_ref());
         let digest = AgentContentDigest::of_bytes(input.as_bytes());
         Self::new(format!("mem-op-{}", digest.value))
     }
@@ -552,6 +568,96 @@ pub struct SessionMemoryPage {
     pub next: Option<SessionMemoryCursor>,
 }
 
+/// Tenant-configurable retention of a terminal run's session records
+/// (open decision 7, [specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The policy is deployment configuration — owned per tenant and passed to
+/// each purge call, never stored per row — because retention is evaluated at
+/// sweep time, and a policy frozen into the row at write time could never
+/// tighten. What is durable is the rows themselves and the run's terminal
+/// timestamp; the store's job is to enforce the hold and the due time
+/// *inside* the call, so no sweep can forget them. Export is the ordinary
+/// bounded cursor read, taken before the purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRetentionPolicy {
+    retain_for_millis: u64,
+    legal_hold: bool,
+}
+
+impl SessionRetentionPolicy {
+    /// The bounded default retention after a terminal run: 30 days.
+    pub const DEFAULT_RETAIN_FOR_MILLIS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+    /// The bounded default policy: 30 days, no hold.
+    #[must_use]
+    pub const fn bounded_default() -> Self {
+        Self {
+            retain_for_millis: Self::DEFAULT_RETAIN_FOR_MILLIS,
+            legal_hold: false,
+        }
+    }
+
+    /// Sets how long a terminal run's records are retained.
+    #[must_use]
+    pub const fn with_retain_for_millis(mut self, millis: u64) -> Self {
+        self.retain_for_millis = millis;
+        self
+    }
+
+    /// Places or lifts a legal hold. A held run's records survive every purge.
+    #[must_use]
+    pub const fn with_legal_hold(mut self, hold: bool) -> Self {
+        self.legal_hold = hold;
+        self
+    }
+
+    /// How long a terminal run's records are retained, in milliseconds.
+    #[must_use]
+    pub const fn retain_for_millis(self) -> u64 {
+        self.retain_for_millis
+    }
+
+    /// Whether a legal hold is in force.
+    #[must_use]
+    pub const fn legal_hold(self) -> bool {
+        self.legal_hold
+    }
+
+    /// The instant a run that went terminal at `terminal_at` becomes purgeable.
+    #[must_use]
+    pub const fn purge_due_at(self, terminal_at: AgentTimestampMillis) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(
+            terminal_at
+                .as_millis()
+                .saturating_add(self.retain_for_millis),
+        )
+    }
+}
+
+impl Default for SessionRetentionPolicy {
+    fn default() -> Self {
+        Self::bounded_default()
+    }
+}
+
+/// What one terminal-run purge call did.
+///
+/// Held and not-yet-due are values, not errors, so a fleet sweep over many
+/// runs reports what it skipped instead of aborting on the first held run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPurgeOutcome {
+    /// The run's records were deleted; a replay purges nothing and reports
+    /// zero.
+    Purged {
+        /// How many records this call removed.
+        entries: u64,
+    },
+    /// A legal hold is in force; nothing was deleted.
+    Held,
+    /// The retention window has not elapsed; nothing was deleted.
+    NotYetDue,
+}
+
 /// The future a [`SessionMemoryStore`] or [`ContextSnapshotStore`] operation
 /// returns.
 pub type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MemoryError>> + Send + 'a>>;
@@ -594,6 +700,23 @@ pub trait SessionMemoryStore: Send + Sync + 'static {
         scope: &'a AgentRunScope,
         cursor: SessionMemoryCursor,
     ) -> MemoryFuture<'a, SessionMemoryPage>;
+
+    /// Deletes a terminal run's session entries once its retention has
+    /// elapsed, honoring the policy's legal hold (open decision 7,
+    /// [specification 13.2](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The caller supplies the run's durable terminal timestamp; the store
+    /// enforces the hold and the due time inside the call, so no sweep can
+    /// forget them. The purge is idempotent — a replay finds nothing left and
+    /// reports zero — and it is a bounded, deployment-invoked operation,
+    /// never a resident sweeper.
+    fn purge_run<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        policy: &'a SessionRetentionPolicy,
+        terminal_at: AgentTimestampMillis,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, SessionPurgeOutcome>;
 }
 
 /// An in-memory session-memory store, for tests and single-process deployments.
@@ -723,6 +846,35 @@ impl SessionMemoryStore for InMemorySessionMemoryStore {
                 entries: page,
                 next,
             })
+        })
+    }
+
+    fn purge_run<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        policy: &'a SessionRetentionPolicy,
+        terminal_at: AgentTimestampMillis,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, SessionPurgeOutcome> {
+        Box::pin(async move {
+            if policy.legal_hold() {
+                return Ok(SessionPurgeOutcome::Held);
+            }
+            if now < policy.purge_due_at(terminal_at) {
+                return Ok(SessionPurgeOutcome::NotYetDue);
+            }
+            let key = scope.key();
+            let mut operations = self
+                .operations
+                .lock()
+                .expect("the session store should not be poisoned");
+            let mut entries = self
+                .entries
+                .lock()
+                .expect("the session store should not be poisoned");
+            let removed = entries.remove(&key).map_or(0, |run| run.len() as u64);
+            operations.remove(&key);
+            Ok(SessionPurgeOutcome::Purged { entries: removed })
         })
     }
 }
@@ -975,6 +1127,23 @@ pub trait ContextSnapshotStore: Send + Sync + 'static {
         scope: &'a AgentRunScope,
         reference: &'a AgentContextSnapshotRef,
     ) -> MemoryFuture<'a, Option<MemoryContextSnapshot>>;
+
+    /// Deletes a terminal run's snapshots once its retention has elapsed,
+    /// honoring the policy's legal hold (open decision 7).
+    ///
+    /// Snapshots embed copies of the session entries they were assembled
+    /// from, so discharging a run's retention means purging its snapshots
+    /// alongside its session rows — one without the other would keep the
+    /// content the policy said to delete. Same contract as
+    /// [`SessionMemoryStore::purge_run`]: bounded, idempotent,
+    /// deployment-invoked.
+    fn purge_run<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        policy: &'a SessionRetentionPolicy,
+        terminal_at: AgentTimestampMillis,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, SessionPurgeOutcome>;
 }
 
 /// An in-memory snapshot store, for tests and single-process deployments.
@@ -1044,6 +1213,31 @@ impl ContextSnapshotStore for InMemoryContextSnapshotStore {
                 .get(&scope.key())
                 .and_then(|run| run.get(reference.snapshot_id.as_str()))
                 .cloned())
+        })
+    }
+
+    fn purge_run<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        policy: &'a SessionRetentionPolicy,
+        terminal_at: AgentTimestampMillis,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, SessionPurgeOutcome> {
+        Box::pin(async move {
+            if policy.legal_hold() {
+                return Ok(SessionPurgeOutcome::Held);
+            }
+            if now < policy.purge_due_at(terminal_at) {
+                return Ok(SessionPurgeOutcome::NotYetDue);
+            }
+            let mut snapshots = self
+                .snapshots
+                .lock()
+                .expect("the snapshot store should not be poisoned");
+            let removed = snapshots
+                .remove(&scope.key())
+                .map_or(0, |run| run.len() as u64);
+            Ok(SessionPurgeOutcome::Purged { entries: removed })
         })
     }
 }
@@ -1201,8 +1395,22 @@ pub async fn assemble_session_context(
 }
 
 // ===========================================================================
-// Agent-private long-term memory ([specification 13.3]) — interface only.
+// Agent-private long-term memory ([specification 13.3]).
 // ===========================================================================
+
+/// Largest inline private-memory content, in serialized bytes.
+///
+/// Its own bound, separate from [`AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES`], so
+/// the two can evolve independently; larger content belongs behind an
+/// immutable artifact reference
+/// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)).
+pub const AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES: usize = 8 * 1024;
+
+/// Largest page one private-memory list returns.
+pub const AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES: usize = 64;
+
+/// Longest embedding-model name recorded in embedding metadata.
+pub const AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH: usize = 128;
 
 validated_id! {
     /// Stable identity of one agent-private long-term memory
@@ -1226,64 +1434,1054 @@ pub enum AgentPrivateMemoryKind {
     Application,
 }
 
+impl AgentPrivateMemoryKind {
+    /// Stable kebab-case label for errors, logs, and derived identities.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Episodic => "episodic",
+            Self::Preference => "preference",
+            Self::Application => "application",
+        }
+    }
+}
+
+impl Display for AgentPrivateMemoryKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// Provenance of one private memory
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md): source
+/// run/effect/entry references).
+///
+/// Provenance only, never authority: recording the run that originated a
+/// memory does not widen access to that run or to another agent. Every field
+/// is optional — a memory written administratively has no originating run —
+/// and the reference lengths are bounded by [`AgentPrivateMemory::validate`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPrivateMemorySource {
+    /// The run that originated the memory.
+    #[serde(default)]
+    pub run: Option<crate::identity::AgentRunId>,
+    /// The durable effect that promoted it.
+    #[serde(default)]
+    pub effect: Option<rakka_agent_workflow::AgentEffectId>,
+    /// The session entry it was promoted from.
+    #[serde(default)]
+    pub entry: Option<MemoryEntryId>,
+}
+
+/// Content-free embedding metadata
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Records which model, dimension count, and version produced a memory's
+/// derived vectors, so a rebuild is an explicit versioned change. The vectors
+/// themselves are rebuildable derived projections owned by the retrieval
+/// adapter (slice 2.2), never the only copy of the content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEmbeddingRef {
+    /// The embedding model that produced the vectors.
+    pub model: String,
+    /// The vector dimension count.
+    pub dimensions: u32,
+    /// The embedding pipeline version.
+    pub version: AgentRevisionNumber,
+}
+
+/// Retention state of one private memory
+/// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md),
+/// [13.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum MemoryRetention {
+    /// Retained until explicitly tombstoned or deleted.
+    Persistent,
+    /// Invisible to reads at and after the instant, and eligible for
+    /// [`AgentPrivateMemoryStore::purge_expired`].
+    ExpiresAt {
+        /// The expiry instant.
+        at: AgentTimestampMillis,
+    },
+}
+
+impl MemoryRetention {
+    /// The expiry instant, when one is set.
+    #[must_use]
+    pub const fn expires_at(self) -> Option<AgentTimestampMillis> {
+        match self {
+            Self::Persistent => None,
+            Self::ExpiresAt { at } => Some(at),
+        }
+    }
+
+    /// Whether the memory is expired at `now`.
+    ///
+    /// Expiry is a read-visibility and purge rule, enforced from the instant
+    /// itself: an expired-but-unpurged memory is already invisible, whether or
+    /// not a sweep has run.
+    #[must_use]
+    pub fn is_expired(self, now: AgentTimestampMillis) -> bool {
+        matches!(self, Self::ExpiresAt { at } if at <= now)
+    }
+}
+
+/// Why a memory was tombstoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum MemoryTombstoneReason {
+    /// A newer memory supersedes it.
+    Superseded,
+    /// Its owner or a policy withdrew it.
+    Retracted,
+    /// A retention or classification policy removed its content.
+    Policy,
+}
+
+impl MemoryTombstoneReason {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Superseded => "superseded",
+            Self::Retracted => "retracted",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+impl Display for MemoryTombstoneReason {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// Tombstone state: the auditable stub of a withdrawn memory
+/// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The record's digest and provenance remain — the withdrawal itself must
+/// stay visible to the owner — but the content bytes do not, the same rule
+/// [`MemoryClassification::Redacted`] applies to a session entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTombstone {
+    /// The idempotent operation that tombstoned the memory.
+    pub operation_id: MemoryOperationId,
+    /// Why it was tombstoned.
+    pub reason: MemoryTombstoneReason,
+    /// When it was tombstoned.
+    pub tombstoned_at: AgentTimestampMillis,
+}
+
+/// One promoted memory, as the bounded promotion receipt names it: identity
+/// and revision only, never content
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPromotedMemoryRef {
+    /// The private memory the promotion wrote or converged on.
+    pub memory_id: AgentPrivateMemoryId,
+    /// The revision the store holds after the promotion.
+    pub revision: AgentRevisionNumber,
+    /// The session entry the memory was promoted from.
+    pub source_entry: MemoryEntryId,
+}
+
 /// One agent-private long-term memory, scoped `(TenantId, AgentId)`
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// The record shape is fixed here so session and snapshot identities cannot bake
-/// in an incompatible scope; the stores that persist and retrieve it arrive in
-/// phase 2. The originating run is recorded as provenance but never broadens
-/// access to another agent, and embeddings are rebuildable derived projections,
-/// never the only copy of the content.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The originating run is recorded as provenance but never broadens access to
+/// another agent, and embeddings are rebuildable derived projections, never
+/// the only copy of the content. The fields are public so a store adapter can
+/// rebuild a record on load; [`Self::validate`] runs inside [`Self::new`] and
+/// on deserialization, so an out-of-bounds record can neither cross the wire
+/// nor load from a durable row.
+///
+/// The `revision` is the record's compare-and-set fence: a store stamps it —
+/// [`AgentRevisionNumber::INITIAL`] on create, the next revision on update —
+/// and an update that names a stale expected revision is refused rather than
+/// overwriting, which is what keeps concurrent runs of one agent from losing
+/// each other's writes (scenario 15).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentPrivateMemory {
+    schema_version: StateSchemaVersion,
     /// Stable identity of the memory.
     pub memory_id: AgentPrivateMemoryId,
-    /// The idempotent operation that created or last updated it.
+    /// The idempotent operation that created or last mutated it.
     pub operation_id: MemoryOperationId,
+    /// The compare-and-set revision the store stamps on every write.
+    pub revision: AgentRevisionNumber,
     /// The memory type.
     pub kind: AgentPrivateMemoryKind,
-    /// The bounded content or immutable artifact reference.
+    /// The bounded content or immutable artifact reference; the null inline
+    /// marker once tombstoned.
     pub content: AgentTaskContent,
-    /// A digest of the content.
+    /// A digest of the original content. It survives tombstoning, pinning
+    /// exactly what was withdrawn.
     pub content_digest: AgentContentDigest,
-    /// The run that originated the memory, as provenance only.
-    pub source_run: Option<String>,
+    /// Where the memory came from, as provenance only.
+    #[serde(default)]
+    pub source: AgentPrivateMemorySource,
     /// A confidence score in basis points (0-10000).
     pub confidence_bps: u16,
     /// The classification of the content.
     pub classification: MemoryClassification,
+    /// Embedding metadata, when the memory has been embedded.
+    #[serde(default)]
+    pub embedding: Option<MemoryEmbeddingRef>,
+    /// The retention state.
+    pub retention: MemoryRetention,
+    /// The tombstone state, once the memory has been withdrawn.
+    #[serde(default)]
+    pub tombstone: Option<MemoryTombstone>,
+    /// The policy in force when the memory was written.
+    #[serde(default)]
+    pub policy: Option<crate::definition::AgentPolicyRef>,
+    /// An audit-trail reference.
+    #[serde(default)]
+    pub audit: Option<rakka_agent_workflow::AgentAuditEventId>,
     /// When the memory was created.
     pub created_at: AgentTimestampMillis,
     /// When the memory was last updated.
     pub updated_at: AgentTimestampMillis,
 }
 
+impl AgentPrivateMemory {
+    /// Builds a private memory with the default provenance, persistent
+    /// retention, and no embedding, policy, or audit reference.
+    pub fn new(
+        memory_id: AgentPrivateMemoryId,
+        operation_id: MemoryOperationId,
+        kind: AgentPrivateMemoryKind,
+        content: AgentTaskContent,
+        confidence_bps: u16,
+        classification: MemoryClassification,
+        created_at: AgentTimestampMillis,
+    ) -> Result<Self, MemoryError> {
+        let content_digest = content.digest();
+        let memory = Self {
+            schema_version: CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION,
+            memory_id,
+            operation_id,
+            revision: AgentRevisionNumber::INITIAL,
+            kind,
+            content,
+            content_digest,
+            source: AgentPrivateMemorySource::default(),
+            confidence_bps,
+            classification,
+            embedding: None,
+            retention: MemoryRetention::Persistent,
+            tombstone: None,
+            policy: None,
+            audit: None,
+            created_at,
+            updated_at: created_at,
+        };
+        memory.validate()?;
+        Ok(memory)
+    }
+
+    /// The content an already-tombstoned record carries: the null inline
+    /// marker, so a tombstone provably holds no bytes.
+    #[must_use]
+    pub fn tombstone_content() -> AgentTaskContent {
+        AgentTaskContent::Inline(serde_json::Value::Null)
+    }
+
+    /// Sets the provenance.
+    #[must_use]
+    pub fn with_source(mut self, source: AgentPrivateMemorySource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Sets the retention state.
+    #[must_use]
+    pub fn with_retention(mut self, retention: MemoryRetention) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// Sets the policy reference.
+    #[must_use]
+    pub fn with_policy(mut self, policy: crate::definition::AgentPolicyRef) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Sets the audit reference, re-validating its bound.
+    pub fn with_audit(
+        mut self,
+        audit: rakka_agent_workflow::AgentAuditEventId,
+    ) -> Result<Self, MemoryError> {
+        self.audit = Some(audit);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Sets the embedding metadata, re-validating its bounds.
+    pub fn with_embedding(mut self, embedding: MemoryEmbeddingRef) -> Result<Self, MemoryError> {
+        self.embedding = Some(embedding);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Whether the memory has been withdrawn.
+    #[must_use]
+    pub const fn is_tombstoned(&self) -> bool {
+        self.tombstone.is_some()
+    }
+
+    /// Whether the memory is expired at `now`.
+    #[must_use]
+    pub fn is_expired(&self, now: AgentTimestampMillis) -> bool {
+        self.retention.is_expired(now)
+    }
+
+    /// Rejects a record that exceeds any of its bounds, and a tombstoned
+    /// record that still carries content.
+    pub fn validate(&self) -> Result<(), MemoryError> {
+        if let Some(value) = self.content.inline_value() {
+            let bytes = serde_json::to_vec(value)
+                .map_err(|error| MemoryError::Encoding {
+                    message: error.to_string(),
+                })?
+                .len();
+            if bytes > AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES {
+                return Err(MemoryError::EntryTooLarge {
+                    bytes,
+                    maximum: AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES,
+                });
+            }
+        }
+        if self.confidence_bps > 10_000 {
+            return Err(MemoryError::ConfidenceOutOfRange {
+                confidence_bps: self.confidence_bps,
+            });
+        }
+        if let Some(effect) = &self.source.effect {
+            check_reference_bound("source.effect", effect.as_str())?;
+        }
+        if let Some(audit) = &self.audit {
+            check_reference_bound("audit", audit.as_str())?;
+        }
+        if let Some(embedding) = &self.embedding {
+            if embedding.model.is_empty()
+                || embedding.model.len() > AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH
+                || embedding.dimensions == 0
+            {
+                return Err(MemoryError::InvalidEmbeddingRef {
+                    message: format!(
+                        "the embedding model must be non-empty and at most \
+                         {AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH} bytes, and the dimension \
+                         count at least one; got model of {} bytes and {} dimensions",
+                        embedding.model.len(),
+                        embedding.dimensions
+                    ),
+                });
+            }
+        }
+        if self.tombstone.is_some() && self.content != Self::tombstone_content() {
+            return Err(MemoryError::TombstoneCarriesContent {
+                memory_id: self.memory_id.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Rejects an unbounded external reference on a private-memory record.
+fn check_reference_bound(field: &'static str, value: &str) -> Result<(), MemoryError> {
+    if value.len() > crate::identity::AGENT_IDENTITY_MAX_LENGTH {
+        return Err(MemoryError::ReferenceTooLong {
+            field,
+            length: value.len(),
+            maximum: crate::identity::AGENT_IDENTITY_MAX_LENGTH,
+        });
+    }
+    Ok(())
+}
+
+impl VersionedAgentRecord for AgentPrivateMemory {
+    const RECORD_KIND: AgentRecordKind = AgentRecordKind::PrivateMemory;
+
+    fn schema_version(&self) -> StateSchemaVersion {
+        self.schema_version
+    }
+}
+
+/// The wire and durable shape of [`AgentPrivateMemory`], validated on load.
+#[derive(Deserialize)]
+struct AgentPrivateMemoryRecord {
+    schema_version: StateSchemaVersion,
+    memory_id: AgentPrivateMemoryId,
+    operation_id: MemoryOperationId,
+    revision: AgentRevisionNumber,
+    kind: AgentPrivateMemoryKind,
+    content: AgentTaskContent,
+    content_digest: AgentContentDigest,
+    #[serde(default)]
+    source: AgentPrivateMemorySource,
+    confidence_bps: u16,
+    classification: MemoryClassification,
+    #[serde(default)]
+    embedding: Option<MemoryEmbeddingRef>,
+    retention: MemoryRetention,
+    #[serde(default)]
+    tombstone: Option<MemoryTombstone>,
+    #[serde(default)]
+    policy: Option<crate::definition::AgentPolicyRef>,
+    #[serde(default)]
+    audit: Option<rakka_agent_workflow::AgentAuditEventId>,
+    created_at: AgentTimestampMillis,
+    updated_at: AgentTimestampMillis,
+}
+
+impl<'de> Deserialize<'de> for AgentPrivateMemory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let record = AgentPrivateMemoryRecord::deserialize(deserializer)?;
+        let memory = Self {
+            schema_version: record.schema_version,
+            memory_id: record.memory_id,
+            operation_id: record.operation_id,
+            revision: record.revision,
+            kind: record.kind,
+            content: record.content,
+            content_digest: record.content_digest,
+            source: record.source,
+            confidence_bps: record.confidence_bps,
+            classification: record.classification,
+            embedding: record.embedding,
+            retention: record.retention,
+            tombstone: record.tombstone,
+            policy: record.policy,
+            audit: record.audit,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        };
+        memory.validate().map_err(serde::de::Error::custom)?;
+        Ok(memory)
+    }
+}
+
+impl AgentPrivateMemoryId {
+    /// Derives the stable identity of the private memory one session entry
+    /// promotes into ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The derivation is pure over the agent scope, the source entry, and the
+    /// kind: any node, any attempt, any generation — and any *second*
+    /// promotion of the same entry — resolves to the same memory, so replay
+    /// converges instead of duplicating. Two runs of one agent never collide,
+    /// because an entry id embeds its run scope's digest; two agents never
+    /// collide, because the agent scope's injective key is part of the input.
+    pub fn derive_promoted(
+        scope: &AgentScope,
+        source_entry: &MemoryEntryId,
+        kind: AgentPrivateMemoryKind,
+    ) -> AgentIdentityResult<Self> {
+        let input = format!(
+            "private|{}|{}|{}",
+            scope.key(),
+            kind.as_label(),
+            source_entry
+        );
+        let digest = AgentContentDigest::of_bytes(input.as_bytes());
+        Self::new(format!("mem-private-{}", digest.value))
+    }
+}
+
+/// What an upsert expects to find, making a blind overwrite unrepresentable
+/// (open decision 1, [specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateMemoryExpectation {
+    /// The memory must not exist: a create.
+    Absent,
+    /// The memory must exist at exactly this revision: a compare-and-set
+    /// update. Consolidation targets an existing memory this way.
+    Revision(AgentRevisionNumber),
+}
+
+/// A bounded read cursor over one agent's private memories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateMemoryCursor {
+    after: Option<AgentPrivateMemoryId>,
+    limit: usize,
+    include_tombstoned: bool,
+}
+
+impl PrivateMemoryCursor {
+    /// The default page size a list returns when none is requested.
+    pub const DEFAULT_LIMIT: usize = 32;
+
+    /// A cursor over the memories with the lowest identities, from the start.
+    #[must_use]
+    pub const fn start() -> Self {
+        Self {
+            after: None,
+            limit: Self::DEFAULT_LIMIT,
+            include_tombstoned: false,
+        }
+    }
+
+    /// A cursor over the memories after `memory_id`.
+    #[must_use]
+    pub const fn after(memory_id: AgentPrivateMemoryId) -> Self {
+        Self {
+            after: Some(memory_id),
+            limit: Self::DEFAULT_LIMIT,
+            include_tombstoned: false,
+        }
+    }
+
+    /// Sets the page size, clamped to [`AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES`].
+    #[must_use]
+    pub const fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = if limit > AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES {
+            AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES
+        } else if limit == 0 {
+            1
+        } else {
+            limit
+        };
+        self
+    }
+
+    /// Includes tombstoned stubs in the page, for audit listings.
+    #[must_use]
+    pub const fn include_tombstoned(mut self) -> Self {
+        self.include_tombstoned = true;
+        self
+    }
+
+    /// The identity this cursor reads after, when it is not at the start.
+    #[must_use]
+    pub const fn position(&self) -> Option<&AgentPrivateMemoryId> {
+        self.after.as_ref()
+    }
+
+    /// The page size.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Whether tombstoned stubs are included.
+    #[must_use]
+    pub const fn tombstoned_included(&self) -> bool {
+        self.include_tombstoned
+    }
+}
+
+impl Default for PrivateMemoryCursor {
+    fn default() -> Self {
+        Self::start()
+    }
+}
+
+/// One bounded page of private memories, in ascending identity order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrivateMemoryPage {
+    /// The memories in this page.
+    pub memories: Vec<AgentPrivateMemory>,
+    /// The cursor for the next page, when more remain.
+    pub next: Option<PrivateMemoryCursor>,
+}
+
+/// A request to tombstone one private memory: withdraw its content while
+/// keeping the auditable stub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateMemoryTombstoneRequest {
+    /// The memory to tombstone.
+    pub memory_id: AgentPrivateMemoryId,
+    /// The idempotent operation id of this tombstone.
+    pub operation_id: MemoryOperationId,
+    /// Why it is being tombstoned.
+    pub reason: MemoryTombstoneReason,
+    /// When it is being tombstoned.
+    pub tombstoned_at: AgentTimestampMillis,
+}
+
+/// A request to delete one private memory entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateMemoryDeleteRequest {
+    /// The memory to delete.
+    pub memory_id: AgentPrivateMemoryId,
+    /// The idempotent operation id of this deletion.
+    pub operation_id: MemoryOperationId,
+}
+
 /// The durable agent-private long-term memory store, scoped `(TenantId, AgentId)`
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// Declared here — with no implementation — so the ownership scope is fixed
-/// before session and snapshot identities depend on it. Promotion,
-/// consolidation, and demotion from short-term memory are idempotent durable
-/// effects, so an append is idempotent on its operation id. Phase 2 delivers the
-/// PostgreSQL and `pgvector` implementations.
+/// Every method addresses the explicit scope, and the scope is the isolation
+/// boundary: a read under the wrong scope answers exactly as if the memory
+/// never existed — `None`, or an empty page — so an unauthorized caller
+/// learns nothing, not even existence (scenario 18,
+/// [specification 13.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Writes follow open decision 1: a create is idempotent on its operation id
+/// — a replay returns the original logical result recorded in the store's
+/// operation ledger, even when later operations have since moved the record —
+/// and an update is a compare-and-set on an expected revision, so a stale
+/// writer is refused rather than overwriting (scenario 15). A deletion erases
+/// the ledger's payloads for the memory, so no replayed operation can
+/// resurrect deleted content: such a replay fails closed as
+/// [`MemoryError::OperationErased`].
+///
+/// The trait is object-safe so callers hold `Arc<dyn AgentPrivateMemoryStore>`;
+/// the in-memory implementation lives here and the PostgreSQL one in
+/// `rakka-agent-postgres`. Vector retrieval is the slice 2.2 adapter; this
+/// store owns the authoritative records.
 pub trait AgentPrivateMemoryStore: Send + Sync + 'static {
     /// Stable backend name, used in telemetry.
     fn backend_name(&self) -> &'static str;
 
-    /// Appends or updates one private memory, idempotently on its operation id.
+    /// Creates or compare-and-set-updates one private memory, idempotently on
+    /// its operation id.
+    ///
+    /// The store stamps the stored revision itself —
+    /// [`AgentRevisionNumber::INITIAL`] on a create, the expectation's next
+    /// revision on an update — and returns the record it now holds. A create
+    /// over an existing memory fails with [`MemoryError::AlreadyExists`]; an
+    /// update of an absent or out-of-scope memory with
+    /// [`MemoryError::NotFound`] (indistinguishable, deliberately); an update
+    /// of a tombstoned memory with [`MemoryError::Tombstoned`]; a stale
+    /// expected revision with [`MemoryError::RevisionConflict`].
     fn upsert<'a>(
         &'a self,
         scope: &'a AgentScope,
         memory: &'a AgentPrivateMemory,
+        expected: PrivateMemoryExpectation,
     ) -> MemoryFuture<'a, AgentPrivateMemory>;
 
-    /// Loads one private memory by identity, if the caller is authorized and it
-    /// exists.
+    /// Loads one private memory by identity.
+    ///
+    /// Out-of-scope and expired memories answer `None`, exactly like absent
+    /// ones; a tombstoned memory answers its content-free stub, because the
+    /// withdrawal itself must stay visible to the owner.
     fn get<'a>(
         &'a self,
         scope: &'a AgentScope,
         memory_id: &'a AgentPrivateMemoryId,
+        now: AgentTimestampMillis,
     ) -> MemoryFuture<'a, Option<AgentPrivateMemory>>;
+
+    /// Lists one bounded page of the agent's memories, ascending by identity.
+    ///
+    /// Expired memories are excluded; tombstoned stubs are excluded unless the
+    /// cursor opts in via [`PrivateMemoryCursor::include_tombstoned`].
+    fn list<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        cursor: PrivateMemoryCursor,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, PrivateMemoryPage>;
+
+    /// Withdraws one memory's content, keeping the auditable stub, idempotently
+    /// on the request's operation id.
+    ///
+    /// The stub keeps the identity, digest, and provenance, carries the
+    /// tombstone state, and takes the next revision; the store erases its
+    /// ledger's earlier content payloads for the memory, so no replay can
+    /// recover the withdrawn bytes. Tombstoning an already-tombstoned memory
+    /// under a different operation fails with [`MemoryError::Tombstoned`].
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        request: &'a PrivateMemoryTombstoneRequest,
+    ) -> MemoryFuture<'a, AgentPrivateMemory>;
+
+    /// Deletes one memory entirely, idempotently on the request's operation id.
+    ///
+    /// The row and every ledger content payload for the memory are removed;
+    /// the deletion records its own content-free success marker, so a replay
+    /// answers success while a replayed *earlier* write fails closed as
+    /// [`MemoryError::OperationErased`]. Deleting an absent or out-of-scope
+    /// memory fails with [`MemoryError::NotFound`], indistinguishably.
+    fn delete<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        request: &'a PrivateMemoryDeleteRequest,
+    ) -> MemoryFuture<'a, ()>;
+
+    /// Hard-deletes up to `limit` expired memories, returning how many were
+    /// removed.
+    ///
+    /// Bounded and idempotent: a deployment invokes it repeatedly until it
+    /// returns zero, on its own schedule — there is no resident sweeper, and
+    /// expiry already hides the rows from reads whether or not a sweep has
+    /// run.
+    fn purge_expired<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        now: AgentTimestampMillis,
+        limit: usize,
+    ) -> MemoryFuture<'a, u64>;
+}
+
+/// One entry in the in-memory store's operation ledger.
+///
+/// The ledger is what makes a replay answer with the *original* logical
+/// result, and what makes deletion final: erasing a payload turns the replay
+/// of the operation that wrote it into a fail-closed refusal instead of a
+/// resurrection.
+#[derive(Debug, Clone)]
+enum PrivateMemoryLedgerEntry {
+    /// The operation applied; this is the record it returned.
+    Applied(Box<AgentPrivateMemory>),
+    /// The operation was a deletion; a replay answers success with no payload.
+    Deleted,
+    /// The operation's payload was erased by a later deletion or purge.
+    Erased,
+}
+
+/// An in-memory private-memory store, for tests and single-process
+/// deployments.
+///
+/// It implements the exact write table the trait documents — operation-ledger
+/// replays, compare-and-set updates, tombstone and delete erasure — under one
+/// mutex, so the contract tests that run against it and against the
+/// PostgreSQL adapter prove the same semantics.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryAgentPrivateMemoryStore {
+    memories: Arc<Mutex<BTreeMap<String, BTreeMap<String, AgentPrivateMemory>>>>,
+    operations: Arc<Mutex<BTreeMap<String, BTreeMap<String, PrivateMemoryLedgerEntry>>>>,
+}
+
+impl InMemoryAgentPrivateMemoryStore {
+    /// Creates an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many memories one agent holds, tombstoned stubs included.
+    #[must_use]
+    pub fn len(&self, scope: &AgentScope) -> usize {
+        self.memories
+            .lock()
+            .expect("the private memory store should not be poisoned")
+            .get(&scope.key())
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// Whether one agent holds no memories.
+    #[must_use]
+    pub fn is_empty(&self, scope: &AgentScope) -> bool {
+        self.len(scope) == 0
+    }
+
+    /// Rewrites every applied payload for `memory_id` to erased, so no
+    /// replayed write can resurrect deleted or withdrawn content.
+    fn erase_payloads(
+        operations: &mut BTreeMap<String, PrivateMemoryLedgerEntry>,
+        memory_id: &AgentPrivateMemoryId,
+    ) {
+        for entry in operations.values_mut() {
+            if matches!(entry, PrivateMemoryLedgerEntry::Applied(memory) if memory.memory_id == *memory_id)
+            {
+                *entry = PrivateMemoryLedgerEntry::Erased;
+            }
+        }
+    }
+}
+
+impl AgentPrivateMemoryStore for InMemoryAgentPrivateMemoryStore {
+    fn backend_name(&self) -> &'static str {
+        "in-memory"
+    }
+
+    fn upsert<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        memory: &'a AgentPrivateMemory,
+        expected: PrivateMemoryExpectation,
+    ) -> MemoryFuture<'a, AgentPrivateMemory> {
+        Box::pin(async move {
+            let key = scope.key();
+            let mut operations = self
+                .operations
+                .lock()
+                .expect("the private memory store should not be poisoned");
+            let mut memories = self
+                .memories
+                .lock()
+                .expect("the private memory store should not be poisoned");
+
+            let op_key = memory.operation_id.as_str().to_string();
+            if let Some(entry) = operations.get(&key).and_then(|ops| ops.get(&op_key)) {
+                return match entry {
+                    PrivateMemoryLedgerEntry::Applied(original) => Ok(original.as_ref().clone()),
+                    PrivateMemoryLedgerEntry::Deleted | PrivateMemoryLedgerEntry::Erased => {
+                        Err(MemoryError::OperationErased {
+                            operation_id: memory.operation_id.clone(),
+                        })
+                    }
+                };
+            }
+
+            let agent = memories.entry(key.clone()).or_default();
+            let row_key = memory.memory_id.as_str().to_string();
+            let stored = match expected {
+                PrivateMemoryExpectation::Absent => {
+                    if agent.contains_key(&row_key) {
+                        return Err(MemoryError::AlreadyExists {
+                            memory_id: memory.memory_id.clone(),
+                        });
+                    }
+                    let mut stamped = memory.clone();
+                    stamped.revision = AgentRevisionNumber::INITIAL;
+                    agent.insert(row_key, stamped.clone());
+                    stamped
+                }
+                PrivateMemoryExpectation::Revision(expected_revision) => {
+                    let Some(current) = agent.get(&row_key) else {
+                        return Err(MemoryError::NotFound {
+                            memory_id: memory.memory_id.clone(),
+                        });
+                    };
+                    if current.is_tombstoned() {
+                        return Err(MemoryError::Tombstoned {
+                            memory_id: memory.memory_id.clone(),
+                        });
+                    }
+                    if current.revision != expected_revision {
+                        return Err(MemoryError::RevisionConflict {
+                            memory_id: memory.memory_id.clone(),
+                            expected: expected_revision,
+                            actual: current.revision,
+                        });
+                    }
+                    let mut stamped = memory.clone();
+                    stamped.revision = expected_revision.next();
+                    agent.insert(row_key, stamped.clone());
+                    stamped
+                }
+            };
+            operations.entry(key).or_default().insert(
+                op_key,
+                PrivateMemoryLedgerEntry::Applied(Box::new(stored.clone())),
+            );
+            Ok(stored)
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        memory_id: &'a AgentPrivateMemoryId,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, Option<AgentPrivateMemory>> {
+        Box::pin(async move {
+            let memories = self
+                .memories
+                .lock()
+                .expect("the private memory store should not be poisoned");
+            Ok(memories
+                .get(&scope.key())
+                .and_then(|agent| agent.get(memory_id.as_str()))
+                .filter(|memory| !memory.is_expired(now))
+                .cloned())
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        cursor: PrivateMemoryCursor,
+        now: AgentTimestampMillis,
+    ) -> MemoryFuture<'a, PrivateMemoryPage> {
+        Box::pin(async move {
+            let memories = self
+                .memories
+                .lock()
+                .expect("the private memory store should not be poisoned");
+            let Some(agent) = memories.get(&scope.key()) else {
+                return Ok(PrivateMemoryPage {
+                    memories: Vec::new(),
+                    next: None,
+                });
+            };
+
+            use std::ops::Bound;
+            let lower = cursor.position().map_or(Bound::Unbounded, |after| {
+                Bound::Excluded(after.as_str().to_string())
+            });
+            let mut page: Vec<AgentPrivateMemory> = agent
+                .range((lower, Bound::Unbounded))
+                .map(|(_, memory)| memory)
+                .filter(|memory| !memory.is_expired(now))
+                .filter(|memory| cursor.tombstoned_included() || !memory.is_tombstoned())
+                .take(cursor.limit() + 1)
+                .cloned()
+                .collect();
+
+            let next = (page.len() > cursor.limit())
+                .then(|| {
+                    page.pop();
+                    page.last().map(|memory| {
+                        let next = PrivateMemoryCursor::after(memory.memory_id.clone())
+                            .with_limit(cursor.limit());
+                        if cursor.tombstoned_included() {
+                            next.include_tombstoned()
+                        } else {
+                            next
+                        }
+                    })
+                })
+                .flatten();
+
+            Ok(PrivateMemoryPage {
+                memories: page,
+                next,
+            })
+        })
+    }
+
+    fn tombstone<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        request: &'a PrivateMemoryTombstoneRequest,
+    ) -> MemoryFuture<'a, AgentPrivateMemory> {
+        Box::pin(async move {
+            let key = scope.key();
+            let mut operations = self
+                .operations
+                .lock()
+                .expect("the private memory store should not be poisoned");
+            let mut memories = self
+                .memories
+                .lock()
+                .expect("the private memory store should not be poisoned");
+
+            let op_key = request.operation_id.as_str().to_string();
+            if let Some(entry) = operations.get(&key).and_then(|ops| ops.get(&op_key)) {
+                return match entry {
+                    PrivateMemoryLedgerEntry::Applied(original) => Ok(original.as_ref().clone()),
+                    PrivateMemoryLedgerEntry::Deleted | PrivateMemoryLedgerEntry::Erased => {
+                        Err(MemoryError::OperationErased {
+                            operation_id: request.operation_id.clone(),
+                        })
+                    }
+                };
+            }
+
+            let agent = memories.entry(key.clone()).or_default();
+            let row_key = request.memory_id.as_str().to_string();
+            let Some(current) = agent.get(&row_key) else {
+                return Err(MemoryError::NotFound {
+                    memory_id: request.memory_id.clone(),
+                });
+            };
+            if current.is_tombstoned() {
+                return Err(MemoryError::Tombstoned {
+                    memory_id: request.memory_id.clone(),
+                });
+            }
+
+            let mut stub = current.clone();
+            stub.content = AgentPrivateMemory::tombstone_content();
+            stub.tombstone = Some(MemoryTombstone {
+                operation_id: request.operation_id.clone(),
+                reason: request.reason,
+                tombstoned_at: request.tombstoned_at,
+            });
+            stub.operation_id = request.operation_id.clone();
+            stub.revision = current.revision.next();
+            stub.updated_at = request.tombstoned_at;
+            agent.insert(row_key, stub.clone());
+
+            let scope_ops = operations.entry(key).or_default();
+            InMemoryAgentPrivateMemoryStore::erase_payloads(scope_ops, &request.memory_id);
+            scope_ops.insert(
+                op_key,
+                PrivateMemoryLedgerEntry::Applied(Box::new(stub.clone())),
+            );
+            Ok(stub)
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        request: &'a PrivateMemoryDeleteRequest,
+    ) -> MemoryFuture<'a, ()> {
+        Box::pin(async move {
+            let key = scope.key();
+            let mut operations = self
+                .operations
+                .lock()
+                .expect("the private memory store should not be poisoned");
+            let mut memories = self
+                .memories
+                .lock()
+                .expect("the private memory store should not be poisoned");
+
+            let op_key = request.operation_id.as_str().to_string();
+            if let Some(entry) = operations.get(&key).and_then(|ops| ops.get(&op_key)) {
+                return match entry {
+                    PrivateMemoryLedgerEntry::Deleted => Ok(()),
+                    PrivateMemoryLedgerEntry::Applied(_) | PrivateMemoryLedgerEntry::Erased => {
+                        Err(MemoryError::OperationConflict {
+                            operation_id: request.operation_id.clone(),
+                        })
+                    }
+                };
+            }
+
+            let agent = memories.entry(key.clone()).or_default();
+            if agent.remove(request.memory_id.as_str()).is_none() {
+                return Err(MemoryError::NotFound {
+                    memory_id: request.memory_id.clone(),
+                });
+            }
+            let scope_ops = operations.entry(key).or_default();
+            InMemoryAgentPrivateMemoryStore::erase_payloads(scope_ops, &request.memory_id);
+            scope_ops.insert(op_key, PrivateMemoryLedgerEntry::Deleted);
+            Ok(())
+        })
+    }
+
+    fn purge_expired<'a>(
+        &'a self,
+        scope: &'a AgentScope,
+        now: AgentTimestampMillis,
+        limit: usize,
+    ) -> MemoryFuture<'a, u64> {
+        Box::pin(async move {
+            let key = scope.key();
+            let mut operations = self
+                .operations
+                .lock()
+                .expect("the private memory store should not be poisoned");
+            let mut memories = self
+                .memories
+                .lock()
+                .expect("the private memory store should not be poisoned");
+
+            let Some(agent) = memories.get_mut(&key) else {
+                return Ok(0);
+            };
+            let victims: Vec<AgentPrivateMemoryId> = agent
+                .values()
+                .filter(|memory| memory.is_expired(now))
+                .take(limit)
+                .map(|memory| memory.memory_id.clone())
+                .collect();
+            let scope_ops = operations.entry(key).or_default();
+            for memory_id in &victims {
+                agent.remove(memory_id.as_str());
+                InMemoryAgentPrivateMemoryStore::erase_payloads(scope_ops, memory_id);
+            }
+            Ok(victims.len() as u64)
+        })
+    }
 }
 
 // ===========================================================================
@@ -1305,6 +2503,7 @@ pub trait AgentPrivateMemoryStore: Send + Sync + 'static {
 pub struct AgentRunMemory {
     session: Arc<dyn SessionMemoryStore>,
     snapshots: Arc<dyn ContextSnapshotStore>,
+    private: Option<Arc<dyn AgentPrivateMemoryStore>>,
     window: SessionWindowPolicy,
 }
 
@@ -1318,6 +2517,7 @@ impl AgentRunMemory {
         Self {
             session,
             snapshots,
+            private: None,
             window: SessionWindowPolicy::recent_window(),
         }
     }
@@ -1326,6 +2526,19 @@ impl AgentRunMemory {
     #[must_use]
     pub fn with_window(mut self, window: SessionWindowPolicy) -> Self {
         self.window = window;
+        self
+    }
+
+    /// Wires the agent-private long-term store
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The run entity itself never touches it — transitions perform no I/O,
+    /// and promotion is executed dispatcher-side — but the bundle is where a
+    /// deployment names the agent's stores together, and the slice 2.2
+    /// retrieval path assembles snapshots from it.
+    #[must_use]
+    pub fn with_private_store(mut self, private: Arc<dyn AgentPrivateMemoryStore>) -> Self {
+        self.private = Some(private);
         self
     }
 
@@ -1346,6 +2559,12 @@ impl AgentRunMemory {
     pub const fn window(&self) -> &SessionWindowPolicy {
         &self.window
     }
+
+    /// The agent-private long-term store, when one is wired.
+    #[must_use]
+    pub fn private(&self) -> Option<&Arc<dyn AgentPrivateMemoryStore>> {
+        self.private.as_ref()
+    }
 }
 
 impl fmt::Debug for AgentRunMemory {
@@ -1353,6 +2572,13 @@ impl fmt::Debug for AgentRunMemory {
         f.debug_struct("AgentRunMemory")
             .field("session", &self.session.backend_name())
             .field("snapshots", &self.snapshots.backend_name())
+            .field(
+                "private",
+                &self
+                    .private
+                    .as_ref()
+                    .map_or("none", |store| store.backend_name()),
+            )
             .field("window", &self.window)
             .finish()
     }
@@ -1403,6 +2629,64 @@ pub enum MemoryError {
         /// The failure detail.
         message: String,
     },
+    /// A compare-and-set update named a stale revision; the write was refused
+    /// rather than overwriting a concurrent writer's memory.
+    RevisionConflict {
+        /// The contested memory.
+        memory_id: AgentPrivateMemoryId,
+        /// The revision the update expected.
+        expected: AgentRevisionNumber,
+        /// The revision the store holds.
+        actual: AgentRevisionNumber,
+    },
+    /// A create found the memory already present under a different operation.
+    AlreadyExists {
+        /// The already-present memory.
+        memory_id: AgentPrivateMemoryId,
+    },
+    /// The addressed memory does not exist in the caller's scope.
+    ///
+    /// Deliberately identical for absent and out-of-scope memories, so an
+    /// unauthorized caller learns nothing, not even existence.
+    NotFound {
+        /// The addressed memory.
+        memory_id: AgentPrivateMemoryId,
+    },
+    /// The addressed memory was withdrawn; a tombstone accepts no update.
+    Tombstoned {
+        /// The withdrawn memory.
+        memory_id: AgentPrivateMemoryId,
+    },
+    /// A replayed operation's payload was erased by a later deletion or
+    /// purge; the replay fails closed rather than resurrect deleted content.
+    OperationErased {
+        /// The replayed operation.
+        operation_id: MemoryOperationId,
+    },
+    /// A confidence score exceeded the 10000 basis-point bound.
+    ConfidenceOutOfRange {
+        /// The rejected score.
+        confidence_bps: u16,
+    },
+    /// An external reference on a private memory exceeded the identity bound.
+    ReferenceTooLong {
+        /// Which field carried the reference.
+        field: &'static str,
+        /// The rejected length, in bytes.
+        length: usize,
+        /// The maximum accepted length, in bytes.
+        maximum: usize,
+    },
+    /// Embedding metadata was structurally invalid.
+    InvalidEmbeddingRef {
+        /// What was invalid.
+        message: String,
+    },
+    /// A tombstoned record still carried content, which fails closed on load.
+    TombstoneCarriesContent {
+        /// The offending memory.
+        memory_id: AgentPrivateMemoryId,
+    },
 }
 
 impl MemoryError {
@@ -1417,6 +2701,15 @@ impl MemoryError {
             Self::OutboxOverflow { .. } => "memory-outbox-overflow",
             Self::Encoding { .. } => "memory-encoding-failed",
             Self::Backend { .. } => "memory-backend-failed",
+            Self::RevisionConflict { .. } => "memory-revision-conflict",
+            Self::AlreadyExists { .. } => "memory-already-exists",
+            Self::NotFound { .. } => "memory-not-found",
+            Self::Tombstoned { .. } => "memory-tombstoned",
+            Self::OperationErased { .. } => "memory-operation-erased",
+            Self::ConfidenceOutOfRange { .. } => "memory-confidence-out-of-range",
+            Self::ReferenceTooLong { .. } => "memory-reference-too-long",
+            Self::InvalidEmbeddingRef { .. } => "memory-embedding-invalid",
+            Self::TombstoneCarriesContent { .. } => "memory-tombstone-content",
         }
     }
 }
@@ -1447,6 +2740,52 @@ impl Display for MemoryError {
             Self::Backend { backend, message } => {
                 write!(f, "the {backend} memory backend failed: {message}")
             }
+            Self::RevisionConflict {
+                memory_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "private memory {memory_id} is at revision {actual}, not the expected {expected}; \
+                 the stale update was refused"
+            ),
+            Self::AlreadyExists { memory_id } => {
+                write!(f, "private memory {memory_id} already exists")
+            }
+            Self::NotFound { memory_id } => {
+                write!(f, "private memory {memory_id} does not exist in this scope")
+            }
+            Self::Tombstoned { memory_id } => {
+                write!(
+                    f,
+                    "private memory {memory_id} was withdrawn and accepts no update"
+                )
+            }
+            Self::OperationErased { operation_id } => write!(
+                f,
+                "memory operation {operation_id} was erased by a later deletion; \
+                 the replay fails closed rather than resurrect deleted content"
+            ),
+            Self::ConfidenceOutOfRange { confidence_bps } => write!(
+                f,
+                "the confidence score of {confidence_bps} basis points exceeds the 10000 bound"
+            ),
+            Self::ReferenceTooLong {
+                field,
+                length,
+                maximum,
+            } => write!(
+                f,
+                "the private memory reference {field} is {length} bytes, which exceeds the \
+                 {maximum} byte limit"
+            ),
+            Self::InvalidEmbeddingRef { message } => {
+                write!(f, "the embedding metadata is invalid: {message}")
+            }
+            Self::TombstoneCarriesContent { memory_id } => write!(
+                f,
+                "tombstoned private memory {memory_id} still carries content, which fails closed"
+            ),
         }
     }
 }
@@ -1465,6 +2804,14 @@ pub fn check_memory_schema(
     entry: &SessionMemoryEntry,
 ) -> Result<(), AgentSchemaError> {
     policy.check_record(entry)
+}
+
+/// Fails closed on a private memory this binary cannot interpret.
+pub fn check_private_memory_schema(
+    policy: &AgentSchemaPolicy,
+    memory: &AgentPrivateMemory,
+) -> Result<(), AgentSchemaError> {
+    policy.check_record(memory)
 }
 
 /// A convenience alias over the tenant and agent that own private memory.
@@ -1676,5 +3023,622 @@ mod tests {
             .expect("the snapshot exists");
         assert_eq!(loaded, stored);
         assert!(loaded.is_untrusted());
+    }
+
+    // =======================================================================
+    // Agent-private long-term memory (slice 2.1).
+    // =======================================================================
+
+    fn agent_scope(tenant: &str, agent: &str) -> AgentScope {
+        AgentScope::new(
+            TenantId::new(tenant),
+            AgentId::new(agent).expect("the agent id is valid"),
+        )
+        .expect("the scope is valid")
+    }
+
+    fn memory(scope: &AgentScope, slot: &str, at: u64) -> AgentPrivateMemory {
+        AgentPrivateMemory::new(
+            AgentPrivateMemoryId::new(format!("mem-{slot}")).expect("memory id"),
+            MemoryOperationId::derive_for_agent(scope, format!("write-{slot}-{at}"))
+                .expect("op id"),
+            AgentPrivateMemoryKind::Semantic,
+            AgentTaskContent::inline(serde_json::json!({ "slot": slot })).expect("content"),
+            9_000,
+            MemoryClassification::Unclassified,
+            AgentTimestampMillis::new(at),
+        )
+        .expect("the memory is bounded")
+    }
+
+    #[tokio::test]
+    async fn a_replayed_private_create_returns_the_original_without_a_second_memory() {
+        // Scenario 16, private half: replayed memory writes are idempotent.
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        let fact = memory(&scope, "fact", 10);
+
+        let a = store
+            .upsert(&scope, &fact, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("first create");
+        let b = store
+            .upsert(&scope, &fact, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("replayed create");
+        assert_eq!(a, b);
+        assert_eq!(a.revision, AgentRevisionNumber::INITIAL);
+        assert_eq!(store.len(&scope), 1);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_update_returns_its_own_result_even_after_later_updates() {
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        let fact = memory(&scope, "fact", 10);
+        let created = store
+            .upsert(&scope, &fact, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("create");
+
+        let mut second = memory(&scope, "fact", 20);
+        second.content = AgentTaskContent::inline(serde_json::json!({ "slot": "fact", "v": 2 }))
+            .expect("content");
+        let updated = store
+            .upsert(
+                &scope,
+                &second,
+                PrivateMemoryExpectation::Revision(created.revision),
+            )
+            .await
+            .expect("first update");
+        assert_eq!(updated.revision, created.revision.next());
+
+        let mut third = memory(&scope, "fact", 30);
+        third.content = AgentTaskContent::inline(serde_json::json!({ "slot": "fact", "v": 3 }))
+            .expect("content");
+        store
+            .upsert(
+                &scope,
+                &third,
+                PrivateMemoryExpectation::Revision(updated.revision),
+            )
+            .await
+            .expect("second update");
+
+        // The first update's replay answers with the first update's own
+        // result, not the record as the second update since left it.
+        let replayed = store
+            .upsert(
+                &scope,
+                &second,
+                PrivateMemoryExpectation::Revision(created.revision),
+            )
+            .await
+            .expect("replayed first update");
+        assert_eq!(replayed, updated);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cas_updates_admit_exactly_one_writer() {
+        // Scenario 15: concurrent runs append private memory without stale
+        // overwrite. Two writers race the same expected revision; exactly one
+        // wins and the loser is refused rather than overwriting.
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        let created = store
+            .upsert(
+                &scope,
+                &memory(&scope, "fact", 10),
+                PrivateMemoryExpectation::Absent,
+            )
+            .await
+            .expect("create");
+
+        let left = memory(&scope, "fact", 20);
+        let right = memory(&scope, "fact", 21);
+        let expectation = PrivateMemoryExpectation::Revision(created.revision);
+        let (a, b) = tokio::join!(
+            store.upsert(&scope, &left, expectation),
+            store.upsert(&scope, &right, expectation),
+        );
+
+        let outcomes = [a, b];
+        assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+        let refusal = outcomes
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("one writer is refused");
+        assert_eq!(refusal.code(), "memory-revision-conflict");
+    }
+
+    #[tokio::test]
+    async fn creates_and_updates_fail_closed_on_the_wrong_precondition() {
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        let created = store
+            .upsert(
+                &scope,
+                &memory(&scope, "fact", 10),
+                PrivateMemoryExpectation::Absent,
+            )
+            .await
+            .expect("create");
+
+        // A create over an existing memory is refused.
+        let duplicate = memory(&scope, "fact", 20);
+        let refused = store
+            .upsert(&scope, &duplicate, PrivateMemoryExpectation::Absent)
+            .await
+            .expect_err("the create is refused");
+        assert_eq!(refused.code(), "memory-already-exists");
+
+        // An update of an absent memory is refused exactly like an
+        // out-of-scope one.
+        let absent = memory(&scope, "missing", 20);
+        let refused = store
+            .upsert(
+                &scope,
+                &absent,
+                PrivateMemoryExpectation::Revision(created.revision),
+            )
+            .await
+            .expect_err("the update is refused");
+        assert_eq!(refused.code(), "memory-not-found");
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_strips_content_but_keeps_digest_and_provenance() {
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        let created = store
+            .upsert(
+                &scope,
+                &memory(&scope, "fact", 10),
+                PrivateMemoryExpectation::Absent,
+            )
+            .await
+            .expect("create");
+
+        let request = PrivateMemoryTombstoneRequest {
+            memory_id: created.memory_id.clone(),
+            operation_id: MemoryOperationId::derive_for_agent(&scope, "tombstone-fact")
+                .expect("op id"),
+            reason: MemoryTombstoneReason::Retracted,
+            tombstoned_at: AgentTimestampMillis::new(50),
+        };
+        let stub = store
+            .tombstone(&scope, &request)
+            .await
+            .expect("the tombstone applies");
+        assert!(stub.is_tombstoned());
+        assert_eq!(stub.content, AgentPrivateMemory::tombstone_content());
+        assert_eq!(stub.content_digest, created.content_digest);
+        assert_eq!(stub.revision, created.revision.next());
+
+        // The stub stays visible in scope through get; a list excludes it
+        // unless the cursor opts in.
+        let read = store
+            .get(&scope, &created.memory_id, AgentTimestampMillis::new(60))
+            .await
+            .expect("get")
+            .expect("the stub is visible");
+        assert!(read.is_tombstoned());
+        let page = store
+            .list(
+                &scope,
+                PrivateMemoryCursor::start(),
+                AgentTimestampMillis::new(60),
+            )
+            .await
+            .expect("list");
+        assert!(page.memories.is_empty());
+        let audit_page = store
+            .list(
+                &scope,
+                PrivateMemoryCursor::start().include_tombstoned(),
+                AgentTimestampMillis::new(60),
+            )
+            .await
+            .expect("audit list");
+        assert_eq!(audit_page.memories.len(), 1);
+
+        // A tombstone accepts no update, replays idempotently, and refuses a
+        // second withdrawal under a different operation.
+        let update = memory(&scope, "fact", 70);
+        let refused = store
+            .upsert(
+                &scope,
+                &update,
+                PrivateMemoryExpectation::Revision(stub.revision),
+            )
+            .await
+            .expect_err("the update is refused");
+        assert_eq!(refused.code(), "memory-tombstoned");
+        let replayed = store
+            .tombstone(&scope, &request)
+            .await
+            .expect("the replay is harmless");
+        assert_eq!(replayed, stub);
+        let second = PrivateMemoryTombstoneRequest {
+            operation_id: MemoryOperationId::derive_for_agent(&scope, "tombstone-fact-again")
+                .expect("op id"),
+            ..request
+        };
+        let refused = store
+            .tombstone(&scope, &second)
+            .await
+            .expect_err("a second withdrawal is refused");
+        assert_eq!(refused.code(), "memory-tombstoned");
+    }
+
+    #[tokio::test]
+    async fn a_delete_erases_the_memory_and_its_operation_payloads() {
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        let fact = memory(&scope, "fact", 10);
+        store
+            .upsert(&scope, &fact, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("create");
+
+        let request = PrivateMemoryDeleteRequest {
+            memory_id: fact.memory_id.clone(),
+            operation_id: MemoryOperationId::derive_for_agent(&scope, "delete-fact")
+                .expect("op id"),
+        };
+        store.delete(&scope, &request).await.expect("delete");
+        assert!(store.is_empty(&scope));
+        assert!(store
+            .get(&scope, &fact.memory_id, AgentTimestampMillis::new(20))
+            .await
+            .expect("get")
+            .is_none());
+
+        // The delete replays harmlessly; the create's replay fails closed
+        // rather than resurrect the deleted content.
+        store
+            .delete(&scope, &request)
+            .await
+            .expect("replayed delete");
+        let refused = store
+            .upsert(&scope, &fact, PrivateMemoryExpectation::Absent)
+            .await
+            .expect_err("the erased create fails closed");
+        assert_eq!(refused.code(), "memory-operation-erased");
+
+        // Deleting an absent memory answers exactly like a cross-scope one.
+        let absent = PrivateMemoryDeleteRequest {
+            memory_id: AgentPrivateMemoryId::new("mem-missing").expect("memory id"),
+            operation_id: MemoryOperationId::derive_for_agent(&scope, "delete-missing")
+                .expect("op id"),
+        };
+        let missing = store
+            .delete(&scope, &absent)
+            .await
+            .expect_err("the delete is refused");
+        let other = agent_scope("acme", "billing");
+        let foreign = store
+            .delete(
+                &other,
+                &PrivateMemoryDeleteRequest {
+                    memory_id: fact.memory_id.clone(),
+                    operation_id: MemoryOperationId::derive_for_agent(&other, "delete-fact")
+                        .expect("op id"),
+                },
+            )
+            .await
+            .expect_err("the cross-scope delete is refused");
+        assert_eq!(missing.code(), foreign.code());
+    }
+
+    #[tokio::test]
+    async fn expired_memory_is_invisible_and_purge_expired_is_bounded() {
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let scope = agent_scope("acme", "support");
+        for slot in ["a", "b", "c"] {
+            let expiring = memory(&scope, slot, 10).with_retention(MemoryRetention::ExpiresAt {
+                at: AgentTimestampMillis::new(100),
+            });
+            store
+                .upsert(&scope, &expiring, PrivateMemoryExpectation::Absent)
+                .await
+                .expect("create");
+        }
+
+        // Visible before expiry, invisible from the instant itself — sweep or
+        // no sweep.
+        let before = store
+            .list(
+                &scope,
+                PrivateMemoryCursor::start(),
+                AgentTimestampMillis::new(99),
+            )
+            .await
+            .expect("list");
+        assert_eq!(before.memories.len(), 3);
+        let after = store
+            .list(
+                &scope,
+                PrivateMemoryCursor::start(),
+                AgentTimestampMillis::new(100),
+            )
+            .await
+            .expect("list");
+        assert!(after.memories.is_empty());
+
+        // The sweep is bounded by its limit and converges to zero.
+        let first = store
+            .purge_expired(&scope, AgentTimestampMillis::new(100), 2)
+            .await
+            .expect("purge");
+        assert_eq!(first, 2);
+        let second = store
+            .purge_expired(&scope, AgentTimestampMillis::new(100), 2)
+            .await
+            .expect("purge");
+        assert_eq!(second, 1);
+        let third = store
+            .purge_expired(&scope, AgentTimestampMillis::new(100), 2)
+            .await
+            .expect("purge");
+        assert_eq!(third, 0);
+        assert!(store.is_empty(&scope));
+    }
+
+    #[tokio::test]
+    async fn cross_scope_private_reads_reveal_nothing() {
+        // Scenario 18, private half: an unauthorized read is byte-identical
+        // to reading a memory that never existed.
+        let store = InMemoryAgentPrivateMemoryStore::new();
+        let owner = agent_scope("acme", "support");
+        let sibling = agent_scope("acme", "billing");
+        let foreign = agent_scope("globex", "support");
+        let fact = memory(&owner, "fact", 10);
+        store
+            .upsert(&owner, &fact, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("create");
+
+        for scope in [&sibling, &foreign] {
+            assert!(store
+                .get(scope, &fact.memory_id, AgentTimestampMillis::new(20))
+                .await
+                .expect("get")
+                .is_none());
+            let page = store
+                .list(
+                    scope,
+                    PrivateMemoryCursor::start(),
+                    AgentTimestampMillis::new(20),
+                )
+                .await
+                .expect("list");
+            assert!(page.memories.is_empty());
+        }
+
+        // The same memory id string coexists independently in both scopes.
+        let twin = memory(&sibling, "fact", 30);
+        store
+            .upsert(&sibling, &twin, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("create the twin");
+        let owner_view = store
+            .get(&owner, &fact.memory_id, AgentTimestampMillis::new(40))
+            .await
+            .expect("get")
+            .expect("the owner's memory");
+        assert_eq!(owner_view.created_at, AgentTimestampMillis::new(10));
+        let sibling_view = store
+            .get(&sibling, &twin.memory_id, AgentTimestampMillis::new(40))
+            .await
+            .expect("get")
+            .expect("the sibling's memory");
+        assert_eq!(sibling_view.created_at, AgentTimestampMillis::new(30));
+    }
+
+    #[test]
+    fn validate_rejects_out_of_bounds_private_memories() {
+        let scope = agent_scope("acme", "support");
+
+        let mut confident = memory(&scope, "fact", 10);
+        confident.confidence_bps = 10_001;
+        assert_eq!(
+            confident.validate().expect_err("refused").code(),
+            "memory-confidence-out-of-range"
+        );
+
+        let mut oversized = memory(&scope, "fact", 10);
+        oversized.content = AgentTaskContent::Inline(serde_json::json!({
+            "blob": "x".repeat(AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES + 1),
+        }));
+        assert_eq!(
+            oversized.validate().expect_err("refused").code(),
+            "memory-entry-too-large"
+        );
+
+        let overlong = memory(&scope, "fact", 10).with_audit(
+            rakka_agent_workflow::AgentAuditEventId::new("a".repeat(257)),
+        );
+        assert_eq!(
+            overlong.expect_err("refused").code(),
+            "memory-reference-too-long"
+        );
+
+        let flat = memory(&scope, "fact", 10).with_embedding(MemoryEmbeddingRef {
+            model: "embedder".to_string(),
+            dimensions: 0,
+            version: AgentRevisionNumber::INITIAL,
+        });
+        assert_eq!(
+            flat.expect_err("refused").code(),
+            "memory-embedding-invalid"
+        );
+
+        // A tombstoned record that still carries content fails closed on
+        // load, and so does a version this binary does not write.
+        let stocked = memory(&scope, "fact", 10);
+        let mut value = serde_json::to_value(&stocked).expect("encode");
+        value["tombstone"] = serde_json::json!({
+            "operation_id": "mem-op-tombstone",
+            "reason": "retracted",
+            "tombstoned_at": 50,
+        });
+        let carried = serde_json::from_value::<AgentPrivateMemory>(value.clone());
+        assert!(carried
+            .expect_err("refused")
+            .to_string()
+            .contains("still carries content"));
+
+        let mut ahead = serde_json::to_value(&stocked).expect("encode");
+        ahead["schema_version"] = serde_json::json!(2);
+        let decoded = serde_json::from_value::<AgentPrivateMemory>(ahead)
+            .expect("a future version decodes; the policy refuses it");
+        let policy = AgentSchemaPolicy::default();
+        assert!(check_private_memory_schema(&policy, &decoded).is_err());
+    }
+
+    #[test]
+    fn promoted_identities_derive_purely_and_never_collide_across_scopes() {
+        let owner = agent_scope("acme", "support");
+        let sibling = agent_scope("acme", "billing");
+        let run_a = scope("acme", "support", "run-a");
+        let run_b = scope("acme", "support", "run-b");
+        let entry_a = MemoryEntryId::derive(&run_a, "turn-1-assistant").expect("entry id");
+        let entry_b = MemoryEntryId::derive(&run_b, "turn-1-assistant").expect("entry id");
+
+        let first = AgentPrivateMemoryId::derive_promoted(
+            &owner,
+            &entry_a,
+            AgentPrivateMemoryKind::Semantic,
+        )
+        .expect("derives");
+        // Pure: the same inputs derive the same identity.
+        assert_eq!(
+            first,
+            AgentPrivateMemoryId::derive_promoted(
+                &owner,
+                &entry_a,
+                AgentPrivateMemoryKind::Semantic
+            )
+            .expect("derives"),
+        );
+        // Two runs' same-slot entries derive distinct memories, and so do two
+        // agents and two kinds.
+        assert_ne!(
+            first,
+            AgentPrivateMemoryId::derive_promoted(
+                &owner,
+                &entry_b,
+                AgentPrivateMemoryKind::Semantic
+            )
+            .expect("derives"),
+        );
+        assert_ne!(
+            first,
+            AgentPrivateMemoryId::derive_promoted(
+                &sibling,
+                &entry_a,
+                AgentPrivateMemoryKind::Semantic
+            )
+            .expect("derives"),
+        );
+        assert_ne!(
+            first,
+            AgentPrivateMemoryId::derive_promoted(
+                &owner,
+                &entry_a,
+                AgentPrivateMemoryKind::Episodic
+            )
+            .expect("derives"),
+        );
+
+        // The agent-scoped operation domain is disjoint from the run-scoped
+        // one, whatever the discriminator.
+        let agent_op = MemoryOperationId::derive_for_agent(&owner, "x").expect("op id");
+        let run_op = MemoryOperationId::derive(&run_a, "x").expect("op id");
+        assert_ne!(agent_op, run_op);
+    }
+
+    #[tokio::test]
+    async fn session_purge_honors_hold_due_time_and_replays_harmlessly() {
+        // Open decision 7: terminal-run session retention.
+        let session = InMemorySessionMemoryStore::new();
+        let snapshots = InMemoryContextSnapshotStore::new();
+        let scope = scope("acme", "support", "run-1");
+        session
+            .append(&scope, &entry(&scope, 1, "assistant", 1))
+            .await
+            .expect("append");
+        let window = SessionWindowPolicy::recent_window();
+        let reference = AgentContextSnapshotRef::for_turn(&scope, 1).expect("reference");
+        let assembled = assemble_session_context(
+            &session,
+            &scope,
+            &reference,
+            1,
+            &window,
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(5),
+        )
+        .await
+        .expect("assemble");
+        snapshots.persist(&assembled).await.expect("persist");
+
+        let terminal_at = AgentTimestampMillis::new(100);
+        let held = SessionRetentionPolicy::bounded_default()
+            .with_retain_for_millis(50)
+            .with_legal_hold(true);
+        let due = SessionRetentionPolicy::bounded_default().with_retain_for_millis(50);
+
+        assert_eq!(
+            session
+                .purge_run(&scope, &held, terminal_at, AgentTimestampMillis::new(1_000))
+                .await
+                .expect("purge"),
+            SessionPurgeOutcome::Held,
+        );
+        assert_eq!(
+            session
+                .purge_run(&scope, &due, terminal_at, AgentTimestampMillis::new(149))
+                .await
+                .expect("purge"),
+            SessionPurgeOutcome::NotYetDue,
+        );
+        assert_eq!(session.len(&scope), 1);
+
+        assert_eq!(
+            session
+                .purge_run(&scope, &due, terminal_at, AgentTimestampMillis::new(150))
+                .await
+                .expect("purge"),
+            SessionPurgeOutcome::Purged { entries: 1 },
+        );
+        assert_eq!(
+            session
+                .purge_run(&scope, &due, terminal_at, AgentTimestampMillis::new(151))
+                .await
+                .expect("replayed purge"),
+            SessionPurgeOutcome::Purged { entries: 0 },
+        );
+        assert!(session.is_empty(&scope));
+
+        // Snapshots embed session content, so their purge is part of the same
+        // retention discharge.
+        assert_eq!(
+            snapshots
+                .purge_run(&scope, &held, terminal_at, AgentTimestampMillis::new(1_000))
+                .await
+                .expect("purge"),
+            SessionPurgeOutcome::Held,
+        );
+        assert_eq!(
+            snapshots
+                .purge_run(&scope, &due, terminal_at, AgentTimestampMillis::new(150))
+                .await
+                .expect("purge"),
+            SessionPurgeOutcome::Purged { entries: 1 },
+        );
+        assert!(snapshots.is_empty(&scope));
     }
 }

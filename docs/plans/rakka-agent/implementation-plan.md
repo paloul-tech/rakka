@@ -1511,8 +1511,101 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
   CAS or idempotent append for concurrent runs (open decision 1).
 - Retention, tombstone, and deletion semantics from the first schema.
 
+**Amended as implemented (2026-07-23):**
+
+- **A blind overwrite is unrepresentable, and a replay answers its original
+  result.** `upsert` takes an explicit `PrivateMemoryExpectation` — `Absent`
+  (a create, idempotent on its operation id) or `Revision(n)` (a
+  compare-and-set update) — so open decision 1's M2 half is the type system's
+  answer, not a runtime flag. The store keeps an operation ledger: a replayed
+  create returns the *original* stored result even after later updates moved
+  the record, a stale expectation is refused (`memory-revision-conflict`)
+  rather than overwriting a concurrent run's write (scenario 15), and the
+  store — not the caller — stamps every revision. The record was reshaped in
+  place at schema version 1 under the unreleased-branch rule the 1.7
+  amendment recorded; nothing outside the workspace ever persisted the
+  slice 1.11 declaration shape.
+- **Deletion is final in both directions of time.** Tombstone and delete are
+  separate idempotent operations with their own operation ids, and both erase
+  the ledger's earlier content payloads for the memory: a replayed old write
+  fails closed (`memory-operation-erased`) instead of resurrecting withdrawn
+  content. The tombstone keeps a content-free stub — identity, digest, and
+  provenance intact, visible in scope through `get` and an opt-in audit
+  listing — because the withdrawal itself must stay auditable
+  ([spec 13.1](spec.md#131-general-requirements)); a cross-scope read of
+  anything is byte-identical to reading a memory that never existed
+  (scenario 18). Expiry is a read-visibility rule from the instant itself;
+  the bounded `purge_expired` sweep is deployment-invoked, never a resident
+  poller.
+- **Promotion is a durable effect whose identities are all derived.** A
+  deduplicated `AgentRunEntityCommand::PromoteMemory` selects a bounded
+  contiguous range of the run's own durably assigned session sequences and
+  commits one `MemoryPromotion` effect in a bounded transition —
+  budget-reserved, wind-down-fenced, no I/O
+  ([spec 9.5](spec.md#95-execution-rule)); the settle pass flushes owed
+  session entries before dispatching, so the selection is durably readable
+  before the dispatcher-side `SessionMemoryPromotionExecutor` reads it. The
+  promoted memory id derives from (agent scope, source entry, kind); the
+  upsert operation id from (run scope, effect, generation, entry). Any
+  replay of a generation therefore converges on the same records, a distinct
+  later promotion of the same entry *converges on the existing memory*
+  (session entries are immutable; a withdrawn memory stays withdrawn) rather
+  than duplicating or updating it, and two runs of one agent derive disjoint
+  memories. Consolidation is the same effect naming a
+  `AgentMemoryConsolidationTarget`: a compare-and-set update of exactly one
+  memory from exactly one entry.
+- **A failed promotion does not wind the run down.** The generic
+  failed-generation arm fences the run and records a terminal reason; a
+  `MemoryPromotionCall` failure deliberately records only the effect's
+  failure, because [spec 13.1](spec.md#131-general-requirements) makes memory
+  never the correctness source — a memory-store outage must not kill a live
+  run. The initiator observes the failed effect and may re-issue under a new
+  operation id. The run keeps a bounded receipt ring
+  (`AgentLoopState::memory_promotions`, identities and revisions only, the
+  store is the source of truth); a promotion result racing the run's
+  completion is refused as terminal and treated as convergence — memory
+  persists, the receipt does not — which the delivery layer already treats
+  as the fence doing its job.
+- **The guardrail `MemoryIngress` evaluation point is explicitly deferred to
+  slice 2.2.** The boundary's meaning is "before retrieved memory enters a
+  model context" — the retrieval flow, which 2.2 owns. Adding it to
+  `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` on the promotion path alone would
+  let a required MemoryIngress-only stage satisfy coverage while never
+  running where retrieval happens — coverage-as-fail-open, the exact thing
+  `validate_covers` exists to refuse. Deferral is safe: promoted content is
+  verbatim session content, inert in the store, and cannot reach a model
+  context without passing the retrieval-side evaluation when it lands;
+  meanwhile an envelope requiring a MemoryIngress stage keeps failing closed
+  (`guardrail-stage-unevaluated`).
+- **Open decision 7 is resolved as config enforced inside the purge call.**
+  `SessionRetentionPolicy` (30-day bounded default, legal hold) is per-tenant
+  deployment configuration passed to each call, never stored per row —
+  retention is evaluated at sweep time, and a policy frozen at write time
+  could never tighten. The idempotent `purge_run` landed on **both**
+  `SessionMemoryStore` and `ContextSnapshotStore`, because snapshots embed
+  copies of session content and purging one without the other would not
+  discharge retention; held and not-yet-due are reported as values so a
+  fleet sweep never aborts, and export is the ordinary bounded cursor read
+  taken before the purge.
+- **The PostgreSQL store writes each operation as one data-modifying-CTE
+  statement.** A single statement is a single implicit transaction on the
+  shared pipelined client, so the operation-ledger row and the memory-row
+  mutation commit or fail together — no crash window between them, and no
+  raw `BEGIN`/`COMMIT` held on a shared connection. The `WHERE revision = $n`
+  update is the genuinely concurrent compare-and-set, proven over two live
+  connections. The crate's advisory migration lock moved to its own id
+  (`982_451_881`); the previous value collided with
+  `rakka-sharding-postgres`, needlessly serializing two subsystems'
+  migrations in a shared database.
+
 Done when: scenario 15 passes and the private-memory half of scenarios 16
-and 18 passes.
+and 18 passes. **Done (2026-07-23):** all three pass at the store level
+(`memory` unit tests, in-memory and DSN-gated PostgreSQL 16), end to end
+through the real run entity including the owner-kill crash sweep over the
+command → effect → upsert → settle chain
+(`crates/rakka-agent/tests/private_memory_promotion.rs`), and through the
+production dispatch pipeline with the authority's promotion arm under
+dispatcher loss mid-pass (`tests/effect_dispatch.rs`).
 
 ### Slice 2.2 — Vector retrieval adapter
 
@@ -1525,6 +1618,14 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
 - Tenant and `AgentId` filters enforced in schema and query even where it
   costs index performance; recall characteristics documented.
 - Retrieval feeds `MemoryContextSnapshot` only through the Slice 1.11 path.
+- Seams slice 2.1 left for this slice: the snapshot's
+  `private_memory: Vec<MemoryEntryId>` selection field predates
+  `AgentPrivateMemoryId` and must be reconciled when retrieval first fills
+  it; the guardrail `MemoryIngress` boundary joins
+  `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` here, where the retrieval flow it
+  describes is evaluated (the 2.1 amendment records why not earlier); the
+  record's `MemoryEmbeddingRef` metadata is already persisted, content-free,
+  for the vectors this slice derives.
 
 Done when: retrieval isolation tests pass and a snapshot-reuse test proves
 index drift cannot change a retried model input (extends scenario 17).

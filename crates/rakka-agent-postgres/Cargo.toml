@@ -21,14 +21,14 @@ name = "rakka_agent_postgres"
 # features are off: the session and snapshot stores never touch the model
 # adapter, so the `rig` feature is not pulled in.
 rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
+# `AgentTimestampMillis` is the durable substrate's clock type; the retention
+# purge signatures take it, so the substrate crate is a real dependency (it is
+# already in the tree through rakka-agent).
+rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
 serde_json.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
-# The gated tests construct timestamped memory records; `AgentTimestampMillis`
-# is the durable substrate's clock type, reached the same way the agent crate's
-# own tests reach it.
-rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
 tokio.workspace = true
 
 [lints]

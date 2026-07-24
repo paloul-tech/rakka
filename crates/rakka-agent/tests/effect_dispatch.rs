@@ -89,6 +89,7 @@ struct DispatchFixture {
     reconciler: ScriptedReconciler,
     credentials: ScriptedCredentialResolver,
     probe: KillSwitchProbe,
+    promotions: Option<Arc<dyn rakka_agent::AgentMemoryPromotionExecutor>>,
 }
 
 impl DispatchFixture {
@@ -132,7 +133,20 @@ impl DispatchFixture {
             reconciler,
             credentials: ScriptedCredentialResolver::new("live-secret-token"),
             probe: KillSwitchProbe::new(),
+            promotions: None,
         }
+    }
+
+    /// Wires the run with session memory and the pipeline with the promotion
+    /// executor over the same stores.
+    fn with_promotions(
+        mut self,
+        memory: rakka_agent::AgentRunMemory,
+        executor: Arc<dyn rakka_agent::AgentMemoryPromotionExecutor>,
+    ) -> Self {
+        self.fx = self.fx.with_memory(memory);
+        self.promotions = Some(executor);
+        self
     }
 
     async fn start(&self) {
@@ -144,7 +158,7 @@ impl DispatchFixture {
 
     /// A fresh dispatch worker over the shared durable stores.
     fn pipeline(&self) -> Pipeline {
-        AgentRunEffectDispatcher::new(
+        let mut pipeline = AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new("worker-1"),
             self.workflow_store.clone(),
             self.fleet_store.clone(),
@@ -169,7 +183,11 @@ impl DispatchFixture {
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
         .with_reconciler(Arc::new(self.reconciler.clone()))
-        .with_credential_resolver(Arc::new(self.credentials.clone()))
+        .with_credential_resolver(Arc::new(self.credentials.clone()));
+        if let Some(promotions) = &self.promotions {
+            pipeline = pipeline.with_memory_promotion_executor(promotions.clone());
+        }
+        pipeline
     }
 
     fn expire_lease(&self) {
@@ -1678,4 +1696,131 @@ async fn dispatcher_restart_preserves_segments_and_outcome_at_every_window() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2.1: a memory promotion travels the production dispatch path — the
+// authority's promotion arm, the real outbox ticket, the executor invocation,
+// and convergence when a dispatch pass dies mid-flight. The worker is killed
+// at the pass's first `AfterInvocation` window (the model call: its ticket
+// precedes the promotion's, because the selection's first sequence commits
+// with the first model effect); the recovered worker re-drives both tickets,
+// and the promotion's purely derived identities leave exactly one memory
+// however the pass was interrupted. The run may complete before the
+// promotion's result lands — the documented terminal-refusal convergence —
+// and the store, not the receipt, is the source of truth it converges on.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_promotion_survives_dispatcher_loss_mid_pass() {
+    use rakka_agent::{
+        promotion_operation_id, AgentMemoryPromotionRequest, AgentPrivateMemoryKind,
+        AgentPrivateMemoryStore, AgentRevisionNumber, AgentRunMemory,
+        InMemoryAgentPrivateMemoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
+        MemorySequence, PrivateMemoryCursor, SessionMemoryPromotionExecutor,
+    };
+    use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
+
+    let session = Arc::new(InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(InMemoryContextSnapshotStore::new());
+    let private = Arc::new(InMemoryAgentPrivateMemoryStore::new());
+    // Two read-only attempts, declared by the adapter and mirrored by the
+    // spec: the armed death interrupts the model invocation, and the
+    // recovered worker retries it under policy instead of exhausting the
+    // turn.
+    let adapter = DeterministicModelAdapter::new()
+        .with_turn(proposing_turn("resolved"))
+        .with_retry_policy(
+            rakka_agent::AgentModelRetryPolicy::read_only(2).expect("the policy is valid"),
+        )
+        .expect("the adapter accepts the policy");
+    let fx = DispatchFixture::new(
+        adapter,
+        default_registry(),
+        Some(
+            AgentEffectSpec::read_only()
+                .with_max_attempts(2)
+                .expect("the model spec is valid"),
+        ),
+        RecordingToolExecutor::new(),
+        ScriptedReconciler::new(),
+    )
+    .with_promotions(
+        AgentRunMemory::new(session.clone(), snapshots).with_private_store(private.clone()),
+        Arc::new(SessionMemoryPromotionExecutor::new(
+            session.clone(),
+            private.clone(),
+        )),
+    );
+    fx.start().await;
+    fx.settle().await;
+
+    // Commit the promotion of the task's input (sequence one) while the run
+    // waits on its model call.
+    let scope = run_scope();
+    let mut run = fx.fx.run();
+    let now = fx.fx.now();
+    run.recover(now).await.expect("the run recovers");
+    run.apply(
+        AgentRunEntityCommand::PromoteMemory {
+            operation_id: promotion_operation_id(&scope, "policy-1").expect("operation id"),
+            promotion: Box::new(AgentMemoryPromotionRequest {
+                from_sequence: MemorySequence::new(1),
+                to_sequence: MemorySequence::new(1),
+                kind: AgentPrivateMemoryKind::Semantic,
+                target: None,
+                confidence_bps: 9_000,
+                requested_by: PrincipalRef {
+                    principal_type: "service".to_string(),
+                    principal_id: "memory-curator".to_string(),
+                    display_name: None,
+                },
+            }),
+        },
+        &fx.fx.router,
+        now,
+    )
+    .await
+    .expect("the promotion applies");
+
+    // The worker dies mid-pass, after an invocation committed and before its
+    // receipt was recorded anywhere.
+    fx.probe.arm(AgentDispatchWindow::AfterInvocation);
+    let _ = fx.try_pump().await;
+    assert_eq!(fx.probe.deaths(), 1, "the armed window fired");
+
+    // A fresh worker recovers from durable state alone and re-drives every
+    // ticket the dead pass left: the model call retries under its policy, the
+    // promotion executes under its derived operation ids, and the pipeline
+    // settles even when the run completes before the promotion's result lands.
+    fx.expire_lease();
+    fx.pump().await;
+
+    let owner = agent_scope();
+    assert_eq!(
+        private.len(&owner),
+        1,
+        "the redelivered promotion converged on one memory"
+    );
+    let listed = private
+        .list(
+            &owner,
+            PrivateMemoryCursor::start(),
+            AgentTimestampMillis::new(1_000_000),
+        )
+        .await
+        .expect("list");
+    assert_eq!(listed.memories.len(), 1);
+    assert_eq!(
+        listed.memories[0].revision,
+        AgentRevisionNumber::INITIAL,
+        "the second attempt replayed rather than re-wrote"
+    );
+
+    let snapshot = fx.fx.run_snapshot().await.expect("the run exists");
+    assert!(
+        snapshot.status.is_terminal(),
+        "the run settled despite the dispatcher loss: {:?}",
+        snapshot.status
+    );
 }
