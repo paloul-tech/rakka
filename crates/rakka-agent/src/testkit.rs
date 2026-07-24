@@ -70,11 +70,13 @@ use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRev
 use crate::dispatch::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchProbe, AgentDispatchToolExecutor,
     AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
-    AgentReconciliationFinding, AgentRunResultDelivery,
+    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
+    AgentRunResultDelivery,
 };
 use crate::effect::{
-    AgentEffectPolicies, AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome,
-    AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus,
+    AgentEffectPolicies, AgentMemoryPromotionRequest, AgentReconciliationProtocolRef,
+    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
+    AgentRunEffectStatus,
 };
 use crate::identity::{AgentOperationId, AgentRunScope};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
@@ -1387,15 +1389,34 @@ fn model_request(
 /// An adapter error — a provider failure, or a turn that cannot be bounded — is
 /// returned as a failed effect: final for the generation, exactly as the real
 /// pipeline reports a definitive failure.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     adapter: A,
     answered: Arc<Mutex<BTreeMap<String, AgentRunEffectOutcome>>>,
     tools: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
     compensations: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
+    promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
+}
+
+impl<A: std::fmt::Debug> std::fmt::Debug for ScriptedDispatcher<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedDispatcher")
+            .field("adapter", &self.adapter)
+            .field(
+                "promotions_wired",
+                &self
+                    .promotions
+                    .lock()
+                    .map(|slot| slot.is_some())
+                    .unwrap_or(false),
+            )
+            .field("model_calls", &self.model_calls.load(Ordering::SeqCst))
+            .field("tool_calls", &self.tool_calls.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ScriptedDispatcher<DeterministicModelAdapter> {
@@ -1465,6 +1486,7 @@ where
             tools: Arc::new(Mutex::new(BTreeMap::new())),
             failures: Arc::new(Mutex::new(BTreeMap::new())),
             compensations: Arc::new(Mutex::new(BTreeMap::new())),
+            promotions: Arc::new(Mutex::new(None)),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1508,6 +1530,22 @@ where
         self
     }
 
+    /// Executes memory-promotion effects through the given executor — usually
+    /// a [`crate::dispatch::SessionMemoryPromotionExecutor`] over the
+    /// fixture's session and private stores. An unwired promotion fails with
+    /// the real pipeline's `memory-promotion-executor-missing` code.
+    #[must_use]
+    pub fn with_memory_promotion_executor(
+        self,
+        executor: Arc<dyn AgentMemoryPromotionExecutor>,
+    ) -> Self {
+        *self
+            .promotions
+            .lock()
+            .expect("the promotion executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
     /// How many model calls the dispatcher has answered, re-invocations included.
     #[must_use]
     pub fn model_calls(&self) -> usize {
@@ -1545,7 +1583,15 @@ where
 
         let mut delivered = 0;
         for effect in dispatched {
-            let outcome = self.answer(&effect).await;
+            let outcome = match &effect.request {
+                // A promotion executor reads the run's session store, so it
+                // needs the scope only `drive` holds.
+                AgentRunEffectRequest::MemoryPromotion { promotion } => {
+                    self.promotion_outcome(&scope, &effect, promotion, now)
+                        .await
+                }
+                _ => self.answer(&effect).await,
+            };
             let command = AgentRunEntityCommand::RecordEffectResult {
                 operation_id: effect.result_operation_id(&scope)?,
                 effect_id: effect.effect_id.clone(),
@@ -1621,7 +1667,66 @@ where
                 };
                 self.memoize(effect, outcome)
             }
+            AgentRunEffectRequest::MemoryPromotion { .. } => {
+                // A promotion needs the run scope its executor reads under,
+                // which this signature does not carry. Answer it through
+                // [`Self::drive`] or [`Self::promotion_outcome`]. The failure
+                // is deliberately NOT memoized, so a later scoped answer can
+                // still resolve the effect.
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                AgentRunEffectOutcome::Failed {
+                    code: "memory-promotion-unscoped".to_string(),
+                    message: "a memory promotion is answered through drive or promotion_outcome, \
+                              which carry the run scope"
+                        .to_string(),
+                }
+            }
         }
+    }
+
+    /// What this dispatcher returns for one memory-promotion effect, running
+    /// the wired executor under the run's scope. Memoized on the effect id
+    /// and generation exactly like every other answer.
+    pub async fn promotion_outcome(
+        &self,
+        scope: &AgentRunScope,
+        effect: &AgentRunEffect,
+        promotion: &AgentMemoryPromotionRequest,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEffectOutcome {
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.cached(effect) {
+            return outcome;
+        }
+        let executor = self
+            .promotions
+            .lock()
+            .expect("the promotion executor slot should not be poisoned")
+            .clone();
+        let outcome = match executor {
+            None => AgentRunEffectOutcome::Failed {
+                code: "memory-promotion-executor-missing".to_string(),
+                message: "no memory-promotion executor is wired into this dispatcher".to_string(),
+            },
+            Some(executor) => match executor.execute(scope, effect, promotion, now).await {
+                Ok(AgentMemoryPromotionFinding::Promoted { promoted }) => {
+                    AgentRunEffectOutcome::MemoryPromotion { promoted }
+                }
+                Ok(AgentMemoryPromotionFinding::Refused { code, message }) => {
+                    AgentRunEffectOutcome::Failed { code, message }
+                }
+                // The in-process driver has no attempt machinery: a retryable
+                // failure surfaces as a failed effect, the model-adapter
+                // precedent above.
+                Err(error) => AgentRunEffectOutcome::Failed {
+                    code: "memory-promotion-attempt-failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+        };
+        self.memoize(effect, outcome)
     }
 
     fn lock_answered(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, AgentRunEffectOutcome>> {

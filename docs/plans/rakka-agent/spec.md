@@ -2526,6 +2526,11 @@ without one remain open.
    *Disposition (M1): accepted structurally — every run is an independent
    sharded entity with its own ledger and nothing serializes an agent's runs;
    the idempotent/CAS private-memory write rule binds at M2 (slice 2.1).*
+   *Disposition (M2): accepted — a private-memory create is idempotent on its
+   operation id (a replay answers the original result from the store's
+   operation ledger), an update is a compare-and-set on an explicit expected
+   revision, a stale writer is refused rather than overwriting, and two
+   runs' promotions derive disjoint memory identities (slice 2.1).*
 2. **What is the default communal boundary?** Recommended: tenant or
    organization `KnowledgeSpaceId`; no implicit cross-tenant global graph.
 3. **Does every agent-written claim begin as `Proposed`?** Recommended: yes;
@@ -2552,6 +2557,13 @@ without one remain open.
    *Disposition (M1): deliberately still open — deferred to Phase 2
    slice 2.1; until then a deployment retains session rows until it deletes
    them itself (slice 1.11 amendment).*
+   *Disposition (M2): accepted — a per-tenant `SessionRetentionPolicy`
+   (30-day bounded default, legal hold) is deployment configuration passed
+   to each purge call and enforced inside it; the idempotent terminal-run
+   `purge_run` lands on both the session and snapshot stores, because
+   snapshots embed session content; export is the ordinary bounded cursor
+   read taken before the purge; sweeps are bounded, deployment-invoked
+   calls, never a resident poller (slice 2.1).*
 8. **Which communal graph backend ships first?** Recommended: do not select one
    in the domain specification. Capture representative queries and validate
    the database-agnostic SPI against at least two structurally different

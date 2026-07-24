@@ -107,18 +107,23 @@ use rakka_agent_workflow::{
     agent_effect_to_outbox_command, AgentDispatchClaim, AgentDispatcherError, AgentDispatcherFleet,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEffect,
     AgentEphemeralCredential, AgentInboxError, AgentOutboxError, AgentRunId as WorkflowRunId,
-    AgentRunInbox,
+    AgentRunInbox, AgentTimestampMillis,
 };
 use rakka_persistence::DurableStateStore;
 
 use crate::agent::{load_agent_entity_state, AgentEntityError, AgentEntityState};
 use crate::definition::{AgentCredentialBindingRef, AgentEffectSafetyClass, AgentSetupRevision};
 use crate::effect::{
-    compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentReconciliationProtocolRef,
-    AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
-    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    compensation_call_id, AgentEffectError, AgentEffectGeneration, AgentMemoryPromotionRequest,
+    AgentReconciliationProtocolRef, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
+    AgentRunEffectSink, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
 };
 use crate::identity::{AgentIdentityError, AgentRunScope, AgentScope};
+use crate::memory::{
+    AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemorySource, AgentPrivateMemoryStore,
+    AgentPromotedMemoryRef, MemoryError, MemoryOperationId, MemorySequence,
+    PrivateMemoryExpectation, SessionMemoryCursor, SessionMemoryEntry, SessionMemoryStore,
+};
 use crate::model::{AgentModelAdapter, AgentModelRequest, AgentToolCallRequest};
 use crate::run::{
     load_agent_run_state, AgentRun, AgentRunEntityCommand, AgentRunEntityReply, AgentRunError,
@@ -328,6 +333,395 @@ pub trait AgentCompensationExecutor: Send + Sync {
         compensation: &'a crate::checkpoints::AgentCompensationRef,
         credential: Option<&'a AgentEphemeralCredential>,
     ) -> AgentDispatchFuture<'a, AgentTaskContent>;
+}
+
+/// What one bounded memory-promotion attempt established.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentMemoryPromotionFinding {
+    /// Every selected entry is durably promoted; the receipt is bounded —
+    /// identities and revisions only, never content.
+    Promoted {
+        /// The memories the promotion wrote or converged on.
+        promoted: Vec<AgentPromotedMemoryRef>,
+    },
+    /// Definitively refused: no retry can change the answer — a stale
+    /// consolidation revision, a withdrawn target, a validation bound. The
+    /// generation settles `Failed` under the stable code.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one memory-promotion effect inside a bounded dispatch attempt
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)): reads the
+/// selected session entries and idempotently upserts agent-private memories
+/// under purely derived identities, so any replay — attempt retry, crash
+/// re-drive, shard movement — converges on one logical write per entry.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's attempt bound; a [`AgentMemoryPromotionFinding::Refused`] is
+/// definitive. An absent executor fails closed at `invoke`.
+pub trait AgentMemoryPromotionExecutor: Send + Sync {
+    /// Performs the promotion and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        promotion: &'a AgentMemoryPromotionRequest,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding>;
+}
+
+/// The runtime-provided promotion executor: the session store in, the private
+/// store out, every identity derived
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A promoted memory's identity derives from the agent scope, the source
+/// entry, and the kind; its operation id derives from the run scope, the
+/// effect, the generation, and the entry. Within one generation every attempt
+/// therefore upserts the same records — the store's operation ledger answers
+/// replays with the original result — and a *second* promotion of the same
+/// entry converges on the existing memory instead of duplicating or updating
+/// it (session entries are immutable, so its content is already what the
+/// promotion would write; and a withdrawn memory stays withdrawn).
+pub struct SessionMemoryPromotionExecutor {
+    session: Arc<dyn SessionMemoryStore>,
+    private: Arc<dyn AgentPrivateMemoryStore>,
+}
+
+impl SessionMemoryPromotionExecutor {
+    /// Wires the executor over the two stores it bridges.
+    #[must_use]
+    pub fn new(
+        session: Arc<dyn SessionMemoryStore>,
+        private: Arc<dyn AgentPrivateMemoryStore>,
+    ) -> Self {
+        Self { session, private }
+    }
+
+    /// Reads the selected session entries in one bounded page.
+    async fn read_selection(
+        &self,
+        scope: &AgentRunScope,
+        promotion: &AgentMemoryPromotionRequest,
+    ) -> AgentDispatchResult<Vec<SessionMemoryEntry>> {
+        let from = promotion.from_sequence;
+        let to = promotion.to_sequence;
+        let count = usize::try_from(to.get().saturating_sub(from.get()).saturating_add(1))
+            .map_err(|_| AgentDispatchError::Invocation {
+                code: "memory-promotion-selection-invalid",
+                message: "the promotion selection cannot be sized".to_string(),
+            })?;
+        let cursor = if from.get() <= 1 {
+            SessionMemoryCursor::start()
+        } else {
+            SessionMemoryCursor::after(MemorySequence::new(from.get() - 1))
+        }
+        .with_limit(count);
+        let page = self.session.read(scope, cursor).await.map_err(|error| {
+            AgentDispatchError::Invocation {
+                code: "memory-promotion-source-read-failed",
+                message: error.to_string(),
+            }
+        })?;
+        let entries: Vec<SessionMemoryEntry> = page
+            .entries
+            .into_iter()
+            .filter(|entry| entry.sequence >= from && entry.sequence <= to)
+            .collect();
+        if entries.len() != count {
+            // Retryable, deliberately: the run only commits a promotion for
+            // sequences it has durably assigned, so a missing entry is an
+            // outbox flush the settle pass has not landed yet — the next
+            // attempt reads it.
+            return Err(AgentDispatchError::Invocation {
+                code: "memory-promotion-source-missing",
+                message: format!(
+                    "the selection {from}..={to} names {count} entries and the session store \
+                     holds {}; the owed flush lands them before the next attempt",
+                    entries.len()
+                ),
+            });
+        }
+        Ok(entries)
+    }
+}
+
+/// Classifies a private-store write failure: a backend or encoding fault is a
+/// retryable attempt failure; everything else — a stale revision, a withdrawn
+/// or missing target, a validation bound, an erased operation — is definitive.
+fn classify_promotion_error(error: &MemoryError) -> AgentMemoryPromotionOutcomeClass {
+    match error {
+        MemoryError::Backend { .. } | MemoryError::Encoding { .. } => {
+            AgentMemoryPromotionOutcomeClass::Retryable
+        }
+        _ => AgentMemoryPromotionOutcomeClass::Definitive,
+    }
+}
+
+/// How a private-store failure resolves an attempt.
+enum AgentMemoryPromotionOutcomeClass {
+    /// Retry under the attempt bound.
+    Retryable,
+    /// Settle the generation `Failed` under the error's stable code.
+    Definitive,
+}
+
+impl AgentMemoryPromotionExecutor for SessionMemoryPromotionExecutor {
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        promotion: &'a AgentMemoryPromotionRequest,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding> {
+        Box::pin(async move {
+            let entries = self.read_selection(scope, promotion).await?;
+            let agent_scope = scope.agent_scope();
+            let mut promoted = Vec::with_capacity(entries.len());
+
+            if let Some(target) = &promotion.target {
+                // Consolidation: update exactly one existing memory under
+                // compare-and-set, from exactly one source entry (the run
+                // transition enforced the shape).
+                let entry = &entries[0];
+                let operation_id = MemoryOperationId::derive(
+                    scope,
+                    format!("consolidate|{}|g{}", intent.effect_id, intent.generation),
+                )
+                .map_err(|error| AgentDispatchError::Invocation {
+                    code: "memory-promotion-identity",
+                    message: error.to_string(),
+                })?;
+                let current = self
+                    .private
+                    .get(&agent_scope, &target.memory_id, now)
+                    .await
+                    .map_err(|error| AgentDispatchError::Invocation {
+                        code: "memory-promotion-target-read-failed",
+                        message: error.to_string(),
+                    })?;
+                let Some(current) = current else {
+                    return Ok(AgentMemoryPromotionFinding::Refused {
+                        code: "memory-not-found".to_string(),
+                        message: format!(
+                            "the consolidation target {} does not exist in this scope",
+                            target.memory_id
+                        ),
+                    });
+                };
+                let record = match consolidation_record(
+                    scope,
+                    intent,
+                    promotion,
+                    entry,
+                    &current,
+                    operation_id,
+                    now,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Ok(AgentMemoryPromotionFinding::Refused {
+                            code: error.code().to_string(),
+                            message: error.to_string(),
+                        })
+                    }
+                };
+                match self
+                    .private
+                    .upsert(
+                        &agent_scope,
+                        &record,
+                        PrivateMemoryExpectation::Revision(target.expected_revision),
+                    )
+                    .await
+                {
+                    Ok(stored) => promoted.push(AgentPromotedMemoryRef {
+                        memory_id: stored.memory_id.clone(),
+                        revision: stored.revision,
+                        source_entry: entry.entry_id.clone(),
+                    }),
+                    Err(error) => match classify_promotion_error(&error) {
+                        AgentMemoryPromotionOutcomeClass::Retryable => {
+                            return Err(AgentDispatchError::Invocation {
+                                code: "memory-promotion-write-failed",
+                                message: error.to_string(),
+                            })
+                        }
+                        AgentMemoryPromotionOutcomeClass::Definitive => {
+                            return Ok(AgentMemoryPromotionFinding::Refused {
+                                code: error.code().to_string(),
+                                message: error.to_string(),
+                            })
+                        }
+                    },
+                }
+                return Ok(AgentMemoryPromotionFinding::Promoted { promoted });
+            }
+
+            for entry in &entries {
+                let memory_id = AgentPrivateMemoryId::derive_promoted(
+                    &agent_scope,
+                    &entry.entry_id,
+                    promotion.kind,
+                )
+                .map_err(|error| AgentDispatchError::Invocation {
+                    code: "memory-promotion-identity",
+                    message: error.to_string(),
+                })?;
+                let operation_id = MemoryOperationId::derive(
+                    scope,
+                    format!(
+                        "promote|{}|g{}|{}",
+                        intent.effect_id, intent.generation, entry.entry_id
+                    ),
+                )
+                .map_err(|error| AgentDispatchError::Invocation {
+                    code: "memory-promotion-identity",
+                    message: error.to_string(),
+                })?;
+                let record = match promotion_record(
+                    scope,
+                    intent,
+                    promotion,
+                    entry,
+                    memory_id.clone(),
+                    operation_id,
+                    now,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Ok(AgentMemoryPromotionFinding::Refused {
+                            code: error.code().to_string(),
+                            message: error.to_string(),
+                        })
+                    }
+                };
+                match self
+                    .private
+                    .upsert(&agent_scope, &record, PrivateMemoryExpectation::Absent)
+                    .await
+                {
+                    Ok(stored) => promoted.push(AgentPromotedMemoryRef {
+                        memory_id: stored.memory_id.clone(),
+                        revision: stored.revision,
+                        source_entry: entry.entry_id.clone(),
+                    }),
+                    Err(MemoryError::AlreadyExists { .. }) => {
+                        // Convergence: a distinct earlier promotion already
+                        // wrote this entry's memory. Session entries are
+                        // immutable, so the existing record is what this
+                        // write would have produced; report it rather than
+                        // duplicate or churn its revision. A withdrawn
+                        // memory stays withdrawn the same way.
+                        let existing = self
+                            .private
+                            .get(&agent_scope, &memory_id, now)
+                            .await
+                            .map_err(|error| AgentDispatchError::Invocation {
+                                code: "memory-promotion-convergence-failed",
+                                message: error.to_string(),
+                            })?;
+                        let Some(existing) = existing else {
+                            // Deleted or expired between the refusal and the
+                            // read: retry re-establishes the truth.
+                            return Err(AgentDispatchError::Invocation {
+                                code: "memory-promotion-convergence-failed",
+                                message: format!(
+                                    "memory {memory_id} vanished while converging; the next \
+                                     attempt re-reads it"
+                                ),
+                            });
+                        };
+                        promoted.push(AgentPromotedMemoryRef {
+                            memory_id: existing.memory_id.clone(),
+                            revision: existing.revision,
+                            source_entry: entry.entry_id.clone(),
+                        });
+                    }
+                    Err(error) => match classify_promotion_error(&error) {
+                        AgentMemoryPromotionOutcomeClass::Retryable => {
+                            return Err(AgentDispatchError::Invocation {
+                                code: "memory-promotion-write-failed",
+                                message: error.to_string(),
+                            })
+                        }
+                        AgentMemoryPromotionOutcomeClass::Definitive => {
+                            return Ok(AgentMemoryPromotionFinding::Refused {
+                                code: error.code().to_string(),
+                                message: error.to_string(),
+                            })
+                        }
+                    },
+                }
+            }
+
+            Ok(AgentMemoryPromotionFinding::Promoted { promoted })
+        })
+    }
+}
+
+/// Builds the record one entry promotes into, provenance included.
+fn promotion_record(
+    scope: &AgentRunScope,
+    intent: &AgentRunEffect,
+    promotion: &AgentMemoryPromotionRequest,
+    entry: &SessionMemoryEntry,
+    memory_id: AgentPrivateMemoryId,
+    operation_id: MemoryOperationId,
+    now: AgentTimestampMillis,
+) -> Result<AgentPrivateMemory, MemoryError> {
+    let memory = AgentPrivateMemory::new(
+        memory_id,
+        operation_id,
+        promotion.kind,
+        entry.content.clone(),
+        promotion.confidence_bps,
+        entry.classification,
+        now,
+    )?
+    .with_source(AgentPrivateMemorySource {
+        run: Some(scope.run().clone()),
+        effect: Some(intent.effect_id.clone()),
+        entry: Some(entry.entry_id.clone()),
+    });
+    memory.validate()?;
+    Ok(memory)
+}
+
+/// Builds the consolidated record: the target's identity and history, the
+/// selected entry's content.
+fn consolidation_record(
+    scope: &AgentRunScope,
+    intent: &AgentRunEffect,
+    promotion: &AgentMemoryPromotionRequest,
+    entry: &SessionMemoryEntry,
+    current: &AgentPrivateMemory,
+    operation_id: MemoryOperationId,
+    now: AgentTimestampMillis,
+) -> Result<AgentPrivateMemory, MemoryError> {
+    let mut memory = AgentPrivateMemory::new(
+        current.memory_id.clone(),
+        operation_id,
+        promotion.kind,
+        entry.content.clone(),
+        promotion.confidence_bps,
+        entry.classification,
+        current.created_at,
+    )?
+    .with_source(AgentPrivateMemorySource {
+        run: Some(scope.run().clone()),
+        effect: Some(intent.effect_id.clone()),
+        entry: Some(entry.entry_id.clone()),
+    })
+    .with_retention(current.retention);
+    memory.updated_at = now;
+    memory.validate()?;
+    Ok(memory)
 }
 
 /// Resolves a logical credential binding for one dispatch attempt
@@ -682,6 +1076,7 @@ where
     credentials: Option<Arc<dyn AgentEffectCredentialResolver>>,
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
     compensations: Option<Arc<dyn AgentCompensationExecutor>>,
+    memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -736,6 +1131,7 @@ where
             credentials: None,
             reconciler: None,
             compensations: None,
+            memory_promotions: None,
             delivery,
             probe: None,
         }
@@ -789,6 +1185,20 @@ where
         compensations: Arc<dyn AgentCompensationExecutor>,
     ) -> Self {
         self.compensations = Some(compensations);
+        self
+    }
+
+    /// Executes memory-promotion effects through the given executor
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)) —
+    /// usually a [`SessionMemoryPromotionExecutor`] over the deployment's
+    /// session and private stores. Without one, a promotion dispatch fails
+    /// closed with a stable code.
+    #[must_use]
+    pub fn with_memory_promotion_executor(
+        mut self,
+        memory_promotions: Arc<dyn AgentMemoryPromotionExecutor>,
+    ) -> Self {
+        self.memory_promotions = Some(memory_promotions);
         self
     }
 
@@ -1800,6 +2210,27 @@ where
                     call_id: compensation_call_id(intent),
                     content,
                 })
+            }
+            AgentRunEffectRequest::MemoryPromotion { promotion } => {
+                let Some(executor) = self.memory_promotions.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "memory-promotion-executor-missing".to_string(),
+                        message: "no memory-promotion executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+                match executor.execute(scope, intent, promotion, now).await? {
+                    AgentMemoryPromotionFinding::Promoted { promoted } => {
+                        Ok(AgentRunEffectOutcome::MemoryPromotion { promoted })
+                    }
+                    AgentMemoryPromotionFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
             }
         }
     }

@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use rakka_agent_workflow::{
     require_agent_trace_context, AgentAttributes, AgentCausationId, AgentCorrelationId,
     AgentEffect, AgentEffectKind, AgentEffectStatus, AgentEffectTarget, AgentIdempotencyKey,
-    AgentTelemetryContext, AgentTimestampMillis, StateSchemaVersion,
+    AgentTelemetryContext, AgentTimestampMillis, PrincipalRef, StateSchemaVersion,
     AGENT_CREDENTIAL_BINDING_REF_ATTRIBUTE,
 };
 use rakka_agent_workflow::{AgentDeduplicationKey, AgentEffectId};
@@ -73,7 +73,10 @@ use crate::definition::{
     AgentModelProfileId, AgentRevisionNumber, AgentToolId,
 };
 use crate::identity::{AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunScope};
-use crate::memory::AgentContextSnapshotRef;
+use crate::memory::{
+    AgentContextSnapshotRef, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPromotedMemoryRef,
+    MemorySequence, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+};
 use crate::model::{AgentModelTurn, AgentToolCallId, AgentToolCallRequest};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -615,6 +618,7 @@ pub struct AgentEffectPolicies {
     tools: BTreeMap<AgentToolId, AgentEffectSpec>,
     default_tool: AgentEffectSpec,
     compensation: AgentEffectSpec,
+    memory_promotion: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
@@ -627,6 +631,20 @@ impl AgentEffectPolicies {
             tools: BTreeMap::new(),
             default_tool: AgentEffectSpec::non_idempotent(),
             compensation: AgentEffectSpec::non_idempotent(),
+            // A promotion upserts under purely derived operation ids, so a
+            // repeat of any attempt converges on the same records: idempotent
+            // by construction, with a small retry budget.
+            memory_promotion: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
             checkpoint_sla: crate::checkpoints::AgentCheckpointSla::default(),
         }
     }
@@ -679,6 +697,16 @@ impl AgentEffectPolicies {
         Ok(self)
     }
 
+    /// Sets the spec memory promotions dispatch under
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is [`AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS`] idempotent
+    /// attempts.
+    pub fn with_memory_promotion_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.memory_promotion = spec;
+        Ok(self)
+    }
+
     /// Pins every spec — model, registered tools, and the unclassified
     /// default — to the guardrail chain revision the deployment evaluates at
     /// dispatch, so each committed intent records the policy its transforms
@@ -689,6 +717,7 @@ impl AgentEffectPolicies {
     pub fn with_guardrail_revision(mut self, revision: AgentRevisionNumber) -> Self {
         self.model.guardrail_revision = Some(revision);
         self.default_tool.guardrail_revision = Some(revision);
+        self.memory_promotion.guardrail_revision = Some(revision);
         for spec in self.tools.values_mut() {
             spec.guardrail_revision = Some(revision);
         }
@@ -704,6 +733,7 @@ impl AgentEffectPolicies {
                 self.tools.get(&call.tool).unwrap_or(&self.default_tool)
             }
             AgentRunEffectRequest::Compensation { .. } => &self.compensation,
+            AgentRunEffectRequest::MemoryPromotion { .. } => &self.memory_promotion,
         }
     }
 }
@@ -743,6 +773,9 @@ pub enum AgentRunEffectKind {
     /// [`crate::checkpoints::AgentReconciliationDecision::Compensate`] decision
     /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)).
     CompensationCall,
+    /// A promotion of session-memory entries into the agent's private
+    /// long-term store ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    MemoryPromotionCall,
 }
 
 impl AgentRunEffectKind {
@@ -753,6 +786,7 @@ impl AgentRunEffectKind {
             Self::ModelCall => "model-call",
             Self::ToolCall => "tool-call",
             Self::CompensationCall => "compensation-call",
+            Self::MemoryPromotionCall => "memory-promotion-call",
         }
     }
 
@@ -761,10 +795,13 @@ impl AgentRunEffectKind {
     pub const fn workflow_kind(self) -> AgentEffectKind {
         match self {
             Self::ModelCall => AgentEffectKind::ModelCall,
-            // A compensation dispatches through the same adapter surface as a
-            // tool call: the outbox ticket's `compensation` target type is what
-            // routes it to the application-owned handler.
-            Self::ToolCall | Self::CompensationCall => AgentEffectKind::ToolCall,
+            // A compensation or memory promotion dispatches through the same
+            // adapter surface as a tool call: the outbox ticket's target type
+            // (`compensation`, `memory-promotion`) is what routes it to its
+            // executor.
+            Self::ToolCall | Self::CompensationCall | Self::MemoryPromotionCall => {
+                AgentEffectKind::ToolCall
+            }
         }
     }
 }
@@ -896,6 +933,65 @@ impl Display for AgentRunEffectStatus {
     }
 }
 
+/// Most session entries one memory promotion may select.
+///
+/// The same bound as the snapshot window: a promotion selects from what a
+/// turn's working set could have seen, and the executor reads the selection in
+/// one bounded page.
+pub const AGENT_MEMORY_PROMOTION_MAX_ENTRIES: usize = AGENT_SESSION_WINDOW_MAX_ENTRIES;
+
+/// The default attempt bound of a memory-promotion effect.
+pub const AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// What one memory promotion selects and where it writes
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The payload is selection *references* only — sequences, a kind, an optional
+/// consolidation target — never content: the intent stays bounded, and the
+/// executor's session reads happen inside the bounded dispatch attempt, not in
+/// a run transition ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentMemoryPromotionRequest {
+    /// The first selected session sequence, inclusive.
+    pub from_sequence: MemorySequence,
+    /// The last selected session sequence, inclusive.
+    pub to_sequence: MemorySequence,
+    /// The private-memory kind the promoted records take.
+    pub kind: AgentPrivateMemoryKind,
+    /// A consolidation target: update exactly one existing memory under
+    /// compare-and-set instead of deriving fresh identities.
+    #[serde(default)]
+    pub target: Option<AgentMemoryConsolidationTarget>,
+    /// The confidence stamped on the promoted records, in basis points.
+    pub confidence_bps: u16,
+    /// Who asked for the promotion. Provenance and audit, never authority.
+    pub requested_by: PrincipalRef,
+}
+
+impl AgentMemoryPromotionRequest {
+    /// How many session entries the selection spans, when it is well-formed.
+    #[must_use]
+    pub const fn selected_entries(&self) -> Option<u64> {
+        if self.from_sequence.get() == 0 || self.to_sequence.get() < self.from_sequence.get() {
+            return None;
+        }
+        Some(self.to_sequence.get() - self.from_sequence.get() + 1)
+    }
+}
+
+/// The existing memory one consolidation updates, at the exact revision the
+/// initiator read ([specification 13.3](../../../docs/plans/rakka-agent/spec.md);
+/// open decision 1's compare-and-set rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentMemoryConsolidationTarget {
+    /// The memory to update.
+    pub memory_id: AgentPrivateMemoryId,
+    /// The revision the update expects; a stale expectation is refused.
+    pub expected_revision: AgentRevisionNumber,
+}
+
 /// What one effect asks its target to do.
 ///
 /// A request carries no resolved credential and no secret material. The model
@@ -938,6 +1034,14 @@ pub enum AgentRunEffectRequest {
         /// The generation being compensated.
         compensated_generation: AgentEffectGeneration,
     },
+    /// Promote selected session-memory entries into the agent's private
+    /// long-term store ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// an idempotent durable effect, committed by a deduplicated run command
+    /// and executed by the dispatcher's promotion executor.
+    MemoryPromotion {
+        /// What to promote and where.
+        promotion: Box<AgentMemoryPromotionRequest>,
+    },
 }
 
 impl AgentRunEffectRequest {
@@ -948,6 +1052,7 @@ impl AgentRunEffectRequest {
             Self::Model { .. } => AgentRunEffectKind::ModelCall,
             Self::Tool { .. } => AgentRunEffectKind::ToolCall,
             Self::Compensation { .. } => AgentRunEffectKind::CompensationCall,
+            Self::MemoryPromotion { .. } => AgentRunEffectKind::MemoryPromotionCall,
         }
     }
 
@@ -955,7 +1060,7 @@ impl AgentRunEffectRequest {
     #[must_use]
     pub fn tool_call(&self) -> Option<&AgentToolCallRequest> {
         match self {
-            Self::Model { .. } | Self::Compensation { .. } => None,
+            Self::Model { .. } | Self::Compensation { .. } | Self::MemoryPromotion { .. } => None,
             Self::Tool { call } => Some(call),
         }
     }
@@ -1012,6 +1117,12 @@ impl AgentRunEffectRequest {
             Self::Compensation { compensation, .. } => AgentEffectTarget {
                 target_type: "compensation".to_string(),
                 name: compensation.as_str().to_string(),
+                address: None,
+                attributes: BTreeMap::new(),
+            },
+            Self::MemoryPromotion { promotion } => AgentEffectTarget {
+                target_type: "memory-promotion".to_string(),
+                name: promotion.kind.as_label().to_string(),
                 address: None,
                 attributes: BTreeMap::new(),
             },
@@ -1487,6 +1598,12 @@ pub enum AgentRunEffectOutcome {
         /// The bounded result content.
         content: AgentTaskContent,
     },
+    /// A memory promotion durably upserted its selected entries
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+    MemoryPromotion {
+        /// The bounded receipt: identities and revisions only, never content.
+        promoted: Vec<AgentPromotedMemoryRef>,
+    },
     /// The generation failed definitively.
     Failed {
         /// Stable machine-readable code.
@@ -1521,14 +1638,19 @@ impl AgentRunEffectOutcome {
     /// Whether the effect produced its bounded result.
     #[must_use]
     pub const fn is_completed(&self) -> bool {
-        matches!(self, Self::Model { .. } | Self::Tool { .. })
+        matches!(
+            self,
+            Self::Model { .. } | Self::Tool { .. } | Self::MemoryPromotion { .. }
+        )
     }
 
     /// The run-side status this outcome resolves the generation to.
     #[must_use]
     pub const fn resolved_status(&self) -> AgentRunEffectStatus {
         match self {
-            Self::Model { .. } | Self::Tool { .. } => AgentRunEffectStatus::Succeeded,
+            Self::Model { .. } | Self::Tool { .. } | Self::MemoryPromotion { .. } => {
+                AgentRunEffectStatus::Succeeded
+            }
             Self::Failed { .. } => AgentRunEffectStatus::Failed,
             Self::Exhausted { .. } => AgentRunEffectStatus::Exhausted,
             Self::Indeterminate { .. } => AgentRunEffectStatus::Indeterminate,
@@ -1576,6 +1698,19 @@ impl AgentRunEffectOutcome {
                         call_id: call_id.clone(),
                         bytes,
                         maximum: AGENT_TOOL_RESULT_MAX_BYTES,
+                    });
+                }
+                Ok(())
+            }
+            Self::MemoryPromotion { promoted } => {
+                if promoted.len() > AGENT_MEMORY_PROMOTION_MAX_ENTRIES {
+                    return Err(AgentEffectError::InvalidPolicy {
+                        message: format!(
+                            "the promotion receipt names {} memories, which exceeds the {} \
+                             selection bound",
+                            promoted.len(),
+                            AGENT_MEMORY_PROMOTION_MAX_ENTRIES
+                        ),
                     });
                 }
                 Ok(())

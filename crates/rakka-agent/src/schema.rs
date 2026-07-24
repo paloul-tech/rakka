@@ -125,6 +125,21 @@ pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersi
 pub const CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted
+/// [`crate::memory::AgentPrivateMemory`].
+///
+/// A private memory outlives every run that touched it — it is the agent's
+/// long-term record, scoped `(TenantId, AgentId)` and persisted in a store
+/// independent of any run's state
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)) — so it
+/// carries its own version and fails closed on one this binary cannot read.
+/// Slice 2.1 reshaped the record declared by slice 1.11 without bumping this
+/// version, under the unreleased-branch rule the slice 1.7 amendment recorded:
+/// no released writer has ever persisted the earlier shape. The first reshape
+/// after a release must bump it.
+pub const CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of a persisted [`crate::checkpoints::AgentCheckpoint`].
 ///
 /// A checkpoint outlives the effect generation it gates — it is resolved by a
@@ -188,11 +203,13 @@ pub enum AgentRecordKind {
     MemoryContextSnapshot,
     /// One structured loop-decision event, retained by a bounded sink.
     DecisionEvent,
+    /// One agent-private long-term memory, scoped `(TenantId, AgentId)`.
+    PrivateMemory,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -213,6 +230,7 @@ impl AgentRecordKind {
         Self::SessionMemoryEntry,
         Self::MemoryContextSnapshot,
         Self::DecisionEvent,
+        Self::PrivateMemory,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -239,6 +257,7 @@ impl AgentRecordKind {
             Self::SessionMemoryEntry => "agent-session-memory-entry",
             Self::MemoryContextSnapshot => "agent-memory-context-snapshot",
             Self::DecisionEvent => "agent-decision-event",
+            Self::PrivateMemory => "agent-private-memory",
         }
     }
 
@@ -266,6 +285,7 @@ impl AgentRecordKind {
             Self::SessionMemoryEntry => CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION,
             Self::MemoryContextSnapshot => CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
             Self::DecisionEvent => CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
+            Self::PrivateMemory => CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION,
         }
     }
 
@@ -291,6 +311,7 @@ impl AgentRecordKind {
             Self::SessionMemoryEntry => 17,
             Self::MemoryContextSnapshot => 18,
             Self::DecisionEvent => 19,
+            Self::PrivateMemory => 20,
         }
     }
 }

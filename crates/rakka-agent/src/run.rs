@@ -96,8 +96,9 @@ use crate::choreography::{
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
     AgentEffectError, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
-    AgentEffectSpec, AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome,
-    AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult,
+    AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect, AgentRunEffectKind,
+    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus,
+    AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
 };
 use crate::identity::{
     AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
@@ -105,7 +106,7 @@ use crate::identity::{
 };
 use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
 use crate::memory::{
-    assemble_session_context, AgentContextSnapshotRef, AgentRunMemory, MemoryError,
+    assemble_session_context, AgentContextSnapshotRef, AgentRunMemory, MemoryError, MemorySequence,
     SessionMemoryEntry,
 };
 use crate::model::AgentModelError;
@@ -942,6 +943,28 @@ pub fn proposal_operation_id(
             scope.agent().as_str(),
             scope.run().as_str(),
             &turn.to_string(),
+        ],
+    )
+}
+
+/// Derives the stable operation id of one memory-promotion command
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The caller supplies a discriminator it can reconstruct after a crash — a
+/// policy epoch, a turn number — so a retried command deduplicates against the
+/// promotion it already committed instead of promoting twice.
+pub fn promotion_operation_id(
+    scope: &AgentRunScope,
+    discriminator: impl AsRef<str>,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::MemoryWrite,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            "promote",
+            discriminator.as_ref(),
         ],
     )
 }
@@ -1955,6 +1978,15 @@ fn apply_effect_outcome(
                 run.status = AgentRunStatus::Running;
             }
         }
+        AgentRunEffectOutcome::MemoryPromotion { promoted } => {
+            // A promotion is not part of the turn: the bounded receipt is
+            // recorded and nothing else moves — no phase, no status, no
+            // resumption. Whatever wait the run held, it still holds, and a
+            // winding-down run records the receipt and keeps quiescing.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            run.loop_state
+                .record_memory_promotion(effect_id.clone(), promoted.clone(), now);
+        }
         AgentRunEffectOutcome::Failed { code, .. }
         | AgentRunEffectOutcome::Exhausted { code, .. } => {
             // Final for the generation: the dispatch layer already applied the
@@ -1965,14 +1997,23 @@ fn apply_effect_outcome(
             // work already at the dispatch layer settles truthfully.
             effect.status = outcome.resolved_status();
             effect.last_error_code = Some(bounded_detail(code.clone()));
+            let failed_kind = effect.kind();
             let code = code.clone();
-            let run = state.run_mut()?;
-            run.loop_state.fence_unsent_effects();
-            if run.terminal_reason.is_none() {
-                run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
-                    effect_id: effect_id.clone(),
-                    code: bounded_detail(code),
-                });
+            // A failed memory promotion is the one exception to the wind-down:
+            // memory is never the correctness source
+            // ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)),
+            // so a memory-store outage must not kill a live run. The failure
+            // stays on the effect record, and the initiator may re-issue the
+            // promotion under a new operation id.
+            if failed_kind != AgentRunEffectKind::MemoryPromotionCall {
+                let run = state.run_mut()?;
+                run.loop_state.fence_unsent_effects();
+                if run.terminal_reason.is_none() {
+                    run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
+                        effect_id: effect_id.clone(),
+                        code: bounded_detail(code),
+                    });
+                }
             }
         }
         AgentRunEffectOutcome::Indeterminate { code, .. } => {
@@ -2578,6 +2619,86 @@ fn schedule_compensation(
             effect_id: effect_id.clone(),
             compensation,
         });
+    }
+
+    let turn = run.loop_state.turn();
+    let slot = run.loop_state.next_effect_slot();
+    let settings_revision = run.loop_state.agent_settings_revision();
+    let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    run.loop_state.record_effect(effect)?;
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Commits one memory-promotion effect from a deduplicated command
+/// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The transition is bounded and performs no I/O
+/// ([specification 9.5](../../../docs/plans/rakka-agent/spec.md)): it
+/// validates the selection against durable state, reserves the promotion's
+/// attempt budget, and records the effect. The dispatcher-side executor does
+/// the session reads and private-store upserts inside its bounded attempt.
+/// The run's status and phase do not move — a promotion is not part of the
+/// turn, and whatever wait the run held, it still holds; the settle pass
+/// flushes owed session entries before dispatching effects, so the selection
+/// is durably in the store before the executor reads it.
+fn promote_memory(
+    state: &mut AgentRunState,
+    promotion: AgentMemoryPromotionRequest,
+    session_wired: bool,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Err(AgentRunError::Terminal { status: run.status });
+    }
+    if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
+        // A promotion is new work, which the wind-down fence forbids —
+        // contrast with compensation, the one effect an explicit decision
+        // authorizes past the fence.
+        return Err(AgentRunError::MemoryPromotionFenced { status: run.status });
+    }
+    if !session_wired {
+        return Err(AgentRunError::SessionMemoryUnwired);
+    }
+
+    let selected = promotion.selected_entries();
+    let Some(selected) = selected.filter(|count| {
+        usize::try_from(*count).is_ok_and(|count| count <= AGENT_MEMORY_PROMOTION_MAX_ENTRIES)
+    }) else {
+        return Err(AgentRunError::MemorySelectionInvalid {
+            from: promotion.from_sequence,
+            to: promotion.to_sequence,
+            maximum: AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+        });
+    };
+    if promotion.to_sequence.get() > run.loop_state.session_sequence() {
+        // The run may only promote sequences it has durably assigned: such an
+        // entry is either in the store already or owed by the outbox the
+        // settle pass flushes before any dispatch.
+        return Err(AgentRunError::MemorySelectionOutOfRange {
+            to: promotion.to_sequence,
+            latest: run.loop_state.session_sequence(),
+        });
+    }
+    if promotion.target.is_some() && selected != 1 {
+        // A consolidation updates exactly one memory from exactly one source
+        // entry, so the merged content stays bounded and deterministic.
+        return Err(AgentRunError::MemoryConsolidationInvalid);
+    }
+
+    let request = AgentRunEffectRequest::MemoryPromotion {
+        promotion: Box::new(promotion),
+    };
+    let spec = policies.spec_for(&request).clone();
+    if let Err(exhaustion) = run
+        .loop_state
+        .budget_mut()
+        .reserve_attempts(spec.max_attempts)
+    {
+        return Err(AgentRunError::MemoryPromotionUnaffordable { exhaustion });
     }
 
     let turn = run.loop_state.turn();
@@ -3231,6 +3352,18 @@ where
                 })
                 .await?
             }
+            AgentRunEntityCommand::PromoteMemory {
+                operation_id,
+                promotion,
+            } => {
+                let policies = self.policies.clone();
+                let session_wired = self.memory.is_some();
+                self.transition(now, move |state| {
+                    promote_memory(state, *promotion, session_wired, &policies, now)?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
         };
 
         self.settle_side_effects(router, now).await?;
@@ -3841,6 +3974,19 @@ pub enum AgentRunEntityCommand {
         /// A bounded, stable reason.
         reason: String,
     },
+    /// Promote a bounded selection of this run's session memory into the
+    /// agent's private long-term store
+    /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// commits one idempotent durable `MemoryPromotion` effect in a bounded
+    /// transition. Application- or policy-initiated; model-visible memory
+    /// tools are a later slice.
+    PromoteMemory {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`promotion_operation_id`].
+        operation_id: AgentOperationId,
+        /// What to promote and where.
+        promotion: Box<AgentMemoryPromotionRequest>,
+    },
     /// Read the run's bounded durable projection.
     Describe,
 }
@@ -3854,7 +4000,8 @@ impl AgentRunEntityCommand {
             | Self::ResolveIndeterminateEffect { operation_id, .. }
             | Self::ResolveCheckpoint { operation_id, .. }
             | Self::FireCheckpointTimers { operation_id }
-            | Self::Cancel { operation_id, .. } => Some(operation_id),
+            | Self::Cancel { operation_id, .. }
+            | Self::PromoteMemory { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -4525,6 +4672,40 @@ pub enum AgentRunError {
     /// backend outage surfaces here from a settle pass — the run's durable
     /// transition already committed — and a retry re-drives the idempotent write.
     Memory(Box<MemoryError>),
+    /// A promotion was requested of a run with no session-memory backend: it
+    /// has nothing to promote and no store the executor could read.
+    SessionMemoryUnwired,
+    /// A promotion was requested of a run that is winding down; a promotion is
+    /// new work, which the wind-down fence forbids.
+    MemoryPromotionFenced {
+        /// The status the run held.
+        status: AgentRunStatus,
+    },
+    /// A promotion selection was empty, inverted, or wider than its bound.
+    MemorySelectionInvalid {
+        /// The first selected sequence.
+        from: MemorySequence,
+        /// The last selected sequence.
+        to: MemorySequence,
+        /// The most entries one promotion may select.
+        maximum: usize,
+    },
+    /// A promotion selected session sequences the run has not durably
+    /// assigned.
+    MemorySelectionOutOfRange {
+        /// The last selected sequence.
+        to: MemorySequence,
+        /// The highest sequence the run has assigned.
+        latest: u64,
+    },
+    /// A consolidation selected more than one source entry; it updates exactly
+    /// one memory from exactly one entry.
+    MemoryConsolidationInvalid,
+    /// A promotion could not reserve its attempt bound from the run's budget.
+    MemoryPromotionUnaffordable {
+        /// The ceiling the reservation would cross.
+        exhaustion: AgentBudgetExhaustion,
+    },
 }
 
 impl AgentRunError {
@@ -4549,6 +4730,12 @@ impl AgentRunError {
             Self::RedispatchUnaffordable { .. } => "run-redispatch-unaffordable",
             Self::MaterializedStateTooLarge { .. } => "run-state-too-large",
             Self::Memory(error) => error.code(),
+            Self::SessionMemoryUnwired => "run-session-memory-unwired",
+            Self::MemoryPromotionFenced { .. } => "run-memory-promotion-fenced",
+            Self::MemorySelectionInvalid { .. } => "run-memory-selection-invalid",
+            Self::MemorySelectionOutOfRange { .. } => "run-memory-selection-out-of-range",
+            Self::MemoryConsolidationInvalid => "run-memory-consolidation-invalid",
+            Self::MemoryPromotionUnaffordable { .. } => "run-memory-promotion-unaffordable",
         }
     }
 }
@@ -4602,6 +4789,31 @@ impl Display for AgentRunError {
                 "the materialized run record is {bytes} bytes, which exceeds the {maximum} byte limit"
             ),
             Self::Memory(error) => Display::fmt(error, f),
+            Self::SessionMemoryUnwired => write!(
+                f,
+                "the run has no session-memory backend wired, so there is nothing to promote"
+            ),
+            Self::MemoryPromotionFenced { status } => write!(
+                f,
+                "the run is {status} and winding down; a promotion is new work the fence forbids"
+            ),
+            Self::MemorySelectionInvalid { from, to, maximum } => write!(
+                f,
+                "the promotion selection {from}..={to} is empty, inverted, or wider than the \
+                 {maximum} entry bound"
+            ),
+            Self::MemorySelectionOutOfRange { to, latest } => write!(
+                f,
+                "the promotion selects up to sequence {to}, but the run has only assigned {latest}"
+            ),
+            Self::MemoryConsolidationInvalid => write!(
+                f,
+                "a consolidation updates exactly one memory from exactly one source entry"
+            ),
+            Self::MemoryPromotionUnaffordable { exhaustion } => write!(
+                f,
+                "the promotion cannot reserve its attempt bound ({exhaustion})"
+            ),
         }
     }
 }
