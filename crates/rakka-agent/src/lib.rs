@@ -222,8 +222,8 @@ pub use query::{
     AgentSessionSegmentSource, AgentSessionTraceSegment, AgentSessionView,
 };
 pub use retrieval::{
-    assemble_context, derive_retrieval_query, memory_embedding_text, AgentMemoryEmbedder,
-    AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
+    assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
+    AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
     InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome, MemoryRetrievalPolicy,
     MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
     AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES,

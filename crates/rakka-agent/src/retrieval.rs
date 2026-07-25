@@ -716,13 +716,13 @@ impl AgentPrivateMemoryRetriever for InMemoryPrivateMemoryRetriever {
                 }
                 Some(embedder) => {
                     let reference = embedder.embedding_ref();
-                    let query_vector = embed_checked(embedder.as_ref(), query.text()).await?;
+                    let query_vector = embed_memory_vector(embedder.as_ref(), query.text()).await?;
                     let mut ranked = Vec::with_capacity(admitted.len());
                     for memory in admitted {
                         let Some(text) = memory_embedding_text(&memory.content) else {
                             continue;
                         };
-                        let vector = embed_checked(embedder.as_ref(), &text).await?;
+                        let vector = embed_memory_vector(embedder.as_ref(), &text).await?;
                         ranked.push(RetrievedPrivateMemory {
                             memory,
                             relevance_bps: cosine_relevance_bps(&query_vector, &vector),
@@ -749,8 +749,23 @@ impl AgentPrivateMemoryRetriever for InMemoryPrivateMemoryRetriever {
 }
 
 /// Embeds one text and fails closed on a vector the embedder's declared
-/// reference misdescribes.
-async fn embed_checked(
+/// [`MemoryEmbeddingRef`] misdescribes: a length other than the declared
+/// dimension count, or any non-finite component.
+///
+/// This is the checking every retrieval backend owes the
+/// [`AgentMemoryEmbedder`] contract, so it is public and shared rather than
+/// reimplemented per adapter — a backend that validated only the length would
+/// hand its index a vector whose geometry is undefined, and one that skipped
+/// both would store a vector its own metadata contradicts. Both the in-memory
+/// reference retriever here and the pgvector adapter in `rakka-agent-postgres`
+/// call it, so both refuse identically and with the same
+/// `memory-embedding-invalid` code.
+///
+/// # Errors
+///
+/// Returns [`MemoryError::InvalidEmbeddingRef`] on either mismatch, and
+/// whatever error the embedder itself reports.
+pub async fn embed_memory_vector(
     embedder: &dyn AgentMemoryEmbedder,
     text: &str,
 ) -> Result<Vec<f32>, MemoryError> {
