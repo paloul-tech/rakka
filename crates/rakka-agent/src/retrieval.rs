@@ -273,6 +273,17 @@ pub struct MemoryRetrievalOutcome {
 /// memory is never a correctness source. The trait is object-safe so callers
 /// hold `Arc<dyn AgentPrivateMemoryRetriever>`; the in-memory reference
 /// implementation lives here, the pgvector adapter in `rakka-agent-postgres`.
+///
+/// # Scope isolation is the implementation's alone to enforce
+///
+/// [`assemble_context`] re-checks everything it can about a returned record —
+/// record validity, classification, confidence, tombstone, expiry,
+/// duplication — but it cannot re-check *scope*: an [`AgentPrivateMemory`]
+/// carries no tenant or agent, so a record answered from the wrong scope is
+/// indistinguishable from a correct one by the time the assembly sees it.
+/// Answering only for the addressed [`AgentScope`] is therefore the one
+/// contract clause no downstream layer can catch a violation of, and the one
+/// an implementation must prove with its own tests (scenario 18).
 pub trait AgentPrivateMemoryRetriever: Send + Sync + 'static {
     /// Stable backend name, used in telemetry and the snapshot's retrieval
     /// record.
@@ -375,6 +386,11 @@ impl MemoryRetrievalPolicy {
 
     /// Sets the selection's content byte budget, clamped to
     /// `1..=`[`AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES`].
+    ///
+    /// Selection *stops* at the first ranked record that would exceed the
+    /// budget rather than skipping it, so the selection stays a rank prefix
+    /// and a large record can leave the budget under-filled — see
+    /// [`assemble_context`].
     #[must_use]
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = max_bytes.clamp(1, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES);
@@ -879,10 +895,27 @@ pub struct AssembledContext {
 /// no write: persistence stays the caller's, through the idempotent
 /// first-writer-wins [`crate::memory::ContextSnapshotStore::persist`].
 ///
+/// The re-checks cover every property a record carries; scope is the
+/// exception, and stays the retriever's own obligation — see
+/// [`AgentPrivateMemoryRetriever`].
+///
 /// A retriever error degrades the turn — empty selection, attempted retrieval
 /// still recorded — instead of failing the assembly
 /// ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)); a
 /// session-store error propagates, as it always has.
+///
+/// # The selection is always a rank prefix
+///
+/// Selection walks the surviving ranked records in order and *stops* at the
+/// first one that would exceed [`MemoryRetrievalPolicy::max_results`] or
+/// [`MemoryRetrievalPolicy::max_bytes`], rather than skipping it to fit a
+/// smaller record ranked below it. Skipping would make the selected set depend
+/// on the byte sizes of the records it passed over, so two corpora that rank
+/// identically could select different memories; stopping keeps the selection a
+/// prefix of the ranking that survived the re-checks and the ingress boundary,
+/// which is the property a reader of the snapshot can actually reason about.
+/// The cost is deliberate: one large record can leave the byte budget
+/// under-filled.
 pub async fn assemble_context(
     memory: &AgentRunMemory,
     scope: &AgentRunScope,
@@ -955,9 +988,12 @@ pub async fn assemble_context(
         }
         let memory_record = retrieved.memory;
 
-        // Fail-closed re-checks: the assembly trusts no adapter. A record the
-        // query would not admit, an invalid record, or a duplicate is
-        // rejected here even if the retriever returned it.
+        // Fail-closed re-checks: a record the query would not admit, an
+        // invalid record, or a duplicate is rejected here even if the
+        // retriever returned it. Scope is the one clause these cannot cover —
+        // an `AgentPrivateMemory` carries no tenant or agent, so answering
+        // only for the addressed scope stays the retriever's own obligation
+        // (see `AgentPrivateMemoryRetriever`).
         if memory_record.validate().is_err()
             || !query.admits(&memory_record, now)
             || !seen.insert(memory_record.memory_id.clone())
@@ -1008,7 +1044,6 @@ pub async fn assemble_context(
             }
             let transformed = AgentTaskContent::Inline(decision.content.clone());
             let digest = transformed.digest();
-            report.transformed += 1;
             (transformed, digest)
         } else {
             (
@@ -1022,6 +1057,14 @@ pub async fn assemble_context(
             break;
         }
         selected_bytes += entry_bytes;
+
+        // Outcome accounting follows the budget check, so every count here
+        // describes a record the snapshot actually embeds: a transform on a
+        // record the budget then stopped at is not a transform the snapshot
+        // carries.
+        if decision.transformed {
+            report.transformed += 1;
+        }
         report.reported += decision.reports.len();
 
         selections.push(SnapshotPrivateMemory {
@@ -1813,6 +1856,132 @@ mod tests {
             2,
             "the ranked selection stops at the policy's entry bound"
         );
+    }
+
+    #[tokio::test]
+    async fn selection_stops_at_the_byte_budget_instead_of_skipping() {
+        // The byte budget is a rank prefix, not a knapsack: the record that
+        // overflows it ends the selection, and a smaller record ranked below
+        // that one is not pulled up to fill the remaining budget. Skipping
+        // would make the selected set depend on the sizes of the records it
+        // passed over.
+        let scope = run_scope().agent_scope();
+        let head = private_memory(&scope, "alpha", "renewal contract terms");
+        let overflowing = private_memory(&scope, "big", &"renewal contract terms ".repeat(20));
+        let tail = private_memory(&scope, "gamma", "renewal contract terms");
+        let head_bytes = head.content.size_bytes();
+        let tail_bytes = tail.content.size_bytes();
+        // A budget that fits the head and the tail together, but not the
+        // record ranked between them.
+        let budget = head_bytes + tail_bytes;
+        assert!(
+            head_bytes + overflowing.content.size_bytes() > budget,
+            "the middle record must be the one that overflows the budget"
+        );
+
+        let outcome = MemoryRetrievalOutcome {
+            memories: vec![
+                RetrievedPrivateMemory {
+                    memory: head,
+                    relevance_bps: 9_000,
+                    embedding: None,
+                },
+                RetrievedPrivateMemory {
+                    memory: overflowing,
+                    relevance_bps: 8_000,
+                    embedding: None,
+                },
+                RetrievedPrivateMemory {
+                    memory: tail,
+                    relevance_bps: 7_000,
+                    embedding: None,
+                },
+            ],
+            index_watermark: None,
+        };
+        let retrieval = AgentMemoryRetrieval::new(
+            Arc::new(ScriptedPrivateMemoryRetriever::new().with_outcome(outcome)),
+            AgentGuardrailChain::new(AgentRevisionNumber::INITIAL),
+        )
+        .with_policy(MemoryRetrievalPolicy::recent_context().with_max_bytes(budget));
+        let (memory, scope) = memory_with_session(Some(retrieval)).await;
+        let reference = AgentContextSnapshotRef::for_turn(&scope, 1).expect("reference");
+        let assembled = assemble_context(
+            &memory,
+            &scope,
+            &reference,
+            1,
+            AgentRevisionNumber::INITIAL,
+            now(),
+        )
+        .await
+        .expect("assembly");
+
+        assert_eq!(
+            assembled
+                .snapshot
+                .private_memory
+                .iter()
+                .map(|selection| selection.memory_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mem-alpha"],
+            "the selection stopped at the overflowing record rather than skipping to mem-gamma"
+        );
+        assert_eq!(
+            assembled.snapshot.budget.private_memory_bytes, head_bytes,
+            "the budget accounts exactly the bytes the snapshot embeds"
+        );
+        assert_eq!(assembled.snapshot.budget.private_memories, 1);
+        assert_eq!(assembled.retrieval.selected, 1);
+    }
+
+    #[tokio::test]
+    async fn a_transform_the_byte_budget_stops_at_is_not_counted() {
+        // Outcome accounting describes the snapshot: a record whose transform
+        // ran but whose bytes the budget then refused is not a transform the
+        // snapshot carries, so it must not be counted as one.
+        let replacement = json!(format!("[cleaned] {}", "renewal terms ".repeat(20)));
+        let transformed_bytes = AgentTaskContent::Inline(replacement.clone()).size_bytes();
+        let scope = run_scope();
+        let store = seeded_store(
+            &scope.agent_scope(),
+            // Identical text, so relevance ties and the rank order is the
+            // documented ascending-memory-id tiebreak.
+            &[
+                ("alpha", "renewal contract terms"),
+                ("beta", "renewal contract terms"),
+            ],
+        )
+        .await;
+        let retrieval = AgentMemoryRetrieval::new(
+            Arc::new(InMemoryPrivateMemoryRetriever::new(store)),
+            ingress_chain(AgentGuardrailOutcome::Transform {
+                content: replacement,
+                reason_code: "pii-scrub".to_string(),
+            }),
+        )
+        // Room for exactly one transformed record.
+        .with_policy(MemoryRetrievalPolicy::recent_context().with_max_bytes(transformed_bytes));
+        let (memory, scope) = memory_with_session(Some(retrieval)).await;
+        let reference = AgentContextSnapshotRef::for_turn(&scope, 1).expect("reference");
+        let assembled = assemble_context(
+            &memory,
+            &scope,
+            &reference,
+            1,
+            AgentRevisionNumber::INITIAL,
+            now(),
+        )
+        .await
+        .expect("assembly");
+
+        assert_eq!(assembled.snapshot.private_memory.len(), 1);
+        assert_eq!(assembled.snapshot.private_memory[0].transforms.len(), 1);
+        assert_eq!(
+            assembled.retrieval.transformed, 1,
+            "the second record's transform was refused by the budget, not embedded"
+        );
+        assert_eq!(assembled.retrieval.selected, 1);
     }
 
     #[tokio::test]
