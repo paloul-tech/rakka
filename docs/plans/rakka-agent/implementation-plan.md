@@ -1654,10 +1654,16 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
   boundary; a no-stage deployment passes an empty chain explicitly. The
   query is derived deterministically from the just-assembled session window
   (never a second store read), every returned record is re-checked
-  fail-closed against the query's own pre-ranking filter table (the assembly
-  trusts no adapter — duplicates, out-of-scope classifications, and invalid
-  records are rejected), and the ingress evaluation runs per record with the
-  memory's identity on the guardrail context. Outcomes: block drops that
+  fail-closed against the query's own pre-ranking filter table — duplicates,
+  inadmissible classifications, and invalid records are rejected — and the
+  ingress evaluation runs per record with the memory's identity on the
+  guardrail context. The re-check's limit is documented rather than
+  overstated: *scope* is the one clause it cannot cover, because an
+  `AgentPrivateMemory` carries no tenant or agent, so a wrong-scope record is
+  indistinguishable from a correct one by the time the assembly sees it.
+  Answering only for the addressed scope therefore stays the retriever's own
+  obligation, and the one clause a backend must prove with its own tests
+  (scenario 18). Outcomes: block drops that
   record only; a transform's output is what the snapshot embeds, recorded
   with its stage revision, and a retry reuses it *structurally*;
   report-only records the finding on the selection; require-checkpoint is a
@@ -1694,14 +1700,29 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
   databases without pgvector — which is also why the 2.1 tombstone/delete/
   purge CTEs were *not* extended to touch the derived table. Instead the
   retrieval statement inner-joins the authoritative row on scope,
-  `source_revision = revision`, tombstone, and expiry — every filter,
-  classification included, a `WHERE` predicate ahead of the `ORDER BY`
-  distance — so a leftover vector row is unretrievable in any scope even
-  mid-crash between a delete and its deindex, and eventual consistency
-  manifests as absence, never as ranking current content by stale geometry.
+  `source_revision = revision`, tombstone, and expiry — every filter the
+  query carries, classification *and* the confidence floor included, a
+  `WHERE` predicate ahead of the `ORDER BY` distance — so a leftover vector
+  row is unretrievable in any scope even mid-crash between a delete and its
+  deindex, and eventual consistency manifests as absence, never as ranking
+  current content by stale geometry. Both policy columns are denormalized
+  onto the derived row for exactly that reason (a predicate can only sit
+  ahead of the `ORDER BY` if its column is in the ranked table), and neither
+  can go stale, because the revision fence makes a row whose authoritative
+  policy metadata has moved a non-candidate outright. Enforcing either one
+  only in the adapter's post-decode re-check would have been a *post-`LIMIT`*
+  drop: the record it removes has already consumed a result slot, so a
+  retrieval would answer short of what the corpus holds — the review finding
+  this amendment records as fixed.
   Deployment-invoked maintenance (`index_memory`, paged `reindex` as the
   spec 13.3 rebuild path, `deindex_memory`/`purge_orphaned` as residual-row
-  hygiene) mirrors `purge_expired`'s no-resident-sweeper pattern. Vectors
+  hygiene) mirrors `purge_expired`'s no-resident-sweeper pattern, and
+  `reindex` pages *past* a record it cannot decode — advancing its cursor on
+  each row's own id before any fallible step and counting the record into
+  `ReindexPage::failed` — because propagating instead would wedge the sweep
+  on the same page forever and take the rebuild path offline for that agent
+  during exactly the rolling upgrade that produces unreadable records.
+  Vectors
   bind as text literals (`$n::text::vector`, no new dependency; f32
   shortest-round-trip formatting is exact through pgvector's parser, proven
   server-side by zero self-distance), failing closed on non-finite or

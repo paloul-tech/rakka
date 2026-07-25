@@ -16,8 +16,10 @@
 //! # Filters before ranking
 //!
 //! Tenant, agent, embedder compatibility (model, dimensions, version),
-//! revision currency, tombstone, expiry, and classification are all `WHERE`
-//! predicates evaluated before the `ORDER BY` distance — the
+//! revision currency, tombstone, expiry, classification, and the confidence
+//! floor are all `WHERE` predicates evaluated before the `ORDER BY` distance —
+//! never a post-`LIMIT` filter, which would let inadmissible records consume
+//! result slots and answer short of what the corpus holds — the
 //! [specification 16](../../../docs/plans/rakka-agent/spec.md) before-ranking
 //! rule as SQL shape, not convention. The scope columns lead the table's
 //! primary key, so the scope filter is a btree prefix in the schema itself
@@ -124,6 +126,14 @@ pub const PGVECTOR_MAX_DIMENSIONS: u32 = 16_000;
 /// rebuildable derived data, exactly as
 /// [specification 13.3](../../../docs/plans/rakka-agent/spec.md) requires.
 /// No content bytes, ever: the vector plus content-free metadata only.
+///
+/// `classification` and `confidence_bps` are denormalized here for the same
+/// single reason: [specification 16](../../../docs/plans/rakka-agent/spec.md)
+/// requires them enforced *before* ranking, and a predicate can only sit ahead
+/// of the `ORDER BY` if the column is in the ranked table. Neither can go
+/// stale, because `source_revision = revision` is a retrieval predicate and
+/// every authoritative change to a record is a compare-and-set revision bump —
+/// a row whose policy metadata has moved is not a candidate at all.
 pub const VECTOR_MIGRATION_SQL: &str = "
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -136,6 +146,7 @@ CREATE TABLE IF NOT EXISTS rakka_agent_private_memory_embedding (
     version BIGINT NOT NULL CHECK (version > 0),
     source_revision BIGINT NOT NULL CHECK (source_revision > 0),
     classification TEXT NOT NULL,
+    confidence_bps INTEGER NOT NULL CHECK (confidence_bps BETWEEN 0 AND 10000),
     content_digest TEXT NOT NULL,
     derived_at BIGINT NOT NULL,
     embedding vector NOT NULL CHECK (vector_dims(embedding) = dimensions),
@@ -240,10 +251,19 @@ pub enum IndexOutcome {
 pub struct ReindexPage {
     /// How many vectors this page derived and stored.
     pub indexed: u64,
-    /// How many candidates this page skipped (redacted or artifact-backed
-    /// content). Skipped candidates remain candidates; page past them with
-    /// [`Self::next`].
+    /// How many candidates this page skipped by policy (redacted or
+    /// artifact-backed content). Skipped candidates remain candidates; page
+    /// past them with [`Self::next`].
     pub skipped: u64,
+    /// How many candidates this page could not interpret — a stored record
+    /// this binary cannot decode, or one its schema policy refuses.
+    ///
+    /// These are counted and paged past rather than failing the sweep, so one
+    /// unreadable record cannot stall a rebuild (see
+    /// [`PgvectorPrivateMemoryRetriever::reindex`]). A non-zero count is an
+    /// operational signal: the records behind it have no current vector and
+    /// are therefore unretrievable until whatever cannot read them is fixed.
+    pub failed: u64,
     /// The cursor for the next page, `None` when the scan completed.
     pub next: Option<AgentPrivateMemoryId>,
 }
@@ -391,14 +411,16 @@ impl PgvectorPrivateMemoryRetriever {
             .execute(
                 "INSERT INTO rakka_agent_private_memory_embedding
                      (tenant, agent, memory_id, model, dimensions, version,
-                      source_revision, classification, content_digest, derived_at, embedding)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text::vector)
+                      source_revision, classification, confidence_bps,
+                      content_digest, derived_at, embedding)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::text::vector)
                  ON CONFLICT (tenant, agent, memory_id) DO UPDATE SET
                      model = EXCLUDED.model,
                      dimensions = EXCLUDED.dimensions,
                      version = EXCLUDED.version,
                      source_revision = EXCLUDED.source_revision,
                      classification = EXCLUDED.classification,
+                     confidence_bps = EXCLUDED.confidence_bps,
                      content_digest = EXCLUDED.content_digest,
                      derived_at = EXCLUDED.derived_at,
                      embedding = EXCLUDED.embedding
@@ -416,6 +438,7 @@ impl PgvectorPrivateMemoryRetriever {
                     &version,
                     &source_revision,
                     &memory.classification.as_label(),
+                    &i32::from(memory.confidence_bps),
                     &memory.content_digest.value.as_str(),
                     &derived_at,
                     &encoded.as_str(),
@@ -493,10 +516,25 @@ impl PgvectorPrivateMemoryRetriever {
     /// identical retrieval. Bounded, idempotent, deployment-invoked — page
     /// with the returned cursor until [`ReindexPage::next`] is `None`.
     ///
+    /// # A single unreadable record cannot stall the rebuild
+    ///
+    /// The cursor advances on each row's own id before anything fallible runs,
+    /// and a record this binary cannot decode — or whose schema version its
+    /// fail-closed policy refuses, which is exactly what a rolling upgrade
+    /// produces when a newer node has written a newer record shape — is
+    /// counted into [`ReindexPage::failed`] and paged past. Propagating it
+    /// instead would wedge the sweep permanently: the caller's cursor would
+    /// never advance beyond the offending row, so every retry would re-read
+    /// the same page and fail identically, and the rebuild path would be
+    /// unavailable for that agent until the record was repaired by hand.
+    ///
     /// # Errors
     ///
     /// Returns the same errors as
-    /// [`PgvectorPrivateMemoryRetriever::index_memory`].
+    /// [`PgvectorPrivateMemoryRetriever::index_memory`] — SQL failures and
+    /// embedder-identity mismatches, which are conditions of the deployment
+    /// rather than of one record, so retrying the same page is the correct
+    /// response to them.
     pub async fn reindex(
         &self,
         scope: &AgentScope,
@@ -542,10 +580,20 @@ impl PgvectorPrivateMemoryRetriever {
         let more_may_remain = rows.len() == limit;
         let mut indexed = 0u64;
         let mut skipped = 0u64;
+        let mut failed = 0u64;
         let mut last: Option<AgentPrivateMemoryId> = None;
         for row in rows {
-            let memory = self.decode_memory(&row.get::<_, Vec<u8>>("record"))?;
-            last = Some(memory.memory_id.clone());
+            // The cursor advances on the row's own id, ahead of every fallible
+            // step, so no single record can hold the sweep on this page.
+            let Ok(memory_id) = AgentPrivateMemoryId::new(row.get::<_, &str>("memory_id")) else {
+                failed += 1;
+                continue;
+            };
+            last = Some(memory_id);
+            let Ok(memory) = self.decode_memory(&row.get::<_, Vec<u8>>("record")) else {
+                failed += 1;
+                continue;
+            };
             if memory.classification.is_redacted() {
                 skipped += 1;
                 continue;
@@ -560,6 +608,7 @@ impl PgvectorPrivateMemoryRetriever {
         Ok(ReindexPage {
             indexed,
             skipped,
+            failed,
             next: if more_may_remain { last } else { None },
         })
     }
@@ -681,11 +730,14 @@ impl AgentPrivateMemoryRetriever for PgvectorPrivateMemoryRetriever {
                 .collect();
             let limit = query.limit().min(self.config.max_results).max(1);
             let limit_raw = i64::try_from(limit).unwrap_or(i64::MAX);
+            let min_confidence = i32::from(query.min_confidence_bps());
 
-            // One statement; every filter is a WHERE predicate ahead of the
-            // ORDER BY distance, and content comes only from the joined
-            // authoritative record. The scope_index CTE rides along so a
-            // zero-hit retrieval still reports its watermark.
+            // One statement; every filter the query carries is a WHERE
+            // predicate ahead of the ORDER BY distance — including the
+            // confidence floor, so a nearer low-confidence record cannot
+            // consume a LIMIT slot and shorten the answer — and content comes
+            // only from the joined authoritative record. The scope_index CTE
+            // rides along so a zero-hit retrieval still reports its watermark.
             let operator = self.config.distance.operator();
             let sql = format!(
                 "WITH scope_index AS (
@@ -707,8 +759,9 @@ impl AgentPrivateMemoryRetriever for PgvectorPrivateMemoryRetriever {
                        AND m.tombstoned = FALSE
                        AND (m.expires_at IS NULL OR m.expires_at > $7)
                        AND e.classification = ANY($8)
+                       AND e.confidence_bps >= $9
                      ORDER BY distance ASC, e.memory_id ASC
-                     LIMIT $9
+                     LIMIT $10
                  )
                  SELECT s.indexed, s.latest, h.record, h.distance
                  FROM scope_index s LEFT JOIN hits h ON TRUE
@@ -727,6 +780,7 @@ impl AgentPrivateMemoryRetriever for PgvectorPrivateMemoryRetriever {
                         &encoded.as_str(),
                         &now_raw,
                         &classifications,
+                        &min_confidence,
                         &limit_raw,
                     ],
                 )
@@ -743,10 +797,15 @@ impl AgentPrivateMemoryRetriever for PgvectorPrivateMemoryRetriever {
                     continue;
                 };
                 let memory = self.decode_memory(&bytes)?;
-                // Defense in depth: the SQL predicates already enforced the
-                // scope-and-classification table; the decoded record is
-                // re-checked against the full query filter before it leaves
-                // the adapter.
+                // Defense in depth, and nothing more: the statement's
+                // predicates already enforce every filter this re-check
+                // repeats, so a rejection here means the denormalized policy
+                // columns disagreed with the authoritative record — which the
+                // `source_revision = revision` fence should have made
+                // impossible. Dropping the record is the fail-closed answer
+                // either way. It is deliberately not the *only* enforcement of
+                // any filter: a post-LIMIT drop cannot be, because the record
+                // it silently removes has already consumed a result slot.
                 if !query.admits(&memory, now) {
                     continue;
                 }
@@ -1539,5 +1598,157 @@ mod tests {
              proving the exclusion above was a filter, not distance"
         );
         assert_eq!(outcome.memories[0].relevance_bps, 10_000);
+    }
+
+    #[tokio::test]
+    async fn pgvector_confidence_floor_applies_before_ranking_when_dsn_is_set() {
+        // The confidence floor is a predicate, not a post-LIMIT drop: a nearer
+        // record below the floor must not consume a result slot and leave the
+        // retrieval answering short of what the corpus holds.
+        let Some((store, retriever)) = vector_world().await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+
+        // The exact-match record is *below* the floor; the qualifying record is
+        // farther away. A post-LIMIT filter would return nothing at limit 1.
+        let mut nearest = memory(&owner, "unsure", "the launch date is friday");
+        nearest.confidence_bps = 5_000;
+        let nearest = store
+            .upsert(&owner, &nearest, PrivateMemoryExpectation::Absent)
+            .await
+            .expect("seed the low-confidence record");
+        retriever
+            .index_memory(&owner, &nearest.memory_id, now(100))
+            .await
+            .expect("index the low-confidence record");
+        let farther = seed_and_index(
+            &store,
+            &retriever,
+            &owner,
+            "confident",
+            "friday launch checklist",
+        )
+        .await;
+        assert_eq!(
+            farther.confidence_bps, 9_000,
+            "the seeded record is above the floor the query will set"
+        );
+
+        let floored = MemoryRetrievalQuery::new("the launch date is friday")
+            .with_min_confidence_bps(8_000)
+            .with_limit(1);
+        let outcome = retriever
+            .retrieve(&owner, &floored, now(200))
+            .await
+            .expect("retrieval");
+        let names: Vec<&str> = outcome
+            .memories
+            .iter()
+            .map(|retrieved| retrieved.memory.memory_id.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mem-confident"],
+            "the below-floor record was filtered before ranking, so the single \
+             result slot went to the record that qualifies"
+        );
+
+        // And the exclusion above was the floor, not distance: drop the floor
+        // and the same nearer record ranks first.
+        let unfloored = MemoryRetrievalQuery::new("the launch date is friday").with_limit(1);
+        let outcome = retriever
+            .retrieve(&owner, &unfloored, now(200))
+            .await
+            .expect("retrieval");
+        assert_eq!(
+            outcome.memories[0].memory.memory_id.as_str(),
+            "mem-unsure",
+            "without the floor the low-confidence record is the nearest hit"
+        );
+        assert_eq!(outcome.memories[0].relevance_bps, 10_000);
+    }
+
+    #[tokio::test]
+    async fn pgvector_reindex_pages_past_an_unreadable_record_when_dsn_is_set() {
+        // One record this binary cannot decode must not wedge the rebuild
+        // path: the cursor advances past it, the sweep completes, and the
+        // failure is reported as a value.
+        let Some((store, retriever)) = vector_world().await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        for name in ["a", "b"] {
+            store
+                .upsert(
+                    &owner,
+                    &memory(&owner, name, "friday launch checklist"),
+                    PrivateMemoryExpectation::Absent,
+                )
+                .await
+                .expect("seed");
+        }
+
+        // Corrupt the first record's stored bytes, the way a record written by
+        // a newer binary would read to this one's fail-closed decode.
+        let corrupt: &[u8] = b"not a private memory record";
+        let updated = retriever
+            .client
+            .execute(
+                "UPDATE rakka_agent_private_memory SET record = $1 \
+                 WHERE tenant = $2 AND agent = $3 AND memory_id = $4",
+                &[
+                    &corrupt,
+                    &owner.tenant().as_str(),
+                    &owner.agent().as_str(),
+                    &"mem-a",
+                ],
+            )
+            .await
+            .expect("corrupt the record");
+        assert_eq!(updated, 1);
+
+        // Page to completion. The bound is the assertion: a wedged sweep would
+        // re-read the same page every time and never reach `next: None`.
+        let mut after: Option<AgentPrivateMemoryId> = None;
+        let mut indexed = 0u64;
+        let mut failed = 0u64;
+        let mut pages = 0u32;
+        let completed = loop {
+            if pages == 8 {
+                break false;
+            }
+            pages += 1;
+            let page = retriever
+                .reindex(&owner, after.as_ref(), now(300), 1)
+                .await
+                .expect("one unreadable record never fails the sweep");
+            indexed += page.indexed;
+            failed += page.failed;
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break true,
+            }
+        };
+        assert!(completed, "the sweep paged past the unreadable record");
+        assert_eq!(failed, 1, "the unreadable record is reported, not hidden");
+        assert_eq!(indexed, 1, "the readable record behind it was indexed");
+
+        // The readable record is retrievable; the unreadable one has no vector,
+        // so it is absent rather than wrong.
+        let outcome = retriever
+            .retrieve(
+                &owner,
+                &MemoryRetrievalQuery::new("friday launch checklist"),
+                now(400),
+            )
+            .await
+            .expect("retrieval");
+        let names: Vec<&str> = outcome
+            .memories
+            .iter()
+            .map(|retrieved| retrieved.memory.memory_id.as_str())
+            .collect();
+        assert_eq!(names, vec!["mem-b"]);
     }
 }
