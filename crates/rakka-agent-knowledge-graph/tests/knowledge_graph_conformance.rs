@@ -6,7 +6,16 @@
 //! second structurally different backend (scenario 20).
 
 use rakka_agent_knowledge_graph::conformance::{self, ConformanceScopes};
-use rakka_agent_knowledge_graph::InMemoryKnowledgeGraphStore;
+use rakka_agent_knowledge_graph::store::{
+    ClaimCursor, ClaimFilter, ClaimPage, ClaimTransitionCursor, ClaimTransitionPage,
+    ClaimTraversal, ClaimTraversalReport, KnowledgeGraphCapabilities,
+};
+use rakka_agent_knowledge_graph::{
+    Claim, ClaimFuture, ClaimId, ClaimPromotionPolicy, ClaimTransitionOutcome,
+    ClaimTrustTransitionRequest, InMemoryKnowledgeGraphStore, KnowledgeGraphStore,
+    KnowledgeSpaceScope,
+};
+use rakka_agent_workflow::AgentTimestampMillis;
 
 #[tokio::test]
 async fn claim_identity_is_stable_and_reads_back_exactly() {
@@ -79,5 +88,92 @@ async fn the_capability_report_is_coherent() {
 async fn the_whole_contract_passes_as_one_suite() {
     // Exactly what a slice 2.4 backend runs, unchanged.
     let store = InMemoryKnowledgeGraphStore::new();
+    conformance::check_knowledge_graph_contract(&store).await;
+}
+
+/// Declared traversal depth: two, and honoured — the effective depth of any
+/// request is the smaller of the request, this declaration, and the crate cap.
+const SHALLOW_DECLARED_DEPTH: u32 = 2;
+
+/// A conformant backend that declares — and serves — a depth tighter than the
+/// crate cap, which the SPI explicitly permits.
+///
+/// It exists so the suite proves what it promises: a backend using the
+/// tighter-declaration feature passes the same clauses unchanged. Every
+/// operation but `traverse` delegates verbatim; `traverse` clamps to the
+/// declaration, which is the whole point.
+#[derive(Default)]
+struct ShallowKnowledgeGraphStore {
+    inner: InMemoryKnowledgeGraphStore,
+}
+
+impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
+    fn backend_name(&self) -> &'static str {
+        "in-memory-shallow"
+    }
+
+    fn capabilities(&self) -> KnowledgeGraphCapabilities {
+        KnowledgeGraphCapabilities::core().with_max_traversal_depth(SHALLOW_DECLARED_DEPTH)
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim: &'a Claim,
+    ) -> ClaimFuture<'a, Claim> {
+        self.inner.append(scope, claim)
+    }
+
+    fn get<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+    ) -> ClaimFuture<'a, Option<Claim>> {
+        self.inner.get(scope, claim_id)
+    }
+
+    fn query<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        filter: &'a ClaimFilter,
+        cursor: ClaimCursor,
+    ) -> ClaimFuture<'a, ClaimPage> {
+        self.inner.query(scope, filter, cursor)
+    }
+
+    fn traverse<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        traversal: &'a ClaimTraversal,
+    ) -> ClaimFuture<'a, ClaimTraversalReport> {
+        let clamped = traversal
+            .clone()
+            .with_depth(traversal.depth().min(SHALLOW_DECLARED_DEPTH));
+        Box::pin(async move { self.inner.traverse(scope, &clamped).await })
+    }
+
+    fn transition<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        request: &'a ClaimTrustTransitionRequest,
+        policy: &'a ClaimPromotionPolicy,
+        now: AgentTimestampMillis,
+    ) -> ClaimFuture<'a, ClaimTransitionOutcome> {
+        self.inner.transition(scope, request, policy, now)
+    }
+
+    fn transitions<'a>(
+        &'a self,
+        scope: &'a KnowledgeSpaceScope,
+        claim_id: &'a ClaimId,
+        cursor: ClaimTransitionCursor,
+    ) -> ClaimFuture<'a, ClaimTransitionPage> {
+        self.inner.transitions(scope, claim_id, cursor)
+    }
+}
+
+#[tokio::test]
+async fn a_backend_declaring_a_tighter_traversal_depth_passes_the_contract() {
+    let store = ShallowKnowledgeGraphStore::default();
     conformance::check_knowledge_graph_contract(&store).await;
 }

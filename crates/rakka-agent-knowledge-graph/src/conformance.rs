@@ -682,8 +682,26 @@ pub async fn bounded_queries(store: &dyn KnowledgeGraphStore, scopes: Conformanc
     assert!(clamped.claims.len() <= CLAIM_PAGE_MAX_ENTRIES);
 }
 
+/// Edges of the fixture chain reachable within *n* outbound hops of `root`,
+/// indexed by *n*: nothing at zero, the two root edges at one, plus
+/// `l1-a -> l2-a` at two, plus `l2-a -> l3-a` at three.
+const FIXTURE_EDGES_WITHIN_DEPTH: [usize; 4] = [0, 2, 3, 4];
+
+/// Outbound hops needed to exhaust the fixture chain from `root`. Past this
+/// depth the reachable set no longer grows, so nothing is left to truncate.
+const FIXTURE_CHAIN_DEPTH: u32 = 3;
+
 /// Bounded traversal: depth, node, and edge budgets cut explicitly, and the
 /// report is deterministic.
+///
+/// The depth expectations are stated against the *effective* depth — the
+/// smaller of the request and the backend's declared
+/// [`KnowledgeGraphCapabilities::max_traversal_depth`], which is the bound the
+/// SPI obliges an implementation to serve. A backend declaring a tighter depth
+/// must therefore pass this clause by honouring its declaration, and a backend
+/// exceeding its own declaration fails it.
+///
+/// [`KnowledgeGraphCapabilities::max_traversal_depth`]: crate::store::KnowledgeGraphCapabilities::max_traversal_depth
 pub async fn bounded_traversal(store: &dyn KnowledgeGraphStore, scopes: ConformanceScopes) {
     let scope = &scopes.primary;
     // A three-level chain with a fan-out at the root.
@@ -700,13 +718,14 @@ pub async fn bounded_traversal(store: &dyn KnowledgeGraphStore, scopes: Conforma
     }
     let root = ClaimNodeId::new("root").expect("the node id is valid");
 
+    // Depth one is always servable: the declared bound is floored at one.
     let shallow = store
         .traverse(scope, &ClaimTraversal::from_node(root.clone()))
         .await
         .expect("the traversal answers");
     assert_eq!(
         shallow.edges.len(),
-        2,
+        FIXTURE_EDGES_WITHIN_DEPTH[1],
         "depth one follows only the root's edges"
     );
     assert!(
@@ -714,6 +733,14 @@ pub async fn bounded_traversal(store: &dyn KnowledgeGraphStore, scopes: Conforma
         "a depth cut with work remaining is explicit"
     );
 
+    // Ask for the crate cap; the backend's declaration is what it must serve.
+    let effective_depth = store
+        .capabilities()
+        .max_traversal_depth()
+        .min(CLAIM_TRAVERSAL_MAX_DEPTH);
+    let reachable =
+        FIXTURE_EDGES_WITHIN_DEPTH[usize::try_from(effective_depth.min(FIXTURE_CHAIN_DEPTH))
+            .expect("a depth within the chain indexes the fixture table")];
     let full = store
         .traverse(
             scope,
@@ -721,8 +748,17 @@ pub async fn bounded_traversal(store: &dyn KnowledgeGraphStore, scopes: Conforma
         )
         .await
         .expect("the traversal answers");
-    assert_eq!(full.edges.len(), 4);
-    assert!(!full.truncated);
+    assert_eq!(
+        full.edges.len(),
+        reachable,
+        "a traversal follows exactly the edges within its effective depth of {effective_depth}"
+    );
+    assert_eq!(
+        full.truncated,
+        effective_depth < FIXTURE_CHAIN_DEPTH,
+        "truncation is set exactly when the effective depth of {effective_depth} leaves \
+         reachable work"
+    );
     let again = store
         .traverse(
             scope,
