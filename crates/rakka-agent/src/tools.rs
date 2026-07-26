@@ -85,7 +85,7 @@ pub const AGENT_TOOL_REGISTRY_MAX_TOOLS: usize = 256;
 /// How long an issued dispatch grant stays valid, unless configured otherwise.
 pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 
-/// The guardrail boundaries [`AgentToolAuthority`] has evaluation points for
+/// The guardrail boundaries the runtime has evaluation points for
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// A required stage that runs at none of these is refused at dispatch
@@ -95,9 +95,21 @@ pub const AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS: u64 = 60_000;
 /// slices that own those flows — extending it is how a slice declares its new
 /// evaluation point, and doing so is what makes the stages bound to that
 /// boundary start satisfying coverage.
-pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 2] = [
+///
+/// [`AgentToolAuthority`] evaluates the model-request and tool-request
+/// boundaries before every attempt's durable `Started` (slice 1.8). The
+/// memory-ingress boundary is evaluated by the snapshot-assembly retrieval
+/// path ([`crate::retrieval::assemble_context`], slice 2.2) — a different
+/// evaluation point than the authority's, which is why a deployment must wire
+/// the *same* chain into both its [`AgentToolAuthority`] and its
+/// [`crate::retrieval::AgentMemoryRetrieval`]: this coverage check cannot see
+/// the retrieval bundle's chain. A deployment with no retrieval wired is not
+/// fail-open — no memory ever crosses the boundary, so there is nothing an
+/// ingress stage could have protected.
+pub const AGENT_EVALUATED_GUARDRAIL_BOUNDARIES: [AgentGuardrailBoundary; 3] = [
     AgentGuardrailBoundary::ModelRequest,
     AgentGuardrailBoundary::ToolRequest,
+    AgentGuardrailBoundary::MemoryIngress,
 ];
 
 /// Result type for tool registry operations.
@@ -1393,9 +1405,12 @@ impl AgentToolAuthority {
         self.check_guardrail_coverage(&required)?;
         let mut reports = Vec::new();
         if let Some(chain) = &self.guardrails {
-            // Until slice 1.11 gives context snapshots content, the
-            // model-request boundary evaluates a bounded request descriptor —
-            // enough for a kill-switch or checkpoint stage to act on.
+            // The model-request boundary evaluates a bounded request
+            // descriptor — enough for a kill-switch or checkpoint stage to
+            // act on. Snapshot *content* is evaluated where it is assembled:
+            // session entries ride the recording path, and retrieved private
+            // memory passes the memory-ingress boundary in the slice 2.2
+            // retrieval flow before it ever enters a snapshot.
             let content = serde_json::json!({
                 "kind": "model-call",
                 "profile": profile.as_ref().map(ToString::to_string),

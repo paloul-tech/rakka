@@ -74,6 +74,7 @@ pub mod observability;
 #[cfg(feature = "otel")]
 pub mod otel;
 pub mod query;
+pub mod retrieval;
 #[cfg(feature = "rig")]
 pub mod rig;
 pub mod run;
@@ -181,9 +182,11 @@ pub use memory::{
     PrivateMemoryExpectation, PrivateMemoryPage, PrivateMemoryScope, PrivateMemoryTombstoneRequest,
     SessionMemoryCursor, SessionMemoryEntry, SessionMemoryPage, SessionMemoryStore,
     SessionPurgeOutcome, SessionRetentionPolicy, SessionWindowPolicy, SnapshotBudget,
-    SnapshotRetrieval, SnapshotSessionEntry, AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH,
-    AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES, AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES,
-    AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+    SnapshotIngressRecord, SnapshotPrivateMemory, SnapshotRetrieval, SnapshotSessionEntry,
+    AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH, AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES,
+    AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES, AGENT_SESSION_MEMORY_ENTRY_MAX_BYTES,
+    AGENT_SESSION_WINDOW_MAX_ENTRIES, AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES,
+    AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES,
 };
 pub use model::{
     AgentModelAdapter, AgentModelError, AgentModelFuture, AgentModelRequest, AgentModelResult,
@@ -199,6 +202,7 @@ pub use observability::{
     InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
     AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
     METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
@@ -216,6 +220,14 @@ pub use query::{
     agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
     AgentCheckpointView, AgentOperationalSnapshot, AgentPendingEffectView,
     AgentSessionSegmentSource, AgentSessionTraceSegment, AgentSessionView,
+};
+pub use retrieval::{
+    assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
+    AgentMemoryEmbedder, AgentMemoryRetrieval, AgentPrivateMemoryRetriever, AssembledContext,
+    InMemoryPrivateMemoryRetriever, MemoryRetrievalOutcome, MemoryRetrievalPolicy,
+    MemoryRetrievalQuery, RetrievalReport, RetrievedPrivateMemory,
+    AGENT_MEMORY_INDEX_WATERMARK_MAX_LENGTH, AGENT_MEMORY_RETRIEVAL_QUERY_MAX_BYTES,
+    AGENT_MEMORY_RETRIEVAL_QUERY_SOURCE_ENTRIES, AGENT_MEMORY_RETRIEVAL_SCAN_MAX_ENTRIES,
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,

@@ -13,12 +13,14 @@
 //!
 //! # Where the chain is evaluated today
 //!
-//! Slice 1.8 evaluates the chain at exactly two boundaries: the dispatch
-//! authority runs [`AgentGuardrailBoundary::ToolRequest`] and
+//! The dispatch authority runs [`AgentGuardrailBoundary::ToolRequest`] and
 //! [`AgentGuardrailBoundary::ModelRequest`] before every attempt's durable
-//! `Started`. The remaining boundaries — model/tool response, A2A
-//! ingress/egress, memory ingress — are declared here so chains can be
-//! configured for them, but their evaluation points arrive with the slices
+//! `Started` (slice 1.8), and the snapshot-assembly retrieval path runs
+//! [`AgentGuardrailBoundary::MemoryIngress`] on every retrieved private memory
+//! before it enters a model context (slice 2.2,
+//! [`crate::retrieval::assemble_context`]). The remaining boundaries —
+//! model/tool response, A2A ingress/egress — are declared here so chains can
+//! be configured for them, but their evaluation points arrive with the slices
 //! that own those flows.
 //!
 //! A stage bound only to a not-yet-evaluated boundary therefore protects
@@ -166,16 +168,22 @@ pub struct AgentGuardrailContext<'a> {
     /// The tool the call names, at the tool boundaries. `None` at boundaries
     /// that name no tool.
     pub tool: Option<&'a AgentToolId>,
+    /// The private memory being retrieved, at
+    /// [`AgentGuardrailBoundary::MemoryIngress`]. `None` at boundaries that
+    /// name no memory.
+    pub memory: Option<&'a crate::memory::AgentPrivateMemoryId>,
 }
 
 impl<'a> AgentGuardrailContext<'a> {
-    /// The context of one evaluation at the given boundary, naming no tool.
+    /// The context of one evaluation at the given boundary, naming no tool or
+    /// memory.
     #[must_use]
     pub const fn new(boundary: AgentGuardrailBoundary, scope: &'a AgentRunScope) -> Self {
         Self {
             boundary,
             scope,
             tool: None,
+            memory: None,
         }
     }
 
@@ -183,6 +191,13 @@ impl<'a> AgentGuardrailContext<'a> {
     #[must_use]
     pub const fn with_tool(mut self, tool: &'a AgentToolId) -> Self {
         self.tool = Some(tool);
+        self
+    }
+
+    /// Names the private memory whose retrieval is being evaluated.
+    #[must_use]
+    pub const fn with_memory(mut self, memory: &'a crate::memory::AgentPrivateMemoryId) -> Self {
+        self.memory = Some(memory);
         self
     }
 }
@@ -1041,8 +1056,9 @@ mod tests {
         assert_eq!(error.code(), "guardrail-stage-unevaluated");
 
         // The same stage satisfies coverage once the caller evaluates the
-        // boundary it runs at — this is exactly what a later slice landing its
-        // memory-ingress evaluation point changes.
+        // boundary it runs at — which slice 2.2's retrieval path did:
+        // `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` now carries MemoryIngress,
+        // and the snapshot-assembly flow evaluates it.
         chain
             .validate_covers(&required, &[AgentGuardrailBoundary::MemoryIngress])
             .expect("the stage runs at a boundary the caller evaluates");
