@@ -234,7 +234,7 @@ mod tests {
         let operation_id =
             ClaimOperationId::derive_append(&scope(), "op-1").expect("the operation id derives");
         Claim::new(
-            ClaimId::derive_appended(&scope(), &operation_id).expect("the claim id derives"),
+            &scope(),
             operation_id,
             ClaimNodeId::new("customer-1").expect("the node id is valid"),
             ClaimPredicate::new(predicate).expect("the predicate is valid"),

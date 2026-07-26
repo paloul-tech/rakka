@@ -89,7 +89,7 @@ pub fn conformance_claim(
     let operation_id =
         ClaimOperationId::derive_append(scope, discriminator).expect("the operation id derives");
     Claim::new(
-        ClaimId::derive_appended(scope, &operation_id).expect("the claim id derives"),
+        scope,
         operation_id,
         ClaimNodeId::new(subject).expect("the node id is valid"),
         ClaimPredicate::new("links").expect("the predicate is valid"),
@@ -309,7 +309,7 @@ pub async fn provenance_preservation(store: &dyn KnowledgeGraphStore, scopes: Co
             )
             .with_effect(rakka_agent_workflow::AgentEffectId::new("effect-1"));
     let claim = Claim::new(
-        ClaimId::derive_appended(scope, &operation_id).expect("the claim id derives"),
+        scope,
         operation_id,
         ClaimNodeId::new("a").expect("the node id is valid"),
         ClaimPredicate::new("links").expect("the predicate is valid"),
@@ -516,6 +516,42 @@ pub async fn born_proposed(store: &dyn KnowledgeGraphStore, scopes: ConformanceS
             .code(),
         "claim-append-not-proposed"
     );
+}
+
+/// Derived identity: an append is refused unless the claim carries the id its
+/// own operation derives in the addressed scope, so no writer can squat the id
+/// another writer's operation will produce.
+pub async fn appended_identity_is_derived(
+    store: &dyn KnowledgeGraphStore,
+    scopes: ConformanceScopes,
+) {
+    let scope = &scopes.primary;
+
+    // The id a later writer's "victim" operation will derive.
+    let victim = conformance_claim(scope, "victim", "a", "b");
+    // A squatter's own operation, wearing the victim's id — restorable through
+    // the mirror, which is exactly why the append door must re-derive.
+    let squatter = conformance_claim(scope, "squatter", "x", "y");
+    let mut record = squatter.to_record();
+    record.claim_id = victim.claim_id.clone();
+    let squat = Claim::restore(record).expect("the mirror restores a foreign id");
+
+    let refusal = store
+        .append(scope, &squat)
+        .await
+        .expect_err("an underived claim id is refused");
+    assert_eq!(refusal.code(), "claim-append-id-not-derived");
+
+    // The refusal is not a partial write: the victim's own append still works,
+    // and the squatter's operation id is still spendable by its own claim.
+    store
+        .append(scope, &victim)
+        .await
+        .expect("the squat left the victim's identity free");
+    store
+        .append(scope, &squatter)
+        .await
+        .expect("the squat spent nothing of its own operation");
 }
 
 /// Scenario 18 (graph half): an unauthorized scope learns nothing — reads
@@ -876,7 +912,7 @@ pub async fn transition_legality_and_replay(
         .append(scope, &{
             let operation_id = request.operation_id.clone();
             Claim::new(
-                ClaimId::derive_appended(scope, &operation_id).expect("the claim id derives"),
+                scope,
                 operation_id,
                 ClaimNodeId::new("x").expect("the node id is valid"),
                 ClaimPredicate::new("links").expect("the predicate is valid"),
@@ -1052,6 +1088,7 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     provenance_preservation(store, ConformanceScopes::unique("provenance")).await;
     trust_filtering(store, ConformanceScopes::unique("trust")).await;
     born_proposed(store, ConformanceScopes::unique("born-proposed")).await;
+    appended_identity_is_derived(store, ConformanceScopes::unique("derived-identity")).await;
     authorization_isolation(store, ConformanceScopes::unique("isolation")).await;
     bounded_queries(store, ConformanceScopes::unique("bounded-queries")).await;
     bounded_traversal(store, ConformanceScopes::unique("bounded-traversal")).await;

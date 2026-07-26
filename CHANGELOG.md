@@ -126,8 +126,13 @@ The format follows Keep a Changelog style sections, and versioning is expected t
   injective scope key, so a cross-tenant graph is unrepresentable rather than
   merely disallowed. Claim identity derives from the append operation id
   (conflicting claims must coexist, so the statement cannot be the identity),
-  which is what makes a replayed append converge on the same claim; trust
-  moves only through append-only `ClaimTrustTransition` records under the
+  which is what makes a replayed append converge on the same claim — and the
+  derivation is an invariant rather than a convention: `Claim::new` takes no
+  claim id and derives one from the scope and operation id, while the append
+  door re-derives and refuses a mismatch
+  (`claim-append-id-not-derived`), since a restored record can carry any id
+  and a squatted id would otherwise deny its rightful writer's append forever.
+  Trust moves only through append-only `ClaimTrustTransition` records under the
   documented lattice (`Retracted` terminal, nothing transitions to
   `Proposed`), with a bounded history that refuses explicitly at its cap. The
   `KnowledgeGraphStore` SPI is vendor-neutral — no client, SQL, Cypher,

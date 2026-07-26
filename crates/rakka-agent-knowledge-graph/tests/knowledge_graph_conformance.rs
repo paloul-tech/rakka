@@ -48,6 +48,16 @@ async fn every_appended_claim_is_born_proposed() {
 }
 
 #[tokio::test]
+async fn an_appended_claim_carries_the_identity_its_operation_derives() {
+    let store = InMemoryKnowledgeGraphStore::new();
+    conformance::appended_identity_is_derived(
+        &store,
+        ConformanceScopes::unique("derived-identity"),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn scenario_18_unauthorized_graph_reads_do_not_reveal_existence() {
     let store = InMemoryKnowledgeGraphStore::new();
     conformance::authorization_isolation(&store, ConformanceScopes::unique("scenario-18")).await;

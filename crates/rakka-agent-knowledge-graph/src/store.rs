@@ -665,7 +665,17 @@ pub trait KnowledgeGraphStore: Send + Sync + 'static {
     /// A replay returns the originally stored claim. A different claim under
     /// an already-claimed id fails `claim-already-exists`; a claim carrying
     /// any trust but `Proposed` or any transition history fails
-    /// `claim-append-not-proposed` (open decision 3).
+    /// `claim-append-not-proposed` (open decision 3); a claim whose id is not
+    /// the one its own operation id derives in this scope fails
+    /// `claim-append-id-not-derived`.
+    ///
+    /// That last check is what keeps claim identity *derived* rather than
+    /// merely conventional. [`Claim::new`] cannot construct a mismatched
+    /// claim, but [`Claim::restore`] must accept any persisted id to load one
+    /// at all, so the door re-derives: without it a caller could squat the id
+    /// another writer's operation will derive and deny that append forever.
+    ///
+    /// [`Claim::restore`]: crate::claim::Claim::restore
     fn append<'a>(
         &'a self,
         scope: &'a KnowledgeSpaceScope,
@@ -798,6 +808,15 @@ impl KnowledgeGraphStore for InMemoryKnowledgeGraphStore {
             if claim.trust() != ClaimTrustStatus::Proposed || claim.transition_count() != 0 {
                 return Err(ClaimError::AppendNotProposed {
                     claim_id: claim.claim_id.clone(),
+                });
+            }
+            // Re-derive the identity: a restored record can carry any id, and
+            // an id that is not this operation's is a squat on someone else's.
+            let derived = ClaimId::derive_appended(scope, &claim.operation_id)?;
+            if claim.claim_id != derived {
+                return Err(ClaimError::AppendIdNotDerived {
+                    claim_id: claim.claim_id.clone(),
+                    derived,
                 });
             }
             let key = scope.key();
@@ -1193,7 +1212,7 @@ mod tests {
         let operation_id = ClaimOperationId::derive_append(scope, discriminator)
             .expect("the operation id derives");
         Claim::new(
-            ClaimId::derive_appended(scope, &operation_id).expect("the claim id derives"),
+            scope,
             operation_id,
             ClaimNodeId::new(from).expect("the node id is valid"),
             ClaimPredicate::new("links").expect("the predicate is valid"),

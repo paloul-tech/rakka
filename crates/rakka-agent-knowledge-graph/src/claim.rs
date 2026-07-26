@@ -13,6 +13,14 @@
 //! transitions, so an agent-written claim cannot be born anything else. The
 //! only path to a non-`Proposed` claim is [`Claim::restore`] from a persisted
 //! record, and the store contract refuses to *append* such a record.
+//!
+//! Claim identity follows the same shape. [`Claim::new`] takes no claim id
+//! either — it derives one from the scope and the append operation id — so a
+//! constructed claim cannot carry an identity its own operation does not
+//! produce. [`Claim::restore`] must accept any persisted id to load a record
+//! at all, so the store's append door re-derives and refuses a mismatch
+//! (`claim-append-id-not-derived`): otherwise a writer could squat the id
+//! another writer's operation will derive and deny that append forever.
 
 use std::collections::BTreeSet;
 
@@ -491,13 +499,20 @@ pub struct Claim {
 }
 
 impl Claim {
-    /// Creates a claim, born `Proposed` with zero transitions.
+    /// Creates a claim, born `Proposed` with zero transitions, under the
+    /// identity its append operation derives.
     ///
-    /// There is no trust parameter: open decision 3 is the constructor's
-    /// signature, not a runtime check.
+    /// There is no trust parameter and no claim-id parameter: both invariants
+    /// are the constructor's signature rather than a runtime check. The claim
+    /// id is [derived](ClaimId::derive_appended) from `scope` and
+    /// `operation_id` here, so a constructed claim cannot carry an identity
+    /// its own append operation does not produce — the property that makes a
+    /// replayed append converge on one claim. The scope is *used*, never
+    /// stored: a claim record carries no tenant or space, so no layer above
+    /// the store can re-check the scope it was answered for.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        claim_id: ClaimId,
+        scope: &KnowledgeSpaceScope,
         operation_id: ClaimOperationId,
         subject: ClaimNodeId,
         predicate: ClaimPredicate,
@@ -507,6 +522,7 @@ impl Claim {
         classification: MemoryClassification,
         created_at: AgentTimestampMillis,
     ) -> ClaimResult<Self> {
+        let claim_id = ClaimId::derive_appended(scope, &operation_id)?;
         let content_digest = statement_digest(&subject, &predicate, &object)?;
         let claim = Self {
             schema_version: CURRENT_CLAIM_SCHEMA_VERSION,
@@ -840,7 +856,7 @@ mod tests {
         let operation_id =
             ClaimOperationId::derive_append(&scope(), "op-1").expect("the operation id derives");
         Claim::new(
-            ClaimId::derive_appended(&scope(), &operation_id).expect("the claim id derives"),
+            &scope(),
             operation_id,
             ClaimNodeId::new("customer-1").expect("the node id is valid"),
             ClaimPredicate::new("prefers").expect("the predicate is valid"),
@@ -859,6 +875,36 @@ mod tests {
         assert_eq!(claim.trust(), ClaimTrustStatus::Proposed);
         assert_eq!(claim.transition_count(), 0);
         assert_eq!(claim.schema_version(), CURRENT_CLAIM_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_constructed_claim_carries_the_identity_its_operation_derives() {
+        // The constructor takes no claim id, so the only assertion available is
+        // that the derived one is what the claim carries — which is the point:
+        // a mismatch is unrepresentable rather than refused.
+        let claim = claim();
+        assert_eq!(
+            claim.claim_id,
+            ClaimId::derive_appended(&scope(), &claim.operation_id).expect("the claim id derives")
+        );
+        // A distinct operation in the same scope is a distinct claim; the same
+        // operation in a distinct scope is too.
+        let other_operation =
+            ClaimOperationId::derive_append(&scope(), "op-other").expect("the operation derives");
+        assert_ne!(
+            claim.claim_id,
+            ClaimId::derive_appended(&scope(), &other_operation).expect("the claim id derives")
+        );
+        let other_scope = KnowledgeSpaceScope::new(
+            TenantId::new("other"),
+            KnowledgeSpaceId::new("support-kb").expect("the space id is valid"),
+        )
+        .expect("the scope is valid");
+        assert_ne!(
+            claim.claim_id,
+            ClaimId::derive_appended(&other_scope, &claim.operation_id)
+                .expect("the claim id derives")
+        );
     }
 
     #[test]
@@ -1067,7 +1113,7 @@ mod tests {
         let operation_id =
             ClaimOperationId::derive_append(&scope(), "op-2").expect("the operation id derives");
         let different = Claim::new(
-            ClaimId::derive_appended(&scope(), &operation_id).expect("the claim id derives"),
+            &scope(),
             operation_id,
             ClaimNodeId::new("customer-1").expect("the node id is valid"),
             ClaimPredicate::new("prefers").expect("the predicate is valid"),

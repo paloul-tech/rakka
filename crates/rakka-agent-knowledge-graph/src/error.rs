@@ -191,6 +191,15 @@ pub enum ClaimError {
         /// Claim that was refused.
         claim_id: ClaimId,
     },
+    /// An appended claim must carry the identity its own append operation
+    /// derives, so a claim id can never be squatted ahead of the writer that
+    /// derives it.
+    AppendIdNotDerived {
+        /// Claim id the record carried.
+        claim_id: ClaimId,
+        /// Claim id the record's operation id derives in the addressed scope.
+        derived: ClaimId,
+    },
     /// The operation id was already spent by a different operation.
     OperationConflict {
         /// Operation id that collided.
@@ -262,6 +271,7 @@ impl ClaimError {
             Self::AlreadyExists { .. } => "claim-already-exists",
             Self::NotFound { .. } => "claim-not-found",
             Self::AppendNotProposed { .. } => "claim-append-not-proposed",
+            Self::AppendIdNotDerived { .. } => "claim-append-id-not-derived",
             Self::OperationConflict { .. } => "claim-operation-conflict",
             Self::IllegalTransition { .. } => "claim-transition-illegal",
             Self::TransitionHistoryFull { .. } => "claim-transition-history-full",
@@ -348,6 +358,11 @@ impl Display for ClaimError {
                 f,
                 "claim {claim_id} was refused: an appended claim must be born proposed with \
                  zero transitions"
+            ),
+            Self::AppendIdNotDerived { claim_id, derived } => write!(
+                f,
+                "claim {claim_id} was refused: its append operation derives claim id {derived} \
+                 in the addressed scope"
             ),
             Self::OperationConflict { operation_id } => write!(
                 f,

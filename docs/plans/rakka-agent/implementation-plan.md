@@ -1792,7 +1792,14 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
   makes a replayed append converge on the same claim (scenario 16) while two
   distinct operations never collide. The salted derivation domains
   (`claim-append` / `claim-transition` / `claim`) follow the slice 2.1
-  `MemoryOperationId` discipline exactly.
+  `MemoryOperationId` discipline exactly. The derivation is closed the same way
+  born-`Proposed` is: `Claim::new` takes no claim id — it derives one from the
+  scope and the operation id — and because `Claim::restore` must accept any
+  persisted id to load a record at all, the store's append door re-derives and
+  refuses a mismatch (`claim-append-id-not-derived`, conformance-tested).
+  Without that door the derivation would be convention rather than invariant,
+  and a writer could squat the id another writer's operation will derive and
+  deny that append forever.
 - **Born-`Proposed` is the type system's answer, closed at three doors.**
   `Claim::new` takes no trust parameter (open decision 3); the only path to a
   non-`Proposed` claim is `Claim::restore` from a persisted record, whose
