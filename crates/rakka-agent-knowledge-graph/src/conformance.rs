@@ -12,17 +12,23 @@
 //! test support is part of the crate's contract surface, not a feature.
 //!
 //! Every clause takes the store under test plus a [`ConformanceScopes`] value
-//! of process-unique scopes. Fresh *scopes*, not fresh stores, are what
-//! clause isolation needs — a live-database backend cannot cheaply construct
-//! stores, but every backend can serve one more tenant. Clauses panic on
-//! violation, so each runs inside a test.
+//! of fresh scopes. Fresh *scopes*, not fresh stores, are what clause
+//! isolation needs — a live-database backend cannot cheaply construct stores,
+//! but every backend can serve one more tenant. Scopes are unique per clause,
+//! per process, and per run against a persistent backend
+//! ([`ConformanceScopes::unique`]); a suite that wants to own its own
+//! namespacing uses [`ConformanceScopes::unique_in`] or pins
+//! [`CONFORMANCE_RUN_ENV`]. Clauses panic on violation, so each runs inside a
+//! test.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rakka_agent::{
-    AgentCheckpointGrant, AgentCheckpointKind, AgentId, AgentRevisionNumber, AgentRunScope,
-    KnowledgeSpaceId, MemoryClassification, TenantId,
+    AgentCheckpointGrant, AgentCheckpointKind, AgentContentDigest, AgentId, AgentRevisionNumber,
+    AgentRunScope, KnowledgeSpaceId, MemoryClassification, TenantId,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, HumanCheckpointId, PrincipalRef};
 
@@ -52,25 +58,83 @@ pub struct ConformanceScopes {
 
 static CONFORMANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Number of hex digits of the run nonce that enter a tenant id. Sixty-four
+/// bits of a cryptographic digest: two runs colliding is not a scenario a suite
+/// needs to defend against, and the tenant stays readable.
+const RUN_NONCE_HEX_DIGITS: usize = 16;
+
+/// Environment variable a deployment may set to pin the run namespace, for a
+/// suite that wants to inspect the rows a failing run left behind.
+pub const CONFORMANCE_RUN_ENV: &str = "RAKKA_KNOWLEDGE_GRAPH_CONFORMANCE_RUN";
+
+/// The namespace distinguishing this run's scopes from every other run's.
+///
+/// A sequence counter alone cannot do this: it is process-local and starts at
+/// zero, so two test binaries — which `cargo test` runs concurrently — and two
+/// runs against the same live database all mint identical tenants. Neither is
+/// hypothetical for slice 2.4's database-backed suite.
+///
+/// The process id alone is not enough either (an operating system recycles it,
+/// so a later run can inherit it), and a coarse clock alone can repeat, so both
+/// enter one digest. [`CONFORMANCE_RUN_ENV`] overrides it when a deployment
+/// wants a namespace it can find again.
+fn run_namespace() -> &'static str {
+    static RUN_NAMESPACE: OnceLock<String> = OnceLock::new();
+    RUN_NAMESPACE.get_or_init(|| {
+        if let Some(pinned) = std::env::var(CONFORMANCE_RUN_ENV)
+            .ok()
+            .filter(|pinned| !pinned.is_empty())
+        {
+            return pinned;
+        }
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let seed = format!("{}|{elapsed}", std::process::id());
+        AgentContentDigest::sha256_of_bytes(seed.as_bytes())
+            .value
+            .chars()
+            .take(RUN_NONCE_HEX_DIGITS)
+            .collect()
+    })
+}
+
 impl ConformanceScopes {
-    /// Process-unique scopes for one clause run.
+    /// Fresh scopes for one clause run, in this run's own namespace.
     ///
-    /// The label enters both tenants, so concurrent suites — and repeated
-    /// runs against a live database — never collide. It must satisfy the
-    /// identity rules (no `/`, `|`, or control characters).
+    /// Distinct from every other clause in this process (a sequence counter),
+    /// and from every other process and every earlier run against the same
+    /// database (a per-run namespace digested from the process id and the
+    /// wall clock, which [`CONFORMANCE_RUN_ENV`] pins when a deployment wants
+    /// one it can find again). The label enters both tenants so a failure names
+    /// the clause that produced it; it must satisfy the identity rules (no `/`,
+    /// `|`, or control characters).
     #[must_use]
     pub fn unique(label: &str) -> Self {
+        Self::unique_in(run_namespace(), label)
+    }
+
+    /// Fresh scopes for one clause run in an explicitly named namespace.
+    ///
+    /// For a suite that manages its own namespacing — a database-backed run
+    /// that wants to drop everything it wrote afterwards, say. Successive calls
+    /// still differ within a namespace: clause isolation is the sequence
+    /// counter's job, and the namespace only separates runs from each other.
+    #[must_use]
+    pub fn unique_in(namespace: &str, label: &str) -> Self {
         let sequence = CONFORMANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tenant =
+            |suffix: char| TenantId::new(format!("conf-{namespace}-{label}-{sequence}-{suffix}"));
         let primary = KnowledgeSpaceScope::new(
-            TenantId::new(format!("conf-{label}-{sequence}-a")),
+            tenant('a'),
             KnowledgeSpaceId::new("space-a").expect("the space id is valid"),
         )
-        .expect("the conformance label satisfies the identity rules");
+        .expect("the conformance namespace and label satisfy the identity rules");
         let foreign = KnowledgeSpaceScope::new(
-            TenantId::new(format!("conf-{label}-{sequence}-b")),
+            tenant('b'),
             KnowledgeSpaceId::new("space-b").expect("the space id is valid"),
         )
-        .expect("the conformance label satisfies the identity rules");
+        .expect("the conformance namespace and label satisfy the identity rules");
         Self { primary, foreign }
     }
 }
@@ -1095,4 +1159,43 @@ pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     transition_legality_and_replay(store, ConformanceScopes::unique("legality")).await;
     promotion_gate(store, ConformanceScopes::unique("gate")).await;
     capability_report_coherence(store).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scopes_are_distinct_per_clause_and_per_namespace() {
+        // Within a namespace, successive calls differ: clause isolation.
+        let first = ConformanceScopes::unique_in("run-1", "clause");
+        let second = ConformanceScopes::unique_in("run-1", "clause");
+        assert_ne!(first.primary, second.primary);
+        // The primary and foreign scopes of one call differ in both segments.
+        assert_ne!(first.primary.tenant(), first.foreign.tenant());
+        assert_ne!(first.primary.space(), first.foreign.space());
+
+        // Across namespaces, nothing is shared even at the same sequence
+        // position — the property a second run against a live database needs.
+        let other = ConformanceScopes::unique_in("run-2", "clause");
+        assert!(!other.primary.tenant().as_str().contains("-run-1-"));
+        assert_ne!(other.primary, first.primary);
+    }
+
+    #[test]
+    fn the_run_namespace_is_stable_within_a_process_and_not_a_counter() {
+        // Stable: every clause in one run shares it, so a suite can find its
+        // own rows. Not a counter: it cannot be reproduced by a later run.
+        assert_eq!(run_namespace(), run_namespace());
+        assert!(!run_namespace().is_empty());
+        // The default namespace is the digest nonce, not the process id alone.
+        if std::env::var(CONFORMANCE_RUN_ENV).is_err() {
+            assert_eq!(run_namespace().len(), RUN_NONCE_HEX_DIGITS);
+            assert!(run_namespace().chars().all(|c| c.is_ascii_hexdigit()));
+            assert_ne!(run_namespace(), std::process::id().to_string());
+        }
+        // The namespace reaches the scopes it names.
+        let scopes = ConformanceScopes::unique("namespaced");
+        assert!(scopes.primary.tenant().as_str().contains(run_namespace()));
+    }
 }

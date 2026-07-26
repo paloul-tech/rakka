@@ -1877,12 +1877,24 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
   space, so no layer above can re-check it — documented on the SPI trait.
 - **The conformance harness is the workspace's first shared contract suite,
   and it injects scopes, not stores.** `conformance` is an ungated `pub mod`
-  (the `rakka_agent::testkit` precedent): eleven clause functions plus the
+  (the `rakka_agent::testkit` precedent): twelve clause functions plus the
   `check_knowledge_graph_contract` umbrella, each taking
-  `&dyn KnowledgeGraphStore` and process-unique `ConformanceScopes`. Fresh
+  `&dyn KnowledgeGraphStore` and fresh `ConformanceScopes`. Fresh
   *scopes* are what clause isolation actually needs — a live-database 2.4
   backend cannot cheaply construct stores, but every backend can serve one
   more tenant (the 2.1/2.2 per-tenant DSN-suite pattern, made reusable).
+  Uniqueness has to hold along three axes, not one: a sequence counter
+  isolates clauses within a process, but it is process-local and starts at
+  zero, so it cannot separate the test binaries `cargo test` runs
+  concurrently, nor a second run from the rows the first left in a live
+  database. `ConformanceScopes::unique` therefore prefixes a per-run
+  namespace digested from the process id and the wall clock (the pid alone is
+  recycled by the operating system; a coarse clock alone can repeat), which
+  `RAKKA_KNOWLEDGE_GRAPH_CONFORMANCE_RUN` pins when a 2.4 suite wants a
+  namespace it can find again, and `unique_in` names explicitly for a suite
+  that manages its own. Until then idempotency was masking the collision —
+  replayed writes converged on their originals — which is exactly the kind of
+  accident a contract suite must not rely on.
 - **Deliberately not in the `rakka` facade yet.** The agent-adapter
   precedent (`rakka-agent-postgres` is not in the facade either) and the
   spec 19 "feature gates and curated prelude exports after API review"

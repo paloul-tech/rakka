@@ -166,7 +166,14 @@ The format follows Keep a Changelog style sections, and versioning is expected t
   statement. The crate ships the workspace's first reusable backend
   conformance harness (`conformance::check_knowledge_graph_contract` and its
   per-clause functions), which slice 2.4 runs unchanged against a second
-  structurally different backend (scenario 20). The crate is deliberately not
+  structurally different backend (scenario 20). It injects fresh *scopes*
+  rather than fresh stores — a live-database backend cannot cheaply build
+  stores, but every backend can serve one more tenant — and those scopes are
+  unique per clause, per process, and per run: `ConformanceScopes::unique`
+  prefixes a per-run namespace digested from the process id and the wall
+  clock, which `RAKKA_KNOWLEDGE_GRAPH_CONFORMANCE_RUN` pins for a suite that
+  wants to find its own rows afterwards and `unique_in` names explicitly for
+  one that manages its own namespacing. The crate is deliberately not
   in the `rakka` facade yet — the agent-adapter precedent — pending the
   specification 19 API review. Proven in
   `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`
