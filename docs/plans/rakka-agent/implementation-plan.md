@@ -1738,13 +1738,21 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
   under filters). Redacted and artifact-backed memories are not semantically
   indexed in v1 (the adapter never loads artifact bytes); they surface as
   visible skips in `ReindexPage`.
-- **CI now exercises the crate.** The postgres job's service image moved to
-  `pgvector/pgvector:pg16` (a drop-in postgres:16 with the extension
-  package) and gained `cargo test -p rakka-agent-postgres` — closing the
-  pre-existing gap where even 2.1's DSN-gated tests ran nowhere but
-  developer machines. The pgvector tests additionally probe
-  `pg_available_extensions` and skip with a message on a plain database, so
-  a DSN without the extension keeps the crate green.
+- **CI now exercises the crate, on every pull request.** The postgres job's
+  service image moved to `pgvector/pgvector:pg16` (a drop-in postgres:16 with
+  the extension package) and gained `cargo test -p rakka-agent-postgres`. On
+  its own that was not enough to close the pre-existing gap where even 2.1's
+  DSN-gated tests ran nowhere but developer machines: the job was still
+  gated to `workflow_dispatch` with an opt-in input, so it ran only when
+  someone remembered to ask. The gate is now `github.event_name !=
+  'workflow_dispatch' || inputs.run_postgres` — always on pull requests and
+  pushes, still skippable on a manual run. What these suites prove cannot be
+  proven another way (the genuinely concurrent compare-and-set race,
+  cross-scope invisibility, the filter-before-ranking predicates are
+  properties of live SQL), and this slice is the evidence: both review
+  findings it fixes were defects only a live database exposes. The pgvector
+  tests additionally probe `pg_available_extensions` and skip with a message
+  on a plain database, so a DSN without the extension keeps the crate green.
 
 Done when: retrieval isolation tests pass and a snapshot-reuse test proves
 index drift cannot change a retried model input (extends scenario 17).

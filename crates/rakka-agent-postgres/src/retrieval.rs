@@ -89,10 +89,11 @@
 use std::sync::Arc;
 
 use rakka_agent::{
-    check_private_memory_schema, memory_embedding_text, AgentMemoryEmbedder, AgentPrivateMemory,
-    AgentPrivateMemoryId, AgentPrivateMemoryRetriever, AgentRevisionNumber, AgentSchemaPolicy,
-    AgentScope, MemoryEmbeddingRef, MemoryError, MemoryFuture, MemoryRetrievalOutcome,
-    MemoryRetrievalQuery, RetrievedPrivateMemory, AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES,
+    check_private_memory_schema, embed_memory_vector, memory_embedding_text, AgentMemoryEmbedder,
+    AgentPrivateMemory, AgentPrivateMemoryId, AgentPrivateMemoryRetriever, AgentRevisionNumber,
+    AgentSchemaPolicy, AgentScope, MemoryEmbeddingRef, MemoryError, MemoryFuture,
+    MemoryRetrievalOutcome, MemoryRetrievalQuery, RetrievedPrivateMemory,
+    AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use tokio_postgres::Client;
@@ -184,8 +185,19 @@ impl PgvectorDistance {
     /// scale the in-memory reference retriever's cosine similarity uses.
     /// Euclidean distance is unbounded, so it maps as `10000 / (1 + d)`:
     /// monotone, deterministic, and 10000 at distance zero.
+    ///
+    /// A non-finite distance scores zero. pgvector's cosine operator answers
+    /// `NaN` when either side has zero magnitude — which a bag-of-words
+    /// embedder produces for text with no tokens at all — and an undefined
+    /// direction carries no relevance. This mirrors the reference retriever's
+    /// zero-magnitude rule, so both backends score such a pair the same, and
+    /// it is stated as a branch rather than left to the saturating float cast
+    /// below to arrive at by accident.
     #[must_use]
     pub fn relevance_bps(self, distance: f64) -> u16 {
+        if !distance.is_finite() {
+            return 0;
+        }
         let bps = match self {
             Self::Cosine => (1.0 - distance / 2.0) * 10_000.0,
             Self::Euclidean => 10_000.0 / (1.0 + distance.max(0.0)),
@@ -355,22 +367,11 @@ impl PgvectorPrivateMemoryRetriever {
         Ok((reference, dimensions, version))
     }
 
-    /// Embeds one text and fails closed on a vector the declared reference
-    /// misdescribes.
+    /// Embeds one text through the domain's shared check, so this adapter
+    /// refuses an embedder's misdescribed output identically to every other
+    /// backend ([`embed_memory_vector`]).
     async fn embed_checked(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
-        let reference = self.embedder.embedding_ref();
-        let vector = self.embedder.embed(text).await?;
-        if vector.len() != reference.dimensions as usize {
-            return Err(MemoryError::InvalidEmbeddingRef {
-                message: format!(
-                    "the embedder {} declares {} dimensions but produced a vector of {}",
-                    reference.model,
-                    reference.dimensions,
-                    vector.len()
-                ),
-            });
-        }
-        Ok(vector)
+        embed_memory_vector(self.embedder.as_ref(), text).await
     }
 
     /// Decodes a stored memory and fails closed on an unsupported schema
@@ -926,6 +927,14 @@ mod tests {
         assert_eq!(PgvectorDistance::Euclidean.relevance_bps(0.0), 10_000);
         assert_eq!(PgvectorDistance::Euclidean.relevance_bps(1.0), 5_000);
         assert!(PgvectorDistance::Euclidean.relevance_bps(1_000.0) < 100);
+
+        // An undefined distance carries no relevance, by branch rather than by
+        // saturating cast: pgvector answers NaN for a zero-magnitude vector.
+        for metric in [PgvectorDistance::Cosine, PgvectorDistance::Euclidean] {
+            assert_eq!(metric.relevance_bps(f64::NAN), 0);
+            assert_eq!(metric.relevance_bps(f64::INFINITY), 0);
+            assert_eq!(metric.relevance_bps(f64::NEG_INFINITY), 0);
+        }
     }
 
     // =======================================================================
@@ -1667,6 +1676,42 @@ mod tests {
             "without the floor the low-confidence record is the nearest hit"
         );
         assert_eq!(outcome.memories[0].relevance_bps, 10_000);
+    }
+
+    #[tokio::test]
+    async fn pgvector_a_zero_magnitude_query_scores_zero_when_dsn_is_set() {
+        // A bag-of-words embedder maps text with no tokens onto the zero
+        // vector, and pgvector's cosine operator answers NaN against it. The
+        // retrieval stays well-defined: the record is still a candidate —
+        // every filter passed, only the ranking is undefined — and it scores
+        // zero, the same as the reference retriever's zero-magnitude rule.
+        let Some((store, retriever)) = vector_world().await else {
+            return;
+        };
+        let owner = scope(&unique(), "support");
+        seed_and_index(
+            &store,
+            &retriever,
+            &owner,
+            "fact",
+            "the launch date is friday",
+        )
+        .await;
+
+        let tokenless = MemoryRetrievalQuery::new("??? ...");
+        let outcome = retriever
+            .retrieve(&owner, &tokenless, now(200))
+            .await
+            .expect("a zero-magnitude query is answered, not refused");
+        assert_eq!(
+            outcome.memories.len(),
+            1,
+            "the filters passed, so the record is a candidate at an undefined rank"
+        );
+        assert_eq!(
+            outcome.memories[0].relevance_bps, 0,
+            "an undefined distance carries no relevance"
+        );
     }
 
     #[tokio::test]
