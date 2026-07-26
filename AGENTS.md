@@ -39,6 +39,7 @@
 - `crates/rakka-sharding`, `crates/rakka-sharding-postgres`: entity identity, shard ownership/coordinator, local/remote routes, remembered entities, PostgreSQL coordinator store/lease.
 - `crates/rakka-workflow`: durable inbox/outbox reliability substrate: deduplication, retries, recovery, clocks, workflow telemetry.
 - `crates/rakka-agent-workflow`: additive agent workflow facade/runtime: runs, steps, effects, graph scheduler, compiled plans, timers, dispatchers, query, retention, audit, OpenTelemetry/Kubernetes helpers.
+- `crates/rakka-agent`, `crates/rakka-agent-postgres`, `crates/rakka-agent-knowledge-graph`: durable agent domain (entities, choreography, loop, model adapter, effects/tool authority, budgets, checkpoints/HITL, session/private memory, retrieval, observability), its PostgreSQL/pgvector adapters, and the database-agnostic communal knowledge graph (claims, trust transitions, promotion gate, portable store SPI, conformance harness).
 - `crates/rakka-stream`, `crates/rakka-process`: bounded streams and supervised child-process actors/process-backed entities.
 - `crates/rakka-http`, `crates/rakka-grpc`, `crates/rakka-k8s`: edge adapters and Kubernetes operation surfaces.
 - `crates/rakka-testkit`: cross-crate probes, assertions, compatibility fixtures, and repository hygiene helpers.

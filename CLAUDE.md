@@ -71,6 +71,10 @@ rakka-core                      foundation: Actor/ActorRef/ActorContext, ActorSy
   ├─ rakka-k8s                  health, drain, DNS discovery, manifest helpers
   ├─ rakka-*-postgres           PostgreSQL adapters for persistence / sharding
   └─ rakka-agent-workflow       durable agent/compiled-workflow execution kernel (see below)
+       └─ rakka-agent           durable agent domain: entities, loop, model adapter, effects,
+                                budgets, checkpoints, memory (rakka-agent-postgres = PostgreSQL/
+                                pgvector adapters; rakka-agent-knowledge-graph = communal claims,
+                                trust transitions, promotion gate, portable graph SPI + conformance)
 
 rakka                          top-level facade crate + curated `rakka::prelude`; re-exports
                                component crates behind cargo features (default = all)

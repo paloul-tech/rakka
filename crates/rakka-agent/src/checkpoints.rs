@@ -364,13 +364,65 @@ pub struct AgentCheckpointGrant {
 }
 
 impl AgentCheckpointGrant {
+    /// Accepts that this grant covers the given attempt of the exact subject
+    /// the binding describes, or fails closed
+    /// ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The binding MUST be recomputed by the caller from the authoritative
+    /// content being gated — never read back from recorded state — so a
+    /// subject that changed after the decision can never pass under a stale
+    /// digest. This is the effect-independent half of [`Self::validate_for`],
+    /// and the seam a non-effect gate (the communal claim promotion gate of
+    /// specification 13.4) validates through: the same digest-binding, expiry,
+    /// and use-count semantics, one code path.
+    pub fn validate_for_binding(
+        &self,
+        binding: &AgentCheckpointEffectBinding,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> Result<(), AgentCheckpointGrantError> {
+        // Defence in depth: neither side of the comparison may bind a
+        // non-cryptographic digest, whatever wrote it.
+        if !self.argument_digest.algorithm.is_cryptographic()
+            || !binding.argument_digest.algorithm.is_cryptographic()
+        {
+            return Err(AgentCheckpointGrantError::NonCryptographicDigest);
+        }
+        if self.effect_id != binding.effect_id
+            || self.generation != binding.generation
+            || self.target != binding.target
+            || self.safety_class != binding.safety_class
+        {
+            return Err(AgentCheckpointGrantError::IntentMismatch);
+        }
+        if self.credential_binding != binding.credential_binding {
+            return Err(AgentCheckpointGrantError::CredentialBindingChanged);
+        }
+        if self.argument_digest != binding.argument_digest {
+            return Err(AgentCheckpointGrantError::ArgumentDigestMismatch);
+        }
+        // Strictly after: a grant is valid through its expiry instant.
+        if now.as_millis() > self.expires_at.as_millis() {
+            return Err(AgentCheckpointGrantError::Expired);
+        }
+        if attempt > self.allowed_use_count {
+            return Err(AgentCheckpointGrantError::UsesExhausted);
+        }
+        Ok(())
+    }
+
     /// Accepts that this grant covers the given attempt of the given intent, or
     /// fails closed ([specification 12.3](../../../docs/plans/rakka-agent/spec.md):
     /// the dispatcher rechecks grant validity before invocation).
     ///
     /// The argument digest is *recomputed* cryptographically from the intent and
     /// compared, so an argument that changed after the human approved it can
-    /// never pass — the fingerprint the effect carries is irrelevant here.
+    /// never pass — the fingerprint the effect carries is irrelevant here. The
+    /// identity checks run before the digest is computed, so the error
+    /// precedence of earlier releases is preserved; the delegated
+    /// [`Self::validate_for_binding`] additionally compares the dispatch
+    /// target, a pure strengthening (a legitimately resolved grant copies its
+    /// target from the same intent).
     pub fn validate_for(
         &self,
         scope: &AgentRunScope,
@@ -393,21 +445,9 @@ impl AgentCheckpointGrant {
         if self.credential_binding != intent.credential_binding {
             return Err(AgentCheckpointGrantError::CredentialBindingChanged);
         }
-        let recomputed = intent
-            .request
-            .cryptographic_argument_digest()
+        let binding = AgentCheckpointEffectBinding::of_effect(intent)
             .map_err(|_| AgentCheckpointGrantError::ArgumentDigestUncomputable)?;
-        if self.argument_digest != recomputed {
-            return Err(AgentCheckpointGrantError::ArgumentDigestMismatch);
-        }
-        // Strictly after: a grant is valid through its expiry instant.
-        if now.as_millis() > self.expires_at.as_millis() {
-            return Err(AgentCheckpointGrantError::Expired);
-        }
-        if attempt > self.allowed_use_count {
-            return Err(AgentCheckpointGrantError::UsesExhausted);
-        }
-        Ok(())
+        self.validate_for_binding(&binding, attempt, now)
     }
 }
 

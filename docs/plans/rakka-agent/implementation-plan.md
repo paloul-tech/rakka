@@ -1781,8 +1781,111 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
 - HITL/policy promotion gate for consequential claims reusing Slice 1.10
   checkpoints.
 
+**Amended as implemented (2026-07-26):**
+
+- **A claim's identity derives from its append operation, not its statement.**
+  Conflicting claims MUST coexist ([spec 13.4](spec.md#134-communal-knowledge-graph)),
+  so two agents asserting the same subject/predicate/object are two claims
+  with distinct provenance — the statement cannot be the identity. The append
+  operation id is the one value reconstructable by the writer after any crash
+  and unique per logical write, so `ClaimId::derive_appended(scope, operation)`
+  makes a replayed append converge on the same claim (scenario 16) while two
+  distinct operations never collide. The salted derivation domains
+  (`claim-append` / `claim-transition` / `claim`) follow the slice 2.1
+  `MemoryOperationId` discipline exactly.
+- **Born-`Proposed` is the type system's answer, closed at three doors.**
+  `Claim::new` takes no trust parameter (open decision 3); the only path to a
+  non-`Proposed` claim is `Claim::restore` from a persisted record, whose
+  `Proposed ⇔ zero-transitions` coherence invariant is re-validated on every
+  load and inside deserialization; and the store's append door refuses any
+  claim that is not `Proposed`-with-no-history
+  (`claim-append-not-proposed`) — conformance-tested so no slice 2.4 backend
+  can drift. Trust moves only through `Claim::apply_transition`, the single
+  legality-enforcement point every backend shares (the fields are private, so
+  no path can skip the table). The lattice: `Proposed → Verified(gated) |
+  Disputed | Retracted`; `Verified → Disputed | Retracted`; `Disputed →
+  Verified(gated) | Retracted`; `Retracted` terminal; nothing transitions
+  *to* `Proposed` (that would launder history); un-retracting is a new claim
+  referencing the old one, preserving both provenances. The bounded history
+  (32) refuses explicitly — an oscillating claim is a policy incident to
+  surface, never a truncation.
+- **The promotion gate reuses the slice 1.10 grant verbatim, through one new
+  additive seam.** `AgentCheckpointGrant::validate_for_binding(binding,
+  attempt, now)` landed in `rakka-agent`'s checkpoints module, and the
+  existing effect-path `validate_for` now delegates to it (its identity
+  checks still run first, so error precedence is preserved; the binding path
+  additionally compares the dispatch `target`, a pure strengthening). The
+  graph crate derives the canonical binding from the *authoritative* claim —
+  sha256 over the scope key, claim id, full statement, `from` status, and the
+  one-based ordinal the promotion would occupy, with the effect generation
+  pinned to that same ordinal — so a grant authorizes exactly one promotion
+  at exactly one history position: after a dispute, re-promotion is a new
+  ordinal, a new generation, a new grant, and the stale grant fails the
+  identity check before the digest is even compared (proven in the gate test
+  matrix). The effect id (`claim-promotion:{claim}`) and target are
+  deterministic so the M4 run-driven claim-append effect (scenario 33) adopts
+  them unchanged and its checkpoint's grant is already what this gate
+  accepts. `AgentCheckpoint::open` is deliberately *not* used — it requires a
+  real `AgentRunEffect`, which exists only when M4 makes promotion a run
+  effect; grants are constructed by the resolving surface (all fields
+  public, as a resolved checkpoint populates them). A replayed promotion
+  answers its original outcome without re-evaluating the gate — a decided
+  promotion is not re-litigated, even by a grant that has since expired —
+  the same argument the checkpoint's own decision dedup makes.
+- **The default promotion policy gates everything.** `ClaimPromotionPolicy`
+  defaults to gate-all (fail closed); `ungated` is an explicit deployment
+  statement, exactly as a no-stage deployment passes an empty guardrail
+  chain in slice 2.2; `gating(classifications, predicates)` scopes the gate.
+  The policy is passed per `transition` call, the recorded decision-7 M2
+  precedent (deployment configuration passed to each call and enforced
+  inside it), which also lets the conformance suite exercise every mode
+  against any backend through `&dyn KnowledgeGraphStore`.
+- **The crate owns its schema window; `AgentRecordKind` is not extended.**
+  `AgentSchemaPolicy::check` takes `rakka-agent`'s non-exhaustive record-kind
+  enum with its fixed-length `ALL` array — widening it for records the base
+  crate does not own would couple `rakka-agent` to every sibling's records
+  and invert the dependency promise its crate docs make. The cross-crate
+  contract is the stable codes: the graph crate's `check_schema_window`
+  fails closed with the same `schema-version-ahead` / `schema-version-too-old`
+  vocabulary under the same N/N+1 default.
+- **Scenario 18 is a shape, not a filter.** Scope data lives under the
+  scope's injective key, so a wrong-scope read is structurally empty: `get`
+  answers `None`, `query`/`transitions` answer the empty page, `traverse`
+  answers the empty report (a start node appears only when an in-scope edge
+  touches it), and a wrong-scope *write* fails with the exact
+  `claim-not-found` an absent claim produces. The conformance clause
+  compares whole answer values against a genuinely empty space. As with the
+  2.2 retriever, answering only for the addressed scope is the
+  implementation's own obligation — a returned claim carries no tenant or
+  space, so no layer above can re-check it — documented on the SPI trait.
+- **The conformance harness is the workspace's first shared contract suite,
+  and it injects scopes, not stores.** `conformance` is an ungated `pub mod`
+  (the `rakka_agent::testkit` precedent): eleven clause functions plus the
+  `check_knowledge_graph_contract` umbrella, each taking
+  `&dyn KnowledgeGraphStore` and process-unique `ConformanceScopes`. Fresh
+  *scopes* are what clause isolation actually needs — a live-database 2.4
+  backend cannot cheaply construct stores, but every backend can serve one
+  more tenant (the 2.1/2.2 per-tenant DSN-suite pattern, made reusable).
+- **Deliberately not in the `rakka` facade yet.** The agent-adapter
+  precedent (`rakka-agent-postgres` is not in the facade either) and the
+  spec 19 "feature gates and curated prelude exports after API review"
+  clause; adding `agent-knowledge-graph = ["dep:...", "agent"]` later is a
+  one-line additive change. Recorded in the CHANGELOG as a decision.
+
 Done when: the graph halves of scenarios 16 and 18 pass on the in-memory
-implementation.
+implementation. **Done (2026-07-26):** both pass by name
+(`scenario_16_replayed_graph_writes_are_idempotent`,
+`scenario_18_unauthorized_graph_reads_do_not_reveal_existence`) in
+`crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`,
+which drives every conformance clause individually plus the one-call umbrella
+a 2.4 backend runs unchanged; the nine-case promotion-gate matrix (grant
+required, valid grant with receipt, expired, wrong-content digest, wrong
+kind, spent, replay-without-re-evaluation, foreign tenant, generation
+pinning across a dispute) passes in `tests/claim_promotion_gate.rs`; the
+transition table, derivation stability, bounds, and fail-closed
+schema/coherence loads are proven in the inline module tests; and the
+binding/effect validation-path parity is proven in
+`crates/rakka-agent/tests/checkpoints.rs`.
 
 ### Slice 2.4 — Backend conformance and M2 acceptance
 

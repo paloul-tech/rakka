@@ -9,8 +9,8 @@
 //! invalidates a stale grant.
 
 use rakka_agent::{
-    AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointError,
-    AgentCheckpointKind, AgentCheckpointOutcome, AgentCheckpointStatus,
+    AgentApprovalDecision, AgentCheckpoint, AgentCheckpointDecision, AgentCheckpointEffectBinding,
+    AgentCheckpointError, AgentCheckpointKind, AgentCheckpointOutcome, AgentCheckpointStatus,
     AgentCheckpointTimerOutcome, AgentCompensationRef, AgentEffectResolution, AgentEffectSpec,
     AgentId, AgentOperationId, AgentOperationKind, AgentReconciliationDecision, AgentRecordKind,
     AgentRevisionNumber, AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest,
@@ -456,4 +456,76 @@ fn a_cancelled_run_cancels_a_waiting_checkpoint() {
         refused,
         AgentCheckpointError::AlreadyResolved { .. }
     ));
+}
+
+#[test]
+fn the_binding_validation_path_agrees_with_the_effect_validation_path() {
+    // The claim promotion gate (slice 2.3) validates grants through
+    // `validate_for_binding`; this parity proof is what lets one code path
+    // serve both gates without drift. For the same grant, the effect path and
+    // the binding path derived from that same effect agree on the pass case
+    // and on every single-defect refusal.
+    let intent = tool_intent(42);
+    let mut checkpoint = open(AgentCheckpointKind::Approval, &intent);
+    let report = checkpoint
+        .resolve(
+            decision_key("d1"),
+            resolver(),
+            approve(),
+            AgentTimestampMillis::new(5),
+        )
+        .expect("the approval resolves");
+    let AgentCheckpointOutcome::Granted(grant) = report.outcome else {
+        panic!("an approval yields a grant");
+    };
+    let binding = AgentCheckpointEffectBinding::of_effect(&intent).expect("the binding derives");
+
+    // Pass case.
+    grant
+        .validate_for(&scope(), &intent, 1, AgentTimestampMillis::new(500))
+        .expect("the effect path accepts");
+    grant
+        .validate_for_binding(&binding, 1, AgentTimestampMillis::new(500))
+        .expect("the binding path accepts");
+
+    // A changed argument refuses identically on both paths.
+    let changed = tool_intent(99);
+    let changed_binding =
+        AgentCheckpointEffectBinding::of_effect(&changed).expect("the binding derives");
+    assert_eq!(
+        grant
+            .validate_for(&scope(), &changed, 1, AgentTimestampMillis::new(500))
+            .expect_err("a changed digest is refused")
+            .code(),
+        grant
+            .validate_for_binding(&changed_binding, 1, AgentTimestampMillis::new(500))
+            .expect_err("a changed digest is refused")
+            .code(),
+    );
+
+    // Spent and expired grants refuse identically on both paths.
+    for (attempt, now) in [(2, 500), (1, 1_001)] {
+        assert_eq!(
+            grant
+                .validate_for(&scope(), &intent, attempt, AgentTimestampMillis::new(now))
+                .expect_err("the effect path refuses")
+                .code(),
+            grant
+                .validate_for_binding(&binding, attempt, AgentTimestampMillis::new(now))
+                .expect_err("the binding path refuses")
+                .code(),
+        );
+    }
+
+    // The binding path's target comparison is the one strengthening: a
+    // tampered target refuses even though every other field still matches.
+    let mut tampered = binding.clone();
+    tampered.target = "tool:other-tool".to_string();
+    assert_eq!(
+        grant
+            .validate_for_binding(&tampered, 1, AgentTimestampMillis::new(500))
+            .expect_err("a tampered target is refused")
+            .code(),
+        "checkpoint-grant-intent-mismatch"
+    );
 }
