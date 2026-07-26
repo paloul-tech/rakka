@@ -1826,6 +1826,23 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
   referencing the old one, preserving both provenances. The bounded history
   (32) refuses explicitly — an oscillating claim is a policy incident to
   surface, never a truncation.
+- **Every derived field on a claim is re-derived on load, including the audit
+  fingerprint.** `Claim::validate` recomputes `content_digest` from the
+  record's own subject/predicate/object and refuses a mismatch
+  (`claim-statement-digest-mismatch`), on construction and on every restore,
+  which is also how deserialization is implemented — so a forged fingerprint,
+  or the realistic case of a statement edited under a stale one (a
+  hand-repaired row, an adapter that rewrote one column), cannot cross the
+  wire or reach a store. It was the one field crossing the load boundary
+  unverified while every other was bounded and re-checked, and an audit
+  fingerprint that disagrees with its own statement is worse than none: it
+  reports two claims as differing when they do not, and it hides an edit. The
+  refusal ranks after the field bounds and beside the trust-coherence check —
+  a bound describes the content and answers with the specific refusal a writer
+  needs, while these two describe whether the record contradicts itself.
+  Nothing authorizes on this field (the promotion gate recomputes sha2-256
+  over the statement itself), so this is integrity, not a security boundary,
+  and the fingerprint stays FNV on purpose.
 - **The promotion gate reuses the slice 1.10 grant verbatim, through one new
   additive seam.** `AgentCheckpointGrant::validate_for_binding(binding,
   attempt, now)` landed in `rakka-agent`'s checkpoints module, and the

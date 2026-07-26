@@ -16,7 +16,9 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-use rakka_agent::{AgentCheckpointGrantError, AgentCheckpointKind, AgentIdentityError};
+use rakka_agent::{
+    AgentCheckpointGrantError, AgentCheckpointKind, AgentContentDigest, AgentIdentityError,
+};
 use rakka_agent_workflow::StateSchemaVersion;
 
 use crate::claim::{ClaimId, ClaimOperationId, ClaimTrustStatus};
@@ -160,6 +162,16 @@ pub enum ClaimError {
         /// Claim that failed the invariant.
         claim_id: ClaimId,
     },
+    /// A claim's recorded statement fingerprint does not describe its own
+    /// subject/predicate/object.
+    StatementDigestMismatch {
+        /// Claim that failed the invariant.
+        claim_id: ClaimId,
+        /// Fingerprint the record carried.
+        recorded: AgentContentDigest,
+        /// Fingerprint the record's own statement derives.
+        derived: AgentContentDigest,
+    },
     /// A record could not be encoded or decoded.
     Encoding {
         /// What failed.
@@ -266,6 +278,7 @@ impl ClaimError {
             Self::ReferenceTooLong { .. } => "claim-reference-too-long",
             Self::InvalidEmbeddingRef { .. } => "claim-embedding-invalid",
             Self::TrustIncoherent { .. } => "claim-trust-incoherent",
+            Self::StatementDigestMismatch { .. } => "claim-statement-digest-mismatch",
             Self::Encoding { .. } => "claim-encoding-failed",
             Self::Backend { .. } => "claim-backend-failed",
             Self::AlreadyExists { .. } => "claim-already-exists",
@@ -343,6 +356,15 @@ impl Display for ClaimError {
                 f,
                 "claim {claim_id} carries a trust status and transition count that contradict \
                  each other"
+            ),
+            Self::StatementDigestMismatch {
+                claim_id,
+                recorded,
+                derived,
+            } => write!(
+                f,
+                "claim {claim_id} records statement fingerprint {recorded}, but its own \
+                 statement derives {derived}"
             ),
             Self::Encoding { message } => write!(f, "the record could not be encoded: {message}"),
             Self::Backend { backend, message } => {

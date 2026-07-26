@@ -21,6 +21,12 @@
 //! at all, so the store's append door re-derives and refuses a mismatch
 //! (`claim-append-id-not-derived`): otherwise a writer could squat the id
 //! another writer's operation will derive and deny that append forever.
+//!
+//! The statement fingerprint is the third derived field, and the one place a
+//! load can check itself: [`Claim::validate`] re-derives it from the record's
+//! own subject/predicate/object on every construction *and* every restore, so
+//! no path leaves a claim carrying an audit fingerprint that describes some
+//! other statement.
 
 use std::collections::BTreeSet;
 
@@ -490,8 +496,12 @@ pub struct Claim {
     /// The statement's object: an edge or a bounded value.
     pub object: ClaimObject,
     /// Fingerprint of the canonical subject/predicate/object statement,
-    /// stamped at construction. Audit identity only, never authorization —
-    /// the promotion gate recomputes a cryptographic digest of its own.
+    /// stamped at construction and re-derived on every [`Claim::validate`], so
+    /// it always describes the statement beside it — a loaded record whose
+    /// fingerprint disagrees fails closed
+    /// (`claim-statement-digest-mismatch`). Audit identity only, never
+    /// authorization: the promotion gate recomputes a cryptographic digest of
+    /// its own and never reads this field.
     pub content_digest: AgentContentDigest,
     /// Who asserted the claim, and in service of what.
     pub provenance: ClaimProvenance,
@@ -710,7 +720,8 @@ impl Claim {
         Ok(claim)
     }
 
-    /// Validates every bound and the trust coherence invariant.
+    /// Validates every bound, the statement fingerprint, and the trust
+    /// coherence invariant.
     pub fn validate(&self) -> ClaimResult<()> {
         if let ClaimObject::Value(content) = &self.object {
             let bytes = content.size_bytes();
@@ -749,6 +760,23 @@ impl Claim {
                     ),
                 });
             }
+        }
+        // Record coherence, after the field bounds: a bound describes the
+        // content (and answers with the specific refusal a writer needs), while
+        // these two describe whether the record contradicts itself.
+        //
+        // The statement fingerprint is re-derived, never trusted: it is the one
+        // field a loaded record could otherwise carry without describing the
+        // statement beside it. An audit fingerprint that disagrees with its own
+        // statement is worse than none — it tells an operator two claims differ
+        // when they do not, and it hides a row that was edited after the fact.
+        let derived = statement_digest(&self.subject, &self.predicate, &self.object)?;
+        if self.content_digest != derived {
+            return Err(ClaimError::StatementDigestMismatch {
+                claim_id: self.claim_id.clone(),
+                recorded: self.content_digest.clone(),
+                derived,
+            });
         }
         // Coherence: nothing transitions *to* Proposed, so the pair is a
         // bijection — a Proposed claim has no history and a claim with
@@ -791,7 +819,8 @@ pub struct ClaimRecord {
     pub predicate: ClaimPredicate,
     /// The statement's object.
     pub object: ClaimObject,
-    /// Fingerprint of the canonical statement.
+    /// Fingerprint of the canonical statement, re-derived and compared by
+    /// [`Claim::restore`].
     pub content_digest: AgentContentDigest,
     /// Who asserted the claim, and in service of what.
     pub provenance: ClaimProvenance,
@@ -1165,6 +1194,49 @@ mod tests {
         let json = serde_json::to_string(&base).expect("the claim serializes");
         let restored: Claim = serde_json::from_str(&json).expect("the claim deserializes");
         assert_eq!(restored, base);
+    }
+
+    #[test]
+    fn a_statement_fingerprint_that_does_not_describe_its_statement_fails_closed() {
+        let base = claim();
+
+        // A forged fingerprint beside an untouched statement.
+        let mut forged = base.to_record();
+        forged.content_digest = AgentContentDigest::of_bytes(b"not this statement");
+        assert_eq!(
+            Claim::restore(forged.clone())
+                .expect_err("a fingerprint that describes nothing is refused")
+                .code(),
+            "claim-statement-digest-mismatch"
+        );
+        // And through serde, so such a record cannot cross the wire either.
+        let json = serde_json::to_string(&forged).expect("the record serializes");
+        assert!(serde_json::from_str::<Claim>(&json).is_err());
+
+        // The realistic direction: a statement edited under a stale fingerprint
+        // — a hand-repaired row, or an adapter that rewrote one column.
+        let mut edited = base.to_record();
+        edited.subject = ClaimNodeId::new("customer-2").expect("the node id is valid");
+        assert_eq!(
+            Claim::restore(edited)
+                .expect_err("a statement edited under a stale fingerprint is refused")
+                .code(),
+            "claim-statement-digest-mismatch"
+        );
+
+        // Every field the fingerprint covers is covered: predicate and object
+        // too, not only the subject.
+        let mut repredicated = base.to_record();
+        repredicated.predicate = ClaimPredicate::new("avoids").expect("the predicate is valid");
+        assert!(Claim::restore(repredicated).is_err());
+        let mut reobjected = base.to_record();
+        reobjected.object =
+            ClaimObject::Node(ClaimNodeId::new("channel-sms").expect("the node id is valid"));
+        assert!(Claim::restore(reobjected).is_err());
+
+        // An untouched record still restores: the check re-derives, it does not
+        // merely refuse anything it did not compute itself.
+        Claim::restore(base.to_record()).expect("a coherent record restores");
     }
 
     #[test]

@@ -121,7 +121,13 @@ The format follows Keep a Changelog style sections, and versioning is expected t
   parameter, the only path to a non-`Proposed` claim is restoring a persisted
   record whose `Proposed ⇔ zero-transitions` coherence invariant is
   re-validated on every load, and the store's append door refuses anything
-  else (`claim-append-not-proposed`), which resolves open decision 3. Open
+  else (`claim-append-not-proposed`), which resolves open decision 3. Every
+  derived field on a claim is likewise re-derived on load rather than trusted:
+  `Claim::validate` recomputes the `content_digest` statement fingerprint from
+  the record's own subject/predicate/object and refuses a mismatch
+  (`claim-statement-digest-mismatch`), so a forged fingerprint — or a statement
+  edited under a stale one, as a hand-repaired row or a partially rewritten
+  adapter row would leave it — reaches neither the wire nor a store. Open
   decision 2 is resolved by `KnowledgeSpaceScope`: the tenant is part of the
   injective scope key, so a cross-tenant graph is unrepresentable rather than
   merely disallowed. Claim identity derives from the append operation id
