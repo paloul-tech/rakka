@@ -124,6 +124,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - Agent dispatcher cancellation is durable end to end: `AgentDispatcherWorker::cancel_run_dispatches` settles cancelled effects at the outbox layer, in-flight entries carry a typed `cancellation_requested` flag that blocks re-claiming after lease expiry, and worker refresh finalizes expired cancellation-requested entries as cancelled instead of redelivering them.
 - Agent dispatch target classification only honors `target_class` attribute and target-type refinements that are compatible with the effect kind, so a mislabeled effect can no longer be routed to a dispatcher that deterministically rejects it.
 - Agent autonomy policy classification (`AgentAutonomyTargetClass::for_effect`) is derived from the dispatcher's `AgentDispatchTargetClass::classify`, removing the name-substring webhook/push heuristics so policy admission and dispatch routing always agree on an effect's class.
+- `rakka-persistence-postgres` applies its migration under a session advisory lock (`MIGRATION_LOCK_ID`), so concurrent migrators no longer race PostgreSQL's system catalogs. `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent creation of the same table: two nodes starting together against a fresh database both saw the tables missing, both proceeded, and the loser failed to start with `duplicate key value violates unique constraint "pg_type_typname_nsp_index"` instead of the no-op the `IF NOT EXISTS` reads like. The guard matches the one `rakka-a2a`, `rakka-sharding-postgres`, and `rakka-agent-postgres` already applied to theirs — this crate, the oldest of them, was the one still unguarded — under a lock id distinct from every sibling's so the subsystems' migrations do not serialize against each other. The race is invisible once the tables exist, which is why a reused developer database never showed it; a DSN-gated test now races four migrators in a private schema.
 
 ### Security
 
@@ -136,6 +137,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - Packaging validation: `scripts/package-check.sh` in Cargo offline mode.
 - Release-candidate review: `docs/rakka-v1-release-candidate-review.md`.
 - Optional PostgreSQL validation: `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres`.
+- The PostgreSQL suites also run in CI on every pull request and push, against `pgvector/pgvector:pg16` on a fresh database each time, rather than only on a manual `workflow_dispatch`.
 - Optional Kubernetes validation: `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`.
 
 ## 0.1.0-v1-rc.0 Draft
