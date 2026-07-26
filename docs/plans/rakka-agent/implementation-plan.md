@@ -1792,7 +1792,17 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
   makes a replayed append converge on the same claim (scenario 16) while two
   distinct operations never collide. The salted derivation domains
   (`claim-append` / `claim-transition` / `claim`) follow the slice 2.1
-  `MemoryOperationId` discipline exactly. The derivation is closed the same way
+  `MemoryOperationId` discipline exactly, and every one of them digests with
+  sha2-256 rather than the default FNV fingerprint: salting stops a
+  discriminator from being *spelled* as another domain's input, but only a
+  collision-resistant digest stops one from being *searched* for a collision
+  inside a domain — and a steered operation-id collision would make a distinct
+  logical write replay to another writer's stored result, while a steered
+  claim-id collision would deny one of two writers its append. Because the
+  append door re-derives, the algorithm is part of the durable contract:
+  changing it changes the identity of every stored claim, so it is a breaking
+  change to a persisted graph rather than a transparent strengthening. The
+  derivation is closed the same way
   born-`Proposed` is: `Claim::new` takes no claim id — it derives one from the
   scope and the operation id — and because `Claim::restore` must accept any
   persisted id to load a record at all, the store's append door re-derives and

@@ -168,6 +168,27 @@ claim_id_type! {
     pub ClaimOperationId, "claim_operation_id"
 }
 
+/// Digests one salted derivation input into an identity value.
+///
+/// Cryptographic ([`AgentContentDigest::sha256_of_bytes`]) rather than the
+/// default FNV fingerprint, because these derivations decide *identity*, and in
+/// a communal space identity decides who a write belongs to. An operation id is
+/// the idempotency key: a caller who can steer a colliding derivation makes a
+/// distinct logical write replay to someone else's stored result, and the claim
+/// id derived from it names whose claim that is. Salted domain separation stops
+/// one derivation's input from being spelled as another's; only a
+/// collision-resistant digest stops a *chosen* collision within one domain, and
+/// FNV — which `rakka-agent` documents as explicitly not a security boundary —
+/// does not.
+///
+/// The derivation is part of the durable contract: because the store's append
+/// door re-derives the claim id, changing this algorithm changes claim identity
+/// for every already-stored claim. It is a breaking change to a persisted
+/// graph, never a transparent strengthening.
+fn derivation_digest(input: &str) -> AgentContentDigest {
+    AgentContentDigest::sha256_of_bytes(input.as_bytes())
+}
+
 impl ClaimOperationId {
     /// Derives the append key of one claim write.
     ///
@@ -181,15 +202,16 @@ impl ClaimOperationId {
         discriminator: impl AsRef<str>,
     ) -> AgentIdentityResult<Self> {
         let input = format!("claim-append|{}|{}", scope.key(), discriminator.as_ref());
-        let digest = AgentContentDigest::of_bytes(input.as_bytes());
-        Self::new(format!("claim-op-{}", digest.value))
+        Self::new(format!("claim-op-{}", derivation_digest(&input).value))
     }
 
     /// Derives the key of one trust transition on one claim.
     ///
     /// The `claim-transition` salt keeps this domain disjoint from the append
-    /// domain, so no discriminator, however adversarial, can make a
-    /// transition's key collide with an append's.
+    /// domain, so no discriminator can be spelled to land in the other
+    /// domain's input, and the derivation digests with
+    /// [`AgentContentDigest::sha256_of_bytes`], so no discriminator can be
+    /// *searched* for a collision within this one either.
     pub fn derive_transition(
         scope: &KnowledgeSpaceScope,
         claim: &ClaimId,
@@ -201,8 +223,7 @@ impl ClaimOperationId {
             claim,
             discriminator.as_ref()
         );
-        let digest = AgentContentDigest::of_bytes(input.as_bytes());
-        Self::new(format!("claim-op-{}", digest.value))
+        Self::new(format!("claim-op-{}", derivation_digest(&input).value))
     }
 }
 
@@ -216,14 +237,15 @@ impl ClaimId {
     /// provenance. The append operation id is the one value that is
     /// reconstructable by the writer after any crash and unique per logical
     /// write, so a replay converges on the same claim and two distinct
-    /// operations never collide.
+    /// operations never collide — the latter resting on the collision
+    /// resistance of [`AgentContentDigest::sha256_of_bytes`], since a collision
+    /// here would deny one of the two writers its append.
     pub fn derive_appended(
         scope: &KnowledgeSpaceScope,
         operation_id: &ClaimOperationId,
     ) -> AgentIdentityResult<Self> {
         let input = format!("claim|{}|{}", scope.key(), operation_id);
-        let digest = AgentContentDigest::of_bytes(input.as_bytes());
-        Self::new(format!("claim-{}", digest.value))
+        Self::new(format!("claim-{}", derivation_digest(&input).value))
     }
 }
 
@@ -802,6 +824,12 @@ pub struct ClaimRecord {
 
 /// Fingerprints the canonical statement (sorted keys, so structurally equal
 /// statements digest alike).
+///
+/// Deliberately the FNV fingerprint, not the cryptographic digest the identity
+/// derivations use: nothing decides on this value. It tells an operator one
+/// statement from another, while the promotion gate — the one place a statement
+/// gates a decision — recomputes sha2-256 over the statement itself and never
+/// reads this field.
 fn statement_digest(
     subject: &ClaimNodeId,
     predicate: &ClaimPredicate,
@@ -936,6 +964,41 @@ mod tests {
             ClaimOperationId::derive_append(&other, "op-1").expect("the operation id derives"),
             append_a
         );
+    }
+
+    #[test]
+    fn identity_derivations_are_backed_by_a_cryptographic_digest() {
+        // Salted domains stop a derivation input from being *spelled* as
+        // another's; only a collision-resistant digest stops one from being
+        // searched for. Pin the algorithm, not just the shape: identity decides
+        // whose write a replay answers, so an FNV fingerprint here is a
+        // steerable collision.
+        let digest = derivation_digest("any derivation input");
+        assert_eq!(digest.algorithm, rakka_agent::AgentDigestAlgorithm::Sha256);
+        assert!(digest.algorithm.is_cryptographic());
+
+        // The identities carry that digest's full width, and stay inside the
+        // identity bound the newtypes validate against.
+        let scope = scope();
+        let operation =
+            ClaimOperationId::derive_append(&scope, "op-1").expect("the operation id derives");
+        let claim_id = ClaimId::derive_appended(&scope, &operation).expect("the claim id derives");
+        let transition = ClaimOperationId::derive_transition(&scope, &claim_id, "t-1")
+            .expect("the operation id derives");
+        for (label, value) in [
+            ("claim-op-", operation.as_str()),
+            ("claim-", claim_id.as_str()),
+            ("claim-op-", transition.as_str()),
+        ] {
+            let hex = value
+                .strip_prefix(label)
+                .expect("the identity carries its derivation prefix");
+            assert_eq!(hex.len(), 64, "a sha2-256 identity carries 64 hex digits");
+            assert!(hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+            assert!(value.len() <= AGENT_IDENTITY_MAX_LENGTH);
+        }
     }
 
     #[test]

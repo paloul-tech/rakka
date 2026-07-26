@@ -126,8 +126,15 @@ The format follows Keep a Changelog style sections, and versioning is expected t
   injective scope key, so a cross-tenant graph is unrepresentable rather than
   merely disallowed. Claim identity derives from the append operation id
   (conflicting claims must coexist, so the statement cannot be the identity),
-  which is what makes a replayed append converge on the same claim — and the
-  derivation is an invariant rather than a convention: `Claim::new` takes no
+  which is what makes a replayed append converge on the same claim. Every
+  identity derivation (append key, transition key, claim id) digests with
+  sha2-256 rather than the default FNV fingerprint — salted domains stop a
+  discriminator from being spelled as another domain's input, but only a
+  collision-resistant digest stops one from being searched for a collision
+  within a domain, and identity here decides whose write a replay answers;
+  because the append door re-derives, the algorithm is part of the durable
+  contract rather than an implementation detail. The derivation is likewise an
+  invariant rather than a convention: `Claim::new` takes no
   claim id and derives one from the scope and operation id, while the append
   door re-derives and refuses a mismatch
   (`claim-append-id-not-derived`), since a restored record can carry any id
