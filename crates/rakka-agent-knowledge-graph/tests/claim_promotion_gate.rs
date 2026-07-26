@@ -74,7 +74,7 @@ fn rejection_reason(refusal: ClaimError) -> &'static str {
 }
 
 #[tokio::test]
-async fn the_default_policy_refuses_an_ungrated_promotion() {
+async fn the_default_policy_refuses_an_ungated_promotion() {
     let store = InMemoryKnowledgeGraphStore::new();
     let scope = ConformanceScopes::unique("gate-required").primary;
     let claim = appended(&store, &scope).await;

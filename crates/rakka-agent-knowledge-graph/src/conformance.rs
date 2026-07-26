@@ -258,6 +258,33 @@ fn transition_request(
     )
 }
 
+/// Every claim a filter admits, drained across pages.
+///
+/// A clause asserting on a *complete* answer must walk the cursor rather than
+/// read one page: a backend may declare a page bound tighter than the crate cap
+/// and serve it, so one page is not guaranteed to hold everything a filter
+/// admits. Only [`bounded_queries`] — the clause about paging itself — inspects
+/// pages directly.
+async fn drained_query(
+    store: &dyn KnowledgeGraphStore,
+    scope: &KnowledgeSpaceScope,
+    filter: &ClaimFilter,
+) -> Vec<Claim> {
+    let mut drained = Vec::new();
+    let mut cursor = ClaimCursor::start();
+    loop {
+        let page = store
+            .query(scope, filter, cursor)
+            .await
+            .expect("the query answers");
+        drained.extend(page.claims);
+        match page.next {
+            Some(next) => cursor = next,
+            None => return drained,
+        }
+    }
+}
+
 /// Claim identity: derivation is stable, distinct operations yield distinct
 /// claims, and a stored claim reads back exactly.
 pub async fn claim_identity(store: &dyn KnowledgeGraphStore, scopes: ConformanceScopes) {
@@ -344,15 +371,8 @@ pub async fn idempotent_append(store: &dyn KnowledgeGraphStore, scopes: Conforma
         "the replay must not have rewound the current record"
     );
 
-    let page = store
-        .query(scope, &ClaimFilter::matching_all(), ClaimCursor::start())
-        .await
-        .expect("the query answers");
-    assert_eq!(
-        page.claims.len(),
-        1,
-        "a replay must not create a second claim"
-    );
+    let all = drained_query(store, scope, &ClaimFilter::matching_all()).await;
+    assert_eq!(all.len(), 1, "a replay must not create a second claim");
 }
 
 /// Provenance: every dimension round-trips, and transitions preserve the
@@ -503,45 +523,39 @@ pub async fn trust_filtering(store: &dyn KnowledgeGraphStore, scopes: Conformanc
     }
 
     for (state, claim_id) in &by_state {
-        let page = store
-            .query(
-                scope,
-                &ClaimFilter::matching_all().with_trust(BTreeSet::from([*state])),
-                ClaimCursor::start(),
-            )
-            .await
-            .expect("the query answers");
+        let matching = drained_query(
+            store,
+            scope,
+            &ClaimFilter::matching_all().with_trust(BTreeSet::from([*state])),
+        )
+        .await;
         assert_eq!(
-            page.claims.len(),
+            matching.len(),
             1,
             "exactly one claim holds trust state {}",
             state.as_label()
         );
-        assert_eq!(&page.claims[0].claim_id, claim_id);
+        assert_eq!(&matching[0].claim_id, claim_id);
     }
 
     // Provenance filtering: everything here was asserted by "scout"; a
     // different agent matches nothing.
-    let by_agent = store
-        .query(
-            scope,
-            &ClaimFilter::matching_all()
-                .with_agent(AgentId::new("scout").expect("the agent id is valid")),
-            ClaimCursor::start(),
-        )
-        .await
-        .expect("the query answers");
-    assert_eq!(by_agent.claims.len(), 4);
-    let by_other = store
-        .query(
-            scope,
-            &ClaimFilter::matching_all()
-                .with_agent(AgentId::new("someone-else").expect("the agent id is valid")),
-            ClaimCursor::start(),
-        )
-        .await
-        .expect("the query answers");
-    assert!(by_other.claims.is_empty());
+    let by_agent = drained_query(
+        store,
+        scope,
+        &ClaimFilter::matching_all()
+            .with_agent(AgentId::new("scout").expect("the agent id is valid")),
+    )
+    .await;
+    assert_eq!(by_agent.len(), 4);
+    let by_other = drained_query(
+        store,
+        scope,
+        &ClaimFilter::matching_all()
+            .with_agent(AgentId::new("someone-else").expect("the agent id is valid")),
+    )
+    .await;
+    assert!(by_other.is_empty());
 
     // Default traversal follows every state but Retracted.
     let report = store
@@ -731,8 +745,17 @@ pub async fn authorization_isolation(store: &dyn KnowledgeGraphStore, scopes: Co
     assert_eq!(foreign_refusal.code(), absent_refusal.code());
 }
 
-/// Bounded queries: pages clamp their limits, and a full cursor walk covers
-/// every claim exactly once.
+/// Bounded queries: pages hold no more than their effective limit, and a full
+/// cursor walk covers every claim exactly once.
+///
+/// The page expectations are stated against the *effective* limit — the smaller
+/// of the request and the backend's declared
+/// [`KnowledgeGraphCapabilities::max_page_entries`], which is the bound the SPI
+/// obliges an implementation to serve. A backend declaring a tighter page bound
+/// passes by honouring its declaration; one that serves more than it declares
+/// fails.
+///
+/// [`KnowledgeGraphCapabilities::max_page_entries`]: crate::store::KnowledgeGraphCapabilities::max_page_entries
 pub async fn bounded_queries(store: &dyn KnowledgeGraphStore, scopes: ConformanceScopes) {
     let scope = &scopes.primary;
     let total = 7usize;
@@ -745,16 +768,22 @@ pub async fn bounded_queries(store: &dyn KnowledgeGraphStore, scopes: Conformanc
             .await
             .expect("the claim appends");
     }
+    let declared = store.capabilities().max_page_entries();
 
+    let requested = 3;
+    let effective = requested.min(declared);
     let mut seen = BTreeSet::new();
-    let mut cursor = ClaimCursor::start().with_limit(3);
+    let mut cursor = ClaimCursor::start().with_limit(requested);
     let mut pages = 0;
     loop {
         let page = store
             .query(scope, &ClaimFilter::matching_all(), cursor)
             .await
             .expect("the query answers");
-        assert!(page.claims.len() <= 3, "a page never exceeds its limit");
+        assert!(
+            page.claims.len() <= effective,
+            "a page never exceeds its effective limit of {effective}"
+        );
         for claim in &page.claims {
             assert!(
                 seen.insert(claim.claim_id.as_str().to_string()),
@@ -770,7 +799,8 @@ pub async fn bounded_queries(store: &dyn KnowledgeGraphStore, scopes: Conformanc
     }
     assert_eq!(seen.len(), total, "a cursor walk must omit nothing");
 
-    // An oversized request is clamped, not refused.
+    // An oversized request is clamped, not refused — to the declaration when
+    // the backend has one tighter than the crate cap, to the cap otherwise.
     let clamped = store
         .query(
             scope,
@@ -779,7 +809,11 @@ pub async fn bounded_queries(store: &dyn KnowledgeGraphStore, scopes: Conformanc
         )
         .await
         .expect("the query answers");
-    assert!(clamped.claims.len() <= CLAIM_PAGE_MAX_ENTRIES);
+    assert!(
+        clamped.claims.len() <= declared,
+        "an oversized request is clamped to the declared bound of {declared}, not refused"
+    );
+    assert!(declared <= CLAIM_PAGE_MAX_ENTRIES);
 }
 
 /// Edges of the fixture chain reachable within *n* outbound hops of `root`,
@@ -1055,7 +1089,7 @@ pub async fn promotion_gate(store: &dyn KnowledgeGraphStore, scopes: Conformance
     let scope = &scopes.primary;
     let now = AgentTimestampMillis::new(10);
 
-    // The default policy refuses an ungrated promotion.
+    // The default policy refuses an ungated promotion.
     let gated = conformance_claim(scope, "pg-1", "a", "b");
     store
         .append(scope, &gated)
@@ -1070,7 +1104,7 @@ pub async fn promotion_gate(store: &dyn KnowledgeGraphStore, scopes: Conformance
                 now,
             )
             .await
-            .expect_err("an ungrated promotion is refused")
+            .expect_err("an ungated promotion is refused")
             .code(),
         "claim-promotion-grant-required"
     );

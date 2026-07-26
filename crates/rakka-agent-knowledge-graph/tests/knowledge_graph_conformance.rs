@@ -105,13 +105,18 @@ async fn the_whole_contract_passes_as_one_suite() {
 /// request is the smaller of the request, this declaration, and the crate cap.
 const SHALLOW_DECLARED_DEPTH: u32 = 2;
 
-/// A conformant backend that declares — and serves — a depth tighter than the
-/// crate cap, which the SPI explicitly permits.
+/// Declared page bound: two, and honoured. Deliberately far below the crate cap
+/// and below what several clauses expect a single page to hold, so a clause that
+/// reads one page where it means "everything" fails here.
+const SHALLOW_DECLARED_PAGE_ENTRIES: usize = 2;
+
+/// A conformant backend that declares — and serves — traversal and page bounds
+/// tighter than the crate caps, which the SPI explicitly permits.
 ///
 /// It exists so the suite proves what it promises: a backend using the
 /// tighter-declaration feature passes the same clauses unchanged. Every
-/// operation but `traverse` delegates verbatim; `traverse` clamps to the
-/// declaration, which is the whole point.
+/// operation but `traverse` and `query` delegates verbatim; those two clamp to
+/// the declaration, which is the whole point.
 #[derive(Default)]
 struct ShallowKnowledgeGraphStore {
     inner: InMemoryKnowledgeGraphStore,
@@ -123,7 +128,9 @@ impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
     }
 
     fn capabilities(&self) -> KnowledgeGraphCapabilities {
-        KnowledgeGraphCapabilities::core().with_max_traversal_depth(SHALLOW_DECLARED_DEPTH)
+        KnowledgeGraphCapabilities::core()
+            .with_max_traversal_depth(SHALLOW_DECLARED_DEPTH)
+            .with_max_page_entries(SHALLOW_DECLARED_PAGE_ENTRIES)
     }
 
     fn append<'a>(
@@ -148,7 +155,12 @@ impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
         filter: &'a ClaimFilter,
         cursor: ClaimCursor,
     ) -> ClaimFuture<'a, ClaimPage> {
-        self.inner.query(scope, filter, cursor)
+        let clamped = match cursor.position() {
+            Some(after) => ClaimCursor::after(after.clone()),
+            None => ClaimCursor::start(),
+        }
+        .with_limit(cursor.limit().min(SHALLOW_DECLARED_PAGE_ENTRIES));
+        self.inner.query(scope, filter, clamped)
     }
 
     fn traverse<'a>(
@@ -183,7 +195,9 @@ impl KnowledgeGraphStore for ShallowKnowledgeGraphStore {
 }
 
 #[tokio::test]
-async fn a_backend_declaring_a_tighter_traversal_depth_passes_the_contract() {
+async fn a_backend_declaring_tighter_limits_passes_the_contract() {
+    // The slice 2.4 shape: the declared-limit feature is only usable if the
+    // suite a backend must pass unchanged accepts a backend that uses it.
     let store = ShallowKnowledgeGraphStore::default();
     conformance::check_knowledge_graph_contract(&store).await;
 }

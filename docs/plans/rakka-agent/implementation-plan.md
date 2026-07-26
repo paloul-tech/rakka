@@ -1912,6 +1912,22 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
   that manages its own. Until then idempotency was masking the collision —
   replayed writes converged on their originals — which is exactly the kind of
   accident a contract suite must not rely on.
+- **The suite states its bounded-query and bounded-traversal expectations
+  against the *effective* limit, not the crate cap.** The SPI lets a backend
+  declare traversal and page bounds tighter than the crate caps, and the
+  effective limit of a request is the smallest of the request, the
+  declaration, and the cap. A suite that asserted the cap would therefore
+  reject a backend for honouring its own declaration, which makes the feature
+  unusable — so `bounded_traversal` derives its expected edge count and
+  `truncated` flag from `capabilities().max_traversal_depth()`, and
+  `bounded_queries` bounds its pages by `capabilities().max_page_entries()`.
+  Both stay exact equalities or `<=` against the effective value, so a backend
+  that serves *more* than it declares still fails. Consequently every other
+  clause that means "all claims a filter admits" drains the cursor through the
+  `drained_query` helper instead of reading one page: only the paging clause
+  inspects pages. `tests/knowledge_graph_conformance.rs` carries a store that
+  declares depth two and page-entries two and serves both, running the whole
+  umbrella — the 2.4 shape, and a regression test rather than a promise.
 - **Deliberately not in the `rakka` facade yet.** The agent-adapter
   precedent (`rakka-agent-postgres` is not in the facade either) and the
   spec 19 "feature gates and curated prelude exports after API review"

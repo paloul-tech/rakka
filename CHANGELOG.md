@@ -179,7 +179,13 @@ The format follows Keep a Changelog style sections, and versioning is expected t
   prefixes a per-run namespace digested from the process id and the wall
   clock, which `RAKKA_KNOWLEDGE_GRAPH_CONFORMANCE_RUN` pins for a suite that
   wants to find its own rows afterwards and `unique_in` names explicitly for
-  one that manages its own namespacing. The crate is deliberately not
+  one that manages its own namespacing. Its bounded-query and
+  bounded-traversal clauses assert against the *effective* limit — the smaller
+  of the request and the backend's declared bound — so a backend declaring a
+  page or depth bound tighter than the crate cap passes the suite by honouring
+  it, while one serving more than it declares still fails; every other clause
+  drains the cursor rather than reading a single page. The crate is
+  deliberately not
   in the `rakka` facade yet — the agent-adapter precedent — pending the
   specification 19 API review. Proven in
   `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`
