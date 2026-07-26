@@ -2654,8 +2654,9 @@ where
     }
 }
 
-/// A deterministic [`AgentMemoryEmbedder`] for tests: a fixed-dimension
-/// token-hash bag-of-words embedding, no network, no model.
+/// A deterministic [`AgentMemoryEmbedder`](crate::retrieval::AgentMemoryEmbedder)
+/// for tests: a fixed-dimension token-hash bag-of-words embedding, no network,
+/// no model.
 ///
 /// The same text always embeds to the same vector, related texts share
 /// components (each token increments the component its hash selects), and the
@@ -2734,8 +2735,9 @@ impl crate::retrieval::AgentMemoryEmbedder for DeterministicEmbedder {
     }
 }
 
-/// A scripted [`AgentPrivateMemoryRetriever`] for tests: queued outcomes,
-/// answered in order, with every call recorded.
+/// A scripted
+/// [`AgentPrivateMemoryRetriever`](crate::retrieval::AgentPrivateMemoryRetriever)
+/// for tests: queued outcomes, answered in order, with every call recorded.
 ///
 /// An exhausted script answers an empty outcome, so a test scripts only the
 /// calls it is proving. Clones share the queue and the counters, matching the
