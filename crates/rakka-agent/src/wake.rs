@@ -75,7 +75,7 @@ pub type AgentWakeResult<T> = Result<T, AgentWakeError>;
 /// them. It is deliberately distinct from [`AgentRevisionNumber`]: the fencing
 /// decision of slice 3.2 compares schedule revisions specifically, and the type
 /// keeps a definition or policy revision from ever standing in for one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ScheduleRevision(u64);
 
@@ -84,9 +84,18 @@ impl ScheduleRevision {
     pub const INITIAL: Self = Self(1);
 
     /// Creates a schedule revision.
+    ///
+    /// Revisions begin at [`Self::INITIAL`], so zero is not a value any
+    /// schedule ever carried; it is clamped to the initial revision — the
+    /// constructor cannot produce a revision the fencing comparison of slice
+    /// 3.2 would have to special-case.
     #[must_use]
     pub const fn new(value: u64) -> Self {
-        Self(value)
+        if value == 0 {
+            Self::INITIAL
+        } else {
+            Self(value)
+        }
     }
 
     /// Returns the raw revision number.
@@ -105,6 +114,21 @@ impl ScheduleRevision {
 impl Display for ScheduleRevision {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScheduleRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 {
+            return Err(DeserializeError::custom(
+                "a schedule revision of zero was never issued",
+            ));
+        }
+        Ok(Self(value))
     }
 }
 
@@ -766,11 +790,15 @@ pub struct AgentWakePolicy {
     /// Trigger classes allowed to deliver occurrences. Non-empty; more than
     /// one makes the policy hybrid.
     pub triggers: BTreeSet<AgentWakeTriggerKind>,
-    /// How long after its due time an occurrence may still be admitted, in
-    /// milliseconds. Positive when set; unset means no window bound.
+    /// How long after its due time an occurrence may still be admitted as-is,
+    /// in milliseconds. Positive when set; unset means no window bound.
     pub admission_window_millis: Option<u64>,
     /// Lateness past which an occurrence is treated as missed rather than
-    /// admitted, in milliseconds. Positive when set.
+    /// admitted, in milliseconds. Positive when set, and at least the
+    /// admission window when both are set — an occurrence still inside the
+    /// window cannot simultaneously be missed. An occurrence between the two
+    /// is past direct admission but not yet missed: it is what the overlap
+    /// policy durably coalesces.
     pub maximum_lateness_millis: Option<u64>,
     /// What happens when a trigger arrives while an epoch is active.
     pub overlap: AgentWakeOverlapPolicy,
@@ -903,6 +931,16 @@ impl AgentWakePolicy {
                 return Err(AgentWakeError::ZeroDuration { field });
             }
         }
+        if let (Some(window), Some(lateness)) =
+            (self.admission_window_millis, self.maximum_lateness_millis)
+        {
+            if lateness < window {
+                return Err(AgentWakeError::LatenessBelowAdmissionWindow {
+                    admission_window_millis: window,
+                    maximum_lateness_millis: lateness,
+                });
+            }
+        }
         if let AgentWakeOverlapPolicy::Parallel {
             max_concurrent_epochs,
             ..
@@ -985,7 +1023,7 @@ impl<'de> Deserialize<'de> for AgentWakePolicy {
 /// The policy is versioned exactly as settings are: every wake binds the
 /// policy revision in force when it was constructed, so an operator can read
 /// which contract admitted an epoch long after the policy moved on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentWakePolicyRevision {
     schema_version: StateSchemaVersion,
     revision: AgentRevisionNumber,
@@ -1050,29 +1088,6 @@ impl VersionedAgentRecord for AgentWakePolicyRevision {
     }
 }
 
-impl<'de> Deserialize<'de> for AgentWakePolicyRevision {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Record {
-            schema_version: StateSchemaVersion,
-            revision: AgentRevisionNumber,
-            policy: AgentWakePolicy,
-            provenance: AgentRevisionProvenance,
-        }
-
-        let record = Record::deserialize(deserializer)?;
-        Ok(Self {
-            schema_version: record.schema_version,
-            revision: record.revision,
-            policy: record.policy,
-            provenance: record.provenance,
-        })
-    }
-}
-
 /// Rejection of a wake identity, binding, or policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1094,6 +1109,13 @@ pub enum AgentWakeError {
     ZeroDuration {
         /// The field that was zero.
         field: &'static str,
+    },
+    /// A maximum lateness that undercuts the admission window.
+    LatenessBelowAdmissionWindow {
+        /// The admission window, in milliseconds.
+        admission_window_millis: u64,
+        /// The declared maximum lateness, in milliseconds.
+        maximum_lateness_millis: u64,
     },
     /// The backoff's initial delay was zero.
     BackoffInitialZero,
@@ -1132,6 +1154,7 @@ impl AgentWakeError {
             Self::ParallelEpochsNotParallel { .. } => "wake-parallel-not-parallel",
             Self::ZeroCatchUp => "wake-zero-catch-up",
             Self::ZeroDuration { .. } => "wake-zero-duration",
+            Self::LatenessBelowAdmissionWindow { .. } => "wake-lateness-below-admission-window",
             Self::BackoffInitialZero => "wake-backoff-initial-zero",
             Self::BackoffMultiplierBelowUnit { .. } => "wake-backoff-multiplier-below-unit",
             Self::BackoffMaximumBelowInitial { .. } => "wake-backoff-maximum-below-initial",
@@ -1162,6 +1185,13 @@ impl Display for AgentWakeError {
                 f.write_str("a bounded catch-up policy must replay at least one occurrence")
             }
             Self::ZeroDuration { field } => write!(f, "the {field} must be positive"),
+            Self::LatenessBelowAdmissionWindow {
+                admission_window_millis,
+                maximum_lateness_millis,
+            } => write!(
+                f,
+                "the maximum lateness of {maximum_lateness_millis} ms is below the admission window of {admission_window_millis} ms; an occurrence between them would be both admittable and missed"
+            ),
             Self::BackoffInitialZero => f.write_str("the backoff initial delay must be positive"),
             Self::BackoffMultiplierBelowUnit { multiplier_percent } => write!(
                 f,
@@ -1359,6 +1389,46 @@ mod tests {
             })
             .expect_err("renewal without expiry should be refused");
         assert_eq!(error.code(), "wake-renewal-without-expiry");
+    }
+
+    #[test]
+    fn the_maximum_lateness_cannot_undercut_the_admission_window() {
+        // An occurrence inside the admission window but past the maximum
+        // lateness would be both admittable and missed at once, so the
+        // contradiction is refused at construction, whichever bound is
+        // declared first.
+        let error = default_policy()
+            .with_admission_window(60_000)
+            .expect("an admission window alone is accepted")
+            .with_maximum_lateness(30_000)
+            .expect_err("a lateness inside the window should be refused");
+        assert_eq!(error.code(), "wake-lateness-below-admission-window");
+
+        let error = default_policy()
+            .with_maximum_lateness(30_000)
+            .expect("a maximum lateness alone is accepted")
+            .with_admission_window(60_000)
+            .expect_err("the refusal cannot depend on declaration order");
+        assert_eq!(error.code(), "wake-lateness-below-admission-window");
+
+        default_policy()
+            .with_admission_window(60_000)
+            .expect("an admission window alone is accepted")
+            .with_maximum_lateness(60_000)
+            .expect("a lateness equal to the window is accepted");
+    }
+
+    #[test]
+    fn a_zero_schedule_revision_is_unrepresentable() {
+        assert_eq!(ScheduleRevision::new(0), ScheduleRevision::INITIAL);
+
+        let error = serde_json::from_value::<ScheduleRevision>(serde_json::json!(0))
+            .expect_err("a zero revision should fail closed on load");
+        assert!(error.to_string().contains("never issued"));
+
+        let loaded: ScheduleRevision =
+            serde_json::from_value(serde_json::json!(7)).expect("a positive revision loads");
+        assert_eq!(loaded, ScheduleRevision::new(7));
     }
 
     #[test]
