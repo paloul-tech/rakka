@@ -37,12 +37,13 @@ use rakka_agent::{
     AgentTaskStatus, AgentWakePolicy, AgentWakePolicyRevision, AgentWakeTriggerKind,
     InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
     AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE, AGENT_TASK_CREATION_PAYLOAD_TYPE,
+    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentCorrelationId, AgentTimestampMillis, PrincipalRef,
 };
 use rakka_core::ActorSystem;
-use rakka_persistence::InMemoryDurableStateStore;
+use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
 use rakka_sharding::{ClusterSharding, EntityTypeKey};
 
 type TaskStore = CrashingStateStore<AgentTaskState>;
@@ -1180,6 +1181,54 @@ async fn a_continuous_root_task_round_trips_its_mode() {
     let task = state.task().expect("the task is created");
     assert!(task.goal_mode.is_continuous());
     assert_eq!(task.goal_mode, expected);
+}
+
+#[tokio::test]
+async fn a_wake_policy_revision_from_a_newer_binary_fails_closed_on_load() {
+    // The wake policy carries its own schema version so it can evolve
+    // independently of the task state's, which means the load gate must check
+    // it independently too: a task record whose embedded revision was written
+    // by a newer binary is unreadable even when the task state itself is not.
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+
+    let mut rooted = creation(Vec::new());
+    rooted.goal = Some(AgentGoalId::new(TASK).expect("the goal id is valid"));
+    rooted.goal_mode = continuous_mode();
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(rooted),
+        })
+        .await,
+    );
+
+    let persistence_id = task_scope().persistence_id();
+    let record = fx
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the task record loads")
+        .expect("the task record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the state serializes");
+    let stored = &mut value["task"]["goal_mode"]["continuous"]["wake_policy"]["schema_version"];
+    assert_eq!(
+        *stored,
+        serde_json::json!(CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION.get()),
+        "the doctored path must reach the embedded revision's schema version"
+    );
+    *stored = serde_json::json!(CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION.get() + 1);
+    let doctored: AgentTaskState =
+        serde_json::from_value(value).expect("the doctored state deserializes");
+    fx.tasks
+        .compare_and_set(&persistence_id, record.revision, doctored)
+        .await
+        .expect("the doctored state persists");
+
+    let error = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect_err("a wake policy from a newer binary must fail closed");
+    assert_eq!(error.code(), "schema-version-ahead");
 }
 
 #[test]

@@ -3237,6 +3237,9 @@ impl AgentExchangeState for AgentTaskState {
         policy.check_record(self)?;
         if let Some(task) = &self.task {
             policy.check_record(&task.definition)?;
+            if let Some(spec) = task.goal_mode.continuous() {
+                policy.check_record(&spec.wake_policy)?;
+            }
         }
         for entry in &self.pending_history {
             policy.check_record(entry)?;
