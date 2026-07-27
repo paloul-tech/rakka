@@ -150,6 +150,7 @@ jobs:
           cargo test -p rakka-persistence-postgres
           cargo test -p rakka-sharding-postgres
           cargo test -p rakka-agent-postgres
+          cargo test -p rakka-agent-knowledge-graph-postgres
 
   kubernetes-dry-run:
     name: Kubernetes Scenario Dry Run
