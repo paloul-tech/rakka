@@ -112,7 +112,13 @@ pub const CURRENT_AGENT_SESSION_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
 /// A snapshot is immutable and content-addressed, and a model-effect retry reads
 /// it back long after it was assembled
 /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)), so it carries
-/// its own version rather than the run state's.
+/// its own version rather than the run state's. Slice 2.2 reshaped the
+/// private-selection field from bare identities to content-embedding
+/// selections without bumping this version, under the unreleased-branch rule
+/// the slice 1.7 amendment recorded: no released writer has ever persisted
+/// the earlier shape, and every record written so far carries an empty
+/// selection, which the reshaped field still loads. The first reshape after a
+/// release must bump it.
 pub const CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 

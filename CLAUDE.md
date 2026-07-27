@@ -48,6 +48,7 @@ These are skipped by default and require env vars and/or external services:
 ```sh
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres
 RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-postgres
+RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres
 RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix -- --nocapture
 RAKKA_K8S_SCENARIO_DRY_RUN=1 examples/kubernetes/local-cluster-scenario.sh         # preview, no cluster touched
 RAKKA_K8S_VALIDATE_MANIFESTS=1 cargo test -p rakka-k8s optional_kubectl_manifest_validation_is_gated -- --nocapture
@@ -71,6 +72,11 @@ rakka-core                      foundation: Actor/ActorRef/ActorContext, ActorSy
   ├─ rakka-k8s                  health, drain, DNS discovery, manifest helpers
   ├─ rakka-*-postgres           PostgreSQL adapters for persistence / sharding
   └─ rakka-agent-workflow       durable agent/compiled-workflow execution kernel (see below)
+       └─ rakka-agent           durable agent domain: entities, loop, model adapter, effects,
+                                budgets, checkpoints, memory (rakka-agent-postgres = PostgreSQL/
+                                pgvector adapters; rakka-agent-knowledge-graph = communal claims,
+                                trust transitions, promotion gate, portable graph SPI + conformance;
+                                rakka-agent-knowledge-graph-postgres = the graph's relational backend)
 
 rakka                          top-level facade crate + curated `rakka::prelude`; re-exports
                                component crates behind cargo features (default = all)

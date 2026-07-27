@@ -106,15 +106,16 @@ use crate::identity::{
 };
 use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
 use crate::memory::{
-    assemble_session_context, AgentContextSnapshotRef, AgentRunMemory, MemoryError, MemorySequence,
-    SessionMemoryEntry,
+    AgentContextSnapshotRef, AgentRunMemory, MemoryError, MemorySequence, SessionMemoryEntry,
 };
 use crate::model::AgentModelError;
 use crate::observability::{
     record_agent_domain_counter, record_agent_domain_gauge, AgentDecisionDraft,
     AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_RECOVERY_EVENTS,
-    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -3619,10 +3620,13 @@ where
     /// persisted before the effect is dispatched, so it exists before the model
     /// call the effect represents. It is immutable: a re-driven pass — a retry,
     /// a recovery — finds the snapshot already stored and reuses it, even when
-    /// session memory has been appended to since, which is what stops a
-    /// dispatcher retry from silently changing the model's input. A run with no
-    /// session-memory backend keeps only the opaque reference, so this is a no-op
-    /// for it.
+    /// session memory has been appended to or the retrieval index has moved
+    /// since, which is what stops a dispatcher retry from silently changing the
+    /// model's input. Assembly runs through
+    /// [`crate::retrieval::assemble_context`], which fills the private
+    /// selections when a retrieval bundle is wired; a run with no
+    /// session-memory backend keeps only the opaque reference, so this is a
+    /// no-op for it.
     async fn persist_context_snapshots(
         &mut self,
         now: AgentTimestampMillis,
@@ -3660,18 +3664,48 @@ where
                 // The snapshot already exists and is immutable — reuse it.
                 continue;
             }
-            let snapshot = assemble_session_context(
-                memory.session(),
+            let assembled = crate::retrieval::assemble_context(
+                &memory,
                 &self.scope,
                 &reference,
                 turn,
-                memory.window(),
                 AgentRevisionNumber::INITIAL,
                 now,
             )
             .await?;
-            memory.snapshots().persist(&snapshot).await?;
+            memory.snapshots().persist(&assembled.snapshot).await?;
             persisted += 1;
+
+            let report = assembled.retrieval;
+            if report.attempted {
+                let backend = memory
+                    .retrieval()
+                    .map_or("none", |retrieval| retrieval.retriever().backend_name());
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_MEMORY_RETRIEVALS,
+                    1,
+                    &[("backend", backend), ("outcome", report.outcome_label())],
+                )
+                .ok();
+                for (outcome, count) in [
+                    ("blocked", report.blocked),
+                    ("transformed", report.transformed),
+                    ("reported", report.reported),
+                    ("checkpoint-refused", report.checkpoint_refused),
+                    ("rejected", report.rejected),
+                ] {
+                    if count > 0 {
+                        record_agent_domain_counter(
+                            self.metrics.as_ref(),
+                            METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+                            count as u64,
+                            &[("outcome", outcome)],
+                        )
+                        .ok();
+                    }
+                }
+            }
         }
         Ok(persisted)
     }

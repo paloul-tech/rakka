@@ -1627,8 +1627,144 @@ Spec: [13.3](spec.md#133-agent-private-long-term-memory),
   record's `MemoryEmbeddingRef` metadata is already persisted, content-free,
   for the vectors this slice derives.
 
+**Amended as implemented (2026-07-24):**
+
+- **The snapshot embeds selected content, not just ids.** The reconciliation
+  the slice text ordered went further than a type swap: `private_memory`
+  became `Vec<SnapshotPrivateMemory>` — id, revision, kind, the *exact
+  content used*, digest, classification, confidence, relevance, embedding
+  metadata, and the recorded ingress transforms/reports — because
+  [spec 13.5](spec.md#135-memory-context-snapshot) requires "selected private
+  memory IDs and exact content/references", and an id alone cannot make a
+  retried model input immune to index drift: a retry that re-read the store
+  by id would observe whatever the id points at *now*. Content in the
+  snapshot plus first-writer-wins persistence is what discharges the
+  done-when test. The reshape stayed at snapshot schema version 1 under the
+  unreleased-branch rule (every record written so far carries an empty
+  selection, which still loads); 2.1's purge-both-stores retention argument
+  now covers private content embedded in snapshots unchanged — and a memory
+  tombstoned *after* a snapshot embedded it keeps that embedded copy until
+  the run's snapshot retention purges it, immutability over withdrawal, the
+  same rule redacted session entries follow.
+- **Retrieval is a settle-pass concern with a required guardrail chain.** The
+  Rakka-owned seam (`AgentPrivateMemoryRetriever`, `AgentMemoryEmbedder`,
+  `rakka_agent::retrieval`) rides `AgentRunMemory` as an
+  `AgentMemoryRetrieval` bundle whose memory-ingress chain is a *required*
+  constructor argument — a wired retriever can never silently skip the
+  boundary; a no-stage deployment passes an empty chain explicitly. The
+  query is derived deterministically from the just-assembled session window
+  (never a second store read), every returned record is re-checked
+  fail-closed against the query's own pre-ranking filter table — duplicates,
+  inadmissible classifications, and invalid records are rejected — and the
+  ingress evaluation runs per record with the memory's identity on the
+  guardrail context. The re-check's limit is documented rather than
+  overstated: *scope* is the one clause it cannot cover, because an
+  `AgentPrivateMemory` carries no tenant or agent, so a wrong-scope record is
+  indistinguishable from a correct one by the time the assembly sees it.
+  Answering only for the addressed scope therefore stays the retriever's own
+  obligation, and the one clause a backend must prove with its own tests
+  (scenario 18). Outcomes: block drops that
+  record only; a transform's output is what the snapshot embeds, recorded
+  with its stage revision, and a retry reuses it *structurally*;
+  report-only records the finding on the selection; require-checkpoint is a
+  fail-closed drop, because no checkpoint plumbing exists at snapshot
+  assembly and memory must never gate liveness (confirmed decision). Blocked
+  and checkpoint-refused records are deliberately absent from the snapshot —
+  absence is the decision, and a reason code for absent content would leak
+  what was blocked into model-adjacent data — so the new bounded
+  `rakka.agent.memory.retrievals` / `rakka.agent.memory.ingress.outcomes`
+  counters are their visibility. A retriever outage degrades the turn to an
+  empty selection with the attempted retrieval still recorded
+  ([spec 13.1](spec.md#131-general-requirements) over 13.5, the exact
+  argument of 2.1's failed-promotion amendment); the degraded turn keeps its
+  empty selection forever, because first-writer-wins determinism is the
+  stronger promise. Coverage note: the dispatch authority's
+  `validate_covers` cannot see the retrieval bundle's chain, so a deployment
+  must wire the same chain into both — documented on both seams; a
+  deployment with no retrieval wired is not fail-open, because nothing
+  crosses the boundary at all.
+- **Nothing stamps `AgentPrivateMemory.embedding` in this slice.** A
+  compare-and-set stamp from the indexing path would bump the revision the
+  just-derived vector was keyed to (invalidating its own `source_revision`
+  fence) and race live runs for nothing the derived row does not already
+  record. The derived row *is* the model/dimensions/version record;
+  `RetrievedPrivateMemory.embedding` carries it into the snapshot selection.
+  The record field remains for deployment writers that know their embedder
+  configuration.
+- **The pgvector adapter separates its migration and lets the join carry
+  reveal-nothing.** `VECTOR_MIGRATION_SQL` (extension + a typmod-less
+  `vector` table keyed `(tenant, agent, memory_id)` with a per-row dimension
+  check, so one shared migration serves any embedder) is applied only by the
+  retriever's `migrate()` under the crate's existing advisory lock; the
+  three 2.1 stores and `MIGRATION_SQL` are untouched and stay green on
+  databases without pgvector — which is also why the 2.1 tombstone/delete/
+  purge CTEs were *not* extended to touch the derived table. Instead the
+  retrieval statement inner-joins the authoritative row on scope,
+  `source_revision = revision`, tombstone, and expiry — every filter the
+  query carries, classification *and* the confidence floor included, a
+  `WHERE` predicate ahead of the `ORDER BY` distance — so a leftover vector
+  row is unretrievable in any scope even mid-crash between a delete and its
+  deindex, and eventual consistency manifests as absence, never as ranking
+  current content by stale geometry. Both policy columns are denormalized
+  onto the derived row for exactly that reason (a predicate can only sit
+  ahead of the `ORDER BY` if its column is in the ranked table), and neither
+  can go stale, because the revision fence makes a row whose authoritative
+  policy metadata has moved a non-candidate outright. Enforcing either one
+  only in the adapter's post-decode re-check would have been a *post-`LIMIT`*
+  drop: the record it removes has already consumed a result slot, so a
+  retrieval would answer short of what the corpus holds — the review finding
+  this amendment records as fixed.
+  Deployment-invoked maintenance (`index_memory`, paged `reindex` as the
+  spec 13.3 rebuild path, `deindex_memory`/`purge_orphaned` as residual-row
+  hygiene) mirrors `purge_expired`'s no-resident-sweeper pattern, and
+  `reindex` pages *past* a record it cannot decode — advancing its cursor on
+  each row's own id before any fallible step and counting the record into
+  `ReindexPage::failed` — because propagating instead would wedge the sweep
+  on the same page forever and take the rebuild path offline for that agent
+  during exactly the rolling upgrade that produces unreadable records.
+  Vectors
+  bind as text literals (`$n::text::vector`, no new dependency; f32
+  shortest-round-trip formatting is exact through pgvector's parser, proven
+  server-side by zero self-distance), failing closed on non-finite or
+  wrong-length embedder output.
+- **Recall characteristics: exact scan ships; ANN is a documented opt-in.**
+  The `(tenant, agent)` primary-key prefix bounds the candidate set to one
+  agent's corpus and the distance is exact within it — recall 1.0, cost
+  linear in the agent's live indexed corpus, the right default because
+  pgvector's approximate indexes post-filter their candidates and silently
+  lose recall under exactly the scope predicate spec 13.6 makes mandatory.
+  The module rustdoc documents the expression-HNSW opt-in (deployment DDL,
+  fixed-dimension cast, pgvector ≥ 0.8 iterative scans to restore recall
+  under filters). Redacted and artifact-backed memories are not semantically
+  indexed in v1 (the adapter never loads artifact bytes); they surface as
+  visible skips in `ReindexPage`.
+- **CI now exercises the crate, on every pull request.** The postgres job's
+  service image moved to `pgvector/pgvector:pg16` (a drop-in postgres:16 with
+  the extension package) and gained `cargo test -p rakka-agent-postgres`. On
+  its own that was not enough to close the pre-existing gap where even 2.1's
+  DSN-gated tests ran nowhere but developer machines: the job was still
+  gated to `workflow_dispatch` with an opt-in input, so it ran only when
+  someone remembered to ask. The gate is now `github.event_name !=
+  'workflow_dispatch' || inputs.run_postgres` — always on pull requests and
+  pushes, still skippable on a manual run. What these suites prove cannot be
+  proven another way (the genuinely concurrent compare-and-set race,
+  cross-scope invisibility, the filter-before-ranking predicates are
+  properties of live SQL), and this slice is the evidence: both review
+  findings it fixes were defects only a live database exposes. The pgvector
+  tests additionally probe `pg_available_extensions` and skip with a message
+  on a plain database, so a DSN without the extension keeps the crate green.
+
 Done when: retrieval isolation tests pass and a snapshot-reuse test proves
 index drift cannot change a retried model input (extends scenario 17).
+**Done (2026-07-24):** isolation holds at the reference-retriever, run-entity
+(`crates/rakka-agent/tests/private_memory_retrieval.rs`), and pgvector
+(DSN-gated, per-tenant/per-agent with empty-scope indistinguishability)
+levels; the drift test re-drives a persisted turn after a CAS update, a
+tombstone, *and* a retriever upgrade and reloads the snapshot byte-identical;
+the ingress boundary's outcome table and the 2.1 coverage flip are proven in
+`tests/memory_ingress_guardrails.rs`; the pgvector suite passes against
+`pgvector/pgvector:pg16` and probe-skips (with the base stores green) against
+plain PostgreSQL 16.
 
 ### Slice 2.3 — Communal knowledge graph crate
 
@@ -1645,8 +1781,173 @@ Spec: [13.4](spec.md#134-communal-knowledge-graph),
 - HITL/policy promotion gate for consequential claims reusing Slice 1.10
   checkpoints.
 
+**Amended as implemented (2026-07-26):**
+
+- **A claim's identity derives from its append operation, not its statement.**
+  Conflicting claims MUST coexist ([spec 13.4](spec.md#134-communal-knowledge-graph)),
+  so two agents asserting the same subject/predicate/object are two claims
+  with distinct provenance — the statement cannot be the identity. The append
+  operation id is the one value reconstructable by the writer after any crash
+  and unique per logical write, so `ClaimId::derive_appended(scope, operation)`
+  makes a replayed append converge on the same claim (scenario 16) while two
+  distinct operations never collide. The salted derivation domains
+  (`claim-append` / `claim-transition` / `claim`) follow the slice 2.1
+  `MemoryOperationId` discipline exactly, and every one of them digests with
+  sha2-256 rather than the default FNV fingerprint: salting stops a
+  discriminator from being *spelled* as another domain's input, but only a
+  collision-resistant digest stops one from being *searched* for a collision
+  inside a domain — and a steered operation-id collision would make a distinct
+  logical write replay to another writer's stored result, while a steered
+  claim-id collision would deny one of two writers its append. Because the
+  append door re-derives, the algorithm is part of the durable contract:
+  changing it changes the identity of every stored claim, so it is a breaking
+  change to a persisted graph rather than a transparent strengthening. The
+  derivation is closed the same way
+  born-`Proposed` is: `Claim::new` takes no claim id — it derives one from the
+  scope and the operation id — and because `Claim::restore` must accept any
+  persisted id to load a record at all, the store's append door re-derives and
+  refuses a mismatch (`claim-append-id-not-derived`, conformance-tested).
+  Without that door the derivation would be convention rather than invariant,
+  and a writer could squat the id another writer's operation will derive and
+  deny that append forever.
+- **Born-`Proposed` is the type system's answer, closed at three doors.**
+  `Claim::new` takes no trust parameter (open decision 3); the only path to a
+  non-`Proposed` claim is `Claim::restore` from a persisted record, whose
+  `Proposed ⇔ zero-transitions` coherence invariant is re-validated on every
+  load and inside deserialization; and the store's append door refuses any
+  claim that is not `Proposed`-with-no-history
+  (`claim-append-not-proposed`) — conformance-tested so no slice 2.4 backend
+  can drift. Trust moves only through `Claim::apply_transition`, the single
+  legality-enforcement point every backend shares (the fields are private, so
+  no path can skip the table). The lattice: `Proposed → Verified(gated) |
+  Disputed | Retracted`; `Verified → Disputed | Retracted`; `Disputed →
+  Verified(gated) | Retracted`; `Retracted` terminal; nothing transitions
+  *to* `Proposed` (that would launder history); un-retracting is a new claim
+  referencing the old one, preserving both provenances. The bounded history
+  (32) refuses explicitly — an oscillating claim is a policy incident to
+  surface, never a truncation.
+- **Every derived field on a claim is re-derived on load, including the audit
+  fingerprint.** `Claim::validate` recomputes `content_digest` from the
+  record's own subject/predicate/object and refuses a mismatch
+  (`claim-statement-digest-mismatch`), on construction and on every restore,
+  which is also how deserialization is implemented — so a forged fingerprint,
+  or the realistic case of a statement edited under a stale one (a
+  hand-repaired row, an adapter that rewrote one column), cannot cross the
+  wire or reach a store. It was the one field crossing the load boundary
+  unverified while every other was bounded and re-checked, and an audit
+  fingerprint that disagrees with its own statement is worse than none: it
+  reports two claims as differing when they do not, and it hides an edit. The
+  refusal ranks after the field bounds and beside the trust-coherence check —
+  a bound describes the content and answers with the specific refusal a writer
+  needs, while these two describe whether the record contradicts itself.
+  Nothing authorizes on this field (the promotion gate recomputes sha2-256
+  over the statement itself), so this is integrity, not a security boundary,
+  and the fingerprint stays FNV on purpose.
+- **The promotion gate reuses the slice 1.10 grant verbatim, through one new
+  additive seam.** `AgentCheckpointGrant::validate_for_binding(binding,
+  attempt, now)` landed in `rakka-agent`'s checkpoints module, and the
+  existing effect-path `validate_for` now delegates to it (its identity
+  checks still run first, so error precedence is preserved; the binding path
+  additionally compares the dispatch `target`, a pure strengthening). The
+  graph crate derives the canonical binding from the *authoritative* claim —
+  sha256 over the scope key, claim id, full statement, `from` status, and the
+  one-based ordinal the promotion would occupy, with the effect generation
+  pinned to that same ordinal — so a grant authorizes exactly one promotion
+  at exactly one history position: after a dispute, re-promotion is a new
+  ordinal, a new generation, a new grant, and the stale grant fails the
+  identity check before the digest is even compared (proven in the gate test
+  matrix). The effect id (`claim-promotion:{claim}`) and target are
+  deterministic so the M4 run-driven claim-append effect (scenario 33) adopts
+  them unchanged and its checkpoint's grant is already what this gate
+  accepts. `AgentCheckpoint::open` is deliberately *not* used — it requires a
+  real `AgentRunEffect`, which exists only when M4 makes promotion a run
+  effect; grants are constructed by the resolving surface (all fields
+  public, as a resolved checkpoint populates them). A replayed promotion
+  answers its original outcome without re-evaluating the gate — a decided
+  promotion is not re-litigated, even by a grant that has since expired —
+  the same argument the checkpoint's own decision dedup makes.
+- **The default promotion policy gates everything.** `ClaimPromotionPolicy`
+  defaults to gate-all (fail closed); `ungated` is an explicit deployment
+  statement, exactly as a no-stage deployment passes an empty guardrail
+  chain in slice 2.2; `gating(classifications, predicates)` scopes the gate.
+  The policy is passed per `transition` call, the recorded decision-7 M2
+  precedent (deployment configuration passed to each call and enforced
+  inside it), which also lets the conformance suite exercise every mode
+  against any backend through `&dyn KnowledgeGraphStore`.
+- **The crate owns its schema window; `AgentRecordKind` is not extended.**
+  `AgentSchemaPolicy::check` takes `rakka-agent`'s non-exhaustive record-kind
+  enum with its fixed-length `ALL` array — widening it for records the base
+  crate does not own would couple `rakka-agent` to every sibling's records
+  and invert the dependency promise its crate docs make. The cross-crate
+  contract is the stable codes: the graph crate's `check_schema_window`
+  fails closed with the same `schema-version-ahead` / `schema-version-too-old`
+  vocabulary under the same N/N+1 default.
+- **Scenario 18 is a shape, not a filter.** Scope data lives under the
+  scope's injective key, so a wrong-scope read is structurally empty: `get`
+  answers `None`, `query`/`transitions` answer the empty page, `traverse`
+  answers the empty report (a start node appears only when an in-scope edge
+  touches it), and a wrong-scope *write* fails with the exact
+  `claim-not-found` an absent claim produces. The conformance clause
+  compares whole answer values against a genuinely empty space. As with the
+  2.2 retriever, answering only for the addressed scope is the
+  implementation's own obligation — a returned claim carries no tenant or
+  space, so no layer above can re-check it — documented on the SPI trait.
+- **The conformance harness is the workspace's first shared contract suite,
+  and it injects scopes, not stores.** `conformance` is an ungated `pub mod`
+  (the `rakka_agent::testkit` precedent): twelve clause functions plus the
+  `check_knowledge_graph_contract` umbrella, each taking
+  `&dyn KnowledgeGraphStore` and fresh `ConformanceScopes`. Fresh
+  *scopes* are what clause isolation actually needs — a live-database 2.4
+  backend cannot cheaply construct stores, but every backend can serve one
+  more tenant (the 2.1/2.2 per-tenant DSN-suite pattern, made reusable).
+  Uniqueness has to hold along three axes, not one: a sequence counter
+  isolates clauses within a process, but it is process-local and starts at
+  zero, so it cannot separate the test binaries `cargo test` runs
+  concurrently, nor a second run from the rows the first left in a live
+  database. `ConformanceScopes::unique` therefore prefixes a per-run
+  namespace digested from the process id and the wall clock (the pid alone is
+  recycled by the operating system; a coarse clock alone can repeat), which
+  `RAKKA_KNOWLEDGE_GRAPH_CONFORMANCE_RUN` pins when a 2.4 suite wants a
+  namespace it can find again, and `unique_in` names explicitly for a suite
+  that manages its own. Until then idempotency was masking the collision —
+  replayed writes converged on their originals — which is exactly the kind of
+  accident a contract suite must not rely on.
+- **The suite states its bounded-query and bounded-traversal expectations
+  against the *effective* limit, not the crate cap.** The SPI lets a backend
+  declare traversal and page bounds tighter than the crate caps, and the
+  effective limit of a request is the smallest of the request, the
+  declaration, and the cap. A suite that asserted the cap would therefore
+  reject a backend for honouring its own declaration, which makes the feature
+  unusable — so `bounded_traversal` derives its expected edge count and
+  `truncated` flag from `capabilities().max_traversal_depth()`, and
+  `bounded_queries` bounds its pages by `capabilities().max_page_entries()`.
+  Both stay exact equalities or `<=` against the effective value, so a backend
+  that serves *more* than it declares still fails. Consequently every other
+  clause that means "all claims a filter admits" drains the cursor through the
+  `drained_query` helper instead of reading one page: only the paging clause
+  inspects pages. `tests/knowledge_graph_conformance.rs` carries a store that
+  declares depth two and page-entries two and serves both, running the whole
+  umbrella — the 2.4 shape, and a regression test rather than a promise.
+- **Deliberately not in the `rakka` facade yet.** The agent-adapter
+  precedent (`rakka-agent-postgres` is not in the facade either) and the
+  spec 19 "feature gates and curated prelude exports after API review"
+  clause; adding `agent-knowledge-graph = ["dep:...", "agent"]` later is a
+  one-line additive change. Recorded in the CHANGELOG as a decision.
+
 Done when: the graph halves of scenarios 16 and 18 pass on the in-memory
-implementation.
+implementation. **Done (2026-07-26):** both pass by name
+(`scenario_16_replayed_graph_writes_are_idempotent`,
+`scenario_18_unauthorized_graph_reads_do_not_reveal_existence`) in
+`crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`,
+which drives every conformance clause individually plus the one-call umbrella
+a 2.4 backend runs unchanged; the nine-case promotion-gate matrix (grant
+required, valid grant with receipt, expired, wrong-content digest, wrong
+kind, spent, replay-without-re-evaluation, foreign tenant, generation
+pinning across a dispute) passes in `tests/claim_promotion_gate.rs`; the
+transition table, derivation stability, bounds, and fail-closed
+schema/coherence loads are proven in the inline module tests; and the
+binding/effect validation-path parity is proven in
+`crates/rakka-agent/tests/checkpoints.rs`.
 
 ### Slice 2.4 — Backend conformance and M2 acceptance
 
@@ -1661,8 +1962,86 @@ Spec: [13.6](spec.md#136-storage-adapters),
   provenance, trust filtering, authorization, bounded queries) unchanged
   across backends.
 
+**Amended as implemented (2026-07-26):**
+
+- **The second backend is PostgreSQL relational tables in a new crate,
+  `rakka-agent-knowledge-graph-postgres`, and no reference backend is
+  named.** The disposition on open decision 8 records the resolution:
+  the representative claim/traversal/tenancy/bounded-query families are
+  captured as the conformance clauses themselves (a table in the
+  conformance-module docs maps each family to the clause proving it), and
+  migration stays backend-owned because the portable SPI deliberately has no
+  migration surface. A separate crate follows the
+  `rakka-persistence`/`rakka-persistence-postgres` precedent;
+  `rakka-agent-postgres` is scoped "one crate, one schema, one lock" to
+  agent memory and never referenced the graph domain, so grafting claims
+  onto it would have coupled memory-only consumers to the graph crate.
+- **The scenario-20 proof is the commit shape, not just the test.** The
+  capture doc landed as its own docs-only commit to the domain crate; the
+  backend commit then touches nothing under `crates/rakka-agent` or
+  `crates/rakka-agent-knowledge-graph` — the suite ran unchanged by
+  construction, and `scenario_20_the_whole_contract_passes_unchanged...`
+  drives the one-call umbrella against the live store.
+- **The record BYTEA is authoritative; columns are fences and predicates
+  only.** Claims and transitions persist as their canonical `serde_json`
+  encodings and are rebuilt through the domain `restore` doors on every
+  load, so the schema window, statement-digest re-derivation, and trust
+  coherence all fail closed against live rows (proven by doctoring rows in
+  place). `subject`/`predicate`/`object_node`/`trust` are denormalized only
+  for traversal predicates, `transition_count` only as the compare-and-set
+  fence, and a column that disagrees with its own record is refused as
+  drift — never skipped (a skip would answer short) and never preferred.
+- **Queries are `admits()`-in-Rust keyset scans, by design of the filter.**
+  `ClaimFilter` exposes builders and the shared `admits` predicate but no
+  field accessors, so SQL pushdown is impossible without widening the domain
+  API — and unnecessary: resumption is by claim-id position, not offset, so
+  Rust-side admission loses no rows, and the `COLLATE "C"` column makes SQL
+  order exactly the reference implementation's string order. Cost is linear
+  in one scope's corpus, documented in the crate docs — the same
+  exactness-first trade slice 2.2 recorded for pgvector. The `next` cursor
+  is minted only when a further *admitted* claim was actually seen, the one
+  convention a raw `LIMIT n+1` cannot reproduce under Rust-side admission.
+- **Writes are single data-modifying-CTE statements; the transition is a
+  bounded CAS loop that reads the ledger first on every attempt.** The
+  slice 2.1 discipline carries over: ledger consultation, the claim
+  mutation, the transition append, and the ledger insert commit or fail as
+  one implicit transaction on the shared pipelined client. A replay answers
+  the ledger's original bytes — a decided promotion is not re-litigated,
+  even by a grant that has since expired, proven across a reconnect — and a
+  lost race loops into a fresh read where the legality table re-runs
+  against the state that won, so contention converges on the winner's
+  replay or a typed refusal (`TRANSITION_CAS_MAX_ATTEMPTS` bounds the loop;
+  exhaustion is `claim-backend-failed`, never a silent wrong answer).
+  Traversal is the reference breadth-first expansion over bounded per-node
+  queries — every predicate ahead of the per-node `LIMIT`, the global
+  spent-edge set threaded through each statement — because a recursive CTE
+  cannot express the global dedup, the deterministic edge order, or
+  truncation at the exact budgeted edge.
+- **The migration advisory lock takes the fresh id `982_451_927`.** The
+  existing family (`…653/659/707/777/881`) is folklore-prime but really
+  just distinct values; distinctness is the only real constraint, and the
+  doc on the constant says so.
+- **`tests/claim_promotion_gate.rs` deliberately stays typed to the
+  in-memory store.** Its nine cases exercise `validate_promotion` and the
+  binding derivation — domain logic the backend calls verbatim before its
+  write statement; the backend-coupled cases (grant required, granted
+  receipt, expired grant, replay-without-re-evaluation) already run against
+  the live store through the conformance clauses, and the one genuinely
+  backend-shaped risk — a replayed gated promotion racing the CAS loop
+  after grant expiry — has its own dedicated proof. Generalizing the
+  helper file would have put agent-domain edits into the slice whose
+  acceptance is their absence; it remains an optional follow-up.
+
 Done when: scenario 20 passes across both implementations without touching
-agent-domain code.
+agent-domain code. **Done (2026-07-26):** the umbrella and all twelve
+clauses pass by name against the live store in
+`crates/rakka-agent-knowledge-graph-postgres/tests/postgres_conformance.rs`
+(scenarios 16, 18, and 20 named), the backend-only durability proofs pass in
+`tests/postgres_backend_proofs.rs` (reconnect replay, two-connection
+distinct- and same-operation races, gated-promotion replay after expiry,
+migration idempotence and the four-migrator race, doctored rows failing
+closed), the CI postgres job runs the crate on every pull request, and the
+backend commit's diff contains zero agent-domain changes.
 
 ---
 

@@ -18,7 +18,9 @@
 //!
 //! Specification: sections 13.1, 13.2, 13.5, and the short-term clauses of 13.6;
 //! the private trait of 13.3 is declared here so scopes are fixed early. Filled
-//! by slice 1.11; the private and communal stores by phase 2.
+//! by slice 1.11; the private store by slice 2.1; the retrieval path that fills
+//! a snapshot's private selections by slice 2.2 ([`crate::retrieval`]); the
+//! communal store by the phase-2 graph slice.
 //!
 //! # What memory is, and is not
 //!
@@ -54,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::definition::AgentRevisionNumber;
+use crate::definition::{AgentGuardrailStageId, AgentRevisionNumber};
 use crate::identity::{validated_id, AgentIdentityResult, AgentRunScope, AgentScope};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -945,6 +947,66 @@ pub struct SnapshotRetrieval {
     pub index_watermark: Option<String>,
 }
 
+/// One memory-ingress guardrail finding recorded on a snapshot selection
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Snapshot-owned rather than reusing the chain's decision types, because those
+/// are serialize-only telemetry shapes and a snapshot must round-trip through
+/// its store. The stage revision is what makes a recorded transform
+/// reconstructable: the pair (revision, input) fixes the output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotIngressRecord {
+    /// The stage that decided.
+    pub stage: AgentGuardrailStageId,
+    /// The revision the stage evaluated under.
+    pub revision: AgentRevisionNumber,
+    /// Stable machine-readable reason code.
+    pub reason_code: String,
+}
+
+/// One private memory, exactly as it entered the snapshot
+/// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md): "selected
+/// private memory IDs and exact content/references").
+///
+/// The snapshot embeds the content, not just the identity, for the same reason
+/// [`SnapshotSessionEntry`] does: a model-effect retry must reuse the exact
+/// input the first assembly selected, and an identity alone would let a
+/// concurrent memory update or an eventually consistent index change a retried
+/// model input (scenario 17). `(memory_id, revision)` still names the
+/// authoritative record; store-internal state — retention, ledger operations,
+/// audit references — deliberately stays out of model-adjacent data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotPrivateMemory {
+    /// Identity of the private memory this selection used.
+    pub memory_id: AgentPrivateMemoryId,
+    /// The store revision the selection read.
+    pub revision: AgentRevisionNumber,
+    /// The memory type.
+    pub kind: AgentPrivateMemoryKind,
+    /// The exact content used — post-transform, when a memory-ingress stage
+    /// rewrote it.
+    pub content: AgentTaskContent,
+    /// The digest of the content as included, recomputed after any transform.
+    pub content_digest: AgentContentDigest,
+    /// The classification of the content.
+    pub classification: MemoryClassification,
+    /// The record's confidence score in basis points.
+    pub confidence_bps: u16,
+    /// The retriever's deterministic relevance score in basis points.
+    pub relevance_bps: u16,
+    /// Metadata of the derived vector that ranked this memory, when the
+    /// retriever reported one ([specification 13.5](../../../docs/plans/rakka-agent/spec.md):
+    /// embedding version when available).
+    #[serde(default)]
+    pub embedding: Option<MemoryEmbeddingRef>,
+    /// Every memory-ingress transform applied to the content, in stage order.
+    #[serde(default)]
+    pub transforms: Vec<SnapshotIngressRecord>,
+    /// Every memory-ingress report-only finding, in stage order.
+    #[serde(default)]
+    pub reports: Vec<SnapshotIngressRecord>,
+}
+
 /// The prompt and context budget one snapshot accounted for
 /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -959,6 +1021,9 @@ pub struct SnapshotBudget {
     pub session_bytes: usize,
     /// How many private memories the snapshot selected.
     pub private_memories: usize,
+    /// The serialized byte size of the selected private-memory content.
+    #[serde(default)]
+    pub private_memory_bytes: usize,
     /// How many communal claims the snapshot selected.
     pub communal_claims: usize,
 }
@@ -972,9 +1037,11 @@ pub struct SnapshotBudget {
 /// untrusted contextual data ([`Self::trust`]); its digest pins the exact bytes
 /// it assembled.
 ///
-/// The private and communal selections are present but empty until phase 2
-/// delivers those stores; the scopes are fixed here so a session-only snapshot
-/// and a phase-2 snapshot share one record shape.
+/// The private selections are filled by the slice 2.2 retrieval path when a
+/// retriever is wired ([`crate::retrieval::assemble_context`]); the communal
+/// selections stay empty until the phase-2 graph slice delivers that store.
+/// The scopes were fixed in phase 1 so a session-only snapshot and a phase-2
+/// snapshot share one record shape.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MemoryContextSnapshot {
     schema_version: StateSchemaVersion,
@@ -990,12 +1057,17 @@ pub struct MemoryContextSnapshot {
     pub session: Vec<SnapshotSessionEntry>,
     /// The retrievals that assembled the snapshot.
     pub retrievals: Vec<SnapshotRetrieval>,
-    /// The private memory selections; empty until phase 2.
-    pub private_memory: Vec<MemoryEntryId>,
-    /// The communal claim selections; empty until phase 2.
+    /// The private memory selections, exactly as retrieval selected them.
+    pub private_memory: Vec<SnapshotPrivateMemory>,
+    /// The communal claim selections; empty until the phase-2 graph slice.
     pub communal_claims: Vec<MemoryEntryId>,
     /// The trust, classification, and ranking policy revision in force.
     pub policy_revision: AgentRevisionNumber,
+    /// The memory-ingress guardrail chain revision the private selections were
+    /// evaluated under; `None` when no retrieval ran
+    /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)).
+    #[serde(default)]
+    pub ingress_revision: Option<AgentRevisionNumber>,
     /// The prompt and context budget the snapshot accounted for.
     pub budget: SnapshotBudget,
     /// A digest over the assembled content, so a corrupted or altered snapshot
@@ -1039,6 +1111,7 @@ impl MemoryContextSnapshot {
             "private_memory": self.private_memory,
             "communal_claims": self.communal_claims,
             "policy_revision": self.policy_revision,
+            "ingress_revision": self.ingress_revision,
         });
         AgentContentDigest::of_json(&payload)
     }
@@ -1064,10 +1137,12 @@ struct MemoryContextSnapshotRecord {
     session: Vec<SnapshotSessionEntry>,
     retrievals: Vec<SnapshotRetrieval>,
     #[serde(default)]
-    private_memory: Vec<MemoryEntryId>,
+    private_memory: Vec<SnapshotPrivateMemory>,
     #[serde(default)]
     communal_claims: Vec<MemoryEntryId>,
     policy_revision: AgentRevisionNumber,
+    #[serde(default)]
+    ingress_revision: Option<AgentRevisionNumber>,
     budget: SnapshotBudget,
     content_digest: AgentContentDigest,
     assembled_at: AgentTimestampMillis,
@@ -1090,6 +1165,7 @@ impl<'de> Deserialize<'de> for MemoryContextSnapshot {
             private_memory: record.private_memory,
             communal_claims: record.communal_claims,
             policy_revision: record.policy_revision,
+            ingress_revision: record.ingress_revision,
             budget: record.budget,
             content_digest: record.content_digest,
             assembled_at: record.assembled_at,
@@ -1131,10 +1207,14 @@ pub trait ContextSnapshotStore: Send + Sync + 'static {
     /// Deletes a terminal run's snapshots once its retention has elapsed,
     /// honoring the policy's legal hold (open decision 7).
     ///
-    /// Snapshots embed copies of the session entries they were assembled
-    /// from, so discharging a run's retention means purging its snapshots
-    /// alongside its session rows — one without the other would keep the
-    /// content the policy said to delete. Same contract as
+    /// Snapshots embed copies of the session entries — and, since slice 2.2,
+    /// of the private-memory content — they were assembled from, so
+    /// discharging a run's retention means purging its snapshots alongside its
+    /// session rows: one without the other would keep the content the policy
+    /// said to delete. A private memory tombstoned or deleted *after* a
+    /// snapshot embedded it keeps that embedded copy until this purge removes
+    /// the run's snapshots — immutability wins over withdrawal, the same rule
+    /// a redacted session entry follows. Same contract as
     /// [`SessionMemoryStore::purge_run`]: bounded, idempotent,
     /// deployment-invoked.
     fn purge_run<'a>(
@@ -1305,14 +1385,17 @@ impl Default for SessionWindowPolicy {
     }
 }
 
-/// Assembles the immutable context snapshot one model turn is computed from.
+/// Assembles the session half of the immutable context snapshot one model turn
+/// is computed from.
 ///
 /// It reads a bounded recent window from the session store, shapes it with the
 /// window policy, and builds a [`MemoryContextSnapshot`] under the given
 /// reference. It performs no write: persistence is the caller's, through a
 /// [`ContextSnapshotStore`] whose idempotent persist is what makes a retry reuse
-/// the first assembly. The private and communal selections are empty until phase
-/// 2 delivers those stores.
+/// the first assembly. It is the session building block of
+/// [`crate::retrieval::assemble_context`], which fills the private selections
+/// when a retriever is wired; called directly, the private and communal
+/// selections stay empty.
 pub async fn assemble_session_context(
     session: &dyn SessionMemoryStore,
     scope: &AgentRunScope,
@@ -1372,6 +1455,7 @@ pub async fn assemble_session_context(
         session_entries: session_selection.len(),
         session_bytes,
         private_memories: 0,
+        private_memory_bytes: 0,
         communal_claims: 0,
     };
 
@@ -1386,6 +1470,7 @@ pub async fn assemble_session_context(
         private_memory: Vec::new(),
         communal_claims: Vec::new(),
         policy_revision,
+        ingress_revision: None,
         budget,
         content_digest: AgentContentDigest::of_bytes(b""),
         assembled_at: now,
@@ -1411,6 +1496,23 @@ pub const AGENT_PRIVATE_MEMORY_PAGE_MAX_ENTRIES: usize = 64;
 
 /// Longest embedding-model name recorded in embedding metadata.
 pub const AGENT_MEMORY_EMBEDDING_MODEL_MAX_LENGTH: usize = 128;
+
+/// Most private memories one context snapshot may select
+/// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The selection is part of the immutable snapshot a model turn is computed
+/// from, so it is bounded like the session window: retrieval ranks, the
+/// snapshot keeps at most this many.
+pub const AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_ENTRIES: usize = 16;
+
+/// Largest total serialized private-memory content one snapshot may embed, in
+/// bytes.
+///
+/// Each inline private memory is already bounded by
+/// [`AGENT_PRIVATE_MEMORY_INLINE_MAX_BYTES`]; this caps the whole selection so
+/// a snapshot's private half stays comfortably bounded even at the entry
+/// limit.
+pub const AGENT_SNAPSHOT_PRIVATE_MEMORY_MAX_BYTES: usize = 64 * 1024;
 
 validated_id! {
     /// Stable identity of one agent-private long-term memory
@@ -2504,6 +2606,7 @@ pub struct AgentRunMemory {
     session: Arc<dyn SessionMemoryStore>,
     snapshots: Arc<dyn ContextSnapshotStore>,
     private: Option<Arc<dyn AgentPrivateMemoryStore>>,
+    retrieval: Option<crate::retrieval::AgentMemoryRetrieval>,
     window: SessionWindowPolicy,
 }
 
@@ -2518,6 +2621,7 @@ impl AgentRunMemory {
             session,
             snapshots,
             private: None,
+            retrieval: None,
             window: SessionWindowPolicy::recent_window(),
         }
     }
@@ -2539,6 +2643,23 @@ impl AgentRunMemory {
     #[must_use]
     pub fn with_private_store(mut self, private: Arc<dyn AgentPrivateMemoryStore>) -> Self {
         self.private = Some(private);
+        self
+    }
+
+    /// Wires the private-memory retrieval bundle
+    /// ([specification 13.5](../../../docs/plans/rakka-agent/spec.md),
+    /// [16](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// With a bundle wired, [`crate::retrieval::assemble_context`] fills the
+    /// snapshot's private selections through the bundle's retriever, evaluated
+    /// against the bundle's memory-ingress guardrail chain. The chain must be
+    /// the same one the deployment's dispatch authority carries: the
+    /// authority's coverage check cannot see this bundle, so wiring two
+    /// different chains would let a required memory-ingress stage satisfy
+    /// coverage there while a different chain runs here.
+    #[must_use]
+    pub fn with_retrieval(mut self, retrieval: crate::retrieval::AgentMemoryRetrieval) -> Self {
+        self.retrieval = Some(retrieval);
         self
     }
 
@@ -2565,6 +2686,12 @@ impl AgentRunMemory {
     pub fn private(&self) -> Option<&Arc<dyn AgentPrivateMemoryStore>> {
         self.private.as_ref()
     }
+
+    /// The private-memory retrieval bundle, when one is wired.
+    #[must_use]
+    pub fn retrieval(&self) -> Option<&crate::retrieval::AgentMemoryRetrieval> {
+        self.retrieval.as_ref()
+    }
 }
 
 impl fmt::Debug for AgentRunMemory {
@@ -2578,6 +2705,13 @@ impl fmt::Debug for AgentRunMemory {
                     .private
                     .as_ref()
                     .map_or("none", |store| store.backend_name()),
+            )
+            .field(
+                "retrieval",
+                &self
+                    .retrieval
+                    .as_ref()
+                    .map_or("none", |retrieval| retrieval.retriever().backend_name()),
             )
             .field("window", &self.window)
             .finish()
@@ -3023,6 +3157,105 @@ mod tests {
             .expect("the snapshot exists");
         assert_eq!(loaded, stored);
         assert!(loaded.is_untrusted());
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_digest_covers_the_private_selections() {
+        // Two snapshots differing only in a private selection or the ingress
+        // revision must not agree on a digest — otherwise a corrupted or
+        // altered selection would be undetectable.
+        let session = InMemorySessionMemoryStore::new();
+        let scope = scope("acme", "support", "run-1");
+        session
+            .append(&scope, &entry(&scope, 1, "assistant", 1))
+            .await
+            .expect("append");
+        let reference = AgentContextSnapshotRef::for_turn(&scope, 2).expect("ref");
+        let snapshot = assemble_session_context(
+            &session,
+            &scope,
+            &reference,
+            2,
+            &SessionWindowPolicy::recent_window(),
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(10),
+        )
+        .await
+        .expect("assemble");
+
+        let mut with_selection = snapshot.clone();
+        let content =
+            AgentTaskContent::inline(serde_json::json!("remembered fact")).expect("content");
+        with_selection.private_memory.push(SnapshotPrivateMemory {
+            memory_id: AgentPrivateMemoryId::new("mem-1").expect("id"),
+            revision: AgentRevisionNumber::INITIAL,
+            kind: AgentPrivateMemoryKind::Semantic,
+            content_digest: content.digest(),
+            content,
+            classification: MemoryClassification::Unclassified,
+            confidence_bps: 9_000,
+            relevance_bps: 8_000,
+            embedding: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+        });
+        assert_ne!(
+            with_selection.compute_digest(),
+            snapshot.compute_digest(),
+            "a private selection moves the digest"
+        );
+
+        let mut with_ingress = snapshot.clone();
+        with_ingress.ingress_revision = Some(AgentRevisionNumber::new(3));
+        assert_ne!(
+            with_ingress.compute_digest(),
+            snapshot.compute_digest(),
+            "the recorded ingress revision moves the digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pre_reshape_snapshot_record_loads_with_empty_selections() {
+        // Every snapshot persisted before slice 2.2 carried
+        // `private_memory: []` and none of the phase-2 fields; the reshaped
+        // record still loads such a record under the unreleased-branch rule.
+        // The pre-reshape wire form is derived from a real snapshot by
+        // stripping exactly what this slice added, so the test cannot drift
+        // from the actual serialization.
+        let session = InMemorySessionMemoryStore::new();
+        let scope = scope("acme", "support", "run-1");
+        session
+            .append(&scope, &entry(&scope, 1, "assistant", 1))
+            .await
+            .expect("append");
+        let reference = AgentContextSnapshotRef::for_turn(&scope, 2).expect("ref");
+        let snapshot = assemble_session_context(
+            &session,
+            &scope,
+            &reference,
+            2,
+            &SessionWindowPolicy::recent_window(),
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(10),
+        )
+        .await
+        .expect("assemble");
+
+        let mut record = serde_json::to_value(&snapshot).expect("serializes");
+        let object = record.as_object_mut().expect("a snapshot is an object");
+        object.remove("ingress_revision");
+        object
+            .get_mut("budget")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("a budget is an object")
+            .remove("private_memory_bytes");
+
+        let loaded: MemoryContextSnapshot =
+            serde_json::from_value(record).expect("the pre-reshape record loads");
+        assert!(loaded.private_memory.is_empty());
+        assert_eq!(loaded.ingress_revision, None);
+        assert_eq!(loaded.budget.private_memory_bytes, 0);
+        assert_eq!(loaded, snapshot);
     }
 
     // =======================================================================

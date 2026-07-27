@@ -605,6 +605,26 @@ pub const METRIC_AGENT_DECISION_DROPS: &str = "rakka.agent.decision.drops";
 /// Counter: telemetry flush attempts a sink refused, labeled by signal.
 pub const METRIC_AGENT_TELEMETRY_FLUSH_FAILURES: &str = "rakka.agent.telemetry.flush.failures";
 
+/// Counter: private-memory retrievals run by snapshot assembly, labeled by
+/// bounded backend name and outcome (`retrieved` / `degraded` / `skipped`)
+/// ([specification 17.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Raw query text, returned records, and embeddings are never labels — the
+/// snapshot carries the bounded retrieval record; this counts.
+pub const METRIC_AGENT_MEMORY_RETRIEVALS: &str = "rakka.agent.memory.retrievals";
+
+/// Counter: memory-ingress guardrail outcomes on retrieved records, labeled
+/// by bounded outcome (`blocked` / `transformed` / `reported` /
+/// `checkpoint-refused` / `rejected`)
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md),
+/// [17.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Blocked and checkpoint-refused records are deliberately *not* recorded on
+/// the snapshot — absence is the decision, and a reason code for absent
+/// content would leak what was blocked into model-adjacent data — so this
+/// counter is their bounded visibility.
+pub const METRIC_AGENT_MEMORY_INGRESS_OUTCOMES: &str = "rakka.agent.memory.ingress.outcomes";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the
@@ -613,6 +633,7 @@ pub const METRIC_AGENT_TELEMETRY_FLUSH_FAILURES: &str = "rakka.agent.telemetry.f
 /// transitions under `rakka.agent.*` with these. Every value recorded under
 /// them comes from a closed `as_label()` vocabulary, never an identifier.
 pub const AGENT_METRIC_FIELDS: &[&str] = &[
+    "backend",
     "decision_kind",
     "decision_source",
     "phase",
