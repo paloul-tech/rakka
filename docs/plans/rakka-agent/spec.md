@@ -2579,6 +2579,17 @@ without one remain open.
    the database-agnostic SPI against at least two structurally different
    implementations or contract test doubles before choosing reference
    adapters.
+   *Disposition (M2): accepted — no reference backend is named in the domain
+   specification. The representative claim, traversal, tenancy, and
+   bounded-query families are captured as the conformance clauses themselves,
+   tabled in the `rakka-agent-knowledge-graph` conformance-module docs, and
+   the SPI is validated by running that suite unchanged against two
+   structurally different implementations: the in-memory reference store and
+   the relational `rakka-agent-knowledge-graph-postgres` adapter (scenario
+   20, with zero agent-domain change). Migration queries stay backend-owned —
+   the portable SPI deliberately has no migration surface, so each backend
+   crate owes its own idempotence and concurrent-migrator proofs
+   (slice 2.4).*
 9. **Can authorization be resolved by a service without a human?**
    Recommended: yes, if the resolver is authenticated, authorized, audited,
    and bound to the same exact effect intent.

@@ -25,6 +25,7 @@
 - Optional gated checks need external services or mutable infrastructure:
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres`
   - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-sharding-postgres`
+  - `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres`
   - `RAKKA_RUN_MULTI_PROCESS_COMPATIBILITY=1 cargo test -p rakka-testkit --test compatibility_matrix optional_multi_process_compatibility_example_is_gated -- --nocapture`
   - `RAKKA_ETCD_TEST_ENDPOINTS=http://127.0.0.1:2379 cargo test -p rakka-discovery-etcd --test etcd_discovery -- --nocapture`
   - `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`
@@ -39,7 +40,7 @@
 - `crates/rakka-sharding`, `crates/rakka-sharding-postgres`: entity identity, shard ownership/coordinator, local/remote routes, remembered entities, PostgreSQL coordinator store/lease.
 - `crates/rakka-workflow`: durable inbox/outbox reliability substrate: deduplication, retries, recovery, clocks, workflow telemetry.
 - `crates/rakka-agent-workflow`: additive agent workflow facade/runtime: runs, steps, effects, graph scheduler, compiled plans, timers, dispatchers, query, retention, audit, OpenTelemetry/Kubernetes helpers.
-- `crates/rakka-agent`, `crates/rakka-agent-postgres`, `crates/rakka-agent-knowledge-graph`: durable agent domain (entities, choreography, loop, model adapter, effects/tool authority, budgets, checkpoints/HITL, session/private memory, retrieval, observability), its PostgreSQL/pgvector adapters, and the database-agnostic communal knowledge graph (claims, trust transitions, promotion gate, portable store SPI, conformance harness).
+- `crates/rakka-agent`, `crates/rakka-agent-postgres`, `crates/rakka-agent-knowledge-graph`, `crates/rakka-agent-knowledge-graph-postgres`: durable agent domain (entities, choreography, loop, model adapter, effects/tool authority, budgets, checkpoints/HITL, session/private memory, retrieval, observability), its PostgreSQL/pgvector adapters, the database-agnostic communal knowledge graph (claims, trust transitions, promotion gate, portable store SPI, conformance harness), and the graph's PostgreSQL relational backend.
 - `crates/rakka-stream`, `crates/rakka-process`: bounded streams and supervised child-process actors/process-backed entities.
 - `crates/rakka-http`, `crates/rakka-grpc`, `crates/rakka-k8s`: edge adapters and Kubernetes operation surfaces.
 - `crates/rakka-testkit`: cross-crate probes, assertions, compatibility fixtures, and repository hygiene helpers.
