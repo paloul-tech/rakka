@@ -478,12 +478,27 @@ where
         expected_revision: Revision,
         next: AgentWakeTimerStoreState,
     ) -> AgentWakeTimerResult<StateRecord<AgentWakeTimerStoreState>> {
-        let persisted = self
+        match self
             .store
             .compare_and_set(&self.persistence_id, expected_revision, next)
-            .await?;
-        self.record = Some(persisted.clone());
-        Ok(persisted)
+            .await
+        {
+            Ok(persisted) => {
+                self.record = Some(persisted.clone());
+                Ok(persisted)
+            }
+            Err(error) => {
+                if matches!(error, DurableError::RevisionConflict { .. }) {
+                    // Another scanner won this write, so every operation
+                    // computed from the cached record is now wrong. Drop it:
+                    // the next call recovers the authoritative record instead
+                    // of failing forever against a revision that no longer
+                    // exists.
+                    self.record = None;
+                }
+                Err(error.into())
+            }
+        }
     }
 
     fn current_record(&self) -> AgentWakeTimerResult<StateRecord<AgentWakeTimerStoreState>> {
@@ -569,5 +584,129 @@ impl From<AgentSchemaError> for AgentWakeTimerError {
 impl From<DurableError> for AgentWakeTimerError {
     fn from(error: DurableError) -> Self {
         Self::Persistence { error }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rakka_persistence::InMemoryDurableStateStore;
+
+    use super::*;
+    use crate::definition::AgentRevisionNumber;
+    use crate::identity::{AgentGoalId, TenantId};
+    use crate::wake::{AgentWakeOccurrence, AgentWakeTriggerKind, ScheduleRevision};
+
+    fn entry(due_at: u64) -> AgentWakeTimerEntry {
+        let binding = AgentWakeBinding::new(
+            TenantId::new("acme"),
+            AgentGoalId::new("nightly-reconciliation").expect("goal id should be valid"),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::Scheduled {
+                due_at: AgentTimestampMillis::new(due_at),
+            },
+            AgentWakeTriggerKind::DurableTimer,
+            AgentTimestampMillis::new(due_at),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("the binding derives");
+        let task = AgentTaskId::new("task-root").expect("task id should be valid");
+        AgentWakeTimerEntry::new(binding, task, AgentTimestampMillis::new(due_at))
+    }
+
+    fn shared_stores() -> (
+        AgentWakeTimerStore<InMemoryDurableStateStore<AgentWakeTimerStoreState>>,
+        AgentWakeTimerStore<InMemoryDurableStateStore<AgentWakeTimerStoreState>>,
+    ) {
+        let store = InMemoryDurableStateStore::new();
+        (
+            AgentWakeTimerStore::new(store.clone()),
+            AgentWakeTimerStore::new(store),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_loser_of_a_write_race_recovers_and_converges() {
+        // Two scanners over the same durable record, both recovered at the
+        // same revision — the topology the module doc promises is safe.
+        let (mut winner, mut loser) = shared_stores();
+        winner
+            .recover(AgentTimestampMillis::new(0))
+            .await
+            .expect("the winner recovers");
+        loser
+            .recover(AgentTimestampMillis::new(0))
+            .await
+            .expect("the loser recovers");
+
+        winner
+            .schedule_occurrence(entry(1_000))
+            .await
+            .expect("the winner's write applies");
+
+        // The loser's compare-and-set is fenced by the revision the winner
+        // already consumed.
+        let error = loser
+            .schedule_occurrence(entry(2_000))
+            .await
+            .expect_err("the stale write is fenced");
+        assert!(matches!(
+            error,
+            AgentWakeTimerError::Persistence {
+                error: DurableError::RevisionConflict { .. }
+            }
+        ));
+
+        // Losing the race dropped the stale cached record, so the retry
+        // recovers the authoritative revision and applies — no manual
+        // recovery, no restart.
+        let scheduled = loser
+            .schedule_occurrence(entry(2_000))
+            .await
+            .expect("the retried write applies after recovery");
+        assert!(!scheduled.duplicate);
+
+        let state = loser.state().expect("the loser holds the latest record");
+        assert_eq!(state.entries().len(), 2);
+        assert!(state.entry(entry(1_000).wake_id()).is_some());
+        assert!(state.entry(entry(2_000).wake_id()).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_lost_mark_race_converges_on_the_next_operation() {
+        let (mut winner, mut loser) = shared_stores();
+        winner
+            .schedule_occurrence(entry(1_000))
+            .await
+            .expect("the entry parks");
+        loser
+            .recover(AgentTimestampMillis::new(0))
+            .await
+            .expect("the loser recovers");
+
+        let wake = entry(1_000).wake_id().clone();
+        winner
+            .mark_fired(&wake, AgentTimestampMillis::new(1_500))
+            .await
+            .expect("the winner marks the entry fired");
+
+        let error = loser
+            .mark_fired(&wake, AgentTimestampMillis::new(1_600))
+            .await
+            .expect_err("the stale mark is fenced");
+        assert!(matches!(
+            error,
+            AgentWakeTimerError::Persistence {
+                error: DurableError::RevisionConflict { .. }
+            }
+        ));
+
+        // The retry recovers, finds the entry already terminal, and answers
+        // idempotently without another write.
+        let marked = loser
+            .mark_fired(&wake, AgentTimestampMillis::new(1_700))
+            .await
+            .expect("the retried mark converges");
+        assert_eq!(marked.status(), AgentWakeTimerStatus::Fired);
+        assert_eq!(marked.fired_at(), Some(AgentTimestampMillis::new(1_500)));
     }
 }
