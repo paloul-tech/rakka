@@ -2533,8 +2533,18 @@ without one remain open.
    runs' promotions derive disjoint memory identities (slice 2.1).*
 2. **What is the default communal boundary?** Recommended: tenant or
    organization `KnowledgeSpaceId`; no implicit cross-tenant global graph.
+   *Disposition (M2): accepted structurally — every graph operation is
+   addressed through `KnowledgeSpaceScope`, whose injective key includes the
+   tenant, so a cross-tenant graph is unrepresentable rather than merely
+   disallowed; federation would be an explicit later design (slice 2.3).*
 3. **Does every agent-written claim begin as `Proposed`?** Recommended: yes;
    policy or HITL promotes consequential claims to `Verified`.
+   *Disposition (M2): accepted — `Claim::new` takes no trust parameter, the
+   `Proposed ⇔ zero-transitions` coherence invariant is re-validated on every
+   load, the store's append door refuses anything else, and `Verified` is
+   reachable only through the append-only transition path, gated for
+   consequential claims by a slice 1.10 checkpoint grant bound to the exact
+   claim content and history ordinal (slice 2.3).*
 4. **Which model calls are safe to retry?** Recommended: an explicit
    deployment policy based on provider idempotency, cost, and replay tolerance.
    *Disposition (M1): accepted — the adapter declares an explicit

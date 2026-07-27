@@ -113,6 +113,88 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - `rakka-agent` private-memory retrieval (specification 13.3, 13.5, 13.6, and the retrieval clauses of 16; slice 2.2 — retrieval isolation extending scenario 18, and snapshot-reuse-under-drift extending scenario 17): the new `rakka_agent::retrieval` module owns the vendor-neutral seam a vector backend implements. `AgentPrivateMemoryRetriever` ranks an agent's private memories against a bounded `MemoryRetrievalQuery` whose scope, classification, confidence, tombstone, and expiry filters are all *pre-ranking* predicates — a wrong-scope retrieval answers byte-identically to an empty agent's — and `AgentMemoryEmbedder` is the deployment-supplied embedding seam (Rakka ships no production embedder; the deterministic testkit one and the in-memory reference retriever prove the contract without a backend). Retrieval feeds a model only through the slice 1.11 snapshot path: `assemble_context` extends the settle-pass assembly to derive a deterministic query from the just-assembled session window, retrieve, re-check every returned record fail-closed (the assembly trusts no adapter), evaluate each record at the now-live `MemoryIngress` guardrail boundary, and embed the selections *content-first* into the immutable `MemoryContextSnapshot` — `private_memory` was retyped from bare entry ids to `SnapshotPrivateMemory` (id, revision, kind, exact content used, digest, classification, confidence, relevance, embedding metadata, and recorded ingress transforms/reports) under the unreleased-branch rule, because spec 13.5 requires the snapshot to pin content and an id alone cannot make a retried input immune to index drift. First-writer-wins persistence then makes the proof: a re-driven settle after a concurrent CAS update, a tombstone, even a retriever upgrade reloads the original snapshot byte-identical. The ingress boundary joins `AGENT_EVALUATED_GUARDRAIL_BOUNDARIES` (the flip slice 2.1 deferred), evaluated per record with the memory's identity on the guardrail context: block drops that record only, a transform's output is what the snapshot embeds (recorded with its stage revision; a retry reuses it structurally), report-only records the finding on the selection, and require-checkpoint is a fail-closed drop — no checkpoint plumbing exists at snapshot assembly, and memory must never gate liveness. A retriever outage degrades the turn to an empty selection with the attempted retrieval still recorded (13.1 over 13.5; the degraded turn keeps its empty selection forever, by design), counted under the new bounded `rakka.agent.memory.retrievals` / `rakka.agent.memory.ingress.outcomes` metrics — raw queries, records, and embeddings are never labels. Nothing stamps `AgentPrivateMemory.embedding` back through the store: the derived rows carry the metadata, and retrieval output surfaces it per item. Proven by the `retrieval` unit suite and end to end through the real run entity (`tests/private_memory_retrieval.rs`, `tests/memory_ingress_guardrails.rs`).
 - `rakka-agent-postgres`: the pgvector retrieval adapter (`PgvectorPrivateMemoryRetriever`). Derived vectors live in their own `rakka_agent_private_memory_embedding` table — a typmod-less `vector` column with a per-row dimension check so one shared migration serves any embedder, keyed `(tenant, agent, memory_id)` with the scope columns leading the primary key, holding the vector plus content-free metadata (model, dimensions, version, `source_revision`, classification, confidence, digest) and never content — and the vector migration is separate (`CREATE EXTENSION IF NOT EXISTS vector` + DDL under the same advisory lock), so the three existing stores and `MIGRATION_SQL` stay green on databases without pgvector. Retrieval is one statement whose tenant, agent, embedder-compatibility, `source_revision = revision` currency, tombstone, expiry, classification, and confidence-floor predicates all sit ahead of the `ORDER BY` distance — every filter the query carries, so an inadmissible record can never consume a result slot and leave a retrieval answering short of what the corpus holds; the two policy columns are denormalized onto the derived row precisely so their predicates can precede the ranking, and the revision fence keeps them from going stale — joined to the authoritative table so content only ever comes from the live record: a leftover vector row is unretrievable in any scope even mid-crash between a delete and its deindex, and eventual consistency manifests as absence, never as ranking current content by stale geometry. Vectors bind as text literals (`$n::text::vector`) — no new dependency; Rust's shortest-round-trip `f32` formatting restores identical values through pgvector's parser, proven server-side by exact zero self-distance — and non-finite or wrong-length embedder output fails closed before any SQL through `embed_memory_vector`, the one check `rakka-agent` now exports so every backend refuses a misdescribed vector identically. The shipped configuration is an exact scan (recall 1.0, cost linear in one agent's corpus; pgvector's approximate indexes post-filter and lose recall under the mandatory scope predicate), with the HNSW/iterative-scan opt-in recipe documented on the module. Maintenance is deployment-invoked, mirroring `purge_expired`: `index_memory` derives one vector (skipping absent/tombstoned/expired/redacted/artifact-backed records visibly), paged `reindex` is the rebuild path — drop every derived row and reindex restores identical retrieval, and it pages *past* a record it cannot decode, counting it into `ReindexPage::failed` rather than propagating, so one unreadable record cannot wedge a rebuild on the same page forever — and `deindex_memory`/`purge_orphaned` remove residual rows after withdrawal, as hygiene rather than correctness. The DSN-gated suite (which probes for the extension and skips with a message on plain PostgreSQL) proves migration idempotence beside the base schema, per-tenant/per-agent scoping with empty-scope indistinguishability, exclusion of withdrawn records with no deindex run, rebuild-identical reindexing, stale-revision and model/version non-candidacy, fail-closed embedder mismatches, exact text-path round-trips, two-connection concurrent index convergence, the classification filter and the confidence floor each beating a nearer hit, and a rebuild paging past a deliberately corrupted record; the CI postgres job now runs on `pgvector/pgvector:pg16` and tests this crate.
 
+- `rakka-agent-knowledge-graph`: the communal knowledge graph crate
+  (specification 13.4, 13.6; slice 2.3 — the graph halves of scenarios 16 and
+  18). Agents append provenance-bearing claims scoped
+  `(TenantId, KnowledgeSpaceId)` — never overwrite communal truth — and every
+  claim is born `Proposed` structurally: `Claim::new` takes no trust
+  parameter, the only path to a non-`Proposed` claim is restoring a persisted
+  record whose `Proposed ⇔ zero-transitions` coherence invariant is
+  re-validated on every load, and the store's append door refuses anything
+  else (`claim-append-not-proposed`), which resolves open decision 3. Every
+  derived field on a claim is likewise re-derived on load rather than trusted:
+  `Claim::validate` recomputes the `content_digest` statement fingerprint from
+  the record's own subject/predicate/object and refuses a mismatch
+  (`claim-statement-digest-mismatch`), so a forged fingerprint — or a statement
+  edited under a stale one, as a hand-repaired row or a partially rewritten
+  adapter row would leave it — reaches neither the wire nor a store. Open
+  decision 2 is resolved by `KnowledgeSpaceScope`: the tenant is part of the
+  injective scope key, so a cross-tenant graph is unrepresentable rather than
+  merely disallowed. Claim identity derives from the append operation id
+  (conflicting claims must coexist, so the statement cannot be the identity),
+  which is what makes a replayed append converge on the same claim. Every
+  identity derivation (append key, transition key, claim id) digests with
+  sha2-256 rather than the default FNV fingerprint — salted domains stop a
+  discriminator from being spelled as another domain's input, but only a
+  collision-resistant digest stops one from being searched for a collision
+  within a domain, and identity here decides whose write a replay answers;
+  because the append door re-derives, the algorithm is part of the durable
+  contract rather than an implementation detail. The derivation is likewise an
+  invariant rather than a convention: `Claim::new` takes no
+  claim id and derives one from the scope and operation id, while the append
+  door re-derives and refuses a mismatch
+  (`claim-append-id-not-derived`), since a restored record can carry any id
+  and a squatted id would otherwise deny its rightful writer's append forever.
+  Trust moves only through append-only `ClaimTrustTransition` records under the
+  documented lattice (`Retracted` terminal, nothing transitions to
+  `Proposed`), with a bounded history that refuses explicitly at its cap. The
+  `KnowledgeGraphStore` SPI is vendor-neutral — no client, SQL, Cypher,
+  SPARQL, or vendor identifier in any public type — with idempotent append
+  and transition by operation id (a replay answers the *original* result,
+  even after later operations moved the record, and never re-evaluates a
+  decided promotion gate), bounded provenance/trust-filtered queries, bounded
+  deterministic breadth-first traversal with explicit truncation, and
+  optional-capability reporting (`semantic-search` is declared;
+  no search method ships until the communal-retrieval slice). Scope isolation
+  is scenario 18's shape: every wrong-scope read answers exactly as an empty
+  space answers, and a wrong-scope write fails with the same
+  `claim-not-found` an absent claim produces. Promotion to `Verified` for
+  consequential claims reuses the slice 1.10 checkpoint machinery verbatim:
+  the new additive `AgentCheckpointGrant::validate_for_binding` seam in
+  `rakka-agent` (which the existing effect-path `validate_for` now delegates
+  to, gaining a `target` comparison — a pure strengthening) validates a grant
+  against a binding recomputed from the authoritative claim, sha256 over the
+  scope key, full statement, and history position, with the effect generation
+  pinned to the transition ordinal — so a grant authorizes exactly one
+  promotion at exactly one history position and a pre-dispute grant can never
+  be replayed into a re-promotion. The default `ClaimPromotionPolicy` gates
+  every promotion (fail closed); `ungated` is an explicit deployment
+  statement. The crate ships the workspace's first reusable backend
+  conformance harness (`conformance::check_knowledge_graph_contract` and its
+  per-clause functions), which slice 2.4 runs unchanged against a second
+  structurally different backend (scenario 20). It injects fresh *scopes*
+  rather than fresh stores — a live-database backend cannot cheaply build
+  stores, but every backend can serve one more tenant — and those scopes are
+  unique per clause, per process, and per run: `ConformanceScopes::unique`
+  prefixes a per-run namespace digested from the process id and the wall
+  clock, which `RAKKA_KNOWLEDGE_GRAPH_CONFORMANCE_RUN` pins for a suite that
+  wants to find its own rows afterwards and `unique_in` names explicitly for
+  one that manages its own namespacing. Its bounded-query and
+  bounded-traversal clauses assert against the *effective* limit — the smaller
+  of the request and the backend's declared bound — so a backend declaring a
+  page or depth bound tighter than the crate cap passes the suite by honouring
+  it, while one serving more than it declares still fails; every other clause
+  drains the cursor rather than reading a single page. The crate is
+  deliberately not
+  in the `rakka` facade yet — the agent-adapter precedent — pending the
+  specification 19 API review. Proven in
+  `crates/rakka-agent-knowledge-graph/tests/knowledge_graph_conformance.rs`
+  (scenarios 16 and 18 by name),
+  `crates/rakka-agent-knowledge-graph/tests/claim_promotion_gate.rs` (the
+  nine-case gate matrix, generation pinning included), the inline module
+  tests, and the binding/effect parity test in
+  `crates/rakka-agent/tests/checkpoints.rs`.
+
 ### Changed
 
 - Workspace MSRV is raised from Rust 1.80 to Rust 1.85, required by the published A2A SDK crates used by the Phase 0 clustered sharded A2A agents example.
