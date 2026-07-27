@@ -17,6 +17,15 @@
 //! redelivers into the controller's deduplication, which answers a duplicate
 //! rather than admitting twice.
 //!
+//! A pass preserves per-task due order: after a failed or refused delivery,
+//! every later-due entry of the same task is held back for the next pass
+//! rather than delivered around the failure. The controller's
+//! scheduled-occurrence watermark deduplicates on the invariant that a task's
+//! scheduled occurrences arrive in due order; delivering past a failure would
+//! let a later occurrence advance the watermark over an earlier one that was
+//! never applied, and its redelivery would then be swallowed as a false
+//! duplicate.
+//!
 //! Deployment topology: any number of scanners may run, and every delivery is
 //! safe to duplicate. The provided [`ShardedWakeDelivery`] delivers to task
 //! entities this node owns and reports a stable `wake-remote-owner` failure
@@ -24,6 +33,7 @@
 //! scanner — delivery follows shard ownership, so no wake ever needs a
 //! cross-node command surface.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,7 +46,7 @@ use rakka_persistence::DurableStateStore;
 use rakka_sharding::ClusterSharding;
 
 use crate::choreography::AgentExchangeDeliveryError;
-use crate::identity::{AgentIdentityError, AgentTaskScope, AgentWakeId};
+use crate::identity::{AgentIdentityError, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId};
 use crate::task::{
     agent_task_entity_ref, AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityReply,
     AgentTaskEntityTypeKey,
@@ -192,6 +202,13 @@ where
 
     /// Recovers and delivers due occurrences, bounded by the configured batch
     /// size.
+    ///
+    /// Deliveries preserve per-task due order: after a failed or refused
+    /// delivery, every later-due entry of the same task is
+    /// [held back](AgentWakeScanOutcome::HeldBack) for the next pass instead
+    /// of delivered around the failure, so the controller's scheduled-due-time
+    /// watermark can never be advanced over an occurrence that was never
+    /// applied.
     pub async fn scan_due(&mut self) -> AgentWakeScanResult<AgentWakeScan> {
         let now = AgentTimestampMillis::new(self.clock.now().as_millis());
         let due_count = self.timers.due_entry_count(now).await?;
@@ -200,8 +217,25 @@ where
             .due_entries(now, self.settings.max_batch_size)
             .await?;
         let mut outcomes = Vec::with_capacity(due.len());
+        let mut blocked: BTreeMap<(TenantId, AgentTaskId), AgentWakeId> = BTreeMap::new();
         for entry in due {
-            outcomes.push(self.deliver_entry(&entry, now).await?);
+            let task_key = (entry.binding().tenant().clone(), entry.task().clone());
+            if let Some(blocked_by) = blocked.get(&task_key) {
+                self.record_wake_metric("held-back", entry.binding().trigger().as_label());
+                outcomes.push(AgentWakeScanOutcome::HeldBack {
+                    wake: entry.wake_id().clone(),
+                    blocked_by: blocked_by.clone(),
+                });
+                continue;
+            }
+            let outcome = self.deliver_entry(&entry, now).await?;
+            if matches!(
+                outcome,
+                AgentWakeScanOutcome::Failed { .. } | AgentWakeScanOutcome::Rejected { .. }
+            ) {
+                blocked.insert(task_key, entry.wake_id().clone());
+            }
+            outcomes.push(outcome);
         }
         let delivered = outcomes.len();
         Ok(AgentWakeScan {
@@ -320,6 +354,18 @@ pub enum AgentWakeScanOutcome {
         wake: AgentWakeId,
         /// The stable delivery-failure code.
         code: String,
+    },
+    /// The entry was held back with no delivery attempt: an earlier-due
+    /// occurrence of the same task failed or was refused in this pass, and
+    /// the entry stays pending so the task's scheduled occurrences keep
+    /// arriving in due order — the invariant the controller's due-time
+    /// watermark deduplicates on.
+    HeldBack {
+        /// The held wake.
+        wake: AgentWakeId,
+        /// The earlier-due wake whose failure or refusal blocked the task for
+        /// the rest of the pass.
+        blocked_by: AgentWakeId,
     },
 }
 

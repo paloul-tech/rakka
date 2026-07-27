@@ -166,6 +166,70 @@ async fn a_lost_reply_leaves_the_entry_pending_and_the_rescan_converges() {
 }
 
 #[tokio::test]
+async fn a_failed_delivery_holds_back_the_tasks_later_occurrences() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_task().await;
+    fx.schedule_wake(5, ScheduleRevision::INITIAL).await;
+    fx.schedule_wake(50, ScheduleRevision::INITIAL).await;
+    fx.clock.fetch_add(1_000, Ordering::SeqCst);
+
+    // The earlier occurrence's command is lost before the entity. Delivering
+    // the later one around it would advance the controller's due-time
+    // watermark past an occurrence that was never applied — its redelivery
+    // would then answer as a false duplicate and the occurrence would be
+    // silently lost — so the pass holds the later entry back instead.
+    fx.wake_delivery.inject(ExchangeFault::LoseEnvelope);
+    let scan = fx.wake_scanner().scan_due().await.expect("the pass runs");
+    assert_eq!(scan.outcomes.len(), 2);
+    assert!(matches!(
+        &scan.outcomes[0],
+        rakka_agent::AgentWakeScanOutcome::Failed { .. }
+    ));
+    let rakka_agent::AgentWakeScanOutcome::HeldBack { wake, blocked_by } = &scan.outcomes[1] else {
+        panic!(
+            "the later occurrence is held back, got {:?}",
+            scan.outcomes[1]
+        );
+    };
+    assert_eq!(
+        wake,
+        common::scheduled_wake_binding(50, ScheduleRevision::INITIAL).wake_id()
+    );
+    assert_eq!(
+        blocked_by,
+        common::scheduled_wake_binding(5, ScheduleRevision::INITIAL).wake_id()
+    );
+    assert_eq!(fx.wake_delivery.deliveries(), 0);
+    assert_eq!(wake_counters(&fx).await, AgentWakeCounters::default());
+
+    // The rescan delivers both in due order: the earlier occurrence admits
+    // fresh — not as a duplicate — and the later one coalesces behind it.
+    let scan = fx.wake_scanner().scan_due().await.expect("the rescan runs");
+    assert_eq!(scan.outcomes.len(), 2);
+    assert!(matches!(
+        &scan.outcomes[0],
+        rakka_agent::AgentWakeScanOutcome::Dispositioned {
+            disposition: AgentWakeDisposition::Admitted { .. },
+            redelivery: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &scan.outcomes[1],
+        rakka_agent::AgentWakeScanOutcome::Dispositioned {
+            disposition: AgentWakeDisposition::Coalesced { .. },
+            ..
+        }
+    ));
+    let counters = wake_counters(&fx).await;
+    assert_eq!(counters.admitted, 1);
+    assert_eq!(counters.coalesced, 1);
+    assert_eq!(counters.missed, 0);
+    assert_eq!(active_wakes(&fx).await, 1);
+}
+
+#[tokio::test]
 async fn a_double_delivery_is_answered_from_the_record() {
     let fx = fixture();
     fx.instantiate_agent().await;

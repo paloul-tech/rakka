@@ -2161,7 +2161,11 @@ obsolete-revision injection.
   beyond the operation-log ring is a state property: the active/parked slots,
   a bounded recent-wake ring, and a monotone scheduled-due-time watermark
   (scheduled occurrences arrive in due order, so at-or-below-watermark
-  answers as a duplicate).
+  answers as a duplicate). The scanner enforces that due-order invariant per
+  task: after a failed or refused delivery, a pass holds back the same
+  task's later-due entries (`AgentWakeScanOutcome::HeldBack`) rather than
+  delivering around the failure, which would advance the watermark over an
+  occurrence that was never applied and silently lose it.
 - **`BoundedCatchUp` runs minimally by design** (decision locked at planning):
   the parked queue caps at `min(bound, AGENT_WAKE_PENDING_CAPACITY)` inside
   the bounded task state, drains one occurrence per release, and skips the
