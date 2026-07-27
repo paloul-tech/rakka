@@ -1748,6 +1748,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-agent-knowledge-graph-postgres"
+version = "0.1.0"
+dependencies = [
+ "rakka-agent-knowledge-graph",
+ "rakka-agent-workflow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "rakka-agent-postgres"
 version = "0.1.0"
 dependencies = [

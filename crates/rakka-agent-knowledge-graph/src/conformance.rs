@@ -20,6 +20,35 @@
 //! namespacing uses [`ConformanceScopes::unique_in`] or pins
 //! [`CONFORMANCE_RUN_ENV`]. Clauses panic on violation, so each runs inside a
 //! test.
+//!
+//! # Representative queries (open decision 8)
+//!
+//! Open decision 8 of [specification 21.3](../../../docs/plans/rakka-agent/spec.md)
+//! requires representative claim, traversal, tenancy, and migration queries
+//! to be captured — and the SPI validated against at least two structurally
+//! different implementations — before any reference backend is named. The
+//! capture *is* the clause list: each query family a deployment will ask of a
+//! backend maps onto the clause that proves it, and because every backend
+//! runs the same clauses, the capture is enforced rather than aspirational.
+//!
+//! | Family | Representative operation | Proven by |
+//! | --- | --- | --- |
+//! | Claim identity and lookup | derive, append, and read back one claim, byte-identical | [`claim_identity`], [`appended_identity_is_derived`] |
+//! | Idempotent append (scenario 16) | replay an append after an intervening transition; the original answers | [`idempotent_append`] |
+//! | Provenance | full-dimension provenance round-trip and append-only ordinal history | [`provenance_preservation`] |
+//! | Trust filtering | per-state queries, provenance-axis filters, retracted-edge exclusion | [`trust_filtering`], [`born_proposed`] |
+//! | Tenancy and authorization (scenario 18) | a foreign scope reads byte-identical to an empty space; a foreign write fails like an absent claim | [`authorization_isolation`] |
+//! | Bounded query | keyset cursor walk under the effective (declared) page limit | [`bounded_queries`] |
+//! | Bounded traversal | deterministic breadth-first expansion with explicit budget cuts | [`bounded_traversal`] |
+//! | Trust transition and audit | the 4×4 legality table, cross-kind operation conflicts, the history cap, replay convergence, and the gated promotion | [`transition_legality_and_replay`], [`promotion_gate`] |
+//! | Migration | backend-owned: idempotent schema application and the concurrent-migrator race | each backend crate's own migration tests |
+//!
+//! Migration deliberately has no shared clause: the portable SPI has no
+//! migration surface — schema is a property of a concrete store, not of the
+//! domain — so each backend crate owes its own idempotence and
+//! concurrent-migrator proofs (the in-memory reference has no schema to
+//! migrate; the PostgreSQL adapter crate carries the pattern for relational
+//! backends).
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -15,6 +15,7 @@ members = [
     "crates/rakka-agent",
     "crates/rakka-agent-postgres",
     "crates/rakka-agent-knowledge-graph",
+    "crates/rakka-agent-knowledge-graph-postgres",
     "crates/rakka-a2a",
     "crates/rakka-stream",
     "crates/rakka-process",

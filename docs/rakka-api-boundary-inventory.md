@@ -54,6 +54,7 @@ Component crates continue to own implementation-specific concepts:
 | `rakka-k8s` | Adapter | Kubernetes health, drain, discovery, and manifest helpers. |
 | `rakka-a2a` | Adapter | A2A protocol adapter over HTTP, PostgreSQL, and sharding: durable request handler, task projection and streaming replay, push config persistence and dispatch boundary, sharded run owner host, owner router, and dynamic agent card. |
 | `rakka-agent-knowledge-graph` | Foundation | Communal knowledge-graph claims with provenance and the `Proposed`/`Verified`/`Disputed`/`Retracted` trust lattice, append-only transitions, the checkpoint-grant promotion gate, the portable vendor-neutral store SPI with capability reporting, the in-memory reference store, and the backend conformance harness. |
+| `rakka-agent-knowledge-graph-postgres` | Adapter | PostgreSQL relational binding of the communal knowledge-graph store SPI: claim, transition, and operation-ledger tables, compare-and-set trust transitions, migration helpers, and the DSN-gated conformance and durability suites. |
 | `rakka-testkit` | Test/support | Cross-crate probes, assertions, compatibility fixtures, and repository hygiene tests. |
 
 ## Prelude Inventory

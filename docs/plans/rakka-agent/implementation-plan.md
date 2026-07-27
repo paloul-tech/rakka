@@ -1962,8 +1962,86 @@ Spec: [13.6](spec.md#136-storage-adapters),
   provenance, trust filtering, authorization, bounded queries) unchanged
   across backends.
 
+**Amended as implemented (2026-07-26):**
+
+- **The second backend is PostgreSQL relational tables in a new crate,
+  `rakka-agent-knowledge-graph-postgres`, and no reference backend is
+  named.** The disposition on open decision 8 records the resolution:
+  the representative claim/traversal/tenancy/bounded-query families are
+  captured as the conformance clauses themselves (a table in the
+  conformance-module docs maps each family to the clause proving it), and
+  migration stays backend-owned because the portable SPI deliberately has no
+  migration surface. A separate crate follows the
+  `rakka-persistence`/`rakka-persistence-postgres` precedent;
+  `rakka-agent-postgres` is scoped "one crate, one schema, one lock" to
+  agent memory and never referenced the graph domain, so grafting claims
+  onto it would have coupled memory-only consumers to the graph crate.
+- **The scenario-20 proof is the commit shape, not just the test.** The
+  capture doc landed as its own docs-only commit to the domain crate; the
+  backend commit then touches nothing under `crates/rakka-agent` or
+  `crates/rakka-agent-knowledge-graph` — the suite ran unchanged by
+  construction, and `scenario_20_the_whole_contract_passes_unchanged...`
+  drives the one-call umbrella against the live store.
+- **The record BYTEA is authoritative; columns are fences and predicates
+  only.** Claims and transitions persist as their canonical `serde_json`
+  encodings and are rebuilt through the domain `restore` doors on every
+  load, so the schema window, statement-digest re-derivation, and trust
+  coherence all fail closed against live rows (proven by doctoring rows in
+  place). `subject`/`predicate`/`object_node`/`trust` are denormalized only
+  for traversal predicates, `transition_count` only as the compare-and-set
+  fence, and a column that disagrees with its own record is refused as
+  drift — never skipped (a skip would answer short) and never preferred.
+- **Queries are `admits()`-in-Rust keyset scans, by design of the filter.**
+  `ClaimFilter` exposes builders and the shared `admits` predicate but no
+  field accessors, so SQL pushdown is impossible without widening the domain
+  API — and unnecessary: resumption is by claim-id position, not offset, so
+  Rust-side admission loses no rows, and the `COLLATE "C"` column makes SQL
+  order exactly the reference implementation's string order. Cost is linear
+  in one scope's corpus, documented in the crate docs — the same
+  exactness-first trade slice 2.2 recorded for pgvector. The `next` cursor
+  is minted only when a further *admitted* claim was actually seen, the one
+  convention a raw `LIMIT n+1` cannot reproduce under Rust-side admission.
+- **Writes are single data-modifying-CTE statements; the transition is a
+  bounded CAS loop that reads the ledger first on every attempt.** The
+  slice 2.1 discipline carries over: ledger consultation, the claim
+  mutation, the transition append, and the ledger insert commit or fail as
+  one implicit transaction on the shared pipelined client. A replay answers
+  the ledger's original bytes — a decided promotion is not re-litigated,
+  even by a grant that has since expired, proven across a reconnect — and a
+  lost race loops into a fresh read where the legality table re-runs
+  against the state that won, so contention converges on the winner's
+  replay or a typed refusal (`TRANSITION_CAS_MAX_ATTEMPTS` bounds the loop;
+  exhaustion is `claim-backend-failed`, never a silent wrong answer).
+  Traversal is the reference breadth-first expansion over bounded per-node
+  queries — every predicate ahead of the per-node `LIMIT`, the global
+  spent-edge set threaded through each statement — because a recursive CTE
+  cannot express the global dedup, the deterministic edge order, or
+  truncation at the exact budgeted edge.
+- **The migration advisory lock takes the fresh id `982_451_927`.** The
+  existing family (`…653/659/707/777/881`) is folklore-prime but really
+  just distinct values; distinctness is the only real constraint, and the
+  doc on the constant says so.
+- **`tests/claim_promotion_gate.rs` deliberately stays typed to the
+  in-memory store.** Its nine cases exercise `validate_promotion` and the
+  binding derivation — domain logic the backend calls verbatim before its
+  write statement; the backend-coupled cases (grant required, granted
+  receipt, expired grant, replay-without-re-evaluation) already run against
+  the live store through the conformance clauses, and the one genuinely
+  backend-shaped risk — a replayed gated promotion racing the CAS loop
+  after grant expiry — has its own dedicated proof. Generalizing the
+  helper file would have put agent-domain edits into the slice whose
+  acceptance is their absence; it remains an optional follow-up.
+
 Done when: scenario 20 passes across both implementations without touching
-agent-domain code.
+agent-domain code. **Done (2026-07-26):** the umbrella and all twelve
+clauses pass by name against the live store in
+`crates/rakka-agent-knowledge-graph-postgres/tests/postgres_conformance.rs`
+(scenarios 16, 18, and 20 named), the backend-only durability proofs pass in
+`tests/postgres_backend_proofs.rs` (reconnect replay, two-connection
+distinct- and same-operation races, gated-promotion replay after expiry,
+migration idempotence and the four-migrator race, doctored rows failing
+closed), the CI postgres job runs the crate on every pull request, and the
+backend commit's diff contains zero agent-domain changes.
 
 ---
 

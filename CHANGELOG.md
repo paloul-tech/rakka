@@ -194,6 +194,42 @@ The format follows Keep a Changelog style sections, and versioning is expected t
   nine-case gate matrix, generation pinning included), the inline module
   tests, and the binding/effect parity test in
   `crates/rakka-agent/tests/checkpoints.rs`.
+- `rakka-agent-knowledge-graph-postgres`: the PostgreSQL binding of the
+  communal knowledge-graph store SPI, and the second structurally different
+  `KnowledgeGraphStore` implementation slice 2.4 owes (specification 13.6,
+  scenario 20) — relational tables instead of ordered in-process maps, proven
+  by running the conformance suite unchanged, in a commit that touches
+  nothing under the agent-domain crates. This also discharges open decision 8
+  with no reference backend named: the representative claim, traversal,
+  tenancy, and bounded-query families are captured as the conformance
+  clauses themselves (tabled in the conformance-module docs), and migration
+  stays backend-owned because the portable SPI deliberately has no migration
+  surface. The `record` BYTEA is authoritative and rebuilt through the
+  domain restore doors on every load, so the schema window, statement-digest
+  re-derivation, and trust coherence fail closed against live rows; the
+  denormalized columns serve only the traversal predicates and the
+  `transition_count` compare-and-set fence, and a column that disagrees with
+  its own record is refused as drift. Every write is one
+  data-modifying-CTE statement on the shared pipelined client — claim
+  mutation, transition row, and scope-wide operation-ledger row commit or
+  fail together — and a replay answers the ledger's original bytes without
+  re-litigating a decided promotion gate, even under a grant that has since
+  expired. Queries are keyset scans in `COLLATE "C"` claim-id order with the
+  shared `admits()` rule applied in Rust (`ClaimFilter` deliberately exposes
+  no accessors, and resuming by claim-id position loses nothing); traversal
+  is the reference breadth-first expansion over bounded per-node queries
+  whose predicates all sit ahead of the `LIMIT`; the transition path is a
+  bounded compare-and-set retry loop that re-reads the ledger first on every
+  attempt, so contention converges on the winner's replay or a typed
+  legality refusal. The migration advisory lock takes the fresh id
+  `982_451_927`, and the CI postgres job tests the crate on every pull
+  request. Proven in
+  `crates/rakka-agent-knowledge-graph-postgres/tests/postgres_conformance.rs`
+  (all twelve clauses plus scenarios 16, 18, and 20 by name) and
+  `tests/postgres_backend_proofs.rs` (reconnect replay, two-connection
+  distinct- and same-operation races, gated-promotion replay after grant
+  expiry, migration idempotence and the four-migrator private-schema race,
+  doctored rows failing closed).
 
 ### Changed
 
@@ -219,6 +255,7 @@ The format follows Keep a Changelog style sections, and versioning is expected t
 - Packaging validation: `scripts/package-check.sh` in Cargo offline mode.
 - Release-candidate review: `docs/rakka-v1-release-candidate-review.md`.
 - Optional PostgreSQL validation: `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-persistence-postgres`.
+- Optional knowledge-graph backend conformance: `RAKKA_POSTGRES_TEST_DSN=postgres://postgres:postgres@localhost:5432/postgres cargo test -p rakka-agent-knowledge-graph-postgres`.
 - The PostgreSQL suites also run in CI on every pull request and push, against `pgvector/pgvector:pg16` on a fresh database each time, rather than only on a manual `workflow_dispatch`.
 - Optional Kubernetes validation: `RAKKA_K8S_RUN_LOCAL_CLUSTER=1 RAKKA_K8S_IMAGE=<image> examples/kubernetes/local-cluster-scenario.sh`.
 
