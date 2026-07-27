@@ -2133,6 +2133,52 @@ clauses).
 Done when: scenarios 47, 48, 49, and 50 pass, including duplicate-scan and
 obsolete-revision injection.
 
+**Amended as implemented (2026-07-27):**
+
+- **The wake-timer store and scanner are agent-domain, not the workflow
+  kernel's.** The substrate's `AgentTimerScanner` fire path is run-bound — it
+  fences on `workflow_id`, injects into an `AgentRunInbox`, and resumes an
+  `AgentStepRunner`, erring `MissingRunState` for a target with no run —
+  while a goal wake has no run until slice 3.3 admits an epoch, and
+  `AgentTimerEntry` carries no `ScheduleRevision` to fence on. So
+  `AgentWakeTimerStore`/`AgentWakeScanner` live in `rakka-agent` and mirror
+  the substrate's discipline exactly (one compare-and-set durable record, a
+  bounded due scan, idempotent terminal marks, the `WorkflowClock` seam, the
+  metrics conventions) with agent-typed entries keyed by the derived wake id
+  under the new fail-closed `AgentRecordKind::WakeTimerState` version; the
+  substrate's trigger-metadata half (`AgentTriggerSource`) is reused as-is on
+  the binding. Generalizing the workflow kernel's persisted timer schema for
+  one consumer was rejected.
+- **Every disposition is a recorded transition, and "admitted" is an active
+  slot.** `AgentWakeControllerState` — embedded in the root control task's
+  record — dispositions each delivery deterministically (fence, duplicate,
+  admit, coalesce, skip) and records the result under the wake's derived
+  admission operation id, so the counters are exact and a replay answers from
+  the record. The active slot is what slice 3.3 turns into the epoch's child
+  task/run; `CompleteWakeOccurrence` releases it and promotes the oldest
+  parked occurrence in the same durable transition, and is the transition the
+  epoch-result exchange of 3.3 drives rather than replaces. Deduplication
+  beyond the operation-log ring is a state property: the active/parked slots,
+  a bounded recent-wake ring, and a monotone scheduled-due-time watermark
+  (scheduled occurrences arrive in due order, so at-or-below-watermark
+  answers as a duplicate).
+- **`BoundedCatchUp` runs minimally by design** (decision locked at planning):
+  the parked queue caps at `min(bound, AGENT_WAKE_PENDING_CAPACITY)` inside
+  the bounded task state, drains one occurrence per release, and skips the
+  overflow with an exact `missed` count; the deeper replay sequencing lands
+  with 3.3's real epochs. The defaults are complete: latest-wins single-slot
+  coalescing while exactly one occurrence owns execution, at most one
+  coalesced admission after downtime, `Skip` counts and drops.
+- **Delivery follows shard ownership.** `ShardedWakeDelivery` asks the
+  locally owned task entity and reports a stable `wake-remote-owner` failure
+  for the rest, leaving those entries pending for the owning node's own
+  scanner — every node may run a scanner, overlap is safe because every
+  delivery is deduplicated by construction, and no wake needs a cross-node
+  command surface. A schedule update fences parked occurrences in its own
+  transition (`UpdateContinuousSchedule`, strictly monotonic on schedule and
+  policy revisions); a binding *ahead* of the controller fails closed
+  (`wake-revision-ahead`) because no accepted schedule issued it.
+
 ### Slice 3.3 — Epoch admission and budget windows
 
 Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),

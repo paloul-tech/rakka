@@ -23,20 +23,25 @@ use std::sync::Arc;
 
 use rakka_agent::testkit::{
     run_entity, CrashingStateStore, DeferredExchangeRouter, InProcessRunEntityTransport,
-    InProcessTaskEntityTransport, ScriptedDispatcher,
+    InProcessTaskEntityTransport, InProcessWakeDelivery, ScriptedDispatcher,
+    SharedAtomicWorkflowClock,
 };
 use rakka_agent::{
-    AgentAuthorityEnvelope, AgentBudgetCeilings, AgentDefinition, AgentDefinitionId,
-    AgentEffectPolicies, AgentEffectSpec, AgentEntityClass, AgentEntityCommand, AgentEntityState,
-    AgentEntityStore, AgentExchangeRouter, AgentId, AgentModelAdapter, AgentOperationId,
-    AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentRunEffectSink,
-    AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot, AgentRunState,
-    AgentRunStatus, AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent,
-    AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityCommand,
-    AgentTaskEntityStore, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
-    AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentToolBinding, AgentToolDeclaration,
-    AgentToolDescriptor, AgentToolKind, AgentToolRegistry, InMemoryAgentRunEffectSink,
-    InMemoryAgentTaskHistoryStore, TenantId,
+    AgentAuthorityEnvelope, AgentBudgetAllocation, AgentBudgetCeilings, AgentBudgetDimension,
+    AgentContinuousGoalSpec, AgentDefinition, AgentDefinitionId, AgentEffectPolicies,
+    AgentEffectSpec, AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
+    AgentExchangeRouter, AgentGoalId, AgentGoalMode, AgentId, AgentModelAdapter, AgentOperationId,
+    AgentOperationKind, AgentPolicyRef, AgentRevisionNumber, AgentRevisionProvenance,
+    AgentRunEffectSink, AgentRunEntityStore, AgentRunMemory, AgentRunScope, AgentRunSnapshot,
+    AgentRunState, AgentRunStatus, AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings,
+    AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
+    AgentTaskEntityCommand, AgentTaskEntityStore, AgentTaskResultCheck, AgentTaskResultRule,
+    AgentTaskRuleId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentToolBinding,
+    AgentToolDeclaration, AgentToolDescriptor, AgentToolKind, AgentToolRegistry, AgentWakeBinding,
+    AgentWakeOccurrence, AgentWakePolicy, AgentWakePolicyRevision, AgentWakeScanner,
+    AgentWakeScannerSettings, AgentWakeTimerEntry, AgentWakeTimerStore, AgentWakeTimerStoreState,
+    AgentWakeTriggerKind, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore,
+    ScheduleRevision, TenantId,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
@@ -51,11 +56,19 @@ pub type AgentStore = CrashingStateStore<AgentEntityState>;
 /// Durable store for the run entity class; a pass-through until a crash point
 /// is armed.
 pub type RunStore = CrashingStateStore<AgentRunState>;
+/// Durable store for the shared wake-timer index; a pass-through until a
+/// crash point is armed.
+pub type WakeStore = CrashingStateStore<AgentWakeTimerStoreState>;
+/// The wake delivery the scanner injects admission commands through.
+pub type WakeDelivery = InProcessWakeDelivery<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>;
+/// The scanner the wake tests drive.
+pub type WakeScanner = AgentWakeScanner<WakeStore, WakeDelivery, SharedAtomicWorkflowClock>;
 
 pub const TENANT: &str = "acme";
 pub const AGENT: &str = "support-agent";
 pub const TASK: &str = "ticket-1";
 pub const TASK_DEFINITION: &str = "resolve-ticket";
+pub const GOAL: &str = "nightly-reconciliation";
 
 pub fn tenant() -> TenantId {
     TenantId::new(TENANT)
@@ -88,6 +101,48 @@ pub fn run_scope() -> AgentRunScope {
 
 pub fn task_definition_id() -> AgentTaskDefinitionId {
     AgentTaskDefinitionId::new(TASK_DEFINITION).expect("task definition id should be valid")
+}
+
+pub fn goal_id() -> AgentGoalId {
+    AgentGoalId::new(GOAL).expect("goal id should be valid")
+}
+
+/// The default continuous wake policy: durable-timer trigger, a bounded
+/// per-epoch budget, and a one-minute epoch deadline — the resolved defaults
+/// everywhere else.
+pub fn wake_policy() -> AgentWakePolicy {
+    let mut budget = AgentBudgetAllocation::unbounded();
+    budget.set(AgentBudgetDimension::ModelCalls, Some(8));
+    AgentWakePolicy::new([AgentWakeTriggerKind::DurableTimer], budget, Some(60_000))
+        .expect("the wake policy should be valid")
+}
+
+/// A continuous goal mode over `policy` at the initial schedule revision.
+pub fn continuous_goal_mode(policy: AgentWakePolicy) -> AgentGoalMode {
+    AgentGoalMode::Continuous(Box::new(AgentContinuousGoalSpec {
+        schedule_revision: ScheduleRevision::INITIAL,
+        wake_policy: AgentWakePolicyRevision::initial(policy, provenance(1))
+            .expect("the wake policy revision should be valid"),
+        health_condition: AgentPolicyRef::new("nightly-health")
+            .expect("the policy ref should be valid"),
+    }))
+}
+
+/// A scheduled wake binding for the fixture's goal, due at `due_at` under
+/// `revision`.
+pub fn scheduled_wake_binding(due_at: u64, revision: ScheduleRevision) -> AgentWakeBinding {
+    AgentWakeBinding::new(
+        tenant(),
+        goal_id(),
+        revision,
+        AgentWakeOccurrence::Scheduled {
+            due_at: AgentTimestampMillis::new(due_at),
+        },
+        AgentWakeTriggerKind::DurableTimer,
+        AgentTimestampMillis::new(due_at),
+        AgentRevisionNumber::INITIAL,
+    )
+    .expect("the wake binding should be valid")
 }
 
 pub fn schema(id: &str) -> AgentSchemaRef {
@@ -196,6 +251,11 @@ pub struct Fixture<
     pub tasks: TaskStore,
     pub agents: AgentStore,
     pub runs: RunStore,
+    /// The shared wake-timer index the scanner recovers occurrences from.
+    pub wakes: WakeStore,
+    /// The delivery the scanner injects admission commands through; its fault
+    /// queue injects the wake failure windows.
+    pub wake_delivery: WakeDelivery,
     pub history: InMemoryAgentTaskHistoryStore,
     pub effects: S,
     pub policies: AgentEffectPolicies,
@@ -245,6 +305,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
+        let wakes = WakeStore::new();
         let history = InMemoryAgentTaskHistoryStore::new();
 
         // The task and the run exchange with each other, so each transport needs
@@ -269,11 +330,20 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
             .with_route(AgentEntityClass::Run, Arc::new(run_transport.clone()));
         deferred.install(router.clone());
+        let wake_delivery = InProcessWakeDelivery::new(
+            tasks.clone(),
+            agents.clone(),
+            history.clone(),
+            router.clone(),
+            clock.clone(),
+        );
 
         Self {
             tasks,
             agents,
             runs,
+            wakes,
+            wake_delivery,
             history,
             effects,
             policies,
@@ -415,6 +485,94 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                 now,
             )
             .await;
+    }
+
+    /// Creates the continuous root control task: the fixture goal, the default
+    /// continuous wake policy, and the standard agent-owned definition.
+    pub async fn create_continuous_task(&self) {
+        self.create_continuous_task_with_mode(continuous_goal_mode(wake_policy()))
+            .await;
+    }
+
+    /// Creates the continuous root control task under an explicit goal mode.
+    pub async fn create_continuous_task_with_mode(&self, goal_mode: AgentGoalMode) {
+        let mut task = AgentTaskEntityStore::new(
+            task_scope(),
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        let now = self.now();
+        task.recover(now).await.expect("the task should recover");
+        let _reply = task
+            .apply(
+                AgentTaskEntityCommand::Create {
+                    operation_id: AgentOperationId::new(
+                        AgentOperationKind::TaskCreation,
+                        [TENANT, TASK, "1"],
+                    )
+                    .expect("operation id should be derivable"),
+                    creation: Box::new(AgentTaskCreation {
+                        definition: task_definition(),
+                        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                            .expect("the input is inline-bounded"),
+                        assignee: Some(agent_id()),
+                        goal: Some(goal_id()),
+                        goal_mode,
+                        parent: None,
+                        dependencies: Vec::new(),
+                        telemetry: Default::default(),
+                    }),
+                },
+                &self.router,
+                now,
+            )
+            .await;
+    }
+
+    /// Applies one command to the fixture task through a freshly materialized
+    /// entity — every call is already a restart.
+    pub async fn apply_task_command(
+        &self,
+        command: AgentTaskEntityCommand,
+    ) -> Result<rakka_agent::AgentTaskEntityReply, rakka_agent::AgentTaskError> {
+        let mut task = AgentTaskEntityStore::new(
+            task_scope(),
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        let now = self.now();
+        task.recover(now).await?;
+        task.apply(command, &self.router, self.now()).await
+    }
+
+    /// A wake scanner over the fixture's durable wake index and its in-process
+    /// delivery, on the fixture's shared clock.
+    pub fn wake_scanner(&self) -> WakeScanner {
+        AgentWakeScanner::with_clock_and_metrics(
+            AgentWakeTimerStore::new(self.wakes.clone()),
+            self.wake_delivery.clone(),
+            SharedAtomicWorkflowClock::new(self.clock.clone()),
+            AgentWakeScannerSettings::default(),
+            Arc::new(rakka_core::NoopMetricsRecorder),
+        )
+    }
+
+    /// Durably parks one scheduled occurrence for the fixture's goal and root
+    /// control task, as the application's schedule layer would.
+    pub async fn schedule_wake(&self, due_at: u64, revision: ScheduleRevision) -> AgentWakeBinding {
+        let binding = scheduled_wake_binding(due_at, revision);
+        let entry = AgentWakeTimerEntry::new(
+            binding.clone(),
+            task_scope().task().clone(),
+            AgentTimestampMillis::new(due_at),
+        );
+        AgentWakeTimerStore::new(self.wakes.clone())
+            .schedule_occurrence(entry)
+            .await
+            .expect("the occurrence should park");
+        binding
     }
 
     pub fn run(&self) -> AgentRunEntityStore<RunStore, S> {

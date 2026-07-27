@@ -83,6 +83,8 @@ pub mod task;
 pub mod testkit;
 pub mod tools;
 pub mod wake;
+pub mod wake_scanner;
+pub mod wake_timers;
 pub mod workflow_tool;
 
 pub use admission::{
@@ -248,12 +250,26 @@ pub use run::{
 
 pub use goal::{AgentContinuousGoalSpec, AgentGoalMode};
 pub use wake::{
-    wake_admission_operation_id, wake_id_for_occurrence, AgentBudgetWindow, AgentCalendarUnit,
-    AgentGoalWindowCeiling, AgentMissedOccurrencePolicy, AgentWakeBackoffPolicy, AgentWakeBinding,
-    AgentWakeCallbackId, AgentWakeError, AgentWakeEventId, AgentWakeLifecyclePolicy,
-    AgentWakeOccurrence, AgentWakeOverlapPolicy, AgentWakePolicy, AgentWakePolicyRevision,
-    AgentWakeRenewalPolicy, AgentWakeResult, AgentWakeRetirementPolicy, AgentWakeSuspensionPolicy,
-    AgentWakeTriggerKind, ScheduleRevision, AGENT_WAKE_ID_PREFIX,
+    wake_admission_operation_id, wake_id_for_occurrence, AgentActiveWake, AgentBudgetWindow,
+    AgentCalendarUnit, AgentGoalWindowCeiling, AgentMissedOccurrencePolicy, AgentWakeBackoffPolicy,
+    AgentWakeBinding, AgentWakeCallbackId, AgentWakeControllerState, AgentWakeCounters,
+    AgentWakeDisposition, AgentWakeError, AgentWakeEventId, AgentWakeLifecyclePolicy,
+    AgentWakeOccurrence, AgentWakeOutcome, AgentWakeOverlapPolicy, AgentWakePolicy,
+    AgentWakePolicyRevision, AgentWakeRelease, AgentWakeRenewalPolicy, AgentWakeResult,
+    AgentWakeRetirementPolicy, AgentWakeStatusView, AgentWakeSuspensionPolicy,
+    AgentWakeTriggerKind, ScheduleRevision, AGENT_WAKE_ACTIVE_CAPACITY, AGENT_WAKE_ID_PREFIX,
+    AGENT_WAKE_PENDING_CAPACITY, AGENT_WAKE_RECENT_CAPACITY,
+};
+pub use wake_scanner::{
+    wake_admission_command, AgentWakeDelivery, AgentWakeDeliveryFuture, AgentWakeScan,
+    AgentWakeScanError, AgentWakeScanOutcome, AgentWakeScanResult, AgentWakeScanner,
+    AgentWakeScannerSettings, ShardedWakeDelivery, METRIC_AGENT_WAKES,
+};
+pub use wake_timers::{
+    agent_wake_timer_store_persistence_id, AgentWakeTimerEntry, AgentWakeTimerError,
+    AgentWakeTimerResult, AgentWakeTimerScheduled, AgentWakeTimerStatus, AgentWakeTimerStore,
+    AgentWakeTimerStoreState, AGENT_WAKE_TIMER_PERSISTENCE_PREFIX,
+    DEFAULT_AGENT_WAKE_TIMER_STORE_ID,
 };
 
 pub use definition::{
@@ -288,7 +304,7 @@ pub use schema::{
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
     CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
     CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
+    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION, CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
 };
 pub use task::{
     agent_task_entity_id, agent_task_entity_persistence_id, agent_task_entity_ref,

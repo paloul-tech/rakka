@@ -35,10 +35,13 @@
 //! bounded catch-up exist in the contract but must be declared explicitly,
 //! with their concurrency and result policy; no default produces them.
 //!
-//! The durable wake controller, scanners, and coalescing runtime built over
-//! this contract land with slice 3.2; epoch admission and the window-refill
-//! transition with slice 3.3. Scanner and pod uptime never create an
-//! occurrence; only durable logical time does.
+//! The controller's admission state machine also lives here:
+//! [`AgentWakeControllerState`] dispositions every delivery deterministically
+//! — fence, duplicate, admit, coalesce, or skip — while the task entity
+//! records its transitions and the shared scanner injects its deliveries.
+//! Epoch admission and the window-refill transition land with slice 3.3.
+//! Scanner and pod uptime never create an occurrence; only durable logical
+//! time does.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -1088,6 +1091,607 @@ impl VersionedAgentRecord for AgentWakePolicyRevision {
     }
 }
 
+/// Most occurrences the controller durably parks while they wait for an
+/// active slot, whatever bound the policy declares.
+///
+/// The controller state lives inside the bounded task state, so the parked
+/// queue is capped independently of
+/// [`AgentMissedOccurrencePolicy::BoundedCatchUp`]'s own bound; an occurrence
+/// past both is skipped, never silently kept.
+pub const AGENT_WAKE_PENDING_CAPACITY: usize = 8;
+
+/// Most concurrently active occurrences, whatever concurrency a parallel
+/// overlap policy declares.
+pub const AGENT_WAKE_ACTIVE_CAPACITY: usize = 8;
+
+/// How many recently dispositioned wake identities the controller remembers
+/// for deduplication beyond the operation-log window.
+pub const AGENT_WAKE_RECENT_CAPACITY: usize = 16;
+
+/// One admitted occurrence currently owning execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActiveWake {
+    binding: AgentWakeBinding,
+    admitted_at: AgentTimestampMillis,
+}
+
+impl AgentActiveWake {
+    /// The admitted wake's binding.
+    #[must_use]
+    pub const fn binding(&self) -> &AgentWakeBinding {
+        &self.binding
+    }
+
+    /// When the controller admitted the occurrence.
+    #[must_use]
+    pub const fn admitted_at(&self) -> AgentTimestampMillis {
+        self.admitted_at
+    }
+}
+
+/// Monotone wake counters of one continuous goal's controller
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every count moves inside the recorded transition that dispositioned the
+/// wake, so a replayed delivery never moves one twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentWakeCounters {
+    /// Occurrences admitted into an active slot, directly or after coalescing.
+    #[serde(default)]
+    pub admitted: u64,
+    /// Occurrences durably parked behind an active occurrence.
+    #[serde(default)]
+    pub coalesced: u64,
+    /// Parked occurrences replaced by a later one under the single coalescing
+    /// slot.
+    #[serde(default)]
+    pub superseded: u64,
+    /// Occurrences skipped as missed.
+    #[serde(default)]
+    pub missed: u64,
+    /// Occurrences fenced for carrying an obsolete schedule revision.
+    #[serde(default)]
+    pub fenced: u64,
+    /// Active occurrences released by a completed execution.
+    #[serde(default)]
+    pub released: u64,
+}
+
+/// How the controller dispositioned one wake delivery
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every disposition except [`Self::Duplicate`] is a recorded state
+/// transition under the wake's admission operation id; a duplicate makes no
+/// transition and answers from what an earlier delivery already recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentWakeDisposition {
+    /// The occurrence was admitted into an active slot within its admission
+    /// window.
+    Admitted {
+        /// The admitted wake.
+        wake: AgentWakeId,
+    },
+    /// The occurrence was admitted as the coalesced representative — it was
+    /// past its direct-admission window or replayed after downtime, and the
+    /// controller was free to run it.
+    AdmittedCoalesced {
+        /// The admitted wake.
+        wake: AgentWakeId,
+    },
+    /// The occurrence was durably parked behind the active occurrence.
+    Coalesced {
+        /// The parked wake.
+        wake: AgentWakeId,
+        /// The previously parked wake this one replaced, when the single
+        /// coalescing slot was already full.
+        replaced: Option<AgentWakeId>,
+    },
+    /// The occurrence was skipped as missed under the policy in force.
+    Skipped {
+        /// The skipped wake.
+        wake: AgentWakeId,
+    },
+    /// The occurrence carried an obsolete schedule revision and was fenced.
+    Fenced {
+        /// The fenced wake.
+        wake: AgentWakeId,
+        /// The obsolete revision the binding carried.
+        offered: ScheduleRevision,
+        /// The revision currently in force.
+        current: ScheduleRevision,
+    },
+    /// The occurrence was already dispositioned; nothing changed.
+    Duplicate {
+        /// The already-dispositioned wake.
+        wake: AgentWakeId,
+    },
+}
+
+impl AgentWakeDisposition {
+    /// Stable kebab-case label of the disposition.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Admitted { .. } => "admitted",
+            Self::AdmittedCoalesced { .. } => "admitted-coalesced",
+            Self::Coalesced { .. } => "coalesced",
+            Self::Skipped { .. } => "skipped",
+            Self::Fenced { .. } => "fenced",
+            Self::Duplicate { .. } => "duplicate",
+        }
+    }
+
+    /// The wake the disposition is about.
+    #[must_use]
+    pub const fn wake_id(&self) -> &AgentWakeId {
+        match self {
+            Self::Admitted { wake }
+            | Self::AdmittedCoalesced { wake }
+            | Self::Coalesced { wake, .. }
+            | Self::Skipped { wake }
+            | Self::Fenced { wake, .. }
+            | Self::Duplicate { wake } => wake,
+        }
+    }
+
+    /// Whether the disposition admitted the occurrence into an active slot.
+    #[must_use]
+    pub const fn is_admission(&self) -> bool {
+        matches!(self, Self::Admitted { .. } | Self::AdmittedCoalesced { .. })
+    }
+}
+
+impl Display for AgentWakeDisposition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// What releasing an active occurrence changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWakeRelease {
+    /// The released wake.
+    pub released: AgentWakeId,
+    /// The parked wake promoted into the freed slot, when one was waiting.
+    pub admitted_next: Option<AgentWakeId>,
+}
+
+/// What one wake transition of the controller recorded.
+///
+/// This rides on the task outcome the operation log remembers, so a replayed
+/// wake command answers with exactly what its original application decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentWakeOutcome {
+    /// How an admission command's delivery was dispositioned.
+    Disposition(AgentWakeDisposition),
+    /// What releasing an active occurrence changed.
+    Release(AgentWakeRelease),
+    /// A schedule update took force.
+    ScheduleUpdated {
+        /// The schedule revision now in force.
+        schedule_revision: ScheduleRevision,
+        /// The wake-policy revision now in force.
+        policy_revision: AgentRevisionNumber,
+        /// How many parked occurrences the update fenced.
+        fenced: u64,
+    },
+}
+
+/// A bounded, credential-free view of one continuous goal's wake state,
+/// exposed through the task snapshot
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWakeStatusView {
+    /// The schedule revision in force.
+    pub schedule_revision: ScheduleRevision,
+    /// The wake-policy revision in force.
+    pub policy_revision: AgentRevisionNumber,
+    /// The wakes currently owning execution.
+    pub active: Vec<AgentWakeId>,
+    /// The wakes durably parked behind them, oldest first.
+    pub pending: Vec<AgentWakeId>,
+    /// The most recently admitted wake.
+    pub last_admitted: Option<AgentWakeId>,
+    /// When the most recent admission happened.
+    pub last_admitted_at: Option<AgentTimestampMillis>,
+    /// The monotone wake counters.
+    pub counters: AgentWakeCounters,
+}
+
+/// Durable controller state of one continuous goal's wakes
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the slice of the root control task's state the wake controller
+/// owns: which occurrences are active, which are durably parked, and the
+/// monotone counters. It is deliberately small — everything in it is bounded
+/// by a constant, because it lives inside the bounded task state and survives
+/// every passivation, restart, and shard movement.
+///
+/// Deduplication is layered. The operation log answers a replay of a recent
+/// admission command; beneath it, this state fences on the active and parked
+/// slots, a bounded ring of recently dispositioned wake identities, and — for
+/// scheduled occurrences, which arrive in due order — a monotone due-time
+/// watermark. A scheduled occurrence at or below the watermark that is no
+/// longer in any slot was already dispositioned and answers as a duplicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentWakeControllerState {
+    active: Vec<AgentActiveWake>,
+    pending: Vec<AgentWakeBinding>,
+    recent: Vec<AgentWakeId>,
+    scheduled_watermark: Option<AgentTimestampMillis>,
+    last_admitted: Option<AgentWakeId>,
+    last_admitted_at: Option<AgentTimestampMillis>,
+    counters: AgentWakeCounters,
+}
+
+impl AgentWakeControllerState {
+    /// Creates an empty controller state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The occurrences currently owning execution.
+    #[must_use]
+    pub fn active(&self) -> &[AgentActiveWake] {
+        &self.active
+    }
+
+    /// The occurrences durably parked behind the active ones, oldest first.
+    #[must_use]
+    pub fn pending(&self) -> &[AgentWakeBinding] {
+        &self.pending
+    }
+
+    /// The most recently admitted wake, if any occurrence was ever admitted.
+    #[must_use]
+    pub const fn last_admitted(&self) -> Option<&AgentWakeId> {
+        self.last_admitted.as_ref()
+    }
+
+    /// When the most recent admission happened.
+    #[must_use]
+    pub const fn last_admitted_at(&self) -> Option<AgentTimestampMillis> {
+        self.last_admitted_at
+    }
+
+    /// The monotone wake counters.
+    #[must_use]
+    pub const fn counters(&self) -> &AgentWakeCounters {
+        &self.counters
+    }
+
+    /// Whether the controller already holds or recently dispositioned a wake.
+    #[must_use]
+    pub fn contains(&self, wake: &AgentWakeId) -> bool {
+        self.active.iter().any(|a| a.binding.wake_id() == wake)
+            || self.pending.iter().any(|b| b.wake_id() == wake)
+            || self.recent.iter().any(|seen| seen == wake)
+            || self.last_admitted.as_ref() == Some(wake)
+    }
+
+    fn active_capacity(policy: &AgentWakePolicy) -> usize {
+        match &policy.overlap {
+            AgentWakeOverlapPolicy::ForbidAndCoalesce => 1,
+            AgentWakeOverlapPolicy::Parallel {
+                max_concurrent_epochs,
+                ..
+            } => (*max_concurrent_epochs as usize).min(AGENT_WAKE_ACTIVE_CAPACITY),
+        }
+    }
+
+    fn pending_capacity(policy: &AgentWakePolicy) -> usize {
+        match policy.missed_occurrence {
+            AgentMissedOccurrencePolicy::BoundedCatchUp { max_occurrences } => {
+                (max_occurrences as usize).min(AGENT_WAKE_PENDING_CAPACITY)
+            }
+            _ => 1,
+        }
+    }
+
+    /// Dispositions one wake delivery under the policy and schedule revision
+    /// in force.
+    ///
+    /// This is the deterministic admission decision of
+    /// [specification 8.2](../../../docs/plans/rakka-agent/spec.md): fence an
+    /// obsolete revision, answer a duplicate without a transition, and place
+    /// everything else by its time band — within the admission window it is
+    /// fresh; between the window and the maximum lateness it is what the
+    /// overlap policy durably coalesces; past the maximum lateness the
+    /// missed-occurrence policy decides. A binding whose revision is *ahead*
+    /// of the controller fails closed: no schedule the controller accepted
+    /// ever issued it.
+    pub fn admit(
+        &mut self,
+        policy: &AgentWakePolicy,
+        current_revision: ScheduleRevision,
+        binding: AgentWakeBinding,
+        now: AgentTimestampMillis,
+    ) -> AgentWakeResult<AgentWakeDisposition> {
+        let offered = binding.schedule_revision();
+        if offered > current_revision {
+            return Err(AgentWakeError::RevisionAhead {
+                offered,
+                current: current_revision,
+            });
+        }
+        if !policy.allows_trigger(binding.trigger()) {
+            return Err(AgentWakeError::TriggerNotAllowed {
+                trigger: binding.trigger(),
+            });
+        }
+        let wake = binding.wake_id().clone();
+        if self.contains(&wake) {
+            return Ok(AgentWakeDisposition::Duplicate { wake });
+        }
+        if let Some(due_at) = binding.due_at() {
+            if self
+                .scheduled_watermark
+                .is_some_and(|watermark| due_at.as_millis() <= watermark.as_millis())
+            {
+                return Ok(AgentWakeDisposition::Duplicate { wake });
+            }
+        }
+        if offered < current_revision {
+            self.note_seen(&binding);
+            self.counters.fenced += 1;
+            return Ok(AgentWakeDisposition::Fenced {
+                wake,
+                offered,
+                current: current_revision,
+            });
+        }
+        let lateness = binding
+            .due_at()
+            .map(|due_at| now.as_millis().saturating_sub(due_at.as_millis()));
+        let missed = matches!(
+            (lateness, policy.maximum_lateness_millis),
+            (Some(late), Some(maximum)) if late > maximum
+        );
+        if missed {
+            return Ok(self.dispose_missed(policy, binding, now));
+        }
+        let past_window = matches!(
+            (lateness, policy.admission_window_millis),
+            (Some(late), Some(window)) if late > window
+        );
+        if past_window {
+            // The band between the admission window and the maximum lateness:
+            // past direct admission but not yet missed, so it coalesces — into
+            // a free active slot when one exists, behind the active occurrence
+            // otherwise.
+            return Ok(self.coalesce_or_admit(policy, binding, now));
+        }
+        if self.active.len() < Self::active_capacity(policy) {
+            Ok(self.admit_binding(binding, now, false))
+        } else {
+            Ok(self.coalesce(policy, binding))
+        }
+    }
+
+    /// Releases an active occurrence, promoting the oldest parked occurrence
+    /// into the freed slot.
+    ///
+    /// The promotion happens inside this same transition: the coalesced
+    /// occurrence's epoch follows the released one without any further
+    /// trigger, which is what keeps the default overlap policy live.
+    pub fn release(
+        &mut self,
+        wake: &AgentWakeId,
+        now: AgentTimestampMillis,
+    ) -> AgentWakeResult<AgentWakeRelease> {
+        let Some(index) = self
+            .active
+            .iter()
+            .position(|active| active.binding.wake_id() == wake)
+        else {
+            return Err(AgentWakeError::NotActive { wake: wake.clone() });
+        };
+        self.active.remove(index);
+        self.counters.released += 1;
+        let admitted_next = if self.pending.is_empty() {
+            None
+        } else {
+            let binding = self.pending.remove(0);
+            let next = binding.wake_id().clone();
+            self.admit_binding(binding, now, true);
+            Some(next)
+        };
+        Ok(AgentWakeRelease {
+            released: wake.clone(),
+            admitted_next,
+        })
+    }
+
+    /// Fences every parked occurrence constructed under a revision older than
+    /// the one now in force, returning how many were fenced.
+    ///
+    /// A schedule update calls this so an occurrence the old schedule parked
+    /// can never admit an epoch the new schedule did not issue. Active
+    /// occurrences are untouched: they were already admitted.
+    pub fn fence_obsolete_pending(&mut self, current_revision: ScheduleRevision) -> u64 {
+        let before = self.pending.len();
+        self.pending
+            .retain(|binding| binding.schedule_revision() >= current_revision);
+        let fenced = (before - self.pending.len()) as u64;
+        self.counters.fenced += fenced;
+        fenced
+    }
+
+    fn dispose_missed(
+        &mut self,
+        policy: &AgentWakePolicy,
+        binding: AgentWakeBinding,
+        now: AgentTimestampMillis,
+    ) -> AgentWakeDisposition {
+        match policy.missed_occurrence {
+            AgentMissedOccurrencePolicy::AdmitOneCoalesced => {
+                self.coalesce_or_admit(policy, binding, now)
+            }
+            AgentMissedOccurrencePolicy::Skip => {
+                let wake = binding.wake_id().clone();
+                self.note_seen(&binding);
+                self.counters.missed += 1;
+                AgentWakeDisposition::Skipped { wake }
+            }
+            AgentMissedOccurrencePolicy::BoundedCatchUp { .. } => {
+                if self.active.len() < Self::active_capacity(policy) {
+                    self.admit_binding(binding, now, true)
+                } else {
+                    self.coalesce(policy, binding)
+                }
+            }
+        }
+    }
+
+    fn coalesce_or_admit(
+        &mut self,
+        policy: &AgentWakePolicy,
+        binding: AgentWakeBinding,
+        now: AgentTimestampMillis,
+    ) -> AgentWakeDisposition {
+        if self.active.len() < Self::active_capacity(policy) {
+            self.admit_binding(binding, now, true)
+        } else {
+            self.coalesce(policy, binding)
+        }
+    }
+
+    fn coalesce(
+        &mut self,
+        policy: &AgentWakePolicy,
+        binding: AgentWakeBinding,
+    ) -> AgentWakeDisposition {
+        let wake = binding.wake_id().clone();
+        self.note_seen(&binding);
+        let capacity = Self::pending_capacity(policy);
+        if self.pending.len() < capacity {
+            self.pending.push(binding);
+            self.counters.coalesced += 1;
+            AgentWakeDisposition::Coalesced {
+                wake,
+                replaced: None,
+            }
+        } else if capacity == 1 {
+            // The default single coalescing slot: the latest occurrence wins,
+            // which is the "at most one pending occurrence" the resolved
+            // defaults promise.
+            let replaced = self.pending[0].wake_id().clone();
+            self.pending[0] = binding;
+            self.counters.coalesced += 1;
+            self.counters.superseded += 1;
+            AgentWakeDisposition::Coalesced {
+                wake,
+                replaced: Some(replaced),
+            }
+        } else {
+            // A full catch-up queue is the bound the policy declared: the
+            // overflow is skipped, never silently kept.
+            self.counters.missed += 1;
+            AgentWakeDisposition::Skipped { wake }
+        }
+    }
+
+    fn admit_binding(
+        &mut self,
+        binding: AgentWakeBinding,
+        now: AgentTimestampMillis,
+        coalesced: bool,
+    ) -> AgentWakeDisposition {
+        let wake = binding.wake_id().clone();
+        self.note_seen(&binding);
+        self.active.push(AgentActiveWake {
+            binding,
+            admitted_at: now,
+        });
+        self.last_admitted = Some(wake.clone());
+        self.last_admitted_at = Some(now);
+        self.counters.admitted += 1;
+        if coalesced {
+            AgentWakeDisposition::AdmittedCoalesced { wake }
+        } else {
+            AgentWakeDisposition::Admitted { wake }
+        }
+    }
+
+    fn note_seen(&mut self, binding: &AgentWakeBinding) {
+        self.recent.push(binding.wake_id().clone());
+        if self.recent.len() > AGENT_WAKE_RECENT_CAPACITY {
+            self.recent.remove(0);
+        }
+        if let Some(due_at) = binding.due_at() {
+            let advanced = self
+                .scheduled_watermark
+                .is_none_or(|watermark| due_at.as_millis() > watermark.as_millis());
+            if advanced {
+                self.scheduled_watermark = Some(due_at);
+            }
+        }
+    }
+
+    fn validate(&self) -> AgentWakeResult<()> {
+        if self.active.len() > AGENT_WAKE_ACTIVE_CAPACITY {
+            return Err(AgentWakeError::StateOutOfBounds {
+                detail: "active occurrences",
+            });
+        }
+        if self.pending.len() > AGENT_WAKE_PENDING_CAPACITY {
+            return Err(AgentWakeError::StateOutOfBounds {
+                detail: "parked occurrences",
+            });
+        }
+        if self.recent.len() > AGENT_WAKE_RECENT_CAPACITY {
+            return Err(AgentWakeError::StateOutOfBounds {
+                detail: "recent wake identities",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentWakeControllerState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Record {
+            #[serde(default)]
+            active: Vec<AgentActiveWake>,
+            #[serde(default)]
+            pending: Vec<AgentWakeBinding>,
+            #[serde(default)]
+            recent: Vec<AgentWakeId>,
+            #[serde(default)]
+            scheduled_watermark: Option<AgentTimestampMillis>,
+            #[serde(default)]
+            last_admitted: Option<AgentWakeId>,
+            #[serde(default)]
+            last_admitted_at: Option<AgentTimestampMillis>,
+            #[serde(default)]
+            counters: AgentWakeCounters,
+        }
+
+        let record = Record::deserialize(deserializer)?;
+        let state = Self {
+            active: record.active,
+            pending: record.pending,
+            recent: record.recent,
+            scheduled_watermark: record.scheduled_watermark,
+            last_admitted: record.last_admitted,
+            last_admitted_at: record.last_admitted_at,
+            counters: record.counters,
+        };
+        state.validate().map_err(DeserializeError::custom)?;
+        Ok(state)
+    }
+}
+
 /// Rejection of a wake identity, binding, or policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1141,6 +1745,29 @@ pub enum AgentWakeError {
     WindowCeilingUnbounded,
     /// An epoch with neither a bounded budget dimension nor a deadline.
     EpochUnbounded,
+    /// A binding carrying a schedule revision ahead of the controller's: no
+    /// schedule the controller accepted ever issued it.
+    RevisionAhead {
+        /// The revision the binding carried.
+        offered: ScheduleRevision,
+        /// The revision currently in force.
+        current: ScheduleRevision,
+    },
+    /// A trigger class the policy does not allow.
+    TriggerNotAllowed {
+        /// The disallowed trigger class.
+        trigger: AgentWakeTriggerKind,
+    },
+    /// A release of a wake that is not active.
+    NotActive {
+        /// The wake that was not active.
+        wake: AgentWakeId,
+    },
+    /// A persisted controller state exceeding its bounded capacities.
+    StateOutOfBounds {
+        /// Which bound the record exceeded.
+        detail: &'static str,
+    },
 }
 
 impl AgentWakeError {
@@ -1163,6 +1790,10 @@ impl AgentWakeError {
             Self::RenewalWithoutExpiry => "wake-renewal-without-expiry",
             Self::WindowCeilingUnbounded => "wake-window-ceiling-unbounded",
             Self::EpochUnbounded => "wake-epoch-unbounded",
+            Self::RevisionAhead { .. } => "wake-revision-ahead",
+            Self::TriggerNotAllowed { .. } => "wake-trigger-not-allowed",
+            Self::NotActive { .. } => "wake-not-active",
+            Self::StateOutOfBounds { .. } => "wake-state-out-of-bounds",
         }
     }
 }
@@ -1218,6 +1849,20 @@ impl Display for AgentWakeError {
             }
             Self::EpochUnbounded => f.write_str(
                 "an epoch must be bounded: set a deadline or bound at least one budget dimension",
+            ),
+            Self::RevisionAhead { offered, current } => write!(
+                f,
+                "the binding carries schedule revision {offered}, ahead of the current revision {current}; no accepted schedule issued it"
+            ),
+            Self::TriggerNotAllowed { trigger } => {
+                write!(f, "the wake policy does not allow the {trigger} trigger")
+            }
+            Self::NotActive { wake } => {
+                write!(f, "the wake {wake} is not an active occurrence")
+            }
+            Self::StateOutOfBounds { detail } => write!(
+                f,
+                "the persisted wake controller state exceeds its bound on {detail}"
             ),
         }
     }
@@ -1505,5 +2150,377 @@ mod tests {
         let loaded = serde_json::from_value::<AgentWakeBinding>(roundtrip)
             .expect("an untampered binding should load");
         assert_eq!(loaded, binding);
+    }
+
+    fn scheduled_binding(due_at: u64, revision: ScheduleRevision) -> AgentWakeBinding {
+        AgentWakeBinding::new(
+            tenant(),
+            goal(),
+            revision,
+            AgentWakeOccurrence::Scheduled {
+                due_at: AgentTimestampMillis::new(due_at),
+            },
+            AgentWakeTriggerKind::DurableTimer,
+            AgentTimestampMillis::new(due_at),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("binding should be valid")
+    }
+
+    fn now(at: u64) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(at)
+    }
+
+    #[test]
+    fn a_fresh_occurrence_admits_and_a_concurrent_one_coalesces_latest_wins() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+
+        let first = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_010),
+            )
+            .expect("a fresh occurrence should be dispositioned");
+        assert!(matches!(first, AgentWakeDisposition::Admitted { .. }));
+
+        let second = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_010),
+            )
+            .expect("a concurrent occurrence should be dispositioned");
+        assert!(matches!(
+            second,
+            AgentWakeDisposition::Coalesced { replaced: None, .. }
+        ));
+
+        let third = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(3_000, ScheduleRevision::INITIAL),
+                now(3_010),
+            )
+            .expect("a later concurrent occurrence should be dispositioned");
+        assert!(matches!(
+            third,
+            AgentWakeDisposition::Coalesced {
+                replaced: Some(_),
+                ..
+            }
+        ));
+
+        assert_eq!(controller.active().len(), 1);
+        assert_eq!(controller.pending().len(), 1);
+        assert_eq!(
+            controller.pending()[0].due_at(),
+            Some(AgentTimestampMillis::new(3_000)),
+            "the single coalescing slot keeps the latest occurrence"
+        );
+        assert_eq!(controller.counters().admitted, 1);
+        assert_eq!(controller.counters().coalesced, 2);
+        assert_eq!(controller.counters().superseded, 1);
+    }
+
+    #[test]
+    fn release_promotes_the_parked_occurrence_in_the_same_transition() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let first = scheduled_binding(1_000, ScheduleRevision::INITIAL);
+        let second = scheduled_binding(2_000, ScheduleRevision::INITIAL);
+        let first_wake = first.wake_id().clone();
+        let second_wake = second.wake_id().clone();
+
+        controller
+            .admit(&policy, ScheduleRevision::INITIAL, first, now(1_010))
+            .expect("the first occurrence should admit");
+        controller
+            .admit(&policy, ScheduleRevision::INITIAL, second, now(2_010))
+            .expect("the second occurrence should coalesce");
+
+        let release = controller
+            .release(&first_wake, now(5_000))
+            .expect("the active occurrence should release");
+        assert_eq!(release.released, first_wake);
+        assert_eq!(release.admitted_next, Some(second_wake.clone()));
+        assert_eq!(controller.active().len(), 1);
+        assert_eq!(controller.active()[0].binding().wake_id(), &second_wake);
+        assert!(controller.pending().is_empty());
+        assert_eq!(controller.counters().admitted, 2);
+        assert_eq!(controller.counters().released, 1);
+
+        let error = controller
+            .release(&first_wake, now(5_001))
+            .expect_err("releasing a wake that is not active should be refused");
+        assert_eq!(error.code(), "wake-not-active");
+    }
+
+    #[test]
+    fn an_obsolete_revision_is_fenced_and_a_revision_ahead_fails_closed() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let current = ScheduleRevision::new(3);
+
+        let fenced = controller
+            .admit(
+                &policy,
+                current,
+                scheduled_binding(1_000, ScheduleRevision::new(2)),
+                now(1_010),
+            )
+            .expect("an obsolete revision should be dispositioned, not erred");
+        assert!(matches!(
+            fenced,
+            AgentWakeDisposition::Fenced { offered, current: in_force, .. }
+                if offered == ScheduleRevision::new(2) && in_force == current
+        ));
+        assert_eq!(controller.counters().fenced, 1);
+        assert!(controller.active().is_empty());
+
+        let error = controller
+            .admit(
+                &policy,
+                current,
+                scheduled_binding(1_000, ScheduleRevision::new(4)),
+                now(1_010),
+            )
+            .expect_err("a revision ahead of the controller should fail closed");
+        assert_eq!(error.code(), "wake-revision-ahead");
+    }
+
+    #[test]
+    fn a_duplicate_delivery_answers_without_a_transition() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let binding = scheduled_binding(1_000, ScheduleRevision::INITIAL);
+        let wake = binding.wake_id().clone();
+
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                binding.clone(),
+                now(1_010),
+            )
+            .expect("the first delivery should admit");
+        let before = controller.clone();
+
+        let duplicate = controller
+            .admit(&policy, ScheduleRevision::INITIAL, binding, now(9_999))
+            .expect("a duplicate delivery should be dispositioned");
+        assert_eq!(
+            duplicate,
+            AgentWakeDisposition::Duplicate { wake: wake.clone() }
+        );
+        assert_eq!(controller, before, "a duplicate must not change state");
+
+        // Even after the occurrence releases and leaves every slot, the
+        // scheduled watermark still answers a late redelivery as a duplicate.
+        controller
+            .release(&wake, now(10_000))
+            .expect("the active occurrence should release");
+        let late = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(20_000),
+            )
+            .expect("a late redelivery should be dispositioned");
+        assert!(matches!(late, AgentWakeDisposition::Duplicate { .. }));
+    }
+
+    #[test]
+    fn the_time_bands_place_an_occurrence() {
+        let policy = default_policy()
+            .with_admission_window(60_000)
+            .expect("the window should be accepted")
+            .with_maximum_lateness(120_000)
+            .expect("the lateness should be accepted");
+        let mut controller = AgentWakeControllerState::new();
+
+        // Within the admission window: a direct admission.
+        let fresh = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(100_000, ScheduleRevision::INITIAL),
+                now(130_000),
+            )
+            .expect("an in-window occurrence should be dispositioned");
+        assert!(matches!(fresh, AgentWakeDisposition::Admitted { .. }));
+        let active = controller.active()[0].binding().wake_id().clone();
+        controller
+            .release(&active, now(140_000))
+            .expect("the active occurrence should release");
+
+        // Between the window and the maximum lateness: coalesced, which in an
+        // idle controller admits as the coalesced representative.
+        let in_band = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(200_000, ScheduleRevision::INITIAL),
+                now(290_000),
+            )
+            .expect("an in-band occurrence should be dispositioned");
+        assert!(matches!(
+            in_band,
+            AgentWakeDisposition::AdmittedCoalesced { .. }
+        ));
+
+        // Past the maximum lateness with the default policy: the one
+        // coalesced representative — but an occurrence is already active, so
+        // it parks.
+        let missed = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(300_000, ScheduleRevision::INITIAL),
+                now(500_000),
+            )
+            .expect("a missed occurrence should be dispositioned");
+        assert!(matches!(missed, AgentWakeDisposition::Coalesced { .. }));
+
+        // The same lateness under a skip policy is skipped outright.
+        let skip_policy = {
+            let mut skip = policy.clone();
+            skip.missed_occurrence = AgentMissedOccurrencePolicy::Skip;
+            skip
+        };
+        let skipped = controller
+            .admit(
+                &skip_policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(310_000, ScheduleRevision::INITIAL),
+                now(500_000),
+            )
+            .expect("a skipped occurrence should be dispositioned");
+        assert!(matches!(skipped, AgentWakeDisposition::Skipped { .. }));
+        assert_eq!(controller.counters().missed, 1);
+    }
+
+    #[test]
+    fn bounded_catch_up_queues_to_its_bound_and_skips_the_overflow() {
+        let policy = default_policy()
+            .with_maximum_lateness(1_000)
+            .expect("the lateness should be accepted")
+            .with_bounded_catch_up(2)
+            .expect("the catch-up bound should be accepted");
+        let mut controller = AgentWakeControllerState::new();
+
+        // Four occurrences long past their lateness, as after downtime. The
+        // first replays into the free slot; two queue; the fourth overflows
+        // the declared bound and is skipped.
+        let dispositions: Vec<_> = (1..=4)
+            .map(|slot| {
+                controller
+                    .admit(
+                        &policy,
+                        ScheduleRevision::INITIAL,
+                        scheduled_binding(slot * 1_000, ScheduleRevision::INITIAL),
+                        now(1_000_000),
+                    )
+                    .expect("every occurrence should be dispositioned")
+            })
+            .collect();
+        assert!(matches!(
+            dispositions[0],
+            AgentWakeDisposition::AdmittedCoalesced { .. }
+        ));
+        assert!(matches!(
+            dispositions[1],
+            AgentWakeDisposition::Coalesced { .. }
+        ));
+        assert!(matches!(
+            dispositions[2],
+            AgentWakeDisposition::Coalesced { .. }
+        ));
+        assert!(matches!(
+            dispositions[3],
+            AgentWakeDisposition::Skipped { .. }
+        ));
+        assert_eq!(controller.pending().len(), 2);
+        assert_eq!(controller.counters().missed, 1);
+    }
+
+    #[test]
+    fn a_disallowed_trigger_is_refused() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let binding = AgentWakeBinding::new(
+            tenant(),
+            goal(),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::ExternalEvent {
+                event: AgentWakeEventId::new("deploy-finished").expect("event id should be valid"),
+            },
+            AgentWakeTriggerKind::ExternalEvent,
+            AgentTimestampMillis::new(1_000),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("binding should be valid");
+
+        let error = controller
+            .admit(&policy, ScheduleRevision::INITIAL, binding, now(1_000))
+            .expect_err("a trigger class the policy does not allow should be refused");
+        assert_eq!(error.code(), "wake-trigger-not-allowed");
+    }
+
+    #[test]
+    fn a_schedule_update_fences_every_parked_occurrence() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_010),
+            )
+            .expect("the first occurrence should admit");
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_010),
+            )
+            .expect("the second occurrence should coalesce");
+
+        let fenced = controller.fence_obsolete_pending(ScheduleRevision::INITIAL.next());
+        assert_eq!(fenced, 1);
+        assert!(controller.pending().is_empty());
+        assert_eq!(
+            controller.active().len(),
+            1,
+            "an already-admitted occurrence is not fenced by a schedule update"
+        );
+        assert_eq!(controller.counters().fenced, 1);
+    }
+
+    #[test]
+    fn a_controller_state_beyond_its_bounds_fails_closed_on_load() {
+        let mut value = serde_json::to_value(AgentWakeControllerState::new())
+            .expect("controller state should serialize");
+        let overflow: Vec<_> = (0..AGENT_WAKE_RECENT_CAPACITY + 1)
+            .map(|index| {
+                let binding = scheduled_binding(1_000 + index as u64, ScheduleRevision::INITIAL);
+                serde_json::to_value(binding.wake_id()).expect("wake id should serialize")
+            })
+            .collect();
+        value["recent"] = serde_json::Value::Array(overflow);
+        let error = serde_json::from_value::<AgentWakeControllerState>(value)
+            .expect_err("a state beyond its bounds should fail closed on load");
+        assert!(error.to_string().contains("recent wake identities"));
+
+        let empty: AgentWakeControllerState =
+            serde_json::from_value(serde_json::json!({})).expect("an empty record loads");
+        assert_eq!(empty, AgentWakeControllerState::new());
     }
 }
