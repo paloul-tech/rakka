@@ -246,6 +246,16 @@ pub use run::{
     DEFAULT_AGENT_RUN_ENTITY_TYPE,
 };
 
+pub use goal::{AgentContinuousGoalSpec, AgentGoalMode};
+pub use wake::{
+    wake_admission_operation_id, wake_id_for_occurrence, AgentBudgetWindow, AgentCalendarUnit,
+    AgentGoalWindowCeiling, AgentMissedOccurrencePolicy, AgentWakeBackoffPolicy, AgentWakeBinding,
+    AgentWakeCallbackId, AgentWakeError, AgentWakeEventId, AgentWakeLifecyclePolicy,
+    AgentWakeOccurrence, AgentWakeOverlapPolicy, AgentWakePolicy, AgentWakePolicyRevision,
+    AgentWakeRenewalPolicy, AgentWakeResult, AgentWakeRetirementPolicy, AgentWakeSuspensionPolicy,
+    AgentWakeTriggerKind, ScheduleRevision, AGENT_WAKE_ID_PREFIX,
+};
+
 pub use definition::{
     effective_settings_for_turn, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentCapabilityId,
     AgentCoordinationCapabilityKind, AgentCredentialBindingRef, AgentDefinition,
@@ -278,6 +288,7 @@ pub use schema::{
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
     CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
     CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
 };
 pub use task::{
     agent_task_entity_id, agent_task_entity_persistence_id, agent_task_entity_ref,

@@ -22,17 +22,20 @@ use rakka_agent::testkit::{
 use rakka_agent::{
     init_agent_task_entity_sharding, load_agent_task_state, passivate_agent_task_entity,
     registered_agent_task_entity_ref, AgentAssignmentStatus, AgentAuthorityEnvelope,
-    AgentDefinition, AgentDefinitionId, AgentDependencyFailurePolicy, AgentEntityAddress,
-    AgentEntityClass, AgentEntityCommand, AgentEntityState, AgentEntityStore,
-    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter, AgentId,
-    AgentOperationId, AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance, AgentRunId,
-    AgentRunScope, AgentSchemaId, AgentSchemaPolicy, AgentSchemaRef, AgentScope, AgentSettings,
-    AgentTaskContent, AgentTaskCreation, AgentTaskDefinition, AgentTaskDefinitionId,
-    AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntityCommand,
-    AgentTaskEntityMessage, AgentTaskEntityReply, AgentTaskEntityShardingSettings,
-    AgentTaskEntityStore, AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind,
-    AgentTaskId, AgentTaskOutcome, AgentTaskOwnership, AgentTaskScope, AgentTaskSnapshot,
-    AgentTaskState, AgentTaskStatus, InMemoryAgentTaskHistoryStore, TenantId,
+    AgentBudgetAllocation, AgentBudgetDimension, AgentContinuousGoalSpec, AgentDefinition,
+    AgentDefinitionId, AgentDependencyFailurePolicy, AgentEntityAddress, AgentEntityClass,
+    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentExchangeEnvelope,
+    AgentExchangeKind, AgentExchangePayload, AgentExchangeRouter, AgentGoalId, AgentGoalMode,
+    AgentId, AgentOperationId, AgentOperationKind, AgentPolicyRef, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunId, AgentRunScope, AgentSchemaId, AgentSchemaPolicy,
+    AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskCreation,
+    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskDependencyDeclaration,
+    AgentTaskDependencyOutcome, AgentTaskEntityCommand, AgentTaskEntityMessage,
+    AgentTaskEntityReply, AgentTaskEntityShardingSettings, AgentTaskEntityStore,
+    AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind, AgentTaskId,
+    AgentTaskOutcome, AgentTaskOwnership, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
+    AgentTaskStatus, AgentWakePolicy, AgentWakePolicyRevision, AgentWakeTriggerKind,
+    InMemoryAgentTaskHistoryStore, ScheduleRevision, TenantId,
     AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE, AGENT_TASK_CREATION_PAYLOAD_TYPE,
 };
 use rakka_agent_workflow::{
@@ -119,6 +122,7 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
         goal: None,
+        goal_mode: Default::default(),
         parent: None,
         dependencies,
         telemetry: Default::default(),
@@ -1111,4 +1115,81 @@ async fn the_dependency_and_assignment_flow_survives_any_owner_loss() {
         }
     })
     .await;
+}
+
+/// A continuous goal mode for the root-control-task tests: a durable-timer
+/// wake with a bounded epoch, exactly what the slice 3.2 controller drives.
+fn continuous_mode() -> AgentGoalMode {
+    let mut epoch_budget = AgentBudgetAllocation::unbounded();
+    epoch_budget.set(AgentBudgetDimension::ModelCalls, Some(8));
+    let policy = AgentWakePolicy::new(
+        [AgentWakeTriggerKind::DurableTimer],
+        epoch_budget,
+        Some(60_000),
+    )
+    .expect("the wake policy is valid");
+    AgentGoalMode::Continuous(Box::new(AgentContinuousGoalSpec {
+        schedule_revision: ScheduleRevision::INITIAL,
+        wake_policy: AgentWakePolicyRevision::initial(policy, provenance(1))
+            .expect("the initial wake-policy revision is accepted"),
+        health_condition: AgentPolicyRef::new("nightly-health").expect("the policy ref is valid"),
+    }))
+}
+
+#[tokio::test]
+async fn a_continuous_task_must_bind_its_goal() {
+    // A continuous root control task exists to admit epochs for a goal;
+    // without the binding there is nothing for the wake controller to fence,
+    // budget, or retire against, so the creation is refused closed.
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+
+    let mut untethered = creation(Vec::new());
+    untethered.goal_mode = continuous_mode();
+    let code = rejection_code(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(untethered),
+        })
+        .await,
+    );
+    assert_eq!(code, "task-continuous-without-goal");
+}
+
+#[tokio::test]
+async fn a_continuous_root_task_round_trips_its_mode() {
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+
+    let mut rooted = creation(Vec::new());
+    rooted.goal = Some(AgentGoalId::new(TASK).expect("the goal id is valid"));
+    rooted.goal_mode = continuous_mode();
+    let expected = rooted.goal_mode.clone();
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(rooted),
+        })
+        .await,
+    );
+
+    let state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the task state loads")
+        .expect("the task state exists");
+    let task = state.task().expect("the task is created");
+    assert!(task.goal_mode.is_continuous());
+    assert_eq!(task.goal_mode, expected);
+}
+
+#[test]
+fn a_record_persisted_before_the_goal_mode_field_loads_as_finite() {
+    let mut value = serde_json::to_value(creation(Vec::new())).expect("the creation serializes");
+    value
+        .as_object_mut()
+        .expect("a creation is an object")
+        .remove("goal_mode");
+    let loaded: AgentTaskCreation =
+        serde_json::from_value(value).expect("a record without the field loads");
+    assert_eq!(loaded.goal_mode, AgentGoalMode::Finite);
 }

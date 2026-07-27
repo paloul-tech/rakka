@@ -694,6 +694,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                             .expect("the input is inline-bounded"),
                         assignee: Some(auditor_id()),
                         goal: None,
+                        goal_mode: Default::default(),
                         parent: None,
                         dependencies: Vec::new(),
                         telemetry: Default::default(),
