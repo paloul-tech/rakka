@@ -43,6 +43,10 @@ tracing.workspace = true
 rig-core = { version = "=0.37.0", default-features = false, optional = true }
 
 [dev-dependencies]
+# Property tests for the derived wake identity: same occurrence from any
+# trigger path yields one identity (slice 3.1 exit criterion). Dev-only, so it
+# never enters the publishable dependency tree.
+proptest.workspace = true
 rakka-cluster = { path = "../rakka-cluster", version = "0.1.0" }
 
 [lints]

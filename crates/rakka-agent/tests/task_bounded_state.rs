@@ -240,6 +240,7 @@ impl Fixture {
             input,
             assignee: Some(agent_id()),
             goal: None,
+            goal_mode: Default::default(),
             parent: None,
             dependencies: Vec::new(),
             telemetry: Default::default(),
@@ -447,6 +448,7 @@ async fn the_widest_transition_never_loses_a_history_entry() {
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
         goal: None,
+        goal_mode: Default::default(),
         parent: None,
         dependencies,
         telemetry: Default::default(),
@@ -686,6 +688,7 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
                         goal: None,
+                        goal_mode: Default::default(),
                         parent: None,
                         dependencies: Vec::new(),
                         telemetry: Default::default(),
@@ -833,6 +836,7 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
                         goal: None,
+                        goal_mode: Default::default(),
                         parent: None,
                         // The dependency keeps the creation from deciding its
                         // own assignment, which is exactly the window where an

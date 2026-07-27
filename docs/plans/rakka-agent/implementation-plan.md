@@ -2070,6 +2070,53 @@ Guidance: [Continuous Goal Controller](technical-guidance.md#continuous-goal-con
 Done when: wake-ID dedup construction is property-tested (same occurrence
 from any trigger path yields one identity).
 
+**Amended as implemented (2026-07-27):**
+
+- **The wake identity is derived, never generated, following the slice 2.3
+  derived-claim-identity precedent.** `wake_id_for_occurrence` is a pure
+  function of `(tenant, goal, ScheduleRevision, logical occurrence)` — a
+  `wake-`-prefixed SHA-256 digest over a length-prefixed canonical encoding
+  that is injective whatever the goal or event identity contains — and
+  deliberately takes no trigger source, delivery time, or lateness, so every
+  trigger path reconstructs one identity and deduplication is a construction
+  property rather than runtime coordination. Delivery metadata lives on
+  `AgentWakeBinding`, whose deserialization re-derives the identity and fails
+  closed on a record its own components do not derive. The derivation is a
+  persisted compatibility surface: golden vectors in `tests/wake_identity.rs`
+  pin it (verified against an independent recomputation), and the fixed
+  69-byte output leaves headroom inside `AGENT_IDENTITY_MAX_LENGTH` for the
+  epoch task/run ids slice 3.3 derives from it.
+  `wake_admission_operation_id` is the durable-inbox deduplication value the
+  slice 3.2 controller admits on.
+- **The policy is versioned under its own record kind with the standard
+  N/N+1 window.** `AgentWakePolicyRevision` persists as
+  `AgentRecordKind::WakePolicyRevision` with its own schema version, because
+  a wake binds the policy revision in force at construction and outlives the
+  policy that admitted it. The constructor produces the resolved continuous
+  defaults (spec 21.1 items 1-3); parallel epochs and bounded catch-up are
+  representable but constructible only through explicit builders that demand
+  the concurrency bound and result policy; an epoch must be bounded from
+  construction (a deadline or at least one bounded budget dimension); and a
+  policy violating any bounded invariant fails closed on deserialization.
+- **The goal contract carries only the controller's slice.**
+  `AgentGoalMode`/`AgentContinuousGoalSpec` hold the schedule revision, wake
+  policy revision, and explicit health condition; the full `AgentGoalSpec`
+  still lands in slice 4.1. Records persisted before the field load as
+  finite, a continuous creation without a goal binding is refused closed
+  (`task-continuous-without-goal`), and A2A ingress always creates finite
+  work — a continuous root control task is instituted by the goal surface,
+  never by ingress.
+- **Review hardening (post-review, same slice).** The task-state load gate
+  version-checks the embedded wake-policy revision exactly as it checks the
+  embedded task definition, proven by a doctored-record test
+  (`schema-version-ahead`); a maximum lateness that undercuts the admission
+  window is refused (`wake-lateness-below-admission-window`) because an
+  occurrence between the two would be both admittable and missed — the band
+  between window and lateness is what the overlap policy durably coalesces;
+  and a zero `ScheduleRevision` is unrepresentable: construction clamps to
+  the initial revision, and a persisted zero fails closed on load, so the
+  slice 3.2 fencing comparison never sees a revision no schedule issued.
+
 ### Slice 3.2 — Wake controller and scanners
 
 Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),

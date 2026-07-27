@@ -246,6 +246,7 @@ impl Sharded {
                                 .expect("the input is inline-bounded"),
                             assignee: Some(agent_id()),
                             goal: Some(goal_id()),
+                            goal_mode: Default::default(),
                             parent: None,
                             dependencies: Vec::new(),
                             telemetry: Default::default(),

@@ -405,6 +405,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                             .expect("the input is inline-bounded"),
                         assignee: Some(agent_id()),
                         goal: None,
+                        goal_mode: Default::default(),
                         parent: None,
                         dependencies: Vec::new(),
                         telemetry,

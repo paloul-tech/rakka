@@ -117,6 +117,7 @@ use crate::definition::{
     AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
     AgentRevisionNumber, AgentTaskDefinitionId,
 };
+use crate::goal::AgentGoalMode;
 use crate::identity::{
     validated_id, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
     AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, TenantId,
@@ -2467,6 +2468,14 @@ pub struct AgentTaskCreation {
     pub assignee: Option<AgentId>,
     /// The collaborative goal it contributes to.
     pub goal: Option<AgentGoalId>,
+    /// Whether the task coordinates a finite or continuous goal
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Continuous mode makes this the root control task the wake controller of
+    /// slice 3.2 drives, and it requires a goal binding. Records persisted
+    /// before this field load as finite.
+    #[serde(default)]
+    pub goal_mode: AgentGoalMode,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
     /// Dependencies declared with the creation.
@@ -2865,6 +2874,10 @@ pub struct AgentTask {
     pub status: AgentTaskStatus,
     /// The collaborative goal this task contributes to.
     pub goal: Option<AgentGoalId>,
+    /// Whether it coordinates a finite or continuous goal. Records persisted
+    /// before this field load as finite.
+    #[serde(default)]
+    pub goal_mode: AgentGoalMode,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
     /// The agent the task is meant for, when it is agent-owned.
@@ -3224,6 +3237,9 @@ impl AgentExchangeState for AgentTaskState {
         policy.check_record(self)?;
         if let Some(task) = &self.task {
             policy.check_record(&task.definition)?;
+            if let Some(spec) = task.goal_mode.continuous() {
+                policy.check_record(&spec.wake_policy)?;
+            }
         }
         for entry in &self.pending_history {
             policy.check_record(entry)?;
@@ -3392,6 +3408,13 @@ fn create_task(
         });
     }
 
+    if creation.goal_mode.is_continuous() && creation.goal.is_none() {
+        // A continuous root control task exists to admit epochs for a goal;
+        // without the goal binding there is nothing for the wake controller
+        // to fence, budget, or retire against.
+        return Err(AgentTaskError::ContinuousWithoutGoal);
+    }
+
     let agent_owned = creation.definition.is_agent_owned();
     if agent_owned && creation.assignee.is_none() {
         return Err(AgentTaskError::MissingAssignee);
@@ -3431,6 +3454,7 @@ fn create_task(
         input: creation.input,
         status,
         goal: creation.goal,
+        goal_mode: creation.goal_mode,
         parent: creation.parent,
         assignee: creation.assignee,
         dependencies,
@@ -5590,6 +5614,8 @@ pub enum AgentTaskError {
     },
     /// An agent-owned task was created without an assignee.
     MissingAssignee,
+    /// A continuous-mode task was created without a goal binding.
+    ContinuousWithoutGoal,
     /// An agent-owned task's id is too long to derive assignment run ids from.
     TaskIdTooLong {
         /// The task id's length, in bytes.
@@ -5706,6 +5732,7 @@ impl AgentTaskError {
             Self::AlreadyCreated { .. } => "task-already-created",
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
+            Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::TaskIdTooLong { .. } => "task-id-too-long",
             Self::NotReady => "task-admission-not-resolved",
             Self::DependencyCycle { .. } => "task-dependency-cycle",
@@ -5746,6 +5773,9 @@ impl Display for AgentTaskError {
             ),
             Self::MissingAssignee => {
                 write!(f, "an agent-owned task must name the agent it is created for")
+            }
+            Self::ContinuousWithoutGoal => {
+                write!(f, "a continuous-mode task must bind the goal its controller drives")
             }
             Self::TaskIdTooLong { length, maximum } => write!(
                 f,
