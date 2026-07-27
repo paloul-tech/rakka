@@ -120,13 +120,17 @@ use crate::definition::{
 use crate::goal::AgentGoalMode;
 use crate::identity::{
     validated_id, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
-    AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, TenantId,
+    AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId,
     AGENT_IDENTITY_MAX_LENGTH,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION,
     CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
+};
+use crate::wake::{
+    AgentWakeBinding, AgentWakeControllerState, AgentWakeError, AgentWakeOutcome,
+    AgentWakePolicyRevision, AgentWakeStatusView, ScheduleRevision,
 };
 
 /// Default sharded entity type of the typed-task entity.
@@ -2878,6 +2882,11 @@ pub struct AgentTask {
     /// before this field load as finite.
     #[serde(default)]
     pub goal_mode: AgentGoalMode,
+    /// The wake controller's durable state, once the task coordinates a
+    /// continuous goal. Records persisted before this field load with no
+    /// controller activity, and a finite task never carries one.
+    #[serde(default)]
+    pub wake_controller: Option<AgentWakeControllerState>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
     /// The agent the task is meant for, when it is agent-owned.
@@ -3000,6 +3009,10 @@ pub struct AgentTaskOutcome {
     pub rejection_count: u32,
     /// Whether every dependency permits the task to be worked on.
     pub dependencies_satisfied: bool,
+    /// What a wake transition recorded, when this outcome answers one.
+    /// Outcomes persisted before this field load with no wake record.
+    #[serde(default)]
+    pub wake: Option<AgentWakeOutcome>,
 }
 
 /// Bounded log of resolved operation ids and the outcome each produced.
@@ -3141,6 +3154,7 @@ impl AgentTaskState {
                 run: None,
                 rejection_count: 0,
                 dependencies_satisfied: true,
+                wake: None,
             };
         };
         AgentTaskOutcome {
@@ -3156,6 +3170,7 @@ impl AgentTaskState {
                 .map(|assignment| assignment.run.clone()),
             rejection_count: task.rejection_count,
             dependencies_satisfied: task.dependencies_satisfied(),
+            wake: None,
         }
     }
 
@@ -3181,6 +3196,37 @@ impl AgentTaskState {
             terminal_reason: task.terminal_reason.clone(),
             history_entries: self.next_history_sequence.get().saturating_sub(1),
             updated_at: self.updated_at,
+            wake: task.goal_mode.continuous().map(|spec| {
+                let controller = task.wake_controller.as_ref();
+                AgentWakeStatusView {
+                    schedule_revision: spec.schedule_revision,
+                    policy_revision: spec.wake_policy.revision(),
+                    active: controller
+                        .map(|state| {
+                            state
+                                .active()
+                                .iter()
+                                .map(|active| active.binding().wake_id().clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    pending: controller
+                        .map(|state| {
+                            state
+                                .pending()
+                                .iter()
+                                .map(|binding| binding.wake_id().clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    last_admitted: controller.and_then(|state| state.last_admitted().cloned()),
+                    last_admitted_at: controller
+                        .and_then(AgentWakeControllerState::last_admitted_at),
+                    counters: controller
+                        .map(|state| *state.counters())
+                        .unwrap_or_default(),
+                }
+            }),
         })
     }
 
@@ -3294,6 +3340,10 @@ pub struct AgentTaskSnapshot {
     pub history_entries: u64,
     /// The time of its last accepted transition.
     pub updated_at: AgentTimestampMillis,
+    /// The continuous goal's wake state, when the task coordinates one.
+    /// Snapshots persisted before this field load without it.
+    #[serde(default)]
+    pub wake: Option<AgentWakeStatusView>,
 }
 
 /// Loads one task's durable state without waking its entity.
@@ -3449,12 +3499,17 @@ fn create_task(
         &creation.definition.budgets,
     ));
 
+    let wake_controller = creation
+        .goal_mode
+        .is_continuous()
+        .then(AgentWakeControllerState::new);
     let task = AgentTask {
         definition: creation.definition,
         input: creation.input,
         status,
         goal: creation.goal,
         goal_mode: creation.goal_mode,
+        wake_controller,
         parent: creation.parent,
         assignee: creation.assignee,
         dependencies,
@@ -3696,6 +3751,138 @@ fn terminate(
         .with_detail(reason.code())
     });
     Ok(())
+}
+
+/// The continuous root control task a wake command must address, or the
+/// refusal it answers instead.
+///
+/// Every wake transition shares these fences: the task must exist, must not be
+/// terminal, and must coordinate a continuous goal.
+fn continuous_task_mut(state: &mut AgentTaskState) -> AgentTaskResult<&mut AgentTask> {
+    let scope = state.scope.clone();
+    let task = state
+        .task
+        .as_mut()
+        .ok_or(AgentTaskError::NotCreated { scope })?;
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    if !task.goal_mode.is_continuous() {
+        return Err(AgentTaskError::WakeNotContinuous);
+    }
+    Ok(task)
+}
+
+/// Dispositions one delivered wake occurrence, or fails closed.
+///
+/// The operation id must be the one the binding itself derives — every trigger
+/// path reconstructs it, so a delivery whose id disagrees with its own binding
+/// is not a redelivery, it is a forgery, and it is refused before any state is
+/// read. The disposition — including a fence or a skip — is a recorded
+/// transition, which is what makes the wake counters exact and a replayed
+/// delivery a [`AgentTaskEntityReply::Duplicate`] instead of a second epoch.
+fn admit_wake(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    binding: AgentWakeBinding,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentWakeOutcome> {
+    let expected = binding.admission_operation_id()?;
+    if *operation_id != expected {
+        return Err(AgentTaskError::WakeOperationMismatch);
+    }
+    let task = continuous_task_mut(state)?;
+    if task.goal.as_ref() != Some(binding.goal()) {
+        return Err(AgentTaskError::WakeGoalMismatch {
+            offered: binding.goal().clone(),
+        });
+    }
+    let spec = task
+        .goal_mode
+        .continuous()
+        .expect("continuous_task_mut proved the mode");
+    let current_revision = spec.schedule_revision;
+    let policy = spec.wake_policy.policy().clone();
+    let disposition = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new)
+        .admit(&policy, current_revision, binding, now)?;
+    // Admission stores at most the bounded slots, but the record must still
+    // keep its lifecycle growth reserve free.
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    Ok(AgentWakeOutcome::Disposition(disposition))
+}
+
+/// Releases the active occurrence a completed execution owned, promoting the
+/// oldest parked occurrence in the same transition.
+///
+/// Slice 3.3's epoch-result path drives this same transition; the command
+/// exists so the release is a durable, deduplicated act rather than an
+/// implicit consequence of anything resident.
+fn complete_wake_occurrence(
+    state: &mut AgentTaskState,
+    wake: &AgentWakeId,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentWakeOutcome> {
+    let task = continuous_task_mut(state)?;
+    let release = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new)
+        .release(wake, now)?;
+    state.updated_at = now;
+    Ok(AgentWakeOutcome::Release(release))
+}
+
+/// Takes a schedule update into force, fencing every parked occurrence the
+/// old schedule created.
+///
+/// The revision must move strictly forward — a replayed update inside the
+/// deduplication window answers as a duplicate, and one outside it is refused
+/// here, so a restart can never reset the revision
+/// ([specification 6.9](../../../docs/plans/rakka-agent/spec.md)). A policy
+/// update rides the same transition and must also move strictly forward.
+fn update_continuous_schedule(
+    state: &mut AgentTaskState,
+    schedule_revision: ScheduleRevision,
+    wake_policy: Option<AgentWakePolicyRevision>,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentWakeOutcome> {
+    let task = continuous_task_mut(state)?;
+    let AgentGoalMode::Continuous(spec) = &mut task.goal_mode else {
+        unreachable!("continuous_task_mut proved the mode");
+    };
+    if schedule_revision <= spec.schedule_revision {
+        return Err(AgentTaskError::ScheduleNotMonotonic {
+            offered: schedule_revision,
+            current: spec.schedule_revision,
+        });
+    }
+    if let Some(policy) = wake_policy {
+        if policy.revision() <= spec.wake_policy.revision() {
+            return Err(AgentTaskError::WakePolicyNotNewer {
+                offered: policy.revision(),
+                current: spec.wake_policy.revision(),
+            });
+        }
+        policy.policy().validate()?;
+        spec.wake_policy = policy;
+    }
+    spec.schedule_revision = schedule_revision;
+    let policy_revision = spec.wake_policy.revision();
+    let fenced = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new)
+        .fence_obsolete_pending(schedule_revision);
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    Ok(AgentWakeOutcome::ScheduleUpdated {
+        schedule_revision,
+        policy_revision,
+        fenced,
+    })
 }
 
 /// Why the task cannot escrow a run right now, when it cannot.
@@ -4636,7 +4823,7 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     create_task(state, &operation_id, *creation, now)?;
-                    Ok(operation_id)
+                    Ok((operation_id, None))
                 })
                 .await?
             }
@@ -4646,7 +4833,7 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     declare_dependency(state, &operation_id, &declaration, now)?;
-                    Ok(operation_id)
+                    Ok((operation_id, None))
                 })
                 .await?
             }
@@ -4657,7 +4844,7 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
-                    Ok(operation_id)
+                    Ok((operation_id, None))
                 })
                 .await?
             }
@@ -4674,7 +4861,40 @@ where
                         },
                         now,
                     )?;
-                    Ok(operation_id)
+                    Ok((operation_id, None))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::AdmitWake {
+                operation_id,
+                binding,
+            } => {
+                self.transition(now, None, move |state| {
+                    let wake = admit_wake(state, &operation_id, *binding, now)?;
+                    Ok((operation_id, Some(wake)))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::CompleteWakeOccurrence { operation_id, wake } => {
+                self.transition(now, None, move |state| {
+                    let outcome = complete_wake_occurrence(state, &wake, now)?;
+                    Ok((operation_id, Some(outcome)))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::UpdateContinuousSchedule {
+                operation_id,
+                schedule_revision,
+                wake_policy,
+            } => {
+                self.transition(now, None, move |state| {
+                    let outcome = update_continuous_schedule(
+                        state,
+                        schedule_revision,
+                        wake_policy.map(|policy| *policy),
+                        now,
+                    )?;
+                    Ok((operation_id, Some(outcome)))
                 })
                 .await?
             }
@@ -4702,9 +4922,15 @@ where
                     .is_agent_owned()
                     .then(|| creation.definition.clone()),
             ),
-            AgentTaskEntityCommand::Describe | AgentTaskEntityCommand::Cancel { .. } => {
-                return Ok(None)
-            }
+            // Wake transitions never change assignability, so they read no
+            // agent state at all: a scanner delivering to a passivated
+            // controller costs one entity transition, not an extra durable
+            // read.
+            AgentTaskEntityCommand::Describe
+            | AgentTaskEntityCommand::Cancel { .. }
+            | AgentTaskEntityCommand::AdmitWake { .. }
+            | AgentTaskEntityCommand::CompleteWakeOccurrence { .. }
+            | AgentTaskEntityCommand::UpdateContinuousSchedule { .. } => return Ok(None),
             _ => {
                 let Some(task) = self.state()?.task() else {
                     return Ok(None);
@@ -4959,7 +5185,9 @@ where
         transition: F,
     ) -> AgentTaskResult<AgentTaskEntityReply>
     where
-        F: FnOnce(&mut AgentTaskState) -> AgentTaskResult<AgentOperationId>,
+        F: FnOnce(
+            &mut AgentTaskState,
+        ) -> AgentTaskResult<(AgentOperationId, Option<AgentWakeOutcome>)>,
     {
         let mut outcome = None;
         let mut rejection = None;
@@ -4968,7 +5196,7 @@ where
             .initiate(now, |state| {
                 let assign =
                     |state: &mut AgentTaskState| -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
-                        let operation_id = transition(state)?;
+                        let (operation_id, wake) = transition(state)?;
                         // The command's own transition may have made the task
                         // eligible. Deciding here means the assignment, the run-creation
                         // command it owes, and the transition that caused it all commit
@@ -4980,7 +5208,8 @@ where
                                 .collect(),
                             None => Vec::new(),
                         };
-                        let result = state.outcome();
+                        let mut result = state.outcome();
+                        result.wake = wake;
                         state
                             .applied_operations
                             .record(operation_id, result.clone());
@@ -5080,6 +5309,38 @@ pub enum AgentTaskEntityCommand {
         /// A bounded, stable reason.
         reason: String,
     },
+    /// Deliver one wake occurrence to the continuous goal's controller.
+    ///
+    /// Every trigger path — the shared scanner, an external event, an
+    /// authenticated A2A command, a callback — injects this same command with
+    /// the operation id the binding itself derives, so duplicate delivery is
+    /// deduplicated by construction
+    /// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+    AdmitWake {
+        /// The stable operation id this command deduplicates on. It must be
+        /// the binding's own derived admission operation id.
+        operation_id: AgentOperationId,
+        /// The wake to disposition.
+        binding: Box<AgentWakeBinding>,
+    },
+    /// Release the active occurrence a completed execution owned.
+    CompleteWakeOccurrence {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The active wake to release.
+        wake: AgentWakeId,
+    },
+    /// Take a schedule update into force, fencing parked occurrences the old
+    /// schedule created.
+    UpdateContinuousSchedule {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The strictly newer schedule revision.
+        schedule_revision: ScheduleRevision,
+        /// A strictly newer wake-policy revision riding the same update, when
+        /// the policy changes too.
+        wake_policy: Option<Box<AgentWakePolicyRevision>>,
+    },
     /// Read the task's bounded durable projection.
     Describe,
 }
@@ -5092,7 +5353,10 @@ impl AgentTaskEntityCommand {
             Self::Create { operation_id, .. }
             | Self::DeclareDependency { operation_id, .. }
             | Self::RecordDependencyOutcome { operation_id, .. }
-            | Self::Cancel { operation_id, .. } => Some(operation_id),
+            | Self::Cancel { operation_id, .. }
+            | Self::AdmitWake { operation_id, .. }
+            | Self::CompleteWakeOccurrence { operation_id, .. }
+            | Self::UpdateContinuousSchedule { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -5616,6 +5880,33 @@ pub enum AgentTaskError {
     MissingAssignee,
     /// A continuous-mode task was created without a goal binding.
     ContinuousWithoutGoal,
+    /// The wake contract itself refused the command.
+    Wake(AgentWakeError),
+    /// A wake command was delivered to a task that does not coordinate a
+    /// continuous goal.
+    WakeNotContinuous,
+    /// A wake was delivered to a task that does not bind its goal.
+    WakeGoalMismatch {
+        /// The goal the wake was constructed for.
+        offered: AgentGoalId,
+    },
+    /// A wake command's operation id disagrees with the one its own binding
+    /// derives.
+    WakeOperationMismatch,
+    /// A schedule update whose revision does not move strictly forward.
+    ScheduleNotMonotonic {
+        /// The revision the update carried.
+        offered: ScheduleRevision,
+        /// The revision currently in force.
+        current: ScheduleRevision,
+    },
+    /// A wake-policy update whose revision does not move strictly forward.
+    WakePolicyNotNewer {
+        /// The revision the update carried.
+        offered: AgentRevisionNumber,
+        /// The revision currently in force.
+        current: AgentRevisionNumber,
+    },
     /// An agent-owned task's id is too long to derive assignment run ids from.
     TaskIdTooLong {
         /// The task id's length, in bytes.
@@ -5733,6 +6024,12 @@ impl AgentTaskError {
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
+            Self::Wake(error) => error.code(),
+            Self::WakeNotContinuous => "task-wake-not-continuous",
+            Self::WakeGoalMismatch { .. } => "task-wake-goal-mismatch",
+            Self::WakeOperationMismatch => "task-wake-operation-mismatch",
+            Self::ScheduleNotMonotonic { .. } => "task-schedule-not-monotonic",
+            Self::WakePolicyNotNewer { .. } => "task-wake-policy-not-newer",
             Self::TaskIdTooLong { .. } => "task-id-too-long",
             Self::NotReady => "task-admission-not-resolved",
             Self::DependencyCycle { .. } => "task-dependency-cycle",
@@ -5777,6 +6074,27 @@ impl Display for AgentTaskError {
             Self::ContinuousWithoutGoal => {
                 write!(f, "a continuous-mode task must bind the goal its controller drives")
             }
+            Self::Wake(error) => Display::fmt(error, f),
+            Self::WakeNotContinuous => write!(
+                f,
+                "a wake command addresses a task that does not coordinate a continuous goal"
+            ),
+            Self::WakeGoalMismatch { offered } => write!(
+                f,
+                "the wake was constructed for goal {offered}, which this task does not bind"
+            ),
+            Self::WakeOperationMismatch => write!(
+                f,
+                "the command's operation id is not the one its own wake binding derives"
+            ),
+            Self::ScheduleNotMonotonic { offered, current } => write!(
+                f,
+                "a schedule update must move strictly forward: revision {offered} does not follow {current}"
+            ),
+            Self::WakePolicyNotNewer { offered, current } => write!(
+                f,
+                "a wake-policy update must move strictly forward: revision {offered} does not follow {current}"
+            ),
             Self::TaskIdTooLong { length, maximum } => write!(
                 f,
                 "the task id is {length} bytes, and an agent-owned task id may use at most {maximum} so the run ids derived from it stay valid"
@@ -5851,8 +6169,15 @@ impl Error for AgentTaskError {
             Self::Choreography(error) => Some(error),
             Self::Escrow(error) => Some(error),
             Self::Persistence(error) => Some(error),
+            Self::Wake(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<AgentWakeError> for AgentTaskError {
+    fn from(error: AgentWakeError) -> Self {
+        Self::Wake(error)
     }
 }
 
