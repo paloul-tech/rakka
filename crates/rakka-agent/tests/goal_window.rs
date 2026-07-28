@@ -135,29 +135,40 @@ async fn the_window_ceiling_defers_admissions_and_refills_only_by_logical_time()
         "activation neither refills nor consumes"
     );
 
-    // Logical time crosses the window boundary: the next admission's own
-    // recorded transition refills, admits, and charges the fresh window.
+    // Logical time crosses the window boundary: the next delivery's own
+    // recorded transition refills — and the *deferred* occurrence takes the
+    // turned window first, oldest parked ahead of the fresh delivery, which
+    // parks behind it instead of leapfrogging it.
     fx.clock
         .store(WINDOW_MILLIS + 100, std::sync::atomic::Ordering::SeqCst);
     let fourth = scheduled_wake_binding(WINDOW_MILLIS + 50, ScheduleRevision::INITIAL);
     let disposition = disposition_of(
         fx.apply_task_command(wake_admission_command(fourth.clone()).expect("the command derives"))
             .await
-            .expect("the post-refill admission applies"),
+            .expect("the post-refill delivery applies"),
     );
-    assert!(matches!(disposition, AgentWakeDisposition::Admitted { .. }));
+    assert!(
+        matches!(disposition, AgentWakeDisposition::Coalesced { .. }),
+        "the fresh delivery parks behind the promoted deferred occurrence, got {disposition:?}"
+    );
     let state = controller(&fx).await;
+    assert_eq!(
+        state.active()[0].binding().wake_id(),
+        third.wake_id(),
+        "the deferred occurrence was promoted first"
+    );
+    assert_eq!(state.pending().len(), 1);
     let ledger = state.window().expect("the refilled ledger exists");
     assert_eq!(
         ledger.consumed().get(AgentBudgetDimension::ModelCalls),
         8,
-        "the turned window holds exactly the new epoch's charge"
+        "the turned window holds exactly the promoted epoch's charge"
     );
 
-    // Releasing the fresh epoch promotes the deferred occurrence, charged
+    // Releasing the promoted epoch promotes the fresh occurrence, charged
     // against the same turned window in the same transition.
     let release = fx
-        .apply_task_command(complete(fourth.wake_id(), "c4"))
+        .apply_task_command(complete(third.wake_id(), "c4"))
         .await
         .expect("the release applies");
     let AgentTaskEntityReply::Applied { outcome } = release else {
@@ -166,7 +177,7 @@ async fn the_window_ceiling_defers_admissions_and_refills_only_by_logical_time()
     assert!(matches!(
         outcome.wake,
         Some(AgentWakeOutcome::Release(release))
-            if release.admitted_next.as_ref() == Some(third.wake_id())
+            if release.admitted_next.as_ref() == Some(fourth.wake_id())
     ));
     let state = controller(&fx).await;
     assert_eq!(state.counters().admitted, 4);

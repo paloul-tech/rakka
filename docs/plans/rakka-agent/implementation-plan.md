@@ -2236,10 +2236,23 @@ Done when: scenarios 36 and 51 pass.
   across the boundary — rolling windows anchored at first charge, calendar
   windows on UTC civil-date boundaries computed in-crate — and never on
   restart, activation, or shard movement. An admission the window cannot pay
-  for parks with the new recorded `Deferred` disposition and retries at the
-  next release or admission; a policy whose window bounds a dimension its
-  epoch budget leaves unbounded is refused at construction
-  (`wake-window-epoch-unbounded`).
+  for parks with the new recorded `Deferred` disposition and is retried —
+  oldest parked first — by the next release or delivery whose transition
+  observes a window able to pay: the admission transition promotes the
+  oldest parked occurrence into a free slot before dispositioning the fresh
+  delivery (`promote_admittable`, the same promotion release runs), so a
+  deferred occurrence is never leapfrogged by a fresher one. Nothing fires
+  at the window turn itself — on a quiet schedule a deferred occurrence
+  waits for the next durable delivery. **Decision (post-review):** a
+  controller-originated window-turn re-wake is deliberately deferred to
+  slice 3.4, where failure backoff needs the identical mechanism (a
+  controller-owned durable re-wake at a computed time, which also requires a
+  transition that re-attempts a wake `contains()` would otherwise answer as
+  a duplicate); the two are designed once, together. A policy whose window
+  bounds a dimension its epoch budget leaves unbounded is refused at
+  construction (`wake-window-epoch-unbounded`), as is an epoch budget
+  exceeding a ceiling dimension (`wake-window-epoch-exceeds-ceiling`) — a
+  window that could never pay for a single epoch.
 - **The next durable wake condition is the parked timer entry.** Schedule
   computation is application-owned, so the goal's "next wake condition" is
   the occurrence the schedule layer parks in the durable wake-timer store —
@@ -2262,6 +2275,12 @@ Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),
 [Continuous Goal Milestone](spec.md#continuous-goal-milestone-m3).
 
 - Suspension, renewal, failure backoff, expiry, and retirement transitions.
+- Controller-originated durable re-wakes, one mechanism for two consumers
+  (decision recorded in slice 3.3's amendment): the failure-backoff retry
+  and the window-turn re-attempt of a `Deferred` occurrence. Both need the
+  controller to park a timer entry due at a computed time and a delivery
+  path that re-attempts a wake the admission dedup would otherwise answer
+  as a duplicate.
 - Operational query exposure: schedule revision, next wake, last progress,
   active epoch, budget window, missed/coalesced counts, retirement state.
 - Wake/epoch metrics and audit events

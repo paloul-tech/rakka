@@ -4153,20 +4153,29 @@ fn admit_wake(
         .expect("continuous_task_mut proved the mode");
     let current_revision = spec.schedule_revision;
     let policy = spec.wake_policy.policy().clone();
-    let disposition = task
-        .wake_controller
-        .get_or_insert_with(AgentWakeControllerState::new)
-        .admit(&policy, current_revision, binding, now)?;
-    let owed = if disposition.is_admission() {
-        vec![owe_epoch_creation(
+    let (promoted, disposition) = {
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        // Oldest parked first: a deferred occurrence takes the free slot
+        // ahead of the fresh delivery once the window can pay, so fresher
+        // occurrences never leapfrog it.
+        let promoted = controller.promote_admittable(&policy, now);
+        let disposition = controller.admit(&policy, current_revision, binding, now)?;
+        (promoted, disposition)
+    };
+    let mut owed = Vec::new();
+    if let Some(wake) = promoted {
+        owed.push(owe_epoch_creation(&scope, task, &wake, now)?);
+    }
+    if disposition.is_admission() {
+        owed.push(owe_epoch_creation(
             &scope,
             task,
             &disposition.wake_id().clone(),
             now,
-        )?]
-    } else {
-        Vec::new()
-    };
+        )?);
+    }
     // Admission stores at most the bounded slots, but the record must still
     // keep its lifecycle growth reserve free.
     task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;

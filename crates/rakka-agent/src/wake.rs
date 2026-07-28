@@ -1417,8 +1417,10 @@ pub enum AgentWakeDisposition {
         wake: AgentWakeId,
     },
     /// The occurrence was parked because the goal-window ceiling is
-    /// exhausted; it retries when the window refills or an active occurrence
-    /// releases.
+    /// exhausted. It is retried — oldest parked first — by the next delivery
+    /// or release whose recorded transition observes a window able to pay;
+    /// nothing fires at the window turn itself, so on a quiet schedule the
+    /// occurrence waits for the next durable delivery.
     Deferred {
         /// The parked wake.
         wake: AgentWakeId,
@@ -1747,6 +1749,10 @@ impl AgentWakeControllerState {
     /// missed-occurrence policy decides. A binding whose revision is *ahead*
     /// of the controller fails closed: no schedule the controller accepted
     /// ever issued it.
+    ///
+    /// The entity's admission transition runs [`Self::promote_admittable`]
+    /// before this, so an occurrence parked on an exhausted window takes a
+    /// free slot ahead of the fresh delivery once the window refills.
     pub fn admit(
         &mut self,
         policy: &AgentWakePolicy,
@@ -1839,36 +1845,54 @@ impl AgentWakeControllerState {
         };
         let released = self.active.remove(index);
         self.counters.released += 1;
-        let affordable = !self.pending.is_empty()
-            && match &policy.goal_window {
-                Some(ceiling) => self
-                    .charge_goal_window(ceiling, &policy.epoch_budget, now)
-                    .is_ok(),
-                None => true,
-            };
-        let admitted_next = if affordable {
-            let binding = self.pending.remove(0);
-            let next = binding.wake_id().clone();
-            // A parked binding carries no representative mark, so the mark is
-            // recomputed from what it means: under admit-one-coalesced, an
-            // occurrence promoted past its maximum lateness stands for its
-            // downtime backlog, and later missed occurrences of that backlog
-            // must absorb into it rather than park an echo that would admit a
-            // second epoch.
-            let representative = matches!(
-                policy.missed_occurrence,
-                AgentMissedOccurrencePolicy::AdmitOneCoalesced
-            ) && Self::past_maximum_lateness(policy, &binding, now);
-            self.admit_binding(binding, now, true, representative);
-            Some(next)
-        } else {
-            None
-        };
+        let admitted_next = self.promote_admittable(policy, now);
         Ok(AgentWakeRelease {
             released: wake.clone(),
             admitted_next,
             epoch: released.epoch,
         })
+    }
+
+    /// Promotes the oldest parked occurrence into a free active slot when the
+    /// goal window can pay for its epoch, returning the promoted wake.
+    ///
+    /// A release runs this for the slot it freed, and the entity's admission
+    /// transition runs it *before* dispositioning a fresh delivery — so an
+    /// occurrence that deferred on an exhausted window is retried oldest
+    /// first by the next transition that observes the refilled window,
+    /// rather than being leapfrogged by every fresher occurrence. The caller
+    /// owes the promoted occurrence's epoch creation in the same
+    /// compare-and-set, exactly as it does for a direct admission.
+    pub fn promote_admittable(
+        &mut self,
+        policy: &AgentWakePolicy,
+        now: AgentTimestampMillis,
+    ) -> Option<AgentWakeId> {
+        if self.pending.is_empty() || self.active.len() >= Self::active_capacity(policy) {
+            return None;
+        }
+        if let Some(ceiling) = &policy.goal_window {
+            if self
+                .charge_goal_window(ceiling, &policy.epoch_budget, now)
+                .is_err()
+            {
+                return None;
+            }
+        }
+        let binding = self.pending.remove(0);
+        let wake = binding.wake_id().clone();
+        // A parked binding carries no representative mark, so the mark is
+        // recomputed from what it means: under admit-one-coalesced, an
+        // occurrence promoted past its maximum lateness stands for its
+        // downtime backlog, and later missed occurrences of that backlog
+        // must absorb into it rather than park an echo that would admit a
+        // second epoch.
+        let representative = matches!(
+            policy.missed_occurrence,
+            AgentMissedOccurrencePolicy::AdmitOneCoalesced
+        ) && Self::past_maximum_lateness(policy, &binding, now);
+        self.admit_binding(binding, now, true, representative);
+        Some(wake)
     }
 
     /// Attaches the finite child epoch an admitting transition created to its
@@ -3315,6 +3339,74 @@ mod tests {
             16,
             "the refilled window holds exactly the new epoch's charge"
         );
+    }
+
+    #[test]
+    fn the_refilled_window_promotes_the_deferred_occurrence_first() {
+        // One epoch per window: the canonical ceiling == epoch budget config,
+        // where leapfrogging would starve a deferred occurrence forever.
+        let policy = windowed_policy(3_600_000, 16);
+        let mut controller = AgentWakeControllerState::new();
+
+        // The first occurrence drains the window and releases; the second
+        // defers on the drained window and parks.
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence admits");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller
+            .release(&policy, &wake, now(2_000))
+            .expect("the first epoch releases");
+        let deferred = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(3_000, ScheduleRevision::INITIAL),
+                now(3_000),
+            )
+            .expect("the second occurrence is dispositioned");
+        assert!(matches!(deferred, AgentWakeDisposition::Deferred { .. }));
+
+        // The entity's admission transition promotes before dispositioning:
+        // after the window turns, the deferred occurrence takes the slot and
+        // the fresh delivery parks behind it — oldest first.
+        let promoted = controller
+            .promote_admittable(&policy, now(4_000_000))
+            .expect("the turned window pays for the deferred occurrence");
+        let fresh = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(4_000_000, ScheduleRevision::INITIAL),
+                now(4_000_000),
+            )
+            .expect("the fresh occurrence is dispositioned");
+        assert!(matches!(fresh, AgentWakeDisposition::Coalesced { .. }));
+        assert_eq!(controller.active()[0].binding().wake_id(), &promoted);
+        assert_eq!(
+            controller.active()[0].binding().due_at(),
+            Some(now(3_000)),
+            "the older occurrence owns the slot"
+        );
+        assert_eq!(controller.pending().len(), 1);
+
+        // The promotion charged the turned window in full, so neither the
+        // release nor another promotion attempt can pay again until the next
+        // turn — the parked fresh occurrence stays parked, not lost.
+        let release = controller
+            .release(&policy, &promoted, now(4_100_000))
+            .expect("the promoted epoch releases");
+        assert!(release.admitted_next.is_none());
+        assert!(controller
+            .promote_admittable(&policy, now(4_200_000))
+            .is_none());
+        assert_eq!(controller.pending().len(), 1);
+        assert_eq!(controller.counters().admitted, 2);
     }
 
     #[test]
