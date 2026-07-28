@@ -465,6 +465,31 @@ impl AgentBudgetLimits {
             max_concurrent_effects: ceilings.max_concurrent_effects,
         }
     }
+
+    /// These limits narrowed to `ceiling`: the smaller of the two per field.
+    ///
+    /// Unbounded is the identity, exactly as
+    /// [`AgentBudgetAllocation::narrowed_to`] treats the conserved dimensions.
+    #[must_use]
+    pub fn narrowed_to(&self, ceiling: &Self) -> Self {
+        fn tighter<T: Ord + Copy>(held: Option<T>, bound: Option<T>) -> Option<T> {
+            match (held, bound) {
+                (None, bound) => bound,
+                (held, None) => held,
+                (Some(held), Some(bound)) => Some(held.min(bound)),
+            }
+        }
+        Self {
+            max_wall_clock_millis: tighter(
+                self.max_wall_clock_millis,
+                ceiling.max_wall_clock_millis,
+            ),
+            max_concurrent_effects: tighter(
+                self.max_concurrent_effects,
+                ceiling.max_concurrent_effects,
+            ),
+        }
+    }
 }
 
 /// What a creation command carries: a conserved grant plus the limits the child
@@ -499,6 +524,16 @@ impl AgentBudgetGrant {
         Self::new(
             AgentBudgetAllocation::from_ceilings(ceilings),
             AgentBudgetLimits::from_ceilings(ceilings),
+        )
+    }
+
+    /// This grant narrowed to `ceiling`, allocation and limits alike: a child
+    /// grant can never widen what its parent or definition permits.
+    #[must_use]
+    pub fn narrowed_to(&self, ceiling: &Self) -> Self {
+        Self::new(
+            self.allocation.narrowed_to(&ceiling.allocation),
+            self.limits.narrowed_to(&ceiling.limits),
         )
     }
 }
@@ -888,6 +923,39 @@ impl AgentEscrowLedger {
         }
         self.outstanding.remove(child);
         Ok(released)
+    }
+
+    /// Widens this scope's own allocation, narrowed to `ceiling`.
+    ///
+    /// This is the goal-scope top-up of
+    /// [specification 9.7](../../../docs/plans/rakka-agent/spec.md): the
+    /// owner's parent-scope decision to allocate more, which the definition
+    /// ceiling still bounds — a child allocation may grow, but never past what
+    /// the definition permits. Per conserved dimension the new allocation is
+    /// the old plus `additional`, capped at `ceiling`, and never smaller than
+    /// what the ledger already held: a widening cannot shrink headroom that
+    /// outstanding children were granted against. Returns the allocation now
+    /// in force; the caller reads [`Self::available`] to learn whether the
+    /// widening relieved a specific exhaustion.
+    pub fn widen(
+        &mut self,
+        additional: &AgentBudgetAllocation,
+        ceiling: &AgentBudgetAllocation,
+    ) -> AgentBudgetAllocation {
+        let target = self
+            .allocation
+            .saturating_add(additional)
+            .narrowed_to(ceiling);
+        let mut widened = self.allocation;
+        for dimension in AgentBudgetDimension::CONSERVED {
+            let amount = match (self.allocation.get(dimension), target.get(dimension)) {
+                (None, _) | (_, None) => None,
+                (Some(held), Some(offered)) => Some(held.max(offered)),
+            };
+            widened.set(dimension, amount);
+        }
+        self.allocation = widened;
+        self.allocation
     }
 }
 
@@ -1414,6 +1482,52 @@ mod tests {
             tokens(amount),
             AgentBudgetLimits::unbounded(),
         ))
+    }
+
+    #[test]
+    fn widen_grows_under_the_ceiling_and_never_shrinks() {
+        let mut ledger = ledger(10);
+        // A widening under a roomy ceiling adds what was asked.
+        let widened = ledger.widen(&tokens(5), &tokens(100));
+        assert_eq!(widened.tokens, Some(15));
+        assert_eq!(ledger.available(AgentBudgetDimension::Tokens), Some(15));
+
+        // The ceiling caps the growth.
+        let widened = ledger.widen(&tokens(1_000), &tokens(20));
+        assert_eq!(widened.tokens, Some(20));
+
+        // A ceiling below the current allocation shrinks nothing: children
+        // were granted against the headroom already held.
+        let widened = ledger.widen(&tokens(1), &tokens(5));
+        assert_eq!(widened.tokens, Some(20));
+    }
+
+    #[test]
+    fn widen_saturates_and_respects_unbounded() {
+        // An unbounded parent stays unbounded whatever is added.
+        let mut unbounded = AgentEscrowLedger::new(AgentBudgetGrant::unbounded());
+        let widened = unbounded.widen(&tokens(5), &tokens(10));
+        assert_eq!(widened.tokens, None);
+
+        // A saturating add near the top of the range cannot overflow, and the
+        // unbounded ceiling leaves the sum unclamped.
+        let mut near_max = ledger(u64::MAX - 1);
+        let widened = near_max.widen(&tokens(u64::MAX), &AgentBudgetAllocation::unbounded());
+        assert_eq!(widened.tokens, Some(u64::MAX));
+
+        // An explicitly unbounded addition under an unbounded ceiling lifts
+        // the bound: unbounded is the type's "everything", here as everywhere.
+        let mut bounded = ledger(10);
+        let widened = bounded.widen(
+            &AgentBudgetAllocation::unbounded(),
+            &AgentBudgetAllocation::unbounded(),
+        );
+        assert_eq!(widened.tokens, None);
+
+        // Under a bounded ceiling the same addition grows exactly to it.
+        let mut bounded = ledger(10);
+        let widened = bounded.widen(&AgentBudgetAllocation::unbounded(), &tokens(25));
+        assert_eq!(widened.tokens, Some(25));
     }
 
     #[test]

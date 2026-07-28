@@ -468,3 +468,60 @@ async fn an_unwired_run_records_nothing() {
     fx.create_task().await;
     fx.pump().await.expect("the loop should run to completion");
 }
+
+/// Goal-contract status transitions count by status difference across the
+/// committed transition — institution, decision, and policy-driven moves
+/// alike — under the `rakka.agent.goal.status` counter, which is distinct
+/// from the admission gate's `rakka.agent.goal.lifecycle`.
+#[tokio::test]
+async fn goal_contract_status_transitions_count_by_status_difference() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::new()).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+
+    // Institution arrives at `Active`: one transition, counted once.
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec(), true),
+    ))
+    .await
+    .expect("the creation applies");
+    assert_eq!(
+        labels_of(&metrics.snapshot(), rakka_agent::METRIC_AGENT_GOAL_STATUS),
+        vec![vec![("transition".to_string(), "active".to_string())]],
+        "the institution counted its arrival at active"
+    );
+
+    // A terminal decision counts its arrival; the duplicate answers from the
+    // record and emits nothing.
+    let cancel = AgentTaskEntityCommand::RecordGoalDecision {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::Command,
+            [TENANT, TASK, "goal-cancel-metrics"],
+        )
+        .expect("the operation id derives"),
+        decision: Box::new(rakka_agent::AgentGoalDecision {
+            reason: rakka_agent::AgentGoalTerminalReason::CancellationRequested {
+                reason: "operator".to_string(),
+            },
+            evaluation: None,
+            provenance: Some(Box::new(provenance(30))),
+            expected_status_revision: rakka_agent::AgentRevisionNumber::INITIAL,
+        }),
+    };
+    fx.apply_task_command(cancel.clone())
+        .await
+        .expect("the decision applies");
+    fx.apply_task_command(cancel)
+        .await
+        .expect("the replay answers");
+    let labels = labels_of(&metrics.snapshot(), rakka_agent::METRIC_AGENT_GOAL_STATUS);
+    assert_eq!(
+        labels,
+        vec![
+            vec![("transition".to_string(), "active".to_string())],
+            vec![("transition".to_string(), "cancelled".to_string())],
+        ],
+        "the decision counted once and its replay counted nothing"
+    );
+}

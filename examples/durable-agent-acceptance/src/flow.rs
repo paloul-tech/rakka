@@ -695,6 +695,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                         assignee: Some(auditor_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,

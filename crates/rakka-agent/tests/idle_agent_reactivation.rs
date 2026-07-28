@@ -176,6 +176,7 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         dependencies: vec![AgentTaskDependencyDeclaration::new(
                             AgentTaskId::new(UPSTREAM).expect("task id should be valid"),

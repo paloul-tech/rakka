@@ -648,6 +648,18 @@ pub const METRIC_AGENT_EPOCHS: &str = "rakka.agent.epochs";
 /// counted from its command.
 pub const METRIC_AGENT_GOAL_LIFECYCLE: &str = "rakka.agent.goal.lifecycle";
 
+/// Counter: goal-contract status transitions
+/// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)), labeled by
+/// the status arrived at.
+///
+/// This is the *contract* status of `AgentGoalStatus` —
+/// proposed/active/waiting/satisfied/unsatisfied/failed/cancelled/expired —
+/// deliberately distinct from [`METRIC_AGENT_GOAL_LIFECYCLE`], which counts
+/// the continuous admission gate. Transitions are counted as the difference of
+/// the goal record's status across the committed transition, so projected and
+/// policy-driven moves count exactly like commanded ones.
+pub const METRIC_AGENT_GOAL_STATUS: &str = "rakka.agent.goal.status";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the

@@ -2411,8 +2411,9 @@ Milestone: M4. Acceptance:
 [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4).
 Scenarios owed: 27-34, 39.
 
-Open decisions to resolve: 14 (distinct goal identity — resolved default),
-15 (catalog resolves specialists), 16 (workflow tools).
+Open decisions to resolve: 14 (distinct goal identity — resolved default,
+disposition recorded by slice 4.1), 15 (catalog resolves specialists),
+16 (workflow tools).
 
 ### Slice 4.1 — Goal contract and lifecycle
 
@@ -2428,6 +2429,105 @@ Guidance: [Define the Goal Before Starting the Loop](technical-guidance.md#defin
 
 Done when: goal lifecycle transitions are covered by unit tests and the goal
 remains addressable while fully passivated.
+
+**Amended as implemented (2026-07-28):**
+
+- **The contract status is orthogonal to the M3 admission gate, and the gate
+  projects one-way onto it.** `AgentGoalStatus` (the spec 8.1 eight-state
+  contract lifecycle) lives on a new goal record; the wake-side
+  `AgentGoalLifecycleStatus` stays exactly the continuous admission gate it
+  was. Where the two overlap, the gate drives the contract in the same
+  compare-and-set (`project_gate_onto_goal`): an observed or commanded
+  expiry → `Expired`, a retirement → `Cancelled` with the structured
+  `Retired` reason (spec 8.1 has no `Retired` status, and spec 9.7 says a
+  structured reason, not a new status — the `AgentTaskTerminalReason`
+  precedent), a suspension parks the goal `Waiting(AdmissionSuspended)`, and
+  a gate resume reactivates only a goal waiting on exactly that suspension.
+  Contract-side transitions drive the gate the other way — a goal-terminal
+  decision retires it, a budget park suspends it — through new
+  provenance-free `suspend_by_policy`/`retire_by_policy` methods, the same
+  class of durable transition as M3's failure-escalation auto-suspend.
+- **The terminal status is derived from the reason, never stored beside it.**
+  `AgentGoalDecision` carries an `AgentGoalTerminalReason` whose `status()`
+  determines the outcome, so an inconsistent outcome/reason pair is
+  unrepresentable. `CriteriaSatisfied` and `CriteriaNotMet` are
+  unconstructible without an `AgentGoalEvaluationRef` that assessed the
+  criteria revision in force — the slice 4.2 hook is the shape of the entry
+  point from day one, and `Satisfied`-by-declaration is refused at the
+  entity surface (spec 8.3). From `Proposed` only `Cancelled` and `Expired`
+  are reachable: no work happened, so no execution failure and no evaluation
+  can exist.
+- **The spec is a bounded component of the root task's record, and identity
+  is composed, not duplicated.** `AgentGoalSpecRevision` (own record kind,
+  fail-closed on load like the wake policy) rides `AgentTask.goal_state`,
+  so every goal transition commits in the root task's one compare-and-set —
+  spec 6.3's coordination without a new entity. The spec serializes under a
+  4 KiB cap with per-collection bounds, which is what keeps a maximal
+  goal-bearing continuous task inside the 32 KiB materialized bound with the
+  growth reserve intact (proven in `task_bounded_state.rs`). Tenant, goal
+  id, root task id, mode, and coordinator run are the task record's own
+  fields, composed around the spec. `allowed_workflows` landed after all —
+  `AgentWorkflowToolId` has been a stable envelope identity since Phase 1,
+  so the planned deferral had nothing to wait for; only stagnation's numeric
+  thresholds wait for 4.2 to define the detector they bound.
+- **Creation institutes the goal, and a `Proposed` goal spends nothing.**
+  `AgentTaskCreation.goal_spec` institutes the goal in the creating
+  transition; the binding defaults to `AgentGoalId::for_root_task` (open
+  decision 14's disposition). The goal's allocation seeds the root escrow
+  narrowed to the definition ceilings — the definition-ceiling → goal →
+  task rung of spec 9.7 with no new machinery. `activate_on_creation`
+  defaults to true (creating the task is the authorization to work);
+  opting out starts the goal `Proposed`, which gates `awaits_assignment`
+  and parks the continuous gate under the `goal-proposed` reason until
+  `ActivateGoal` lifts exactly that park.
+- **Exhaustion policy: park by default, at two trigger points.**
+  `AgentGoalExhaustionPolicy` (default `Park`, per-dimension overrides)
+  is consulted when the root grants a zero top-up in the exhausted conserved
+  dimension, and when an assignment refusal is *permanent* — zero headroom
+  and no outstanding child escrow whose return could restore any. `Park`
+  moves the goal `Waiting` and suspends continuous admission in the same
+  compare-and-set; `Escalate` is the same park with the escalation recorded
+  against the spec's escalation reference (goal-scope HITL is a later
+  slice, and nothing pretends otherwise); `Terminate` fails the goal, the
+  root task (`goal-budget-exhausted`), and the gate together. The M3
+  window-ceiling deferral is deliberately exempt: a window wait relieves
+  itself at the persisted window turn. The run-side contract is untouched —
+  the run still receives the honest zero grant and stops with its original
+  exhaustion.
+- **One `ResumeGoal` door un-parks, and each door owns its wait.**
+  `ResumeGoal` widens the root ledger under the definition ceilings
+  (`AgentEscrowLedger::widen` — grow, cap at the ceiling, never shrink),
+  reactivates the contract, and lifts the goal-driven admission park, in one
+  fenced compare-and-set; a resume that leaves the exhausted dimension
+  without headroom is refused (`task-goal-resume-unrelieved`) rather than
+  re-parking on the next decision. Ownership is fenced both ways
+  (`task-goal-wait-owned-elsewhere`): the gate's resume refuses a budget
+  park, and the goal's resume refuses an admission suspension — without the
+  fence, a gate resume would re-admit spending the contract says is parked.
+- **The settle pass is the goal entry point that always commits.** A goal's
+  own deadline expiry is observed by `settle_side_effects`/
+  `make_local_progress` (skipping the write while nothing would flip),
+  because a command-side observation is discarded with the command's
+  refusal — activate-on-expired refuses `goal-terminal`, and the durable
+  expiry must not depend on a command that succeeds.
+- **A terminal root ends the goal it coordinates — except completion.**
+  Every task-terminal path projects onto a held goal record (cancellation →
+  `RootTaskCancelled`, failures → `ExecutionFailed`), because a terminal
+  coordinator can drive nothing further. `ResultAccepted` deliberately does
+  not: completion is evidence, and only the configured evaluator makes a
+  goal `Satisfied` (spec 8.3) — slice 4.2 wires who may call the decision
+  door. Symmetrically, a failed-and-released run does *not* release its
+  accepted assignment; reassignment/handoff semantics belong to later
+  slices, and `ResumeGoal` honestly reactivates only the contract.
+- **Bookkeeping.** Four new task-history kinds (`GoalActivated`,
+  `GoalParked`, `GoalReactivated`, `GoalDecided`) beside M3's wake-scoped
+  `Goal*` kinds; `AGENT_TASK_MAX_HISTORY_PER_TRANSITION` grew to
+  `max_dependencies + 3` for the creation that also activates a goal; the
+  `rakka.agent.goal.status` counter counts contract transitions by status
+  difference across the committed transition, distinct from the gate's
+  `rakka.agent.goal.lifecycle`; `AgentTaskOutcome`/`AgentTaskSnapshot`
+  carry the goal outcome and view, so replays and `Describe` answer the
+  goal without waking anything.
 
 ### Slice 4.2 — Progress, evidence, and evaluation
 

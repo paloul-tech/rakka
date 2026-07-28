@@ -124,6 +124,7 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         assignee: Some(agent_id()),
         goal: None,
         goal_mode: Default::default(),
+        goal_spec: None,
         parent: None,
         dependencies,
         escrow: None,

@@ -186,6 +186,22 @@ validated_id! {
     pub AgentGoalId, "agent_goal_id"
 }
 
+impl AgentGoalId {
+    /// Derives the goal identity from the root task that coordinates it
+    /// ([specification 6.3](../../../docs/plans/rakka-agent/spec.md), open
+    /// decision 14's resolved default).
+    ///
+    /// Infallible by construction: both identities validate under the same
+    /// [`validate_identity_segment`] rules, and the task id already passed
+    /// them. The value coincides; the types and semantics stay distinct, so
+    /// goal coordination can later move to a dedicated entity without changing
+    /// the public contract.
+    #[must_use]
+    pub fn for_root_task(task: &AgentTaskId) -> Self {
+        Self(task.as_str().to_owned())
+    }
+}
+
 validated_id! {
     /// Identity of one durable, typed unit of work and its eventual public
     /// result ([specification 6.4](../../../docs/plans/rakka-agent/spec.md)).

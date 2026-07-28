@@ -70,6 +70,7 @@ async fn the_controller_passivates_between_wakes_and_a_durable_wake_reactivates_
                         assignee: None,
                         goal: Some(goal_id()),
                         goal_mode: continuous_goal_mode(wake_policy()),
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,

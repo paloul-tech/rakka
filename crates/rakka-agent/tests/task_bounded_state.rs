@@ -43,6 +43,8 @@ use rakka_agent_workflow::{
 };
 use rakka_persistence::InMemoryDurableStateStore;
 
+mod common;
+
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<RunAcceptanceProbeState>;
@@ -235,12 +237,25 @@ impl Fixture {
     }
 
     async fn create(&self, input: AgentTaskContent) -> Result<(), String> {
+        self.create_shaped(input, Default::default(), None).await
+    }
+
+    async fn create_shaped(
+        &self,
+        input: AgentTaskContent,
+        goal_mode: rakka_agent::AgentGoalMode,
+        goal_spec: Option<Box<rakka_agent::AgentGoalSpecDraft>>,
+    ) -> Result<(), String> {
+        let goal = goal_mode
+            .is_continuous()
+            .then(|| rakka_agent::AgentGoalId::new(TASK).expect("the goal id is valid"));
         let creation = AgentTaskCreation {
             definition: task_definition(),
             input,
             assignee: Some(agent_id()),
-            goal: None,
-            goal_mode: Default::default(),
+            goal,
+            goal_mode,
+            goal_spec,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,
@@ -451,6 +466,7 @@ async fn the_widest_transition_never_loses_a_history_entry() {
         assignee: Some(agent_id()),
         goal: None,
         goal_mode: Default::default(),
+        goal_spec: None,
         parent: None,
         dependencies,
         escrow: None,
@@ -693,6 +709,7 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,
@@ -843,6 +860,7 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         // The dependency keeps the creation from deciding its
                         // own assignment, which is exactly the window where an
@@ -1068,4 +1086,108 @@ async fn bounded_state_and_gapless_history_survive_any_owner_loss() {
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_maximal_goal_bearing_continuous_task_stays_inside_its_bound() {
+    // Slice 4.1's addition to scenario 55: the goal contract is a component
+    // of the root task's bounded record, and its own serialized cap is what
+    // keeps a maximal goal-bearing continuous configuration — definition,
+    // wake policy, controller, escrow, and a spec filled to its collection
+    // bounds — inside the materialized limit with the growth reserve intact.
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let mut spec = common::goal_spec();
+    spec.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH);
+    for index in 0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS {
+        spec.allowed_skills.insert(
+            rakka_agent::AgentCapabilityId::new(format!("skill-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.allowed_tools.insert(
+            rakka_agent::AgentToolId::new(format!("tool-{index:02}")).expect("the id is valid"),
+        );
+        spec.allowed_workflows.insert(
+            rakka_agent::AgentWorkflowToolId::new(format!("flow-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.knowledge_spaces.insert(
+            rakka_agent::KnowledgeSpaceId::new(format!("space-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.environments.insert(
+            rakka_agent::AgentEnvironmentRef::new(format!("env-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.required_evidence.insert(format!("class-{index:02}"));
+    }
+    spec.delegation = Some(rakka_agent::AgentGoalDelegationBudget {
+        max_depth: Some(4),
+        max_fan_out: Some(8),
+        max_descendants: Some(64),
+        max_concurrent: Some(8),
+    });
+
+    fx.create_shaped(
+        AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        common::continuous_goal_mode(common::wake_policy()),
+        Some(Box::new(common::goal_spec_draft(spec, true))),
+    )
+    .await
+    .expect("the maximal goal-bearing creation admits");
+
+    let entity = fx.entity().await;
+    let state = entity.state().expect("the state is recovered");
+    let task = state.task().expect("the task is created");
+    assert!(task.goal_state.is_some(), "the goal record is held");
+    assert!(
+        task.materialized_size_bytes()
+            <= AGENT_TASK_MATERIALIZED_MAX_BYTES
+                - rakka_agent::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
+        "the admitted record must keep its growth reserve free: {} bytes",
+        task.materialized_size_bytes()
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_goal_spec_is_refused_at_creation() {
+    // The spec's own bounds fail the whole creation closed: an over-long
+    // summary trips its field bound, and a spec padded past the serialized
+    // cap trips the size bound, both before anything is persisted.
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let mut oversized = common::goal_spec();
+    oversized.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH + 1);
+    let error = fx
+        .create_shaped(
+            AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            Default::default(),
+            Some(Box::new(common::goal_spec_draft(oversized, true))),
+        )
+        .await
+        .expect_err("an over-long summary refuses the creation");
+    assert_eq!(error, "goal-summary-too-long");
+
+    let mut padded = common::goal_spec();
+    padded.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH);
+    for index in 0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS {
+        padded.required_evidence.insert(format!(
+            "{index:02}-{}",
+            "e".repeat(rakka_agent::AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH - 3)
+        ));
+    }
+    let error = fx
+        .create_shaped(
+            AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            Default::default(),
+            Some(Box::new(common::goal_spec_draft(padded, true))),
+        )
+        .await
+        .expect_err("a spec past its serialized cap refuses the creation");
+    assert_eq!(error, "goal-spec-too-large");
 }

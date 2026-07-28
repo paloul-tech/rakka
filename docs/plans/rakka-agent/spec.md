@@ -2628,6 +2628,13 @@ without one remain open.
     underlying value for the goal/root task/initial run, but keep
     `AgentGoalId`, `AgentTaskId`, and `AgentRunId` as separate types and
     contracts.
+    *Disposition (M4): accepted as the resolved default —
+    `AgentGoalId::for_root_task` derives the goal id from the root
+    `AgentTaskId` value when a creation institutes a goal without an explicit
+    binding; the types, validation, and semantics stay distinct; the root
+    `AgentTaskEntity` coordinates the goal record inside its own
+    compare-and-set, so a dedicated goal entity can later take over without
+    changing the public contract (slice 4.1).*
 15. **Who selects a specialist agent?** Recommended: the model/planner requests
     a skill, while an application-owned authorized catalog resolves the
     concrete `AgentId`, endpoint, compatible contract, and scopes.

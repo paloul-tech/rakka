@@ -107,6 +107,99 @@ pub fn goal_id() -> AgentGoalId {
     AgentGoalId::new(GOAL).expect("goal id should be valid")
 }
 
+/// A minimal valid goal contract for the fixture goal: policy-sourced
+/// criteria at the initial revision, unbounded budgets, and the default
+/// (park) exhaustion policy.
+pub fn goal_spec() -> rakka_agent::AgentGoalSpec {
+    rakka_agent::AgentGoalSpec {
+        owner: PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "goal-owner".to_string(),
+            display_name: None,
+        },
+        objective: rakka_agent::AgentGoalObjective {
+            artifact: None,
+            summary: "resolve the fixture ticket to the owner's satisfaction".to_string(),
+        },
+        criteria: rakka_agent::AgentGoalCriteria {
+            source: rakka_agent::AgentGoalCriteriaSource::Policy(
+                AgentPolicyRef::new("ticket-resolved").expect("the policy ref is valid"),
+            ),
+            revision: AgentRevisionNumber::INITIAL,
+            digest: None,
+        },
+        priority: None,
+        deadline: None,
+        cancellation: None,
+        allocation: AgentBudgetAllocation::unbounded(),
+        limits: rakka_agent::AgentBudgetLimits::unbounded(),
+        delegation: None,
+        exhaustion: rakka_agent::AgentGoalExhaustionPolicy::default(),
+        allowed_skills: Default::default(),
+        allowed_tools: Default::default(),
+        allowed_workflows: Default::default(),
+        knowledge_spaces: Default::default(),
+        environments: Default::default(),
+        evaluator: None,
+        required_evidence: Default::default(),
+        escalation: None,
+        terminal_decision: None,
+        stagnation: None,
+        settings_revision: None,
+        policy_revision: None,
+    }
+}
+
+/// The creation draft instituting the fixture goal.
+pub fn goal_spec_draft(
+    spec: rakka_agent::AgentGoalSpec,
+    activate: bool,
+) -> rakka_agent::AgentGoalSpecDraft {
+    rakka_agent::AgentGoalSpecDraft {
+        spec,
+        provenance: provenance(1),
+        activate_on_creation: activate,
+    }
+}
+
+/// The evaluation reference a criteria decision on the fixture goal rests on,
+/// assessed at the initial criteria revision.
+pub fn goal_evaluation() -> rakka_agent::AgentGoalEvaluationRef {
+    rakka_agent::AgentGoalEvaluationRef {
+        evaluator: AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"),
+        criteria_revision: AgentRevisionNumber::INITIAL,
+        evidence: None,
+        digest: None,
+    }
+}
+
+/// The creation command of a goal-bearing agent-owned root task: the goal id
+/// is deliberately omitted, so creation derives it from the root task's own
+/// value (open decision 14's resolved default).
+pub fn goal_task_creation_command(
+    definition: AgentTaskDefinition,
+    draft: rakka_agent::AgentGoalSpecDraft,
+) -> AgentTaskEntityCommand {
+    AgentTaskEntityCommand::Create {
+        operation_id: AgentOperationId::new(AgentOperationKind::TaskCreation, [TENANT, TASK, "1"])
+            .expect("operation id should be derivable"),
+        creation: Box::new(AgentTaskCreation {
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: Some(agent_id()),
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: Some(Box::new(draft)),
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            telemetry: Default::default(),
+        }),
+    }
+}
+
 /// The default continuous wake policy: durable-timer trigger, a bounded
 /// per-epoch budget, and a one-minute epoch deadline — the resolved defaults
 /// everywhere else.
@@ -160,6 +253,33 @@ pub fn continuous_control_creation_command(goal_mode: AgentGoalMode) -> AgentTas
             assignee: None,
             goal: Some(goal_id()),
             goal_mode,
+            goal_spec: None,
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            telemetry: Default::default(),
+        }),
+    }
+}
+
+/// The creation command of a human-owned continuous root control task that
+/// also institutes the full goal contract.
+pub fn continuous_goal_control_creation_command(
+    goal_mode: AgentGoalMode,
+    draft: rakka_agent::AgentGoalSpecDraft,
+) -> AgentTaskEntityCommand {
+    AgentTaskEntityCommand::Create {
+        operation_id: AgentOperationId::new(AgentOperationKind::TaskCreation, [TENANT, TASK, "1"])
+            .expect("operation id should be derivable"),
+        creation: Box::new(AgentTaskCreation {
+            definition: task_definition().with_ownership(rakka_agent::AgentTaskOwnership::Human),
+            input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            goal: Some(goal_id()),
+            goal_mode,
+            goal_spec: Some(Box::new(draft)),
             parent: None,
             dependencies: Vec::new(),
             escrow: None,
@@ -541,6 +661,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,
@@ -604,6 +725,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         assignee: Some(agent_id()),
                         goal: Some(goal_id()),
                         goal_mode,
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,
