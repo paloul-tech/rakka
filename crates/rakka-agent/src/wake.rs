@@ -1027,13 +1027,25 @@ impl AgentWakePolicy {
                 return Err(AgentWakeError::WindowCeilingUnbounded);
             }
             for dimension in AgentBudgetDimension::CONSERVED {
-                if goal_window.ceiling.get(dimension).is_some()
-                    && self.epoch_budget.get(dimension).is_none()
-                {
+                let Some(limit) = goal_window.ceiling.get(dimension) else {
+                    continue;
+                };
+                let Some(epoch_budget) = self.epoch_budget.get(dimension) else {
                     // An unbounded epoch dimension can never be charged
                     // against a bounded window ceiling: the very first
                     // admission would exhaust it.
                     return Err(AgentWakeError::WindowEpochUnbounded { dimension });
+                };
+                if epoch_budget > limit {
+                    // A bounded epoch budget above the ceiling is just as
+                    // unsatisfiable: even a freshly refilled window could
+                    // never pay for one epoch, so every occurrence would
+                    // defer forever.
+                    return Err(AgentWakeError::WindowEpochExceedsCeiling {
+                        dimension,
+                        epoch_budget,
+                        ceiling: limit,
+                    });
                 }
             }
         }
@@ -1705,6 +1717,24 @@ impl AgentWakeControllerState {
         }
     }
 
+    /// Whether the occurrence is past the policy's maximum lateness at this
+    /// logical time — the band the missed-occurrence policy owns.
+    fn past_maximum_lateness(
+        policy: &AgentWakePolicy,
+        binding: &AgentWakeBinding,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        matches!(
+            (
+                binding
+                    .due_at()
+                    .map(|due_at| now.as_millis().saturating_sub(due_at.as_millis())),
+                policy.maximum_lateness_millis,
+            ),
+            (Some(late), Some(maximum)) if late > maximum
+        )
+    }
+
     /// Dispositions one wake delivery under the policy and schedule revision
     /// in force.
     ///
@@ -1762,16 +1792,12 @@ impl AgentWakeControllerState {
                 return Ok(AgentWakeDisposition::Duplicate { wake });
             }
         }
+        if Self::past_maximum_lateness(policy, &binding, now) {
+            return Ok(self.dispose_missed(policy, binding, now));
+        }
         let lateness = binding
             .due_at()
             .map(|due_at| now.as_millis().saturating_sub(due_at.as_millis()));
-        let missed = matches!(
-            (lateness, policy.maximum_lateness_millis),
-            (Some(late), Some(maximum)) if late > maximum
-        );
-        if missed {
-            return Ok(self.dispose_missed(policy, binding, now));
-        }
         let past_window = matches!(
             (lateness, policy.admission_window_millis),
             (Some(late), Some(window)) if late > window
@@ -1823,7 +1849,17 @@ impl AgentWakeControllerState {
         let admitted_next = if affordable {
             let binding = self.pending.remove(0);
             let next = binding.wake_id().clone();
-            self.admit_binding(binding, now, true, false);
+            // A parked binding carries no representative mark, so the mark is
+            // recomputed from what it means: under admit-one-coalesced, an
+            // occurrence promoted past its maximum lateness stands for its
+            // downtime backlog, and later missed occurrences of that backlog
+            // must absorb into it rather than park an echo that would admit a
+            // second epoch.
+            let representative = matches!(
+                policy.missed_occurrence,
+                AgentMissedOccurrencePolicy::AdmitOneCoalesced
+            ) && Self::past_maximum_lateness(policy, &binding, now);
+            self.admit_binding(binding, now, true, representative);
             Some(next)
         } else {
             None
@@ -2137,6 +2173,16 @@ pub enum AgentWakeError {
         /// The dimension the ceiling bounds but the epoch budget does not.
         dimension: AgentBudgetDimension,
     },
+    /// A goal window whose ceiling is below the per-epoch budget on a
+    /// dimension, so no window could ever pay for a single epoch.
+    WindowEpochExceedsCeiling {
+        /// The dimension whose ceiling the epoch budget exceeds.
+        dimension: AgentBudgetDimension,
+        /// The per-epoch budget declared on that dimension.
+        epoch_budget: u64,
+        /// The window ceiling declared on that dimension.
+        ceiling: u64,
+    },
     /// An epoch with neither a bounded budget dimension nor a deadline.
     EpochUnbounded,
     /// A binding carrying a schedule revision ahead of the controller's: no
@@ -2190,6 +2236,7 @@ impl AgentWakeError {
             Self::RenewalWithoutExpiry => "wake-renewal-without-expiry",
             Self::WindowCeilingUnbounded => "wake-window-ceiling-unbounded",
             Self::WindowEpochUnbounded { .. } => "wake-window-epoch-unbounded",
+            Self::WindowEpochExceedsCeiling { .. } => "wake-window-epoch-exceeds-ceiling",
             Self::EpochUnbounded => "wake-epoch-unbounded",
             Self::RevisionAhead { .. } => "wake-revision-ahead",
             Self::TriggerNotAllowed { .. } => "wake-trigger-not-allowed",
@@ -2252,6 +2299,14 @@ impl Display for AgentWakeError {
             Self::WindowEpochUnbounded { dimension } => write!(
                 f,
                 "the goal window bounds {dimension:?}, which the per-epoch budget leaves unbounded; the first admission would exhaust the window"
+            ),
+            Self::WindowEpochExceedsCeiling {
+                dimension,
+                epoch_budget,
+                ceiling,
+            } => write!(
+                f,
+                "the per-epoch budget of {epoch_budget} on {dimension:?} exceeds the goal window ceiling of {ceiling}; no window could ever pay for one epoch"
             ),
             Self::EpochUnbounded => f.write_str(
                 "an epoch must be bounded: set a deadline or bound at least one budget dimension",
@@ -2431,6 +2486,29 @@ mod tests {
             })
             .expect_err("an unbounded ceiling should be refused");
         assert_eq!(error.code(), "wake-window-ceiling-unbounded");
+    }
+
+    #[test]
+    fn an_epoch_budget_above_the_window_ceiling_is_refused() {
+        // The default policy's epoch costs 16 model calls. A ceiling of 8
+        // could never pay for one epoch even freshly refilled, so every
+        // occurrence would defer forever; the contradiction is refused at
+        // construction, exactly as its unbounded sibling is.
+        let mut ceiling = AgentBudgetAllocation::unbounded();
+        ceiling.set(AgentBudgetDimension::ModelCalls, Some(8));
+        let error = default_policy()
+            .with_goal_window(AgentGoalWindowCeiling {
+                window: AgentBudgetWindow::Rolling {
+                    length_millis: 3_600_000,
+                },
+                ceiling,
+            })
+            .expect_err("a ceiling below the epoch budget should be refused");
+        assert_eq!(error.code(), "wake-window-epoch-exceeds-ceiling");
+
+        // The bound is exact: a ceiling equal to the epoch budget pays for
+        // exactly one epoch per window and is accepted.
+        windowed_policy(3_600_000, 16);
     }
 
     #[test]
@@ -3105,6 +3183,66 @@ mod tests {
             .expect("the missed occurrence is dispositioned");
         assert!(matches!(parked, AgentWakeDisposition::Coalesced { .. }));
         assert_eq!(controller.pending().len(), 1);
+    }
+
+    #[test]
+    fn a_promoted_representative_still_absorbs_its_backlog() {
+        let policy = default_policy()
+            .with_maximum_lateness(1_000)
+            .expect("the lateness is accepted");
+        let mut controller = AgentWakeControllerState::new();
+
+        // A normal epoch is active, and a downtime backlog parks its one
+        // representative behind it.
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_010),
+            )
+            .expect("the fresh occurrence admits");
+        assert!(!controller.active()[0].is_representative());
+        let parked = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(500_000),
+            )
+            .expect("the missed occurrence is dispositioned");
+        assert!(matches!(parked, AgentWakeDisposition::Coalesced { .. }));
+
+        // The release promotes the parked occurrence, and it must come back
+        // *as* the backlog's representative: the parked binding carries no
+        // mark, so the mark is recomputed from its lateness at promotion.
+        let wake = controller.active()[0].binding().wake_id().clone();
+        let release = controller
+            .release(&policy, &wake, now(500_100))
+            .expect("the normal epoch releases");
+        assert!(release.admitted_next.is_some());
+        assert!(controller.active()[0].is_representative());
+
+        // A later missed occurrence of the same backlog absorbs into the
+        // promoted representative instead of parking an echo that would
+        // admit a second epoch.
+        let echo = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(3_000, ScheduleRevision::INITIAL),
+                now(500_200),
+            )
+            .expect("the later missed occurrence is dispositioned");
+        assert!(matches!(echo, AgentWakeDisposition::Skipped { .. }));
+        assert!(controller.pending().is_empty());
+
+        let wake = controller.active()[0].binding().wake_id().clone();
+        let release = controller
+            .release(&policy, &wake, now(500_300))
+            .expect("the representative releases");
+        assert!(release.admitted_next.is_none());
+        assert_eq!(controller.counters().admitted, 2);
     }
 
     fn windowed_policy(length_millis: u64, model_calls: u64) -> AgentWakePolicy {

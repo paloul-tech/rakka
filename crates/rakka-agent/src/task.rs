@@ -3937,6 +3937,13 @@ fn apply_epoch_result(
     }
 
     let scope = state.scope.clone();
+    // The sequence below mutates before it can still fail: the settlement and
+    // the release land ahead of the owed creation and the bounds check, either
+    // of which may yet refuse. It therefore runs on a scratch clone, committed
+    // only whole — a refusal persists the recorded result alone, never a
+    // half-applied release that promoted an occurrence whose epoch nobody
+    // owes.
+    let mut scratch = state.clone();
     let applied = (|state: &mut AgentTaskState| -> AgentTaskResult<(
         Option<crate::wake::AgentWakeRelease>,
         Vec<AgentExchangeEnvelope>,
@@ -3987,10 +3994,11 @@ fn apply_epoch_result(
         task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
         state.updated_at = now;
         Ok((release, owed))
-    })(state);
+    })(&mut scratch);
 
     match applied {
         Ok((release, owed)) => {
+            *state = scratch;
             let outcome = release.map(AgentWakeOutcome::Release);
             let payload =
                 AgentExchangePayload::encode(AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE, &outcome)
@@ -5221,7 +5229,12 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
-                    Ok((operation_id, None, Vec::new()))
+                    // A failed dependency can terminate an epoch with no
+                    // outstanding escrow; it owes its terminal result to the
+                    // controller in this same transition, exactly as a
+                    // cancellation does.
+                    let owed = owed_epoch_result(state, now).into_iter().collect();
+                    Ok((operation_id, None, owed))
                 })
                 .await?
             }
@@ -6621,6 +6634,174 @@ impl From<AgentTaskError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod epoch_result_tests {
+    use rakka_agent_workflow::{AgentAuditEventId, PrincipalRef};
+
+    use super::*;
+    use crate::definition::AgentPolicyRef;
+    use crate::definition::AgentRevisionProvenance;
+    use crate::goal::AgentEpochSpec;
+    use crate::wake::{AgentWakeOccurrence, AgentWakePolicy, AgentWakeTriggerKind};
+
+    fn ts(at: u64) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(at)
+    }
+
+    fn schema(id: &str) -> AgentSchemaRef {
+        AgentSchemaRef::new(
+            AgentSchemaId::new(id).expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        )
+    }
+
+    fn definition() -> AgentTaskDefinition {
+        AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("reconcile").expect("the definition id is valid"),
+            "Reconcile one nightly window.",
+            schema("epoch-input"),
+            schema("epoch-result"),
+        )
+        .expect("the definition is valid")
+    }
+
+    fn continuous_mode() -> AgentGoalMode {
+        let mut budget = AgentBudgetAllocation::unbounded();
+        budget.set(crate::budget::AgentBudgetDimension::ModelCalls, Some(8));
+        let policy =
+            AgentWakePolicy::new([AgentWakeTriggerKind::DurableTimer], budget, Some(60_000))
+                .expect("the policy is valid");
+        let provenance = AgentRevisionProvenance {
+            principal: PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "test".to_string(),
+                display_name: None,
+            },
+            accepted_at: ts(1),
+            causation_id: AgentCausationId::new("cause-1"),
+            audit_ref: AgentAuditEventId::new("audit-1"),
+        };
+        AgentGoalMode::Continuous(Box::new(crate::goal::AgentContinuousGoalSpec {
+            schedule_revision: ScheduleRevision::INITIAL,
+            wake_policy: AgentWakePolicyRevision::initial(policy, provenance)
+                .expect("the revision is valid"),
+            health_condition: AgentPolicyRef::new("health").expect("the policy ref is valid"),
+            epoch: Some(Box::new(AgentEpochSpec {
+                definition: definition(),
+                assignee: AgentId::new("worker").expect("the agent id is valid"),
+                observation_scope: None,
+            })),
+        }))
+    }
+
+    fn binding(due_at: u64) -> AgentWakeBinding {
+        AgentWakeBinding::new(
+            TenantId::new("acme"),
+            AgentGoalId::new("nightly").expect("the goal id is valid"),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::Scheduled { due_at: ts(due_at) },
+            AgentWakeTriggerKind::DurableTimer,
+            ts(due_at),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("the binding is valid")
+    }
+
+    #[test]
+    fn a_refused_epoch_result_persists_no_partial_mutation() {
+        let tenant = TenantId::new("acme");
+        let scope = AgentTaskScope::new(
+            tenant.clone(),
+            AgentTaskId::new("root").expect("the task id is valid"),
+        )
+        .expect("the scope is valid");
+        let mut state = AgentTaskState::uncreated(scope.clone(), ts(1));
+        let create_op =
+            AgentOperationId::new(AgentOperationKind::TaskCreation, ["acme", "root", "1"])
+                .expect("the operation id derives");
+        let creation = AgentTaskCreation {
+            definition: definition().with_ownership(AgentTaskOwnership::Human),
+            input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            goal: Some(AgentGoalId::new("nightly").expect("the goal id is valid")),
+            goal_mode: continuous_mode(),
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            telemetry: Default::default(),
+        };
+        create_task(&mut state, &create_op, creation, ts(1)).expect("the control task creates");
+
+        // One occurrence admits and one parks behind it, so the epoch result
+        // below has both an escrow settlement and a promotion to run.
+        let first = binding(1_000);
+        let admit_op = first
+            .admission_operation_id()
+            .expect("the admission id derives");
+        admit_wake(&mut state, &admit_op, first.clone(), ts(1_010))
+            .expect("the first occurrence admits");
+        let second = binding(120_000);
+        let admit_op = second
+            .admission_operation_id()
+            .expect("the admission id derives");
+        admit_wake(&mut state, &admit_op, second, ts(120_010))
+            .expect("the second occurrence parks");
+
+        // Make the promotion fail *after* the settlement and the release have
+        // already mutated: strip the epoch contract, so owing the promoted
+        // occurrence's creation refuses `task-epoch-undefined` mid-sequence.
+        {
+            let task = state.task.as_mut().expect("the task exists");
+            let AgentGoalMode::Continuous(spec) = &mut task.goal_mode else {
+                panic!("the goal is continuous");
+            };
+            spec.epoch = None;
+        }
+
+        let before = state.clone();
+        let wake = first.wake_id().clone();
+        let epoch_task = epoch_task_id_for_wake(&wake).expect("the epoch task derives");
+        let result = AgentEpochResult {
+            wake: wake.clone(),
+            task: epoch_task.clone(),
+            status: AgentTaskStatus::Completed,
+            consumed: AgentBudgetConsumption::zero(),
+            result_digest: None,
+        };
+        let operation_id = epoch_result_operation_id(
+            &tenant,
+            &AgentGoalId::new("nightly").expect("the goal id is valid"),
+            &wake,
+        )
+        .expect("the result operation id derives");
+        let payload = AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)
+            .expect("the result encodes");
+        let envelope = AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::EpochResult,
+            AgentEntityAddress::Task(
+                AgentTaskScope::new(tenant, epoch_task).expect("the epoch scope is valid"),
+            ),
+            AgentEntityAddress::Task(scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            ts(200_000),
+        )
+        .expect("the envelope is valid");
+
+        let transition = apply_epoch_result(&mut state, &envelope, ts(200_000));
+        assert_eq!(
+            transition.result().status().rejection_code(),
+            Some("task-epoch-undefined"),
+            "the mid-sequence failure refuses the exchange"
+        );
+        assert!(transition.owed().is_empty());
+        assert_eq!(state, before, "a refusal persists no partial mutation");
     }
 }
 
