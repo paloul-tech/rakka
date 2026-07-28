@@ -391,3 +391,269 @@ async fn drain_to_zero_residents(world: &ShardedWorld) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// A forged epoch result — a sender other than the very task the wake
+/// derives — is refused closed and changes nothing (the review-claimed
+/// `task-epoch-forged` behavior, now pinned).
+#[tokio::test]
+async fn a_forged_epoch_result_is_refused_and_changes_nothing() {
+    use rakka_agent::{
+        epoch_result_operation_id, AgentBudgetConsumption, AgentEntityAddress, AgentEpochResult,
+        AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentTaskScope,
+        AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+    };
+    use rakka_agent_workflow::AgentCorrelationId;
+
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn()));
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let binding = common::scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(binding.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the admission applies");
+    let before = controller_of(&fx).await;
+
+    // The claimed epoch task does not match what the wake derives.
+    let impostor = AgentTaskScope::new(
+        common::tenant(),
+        rakka_agent::AgentTaskId::new("impostor-epoch").expect("the id is valid"),
+    )
+    .expect("the scope is valid");
+    let operation_id =
+        epoch_result_operation_id(&common::tenant(), &common::goal_id(), binding.wake_id())
+            .expect("the operation id derives");
+    let result = AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: impostor.task().clone(),
+        status: rakka_agent::AgentTaskStatus::Completed,
+        consumed: AgentBudgetConsumption::zero(),
+        result_digest: None,
+    };
+    let forged = AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::EpochResult,
+        AgentEntityAddress::Task(impostor),
+        AgentEntityAddress::Task(task_scope()),
+        AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)
+            .expect("the payload encodes"),
+        AgentCorrelationId::new(operation_id.as_str()),
+        rakka_agent_workflow::AgentTimestampMillis::new(9_000),
+    )
+    .expect("the envelope builds");
+
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    root.recover(rakka_agent_workflow::AgentTimestampMillis::new(9_001))
+        .await
+        .expect("the root recovers");
+    let reply = root
+        .accept(
+            &forged,
+            &fx.router,
+            rakka_agent_workflow::AgentTimestampMillis::new(9_002),
+        )
+        .await
+        .expect("the delivery is answered");
+    assert_eq!(
+        reply.result().status().rejection_code(),
+        Some("task-epoch-forged"),
+        "the forged sender is refused"
+    );
+    assert_eq!(
+        controller_of(&fx).await,
+        before,
+        "a forged result changes no controller state"
+    );
+}
+
+/// An explicit release racing ahead of the epoch's own result: the late
+/// `EpochResult` still settles the escrow, tolerates the missing active
+/// occurrence, and promotes nothing twice (the review-claimed crossing).
+#[tokio::test]
+async fn a_raced_manual_release_and_late_epoch_result_converge() {
+    use rakka_agent::{
+        epoch_result_operation_id, epoch_task_id_for_wake, AgentBudgetConsumption,
+        AgentBudgetDimension, AgentEntityAddress, AgentEpochResult, AgentExchangeEnvelope,
+        AgentExchangeKind, AgentExchangePayload, AgentOperationId, AgentOperationKind,
+        AgentTaskEntityCommand, AgentTaskScope, AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+    };
+    use rakka_agent_workflow::AgentCorrelationId;
+
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn()));
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let binding = common::scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(binding.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the admission applies");
+
+    // An operator releases the occurrence explicitly, ahead of the result.
+    fx.apply_task_command(AgentTaskEntityCommand::CompleteWakeOccurrence {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::Command,
+            [common::TENANT, common::TASK, "manual-release"],
+        )
+        .expect("the operation id derives"),
+        wake: binding.wake_id().clone(),
+    })
+    .await
+    .expect("the manual release applies");
+    assert_eq!(controller_of(&fx).await.counters().released, 1);
+
+    // The epoch's own result arrives late, from the legitimate sender.
+    let epoch_task = epoch_task_id_for_wake(binding.wake_id()).expect("the epoch derives");
+    let epoch_scope =
+        AgentTaskScope::new(common::tenant(), epoch_task.clone()).expect("the scope is valid");
+    let operation_id =
+        epoch_result_operation_id(&common::tenant(), &common::goal_id(), binding.wake_id())
+            .expect("the operation id derives");
+    let mut consumed = AgentBudgetConsumption::zero();
+    consumed.add(AgentBudgetDimension::ModelCalls, 3);
+    let result = AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: epoch_task,
+        status: rakka_agent::AgentTaskStatus::Completed,
+        consumed,
+        result_digest: None,
+    };
+    let late = AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::EpochResult,
+        AgentEntityAddress::Task(epoch_scope),
+        AgentEntityAddress::Task(task_scope()),
+        AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)
+            .expect("the payload encodes"),
+        AgentCorrelationId::new(operation_id.as_str()),
+        rakka_agent_workflow::AgentTimestampMillis::new(9_000),
+    )
+    .expect("the envelope builds");
+
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    root.recover(rakka_agent_workflow::AgentTimestampMillis::new(9_001))
+        .await
+        .expect("the root recovers");
+    let reply = root
+        .accept(
+            &late,
+            &fx.router,
+            rakka_agent_workflow::AgentTimestampMillis::new(9_002),
+        )
+        .await
+        .expect("the late result is answered");
+    assert!(reply.result().is_accepted(), "the settlement still lands");
+
+    let root_state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the root state loads")
+        .expect("the root exists");
+    let root_task = root_state.task().expect("the root is created");
+    assert_eq!(
+        root_task
+            .escrow
+            .consumed()
+            .get(AgentBudgetDimension::ModelCalls),
+        3,
+        "the late result's consumption settled"
+    );
+    assert_eq!(root_task.escrow.outstanding().count(), 0, "escrow returned");
+    let controller = root_task
+        .wake_controller
+        .as_ref()
+        .expect("the controller exists");
+    assert_eq!(controller.counters().released, 1, "no second release");
+    assert!(controller.active().is_empty(), "nothing was re-promoted");
+}
+
+/// A cancelled epoch with a closed ledger owes its terminal result to the
+/// controller from the cancel transition itself (the review-claimed owing).
+#[tokio::test]
+async fn a_cancelled_epoch_owes_its_result_to_the_controller() {
+    // No agent is instantiated: the epoch's assignment is refused, so its
+    // ledger never opens a run child and the cancel finds it closed.
+    let fx = Fixture::new(ScriptedDispatcher::new());
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let binding = common::scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    let (epoch_scope, run_scope) = epoch_scopes_for(binding.wake_id());
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(binding.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the admission applies");
+
+    // Cancel the epoch task directly, then let its courier deliver what the
+    // cancellation owed.
+    let mut epoch = rakka_agent::AgentTaskEntityStore::new(
+        epoch_scope.clone(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    epoch
+        .recover(rakka_agent_workflow::AgentTimestampMillis::new(8_000))
+        .await
+        .expect("the epoch recovers");
+    epoch
+        .apply(
+            rakka_agent::AgentTaskEntityCommand::Cancel {
+                operation_id: rakka_agent::AgentOperationId::new(
+                    rakka_agent::AgentOperationKind::Cancellation,
+                    [common::TENANT, "epoch", "cancel-1"],
+                )
+                .expect("the operation id derives"),
+                reason: "operator abort".to_string(),
+            },
+            &fx.router,
+            rakka_agent_workflow::AgentTimestampMillis::new(8_001),
+        )
+        .await
+        .expect("the cancel applies");
+    // No run ever existed, so the settle passes alone drive the owed result
+    // home: the epoch's courier delivers, the root applies.
+    let _ = run_scope;
+    for _round in 0..4 {
+        fx.settle_task_at(&epoch_scope)
+            .await
+            .expect("the epoch settles");
+        fx.settle_task_at(&task_scope())
+            .await
+            .expect("the root settles");
+    }
+
+    let controller = controller_of(&fx).await;
+    assert_eq!(
+        controller.counters().released,
+        1,
+        "the cancelled epoch's result released its wake"
+    );
+    assert!(controller.active().is_empty());
+    let root_state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the root state loads")
+        .expect("the root exists");
+    assert_eq!(
+        root_state
+            .task()
+            .expect("the root is created")
+            .escrow
+            .outstanding()
+            .count(),
+        0,
+        "the cancelled epoch's escrow settled and returned"
+    );
+}

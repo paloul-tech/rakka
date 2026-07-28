@@ -2290,6 +2290,119 @@ Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),
 Done when: the continuous milestone checklist is demonstrated end to end by
 an example with fault injection across pod restart and shard movement.
 
+**Amended as implemented (2026-07-28):**
+
+- **Lifecycle is controller state under its own monotonic revision.**
+  `AgentGoalLifecycleState` (status, lifecycle revision, provenance of the
+  last change, suspension reason, expiry override, failure streak, backoff,
+  re-wake slots) lives on the controller state. The four operator commands —
+  `Suspend`/`Resume`/`Renew`/`RetireContinuousGoal` — fence on the expected
+  lifecycle revision inside the compare-and-set (the agent-entity
+  suspend/resume precedent); every observation-driven change (expiry
+  crossed, retirement count reached, failure streak escalated) also bumps
+  it, so a racing operator command gets `wake-stale-lifecycle-revision`
+  rather than acting on a state that no longer exists. Expiry and
+  `AfterOccurrences`/`At` retirement are *observed* by whatever recorded
+  transition first sees them true (the window-refill shape) — never by a
+  timer. `Expired` and `Retired` are absorbing: fresh deliveries answer the
+  recorded `Barred` disposition and the scanner marks their entries
+  terminal, while an in-flight epoch's `EpochResult` settlement still lands,
+  so budgets close cleanly on a goal that retired mid-epoch. Resume clears
+  the failure streak and the backoff (approved: an operator resume is an
+  explicit override), and promotes what suspension parked — owing the
+  promoted epoch's creation in its own transition. Renewal fences to
+  `[effective expiry − window, effective expiry)` under `RequiredBefore` and
+  must strictly extend; the extension is an override the policy's own
+  `expires_at` no longer caps.
+- **Failure accounting runs before the release attempt.** A `Failed` epoch
+  grows the streak and arms the backoff (geometric, saturating, capped)
+  even when an explicit `CompleteWakeOccurrence` raced the settlement;
+  `Cancelled` neither grows nor resets. The backoff gates fresh admissions
+  *and* promotions. A streak reaching `escalate_after_failures`
+  auto-suspends with a bounded reason.
+- **One re-wake mechanism, two per-cause slots.** The controller owes itself
+  at most one backoff re-wake and one window-turn re-wake
+  (`AgentWakeRewakes`), recomputed idempotently by `ensure_rewakes` at the
+  end of every mutating entry point — computed from current state, cleared
+  while the lifecycle forbids admission, self-healing after any crash — 
+  rather than written piecemeal at each cause site. One slot for both causes
+  would lose liveness when they coexist. The re-wake is a new
+  `AgentWakeOccurrence::Retry { due_at, cause }` under a new
+  `AgentWakeTriggerKind::Controller`; the two require each other (neither
+  can be smuggled through the other's path), `Controller` is exempt from the
+  policy's trigger allow-list for exactly this pairing, and `Retry` exposes
+  its `due_at` so the parked entry is due at the computed time, not
+  immediately. Consequence, behavior-preserving today: the controller's
+  due-time watermark is scoped to `Scheduled` occurrences. The retry arm of
+  `admit()` consumes the delivery without admitting — the pre-admit
+  `promote_admittable` already did the real work — so a stale parked re-wake
+  is a recorded no-op nudge and never needs cancellation. The slot and the
+  `Retry` occurrence carry an *attempt generation* that is part of the wake
+  identity: a retry delivered before this host's clock reaches its due time
+  (a scanner host running ahead) is consumed while its cause still holds and
+  its timer entry goes terminal, so the consume re-arms the slot unparked
+  under the next attempt and the same transition's settle pass parks a fresh
+  entry the fired one cannot absorb — under skew the retry cycles once per
+  scan until the due time passes here, instead of stranding the parked
+  occurrences behind a terminal entry. Attempt zero keeps the original
+  two-segment identity form, so previously persisted retries re-derive
+  unchanged.
+- **Parking is a settle-pass seam behind an object-safe trait.** The entity
+  parks owed re-wakes through an optional `Arc<dyn AgentWakeRewakeParker>`
+  (`SharedWakeTimerParker` adapts the shared wake-timer store), wired via
+  `with_wake_timers` on the store, entity, and sharding settings — approved
+  over a fourth store generic; without the handle, owed re-wakes stay
+  durably owed and query-visible. Park-then-mark crash windows converge:
+  the slot's `parked` flag commits only after the timer entry exists, and
+  the next settle pass re-parks idempotently on the derived wake id.
+  Terminal timer entries are never pruned implicitly; `prune_terminal` is
+  an explicit operational act.
+- **The wake-timer store converges on a lost compare-and-set.** The parker
+  made the store multi-writer *within one scan pass* — the scanner's mark
+  races the re-wake the delivered entity's own settle just parked (found by
+  the acceptance example). `schedule_occurrence` and the mark/cancel
+  operations now re-recover and retry a bounded number of times; every
+  mutation is idempotent over the re-read record, so losing the race is
+  normal operation, not a failed pass.
+- **Metrics count committed transitions only.** Three bounded instruments —
+  `rakka.agent.wake.dispositions{outcome,trigger}`,
+  `rakka.agent.epochs{outcome}`, `rakka.agent.goal.lifecycle{transition}` —
+  emitted post-commit on `Applied` replies only (never `Duplicate`;
+  reply-driven and replay-suppressed on the exchange path). Admitted epochs
+  are counted as the difference of the controller's monotone `admitted`
+  counter across the committed transition — the one source that sees a
+  promotion made in the same breath as a fresh delivery, a release, or a
+  resume. Lifecycle transitions are counted the same way: the difference of
+  the goal's lifecycle status across the committed transition, so observed
+  flips — expiry, retirement by policy, escalation into suspension — count
+  exactly like commanded ones, from whatever transition first recorded
+  them; `renewed` alone is counted from its command, because renewal leaves
+  the status unchanged. The scanner's existing raw counter now goes through
+  the agent-domain label validator like every other instrument.
+- **Audit is task history** (judgment against 17.13's `AgentAuditSink`
+  wording, approved): new `AgentTaskHistoryKind` entries — wake
+  dispositioned, epoch admitted/settled, goal
+  suspended/resumed/renewed/expired/retired, schedule updated — recorded
+  only inside the recorded transition they describe, with the wake id and
+  disposition in the bounded detail. Observation-driven flips record with
+  detail `observed`. Worst case adds 4 entries to a transition against the
+  34-entry headroom fence.
+- **The operational query is one durable read.**
+  `agent_task_operational_snapshot` mirrors the run-scoped query (content
+  redacted, schema-checked, no entity activation); `AgentWakeStatusView`
+  grew additively (window ledger, lifecycle state, active epoch refs); and
+  `next_pending_wake_for_task` is a pure join over the wake-timer state,
+  because "next wake" lives in the timer store, not the task record.
+- **The milestone's done-when is `examples/continuous-goal-acceptance`**: a
+  16-line transcript pinned three ways (README, `EXPECTED_TRANSCRIPT`,
+  `tests/acceptance.rs`) walking the M3 checklist with fault injection —
+  crash mid-settlement with convergent replay, a downtime backlog, window
+  exhaustion and the window-turn re-wake, failure backoff and escalation,
+  fenced and real resume, a schedule-revision fence, a stale former owner
+  losing the compare-and-set after shard movement, renewal, retirement by
+  occurrence count, and the operational query answering from durable state
+  alone.
+
 ---
 
 ## Phase 4 — M4 Multi-Agent Goals

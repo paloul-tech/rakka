@@ -9,15 +9,22 @@
 //! ever labels a metric. Metrics are aggregates, never the correctness
 //! source: an unwired run records nothing and behaves identically.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    validate_agent_domain_metric_attributes, AgentModelTurn, AgentModelUsage, AgentTaskContent,
-    AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentDecisionEventSink,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION, METRIC_AGENT_DECISIONS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_RUN_TRANSITIONS,
+    epoch_result_operation_id, epoch_task_id_for_wake, validate_agent_domain_metric_attributes,
+    wake_admission_command, AgentBudgetConsumption, AgentEntityAddress, AgentEpochResult,
+    AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload, AgentModelTurn,
+    AgentModelUsage, AgentOperationId, AgentOperationKind, AgentTaskContent,
+    AgentTaskEntityCommand, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
+    AgentToolId, AgentWakeBackoffPolicy, AgentWakeLifecyclePolicy, InMemoryAgentDecisionEventSink,
+    ScheduleRevision, AGENT_EPOCH_RESULT_PAYLOAD_TYPE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS,
+    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
+use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
 use rakka_core::{InMemoryMetricsRecorder, MetricKind};
 
 mod common;
@@ -138,6 +145,314 @@ async fn a_run_records_bounded_agent_metrics_and_no_identifiers() {
             .len(),
         4,
         "a replayed flush counts nothing"
+    );
+}
+
+/// A legitimate epoch-result envelope for one admitted wake.
+fn epoch_result(
+    binding: &rakka_agent::AgentWakeBinding,
+    status: AgentTaskStatus,
+) -> AgentExchangeEnvelope {
+    let epoch_task = epoch_task_id_for_wake(binding.wake_id()).expect("the epoch derives");
+    let epoch_scope =
+        AgentTaskScope::new(tenant(), epoch_task.clone()).expect("the scope is valid");
+    let operation_id = epoch_result_operation_id(&tenant(), &goal_id(), binding.wake_id())
+        .expect("the operation id derives");
+    let result = AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: epoch_task,
+        status,
+        consumed: AgentBudgetConsumption::zero(),
+        result_digest: None,
+    };
+    AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::EpochResult,
+        AgentEntityAddress::Task(epoch_scope),
+        AgentEntityAddress::Task(task_scope()),
+        AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)
+            .expect("the payload encodes"),
+        AgentCorrelationId::new(operation_id.as_str()),
+        AgentTimestampMillis::new(9_000),
+    )
+    .expect("the envelope builds")
+}
+
+/// The label values of every observation of one instrument, as `(key, value)`
+/// pair lists in recording order.
+fn labels_of(snapshot: &rakka_core::MetricsSnapshot, name: &str) -> Vec<Vec<(String, String)>> {
+    snapshot
+        .observations_named(name)
+        .iter()
+        .map(|observation| {
+            observation
+                .attributes()
+                .iter()
+                .map(|attribute| (attribute.key().to_string(), attribute.value().to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+/// The continuous-goal instruments record once per committed transition —
+/// an admission counts a disposition and an admitted epoch, a settled epoch
+/// result counts its terminal class, a lifecycle command counts its
+/// transition — and a replayed admission, answered as a duplicate, counts
+/// nothing again. Every label passes the bounded guard.
+#[tokio::test]
+async fn continuous_goal_transitions_record_bounded_counters_once() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::new()).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+
+    // One scheduled occurrence admits: one disposition, one admitted epoch.
+    let binding = scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    let admission = wake_admission_command(binding.clone()).expect("the command derives");
+    fx.apply_task_command(admission.clone())
+        .await
+        .expect("the admission applies");
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_WAKE_DISPOSITIONS),
+        vec![vec![
+            ("outcome".to_string(), "admitted".to_string()),
+            ("trigger".to_string(), "durable-timer".to_string()),
+        ]],
+        "the admission counted its disposition and trigger"
+    );
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_EPOCHS),
+        vec![vec![("outcome".to_string(), "admitted".to_string())]],
+        "the admission counted its epoch"
+    );
+
+    // The same delivery replayed answers a duplicate and counts nothing.
+    fx.apply_task_command(admission)
+        .await
+        .expect("the replay answers");
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot
+            .observations_named(METRIC_AGENT_WAKE_DISPOSITIONS)
+            .len(),
+        1,
+        "a duplicate reply is never counted"
+    );
+
+    // The epoch's accepted result counts its terminal class, exactly once.
+    let result = epoch_result(&binding, AgentTaskStatus::Completed);
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone())
+    .with_metrics(metrics.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    let reply = root
+        .accept(&result, &fx.router, fx.now())
+        .await
+        .expect("the result is answered");
+    assert!(reply.result().is_accepted(), "the epoch result lands");
+    let replay = root
+        .accept(&result, &fx.router, fx.now())
+        .await
+        .expect("the replay is answered");
+    assert!(replay.is_replayed(), "the second delivery replays");
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_EPOCHS),
+        vec![
+            vec![("outcome".to_string(), "admitted".to_string())],
+            vec![("outcome".to_string(), "completed".to_string())],
+        ],
+        "the settlement counted once, and the replayed delivery not at all"
+    );
+
+    // A lifecycle command counts its transition.
+    let state = rakka_agent::load_agent_task_state(
+        &fx.tasks,
+        &task_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the root state loads")
+    .expect("the root exists");
+    let revision = state
+        .task()
+        .expect("the root is created")
+        .wake_controller
+        .as_ref()
+        .expect("the controller exists")
+        .lifecycle()
+        .lifecycle_revision();
+    fx.apply_task_command(AgentTaskEntityCommand::SuspendContinuousGoal {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::LifecycleSuspend,
+            [TENANT, TASK, "suspend-metrics"],
+        )
+        .expect("the operation id derives"),
+        expected_lifecycle_revision: revision,
+        reason: None,
+        provenance: Box::new(provenance(20)),
+    })
+    .await
+    .expect("the suspend applies");
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        labels_of(&snapshot, METRIC_AGENT_GOAL_LIFECYCLE),
+        vec![vec![("transition".to_string(), "suspended".to_string())]],
+        "the suspend counted its transition"
+    );
+
+    // Everything the whole flow recorded passes the bounded-label guard.
+    for observation in snapshot.observations() {
+        let attributes: Vec<(&str, &str)> = observation
+            .attributes()
+            .iter()
+            .map(|attribute| (attribute.key(), attribute.value()))
+            .collect();
+        validate_agent_domain_metric_attributes(&attributes).unwrap_or_else(|error| {
+            panic!("{}: {error}", observation.name());
+        });
+    }
+}
+
+/// Observed lifecycle flips count exactly like commanded ones: the counter
+/// is the difference of the goal's lifecycle status across the committed
+/// transition, so an escalation auto-suspend on the exchange path and an
+/// expiry observed by a delivery both emit — and a commanded transition
+/// emits exactly once, never doubled by its command label.
+#[tokio::test]
+async fn observed_lifecycle_flips_count_their_transitions() {
+    // Escalation: one failure auto-suspends inside the epoch-result
+    // acceptance — no command anywhere near it.
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let escalating = wake_policy()
+        .with_failure_backoff(AgentWakeBackoffPolicy {
+            escalate_after_failures: Some(1),
+            ..AgentWakeBackoffPolicy::DEFAULT
+        })
+        .expect("the backoff policy is valid");
+    let fx = Fixture::new(ScriptedDispatcher::new()).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(escalating))
+        .await;
+    let binding = scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(binding.clone()).expect("the command derives"))
+        .await
+        .expect("the admission applies");
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone())
+    .with_metrics(metrics.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    root.accept(
+        &epoch_result(&binding, AgentTaskStatus::Failed),
+        &fx.router,
+        fx.now(),
+    )
+    .await
+    .expect("the failed result lands");
+    assert_eq!(
+        labels_of(&metrics.snapshot(), METRIC_AGENT_GOAL_LIFECYCLE),
+        vec![vec![("transition".to_string(), "suspended".to_string())]],
+        "the escalation auto-suspend counted its observed transition"
+    );
+
+    // The commanded resume and retire count exactly once each — the status
+    // difference is the one emitter, so trimming the command labels lost
+    // nothing and doubled nothing.
+    let revision = |state: &rakka_agent::AgentTaskState| {
+        state
+            .task()
+            .expect("the root is created")
+            .wake_controller
+            .as_ref()
+            .expect("the controller exists")
+            .lifecycle()
+            .lifecycle_revision()
+    };
+    let state = rakka_agent::load_agent_task_state(
+        &fx.tasks,
+        &task_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the root state loads")
+    .expect("the root exists");
+    fx.apply_task_command(AgentTaskEntityCommand::ResumeContinuousGoal {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::LifecycleResume,
+            [TENANT, TASK, "resume-metrics"],
+        )
+        .expect("the operation id derives"),
+        expected_lifecycle_revision: revision(&state),
+        provenance: Box::new(provenance(21)),
+    })
+    .await
+    .expect("the resume applies");
+    let state = rakka_agent::load_agent_task_state(
+        &fx.tasks,
+        &task_scope(),
+        &rakka_agent::AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the root state loads")
+    .expect("the root exists");
+    fx.apply_task_command(AgentTaskEntityCommand::RetireContinuousGoal {
+        operation_id: AgentOperationId::new(
+            AgentOperationKind::LifecycleTerminate,
+            [TENANT, TASK, "retire-metrics"],
+        )
+        .expect("the operation id derives"),
+        expected_lifecycle_revision: revision(&state),
+        provenance: Box::new(provenance(22)),
+    })
+    .await
+    .expect("the retire applies");
+    assert_eq!(
+        labels_of(&metrics.snapshot(), METRIC_AGENT_GOAL_LIFECYCLE),
+        vec![
+            vec![("transition".to_string(), "suspended".to_string())],
+            vec![("transition".to_string(), "resumed".to_string())],
+            vec![("transition".to_string(), "retired".to_string())],
+        ],
+        "each commanded transition counted exactly once"
+    );
+
+    // Expiry: a delivery past the policy's expiry is the transition that
+    // observes the flip — the goal was created, which counts nothing, and
+    // then expired without any command.
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let expiring = wake_policy()
+        .with_lifecycle(AgentWakeLifecyclePolicy {
+            expires_at: Some(AgentTimestampMillis::new(500)),
+            ..AgentWakeLifecyclePolicy::DEFAULT
+        })
+        .expect("the lifecycle policy is valid");
+    let fx = Fixture::new(ScriptedDispatcher::new()).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(expiring))
+        .await;
+    fx.clock.store(1_000, Ordering::SeqCst);
+    fx.apply_task_command(
+        wake_admission_command(scheduled_wake_binding(600, ScheduleRevision::INITIAL))
+            .expect("the command derives"),
+    )
+    .await
+    .expect("the late delivery is dispositioned");
+    assert_eq!(
+        labels_of(&metrics.snapshot(), METRIC_AGENT_GOAL_LIFECYCLE),
+        vec![vec![("transition".to_string(), "expired".to_string())]],
+        "the observed expiry counted, and creation counted nothing"
     );
 }
 
