@@ -53,11 +53,11 @@ use rakka_agent_workflow::{
 use serde::de::Error as DeserializeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::budget::AgentBudgetAllocation;
+use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension};
 use crate::definition::{AgentPolicyRef, AgentRevisionNumber, AgentRevisionProvenance};
 use crate::identity::{
     validate_tenant, validated_id, AgentGoalId, AgentIdentityError, AgentOperationId,
-    AgentOperationKind, AgentWakeId, TenantId,
+    AgentOperationKind, AgentRunId, AgentTaskId, AgentWakeId, TenantId,
 };
 use crate::schema::{
     AgentRecordKind, VersionedAgentRecord, CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
@@ -283,6 +283,56 @@ pub fn wake_admission_operation_id(
 ) -> AgentWakeResult<AgentOperationId> {
     Ok(AgentOperationId::new(
         AgentOperationKind::WakeAdmission,
+        [tenant.as_str(), goal.as_str(), wake.as_str()],
+    )?)
+}
+
+/// Derives the finite child task one admitted wake's epoch runs as
+/// ([specification 6.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The identity is derived, never generated: `epoch-` plus the wake's own
+/// digest, so replaying an admission resolves to the same child task, the
+/// length is a constant 70 bytes independent of the root control task's id,
+/// and two wakes can never share an epoch. A wake identity that does not
+/// carry the canonical `wake-` prefix was not derived by
+/// [`wake_id_for_occurrence`] and fails closed.
+pub fn epoch_task_id_for_wake(wake: &AgentWakeId) -> AgentWakeResult<AgentTaskId> {
+    let digest = wake
+        .as_str()
+        .strip_prefix(AGENT_WAKE_ID_PREFIX)
+        .ok_or_else(|| AgentWakeError::ForeignWakeId { wake: wake.clone() })?;
+    Ok(AgentTaskId::new(format!("epoch-{digest}"))?)
+}
+
+/// Derives the stable operation id of one epoch's admission
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The epoch-creation exchange the controller owes deduplicates on it, so a
+/// replayed admission resolves to the same child epoch rather than creating a
+/// second one.
+pub fn epoch_admission_operation_id(
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    wake: &AgentWakeId,
+) -> AgentWakeResult<AgentOperationId> {
+    Ok(AgentOperationId::new(
+        AgentOperationKind::EpochAdmission,
+        [tenant.as_str(), goal.as_str(), wake.as_str()],
+    )?)
+}
+
+/// Derives the stable operation id of one epoch's result exchange
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The completed epoch task owes its result to the controller under it, so a
+/// replayed completion resolves to the same release rather than a second one.
+pub fn epoch_result_operation_id(
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    wake: &AgentWakeId,
+) -> AgentWakeResult<AgentOperationId> {
+    Ok(AgentOperationId::new(
+        AgentOperationKind::EpochResult,
         [tenant.as_str(), goal.as_str(), wake.as_str()],
     )?)
 }
@@ -976,6 +1026,16 @@ impl AgentWakePolicy {
             if goal_window.ceiling.is_unbounded() {
                 return Err(AgentWakeError::WindowCeilingUnbounded);
             }
+            for dimension in AgentBudgetDimension::CONSERVED {
+                if goal_window.ceiling.get(dimension).is_some()
+                    && self.epoch_budget.get(dimension).is_none()
+                {
+                    // An unbounded epoch dimension can never be charged
+                    // against a bounded window ceiling: the very first
+                    // admission would exhaust it.
+                    return Err(AgentWakeError::WindowEpochUnbounded { dimension });
+                }
+            }
         }
         self.failure_backoff.validate()?;
         self.lifecycle.validate()?;
@@ -1108,11 +1168,33 @@ pub const AGENT_WAKE_ACTIVE_CAPACITY: usize = 8;
 /// for deduplication beyond the operation-log window.
 pub const AGENT_WAKE_RECENT_CAPACITY: usize = 16;
 
+/// The finite child epoch one admitted occurrence executes as
+/// ([specification 6.5](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEpochRef {
+    /// The epoch's derived child task.
+    pub task: AgentTaskId,
+    /// The run serving the epoch's first assignment generation.
+    pub run: AgentRunId,
+}
+
 /// One admitted occurrence currently owning execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentActiveWake {
     binding: AgentWakeBinding,
     admitted_at: AgentTimestampMillis,
+    /// Whether this occurrence was admitted as a downtime backlog's coalesced
+    /// representative. While it runs, later missed occurrences of the same
+    /// backlog are absorbed rather than parked, so one downtime yields one
+    /// epoch. Records persisted before this field load as ordinary
+    /// admissions.
+    #[serde(default)]
+    representative: bool,
+    /// The finite child epoch this occurrence created, once the admitting
+    /// transition attached it. Records persisted before this field load
+    /// without one.
+    #[serde(default)]
+    epoch: Option<AgentEpochRef>,
 }
 
 impl AgentActiveWake {
@@ -1126,6 +1208,131 @@ impl AgentActiveWake {
     #[must_use]
     pub const fn admitted_at(&self) -> AgentTimestampMillis {
         self.admitted_at
+    }
+
+    /// Whether the occurrence is a downtime backlog's coalesced
+    /// representative.
+    #[must_use]
+    pub const fn is_representative(&self) -> bool {
+        self.representative
+    }
+
+    /// The finite child epoch this occurrence executes as, once attached.
+    #[must_use]
+    pub const fn epoch(&self) -> Option<&AgentEpochRef> {
+        self.epoch.as_ref()
+    }
+}
+
+/// The durable ledger of one goal-window ceiling
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)): when the
+/// current window began in logical time, and what admitted epochs have
+/// consumed of it.
+///
+/// Refill is the ledger being replaced when an admission's logical time
+/// crosses the window boundary — a persisted transition riding the recorded
+/// admission, never an effect of a restart, activation, or shard movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWakeWindowLedger {
+    window_start: AgentTimestampMillis,
+    consumed: AgentBudgetConsumption,
+}
+
+impl AgentWakeWindowLedger {
+    /// When the current window began, in logical time.
+    #[must_use]
+    pub const fn window_start(&self) -> AgentTimestampMillis {
+        self.window_start
+    }
+
+    /// What admitted epochs have consumed within the current window.
+    #[must_use]
+    pub const fn consumed(&self) -> &AgentBudgetConsumption {
+        &self.consumed
+    }
+}
+
+const MILLIS_PER_DAY: u64 = 86_400_000;
+
+/// Civil year and month of a day count since 1970-01-01 (UTC), by the
+/// classic era-based algorithm.
+const fn civil_year_month(days: u64) -> (u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year, month)
+}
+
+/// Day count since 1970-01-01 (UTC) of the first day of a civil month.
+const fn days_of_month_start(year: u64, month: u64) -> u64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year / 400;
+    let yoe = year % 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The UTC-aligned start of the calendar window containing `now`.
+const fn calendar_window_start(unit: AgentCalendarUnit, now: AgentTimestampMillis) -> u64 {
+    let days = now.as_millis() / MILLIS_PER_DAY;
+    match unit {
+        AgentCalendarUnit::Day => days * MILLIS_PER_DAY,
+        AgentCalendarUnit::Week => {
+            // 1970-01-01 was a Thursday; weeks start on Monday.
+            let weekday = (days + 3) % 7;
+            (days - weekday) * MILLIS_PER_DAY
+        }
+        AgentCalendarUnit::Month => {
+            let (year, month) = civil_year_month(days);
+            days_of_month_start(year, month) * MILLIS_PER_DAY
+        }
+    }
+}
+
+/// The start of the window containing `now`, given where the previous window
+/// began.
+fn advance_window_start(
+    window: &AgentBudgetWindow,
+    previous: AgentTimestampMillis,
+    now: AgentTimestampMillis,
+) -> AgentTimestampMillis {
+    match window {
+        AgentBudgetWindow::Rolling { length_millis } => {
+            let elapsed = now.as_millis().saturating_sub(previous.as_millis());
+            let advanced = previous.as_millis() + (elapsed / length_millis) * length_millis;
+            AgentTimestampMillis::new(advanced)
+        }
+        AgentBudgetWindow::Calendar { unit } => {
+            let boundary = calendar_window_start(*unit, now);
+            // Logical time is monotone, but fail safe: a boundary can never
+            // regress behind the window already in force.
+            if boundary > previous.as_millis() {
+                AgentTimestampMillis::new(boundary)
+            } else {
+                previous
+            }
+        }
+    }
+}
+
+/// The start of the first window a goal-window ceiling opens.
+fn initial_window_start(
+    window: &AgentBudgetWindow,
+    now: AgentTimestampMillis,
+) -> AgentTimestampMillis {
+    match window {
+        // A rolling window is anchored at the first charge.
+        AgentBudgetWindow::Rolling { .. } => now,
+        AgentBudgetWindow::Calendar { unit } => {
+            AgentTimestampMillis::new(calendar_window_start(*unit, now))
+        }
     }
 }
 
@@ -1156,6 +1363,9 @@ pub struct AgentWakeCounters {
     /// Active occurrences released by a completed execution.
     #[serde(default)]
     pub released: u64,
+    /// Occurrences parked because the goal-window ceiling was exhausted.
+    #[serde(default)]
+    pub deferred: u64,
 }
 
 /// How the controller dispositioned one wake delivery
@@ -1194,6 +1404,15 @@ pub enum AgentWakeDisposition {
         /// The skipped wake.
         wake: AgentWakeId,
     },
+    /// The occurrence was parked because the goal-window ceiling is
+    /// exhausted; it retries when the window refills or an active occurrence
+    /// releases.
+    Deferred {
+        /// The parked wake.
+        wake: AgentWakeId,
+        /// The dimension whose window ceiling refused the epoch.
+        dimension: AgentBudgetDimension,
+    },
     /// The occurrence carried an obsolete schedule revision and was fenced.
     Fenced {
         /// The fenced wake.
@@ -1219,6 +1438,7 @@ impl AgentWakeDisposition {
             Self::AdmittedCoalesced { .. } => "admitted-coalesced",
             Self::Coalesced { .. } => "coalesced",
             Self::Skipped { .. } => "skipped",
+            Self::Deferred { .. } => "deferred",
             Self::Fenced { .. } => "fenced",
             Self::Duplicate { .. } => "duplicate",
         }
@@ -1232,6 +1452,7 @@ impl AgentWakeDisposition {
             | Self::AdmittedCoalesced { wake }
             | Self::Coalesced { wake, .. }
             | Self::Skipped { wake }
+            | Self::Deferred { wake, .. }
             | Self::Fenced { wake, .. }
             | Self::Duplicate { wake } => wake,
         }
@@ -1257,6 +1478,10 @@ pub struct AgentWakeRelease {
     pub released: AgentWakeId,
     /// The parked wake promoted into the freed slot, when one was waiting.
     pub admitted_next: Option<AgentWakeId>,
+    /// The released occurrence's epoch, when one was attached. Records
+    /// persisted before this field load without one.
+    #[serde(default)]
+    pub epoch: Option<AgentEpochRef>,
 }
 
 /// What one wake transition of the controller recorded.
@@ -1327,6 +1552,7 @@ pub struct AgentWakeControllerState {
     last_admitted: Option<AgentWakeId>,
     last_admitted_at: Option<AgentTimestampMillis>,
     counters: AgentWakeCounters,
+    window: Option<AgentWakeWindowLedger>,
 }
 
 impl AgentWakeControllerState {
@@ -1364,6 +1590,91 @@ impl AgentWakeControllerState {
     #[must_use]
     pub const fn counters(&self) -> &AgentWakeCounters {
         &self.counters
+    }
+
+    /// The goal-window ledger, once a windowed admission opened one.
+    #[must_use]
+    pub const fn window(&self) -> Option<&AgentWakeWindowLedger> {
+        self.window.as_ref()
+    }
+
+    /// Charges one epoch's allocation against the goal-window ceiling,
+    /// refilling the window first when the admission's logical time crossed
+    /// its boundary.
+    ///
+    /// The refill persists even when the charge is then refused: crossing the
+    /// boundary is a logical-time fact, and recording it inside the same
+    /// transition that observed it is exactly what keeps refill independent
+    /// of restarts. An epoch dimension the policy leaves unbounded cannot be
+    /// charged against a bounded ceiling and is refused closed — the policy
+    /// constructor already rejects that combination.
+    fn charge_goal_window(
+        &mut self,
+        ceiling: &AgentGoalWindowCeiling,
+        epoch_budget: &AgentBudgetAllocation,
+        now: AgentTimestampMillis,
+    ) -> Result<(), AgentBudgetDimension> {
+        let start = match self.window {
+            Some(ledger) => advance_window_start(&ceiling.window, ledger.window_start(), now),
+            None => initial_window_start(&ceiling.window, now),
+        };
+        if self
+            .window
+            .is_none_or(|ledger| ledger.window_start() != start)
+        {
+            self.window = Some(AgentWakeWindowLedger {
+                window_start: start,
+                consumed: AgentBudgetConsumption::zero(),
+            });
+        }
+        let mut ledger = self.window.expect("the window was just ensured");
+        for dimension in AgentBudgetDimension::CONSERVED {
+            if let Some(limit) = ceiling.ceiling.get(dimension) {
+                let Some(requested) = epoch_budget.get(dimension) else {
+                    return Err(dimension);
+                };
+                if ledger.consumed.get(dimension).saturating_add(requested) > limit {
+                    return Err(dimension);
+                }
+            }
+        }
+        for dimension in AgentBudgetDimension::CONSERVED {
+            if ceiling.ceiling.get(dimension).is_some() {
+                if let Some(requested) = epoch_budget.get(dimension) {
+                    ledger.consumed.add(dimension, requested);
+                }
+            }
+        }
+        self.window = Some(ledger);
+        Ok(())
+    }
+
+    /// Admits the binding when the goal window can pay for its epoch, and
+    /// parks it as deferred otherwise.
+    fn admit_or_defer(
+        &mut self,
+        policy: &AgentWakePolicy,
+        binding: AgentWakeBinding,
+        now: AgentTimestampMillis,
+        coalesced: bool,
+        representative: bool,
+    ) -> AgentWakeDisposition {
+        if let Some(ceiling) = &policy.goal_window {
+            if let Err(dimension) = self.charge_goal_window(ceiling, &policy.epoch_budget, now) {
+                let wake = binding.wake_id().clone();
+                let parked = self.coalesce(policy, binding);
+                return match parked {
+                    // A full catch-up queue skips the overflow even when the
+                    // proximate cause was the window.
+                    skipped @ AgentWakeDisposition::Skipped { .. } => skipped,
+                    _ => {
+                        self.counters.deferred += 1;
+                        AgentWakeDisposition::Deferred { wake, dimension }
+                    }
+                };
+            }
+        }
+        self.admit_binding(binding, now, coalesced, representative)
     }
 
     /// Whether the controller already holds or recently dispositioned a wake.
@@ -1429,14 +1740,11 @@ impl AgentWakeControllerState {
         if self.contains(&wake) {
             return Ok(AgentWakeDisposition::Duplicate { wake });
         }
-        if let Some(due_at) = binding.due_at() {
-            if self
-                .scheduled_watermark
-                .is_some_and(|watermark| due_at.as_millis() <= watermark.as_millis())
-            {
-                return Ok(AgentWakeDisposition::Duplicate { wake });
-            }
-        }
+        // The fence runs before the watermark: an obsolete occurrence is
+        // fenced whatever its due time, and its due time never advances the
+        // watermark — the watermark orders the *current* schedule's
+        // occurrences only, so a future-dated obsolete straggler cannot
+        // swallow the occurrences the new schedule legitimately issues.
         if offered < current_revision {
             self.note_seen(&binding);
             self.counters.fenced += 1;
@@ -1445,6 +1753,14 @@ impl AgentWakeControllerState {
                 offered,
                 current: current_revision,
             });
+        }
+        if let Some(due_at) = binding.due_at() {
+            if self
+                .scheduled_watermark
+                .is_some_and(|watermark| due_at.as_millis() <= watermark.as_millis())
+            {
+                return Ok(AgentWakeDisposition::Duplicate { wake });
+            }
         }
         let lateness = binding
             .due_at()
@@ -1468,20 +1784,23 @@ impl AgentWakeControllerState {
             return Ok(self.coalesce_or_admit(policy, binding, now));
         }
         if self.active.len() < Self::active_capacity(policy) {
-            Ok(self.admit_binding(binding, now, false))
+            Ok(self.admit_or_defer(policy, binding, now, false, false))
         } else {
             Ok(self.coalesce(policy, binding))
         }
     }
 
     /// Releases an active occurrence, promoting the oldest parked occurrence
-    /// into the freed slot.
+    /// into the freed slot when the goal window can pay for its epoch.
     ///
     /// The promotion happens inside this same transition: the coalesced
     /// occurrence's epoch follows the released one without any further
-    /// trigger, which is what keeps the default overlap policy live.
+    /// trigger, which is what keeps the default overlap policy live. A parked
+    /// occurrence the window cannot pay for stays parked; the next release or
+    /// admission retries it after the refill its logical time earns.
     pub fn release(
         &mut self,
+        policy: &AgentWakePolicy,
         wake: &AgentWakeId,
         now: AgentTimestampMillis,
     ) -> AgentWakeResult<AgentWakeRelease> {
@@ -1492,34 +1811,69 @@ impl AgentWakeControllerState {
         else {
             return Err(AgentWakeError::NotActive { wake: wake.clone() });
         };
-        self.active.remove(index);
+        let released = self.active.remove(index);
         self.counters.released += 1;
-        let admitted_next = if self.pending.is_empty() {
-            None
-        } else {
+        let affordable = !self.pending.is_empty()
+            && match &policy.goal_window {
+                Some(ceiling) => self
+                    .charge_goal_window(ceiling, &policy.epoch_budget, now)
+                    .is_ok(),
+                None => true,
+            };
+        let admitted_next = if affordable {
             let binding = self.pending.remove(0);
             let next = binding.wake_id().clone();
-            self.admit_binding(binding, now, true);
+            self.admit_binding(binding, now, true, false);
             Some(next)
+        } else {
+            None
         };
         Ok(AgentWakeRelease {
             released: wake.clone(),
             admitted_next,
+            epoch: released.epoch,
         })
     }
 
-    /// Fences every parked occurrence constructed under a revision older than
-    /// the one now in force, returning how many were fenced.
+    /// Attaches the finite child epoch an admitting transition created to its
+    /// active occurrence.
+    ///
+    /// The attachment happens inside the same durable transition as the
+    /// admission and the owed epoch-creation exchange, so the controller can
+    /// never durably hold an admitted occurrence while having forgotten which
+    /// epoch it created.
+    pub fn attach_epoch(
+        &mut self,
+        wake: &AgentWakeId,
+        epoch: AgentEpochRef,
+    ) -> AgentWakeResult<()> {
+        let Some(active) = self
+            .active
+            .iter_mut()
+            .find(|active| active.binding.wake_id() == wake)
+        else {
+            return Err(AgentWakeError::NotActive { wake: wake.clone() });
+        };
+        active.epoch = Some(epoch);
+        Ok(())
+    }
+
+    /// Takes a schedule update into the controller: fences every parked
+    /// occurrence constructed under an older revision and resets the
+    /// scheduled-due-time watermark, returning how many were fenced.
     ///
     /// A schedule update calls this so an occurrence the old schedule parked
-    /// can never admit an epoch the new schedule did not issue. Active
-    /// occurrences are untouched: they were already admitted.
-    pub fn fence_obsolete_pending(&mut self, current_revision: ScheduleRevision) -> u64 {
+    /// can never admit an epoch the new schedule did not issue, and so the
+    /// new schedule starts a fresh due-time sequence — it may legitimately
+    /// issue occurrences due at or below whatever the old schedule reached.
+    /// Active occurrences are untouched: they were already admitted.
+    pub fn apply_schedule_update(&mut self, current_revision: ScheduleRevision) -> u64 {
         let before = self.pending.len();
         self.pending
             .retain(|binding| binding.schedule_revision() >= current_revision);
         let fenced = (before - self.pending.len()) as u64;
         self.counters.fenced += fenced;
+        self.scheduled_watermark = None;
         fenced
     }
 
@@ -1531,17 +1885,34 @@ impl AgentWakeControllerState {
     ) -> AgentWakeDisposition {
         match policy.missed_occurrence {
             AgentMissedOccurrencePolicy::AdmitOneCoalesced => {
-                self.coalesce_or_admit(policy, binding, now)
+                if self.active.len() < Self::active_capacity(policy) {
+                    self.admit_or_defer(policy, binding, now, true, true)
+                } else if self.active.iter().any(AgentActiveWake::is_representative) {
+                    // The active occurrence is already this downtime backlog's
+                    // coalesced representative: later missed occurrences of
+                    // the backlog are absorbed by it, so one downtime yields
+                    // exactly one epoch rather than a representative plus an
+                    // echo ([specification 21.1](../../../docs/plans/rakka-agent/spec.md)
+                    // item 2).
+                    let wake = binding.wake_id().clone();
+                    self.note_consumed(&binding);
+                    self.counters.missed += 1;
+                    AgentWakeDisposition::Skipped { wake }
+                } else {
+                    // A normal epoch is running: the backlog parks exactly one
+                    // representative behind it, admitted when it releases.
+                    self.coalesce(policy, binding)
+                }
             }
             AgentMissedOccurrencePolicy::Skip => {
                 let wake = binding.wake_id().clone();
-                self.note_seen(&binding);
+                self.note_consumed(&binding);
                 self.counters.missed += 1;
                 AgentWakeDisposition::Skipped { wake }
             }
             AgentMissedOccurrencePolicy::BoundedCatchUp { .. } => {
                 if self.active.len() < Self::active_capacity(policy) {
-                    self.admit_binding(binding, now, true)
+                    self.admit_or_defer(policy, binding, now, true, false)
                 } else {
                     self.coalesce(policy, binding)
                 }
@@ -1556,7 +1927,7 @@ impl AgentWakeControllerState {
         now: AgentTimestampMillis,
     ) -> AgentWakeDisposition {
         if self.active.len() < Self::active_capacity(policy) {
-            self.admit_binding(binding, now, true)
+            self.admit_or_defer(policy, binding, now, true, false)
         } else {
             self.coalesce(policy, binding)
         }
@@ -1568,7 +1939,7 @@ impl AgentWakeControllerState {
         binding: AgentWakeBinding,
     ) -> AgentWakeDisposition {
         let wake = binding.wake_id().clone();
-        self.note_seen(&binding);
+        self.note_consumed(&binding);
         let capacity = Self::pending_capacity(policy);
         if self.pending.len() < capacity {
             self.pending.push(binding);
@@ -1602,12 +1973,15 @@ impl AgentWakeControllerState {
         binding: AgentWakeBinding,
         now: AgentTimestampMillis,
         coalesced: bool,
+        representative: bool,
     ) -> AgentWakeDisposition {
         let wake = binding.wake_id().clone();
-        self.note_seen(&binding);
+        self.note_consumed(&binding);
         self.active.push(AgentActiveWake {
             binding,
             admitted_at: now,
+            representative,
+            epoch: None,
         });
         self.last_admitted = Some(wake.clone());
         self.last_admitted_at = Some(now);
@@ -1619,11 +1993,22 @@ impl AgentWakeControllerState {
         }
     }
 
+    /// Remembers a dispositioned wake in the bounded recent ring, without
+    /// touching the watermark — what a fence records: the occurrence was
+    /// answered, but it belongs to an obsolete schedule whose due times must
+    /// not order the current one's.
     fn note_seen(&mut self, binding: &AgentWakeBinding) {
         self.recent.push(binding.wake_id().clone());
         if self.recent.len() > AGENT_WAKE_RECENT_CAPACITY {
             self.recent.remove(0);
         }
+    }
+
+    /// Remembers a wake the controller consumed — admitted, coalesced, or
+    /// skipped — advancing the scheduled-due-time watermark it deduplicates
+    /// later redeliveries against.
+    fn note_consumed(&mut self, binding: &AgentWakeBinding) {
+        self.note_seen(binding);
         if let Some(due_at) = binding.due_at() {
             let advanced = self
                 .scheduled_watermark
@@ -1675,6 +2060,8 @@ impl<'de> Deserialize<'de> for AgentWakeControllerState {
             last_admitted_at: Option<AgentTimestampMillis>,
             #[serde(default)]
             counters: AgentWakeCounters,
+            #[serde(default)]
+            window: Option<AgentWakeWindowLedger>,
         }
 
         let record = Record::deserialize(deserializer)?;
@@ -1686,6 +2073,7 @@ impl<'de> Deserialize<'de> for AgentWakeControllerState {
             last_admitted: record.last_admitted,
             last_admitted_at: record.last_admitted_at,
             counters: record.counters,
+            window: record.window,
         };
         state.validate().map_err(DeserializeError::custom)?;
         Ok(state)
@@ -1743,6 +2131,12 @@ pub enum AgentWakeError {
     RenewalWithoutExpiry,
     /// A goal window whose ceiling bounds nothing.
     WindowCeilingUnbounded,
+    /// A goal window bounding a dimension the per-epoch budget leaves
+    /// unbounded.
+    WindowEpochUnbounded {
+        /// The dimension the ceiling bounds but the epoch budget does not.
+        dimension: AgentBudgetDimension,
+    },
     /// An epoch with neither a bounded budget dimension nor a deadline.
     EpochUnbounded,
     /// A binding carrying a schedule revision ahead of the controller's: no
@@ -1761,6 +2155,12 @@ pub enum AgentWakeError {
     /// A release of a wake that is not active.
     NotActive {
         /// The wake that was not active.
+        wake: AgentWakeId,
+    },
+    /// A wake identity that was not derived by this crate's construction, so
+    /// no epoch identity can be derived from it.
+    ForeignWakeId {
+        /// The underived wake identity.
         wake: AgentWakeId,
     },
     /// A persisted controller state exceeding its bounded capacities.
@@ -1789,10 +2189,12 @@ impl AgentWakeError {
             Self::ZeroRetirementOccurrences => "wake-zero-retirement-occurrences",
             Self::RenewalWithoutExpiry => "wake-renewal-without-expiry",
             Self::WindowCeilingUnbounded => "wake-window-ceiling-unbounded",
+            Self::WindowEpochUnbounded { .. } => "wake-window-epoch-unbounded",
             Self::EpochUnbounded => "wake-epoch-unbounded",
             Self::RevisionAhead { .. } => "wake-revision-ahead",
             Self::TriggerNotAllowed { .. } => "wake-trigger-not-allowed",
             Self::NotActive { .. } => "wake-not-active",
+            Self::ForeignWakeId { .. } => "wake-foreign-id",
             Self::StateOutOfBounds { .. } => "wake-state-out-of-bounds",
         }
     }
@@ -1847,6 +2249,10 @@ impl Display for AgentWakeError {
             Self::WindowCeilingUnbounded => {
                 f.write_str("a goal window ceiling must bound at least one dimension")
             }
+            Self::WindowEpochUnbounded { dimension } => write!(
+                f,
+                "the goal window bounds {dimension:?}, which the per-epoch budget leaves unbounded; the first admission would exhaust the window"
+            ),
             Self::EpochUnbounded => f.write_str(
                 "an epoch must be bounded: set a deadline or bound at least one budget dimension",
             ),
@@ -1860,6 +2266,10 @@ impl Display for AgentWakeError {
             Self::NotActive { wake } => {
                 write!(f, "the wake {wake} is not an active occurrence")
             }
+            Self::ForeignWakeId { wake } => write!(
+                f,
+                "the wake {wake} was not derived by this crate's construction; no epoch identity derives from it"
+            ),
             Self::StateOutOfBounds { detail } => write!(
                 f,
                 "the persisted wake controller state exceeds its bound on {detail}"
@@ -2244,7 +2654,7 @@ mod tests {
             .expect("the second occurrence should coalesce");
 
         let release = controller
-            .release(&first_wake, now(5_000))
+            .release(&policy, &first_wake, now(5_000))
             .expect("the active occurrence should release");
         assert_eq!(release.released, first_wake);
         assert_eq!(release.admitted_next, Some(second_wake.clone()));
@@ -2255,7 +2665,7 @@ mod tests {
         assert_eq!(controller.counters().released, 1);
 
         let error = controller
-            .release(&first_wake, now(5_001))
+            .release(&policy, &first_wake, now(5_001))
             .expect_err("releasing a wake that is not active should be refused");
         assert_eq!(error.code(), "wake-not-active");
     }
@@ -2322,7 +2732,7 @@ mod tests {
         // Even after the occurrence releases and leaves every slot, the
         // scheduled watermark still answers a late redelivery as a duplicate.
         controller
-            .release(&wake, now(10_000))
+            .release(&policy, &wake, now(10_000))
             .expect("the active occurrence should release");
         let late = controller
             .admit(
@@ -2356,7 +2766,7 @@ mod tests {
         assert!(matches!(fresh, AgentWakeDisposition::Admitted { .. }));
         let active = controller.active()[0].binding().wake_id().clone();
         controller
-            .release(&active, now(140_000))
+            .release(&policy, &active, now(140_000))
             .expect("the active occurrence should release");
 
         // Between the window and the maximum lateness: coalesced, which in an
@@ -2493,7 +2903,7 @@ mod tests {
             )
             .expect("the second occurrence should coalesce");
 
-        let fenced = controller.fence_obsolete_pending(ScheduleRevision::INITIAL.next());
+        let fenced = controller.apply_schedule_update(ScheduleRevision::INITIAL.next());
         assert_eq!(fenced, 1);
         assert!(controller.pending().is_empty());
         assert_eq!(
@@ -2502,6 +2912,417 @@ mod tests {
             "an already-admitted occurrence is not fenced by a schedule update"
         );
         assert_eq!(controller.counters().fenced, 1);
+    }
+
+    #[test]
+    fn the_epoch_identity_is_derived_from_the_wake() {
+        let occurrence = AgentWakeOccurrence::Scheduled {
+            due_at: AgentTimestampMillis::new(1_753_500_000_000),
+        };
+        let wake =
+            wake_id_for_occurrence(&tenant(), &goal(), ScheduleRevision::INITIAL, &occurrence)
+                .expect("the wake derives");
+        let task = epoch_task_id_for_wake(&wake).expect("the epoch task derives");
+
+        // Pinned golden vector: the epoch id is the wake digest under the
+        // `epoch-` prefix — a persisted compatibility surface exactly like
+        // the wake derivation it extends.
+        assert_eq!(
+            task.as_str(),
+            "epoch-73e57f72c96f774e5dd6f15cc0d3fb10f758ab6b1c59ebd7b0389e074cc8f392"
+        );
+        assert_eq!(task.as_str().len(), 70);
+        assert_eq!(
+            epoch_task_id_for_wake(&wake).expect("the derivation is stable"),
+            task
+        );
+
+        let foreign = AgentWakeId::new("not-a-derived-wake").expect("the id is a valid segment");
+        let error =
+            epoch_task_id_for_wake(&foreign).expect_err("an underived wake identity fails closed");
+        assert_eq!(error.code(), "wake-foreign-id");
+    }
+
+    #[test]
+    fn a_fenced_occurrence_never_advances_the_watermark() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let current = ScheduleRevision::new(2);
+
+        // A future-dated straggler from the obsolete schedule is fenced —
+        // and its due time must not order the new schedule's occurrences.
+        let fenced = controller
+            .admit(
+                &policy,
+                current,
+                scheduled_binding(500_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the straggler is dispositioned");
+        assert!(matches!(fenced, AgentWakeDisposition::Fenced { .. }));
+
+        // The new schedule legitimately issues an earlier due time: it must
+        // admit, not be swallowed as a duplicate of the fenced straggler.
+        let admitted = controller
+            .admit(
+                &policy,
+                current,
+                scheduled_binding(1_000, current),
+                now(1_010),
+            )
+            .expect("the current occurrence is dispositioned");
+        assert!(matches!(admitted, AgentWakeDisposition::Admitted { .. }));
+    }
+
+    #[test]
+    fn the_fence_runs_before_the_watermark() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let current = ScheduleRevision::new(2);
+
+        // The current schedule has consumed up to due time 5_000.
+        controller
+            .admit(
+                &policy,
+                current,
+                scheduled_binding(5_000, current),
+                now(5_010),
+            )
+            .expect("the current occurrence admits");
+
+        // An obsolete occurrence below that watermark is *fenced*, not
+        // silently swallowed as a duplicate: the fence is the stronger fact,
+        // and the fenced counter must record it.
+        let stale = controller
+            .admit(
+                &policy,
+                current,
+                scheduled_binding(4_000, ScheduleRevision::INITIAL),
+                now(5_020),
+            )
+            .expect("the stale occurrence is dispositioned");
+        assert!(matches!(stale, AgentWakeDisposition::Fenced { .. }));
+        assert_eq!(controller.counters().fenced, 1);
+    }
+
+    #[test]
+    fn a_schedule_update_resets_the_watermark() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(5_000, ScheduleRevision::INITIAL),
+                now(5_010),
+            )
+            .expect("the first occurrence admits");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller
+            .release(&policy, &wake, now(6_000))
+            .expect("the occurrence releases");
+
+        // The update fences nothing here, but it must reset the due-time
+        // watermark: the new schedule may issue due times at or below what
+        // the old schedule reached.
+        let next = ScheduleRevision::INITIAL.next();
+        assert_eq!(controller.apply_schedule_update(next), 0);
+        let admitted = controller
+            .admit(&policy, next, scheduled_binding(1_000, next), now(6_010))
+            .expect("the new schedule's occurrence is dispositioned");
+        assert!(
+            matches!(admitted, AgentWakeDisposition::Admitted { .. }),
+            "an earlier due time under the new revision admits, got {admitted:?}"
+        );
+    }
+
+    #[test]
+    fn a_downtime_backlog_yields_exactly_one_epoch() {
+        let policy = default_policy()
+            .with_maximum_lateness(1_000)
+            .expect("the lateness is accepted");
+        let mut controller = AgentWakeControllerState::new();
+
+        // Three occurrences missed during one downtime. The first admits as
+        // the backlog's coalesced representative; the rest are absorbed by
+        // it — counted missed, never parked — so releasing the
+        // representative finds nothing to promote.
+        let dispositions: Vec<_> = (1..=3)
+            .map(|slot| {
+                controller
+                    .admit(
+                        &policy,
+                        ScheduleRevision::INITIAL,
+                        scheduled_binding(slot * 1_000, ScheduleRevision::INITIAL),
+                        now(1_000_000),
+                    )
+                    .expect("every occurrence is dispositioned")
+            })
+            .collect();
+        assert!(matches!(
+            dispositions[0],
+            AgentWakeDisposition::AdmittedCoalesced { .. }
+        ));
+        assert!(matches!(
+            dispositions[1],
+            AgentWakeDisposition::Skipped { .. }
+        ));
+        assert!(matches!(
+            dispositions[2],
+            AgentWakeDisposition::Skipped { .. }
+        ));
+        assert!(controller.active()[0].is_representative());
+        assert!(controller.pending().is_empty());
+        assert_eq!(controller.counters().admitted, 1);
+        assert_eq!(controller.counters().missed, 2);
+
+        let wake = controller.active()[0].binding().wake_id().clone();
+        let release = controller
+            .release(&policy, &wake, now(1_000_100))
+            .expect("the representative releases");
+        assert!(release.admitted_next.is_none());
+        assert_eq!(controller.counters().admitted, 1);
+
+        // A backlog behind a *normal* epoch still parks its one
+        // representative, admitted at release.
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000_000, ScheduleRevision::INITIAL),
+                now(2_000_010),
+            )
+            .expect("a fresh occurrence admits normally");
+        assert!(!controller.active()[0].is_representative());
+        let parked = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_100_000, ScheduleRevision::INITIAL),
+                now(3_000_000),
+            )
+            .expect("the missed occurrence is dispositioned");
+        assert!(matches!(parked, AgentWakeDisposition::Coalesced { .. }));
+        assert_eq!(controller.pending().len(), 1);
+    }
+
+    fn windowed_policy(length_millis: u64, model_calls: u64) -> AgentWakePolicy {
+        let mut ceiling = AgentBudgetAllocation::unbounded();
+        ceiling.set(AgentBudgetDimension::ModelCalls, Some(model_calls));
+        default_policy()
+            .with_goal_window(AgentGoalWindowCeiling {
+                window: AgentBudgetWindow::Rolling { length_millis },
+                ceiling,
+            })
+            .expect("the windowed policy is valid")
+    }
+
+    #[test]
+    fn the_window_ceiling_defers_an_epoch_it_cannot_pay_for() {
+        // The default policy's epoch costs 16 model calls; a 24-call window
+        // pays for one epoch, then defers the next until the window turns.
+        let policy = windowed_policy(3_600_000, 24);
+        let mut controller = AgentWakeControllerState::new();
+
+        let first = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence is dispositioned");
+        assert!(matches!(first, AgentWakeDisposition::Admitted { .. }));
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller
+            .release(&policy, &wake, now(2_000))
+            .expect("the first epoch releases");
+
+        let second = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(3_000, ScheduleRevision::INITIAL),
+                now(3_000),
+            )
+            .expect("the second occurrence is dispositioned");
+        assert!(
+            matches!(second, AgentWakeDisposition::Deferred { .. }),
+            "the exhausted window defers, got {second:?}"
+        );
+        assert_eq!(controller.counters().deferred, 1);
+        assert_eq!(controller.counters().admitted, 1);
+        assert_eq!(controller.pending().len(), 1, "the deferred wake parks");
+
+        // Releasing with nothing active cannot happen; instead the *next*
+        // admission attempt after the window turns pays for the parked wake's
+        // promotion. Advance past the rolling boundary and admit a fresh
+        // occurrence: the refill is recorded by that same transition.
+        let third = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(4_000_000, ScheduleRevision::INITIAL),
+                now(4_000_000),
+            )
+            .expect("the post-refill occurrence is dispositioned");
+        assert!(
+            matches!(third, AgentWakeDisposition::Admitted { .. }),
+            "the refilled window admits, got {third:?}"
+        );
+        let ledger = controller.window().expect("the window ledger exists");
+        assert_eq!(
+            ledger.consumed().get(AgentBudgetDimension::ModelCalls),
+            16,
+            "the refilled window holds exactly the new epoch's charge"
+        );
+    }
+
+    #[test]
+    fn the_window_refills_only_by_logical_time() {
+        let policy = windowed_policy(3_600_000, 16);
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence admits");
+        let before = controller.window().copied().expect("the ledger exists");
+
+        // A structural restart is a round-trip through the persisted record;
+        // nothing about it may touch the ledger.
+        let json = serde_json::to_value(&controller).expect("the state serializes");
+        let recovered: AgentWakeControllerState =
+            serde_json::from_value(json).expect("the state recovers");
+        assert_eq!(
+            recovered.window().copied().expect("the ledger survives"),
+            before,
+            "recovery neither refills nor consumes"
+        );
+
+        // Inside the same window, the charge is still refused after recovery.
+        let mut controller = recovered;
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller
+            .release(&policy, &wake, now(2_000))
+            .expect("the epoch releases");
+        let deferred = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(3_000, ScheduleRevision::INITIAL),
+                now(3_000),
+            )
+            .expect("the in-window occurrence is dispositioned");
+        assert!(matches!(deferred, AgentWakeDisposition::Deferred { .. }));
+    }
+
+    #[test]
+    fn a_release_promotes_only_what_the_window_can_pay_for() {
+        let policy = windowed_policy(3_600_000, 24);
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence admits");
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_000),
+            )
+            .expect("the second occurrence coalesces");
+        let wake = controller.active()[0].binding().wake_id().clone();
+
+        // 16 of 24 calls are spent; the parked epoch would need 16 more, so
+        // the release promotes nothing and the wake stays parked.
+        let release = controller
+            .release(&policy, &wake, now(3_000))
+            .expect("the epoch releases");
+        assert!(release.admitted_next.is_none());
+        assert_eq!(controller.pending().len(), 1);
+
+        // After the window turns, a release pays for the promotion.
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(4_000_000, ScheduleRevision::INITIAL),
+                now(4_000_000),
+            )
+            .expect("the post-refill occurrence admits");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        let release = controller
+            .release(&policy, &wake, now(7_300_000))
+            .expect("the epoch releases after the next turn");
+        assert!(
+            release.admitted_next.is_some(),
+            "the turned window pays for the parked wake's promotion"
+        );
+    }
+
+    #[test]
+    fn calendar_windows_align_to_utc_boundaries() {
+        // 2026-07-27 (epoch day 20661) is a Monday; 12:00 UTC that day.
+        let monday_noon = 20_661 * MILLIS_PER_DAY + 12 * 3_600_000;
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Day,
+                AgentTimestampMillis::new(monday_noon)
+            ),
+            20_661 * MILLIS_PER_DAY,
+            "the day window starts at midnight UTC"
+        );
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Week,
+                AgentTimestampMillis::new(monday_noon)
+            ),
+            20_661 * MILLIS_PER_DAY,
+            "a Monday noon is inside the week that began that midnight"
+        );
+        // The month began Wednesday 2026-07-01 (epoch day 20635).
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Month,
+                AgentTimestampMillis::new(monday_noon)
+            ),
+            20_635 * MILLIS_PER_DAY,
+            "the month window starts on 2026-07-01T00:00Z"
+        );
+        // A Sunday (2026-07-26, day 20660) belongs to the week that began the
+        // previous Monday (2026-07-20, day 20654).
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Week,
+                AgentTimestampMillis::new(20_660 * MILLIS_PER_DAY + 1)
+            ),
+            20_654 * MILLIS_PER_DAY,
+        );
+    }
+
+    #[test]
+    fn a_window_bounding_an_unbounded_epoch_dimension_is_refused() {
+        let mut ceiling = AgentBudgetAllocation::unbounded();
+        ceiling.set(AgentBudgetDimension::Tokens, Some(1_000_000));
+        let error = default_policy()
+            .with_goal_window(AgentGoalWindowCeiling {
+                window: AgentBudgetWindow::Rolling {
+                    length_millis: 3_600_000,
+                },
+                ceiling,
+            })
+            .expect_err("a ceiling on an unbounded epoch dimension is refused");
+        assert_eq!(error.code(), "wake-window-epoch-unbounded");
     }
 
     #[test]

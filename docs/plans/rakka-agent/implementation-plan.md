@@ -2198,6 +2198,63 @@ Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),
 
 Done when: scenarios 36 and 51 pass.
 
+**Amended as implemented (2026-07-27):**
+
+- **The epoch's identities are derived from the wake.** The child task is
+  `epoch-` plus the wake's own digest (`epoch_task_id_for_wake`, a constant
+  70 bytes independent of the root control task's id length, pinned by a
+  golden vector) and the run is the existing `run_id_for_assignment` at
+  generation one, so a replayed admission resolves to the same child. The
+  epoch contract — task definition, assignee, observation scope — lives on
+  `AgentContinuousGoalSpec` as `AgentEpochSpec` (still only what the
+  controller needs; the full `AgentGoalSpec` remains slice 4.1); a pre-3.3
+  record or a goal without one fails admission closed
+  (`task-epoch-undefined`), rolling the whole admitting transition back.
+- **Admission owes the epoch atomically.** One compare-and-set carries the
+  wake's disposition, the goal-window charge (and any logical-time refill it
+  observed), the escrow debit from the root's own ledger
+  (`AgentEscrowChildId` keyed on the derived run, so a replay never debits
+  twice), the epoch reference on the active slot, and the owed
+  `Creation` exchange — which now carries the debited grant and the wake on
+  `AgentTaskCreation`. Release-time promotion runs the identical path for
+  the promoted occurrence.
+- **Epoch completion returns through a new `AgentExchangeKind::EpochResult`**
+  owed by the epoch task's own transitions once its ledger closes — the run's
+  settlement *and* return have applied — so the consumption it reports is
+  never an early under-count; a cancelled epoch with no outstanding escrow
+  owes it from the cancel transition. The journal's initiation record is the
+  once-guard. The controller's apply verifies the sender is the very task the
+  wake derives (`task-epoch-forged`), settles and returns the epoch's escrow
+  idempotently, releases the wake (an explicit `CompleteWakeOccurrence`
+  having raced is tolerated as already-released — the settlement still
+  counts), and owes the promoted occurrence's epoch creation in the same
+  transition.
+- **The goal window charges the full epoch allocation at admission**
+  (decision locked at planning; unused-budget credit-back is revisited with
+  3.4's observability). The ledger lives on the controller state; refill
+  happens inside whatever recorded transition first observes logical time
+  across the boundary — rolling windows anchored at first charge, calendar
+  windows on UTC civil-date boundaries computed in-crate — and never on
+  restart, activation, or shard movement. An admission the window cannot pay
+  for parks with the new recorded `Deferred` disposition and retries at the
+  next release or admission; a policy whose window bounds a dimension its
+  epoch budget leaves unbounded is refused at construction
+  (`wake-window-epoch-unbounded`).
+- **The next durable wake condition is the parked timer entry.** Schedule
+  computation is application-owned, so the goal's "next wake condition" is
+  the occurrence the schedule layer parks in the durable wake-timer store —
+  which is exactly what scenario 36's test does between epochs; nothing
+  resident stands in for it.
+- **Review carryovers from PR #41 closed.** The obsolete-revision fence now
+  runs before the watermark in `admit()` (a stale binding answers `Fenced`,
+  never a swallowed duplicate), a fence no longer advances the watermark (a
+  future-dated obsolete straggler could otherwise swallow the new schedule's
+  occurrences), `UpdateContinuousSchedule` resets the watermark so a new
+  revision may issue earlier due times, and — resolving the 21.1 question —
+  an active downtime representative *absorbs* later missed occurrences of
+  its backlog (counted `missed`, never parked), so one downtime yields
+  exactly one epoch rather than a representative plus an echo.
+
 ### Slice 3.4 — Continuous lifecycle and M3 acceptance
 
 Spec: [8.2](spec.md#82-continuous-goal-controller-and-epochs),

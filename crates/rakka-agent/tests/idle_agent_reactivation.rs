@@ -180,6 +180,8 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
                         dependencies: vec![AgentTaskDependencyDeclaration::new(
                             AgentTaskId::new(UPSTREAM).expect("task id should be valid"),
                         )],
+                        escrow: None,
+                        wake: None,
                         telemetry: Default::default(),
                     }),
                 }),

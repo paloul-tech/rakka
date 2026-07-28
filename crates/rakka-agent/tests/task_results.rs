@@ -234,6 +234,8 @@ impl Fixture {
             goal_mode: Default::default(),
             parent: None,
             dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
             telemetry: Default::default(),
         };
 

@@ -20,6 +20,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::definition::AgentPolicyRef;
+use crate::identity::{AgentEnvironmentRef, AgentId};
+use crate::task::AgentTaskDefinition;
 use crate::wake::{AgentWakePolicyRevision, ScheduleRevision};
 
 /// Whether a goal terminates after one evaluation of its criteria or operates
@@ -79,4 +81,29 @@ pub struct AgentContinuousGoalSpec {
     /// The reference is application-owned; the controller records which
     /// condition governed each renewal or retirement decision.
     pub health_condition: AgentPolicyRef,
+    /// The epoch contract: what each admitted occurrence executes. Records
+    /// persisted before this field load without one, and the controller then
+    /// refuses epoch admission closed rather than guessing a definition.
+    #[serde(default)]
+    pub epoch: Option<Box<AgentEpochSpec>>,
+}
+
+/// The epoch contract of one continuous goal
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)): the typed
+/// work each admitted occurrence executes as a finite child task and run.
+///
+/// The definition is the epoch's result/evidence contract, and it is
+/// deliberately distinct from the root control task's own definition: the
+/// root coordinates, the epoch works. The observation scope is the authorized
+/// input reference each epoch observes; being an [`AgentEnvironmentRef`], it
+/// can never carry resolved credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEpochSpec {
+    /// The typed task definition every epoch runs under.
+    pub definition: AgentTaskDefinition,
+    /// The agent every epoch is assigned to.
+    pub assignee: AgentId,
+    /// The authorized observation scope each epoch's input references, when
+    /// the goal observes one.
+    pub observation_scope: Option<AgentEnvironmentRef>,
 }
