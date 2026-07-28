@@ -373,6 +373,9 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
+            // An epoch result is a durable transition but not a balance
+            // movement: the probe records the application without crediting.
+            AgentExchangeKind::EpochResult => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or

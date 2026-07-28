@@ -126,6 +126,8 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         goal_mode: Default::default(),
         parent: None,
         dependencies,
+        escrow: None,
+        wake: None,
         telemetry: Default::default(),
     }
 }
@@ -1134,6 +1136,7 @@ fn continuous_mode() -> AgentGoalMode {
         wake_policy: AgentWakePolicyRevision::initial(policy, provenance(1))
             .expect("the initial wake-policy revision is accepted"),
         health_condition: AgentPolicyRef::new("nightly-health").expect("the policy ref is valid"),
+        epoch: None,
     }))
 }
 

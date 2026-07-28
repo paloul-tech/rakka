@@ -72,6 +72,8 @@ async fn the_controller_passivates_between_wakes_and_a_durable_wake_reactivates_
                         goal_mode: continuous_goal_mode(wake_policy()),
                         parent: None,
                         dependencies: Vec::new(),
+                        escrow: None,
+                        wake: None,
                         telemetry: Default::default(),
                     }),
                 }),

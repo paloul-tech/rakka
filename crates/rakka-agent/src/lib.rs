@@ -248,17 +248,18 @@ pub use run::{
     DEFAULT_AGENT_RUN_ENTITY_TYPE,
 };
 
-pub use goal::{AgentContinuousGoalSpec, AgentGoalMode};
+pub use goal::{AgentContinuousGoalSpec, AgentEpochSpec, AgentGoalMode};
 pub use wake::{
+    epoch_admission_operation_id, epoch_result_operation_id, epoch_task_id_for_wake,
     wake_admission_operation_id, wake_id_for_occurrence, AgentActiveWake, AgentBudgetWindow,
-    AgentCalendarUnit, AgentGoalWindowCeiling, AgentMissedOccurrencePolicy, AgentWakeBackoffPolicy,
-    AgentWakeBinding, AgentWakeCallbackId, AgentWakeControllerState, AgentWakeCounters,
-    AgentWakeDisposition, AgentWakeError, AgentWakeEventId, AgentWakeLifecyclePolicy,
-    AgentWakeOccurrence, AgentWakeOutcome, AgentWakeOverlapPolicy, AgentWakePolicy,
-    AgentWakePolicyRevision, AgentWakeRelease, AgentWakeRenewalPolicy, AgentWakeResult,
-    AgentWakeRetirementPolicy, AgentWakeStatusView, AgentWakeSuspensionPolicy,
-    AgentWakeTriggerKind, ScheduleRevision, AGENT_WAKE_ACTIVE_CAPACITY, AGENT_WAKE_ID_PREFIX,
-    AGENT_WAKE_PENDING_CAPACITY, AGENT_WAKE_RECENT_CAPACITY,
+    AgentCalendarUnit, AgentEpochRef, AgentGoalWindowCeiling, AgentMissedOccurrencePolicy,
+    AgentWakeBackoffPolicy, AgentWakeBinding, AgentWakeCallbackId, AgentWakeControllerState,
+    AgentWakeCounters, AgentWakeDisposition, AgentWakeError, AgentWakeEventId,
+    AgentWakeLifecyclePolicy, AgentWakeOccurrence, AgentWakeOutcome, AgentWakeOverlapPolicy,
+    AgentWakePolicy, AgentWakePolicyRevision, AgentWakeRelease, AgentWakeRenewalPolicy,
+    AgentWakeResult, AgentWakeRetirementPolicy, AgentWakeStatusView, AgentWakeSuspensionPolicy,
+    AgentWakeTriggerKind, AgentWakeWindowLedger, ScheduleRevision, AGENT_WAKE_ACTIVE_CAPACITY,
+    AGENT_WAKE_ID_PREFIX, AGENT_WAKE_PENDING_CAPACITY, AGENT_WAKE_RECENT_CAPACITY,
 };
 pub use wake_scanner::{
     wake_admission_command, AgentWakeDelivery, AgentWakeDeliveryFuture, AgentWakeScan,
@@ -314,11 +315,11 @@ pub use task::{
     AgentAcceptedResult, AgentAssignmentGeneration, AgentAssignmentReadiness,
     AgentAssignmentRefusal, AgentAssignmentRefusalReason, AgentAssignmentStatus,
     AgentBudgetLedgerOutcome, AgentBudgetReturn, AgentBudgetSettlement, AgentBudgetTopUpRequest,
-    AgentContentDigest, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentRunAcceptance,
-    AgentRunAssignment, AgentSchemaId, AgentSchemaRef, AgentTask, AgentTaskClock, AgentTaskContent,
-    AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition, AgentTaskDependency,
-    AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntity,
-    AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef,
+    AgentContentDigest, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentEpochResult,
+    AgentRunAcceptance, AgentRunAssignment, AgentSchemaId, AgentSchemaRef, AgentTask,
+    AgentTaskClock, AgentTaskContent, AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition,
+    AgentTaskDependency, AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome,
+    AgentTaskEntity, AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef,
     AgentTaskEntityRegistration, AgentTaskEntityReply, AgentTaskEntityShardingSettings,
     AgentTaskEntityStore, AgentTaskEntityTypeKey, AgentTaskError, AgentTaskHistoryCursor,
     AgentTaskHistoryEntry, AgentTaskHistoryFuture, AgentTaskHistoryKind, AgentTaskHistoryPage,
@@ -329,6 +330,7 @@ pub use task::{
     AgentTaskState, AgentTaskStatus, AgentTaskTerminalReason, InMemoryAgentTaskHistoryStore,
     TypedTask, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
     AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE, AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
+    AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE, AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
     AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
     AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH, AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE,
     AGENT_TASK_CREATION_PAYLOAD_TYPE, AGENT_TASK_DECISION_PAYLOAD_TYPE,

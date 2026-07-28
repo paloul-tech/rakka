@@ -298,10 +298,14 @@ pub fn agent_task_create_command(
             assignee: Some(target.agent.clone()),
             goal: None,
             // An A2A message creates a finite unit of work; a continuous root
-            // control task is instituted by the goal surface, never by ingress.
+            // control task is instituted by the goal surface, never by
+            // ingress — and never an epoch, whose creation only the admitting
+            // controller owes.
             goal_mode: AgentGoalMode::Finite,
             parent: None,
             dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
             telemetry: normalized.telemetry.clone(),
         }),
     })

@@ -186,6 +186,8 @@ async fn a_stale_task_owner_write_is_rejected_and_answered_from_the_authoritativ
             goal_mode: Default::default(),
             parent: None,
             dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
             telemetry: Default::default(),
         }),
     };

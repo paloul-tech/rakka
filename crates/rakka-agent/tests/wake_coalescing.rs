@@ -248,8 +248,10 @@ async fn downtime_admits_at_most_one_coalesced_occurrence() {
         .await;
 
     // Three occurrences became due while no scanner could deliver them, all
-    // now far past the maximum lateness. Recovery must admit at most one
-    // coalesced representative — never unbounded catch-up.
+    // now far past the maximum lateness. Recovery admits exactly one
+    // coalesced representative; the rest of the backlog is absorbed by it —
+    // counted missed, never parked — so one downtime yields one epoch, never
+    // a representative plus an echo.
     for due_at in [1_000, 2_000, 3_000] {
         fx.schedule_wake(due_at, ScheduleRevision::INITIAL).await;
     }
@@ -260,6 +262,18 @@ async fn downtime_admits_at_most_one_coalesced_occurrence() {
         .await
         .expect("the recovery pass runs");
     assert_eq!(scan.outcomes.len(), 3);
+    for outcome in &scan.outcomes[1..] {
+        assert!(
+            matches!(
+                outcome,
+                rakka_agent::AgentWakeScanOutcome::Dispositioned {
+                    disposition: AgentWakeDisposition::Skipped { .. },
+                    ..
+                }
+            ),
+            "the backlog behind the representative is absorbed, got {outcome:?}"
+        );
+    }
 
     let state = controller(&fx).await;
     assert_eq!(
@@ -267,10 +281,12 @@ async fn downtime_admits_at_most_one_coalesced_occurrence() {
         1,
         "downtime admits exactly one coalesced occurrence"
     );
+    assert_eq!(state.counters().missed, 2);
     assert_eq!(state.active().len(), 1);
+    assert!(state.active()[0].is_representative());
     assert!(
-        state.pending().len() <= 1,
-        "the default slot durably coalesces the rest"
+        state.pending().is_empty(),
+        "the absorbed backlog parks nothing behind its representative"
     );
 
     // A second recovery pass finds every entry terminal: nothing replays.

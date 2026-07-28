@@ -685,6 +685,8 @@ pub enum AgentOperationKind {
     WakeAdmission,
     /// Admission of one continuous-goal epoch.
     EpochAdmission,
+    /// A completed epoch returning its result to the controller.
+    EpochResult,
     /// Append of one communal knowledge-graph claim.
     ClaimAppend,
     /// Durable delegation of work to a specialist agent.
@@ -733,6 +735,7 @@ impl AgentOperationKind {
             Self::A2aSend => "a2a-send",
             Self::WakeAdmission => "wake-admission",
             Self::EpochAdmission => "epoch-admission",
+            Self::EpochResult => "epoch-result",
             Self::ClaimAppend => "claim-append",
             Self::Delegation => "delegation",
             Self::Handoff => "handoff",
