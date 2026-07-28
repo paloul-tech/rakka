@@ -299,6 +299,123 @@ async fn a_failed_epoch_backs_off_and_the_parked_rewake_retries_it() {
 }
 
 #[tokio::test]
+async fn an_early_delivered_retry_re_arms_and_the_next_scan_promotes() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let first = scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(first.clone()).expect("the command derives"))
+        .await
+        .expect("the first admission applies");
+    let second = scheduled_wake_binding(10, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(second.clone()).expect("the command derives"))
+        .await
+        .expect("the second delivery coalesces");
+    accept_on_root(&fx, &epoch_result(&first, AgentTaskStatus::Failed)).await;
+    let state = controller(&fx).await;
+    let until = state
+        .lifecycle()
+        .backoff_until()
+        .expect("the backoff is in force");
+    let parked = state
+        .lifecycle()
+        .rewakes()
+        .backoff
+        .expect("the backoff re-wake is owed");
+    assert!(parked.parked, "the settle pass parked it durably");
+
+    // A scanner host whose clock runs ahead delivers the parked retry while
+    // the backoff is still in force on this host: the delivery is applied at
+    // the entity's own (earlier) logical time and the fast scanner marks the
+    // entry fired. Without re-arming, the slot would sit marked parked with
+    // its only timer entry terminal — the parked occurrence stranded.
+    let early_binding = {
+        let store = fx
+            .wake_scanner()
+            .timers_mut()
+            .recover(AgentTimestampMillis::new(0))
+            .await
+            .expect("the store recovers")
+            .clone();
+        store
+            .entries()
+            .values()
+            .find(|entry| {
+                entry.status() == AgentWakeTimerStatus::Pending
+                    && matches!(
+                        entry.binding().occurrence(),
+                        AgentWakeOccurrence::Retry { .. }
+                    )
+            })
+            .expect("the parked retry entry exists")
+            .binding()
+            .clone()
+    };
+    let early_wake = early_binding.wake_id().clone();
+    assert!(
+        fx.now().as_millis() < until.as_millis(),
+        "the delivery is early by this host's clock"
+    );
+    fx.apply_task_command(wake_admission_command(early_binding).expect("the command derives"))
+        .await
+        .expect("the early retry is consumed");
+    fx.wake_scanner()
+        .timers_mut()
+        .mark_fired(&early_wake, fx.now())
+        .await
+        .expect("the fast scanner marks the delivered entry");
+
+    // Nothing promoted, and the consume re-armed the slot: attempt bumped,
+    // the same transition's settle pass parked a fresh entry under a wake
+    // the fired one cannot absorb.
+    let state = controller(&fx).await;
+    assert_eq!(state.counters().retried, 1);
+    assert_eq!(state.counters().admitted, 1, "the backoff still gates");
+    assert_eq!(state.pending().len(), 1, "the occurrence still waits");
+    let slot = state
+        .lifecycle()
+        .rewakes()
+        .backoff
+        .expect("the slot survives the early consume");
+    assert_eq!(slot.due_at, until);
+    assert_eq!(slot.attempt, 1, "the consume bumped the generation");
+    assert!(slot.parked, "the settle pass re-parked the next attempt");
+    let pending: Vec<_> = fx
+        .wake_scanner()
+        .timers_mut()
+        .recover(AgentTimestampMillis::new(0))
+        .await
+        .expect("the store recovers")
+        .entries()
+        .values()
+        .filter(|entry| entry.status() == AgentWakeTimerStatus::Pending)
+        .map(|entry| entry.wake_id().clone())
+        .collect();
+    assert_eq!(pending.len(), 1, "exactly one live retry entry");
+    assert_ne!(pending[0], early_wake, "under a fresh wake identity");
+
+    // Once this host's clock passes the due time, the ordinary scan delivers
+    // the re-armed retry and its transition promotes the parked occurrence.
+    fx.clock.store(until.as_millis() + 1, Ordering::SeqCst);
+    let scan = fx
+        .wake_scanner()
+        .scan_due()
+        .await
+        .expect("the retry pass runs");
+    assert_eq!(scan.outcomes.len(), 1);
+    let state = controller(&fx).await;
+    assert_eq!(state.counters().retried, 2);
+    assert_eq!(state.counters().admitted, 2, "the promotion landed");
+    assert!(state.pending().is_empty());
+    assert_eq!(state.active()[0].binding().wake_id(), second.wake_id());
+    assert!(
+        state.lifecycle().rewakes().backoff.is_none(),
+        "the consumed slot cleared"
+    );
+}
+
+#[tokio::test]
 async fn escalation_suspends_and_the_resume_clears_the_backoff() {
     let policy = wake_policy()
         .with_failure_backoff(AgentWakeBackoffPolicy {

@@ -6104,7 +6104,7 @@ where
         let Some(parker) = self.rewake_parker.clone() else {
             return Ok(0);
         };
-        let owed: Vec<(crate::wake::AgentWakeRewakeCause, AgentTimestampMillis)> = {
+        let owed: Vec<(crate::wake::AgentWakeRewakeCause, AgentTimestampMillis, u64)> = {
             let state = self.state()?;
             let Some(task) = state.task() else {
                 return Ok(0);
@@ -6126,7 +6126,7 @@ where
             .into_iter()
             .filter_map(|(cause, slot)| {
                 slot.filter(|slot| !slot.parked)
-                    .map(|slot| (cause, slot.due_at))
+                    .map(|slot| (cause, slot.due_at, slot.attempt))
             })
             .collect()
         };
@@ -6146,12 +6146,16 @@ where
         };
 
         let mut parked = 0;
-        for (cause, due_at) in owed {
+        for (cause, due_at, attempt) in owed {
             let binding = AgentWakeBinding::new(
                 self.scope.tenant().clone(),
                 goal.clone(),
                 schedule_revision,
-                crate::wake::AgentWakeOccurrence::Retry { due_at, cause },
+                crate::wake::AgentWakeOccurrence::Retry {
+                    due_at,
+                    cause,
+                    attempt,
+                },
                 crate::wake::AgentWakeTriggerKind::Controller,
                 now,
                 policy_revision,
@@ -6172,7 +6176,7 @@ where
                         .as_mut()
                         .and_then(|task| task.wake_controller.as_mut())
                     {
-                        controller.mark_rewake_parked(cause, due_at);
+                        controller.mark_rewake_parked(cause, due_at, attempt);
                     }
                     state.updated_at = now;
                     Ok(Vec::new())

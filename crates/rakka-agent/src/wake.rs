@@ -195,6 +195,14 @@ pub enum AgentWakeOccurrence {
         due_at: AgentTimestampMillis,
         /// What the retry re-attempts.
         cause: AgentWakeRewakeCause,
+        /// Which delivery generation of this re-wake this is. Part of the
+        /// identity: a retry delivered before the controller's own clock
+        /// reaches its due time is consumed without promoting anything, and
+        /// its timer entry goes terminal — the slot re-arms under the next
+        /// attempt so the re-park derives a fresh wake instead of being
+        /// absorbed by the fired entry.
+        #[serde(default)]
+        attempt: u64,
     },
 }
 
@@ -222,8 +230,22 @@ impl AgentWakeOccurrence {
             Self::ExternalEvent { event } => event.as_str().to_string(),
             Self::Command { operation } => operation.as_str().to_string(),
             Self::Callback { callback } => callback.as_str().to_string(),
-            Self::Retry { due_at, cause } => {
+            // Attempt zero keeps the original two-segment form, so every
+            // binding persisted before the attempt generation existed still
+            // re-derives its stored identity.
+            Self::Retry {
+                due_at,
+                cause,
+                attempt: 0,
+            } => {
                 format!("{}:{}", cause.as_label(), due_at.as_millis())
+            }
+            Self::Retry {
+                due_at,
+                cause,
+                attempt,
+            } => {
+                format!("{}:{}:{attempt}", cause.as_label(), due_at.as_millis())
             }
         }
     }
@@ -1452,6 +1474,7 @@ fn merge_rewake_slot(slot: &mut Option<AgentWakeRewake>, desired: Option<AgentTi
         (_, Some(due_at)) => Some(AgentWakeRewake {
             due_at,
             parked: false,
+            attempt: 0,
         }),
     };
 }
@@ -1500,6 +1523,14 @@ pub struct AgentWakeRewake {
     /// transition that owes the re-wake records it unparked; the settle pass
     /// parks it idempotently and marks it.
     pub parked: bool,
+    /// The delivery generation, part of the parked retry's wake identity. A
+    /// retry consumed while its cause still holds — delivered before the
+    /// controller's own clock reached the due time, as a scanner host with a
+    /// faster clock will do — burned its timer entry without doing its work;
+    /// bumping the generation re-owes the slot under a fresh identity the
+    /// fired entry cannot absorb, so the re-wake stays live under clock skew.
+    #[serde(default)]
+    pub attempt: u64,
 }
 
 /// The controller's two per-cause re-wake slots.
@@ -2349,18 +2380,21 @@ impl AgentWakeControllerState {
     }
 
     /// Marks one re-wake slot parked, once the settle pass has durably parked
-    /// its timer entry.
+    /// its timer entry. A mark for a stale generation — the slot re-armed
+    /// under a later attempt since the entry was parked — is a no-op, so the
+    /// re-owed slot stays owed.
     pub fn mark_rewake_parked(
         &mut self,
         cause: AgentWakeRewakeCause,
         due_at: AgentTimestampMillis,
+        attempt: u64,
     ) {
         let slot = match cause {
             AgentWakeRewakeCause::Backoff => &mut self.lifecycle.rewakes.backoff,
             AgentWakeRewakeCause::WindowTurn => &mut self.lifecycle.rewakes.window_turn,
         };
         if let Some(rewake) = slot {
-            if rewake.due_at == due_at {
+            if rewake.due_at == due_at && rewake.attempt == attempt {
                 rewake.parked = true;
             }
         }
@@ -2565,10 +2599,33 @@ impl AgentWakeControllerState {
         // A retry's whole work — promoting whatever is admittable — was
         // already done by the entity's pre-admission promotion pass, so its
         // own arm only consumes it: into the recent ring for duplicate-scan
-        // dedup, counted, never near a time band or an active slot.
-        if retry {
+        // dedup, counted, never near a time band or an active slot. A consume
+        // that matches the current slot burned that generation's timer entry;
+        // re-arming the slot under the next attempt keeps the re-wake live
+        // when the cause still holds — a scanner clock ahead of this host's
+        // delivers the retry before the backoff elapses or the window turns
+        // here, and without the bump the parked occurrences would strand
+        // behind a slot marked parked whose only entry is terminal. When the
+        // pre-admit promotion did the work instead, `ensure_rewakes` clears
+        // the slot and the bump is moot.
+        if let AgentWakeOccurrence::Retry {
+            due_at,
+            cause,
+            attempt,
+        } = *binding.occurrence()
+        {
             self.note_seen(&binding);
             self.counters.retried += 1;
+            let slot = match cause {
+                AgentWakeRewakeCause::Backoff => &mut self.lifecycle.rewakes.backoff,
+                AgentWakeRewakeCause::WindowTurn => &mut self.lifecycle.rewakes.window_turn,
+            };
+            if let Some(rewake) = slot {
+                if rewake.due_at == due_at && rewake.attempt == attempt {
+                    rewake.attempt = rewake.attempt.saturating_add(1);
+                    rewake.parked = false;
+                }
+            }
             return Ok(AgentWakeDisposition::Retried { wake });
         }
         // The watermark orders *scheduled* occurrences only: they arrive in
@@ -4547,6 +4604,7 @@ mod tests {
             AgentWakeOccurrence::Retry {
                 due_at: AgentTimestampMillis::new(1_753_500_000_000),
                 cause: AgentWakeRewakeCause::Backoff,
+                attempt: 0,
             },
             AgentWakeTriggerKind::Controller,
             AgentTimestampMillis::new(1_753_500_000_001),
@@ -4612,6 +4670,134 @@ mod tests {
     }
 
     #[test]
+    fn an_early_retry_consume_re_arms_the_slot_under_the_next_attempt() {
+        // A scanner host whose clock runs ahead delivers the backoff retry
+        // while the backoff is still in force here: the consume burns the
+        // parked entry, so the slot must re-owe itself under a fresh identity
+        // or the parked occurrence strands behind a terminal timer entry.
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence admits");
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_000),
+            )
+            .expect("the second occurrence coalesces");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller.record_epoch_outcome(&policy, AgentEpochOutcomeClass::Failed, now(3_000));
+        controller
+            .release(&policy, &wake, now(3_001))
+            .expect("the failed epoch releases");
+        controller.ensure_rewakes(&policy, now(3_001));
+        let until = controller
+            .lifecycle()
+            .backoff_until()
+            .expect("the backoff is in force");
+        let slot = controller
+            .lifecycle()
+            .rewakes()
+            .backoff
+            .expect("the backoff re-wake is owed");
+        assert_eq!(slot.attempt, 0);
+        controller.mark_rewake_parked(AgentWakeRewakeCause::Backoff, until, 0);
+
+        // The early delivery: consumed, nothing promoted, and the slot
+        // re-armed unparked under attempt 1 — a distinct wake identity.
+        let early = AgentWakeBinding::new(
+            tenant(),
+            goal(),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::Retry {
+                due_at: until,
+                cause: AgentWakeRewakeCause::Backoff,
+                attempt: 0,
+            },
+            AgentWakeTriggerKind::Controller,
+            now(3_002),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("the retry binding derives");
+        let disposition = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                early.clone(),
+                now(3_002),
+            )
+            .expect("the early retry is consumed");
+        assert!(matches!(disposition, AgentWakeDisposition::Retried { .. }));
+        assert_eq!(controller.pending().len(), 1, "nothing promoted early");
+        controller.ensure_rewakes(&policy, now(3_003));
+        let slot = controller
+            .lifecycle()
+            .rewakes()
+            .backoff
+            .expect("the slot survives the early consume");
+        assert_eq!(slot.due_at, until, "the due time is unchanged");
+        assert_eq!(slot.attempt, 1, "the consume bumped the generation");
+        assert!(!slot.parked, "the re-armed slot owes parking again");
+        let re_armed = AgentWakeOccurrence::Retry {
+            due_at: until,
+            cause: AgentWakeRewakeCause::Backoff,
+            attempt: 1,
+        };
+        assert_eq!(
+            re_armed.identity_value(),
+            format!("backoff:{}:1", until.as_millis()),
+            "the attempt is part of the identity"
+        );
+        assert_ne!(
+            wake_id_for_occurrence(&tenant(), &goal(), ScheduleRevision::INITIAL, &re_armed)
+                .expect("the re-armed wake derives"),
+            *early.wake_id(),
+            "the re-park derives a wake the fired entry cannot absorb"
+        );
+
+        // A redelivery of the consumed generation answers from the ring and
+        // leaves the re-armed slot alone; a stale-generation mark is a no-op,
+        // while the current generation's mark parks it.
+        let duplicate = controller
+            .admit(&policy, ScheduleRevision::INITIAL, early, now(3_004))
+            .expect("the redelivered retry is answered");
+        assert!(matches!(duplicate, AgentWakeDisposition::Duplicate { .. }));
+        controller.mark_rewake_parked(AgentWakeRewakeCause::Backoff, until, 0);
+        let slot = controller
+            .lifecycle()
+            .rewakes()
+            .backoff
+            .expect("the slot survives");
+        assert_eq!(slot.attempt, 1);
+        assert!(!slot.parked, "a stale-generation mark is a no-op");
+        controller.mark_rewake_parked(AgentWakeRewakeCause::Backoff, until, 1);
+        assert!(
+            controller
+                .lifecycle()
+                .rewakes()
+                .backoff
+                .expect("the slot survives")
+                .parked
+        );
+
+        // Once the backoff elapses the retry's own transition promotes and
+        // the slot clears.
+        assert!(controller
+            .promote_admittable(&policy, now(until.as_millis() + 1))
+            .is_some());
+        controller.ensure_rewakes(&policy, now(until.as_millis() + 1));
+        assert!(controller.lifecycle().rewakes().backoff.is_none());
+    }
+
+    #[test]
     fn retry_and_controller_trigger_require_each_other() {
         let policy = default_policy();
         let mut controller = AgentWakeControllerState::new();
@@ -4624,6 +4810,7 @@ mod tests {
             AgentWakeOccurrence::Retry {
                 due_at: AgentTimestampMillis::new(5_000),
                 cause: AgentWakeRewakeCause::WindowTurn,
+                attempt: 0,
             },
             AgentWakeTriggerKind::DurableTimer,
             AgentTimestampMillis::new(5_001),
@@ -5031,7 +5218,7 @@ mod tests {
         assert!(controller.lifecycle().rewakes().owes_parking());
 
         // Parking marks it; an unchanged recomputation keeps the mark.
-        controller.mark_rewake_parked(AgentWakeRewakeCause::WindowTurn, slot.due_at);
+        controller.mark_rewake_parked(AgentWakeRewakeCause::WindowTurn, slot.due_at, slot.attempt);
         controller.ensure_rewakes(&windowed, now(4_000));
         assert!(
             controller

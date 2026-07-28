@@ -2336,7 +2336,17 @@ an example with fault injection across pod restart and shard movement.
   due-time watermark is scoped to `Scheduled` occurrences. The retry arm of
   `admit()` consumes the delivery without admitting — the pre-admit
   `promote_admittable` already did the real work — so a stale parked re-wake
-  is a recorded no-op nudge and never needs cancellation.
+  is a recorded no-op nudge and never needs cancellation. The slot and the
+  `Retry` occurrence carry an *attempt generation* that is part of the wake
+  identity: a retry delivered before this host's clock reaches its due time
+  (a scanner host running ahead) is consumed while its cause still holds and
+  its timer entry goes terminal, so the consume re-arms the slot unparked
+  under the next attempt and the same transition's settle pass parks a fresh
+  entry the fired one cannot absorb — under skew the retry cycles once per
+  scan until the due time passes here, instead of stranding the parked
+  occurrences behind a terminal entry. Attempt zero keeps the original
+  two-segment identity form, so previously persisted retries re-derive
+  unchanged.
 - **Parking is a settle-pass seam behind an object-safe trait.** The entity
   parks owed re-wakes through an optional `Arc<dyn AgentWakeRewakeParker>`
   (`SharedWakeTimerParker` adapts the shared wake-timer store), wired via
