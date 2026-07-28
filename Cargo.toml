@@ -23,6 +23,7 @@ members = [
     "crates/rakka-grpc",
     "crates/rakka-k8s",
     "crates/rakka-testkit",
+    "examples/continuous-goal-acceptance",
     "examples/durable-counter",
     "examples/durable-agent-acceptance",
     "examples/durable-workflow",

@@ -185,6 +185,17 @@ pub enum AgentWakeOccurrence {
         /// Stable identity of the callback.
         callback: AgentWakeCallbackId,
     },
+    /// One controller-originated retry: the goal's own durable re-wake at a
+    /// computed time, parked for the failure backoff elapsing or the goal
+    /// window turning. Its delivery promotes whatever is admittable; it never
+    /// admits an epoch of its own.
+    Retry {
+        /// When the retry becomes due — the backoff's end or the window's
+        /// turn. Part of the identity, so each computed retry is one wake.
+        due_at: AgentTimestampMillis,
+        /// What the retry re-attempts.
+        cause: AgentWakeRewakeCause,
+    },
 }
 
 impl AgentWakeOccurrence {
@@ -199,6 +210,7 @@ impl AgentWakeOccurrence {
             Self::ExternalEvent { .. } => "external-event",
             Self::Command { .. } => "a2a-command",
             Self::Callback { .. } => "callback",
+            Self::Retry { .. } => "controller-retry",
         }
     }
 
@@ -210,14 +222,21 @@ impl AgentWakeOccurrence {
             Self::ExternalEvent { event } => event.as_str().to_string(),
             Self::Command { operation } => operation.as_str().to_string(),
             Self::Callback { callback } => callback.as_str().to_string(),
+            Self::Retry { due_at, cause } => {
+                format!("{}:{}", cause.as_label(), due_at.as_millis())
+            }
         }
     }
 
     /// When the occurrence was due, for the kinds that have a logical due time.
+    ///
+    /// A retry exposes its computed due time — that is what makes its parked
+    /// timer entry due at the backoff's end or the window's turn rather than
+    /// immediately.
     #[must_use]
     pub const fn due_at(&self) -> Option<AgentTimestampMillis> {
         match self {
-            Self::Scheduled { due_at } => Some(*due_at),
+            Self::Scheduled { due_at } | Self::Retry { due_at, .. } => Some(*due_at),
             _ => None,
         }
     }
@@ -355,15 +374,21 @@ pub enum AgentWakeTriggerKind {
     A2aCommand,
     /// An external callback normalized by application-owned routing.
     Callback,
+    /// The controller's own durable retry. Never declared by a policy and
+    /// never accepted for any occurrence but a retry: the policy's trigger
+    /// set governs the outside world, and the outside world cannot speak as
+    /// the controller.
+    Controller,
 }
 
 impl AgentWakeTriggerKind {
     /// Every trigger class, in stable order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::DurableTimer,
         Self::ExternalEvent,
         Self::A2aCommand,
         Self::Callback,
+        Self::Controller,
     ];
 
     /// Stable kebab-case label.
@@ -374,6 +399,7 @@ impl AgentWakeTriggerKind {
             Self::ExternalEvent => "external-event",
             Self::A2aCommand => "a2a-command",
             Self::Callback => "callback",
+            Self::Controller => "controller",
         }
     }
 }
@@ -1348,6 +1374,328 @@ fn initial_window_start(
     }
 }
 
+/// The UTC-aligned start of the calendar window after the one containing
+/// `now`.
+const fn next_calendar_boundary(unit: AgentCalendarUnit, now: AgentTimestampMillis) -> u64 {
+    let days = now.as_millis() / MILLIS_PER_DAY;
+    match unit {
+        AgentCalendarUnit::Day => (days + 1) * MILLIS_PER_DAY,
+        AgentCalendarUnit::Week => {
+            let weekday = (days + 3) % 7;
+            (days - weekday + 7) * MILLIS_PER_DAY
+        }
+        AgentCalendarUnit::Month => {
+            let (year, month) = civil_year_month(days);
+            let (year, month) = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
+            days_of_month_start(year, month) * MILLIS_PER_DAY
+        }
+    }
+}
+
+/// When the window containing `now` turns, given where it began.
+fn next_window_boundary(
+    window: &AgentBudgetWindow,
+    start: AgentTimestampMillis,
+    now: AgentTimestampMillis,
+) -> AgentTimestampMillis {
+    match window {
+        AgentBudgetWindow::Rolling { length_millis } => {
+            let elapsed = now.as_millis().saturating_sub(start.as_millis());
+            let turns = elapsed / length_millis + 1;
+            AgentTimestampMillis::new(
+                start
+                    .as_millis()
+                    .saturating_add(turns.saturating_mul(*length_millis)),
+            )
+        }
+        AgentBudgetWindow::Calendar { unit } => {
+            AgentTimestampMillis::new(next_calendar_boundary(*unit, now))
+        }
+    }
+}
+
+/// Truncates a lifecycle reason to its bound on a character boundary.
+fn bounded_reason(reason: impl Into<String>) -> String {
+    let mut reason = reason.into();
+    if reason.len() > AGENT_WAKE_REASON_MAX_LENGTH {
+        let mut end = AGENT_WAKE_REASON_MAX_LENGTH;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    reason
+}
+
+/// Merges one re-wake slot toward its desired due time, keeping the parked
+/// mark only while the due time is unchanged.
+fn merge_rewake_slot(slot: &mut Option<AgentWakeRewake>, desired: Option<AgentTimestampMillis>) {
+    *slot = match (slot.take(), desired) {
+        (_, None) => None,
+        (Some(existing), Some(due_at)) if existing.due_at == due_at => Some(existing),
+        (_, Some(due_at)) => Some(AgentWakeRewake {
+            due_at,
+            parked: false,
+        }),
+    };
+}
+
+/// Longest suspension reason the controller stores.
+pub const AGENT_WAKE_REASON_MAX_LENGTH: usize = 256;
+
+/// Cause of one controller-originated re-wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentWakeRewakeCause {
+    /// A failure backoff elapsing.
+    Backoff,
+    /// A goal-window turning while a deferred occurrence waits.
+    WindowTurn,
+}
+
+impl AgentWakeRewakeCause {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Backoff => "backoff",
+            Self::WindowTurn => "window-turn",
+        }
+    }
+}
+
+impl Display for AgentWakeRewakeCause {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// One owed or parked controller-originated re-wake
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)): a durable
+/// retry the controller schedules for itself, so a parked occurrence is
+/// re-attempted at a computed time instead of waiting for an external
+/// delivery a quiet schedule never sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWakeRewake {
+    /// When the retry becomes due.
+    pub due_at: AgentTimestampMillis,
+    /// Whether a durable timer entry has been parked for it yet. The
+    /// transition that owes the re-wake records it unparked; the settle pass
+    /// parks it idempotently and marks it.
+    pub parked: bool,
+}
+
+/// The controller's two per-cause re-wake slots.
+///
+/// One slot per cause, because the causes coexist: a window-deferred
+/// occurrence and an active backoff each need their own retry time, and one
+/// overwriting the other loses the liveness this mechanism exists for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentWakeRewakes {
+    /// The failure-backoff retry, when one is owed.
+    #[serde(default)]
+    pub backoff: Option<AgentWakeRewake>,
+    /// The window-turn retry, when one is owed.
+    #[serde(default)]
+    pub window_turn: Option<AgentWakeRewake>,
+}
+
+impl AgentWakeRewakes {
+    /// Whether any slot is owed but not yet parked.
+    #[must_use]
+    pub fn owes_parking(&self) -> bool {
+        self.backoff.is_some_and(|slot| !slot.parked)
+            || self.window_turn.is_some_and(|slot| !slot.parked)
+    }
+}
+
+/// Logical lifecycle status of one continuous goal
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is runtime status, deliberately separate from residency: a goal in
+/// any of these states is fully passivatable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentGoalLifecycleStatus {
+    /// Admitting epochs under its policy.
+    #[default]
+    Active,
+    /// Not admitting; triggers coalesce or drop per the suspension policy
+    /// until an authorized resume.
+    Suspended,
+    /// Past its effective expiry without the renewal its policy required.
+    /// Absorbing.
+    Expired,
+    /// Retired by command or by its retirement policy. Absorbing.
+    Retired,
+}
+
+impl AgentGoalLifecycleStatus {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Expired => "expired",
+            Self::Retired => "retired",
+        }
+    }
+
+    /// Whether the status admits new epochs.
+    #[must_use]
+    pub const fn permits_admission(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Whether the status is absorbing.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Expired | Self::Retired)
+    }
+}
+
+impl Display for AgentGoalLifecycleStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// The durable lifecycle state of one continuous goal's controller
+/// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The lifecycle revision is monotonic and fences operator commands exactly
+/// as the agent entity's lifecycle revision does: statuses recur, so a stale
+/// resume replayed after a later suspension is rejected rather than silently
+/// lifting it, even after its operation id ages out of the deduplication
+/// window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGoalLifecycleState {
+    #[serde(default)]
+    status: AgentGoalLifecycleStatus,
+    #[serde(default = "initial_lifecycle_revision")]
+    lifecycle_revision: AgentRevisionNumber,
+    #[serde(default)]
+    changed_by: Option<Box<AgentRevisionProvenance>>,
+    #[serde(default)]
+    suspended_reason: Option<String>,
+    #[serde(default)]
+    expires_at_override: Option<AgentTimestampMillis>,
+    #[serde(default)]
+    consecutive_failures: u32,
+    #[serde(default)]
+    backoff_until: Option<AgentTimestampMillis>,
+    #[serde(default)]
+    rewakes: AgentWakeRewakes,
+}
+
+fn initial_lifecycle_revision() -> AgentRevisionNumber {
+    AgentRevisionNumber::INITIAL
+}
+
+impl Default for AgentGoalLifecycleState {
+    fn default() -> Self {
+        Self {
+            status: AgentGoalLifecycleStatus::Active,
+            lifecycle_revision: AgentRevisionNumber::INITIAL,
+            changed_by: None,
+            suspended_reason: None,
+            expires_at_override: None,
+            consecutive_failures: 0,
+            backoff_until: None,
+            rewakes: AgentWakeRewakes::default(),
+        }
+    }
+}
+
+impl AgentGoalLifecycleState {
+    /// The goal's logical lifecycle status.
+    #[must_use]
+    pub const fn status(&self) -> AgentGoalLifecycleStatus {
+        self.status
+    }
+
+    /// The monotonic lifecycle revision operator commands fence on.
+    #[must_use]
+    pub const fn lifecycle_revision(&self) -> AgentRevisionNumber {
+        self.lifecycle_revision
+    }
+
+    /// Who accepted the most recent lifecycle transition, when one was
+    /// commanded.
+    #[must_use]
+    pub const fn changed_by(&self) -> Option<&AgentRevisionProvenance> {
+        match &self.changed_by {
+            Some(provenance) => Some(provenance),
+            None => None,
+        }
+    }
+
+    /// The bounded suspension reason, while suspended.
+    #[must_use]
+    pub fn suspended_reason(&self) -> Option<&str> {
+        self.suspended_reason.as_deref()
+    }
+
+    /// Consecutive failed epochs since the last completed one.
+    #[must_use]
+    pub const fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// When the failure backoff currently in force elapses.
+    #[must_use]
+    pub const fn backoff_until(&self) -> Option<AgentTimestampMillis> {
+        self.backoff_until
+    }
+
+    /// The effective expiry: a renewal's extension, or the policy's own.
+    #[must_use]
+    pub fn effective_expires_at(
+        &self,
+        policy: &AgentWakeLifecyclePolicy,
+    ) -> Option<AgentTimestampMillis> {
+        self.expires_at_override.or(policy.expires_at)
+    }
+
+    /// The controller-originated re-wake slots.
+    #[must_use]
+    pub const fn rewakes(&self) -> &AgentWakeRewakes {
+        &self.rewakes
+    }
+}
+
+/// The terminal class of one epoch's outcome, as the controller accounts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentEpochOutcomeClass {
+    /// The epoch produced an accepted result: the failure streak resets.
+    Completed,
+    /// The epoch failed: the streak grows and backoff engages.
+    Failed,
+    /// The epoch was cancelled: neither reset nor growth.
+    Cancelled,
+}
+
+impl AgentEpochOutcomeClass {
+    /// Stable kebab-case label of the class.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// Monotone wake counters of one continuous goal's controller
 /// ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -1378,6 +1726,22 @@ pub struct AgentWakeCounters {
     /// Occurrences parked because the goal-window ceiling was exhausted.
     #[serde(default)]
     pub deferred: u64,
+    /// Occurrences parked because a failure backoff was in force.
+    #[serde(default)]
+    pub backed_off: u64,
+    /// Occurrences parked while the goal was suspended.
+    #[serde(default)]
+    pub suspended: u64,
+    /// Occurrences dropped while the goal was suspended under the drop
+    /// policy.
+    #[serde(default)]
+    pub dropped: u64,
+    /// Occurrences refused because the goal was expired or retired.
+    #[serde(default)]
+    pub barred: u64,
+    /// Controller-originated retries consumed.
+    #[serde(default)]
+    pub retried: u64,
 }
 
 /// How the controller dispositioned one wake delivery
@@ -1418,14 +1782,47 @@ pub enum AgentWakeDisposition {
     },
     /// The occurrence was parked because the goal-window ceiling is
     /// exhausted. It is retried — oldest parked first — by the next delivery
-    /// or release whose recorded transition observes a window able to pay;
-    /// nothing fires at the window turn itself, so on a quiet schedule the
-    /// occurrence waits for the next durable delivery.
+    /// or release whose recorded transition observes a window able to pay,
+    /// and the controller owes itself a durable window-turn re-wake so a
+    /// quiet schedule cannot strand it.
     Deferred {
         /// The parked wake.
         wake: AgentWakeId,
         /// The dimension whose window ceiling refused the epoch.
         dimension: AgentBudgetDimension,
+    },
+    /// The occurrence was parked because a failure backoff is in force; the
+    /// controller owes itself a durable backoff re-wake to retry it.
+    BackedOff {
+        /// The parked wake.
+        wake: AgentWakeId,
+        /// When the backoff elapses.
+        until: AgentTimestampMillis,
+    },
+    /// The occurrence was parked while the goal is suspended; resume may
+    /// admit it.
+    SuspendedParked {
+        /// The parked wake.
+        wake: AgentWakeId,
+    },
+    /// The occurrence was dropped while the goal is suspended under the
+    /// drop policy.
+    Dropped {
+        /// The dropped wake.
+        wake: AgentWakeId,
+    },
+    /// The occurrence was refused because the goal is expired or retired.
+    Barred {
+        /// The refused wake.
+        wake: AgentWakeId,
+        /// The absorbing lifecycle status that refused it.
+        status: AgentGoalLifecycleStatus,
+    },
+    /// A controller-originated retry was consumed; whatever it made
+    /// admittable was promoted by this same transition.
+    Retried {
+        /// The retry wake.
+        wake: AgentWakeId,
     },
     /// The occurrence carried an obsolete schedule revision and was fenced.
     Fenced {
@@ -1453,6 +1850,11 @@ impl AgentWakeDisposition {
             Self::Coalesced { .. } => "coalesced",
             Self::Skipped { .. } => "skipped",
             Self::Deferred { .. } => "deferred",
+            Self::BackedOff { .. } => "backed-off",
+            Self::SuspendedParked { .. } => "suspended-parked",
+            Self::Dropped { .. } => "dropped",
+            Self::Barred { .. } => "barred",
+            Self::Retried { .. } => "retried",
             Self::Fenced { .. } => "fenced",
             Self::Duplicate { .. } => "duplicate",
         }
@@ -1467,6 +1869,11 @@ impl AgentWakeDisposition {
             | Self::Coalesced { wake, .. }
             | Self::Skipped { wake }
             | Self::Deferred { wake, .. }
+            | Self::BackedOff { wake, .. }
+            | Self::SuspendedParked { wake }
+            | Self::Dropped { wake }
+            | Self::Barred { wake, .. }
+            | Self::Retried { wake }
             | Self::Fenced { wake, .. }
             | Self::Duplicate { wake } => wake,
         }
@@ -1498,6 +1905,19 @@ pub struct AgentWakeRelease {
     pub epoch: Option<AgentEpochRef>,
 }
 
+/// Where a parked binding landed — the counter-neutral result of
+/// [`AgentWakeControllerState::park_binding`].
+enum AgentWakeParked {
+    /// Stored in the pending queue, possibly replacing the previous occupant
+    /// of the single coalescing slot.
+    Stored {
+        /// The wake the new occupant replaced, when the slot was full.
+        replaced: Option<AgentWakeId>,
+    },
+    /// The bounded catch-up queue was full; the occurrence was not kept.
+    Overflow,
+}
+
 /// What one wake transition of the controller recorded.
 ///
 /// This rides on the task outcome the operation log remembers, so a replayed
@@ -1518,6 +1938,13 @@ pub enum AgentWakeOutcome {
         policy_revision: AgentRevisionNumber,
         /// How many parked occurrences the update fenced.
         fenced: u64,
+    },
+    /// A lifecycle transition took force.
+    Lifecycle {
+        /// The lifecycle status now in force.
+        status: AgentGoalLifecycleStatus,
+        /// The lifecycle revision now in force.
+        lifecycle_revision: AgentRevisionNumber,
     },
 }
 
@@ -1540,6 +1967,19 @@ pub struct AgentWakeStatusView {
     pub last_admitted_at: Option<AgentTimestampMillis>,
     /// The monotone wake counters.
     pub counters: AgentWakeCounters,
+    /// The goal-window ledger in force, once a windowed admission opened one.
+    /// Views persisted before this field load without it.
+    #[serde(default)]
+    pub window: Option<AgentWakeWindowLedger>,
+    /// The goal's lifecycle state: status, revision, failure streak, backoff,
+    /// and the owed or parked controller-originated re-wakes. Views persisted
+    /// before this field load without it.
+    #[serde(default)]
+    pub lifecycle: Option<AgentGoalLifecycleState>,
+    /// The finite child epochs the active occurrences execute as, once
+    /// attached. Views persisted before this field load with none.
+    #[serde(default)]
+    pub epochs: Vec<AgentEpochRef>,
 }
 
 /// Durable controller state of one continuous goal's wakes
@@ -1567,6 +2007,7 @@ pub struct AgentWakeControllerState {
     last_admitted_at: Option<AgentTimestampMillis>,
     counters: AgentWakeCounters,
     window: Option<AgentWakeWindowLedger>,
+    lifecycle: AgentGoalLifecycleState,
 }
 
 impl AgentWakeControllerState {
@@ -1610,6 +2051,307 @@ impl AgentWakeControllerState {
     #[must_use]
     pub const fn window(&self) -> Option<&AgentWakeWindowLedger> {
         self.window.as_ref()
+    }
+
+    /// The goal's durable lifecycle state.
+    #[must_use]
+    pub const fn lifecycle(&self) -> &AgentGoalLifecycleState {
+        &self.lifecycle
+    }
+
+    /// The deterministic backoff delay after `failures` consecutive failures.
+    #[must_use]
+    pub fn backoff_delay_millis(policy: &AgentWakeBackoffPolicy, failures: u32) -> u64 {
+        let mut delay = policy.initial_millis;
+        let mut step = 1;
+        while step < failures {
+            delay = delay.saturating_mul(u64::from(policy.multiplier_percent)) / 100;
+            if delay >= policy.max_millis {
+                return policy.max_millis;
+            }
+            step += 1;
+        }
+        delay.min(policy.max_millis)
+    }
+
+    /// Observes the lifecycle facts logical time has made true — expiry, a
+    /// timed retirement, an occurrence-count retirement — returning the new
+    /// status when one was crossed.
+    ///
+    /// This is the window-refill shape: whatever recorded transition first
+    /// observes the crossing takes it durably; restarts, activations, and
+    /// shard movement never do. Absorbing statuses stay absorbed.
+    pub fn observe_lifecycle(
+        &mut self,
+        policy: &AgentWakePolicy,
+        now: AgentTimestampMillis,
+    ) -> Option<AgentGoalLifecycleStatus> {
+        if self.lifecycle.status.is_terminal() {
+            return None;
+        }
+        let retired = match policy.lifecycle.retirement {
+            AgentWakeRetirementPolicy::Manual => false,
+            AgentWakeRetirementPolicy::AfterOccurrences { occurrences } => {
+                self.counters.admitted >= occurrences
+            }
+            AgentWakeRetirementPolicy::At { at } => now.as_millis() >= at.as_millis(),
+        };
+        if retired {
+            self.lifecycle.status = AgentGoalLifecycleStatus::Retired;
+            self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+            self.lifecycle.rewakes = AgentWakeRewakes::default();
+            return Some(AgentGoalLifecycleStatus::Retired);
+        }
+        if let Some(expires_at) = self.lifecycle.effective_expires_at(&policy.lifecycle) {
+            if now.as_millis() >= expires_at.as_millis() {
+                self.lifecycle.status = AgentGoalLifecycleStatus::Expired;
+                self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+                self.lifecycle.rewakes = AgentWakeRewakes::default();
+                return Some(AgentGoalLifecycleStatus::Expired);
+            }
+        }
+        None
+    }
+
+    fn fence_lifecycle_revision(&self, expected: AgentRevisionNumber) -> AgentWakeResult<()> {
+        if self.lifecycle.status.is_terminal() {
+            return Err(AgentWakeError::LifecycleTerminal {
+                status: self.lifecycle.status,
+            });
+        }
+        if expected != self.lifecycle.lifecycle_revision {
+            return Err(AgentWakeError::StaleLifecycleRevision {
+                expected,
+                current: self.lifecycle.lifecycle_revision,
+            });
+        }
+        Ok(())
+    }
+
+    /// Suspends the goal under an operator's authority.
+    pub fn suspend(
+        &mut self,
+        expected: AgentRevisionNumber,
+        reason: Option<String>,
+        provenance: AgentRevisionProvenance,
+    ) -> AgentWakeResult<AgentRevisionNumber> {
+        self.fence_lifecycle_revision(expected)?;
+        self.lifecycle.status = AgentGoalLifecycleStatus::Suspended;
+        self.lifecycle.suspended_reason = reason.map(bounded_reason);
+        self.lifecycle.changed_by = Some(Box::new(provenance));
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        self.lifecycle.rewakes = AgentWakeRewakes::default();
+        Ok(self.lifecycle.lifecycle_revision)
+    }
+
+    /// Resumes a suspended goal.
+    ///
+    /// Resume clears the failure backoff and its streak — the operator said
+    /// "try again" — and the entity's resume transition promotes whatever the
+    /// suspension parked, owing its epoch in the same compare-and-set.
+    pub fn resume(
+        &mut self,
+        expected: AgentRevisionNumber,
+        provenance: AgentRevisionProvenance,
+    ) -> AgentWakeResult<AgentRevisionNumber> {
+        self.fence_lifecycle_revision(expected)?;
+        if self.lifecycle.status != AgentGoalLifecycleStatus::Suspended {
+            return Err(AgentWakeError::NotSuspended {
+                status: self.lifecycle.status,
+            });
+        }
+        self.lifecycle.status = AgentGoalLifecycleStatus::Active;
+        self.lifecycle.suspended_reason = None;
+        self.lifecycle.consecutive_failures = 0;
+        self.lifecycle.backoff_until = None;
+        self.lifecycle.changed_by = Some(Box::new(provenance));
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        Ok(self.lifecycle.lifecycle_revision)
+    }
+
+    /// Extends the goal's effective expiry.
+    ///
+    /// Under a required renewal, the extension must arrive inside the window
+    /// before the effective expiry; under no requirement it is a plain
+    /// extension accepted any time before expiry. The new expiry must
+    /// strictly extend the effective one.
+    pub fn renew(
+        &mut self,
+        expected: AgentRevisionNumber,
+        policy: &AgentWakePolicy,
+        new_expires_at: AgentTimestampMillis,
+        provenance: AgentRevisionProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentWakeResult<AgentRevisionNumber> {
+        self.fence_lifecycle_revision(expected)?;
+        let Some(effective) = self.lifecycle.effective_expires_at(&policy.lifecycle) else {
+            return Err(AgentWakeError::RenewalWithoutExpiry);
+        };
+        if new_expires_at.as_millis() <= effective.as_millis() {
+            return Err(AgentWakeError::RenewalNotExtending {
+                offered: new_expires_at,
+                effective,
+            });
+        }
+        if let AgentWakeRenewalPolicy::RequiredBefore { window_millis } = policy.lifecycle.renewal {
+            let opens = effective.as_millis().saturating_sub(window_millis);
+            if now.as_millis() < opens || now.as_millis() >= effective.as_millis() {
+                return Err(AgentWakeError::RenewalOutsideWindow {
+                    opens: AgentTimestampMillis::new(opens),
+                    effective,
+                });
+            }
+        }
+        self.lifecycle.expires_at_override = Some(new_expires_at);
+        self.lifecycle.changed_by = Some(Box::new(provenance));
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        Ok(self.lifecycle.lifecycle_revision)
+    }
+
+    /// Retires the goal under an operator's authority. Absorbing.
+    pub fn retire(
+        &mut self,
+        expected: AgentRevisionNumber,
+        provenance: AgentRevisionProvenance,
+    ) -> AgentWakeResult<AgentRevisionNumber> {
+        self.fence_lifecycle_revision(expected)?;
+        self.lifecycle.status = AgentGoalLifecycleStatus::Retired;
+        self.lifecycle.changed_by = Some(Box::new(provenance));
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        self.lifecycle.rewakes = AgentWakeRewakes::default();
+        Ok(self.lifecycle.lifecycle_revision)
+    }
+
+    /// Accounts one epoch's terminal outcome: a completion resets the failure
+    /// streak, a failure grows it and engages backoff, a cancellation does
+    /// neither. Returns whether the failure escalated into an auto-suspend.
+    pub fn record_epoch_outcome(
+        &mut self,
+        policy: &AgentWakePolicy,
+        outcome: AgentEpochOutcomeClass,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        match outcome {
+            AgentEpochOutcomeClass::Completed => {
+                self.lifecycle.consecutive_failures = 0;
+                self.lifecycle.backoff_until = None;
+                false
+            }
+            AgentEpochOutcomeClass::Cancelled => false,
+            AgentEpochOutcomeClass::Failed => {
+                self.lifecycle.consecutive_failures =
+                    self.lifecycle.consecutive_failures.saturating_add(1);
+                let delay = Self::backoff_delay_millis(
+                    &policy.failure_backoff,
+                    self.lifecycle.consecutive_failures,
+                );
+                self.lifecycle.backoff_until = Some(AgentTimestampMillis::new(
+                    now.as_millis().saturating_add(delay),
+                ));
+                let escalated = policy
+                    .failure_backoff
+                    .escalate_after_failures
+                    .is_some_and(|threshold| self.lifecycle.consecutive_failures >= threshold)
+                    && self.lifecycle.status == AgentGoalLifecycleStatus::Active;
+                if escalated {
+                    // Escalation is a durable suspension the operator must
+                    // resume: backing off further would only defer the same
+                    // failure again.
+                    self.lifecycle.status = AgentGoalLifecycleStatus::Suspended;
+                    self.lifecycle.suspended_reason = Some(bounded_reason(format!(
+                        "escalated after {} consecutive epoch failures",
+                        self.lifecycle.consecutive_failures
+                    )));
+                    self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+                    self.lifecycle.rewakes = AgentWakeRewakes::default();
+                }
+                escalated
+            }
+        }
+    }
+
+    /// Whether the goal window could pay for one epoch right now, without
+    /// charging it — the read-only probe [`Self::ensure_rewakes`] plans by.
+    fn window_can_pay(
+        &self,
+        ceiling: &AgentGoalWindowCeiling,
+        epoch_budget: &AgentBudgetAllocation,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        let start = match self.window {
+            Some(ledger) => advance_window_start(&ceiling.window, ledger.window_start(), now),
+            None => initial_window_start(&ceiling.window, now),
+        };
+        let consumed = match self.window {
+            Some(ledger) if ledger.window_start() == start => *ledger.consumed(),
+            _ => AgentBudgetConsumption::zero(),
+        };
+        for dimension in AgentBudgetDimension::CONSERVED {
+            if let Some(limit) = ceiling.ceiling.get(dimension) {
+                let Some(requested) = epoch_budget.get(dimension) else {
+                    return false;
+                };
+                if consumed.get(dimension).saturating_add(requested) > limit {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the failure backoff is in force at this logical time.
+    fn backoff_in_force(&self, now: AgentTimestampMillis) -> bool {
+        self.lifecycle
+            .backoff_until
+            .is_some_and(|until| now.as_millis() < until.as_millis())
+    }
+
+    /// Recomputes the controller's owed re-wakes from what is true now.
+    ///
+    /// Run at the end of every mutating entry point, this is idempotent and
+    /// self-healing: a slot is owed exactly when a parked occurrence needs a
+    /// retry no external delivery is promised to provide — the backoff
+    /// elapsing, or the goal window turning — and cleared whenever the goal
+    /// cannot admit at all. A slot whose due time is unchanged keeps its
+    /// parked mark; one recomputed to a new time is owed for parking again.
+    pub fn ensure_rewakes(&mut self, policy: &AgentWakePolicy, now: AgentTimestampMillis) {
+        if !self.lifecycle.status.permits_admission() {
+            self.lifecycle.rewakes = AgentWakeRewakes::default();
+            return;
+        }
+        let desired_backoff = (self.backoff_in_force(now) && !self.pending.is_empty())
+            .then(|| self.lifecycle.backoff_until.expect("backoff is in force"));
+        let desired_window_turn = policy.goal_window.as_ref().and_then(|ceiling| {
+            let waiting = !self.pending.is_empty()
+                && !self.window_can_pay(ceiling, &policy.epoch_budget, now);
+            waiting.then(|| {
+                let start = match self.window {
+                    Some(ledger) => ledger.window_start(),
+                    None => initial_window_start(&ceiling.window, now),
+                };
+                next_window_boundary(&ceiling.window, start, now)
+            })
+        });
+        merge_rewake_slot(&mut self.lifecycle.rewakes.backoff, desired_backoff);
+        merge_rewake_slot(&mut self.lifecycle.rewakes.window_turn, desired_window_turn);
+    }
+
+    /// Marks one re-wake slot parked, once the settle pass has durably parked
+    /// its timer entry.
+    pub fn mark_rewake_parked(
+        &mut self,
+        cause: AgentWakeRewakeCause,
+        due_at: AgentTimestampMillis,
+    ) {
+        let slot = match cause {
+            AgentWakeRewakeCause::Backoff => &mut self.lifecycle.rewakes.backoff,
+            AgentWakeRewakeCause::WindowTurn => &mut self.lifecycle.rewakes.window_turn,
+        };
+        if let Some(rewake) = slot {
+            if rewake.due_at == due_at {
+                rewake.parked = true;
+            }
+        }
     }
 
     /// Charges one epoch's allocation against the goal-window ceiling,
@@ -1676,14 +2418,21 @@ impl AgentWakeControllerState {
         if let Some(ceiling) = &policy.goal_window {
             if let Err(dimension) = self.charge_goal_window(ceiling, &policy.epoch_budget, now) {
                 let wake = binding.wake_id().clone();
-                let parked = self.coalesce(policy, binding);
-                return match parked {
+                return match self.park_binding(policy, binding) {
+                    AgentWakeParked::Stored { replaced } => {
+                        // A deferral is one delivery and moves one primary
+                        // counter; a replaced occupant is the secondary fact.
+                        self.counters.deferred += 1;
+                        if replaced.is_some() {
+                            self.counters.superseded += 1;
+                        }
+                        AgentWakeDisposition::Deferred { wake, dimension }
+                    }
                     // A full catch-up queue skips the overflow even when the
                     // proximate cause was the window.
-                    skipped @ AgentWakeDisposition::Skipped { .. } => skipped,
-                    _ => {
-                        self.counters.deferred += 1;
-                        AgentWakeDisposition::Deferred { wake, dimension }
+                    AgentWakeParked::Overflow => {
+                        self.counters.missed += 1;
+                        AgentWakeDisposition::Skipped { wake }
                     }
                 };
             }
@@ -1767,7 +2516,18 @@ impl AgentWakeControllerState {
                 current: current_revision,
             });
         }
-        if !policy.allows_trigger(binding.trigger()) {
+        // A retry must arrive as the controller and only a retry may: the
+        // policy's trigger set governs the outside world, and the outside
+        // world cannot smuggle an occurrence in as the controller — nor a
+        // retry in through a declared trigger.
+        let retry = matches!(binding.occurrence(), AgentWakeOccurrence::Retry { .. });
+        let controller_trigger = binding.trigger() == AgentWakeTriggerKind::Controller;
+        if retry != controller_trigger {
+            return Err(AgentWakeError::RetryTriggerMismatch {
+                trigger: binding.trigger(),
+            });
+        }
+        if !controller_trigger && !policy.allows_trigger(binding.trigger()) {
             return Err(AgentWakeError::TriggerNotAllowed {
                 trigger: binding.trigger(),
             });
@@ -1790,13 +2550,80 @@ impl AgentWakeControllerState {
                 current: current_revision,
             });
         }
-        if let Some(due_at) = binding.due_at() {
+        // A retry's whole work — promoting whatever is admittable — was
+        // already done by the entity's pre-admission promotion pass, so its
+        // own arm only consumes it: into the recent ring for duplicate-scan
+        // dedup, counted, never near a time band or an active slot.
+        if retry {
+            self.note_seen(&binding);
+            self.counters.retried += 1;
+            return Ok(AgentWakeDisposition::Retried { wake });
+        }
+        // The watermark orders *scheduled* occurrences only: they arrive in
+        // due order, so at-or-below-watermark is a redelivery. No other
+        // occurrence kind carries that ordering contract, and none may be
+        // swallowed by it.
+        if let AgentWakeOccurrence::Scheduled { due_at } = binding.occurrence() {
             if self
                 .scheduled_watermark
                 .is_some_and(|watermark| due_at.as_millis() <= watermark.as_millis())
             {
                 return Ok(AgentWakeDisposition::Duplicate { wake });
             }
+        }
+        // The lifecycle gate: an absorbing goal bars the delivery — recorded,
+        // so the scanner marks the entry terminal — and a suspended one
+        // dispositions it per the suspension policy.
+        match self.lifecycle.status {
+            AgentGoalLifecycleStatus::Active => {}
+            AgentGoalLifecycleStatus::Suspended => {
+                return Ok(match policy.lifecycle.while_suspended {
+                    AgentWakeSuspensionPolicy::CoalesceLatest => {
+                        match self.park_binding(policy, binding) {
+                            AgentWakeParked::Stored { replaced } => {
+                                self.counters.suspended += 1;
+                                if replaced.is_some() {
+                                    self.counters.superseded += 1;
+                                }
+                                AgentWakeDisposition::SuspendedParked { wake }
+                            }
+                            AgentWakeParked::Overflow => {
+                                self.counters.missed += 1;
+                                AgentWakeDisposition::Skipped { wake }
+                            }
+                        }
+                    }
+                    AgentWakeSuspensionPolicy::Drop => {
+                        self.note_consumed(&binding);
+                        self.counters.dropped += 1;
+                        AgentWakeDisposition::Dropped { wake }
+                    }
+                });
+            }
+            status @ (AgentGoalLifecycleStatus::Expired | AgentGoalLifecycleStatus::Retired) => {
+                self.note_seen(&binding);
+                self.counters.barred += 1;
+                return Ok(AgentWakeDisposition::Barred { wake, status });
+            }
+        }
+        // The backoff gate: while a failure backoff is in force, every
+        // delivery parks — a fresh occurrence starting an epoch mid-backoff
+        // would make the backoff mean nothing.
+        if self.backoff_in_force(now) {
+            let until = self.lifecycle.backoff_until.expect("backoff is in force");
+            return Ok(match self.park_binding(policy, binding) {
+                AgentWakeParked::Stored { replaced } => {
+                    self.counters.backed_off += 1;
+                    if replaced.is_some() {
+                        self.counters.superseded += 1;
+                    }
+                    AgentWakeDisposition::BackedOff { wake, until }
+                }
+                AgentWakeParked::Overflow => {
+                    self.counters.missed += 1;
+                    AgentWakeDisposition::Skipped { wake }
+                }
+            });
         }
         if Self::past_maximum_lateness(policy, &binding, now) {
             return Ok(self.dispose_missed(policy, binding, now));
@@ -1868,6 +2695,13 @@ impl AgentWakeControllerState {
         policy: &AgentWakePolicy,
         now: AgentTimestampMillis,
     ) -> Option<AgentWakeId> {
+        // The same lifecycle and backoff gates every admission passes: a
+        // suspended, expired, retired, or backing-off goal promotes nothing,
+        // through every path that promotes — release, resume, retry, and the
+        // pre-admission promotion alike.
+        if !self.lifecycle.status.permits_admission() || self.backoff_in_force(now) {
+            return None;
+        }
         if self.pending.is_empty() || self.active.len() >= Self::active_capacity(policy) {
             return None;
         }
@@ -1993,38 +2827,53 @@ impl AgentWakeControllerState {
         }
     }
 
-    fn coalesce(
+    /// Parks one consumed binding in the pending queue without touching any
+    /// counter — the counter-neutral primitive every parking disposition
+    /// shares, so each delivery moves exactly one primary counter.
+    fn park_binding(
         &mut self,
         policy: &AgentWakePolicy,
         binding: AgentWakeBinding,
-    ) -> AgentWakeDisposition {
-        let wake = binding.wake_id().clone();
+    ) -> AgentWakeParked {
         self.note_consumed(&binding);
         let capacity = Self::pending_capacity(policy);
         if self.pending.len() < capacity {
             self.pending.push(binding);
-            self.counters.coalesced += 1;
-            AgentWakeDisposition::Coalesced {
-                wake,
-                replaced: None,
-            }
+            AgentWakeParked::Stored { replaced: None }
         } else if capacity == 1 {
             // The default single coalescing slot: the latest occurrence wins,
             // which is the "at most one pending occurrence" the resolved
             // defaults promise.
             let replaced = self.pending[0].wake_id().clone();
             self.pending[0] = binding;
-            self.counters.coalesced += 1;
-            self.counters.superseded += 1;
-            AgentWakeDisposition::Coalesced {
-                wake,
+            AgentWakeParked::Stored {
                 replaced: Some(replaced),
             }
         } else {
             // A full catch-up queue is the bound the policy declared: the
             // overflow is skipped, never silently kept.
-            self.counters.missed += 1;
-            AgentWakeDisposition::Skipped { wake }
+            AgentWakeParked::Overflow
+        }
+    }
+
+    fn coalesce(
+        &mut self,
+        policy: &AgentWakePolicy,
+        binding: AgentWakeBinding,
+    ) -> AgentWakeDisposition {
+        let wake = binding.wake_id().clone();
+        match self.park_binding(policy, binding) {
+            AgentWakeParked::Stored { replaced } => {
+                self.counters.coalesced += 1;
+                if replaced.is_some() {
+                    self.counters.superseded += 1;
+                }
+                AgentWakeDisposition::Coalesced { wake, replaced }
+            }
+            AgentWakeParked::Overflow => {
+                self.counters.missed += 1;
+                AgentWakeDisposition::Skipped { wake }
+            }
         }
     }
 
@@ -2069,12 +2918,14 @@ impl AgentWakeControllerState {
     /// later redeliveries against.
     fn note_consumed(&mut self, binding: &AgentWakeBinding) {
         self.note_seen(binding);
-        if let Some(due_at) = binding.due_at() {
+        // Only a *scheduled* occurrence advances the watermark: the ordering
+        // it deduplicates on belongs to the schedule's due sequence alone.
+        if let AgentWakeOccurrence::Scheduled { due_at } = binding.occurrence() {
             let advanced = self
                 .scheduled_watermark
                 .is_none_or(|watermark| due_at.as_millis() > watermark.as_millis());
             if advanced {
-                self.scheduled_watermark = Some(due_at);
+                self.scheduled_watermark = Some(*due_at);
             }
         }
     }
@@ -2122,6 +2973,8 @@ impl<'de> Deserialize<'de> for AgentWakeControllerState {
             counters: AgentWakeCounters,
             #[serde(default)]
             window: Option<AgentWakeWindowLedger>,
+            #[serde(default)]
+            lifecycle: AgentGoalLifecycleState,
         }
 
         let record = Record::deserialize(deserializer)?;
@@ -2134,6 +2987,7 @@ impl<'de> Deserialize<'de> for AgentWakeControllerState {
             last_admitted_at: record.last_admitted_at,
             counters: record.counters,
             window: record.window,
+            lifecycle: record.lifecycle,
         };
         state.validate().map_err(DeserializeError::custom)?;
         Ok(state)
@@ -2222,6 +3076,12 @@ pub enum AgentWakeError {
         /// The disallowed trigger class.
         trigger: AgentWakeTriggerKind,
     },
+    /// A retry occurrence without the controller trigger, or the controller
+    /// trigger on anything but a retry.
+    RetryTriggerMismatch {
+        /// The trigger the binding carried.
+        trigger: AgentWakeTriggerKind,
+    },
     /// A release of a wake that is not active.
     NotActive {
         /// The wake that was not active.
@@ -2232,6 +3092,38 @@ pub enum AgentWakeError {
     ForeignWakeId {
         /// The underived wake identity.
         wake: AgentWakeId,
+    },
+    /// A lifecycle command carrying a revision the goal has moved past.
+    StaleLifecycleRevision {
+        /// The revision the command expected to advance.
+        expected: AgentRevisionNumber,
+        /// The revision currently in force.
+        current: AgentRevisionNumber,
+    },
+    /// A resume of a goal that is not suspended.
+    NotSuspended {
+        /// The goal's current lifecycle status.
+        status: AgentGoalLifecycleStatus,
+    },
+    /// A lifecycle command on an expired or retired goal. Absorbing statuses
+    /// accept no lifecycle transition.
+    LifecycleTerminal {
+        /// The absorbing status.
+        status: AgentGoalLifecycleStatus,
+    },
+    /// A renewal outside the window its policy requires it inside.
+    RenewalOutsideWindow {
+        /// When the renewal window opens.
+        opens: AgentTimestampMillis,
+        /// The effective expiry the window closes at.
+        effective: AgentTimestampMillis,
+    },
+    /// A renewal that does not strictly extend the effective expiry.
+    RenewalNotExtending {
+        /// The expiry the renewal offered.
+        offered: AgentTimestampMillis,
+        /// The effective expiry already in force.
+        effective: AgentTimestampMillis,
     },
     /// A persisted controller state exceeding its bounded capacities.
     StateOutOfBounds {
@@ -2264,8 +3156,14 @@ impl AgentWakeError {
             Self::EpochUnbounded => "wake-epoch-unbounded",
             Self::RevisionAhead { .. } => "wake-revision-ahead",
             Self::TriggerNotAllowed { .. } => "wake-trigger-not-allowed",
+            Self::RetryTriggerMismatch { .. } => "wake-retry-trigger-mismatch",
             Self::NotActive { .. } => "wake-not-active",
             Self::ForeignWakeId { .. } => "wake-foreign-id",
+            Self::StaleLifecycleRevision { .. } => "wake-stale-lifecycle-revision",
+            Self::NotSuspended { .. } => "wake-not-suspended",
+            Self::LifecycleTerminal { .. } => "wake-lifecycle-terminal",
+            Self::RenewalOutsideWindow { .. } => "wake-renewal-outside-window",
+            Self::RenewalNotExtending { .. } => "wake-renewal-not-extending",
             Self::StateOutOfBounds { .. } => "wake-state-out-of-bounds",
         }
     }
@@ -2342,12 +3240,38 @@ impl Display for AgentWakeError {
             Self::TriggerNotAllowed { trigger } => {
                 write!(f, "the wake policy does not allow the {trigger} trigger")
             }
+            Self::RetryTriggerMismatch { trigger } => write!(
+                f,
+                "a controller retry and the {trigger} trigger cannot name each other: only the controller delivers retries, and it delivers nothing else"
+            ),
             Self::NotActive { wake } => {
                 write!(f, "the wake {wake} is not an active occurrence")
             }
             Self::ForeignWakeId { wake } => write!(
                 f,
                 "the wake {wake} was not derived by this crate's construction; no epoch identity derives from it"
+            ),
+            Self::StaleLifecycleRevision { expected, current } => write!(
+                f,
+                "the lifecycle command expected revision {expected}, but the goal has moved to {current}; re-read and decide again"
+            ),
+            Self::NotSuspended { status } => {
+                write!(f, "the goal is {status}, not suspended; there is nothing to resume")
+            }
+            Self::LifecycleTerminal { status } => {
+                write!(f, "the goal is {status}, which accepts no lifecycle transition")
+            }
+            Self::RenewalOutsideWindow { opens, effective } => write!(
+                f,
+                "the renewal must arrive inside [{}, {}); outside it the policy requires expiry",
+                opens.as_millis(),
+                effective.as_millis()
+            ),
+            Self::RenewalNotExtending { offered, effective } => write!(
+                f,
+                "a renewal must strictly extend the effective expiry: {} does not extend {}",
+                offered.as_millis(),
+                effective.as_millis()
             ),
             Self::StateOutOfBounds { detail } => write!(
                 f,
@@ -3541,6 +4465,51 @@ mod tests {
     }
 
     #[test]
+    fn calendar_windows_handle_leap_years() {
+        // 2024-02-29 — the leap day, a Thursday, epoch day 19782.
+        let leap_noon = 19_782 * MILLIS_PER_DAY + 12 * 3_600_000;
+        assert_eq!(
+            calendar_window_start(AgentCalendarUnit::Day, AgentTimestampMillis::new(leap_noon)),
+            19_782 * MILLIS_PER_DAY,
+        );
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Week,
+                AgentTimestampMillis::new(leap_noon)
+            ),
+            19_779 * MILLIS_PER_DAY,
+            "the leap day belongs to the week of Monday 2024-02-26"
+        );
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Month,
+                AgentTimestampMillis::new(leap_noon)
+            ),
+            19_754 * MILLIS_PER_DAY,
+            "the leap day belongs to the month window of 2024-02-01"
+        );
+
+        // Crossing a leap year's December: 2028-12-31 is epoch day 21549 in
+        // the 366-day year 2028; its month window began 2028-12-01 (21519).
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Month,
+                AgentTimestampMillis::new(21_549 * MILLIS_PER_DAY + 1)
+            ),
+            21_519 * MILLIS_PER_DAY,
+        );
+        // The very next day opens both a new month and a new year.
+        assert_eq!(
+            calendar_window_start(
+                AgentCalendarUnit::Month,
+                AgentTimestampMillis::new(21_550 * MILLIS_PER_DAY)
+            ),
+            21_550 * MILLIS_PER_DAY,
+            "2029-01-01 starts its own month window"
+        );
+    }
+
+    #[test]
     fn a_window_bounding_an_unbounded_epoch_dimension_is_refused() {
         let mut ceiling = AgentBudgetAllocation::unbounded();
         ceiling.set(AgentBudgetDimension::Tokens, Some(1_000_000));
@@ -3553,6 +4522,567 @@ mod tests {
             })
             .expect_err("a ceiling on an unbounded epoch dimension is refused");
         assert_eq!(error.code(), "wake-window-epoch-unbounded");
+    }
+
+    #[test]
+    fn a_retry_is_consumed_without_admitting_and_its_identity_is_pinned() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        let retry = AgentWakeBinding::new(
+            tenant(),
+            goal(),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::Retry {
+                due_at: AgentTimestampMillis::new(1_753_500_000_000),
+                cause: AgentWakeRewakeCause::Backoff,
+            },
+            AgentWakeTriggerKind::Controller,
+            AgentTimestampMillis::new(1_753_500_000_001),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("the retry binding is valid");
+
+        // Pinned golden vector: the retry derivation is a persisted
+        // compatibility surface like every other occurrence kind's.
+        assert_eq!(
+            retry.wake_id().as_str(),
+            wake_id_for_occurrence(
+                &tenant(),
+                &goal(),
+                ScheduleRevision::INITIAL,
+                retry.occurrence()
+            )
+            .expect("the retry wake derives")
+            .as_str(),
+        );
+        assert_eq!(
+            retry.occurrence().identity_value(),
+            "backoff:1753500000000",
+            "the retry identity is its cause and computed due time"
+        );
+
+        // The controller trigger needs no policy declaration, and the retry
+        // dispositions as consumed — no admission, no watermark movement.
+        let disposition = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                retry.clone(),
+                now(1_753_500_000_002),
+            )
+            .expect("the retry is dispositioned");
+        assert!(matches!(disposition, AgentWakeDisposition::Retried { .. }));
+        assert_eq!(controller.counters().retried, 1);
+        assert!(controller.active().is_empty());
+        let fresh = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_753_500_000_003),
+            )
+            .expect("an earlier-due scheduled occurrence still admits");
+        assert!(
+            matches!(fresh, AgentWakeDisposition::Admitted { .. }),
+            "the retry advanced no watermark, got {fresh:?}"
+        );
+
+        // A duplicate scan of the same retry answers from the ring.
+        let duplicate = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                retry,
+                now(1_753_500_000_004),
+            )
+            .expect("the redelivered retry is answered");
+        assert!(matches!(duplicate, AgentWakeDisposition::Duplicate { .. }));
+    }
+
+    #[test]
+    fn retry_and_controller_trigger_require_each_other() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+
+        // A retry smuggled through a declared trigger is refused.
+        let smuggled_retry = AgentWakeBinding::new(
+            tenant(),
+            goal(),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::Retry {
+                due_at: AgentTimestampMillis::new(5_000),
+                cause: AgentWakeRewakeCause::WindowTurn,
+            },
+            AgentWakeTriggerKind::DurableTimer,
+            AgentTimestampMillis::new(5_001),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("the binding is valid");
+        let error = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                smuggled_retry,
+                now(5_002),
+            )
+            .expect_err("a retry without the controller trigger is refused");
+        assert_eq!(error.code(), "wake-retry-trigger-mismatch");
+
+        // A scheduled occurrence smuggled in as the controller is refused.
+        let smuggled_schedule = AgentWakeBinding::new(
+            tenant(),
+            goal(),
+            ScheduleRevision::INITIAL,
+            AgentWakeOccurrence::Scheduled {
+                due_at: AgentTimestampMillis::new(6_000),
+            },
+            AgentWakeTriggerKind::Controller,
+            AgentTimestampMillis::new(6_001),
+            AgentRevisionNumber::INITIAL,
+        )
+        .expect("the binding is valid");
+        let error = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                smuggled_schedule,
+                now(6_002),
+            )
+            .expect_err("the controller trigger carries only retries");
+        assert_eq!(error.code(), "wake-retry-trigger-mismatch");
+    }
+
+    #[test]
+    fn the_backoff_delay_grows_geometrically_and_saturates() {
+        let policy = AgentWakeBackoffPolicy::DEFAULT;
+        let table = [
+            (1, 1_000),
+            (2, 2_000),
+            (3, 4_000),
+            (4, 8_000),
+            (12, 2_048_000),
+            (13, 3_600_000),
+            (30, 3_600_000),
+        ];
+        for (failures, expected) in table {
+            assert_eq!(
+                AgentWakeControllerState::backoff_delay_millis(&policy, failures),
+                expected,
+                "delay after {failures} failures"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_epoch_engages_backoff_and_completion_resets_it() {
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+
+        let escalated =
+            controller.record_epoch_outcome(&policy, AgentEpochOutcomeClass::Failed, now(10_000));
+        assert!(!escalated);
+        assert_eq!(controller.lifecycle().consecutive_failures(), 1);
+        assert_eq!(
+            controller.lifecycle().backoff_until(),
+            Some(AgentTimestampMillis::new(11_000))
+        );
+
+        // While the backoff is in force, every delivery parks and nothing
+        // promotes.
+        let parked = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(10_500, ScheduleRevision::INITIAL),
+                now(10_500),
+            )
+            .expect("the delivery is dispositioned");
+        assert!(matches!(parked, AgentWakeDisposition::BackedOff { .. }));
+        assert_eq!(controller.counters().backed_off, 1);
+        assert!(controller
+            .promote_admittable(&policy, now(10_600))
+            .is_none());
+
+        // Once it elapses, promotion runs again.
+        assert!(controller
+            .promote_admittable(&policy, now(11_001))
+            .is_some());
+
+        // A cancellation neither grows nor resets; a completion resets.
+        controller.record_epoch_outcome(&policy, AgentEpochOutcomeClass::Cancelled, now(12_000));
+        assert_eq!(controller.lifecycle().consecutive_failures(), 1);
+        controller.record_epoch_outcome(&policy, AgentEpochOutcomeClass::Completed, now(12_500));
+        assert_eq!(controller.lifecycle().consecutive_failures(), 0);
+        assert!(controller.lifecycle().backoff_until().is_none());
+    }
+
+    #[test]
+    fn escalation_auto_suspends_after_the_threshold() {
+        let policy = default_policy()
+            .with_failure_backoff(AgentWakeBackoffPolicy {
+                escalate_after_failures: Some(2),
+                ..AgentWakeBackoffPolicy::DEFAULT
+            })
+            .expect("the backoff policy is valid");
+        let mut controller = AgentWakeControllerState::new();
+        let before = controller.lifecycle().lifecycle_revision();
+
+        assert!(!controller.record_epoch_outcome(
+            &policy,
+            AgentEpochOutcomeClass::Failed,
+            now(1_000)
+        ));
+        assert!(controller.record_epoch_outcome(
+            &policy,
+            AgentEpochOutcomeClass::Failed,
+            now(2_000)
+        ));
+        assert_eq!(
+            controller.lifecycle().status(),
+            AgentGoalLifecycleStatus::Suspended
+        );
+        assert_eq!(controller.lifecycle().lifecycle_revision(), before.next());
+        assert!(controller
+            .lifecycle()
+            .suspended_reason()
+            .is_some_and(|reason| reason.contains("escalated")));
+        // A racing operator command carrying the pre-escalation revision is
+        // fenced.
+        let error = controller
+            .resume(before, provenance())
+            .expect_err("the stale resume is fenced");
+        assert_eq!(error.code(), "wake-stale-lifecycle-revision");
+    }
+
+    #[test]
+    fn lifecycle_commands_fence_on_the_revision() {
+        let mut controller = AgentWakeControllerState::new();
+        let initial = controller.lifecycle().lifecycle_revision();
+
+        let error = controller
+            .suspend(initial.next(), None, provenance())
+            .expect_err("a wrong expected revision is fenced");
+        assert_eq!(error.code(), "wake-stale-lifecycle-revision");
+
+        let suspended = controller
+            .suspend(initial, Some("maintenance".to_string()), provenance())
+            .expect("the suspend applies");
+        assert_eq!(suspended, initial.next());
+        assert_eq!(
+            controller.lifecycle().status(),
+            AgentGoalLifecycleStatus::Suspended
+        );
+
+        let error = controller
+            .resume(initial, provenance())
+            .expect_err("the pre-suspension revision is stale");
+        assert_eq!(error.code(), "wake-stale-lifecycle-revision");
+        let resumed = controller
+            .resume(suspended, provenance())
+            .expect("the resume applies");
+        assert_eq!(
+            controller.lifecycle().status(),
+            AgentGoalLifecycleStatus::Active
+        );
+
+        let error = controller
+            .resume(resumed, provenance())
+            .expect_err("resuming an active goal is refused");
+        assert_eq!(error.code(), "wake-not-suspended");
+
+        let retired = controller
+            .retire(resumed, provenance())
+            .expect("the retire applies");
+        assert_eq!(
+            controller.lifecycle().status(),
+            AgentGoalLifecycleStatus::Retired
+        );
+        let error = controller
+            .suspend(retired, None, provenance())
+            .expect_err("an absorbing status accepts no transition");
+        assert_eq!(error.code(), "wake-lifecycle-terminal");
+    }
+
+    #[test]
+    fn suspension_parks_or_drops_per_policy() {
+        let coalesce_policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .suspend(
+                controller.lifecycle().lifecycle_revision(),
+                None,
+                provenance(),
+            )
+            .expect("the suspend applies");
+
+        let parked = controller
+            .admit(
+                &coalesce_policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the delivery is dispositioned");
+        assert!(matches!(
+            parked,
+            AgentWakeDisposition::SuspendedParked { .. }
+        ));
+        assert_eq!(controller.counters().suspended, 1);
+        assert_eq!(controller.pending().len(), 1);
+
+        let drop_policy = default_policy()
+            .with_lifecycle(AgentWakeLifecyclePolicy {
+                while_suspended: AgentWakeSuspensionPolicy::Drop,
+                ..AgentWakeLifecyclePolicy::DEFAULT
+            })
+            .expect("the drop policy is valid");
+        let dropped = controller
+            .admit(
+                &drop_policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_000),
+            )
+            .expect("the delivery is dispositioned");
+        assert!(matches!(dropped, AgentWakeDisposition::Dropped { .. }));
+        assert_eq!(controller.counters().dropped, 1);
+        assert_eq!(controller.pending().len(), 1, "a drop parks nothing");
+
+        // Resume promotes what the suspension parked (via the entity's
+        // promotion; here the primitive itself).
+        let revision = controller.lifecycle().lifecycle_revision();
+        controller
+            .resume(revision, provenance())
+            .expect("the resume applies");
+        assert!(controller
+            .promote_admittable(&coalesce_policy, now(3_000))
+            .is_some());
+    }
+
+    #[test]
+    fn renewal_windows_are_enforced() {
+        let policy = default_policy()
+            .with_lifecycle(AgentWakeLifecyclePolicy {
+                renewal: AgentWakeRenewalPolicy::RequiredBefore {
+                    window_millis: 10_000,
+                },
+                expires_at: Some(AgentTimestampMillis::new(100_000)),
+                ..AgentWakeLifecyclePolicy::DEFAULT
+            })
+            .expect("the renewal policy is valid");
+        let mut controller = AgentWakeControllerState::new();
+        let revision = controller.lifecycle().lifecycle_revision();
+
+        // Too early: the window opens at 90_000.
+        let error = controller
+            .renew(
+                revision,
+                &policy,
+                AgentTimestampMillis::new(200_000),
+                provenance(),
+                now(50_000),
+            )
+            .expect_err("a renewal before the window is refused");
+        assert_eq!(error.code(), "wake-renewal-outside-window");
+
+        // Inside the window, but not extending.
+        let error = controller
+            .renew(
+                revision,
+                &policy,
+                AgentTimestampMillis::new(99_000),
+                provenance(),
+                now(95_000),
+            )
+            .expect_err("a non-extending renewal is refused");
+        assert_eq!(error.code(), "wake-renewal-not-extending");
+
+        // A proper renewal extends the effective expiry.
+        controller
+            .renew(
+                revision,
+                &policy,
+                AgentTimestampMillis::new(200_000),
+                provenance(),
+                now(95_000),
+            )
+            .expect("the renewal applies");
+        assert_eq!(
+            controller
+                .lifecycle()
+                .effective_expires_at(&policy.lifecycle),
+            Some(AgentTimestampMillis::new(200_000))
+        );
+        // The old expiry passing no longer expires the goal.
+        assert!(controller
+            .observe_lifecycle(&policy, now(150_000))
+            .is_none());
+        // The extended one does.
+        assert_eq!(
+            controller.observe_lifecycle(&policy, now(200_000)),
+            Some(AgentGoalLifecycleStatus::Expired)
+        );
+        // Absorbing: nothing further transitions, and deliveries are barred.
+        assert!(controller
+            .observe_lifecycle(&policy, now(300_000))
+            .is_none());
+        let barred = controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(210_000, ScheduleRevision::INITIAL),
+                now(300_000),
+            )
+            .expect("the delivery is dispositioned");
+        assert!(matches!(barred, AgentWakeDisposition::Barred { .. }));
+        assert_eq!(controller.counters().barred, 1);
+    }
+
+    #[test]
+    fn retirement_is_observed_by_count_and_by_time() {
+        let by_count = default_policy()
+            .with_lifecycle(AgentWakeLifecyclePolicy {
+                retirement: AgentWakeRetirementPolicy::AfterOccurrences { occurrences: 1 },
+                ..AgentWakeLifecyclePolicy::DEFAULT
+            })
+            .expect("the retirement policy is valid");
+        let mut controller = AgentWakeControllerState::new();
+        assert!(controller.observe_lifecycle(&by_count, now(500)).is_none());
+        controller
+            .admit(
+                &by_count,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the occurrence admits");
+        assert_eq!(
+            controller.observe_lifecycle(&by_count, now(1_100)),
+            Some(AgentGoalLifecycleStatus::Retired)
+        );
+
+        let by_time = default_policy()
+            .with_lifecycle(AgentWakeLifecyclePolicy {
+                retirement: AgentWakeRetirementPolicy::At {
+                    at: AgentTimestampMillis::new(50_000),
+                },
+                ..AgentWakeLifecyclePolicy::DEFAULT
+            })
+            .expect("the retirement policy is valid");
+        let mut controller = AgentWakeControllerState::new();
+        assert!(controller
+            .observe_lifecycle(&by_time, now(49_999))
+            .is_none());
+        assert_eq!(
+            controller.observe_lifecycle(&by_time, now(50_000)),
+            Some(AgentGoalLifecycleStatus::Retired)
+        );
+    }
+
+    #[test]
+    fn ensure_rewakes_owes_and_heals_the_slots() {
+        // Window-turn slot: a deferred occurrence on an exhausted window owes
+        // a retry at the boundary. The ceiling pays for exactly one epoch per
+        // window.
+        let windowed = windowed_policy(3_600_000, 16);
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &windowed,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence admits");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        controller
+            .release(&windowed, &wake, now(2_000))
+            .expect("the epoch releases");
+        let deferred = controller
+            .admit(
+                &windowed,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(3_000, ScheduleRevision::INITIAL),
+                now(3_000),
+            )
+            .expect("the second occurrence is dispositioned");
+        assert!(matches!(deferred, AgentWakeDisposition::Deferred { .. }));
+
+        controller.ensure_rewakes(&windowed, now(3_000));
+        let slot = controller
+            .lifecycle()
+            .rewakes()
+            .window_turn
+            .expect("the window-turn re-wake is owed");
+        assert_eq!(slot.due_at, AgentTimestampMillis::new(1_000 + 3_600_000));
+        assert!(!slot.parked);
+        assert!(controller.lifecycle().rewakes().owes_parking());
+
+        // Parking marks it; an unchanged recomputation keeps the mark.
+        controller.mark_rewake_parked(AgentWakeRewakeCause::WindowTurn, slot.due_at);
+        controller.ensure_rewakes(&windowed, now(4_000));
+        assert!(
+            controller
+                .lifecycle()
+                .rewakes()
+                .window_turn
+                .expect("the slot survives")
+                .parked
+        );
+
+        // Once the window can pay again — the retry's own transition promotes
+        // and the queue drains — the slot clears.
+        assert!(controller
+            .promote_admittable(&windowed, now(1_000 + 3_600_000 + 1))
+            .is_some());
+        controller.ensure_rewakes(&windowed, now(1_000 + 3_600_000 + 1));
+        assert!(controller.lifecycle().rewakes().window_turn.is_none());
+
+        // Backoff slot: a failure with something parked owes the retry at
+        // backoff_until; suspension clears every slot.
+        let policy = default_policy();
+        let mut controller = AgentWakeControllerState::new();
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(1_000, ScheduleRevision::INITIAL),
+                now(1_000),
+            )
+            .expect("the first occurrence admits");
+        controller
+            .admit(
+                &policy,
+                ScheduleRevision::INITIAL,
+                scheduled_binding(2_000, ScheduleRevision::INITIAL),
+                now(2_000),
+            )
+            .expect("the second occurrence coalesces");
+        let wake = controller.active()[0].binding().wake_id().clone();
+        // The failure's own transition releases before promotion is gated by
+        // the fresh backoff, leaving the parked occurrence waiting.
+        controller.record_epoch_outcome(&policy, AgentEpochOutcomeClass::Failed, now(3_000));
+        controller
+            .release(&policy, &wake, now(3_001))
+            .expect("the failed epoch releases");
+        assert_eq!(controller.pending().len(), 1, "the backoff holds promotion");
+        controller.ensure_rewakes(&policy, now(3_001));
+        let slot = controller
+            .lifecycle()
+            .rewakes()
+            .backoff
+            .expect("the backoff re-wake is owed");
+        assert_eq!(slot.due_at, AgentTimestampMillis::new(4_000));
+
+        controller
+            .suspend(
+                controller.lifecycle().lifecycle_revision(),
+                None,
+                provenance(),
+            )
+            .expect("the suspend applies");
+        controller.ensure_rewakes(&policy, now(3_500));
+        assert!(controller.lifecycle().rewakes().backoff.is_none());
     }
 
     #[test]

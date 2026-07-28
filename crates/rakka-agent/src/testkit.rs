@@ -96,6 +96,7 @@ use crate::task::{
     AgentTaskState, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
 };
 use crate::wake_scanner::{AgentWakeDelivery, AgentWakeDeliveryFuture};
+use crate::wake_timers::AgentWakeRewakeParker;
 
 /// Payload type of a [`ProbeCreation`] command.
 pub const PROBE_CREATION_TYPE: &str = "rakka.agent.testkit.ProbeCreation";
@@ -1012,6 +1013,7 @@ where
     clock: Arc<AtomicU64>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     deliveries: Arc<AtomicUsize>,
+    rewake_parker: Option<Arc<dyn AgentWakeRewakeParker>>,
 }
 
 impl<Store, Agents, History> Clone for InProcessWakeDelivery<Store, Agents, History>
@@ -1029,6 +1031,7 @@ where
             clock: self.clock.clone(),
             faults: self.faults.clone(),
             deliveries: self.deliveries.clone(),
+            rewake_parker: self.rewake_parker.clone(),
         }
     }
 }
@@ -1056,7 +1059,16 @@ where
             clock,
             faults: Arc::new(Mutex::new(VecDeque::new())),
             deliveries: Arc::new(AtomicUsize::new(0)),
+            rewake_parker: None,
         }
+    }
+
+    /// Wires the wake-timer parker the delivered entities' settle passes park
+    /// controller-originated re-wakes through.
+    #[must_use]
+    pub fn with_wake_timers(mut self, parker: Arc<dyn AgentWakeRewakeParker>) -> Self {
+        self.rewake_parker = Some(parker);
+        self
     }
 
     /// Queues a fault to inject into the next delivery.
@@ -1096,6 +1108,9 @@ where
             self.agents.clone(),
             self.history.clone(),
         );
+        if let Some(parker) = self.rewake_parker.clone() {
+            entity = entity.with_wake_timers(parker);
+        }
         self.deliveries.fetch_add(1, Ordering::SeqCst);
         let now = self.now();
         match entity.apply(command, &self.router, now).await {

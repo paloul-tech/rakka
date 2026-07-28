@@ -310,6 +310,9 @@ pub struct Fixture<
     /// The delivery the scanner injects admission commands through; its fault
     /// queue injects the wake failure windows.
     pub wake_delivery: WakeDelivery,
+    /// The parker every task entity parks controller-originated re-wakes
+    /// through — over the same durable wake index the scanner scans.
+    pub rewake_parker: std::sync::Arc<dyn rakka_agent::AgentWakeRewakeParker>,
     pub history: InMemoryAgentTaskHistoryStore,
     pub effects: S,
     pub policies: AgentEffectPolicies,
@@ -384,13 +387,16 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
             .with_route(AgentEntityClass::Run, Arc::new(run_transport.clone()));
         deferred.install(router.clone());
+        let rewake_parker: std::sync::Arc<dyn rakka_agent::AgentWakeRewakeParker> =
+            std::sync::Arc::new(rakka_agent::SharedWakeTimerParker::new(wakes.clone()));
         let wake_delivery = InProcessWakeDelivery::new(
             tasks.clone(),
             agents.clone(),
             history.clone(),
             router.clone(),
             clock.clone(),
-        );
+        )
+        .with_wake_timers(rewake_parker.clone());
 
         Self {
             tasks,
@@ -398,6 +404,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             runs,
             wakes,
             wake_delivery,
+            rewake_parker,
             history,
             effects,
             policies,
@@ -513,6 +520,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             self.agents.clone(),
             self.history.clone(),
         );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
         let now = self.now();
         task.recover(now).await.expect("the task should recover");
         let _reply = task
@@ -572,6 +583,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             self.agents.clone(),
             self.history.clone(),
         );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
         let now = self.now();
         task.recover(now).await.expect("the task should recover");
         let _reply = task
@@ -614,6 +629,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             self.agents.clone(),
             self.history.clone(),
         );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
         let now = self.now();
         task.recover(now).await?;
         task.apply(command, &self.router, self.now()).await
@@ -676,6 +695,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             self.agents.clone(),
             self.history.clone(),
         );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
         let now = self.now();
         task.recover(now)
             .await
@@ -765,6 +788,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                 self.agents.clone(),
                 self.history.clone(),
             );
+            task = task.with_wake_timers(self.rewake_parker.clone());
+            if let Some(metrics) = &self.metrics {
+                task = task.with_metrics(metrics.clone());
+            }
             task.recover(now)
                 .await
                 .map_err(|error| error.code().to_string())?;
@@ -821,6 +848,10 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             self.agents.clone(),
             self.history.clone(),
         );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
         let now = self.now();
         task.recover(now).await.expect("the task should recover");
         task.snapshot()

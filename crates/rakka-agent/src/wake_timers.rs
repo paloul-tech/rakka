@@ -18,6 +18,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
 
 use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId, Revision, StateRecord};
@@ -346,39 +348,66 @@ where
             .ok_or_else(|| self.not_recovered())
     }
 
+    /// How many times a lost compare-and-set is retried against the
+    /// re-recovered record before the loss is surfaced to the caller.
+    ///
+    /// The store is shared: scanners mark entries while the entities they
+    /// deliver to park re-wakes into the same record from their own settle
+    /// passes, so losing a write race is normal operation, not a fault. Every
+    /// mutation here is idempotent over the re-read record, which is what
+    /// makes the retry safe.
+    const CAS_ATTEMPTS: usize = 4;
+
     /// Parks one occurrence durably.
     ///
     /// Scheduling is idempotent on the derived wake id: parking the identical
     /// occurrence again returns the existing entry as a duplicate, while an
     /// entry that collides on the wake id but differs in binding or target
     /// task fails closed — that is not a redelivery, it is a disagreement.
+    /// A lost compare-and-set re-recovers and retries, so racing a concurrent
+    /// scanner or parker converges instead of failing.
     pub async fn schedule_occurrence(
         &mut self,
         entry: AgentWakeTimerEntry,
     ) -> AgentWakeTimerResult<AgentWakeTimerScheduled> {
-        if self.record.is_none() {
-            self.recover(entry.created_at).await?;
-        }
-        let record = self.current_record()?;
-        if let Some(existing) = record.state.entries.get(entry.wake_id()) {
-            if existing.binding == entry.binding && existing.task == entry.task {
-                return Ok(AgentWakeTimerScheduled {
-                    entry: existing.clone(),
-                    duplicate: true,
+        let mut lost = None;
+        for _attempt in 0..Self::CAS_ATTEMPTS {
+            if self.record.is_none() {
+                self.recover(entry.created_at).await?;
+            }
+            let record = self.current_record()?;
+            if let Some(existing) = record.state.entries.get(entry.wake_id()) {
+                if existing.binding == entry.binding && existing.task == entry.task {
+                    return Ok(AgentWakeTimerScheduled {
+                        entry: existing.clone(),
+                        duplicate: true,
+                    });
+                }
+                return Err(AgentWakeTimerError::Mismatch {
+                    wake: entry.wake_id().clone(),
                 });
             }
-            return Err(AgentWakeTimerError::Mismatch {
-                wake: entry.wake_id().clone(),
-            });
+            let mut next = record.state;
+            next.updated_at = entry.updated_at;
+            next.entries.insert(entry.wake_id().clone(), entry.clone());
+            match self.persist(record.revision, next).await {
+                Ok(_) => {
+                    return Ok(AgentWakeTimerScheduled {
+                        entry,
+                        duplicate: false,
+                    })
+                }
+                // The race loser re-reads and retries; `persist` already
+                // dropped the stale cached record.
+                Err(
+                    error @ AgentWakeTimerError::Persistence {
+                        error: DurableError::RevisionConflict { .. },
+                    },
+                ) => lost = Some(error),
+                Err(error) => return Err(error),
+            }
         }
-        let mut next = record.state;
-        next.updated_at = entry.updated_at;
-        next.entries.insert(entry.wake_id().clone(), entry.clone());
-        self.persist(record.revision, next).await?;
-        Ok(AgentWakeTimerScheduled {
-            entry,
-            duplicate: false,
-        })
+        Err(lost.expect("the loop only exits with a lost race"))
     }
 
     /// Returns pending due entries up to `limit`.
@@ -450,27 +479,74 @@ where
         .await
     }
 
+    /// Removes terminal entries last touched before `before`, returning how
+    /// many were pruned.
+    ///
+    /// Terminal entries otherwise accumulate: nothing rescans them, but the
+    /// single durable record grows with each occurrence a goal ever
+    /// consumed. Pruning is an explicit operational act, never something a
+    /// scanner does implicitly — a pruned entry's redelivery window is over
+    /// only when the operator says the controllers' deduplication no longer
+    /// needs it.
+    pub async fn prune_terminal(
+        &mut self,
+        before: AgentTimestampMillis,
+    ) -> AgentWakeTimerResult<usize> {
+        if self.record.is_none() {
+            self.recover(before).await?;
+        }
+        let record = self.current_record()?;
+        let mut next = record.state;
+        let before_len = next.entries.len();
+        next.entries.retain(|_, entry| {
+            !(entry.status().is_terminal() && entry.updated_at().as_millis() < before.as_millis())
+        });
+        let pruned = before_len - next.entries.len();
+        if pruned == 0 {
+            return Ok(0);
+        }
+        next.updated_at = before;
+        self.persist(record.revision, next).await?;
+        Ok(pruned)
+    }
+
     async fn update_entry(
         &mut self,
         wake: &AgentWakeId,
-        update: impl FnOnce(AgentWakeTimerEntry) -> AgentWakeTimerEntry,
+        update: impl Fn(AgentWakeTimerEntry) -> AgentWakeTimerEntry,
     ) -> AgentWakeTimerResult<AgentWakeTimerEntry> {
-        if self.record.is_none() {
-            self.recover(AgentTimestampMillis::new(0)).await?;
+        let mut lost = None;
+        for _attempt in 0..Self::CAS_ATTEMPTS {
+            if self.record.is_none() {
+                self.recover(AgentTimestampMillis::new(0)).await?;
+            }
+            let record = self.current_record()?;
+            let Some(entry) = record.state.entries.get(wake).cloned() else {
+                return Err(AgentWakeTimerError::NotFound { wake: wake.clone() });
+            };
+            let updated = update(entry.clone());
+            if updated == entry {
+                return Ok(entry);
+            }
+            let mut next = record.state;
+            next.updated_at = updated.updated_at;
+            next.entries.insert(wake.clone(), updated.clone());
+            match self.persist(record.revision, next).await {
+                Ok(_) => return Ok(updated),
+                // The race loser re-reads and retries: a mark racing the
+                // parker of the very entity the scanner just delivered to is
+                // normal operation. The update is recomputed from the re-read
+                // record, and a transition another writer already made is
+                // answered idempotently above.
+                Err(
+                    error @ AgentWakeTimerError::Persistence {
+                        error: DurableError::RevisionConflict { .. },
+                    },
+                ) => lost = Some(error),
+                Err(error) => return Err(error),
+            }
         }
-        let record = self.current_record()?;
-        let Some(entry) = record.state.entries.get(wake).cloned() else {
-            return Err(AgentWakeTimerError::NotFound { wake: wake.clone() });
-        };
-        let updated = update(entry.clone());
-        if updated == entry {
-            return Ok(entry);
-        }
-        let mut next = record.state;
-        next.updated_at = updated.updated_at;
-        next.entries.insert(wake.clone(), updated.clone());
-        self.persist(record.revision, next).await?;
-        Ok(updated)
+        Err(lost.expect("the loop only exits with a lost race"))
     }
 
     async fn persist(
@@ -581,6 +657,74 @@ impl From<AgentSchemaError> for AgentWakeTimerError {
     }
 }
 
+/// Boxed future returned by a re-wake parker.
+pub type AgentWakeRewakeParkFuture<'a> =
+    Pin<Box<dyn Future<Output = AgentWakeTimerResult<AgentWakeTimerScheduled>> + Send + 'a>>;
+
+/// Parks controller-originated re-wake entries into a durable wake-timer
+/// store — object-safely, so the task entity can hold one without growing a
+/// store generic through every construction site.
+///
+/// Parking is idempotent on the derived wake id: a settle pass that crashes
+/// between parking and marking re-parks the identical entry and gets it back
+/// as a duplicate.
+pub trait AgentWakeRewakeParker: Send + Sync {
+    /// Parks one entry idempotently.
+    fn park<'a>(&'a self, entry: AgentWakeTimerEntry) -> AgentWakeRewakeParkFuture<'a>;
+}
+
+/// A re-wake parker over a shared durable store.
+///
+/// Every park builds a fresh store facade over a clone of the shared store
+/// and recovers it: two parkers — or a parker racing a scanner — may lose a
+/// compare-and-set, and the loser's next operation recovers the
+/// authoritative revision and converges, so no lock is needed.
+pub struct SharedWakeTimerParker<Store>
+where
+    Store: DurableStateStore<AgentWakeTimerStoreState> + Clone,
+{
+    store: Store,
+    persistence_id: PersistenceId,
+}
+
+impl<Store> SharedWakeTimerParker<Store>
+where
+    Store: DurableStateStore<AgentWakeTimerStoreState> + Clone,
+{
+    /// Creates a parker over the default wake-timer persistence id.
+    #[must_use]
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            persistence_id: agent_wake_timer_store_persistence_id(),
+        }
+    }
+
+    /// Creates a parker over an explicit persistence id.
+    #[must_use]
+    pub const fn with_persistence_id(store: Store, persistence_id: PersistenceId) -> Self {
+        Self {
+            store,
+            persistence_id,
+        }
+    }
+}
+
+impl<Store> AgentWakeRewakeParker for SharedWakeTimerParker<Store>
+where
+    Store: DurableStateStore<AgentWakeTimerStoreState> + Clone + Send + Sync + 'static,
+{
+    fn park<'a>(&'a self, entry: AgentWakeTimerEntry) -> AgentWakeRewakeParkFuture<'a> {
+        Box::pin(async move {
+            let mut timers = AgentWakeTimerStore::with_persistence_id(
+                self.store.clone(),
+                self.persistence_id.clone(),
+            );
+            timers.schedule_occurrence(entry).await
+        })
+    }
+}
+
 impl From<DurableError> for AgentWakeTimerError {
     fn from(error: DurableError) -> Self {
         Self::Persistence { error }
@@ -643,26 +787,14 @@ mod tests {
             .await
             .expect("the winner's write applies");
 
-        // The loser's compare-and-set is fenced by the revision the winner
-        // already consumed.
-        let error = loser
-            .schedule_occurrence(entry(2_000))
-            .await
-            .expect_err("the stale write is fenced");
-        assert!(matches!(
-            error,
-            AgentWakeTimerError::Persistence {
-                error: DurableError::RevisionConflict { .. }
-            }
-        ));
-
-        // Losing the race dropped the stale cached record, so the retry
-        // recovers the authoritative revision and applies — no manual
-        // recovery, no restart.
+        // The loser's first compare-and-set is fenced by the revision the
+        // winner consumed; the same call re-recovers the authoritative record
+        // and retries, so losing the race converges without surfacing — no
+        // manual recovery, no restart, no failed pass.
         let scheduled = loser
             .schedule_occurrence(entry(2_000))
             .await
-            .expect("the retried write applies after recovery");
+            .expect("the race loser converges in one call");
         assert!(!scheduled.duplicate);
 
         let state = loser.state().expect("the loser holds the latest record");
@@ -672,7 +804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lost_mark_race_converges_on_the_next_operation() {
+    async fn a_lost_mark_race_converges_in_the_same_call() {
         let (mut winner, mut loser) = shared_stores();
         winner
             .schedule_occurrence(entry(1_000))
@@ -689,23 +821,14 @@ mod tests {
             .await
             .expect("the winner marks the entry fired");
 
-        let error = loser
+        // The loser's stale mark loses the compare-and-set, re-recovers,
+        // finds the entry already terminal, and answers idempotently — the
+        // exact race a scanner runs against the parker of the entity it just
+        // delivered to.
+        let marked = loser
             .mark_fired(&wake, AgentTimestampMillis::new(1_600))
             .await
-            .expect_err("the stale mark is fenced");
-        assert!(matches!(
-            error,
-            AgentWakeTimerError::Persistence {
-                error: DurableError::RevisionConflict { .. }
-            }
-        ));
-
-        // The retry recovers, finds the entry already terminal, and answers
-        // idempotently without another write.
-        let marked = loser
-            .mark_fired(&wake, AgentTimestampMillis::new(1_700))
-            .await
-            .expect("the retried mark converges");
+            .expect("the race loser converges in one call");
         assert_eq!(marked.status(), AgentWakeTimerStatus::Fired);
         assert_eq!(marked.fired_at(), Some(AgentTimestampMillis::new(1_500)));
     }

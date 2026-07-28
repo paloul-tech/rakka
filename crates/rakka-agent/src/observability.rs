@@ -625,6 +625,22 @@ pub const METRIC_AGENT_MEMORY_RETRIEVALS: &str = "rakka.agent.memory.retrievals"
 /// counter is their bounded visibility.
 pub const METRIC_AGENT_MEMORY_INGRESS_OUTCOMES: &str = "rakka.agent.memory.ingress.outcomes";
 
+/// Counter: wake dispositions the continuous controller recorded, labeled by
+/// bounded disposition outcome
+/// ([specification 17.12](../../../docs/plans/rakka-agent/spec.md)'s
+/// accepted/duplicate/stale/coalesced/missed/late family). Emitted only
+/// after the durable transition committed, never for a replayed delivery;
+/// the controller's durable counters remain the exact record.
+pub const METRIC_AGENT_WAKE_DISPOSITIONS: &str = "rakka.agent.wake.dispositions";
+
+/// Counter: epoch admissions and results, labeled by bounded outcome
+/// (`admitted` / `completed` / `failed` / `cancelled`).
+pub const METRIC_AGENT_EPOCHS: &str = "rakka.agent.epochs";
+
+/// Counter: continuous-goal lifecycle transitions, labeled by the bounded
+/// transition (`suspended` / `resumed` / `renewed` / `expired` / `retired`).
+pub const METRIC_AGENT_GOAL_LIFECYCLE: &str = "rakka.agent.goal.lifecycle";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the
@@ -636,9 +652,12 @@ pub const AGENT_METRIC_FIELDS: &[&str] = &[
     "backend",
     "decision_kind",
     "decision_source",
+    "outcome",
     "phase",
     "safety_class",
     "signal",
+    "transition",
+    "trigger",
 ];
 
 /// Accepts a label set for an agent-domain metric, or fails closed.

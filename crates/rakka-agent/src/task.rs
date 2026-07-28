@@ -90,7 +90,8 @@ use rakka_agent_workflow::{
     StateSchemaVersion,
 };
 use rakka_core::{
-    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, ReplyTo,
+    actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
+    NoopMetricsRecorder, ReplyTo,
 };
 use rakka_persistence::{DurableError, DurableStateStore, PersistenceId};
 use rakka_sharding::{
@@ -116,7 +117,7 @@ use crate::choreography::{
 };
 use crate::definition::{
     AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
-    AgentRevisionNumber, AgentTaskDefinitionId,
+    AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
 };
 use crate::goal::AgentGoalMode;
 use crate::identity::{
@@ -124,16 +125,22 @@ use crate::identity::{
     AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId,
     AGENT_IDENTITY_MAX_LENGTH,
 };
+use crate::observability::{
+    record_agent_domain_counter, METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE,
+    METRIC_AGENT_WAKE_DISPOSITIONS,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION,
     CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
 };
 use crate::wake::{
-    epoch_admission_operation_id, epoch_result_operation_id, epoch_task_id_for_wake, AgentEpochRef,
-    AgentWakeBinding, AgentWakeControllerState, AgentWakeError, AgentWakeOutcome,
-    AgentWakePolicyRevision, AgentWakeStatusView, ScheduleRevision,
+    epoch_admission_operation_id, epoch_result_operation_id, epoch_task_id_for_wake,
+    AgentEpochOutcomeClass, AgentEpochRef, AgentGoalLifecycleStatus, AgentWakeBinding,
+    AgentWakeControllerState, AgentWakeError, AgentWakeOutcome, AgentWakePolicyRevision,
+    AgentWakeStatusView, ScheduleRevision,
 };
+use crate::wake_timers::{AgentWakeRewakeParker, AgentWakeTimerError};
 
 /// Default sharded entity type of the typed-task entity.
 pub const DEFAULT_AGENT_TASK_ENTITY_TYPE: &str = "RakkaAgentTask";
@@ -2136,6 +2143,26 @@ pub enum AgentTaskHistoryKind {
     ResultRejected,
     /// The task reached a terminal status.
     Terminated,
+    /// A delivered wake occurrence was dispositioned by the controller.
+    WakeDispositioned,
+    /// An epoch was admitted — directly, coalesced, or by promotion.
+    EpochAdmitted,
+    /// An admitted epoch's terminal result settled on the controller.
+    EpochSettled,
+    /// The continuous goal was suspended, by an operator or by failure
+    /// escalation.
+    GoalSuspended,
+    /// The continuous goal was resumed.
+    GoalResumed,
+    /// The continuous goal's expiry was renewed.
+    GoalRenewed,
+    /// The continuous goal expired, observed by a recorded transition.
+    GoalExpired,
+    /// The continuous goal was retired, by an operator or by reaching its
+    /// retirement policy.
+    GoalRetired,
+    /// A schedule update took force.
+    ScheduleUpdated,
 }
 
 impl AgentTaskHistoryKind {
@@ -2154,6 +2181,15 @@ impl AgentTaskHistoryKind {
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
             Self::Terminated => "terminated",
+            Self::WakeDispositioned => "wake-dispositioned",
+            Self::EpochAdmitted => "epoch-admitted",
+            Self::EpochSettled => "epoch-settled",
+            Self::GoalSuspended => "goal-suspended",
+            Self::GoalResumed => "goal-resumed",
+            Self::GoalRenewed => "goal-renewed",
+            Self::GoalExpired => "goal-expired",
+            Self::GoalRetired => "goal-retired",
+            Self::ScheduleUpdated => "schedule-updated",
         }
     }
 }
@@ -3254,6 +3290,17 @@ impl AgentTaskState {
                     counters: controller
                         .map(|state| *state.counters())
                         .unwrap_or_default(),
+                    window: controller.and_then(|state| state.window().copied()),
+                    lifecycle: controller.map(|state| state.lifecycle().clone()),
+                    epochs: controller
+                        .map(|state| {
+                            state
+                                .active()
+                                .iter()
+                                .filter_map(|active| active.epoch().cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 }
             }),
         })
@@ -3848,24 +3895,29 @@ pub struct AgentEpochResult {
 fn owed_epoch_result(
     state: &AgentTaskState,
     now: AgentTimestampMillis,
-) -> Option<AgentExchangeEnvelope> {
-    let task = state.task.as_ref()?;
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
     if !task.status.is_terminal() {
-        return None;
+        return Ok(None);
     }
     let (Some(wake), Some(parent), Some(goal)) = (&task.wake, &task.parent, &task.goal) else {
-        return None;
+        return Ok(None);
     };
     if task.escrow.outstanding().count() > 0 {
         // The run has not settled and returned its escrow yet; reporting now
         // would under-count what the parent settles.
-        return None;
+        return Ok(None);
     }
-    let operation_id = epoch_result_operation_id(state.scope.tenant(), goal, wake).ok()?;
+    // A construction failure from here on is loud: the transition that owed
+    // nothing when it should have would silently orphan the controller's
+    // active occurrence. Refusing lets the exchange or command re-drive.
+    let operation_id = epoch_result_operation_id(state.scope.tenant(), goal, wake)?;
     if state.journal.has_initiated(&operation_id) {
-        return None;
+        return Ok(None);
     }
-    let parent_scope = AgentTaskScope::new(state.scope.tenant().clone(), parent.clone()).ok()?;
+    let parent_scope = AgentTaskScope::new(state.scope.tenant().clone(), parent.clone())?;
     let result = AgentEpochResult {
         wake: wake.clone(),
         task: state.scope.task().clone(),
@@ -3876,18 +3928,19 @@ fn owed_epoch_result(
             .as_ref()
             .map(|accepted| accepted.digest.clone()),
     };
-    let payload = AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result).ok()?;
-    AgentExchangeEnvelope::new(
-        operation_id.clone(),
-        AgentExchangeKind::EpochResult,
-        AgentEntityAddress::Task(state.scope.clone()),
-        AgentEntityAddress::Task(parent_scope),
-        payload,
-        AgentCorrelationId::new(operation_id.as_str()),
-        now,
-    )
-    .ok()
-    .map(|envelope| envelope.with_telemetry(task.telemetry.clone()))
+    let payload = AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::EpochResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Task(parent_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
 }
 
 /// Applies one epoch's result to the controller that admitted its wake:
@@ -3964,9 +4017,11 @@ fn apply_epoch_result(
             Err(error) => return Err(error.into()),
         }
 
-        // Release the wake. A wake that is no longer active was released by
-        // an explicit CompleteWakeOccurrence; the settlement above still
-        // counted.
+        // Account the epoch's outcome *before* the release attempt, so the
+        // raced-CompleteWakeOccurrence path — where the release answers
+        // NotActive — still counts a failure exactly as its settlement still
+        // counts. An escalation suspends here, and the release's own
+        // promotion is gated by it in the same breath.
         let policy = task
             .goal_mode
             .continuous()
@@ -3974,15 +4029,34 @@ fn apply_epoch_result(
             .wake_policy
             .policy()
             .clone();
-        let release = match task
+        let outcome_class = match result.status {
+            AgentTaskStatus::Completed => AgentEpochOutcomeClass::Completed,
+            AgentTaskStatus::Failed => AgentEpochOutcomeClass::Failed,
+            // Cancellation — and, defensively, anything that is not a
+            // terminal outcome — neither resets nor grows the streak.
+            _ => AgentEpochOutcomeClass::Cancelled,
+        };
+        let controller = task
             .wake_controller
-            .get_or_insert_with(AgentWakeControllerState::new)
-            .release(&policy, &result.wake, now)
-        {
+            .get_or_insert_with(AgentWakeControllerState::new);
+        let lifecycle_before = controller.lifecycle().status();
+        controller.observe_lifecycle(&policy, now);
+        controller.record_epoch_outcome(&policy, outcome_class, now);
+        // The outcome accounting itself may have flipped the lifecycle — an
+        // escalated failure streak auto-suspends — so the flip window spans
+        // both the observation and the accounting.
+        let lifecycle_flip =
+            observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
+
+        // Release the wake. A wake that is no longer active was released by
+        // an explicit CompleteWakeOccurrence; the settlement above still
+        // counted.
+        let release = match controller.release(&policy, &result.wake, now) {
             Ok(release) => Some(release),
             Err(AgentWakeError::NotActive { .. }) => None,
             Err(error) => return Err(error.into()),
         };
+        controller.ensure_rewakes(&policy, now);
 
         let mut owed = Vec::new();
         if let Some(next) = release
@@ -3993,6 +4067,29 @@ fn apply_epoch_result(
         }
         task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
         state.updated_at = now;
+        let operation_id = envelope.operation_id();
+        if let Some(kind) = lifecycle_flip {
+            record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        }
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochSettled,
+            operation_id,
+            format!("{} {}", outcome_class.as_label(), result.wake),
+            now,
+        );
+        if let Some(next) = release
+            .as_ref()
+            .and_then(|release| release.admitted_next.as_ref())
+        {
+            record_wake_history(
+                state,
+                AgentTaskHistoryKind::EpochAdmitted,
+                operation_id,
+                next.to_string(),
+                now,
+            );
+        }
         Ok((release, owed))
     })(&mut scratch);
 
@@ -4130,6 +4227,49 @@ fn owe_epoch_creation(
 /// delivery a [`AgentTaskEntityReply::Duplicate`] instead of a second epoch.
 /// An admission additionally owes the epoch's creation exchange, committed in
 /// the same compare-and-set.
+/// The audit entry an observed lifecycle flip earns, when a recorded
+/// transition's own observation — an expiry crossed, a retirement count
+/// reached, a failure streak escalated — moved the goal rather than an
+/// operator command.
+fn observed_lifecycle_history(
+    before: AgentGoalLifecycleStatus,
+    after: AgentGoalLifecycleStatus,
+) -> Option<AgentTaskHistoryKind> {
+    if before == after {
+        return None;
+    }
+    match after {
+        AgentGoalLifecycleStatus::Suspended => Some(AgentTaskHistoryKind::GoalSuspended),
+        AgentGoalLifecycleStatus::Expired => Some(AgentTaskHistoryKind::GoalExpired),
+        AgentGoalLifecycleStatus::Retired => Some(AgentTaskHistoryKind::GoalRetired),
+        AgentGoalLifecycleStatus::Active => None,
+    }
+}
+
+/// Records one wake-audit history entry against the task's current status.
+///
+/// Audit is history ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)):
+/// the entry rides the same recorded transition as the change it describes,
+/// so it is emitted exactly once per committed transition and replays never
+/// duplicate it.
+fn record_wake_history(
+    state: &mut AgentTaskState,
+    kind: AgentTaskHistoryKind,
+    operation_id: &AgentOperationId,
+    detail: String,
+    now: AgentTimestampMillis,
+) {
+    let status = state
+        .task
+        .as_ref()
+        .expect("a wake transition proved the task exists")
+        .status;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(sequence, kind, operation_id.clone(), status, now)
+            .with_detail(detail)
+    });
+}
+
 fn admit_wake(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -4153,33 +4293,58 @@ fn admit_wake(
         .expect("continuous_task_mut proved the mode");
     let current_revision = spec.schedule_revision;
     let policy = spec.wake_policy.policy().clone();
-    let (promoted, disposition) = {
+    let (promoted, disposition, lifecycle_flip) = {
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
+        // Logical time first: an expiry or retirement this delivery's clock
+        // has made true is observed by this same recorded transition.
+        let lifecycle_before = controller.lifecycle().status();
+        controller.observe_lifecycle(&policy, now);
+        let lifecycle_flip =
+            observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
         // Oldest parked first: a deferred occurrence takes the free slot
         // ahead of the fresh delivery once the window can pay, so fresher
         // occurrences never leapfrog it.
         let promoted = controller.promote_admittable(&policy, now);
         let disposition = controller.admit(&policy, current_revision, binding, now)?;
-        (promoted, disposition)
+        controller.ensure_rewakes(&policy, now);
+        (promoted, disposition, lifecycle_flip)
     };
-    let mut owed = Vec::new();
+    let mut admitted_wakes = Vec::new();
     if let Some(wake) = promoted {
-        owed.push(owe_epoch_creation(&scope, task, &wake, now)?);
+        admitted_wakes.push(wake);
     }
     if disposition.is_admission() {
-        owed.push(owe_epoch_creation(
-            &scope,
-            task,
-            &disposition.wake_id().clone(),
-            now,
-        )?);
+        admitted_wakes.push(disposition.wake_id().clone());
+    }
+    let mut owed = Vec::new();
+    for wake in &admitted_wakes {
+        owed.push(owe_epoch_creation(&scope, task, wake, now)?);
     }
     // Admission stores at most the bounded slots, but the record must still
     // keep its lifecycle growth reserve free.
     task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
     state.updated_at = now;
+    if let Some(kind) = lifecycle_flip {
+        record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+    }
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::WakeDispositioned,
+        operation_id,
+        format!("{} {}", disposition.as_label(), disposition.wake_id()),
+        now,
+    );
+    for wake in &admitted_wakes {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            wake.to_string(),
+            now,
+        );
+    }
     Ok((AgentWakeOutcome::Disposition(disposition), owed))
 }
 
@@ -4192,6 +4357,7 @@ fn admit_wake(
 /// consequence of anything resident.
 fn complete_wake_occurrence(
     state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
     wake: &AgentWakeId,
     now: AgentTimestampMillis,
 ) -> AgentTaskResult<(AgentWakeOutcome, Vec<AgentExchangeEnvelope>)> {
@@ -4204,10 +4370,18 @@ fn complete_wake_occurrence(
         .wake_policy
         .policy()
         .clone();
-    let release = task
-        .wake_controller
-        .get_or_insert_with(AgentWakeControllerState::new)
-        .release(&policy, wake, now)?;
+    let (release, lifecycle_flip) = {
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        let lifecycle_before = controller.lifecycle().status();
+        controller.observe_lifecycle(&policy, now);
+        let lifecycle_flip =
+            observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
+        let release = controller.release(&policy, wake, now)?;
+        controller.ensure_rewakes(&policy, now);
+        (release, lifecycle_flip)
+    };
     let owed = if let Some(next) = release.admitted_next.clone() {
         vec![owe_epoch_creation(&scope, task, &next, now)?]
     } else {
@@ -4215,6 +4389,18 @@ fn complete_wake_occurrence(
     };
     task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
     state.updated_at = now;
+    if let Some(kind) = lifecycle_flip {
+        record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+    }
+    if let Some(next) = &release.admitted_next {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            next.to_string(),
+            now,
+        );
+    }
     Ok((AgentWakeOutcome::Release(release), owed))
 }
 
@@ -4228,6 +4414,7 @@ fn complete_wake_occurrence(
 /// update rides the same transition and must also move strictly forward.
 fn update_continuous_schedule(
     state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
     schedule_revision: ScheduleRevision,
     wake_policy: Option<AgentWakePolicyRevision>,
     now: AgentTimestampMillis,
@@ -4254,16 +4441,219 @@ fn update_continuous_schedule(
     }
     spec.schedule_revision = schedule_revision;
     let policy_revision = spec.wake_policy.revision();
-    let fenced = task
-        .wake_controller
-        .get_or_insert_with(AgentWakeControllerState::new)
-        .apply_schedule_update(schedule_revision);
+    // The update may have replaced the policy: observation and the re-wake
+    // recomputation both run under the one now in force.
+    let policy = spec.wake_policy.policy().clone();
+    let (fenced, lifecycle_flip) = {
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        let fenced = controller.apply_schedule_update(schedule_revision);
+        let lifecycle_before = controller.lifecycle().status();
+        controller.observe_lifecycle(&policy, now);
+        let lifecycle_flip =
+            observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
+        controller.ensure_rewakes(&policy, now);
+        (fenced, lifecycle_flip)
+    };
     task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
     state.updated_at = now;
+    if let Some(kind) = lifecycle_flip {
+        record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+    }
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::ScheduleUpdated,
+        operation_id,
+        format!(
+            "schedule-revision {} policy-revision {} fenced {fenced}",
+            schedule_revision.get(),
+            policy_revision.get(),
+        ),
+        now,
+    );
     Ok(AgentWakeOutcome::ScheduleUpdated {
         schedule_revision,
         policy_revision,
         fenced,
+    })
+}
+
+/// Suspends the continuous goal under an operator's authority.
+fn suspend_continuous_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    reason: Option<String>,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentWakeOutcome> {
+    let task = continuous_task_mut(state)?;
+    let policy = task
+        .goal_mode
+        .continuous()
+        .expect("continuous_task_mut proved the mode")
+        .wake_policy
+        .policy()
+        .clone();
+    let controller = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new);
+    controller.observe_lifecycle(&policy, now);
+    let detail = reason.clone().unwrap_or_default();
+    let lifecycle_revision = controller.suspend(expected, reason, provenance)?;
+    controller.ensure_rewakes(&policy, now);
+    let status = controller.lifecycle().status();
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalSuspended,
+        operation_id,
+        detail,
+        now,
+    );
+    Ok(AgentWakeOutcome::Lifecycle {
+        status,
+        lifecycle_revision,
+    })
+}
+
+/// Resumes the continuous goal, promoting whatever the suspension parked and
+/// owing its epoch creation in this same transition.
+fn resume_continuous_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<(AgentWakeOutcome, Vec<AgentExchangeEnvelope>)> {
+    let scope = state.scope.clone();
+    let task = continuous_task_mut(state)?;
+    let policy = task
+        .goal_mode
+        .continuous()
+        .expect("continuous_task_mut proved the mode")
+        .wake_policy
+        .policy()
+        .clone();
+    let (promoted, status, lifecycle_revision) = {
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        controller.observe_lifecycle(&policy, now);
+        let lifecycle_revision = controller.resume(expected, provenance)?;
+        let promoted = controller.promote_admittable(&policy, now);
+        controller.ensure_rewakes(&policy, now);
+        (
+            promoted,
+            controller.lifecycle().status(),
+            lifecycle_revision,
+        )
+    };
+    let owed = match &promoted {
+        Some(wake) => vec![owe_epoch_creation(&scope, task, wake, now)?],
+        None => Vec::new(),
+    };
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalResumed,
+        operation_id,
+        String::new(),
+        now,
+    );
+    if let Some(wake) = &promoted {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            wake.to_string(),
+            now,
+        );
+    }
+    Ok((
+        AgentWakeOutcome::Lifecycle {
+            status,
+            lifecycle_revision,
+        },
+        owed,
+    ))
+}
+
+/// Extends the continuous goal's effective expiry.
+fn renew_continuous_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    new_expires_at: AgentTimestampMillis,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentWakeOutcome> {
+    let task = continuous_task_mut(state)?;
+    let policy = task
+        .goal_mode
+        .continuous()
+        .expect("continuous_task_mut proved the mode")
+        .wake_policy
+        .policy()
+        .clone();
+    let controller = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new);
+    controller.observe_lifecycle(&policy, now);
+    let lifecycle_revision =
+        controller.renew(expected, &policy, new_expires_at, provenance, now)?;
+    controller.ensure_rewakes(&policy, now);
+    let status = controller.lifecycle().status();
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalRenewed,
+        operation_id,
+        format!("expires-at {}", new_expires_at.as_millis()),
+        now,
+    );
+    Ok(AgentWakeOutcome::Lifecycle {
+        status,
+        lifecycle_revision,
+    })
+}
+
+/// Retires the continuous goal under an operator's authority.
+fn retire_continuous_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentWakeOutcome> {
+    let task = continuous_task_mut(state)?;
+    let policy = task
+        .goal_mode
+        .continuous()
+        .expect("continuous_task_mut proved the mode")
+        .wake_policy
+        .policy()
+        .clone();
+    let controller = task
+        .wake_controller
+        .get_or_insert_with(AgentWakeControllerState::new);
+    controller.observe_lifecycle(&policy, now);
+    let lifecycle_revision = controller.retire(expected, provenance)?;
+    controller.ensure_rewakes(&policy, now);
+    let status = controller.lifecycle().status();
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalRetired,
+        operation_id,
+        String::new(),
+        now,
+    );
+    Ok(AgentWakeOutcome::Lifecycle {
+        status,
+        lifecycle_revision,
     })
 }
 
@@ -4927,8 +5317,19 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 // the result this epoch owes its controller is now accurate —
                 // and owed in this same compare-and-set.
                 let mut transition = AgentExchangeTransition::new(result);
-                if let Some(owed) = owed_epoch_result(state, now) {
-                    transition = transition.owing(owed);
+                match owed_epoch_result(state, now) {
+                    Ok(Some(owed)) => transition = transition.owing(owed),
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Owing cannot fail for records this binary wrote; a
+                        // failure is a bug. The settlement itself is applied
+                        // and must commit — refusing it would record a
+                        // durable refusal the run could never settle — so
+                        // the owe is skipped loudly instead. The strict
+                        // propagation on the cancellation paths catches
+                        // systematic construction bugs in tests.
+                        debug_assert!(false, "epoch-result construction failed: {error}");
+                    }
                 }
                 return transition;
             }
@@ -5079,6 +5480,8 @@ where
     agents: Agents,
     history: History,
     policy: AgentSchemaPolicy,
+    rewake_parker: Option<Arc<dyn AgentWakeRewakeParker>>,
+    metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
 
@@ -5117,8 +5520,18 @@ where
             agents,
             history,
             policy: AgentSchemaPolicy::default(),
+            rewake_parker: None,
+            metrics: Arc::new(NoopMetricsRecorder),
             recovered: false,
         }
+    }
+
+    /// Wires a metrics recorder for the bounded wake, epoch, and lifecycle
+    /// counters this entity emits after its durable transitions commit.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Uses an explicit schema-compatibility policy.
@@ -5126,6 +5539,19 @@ where
     pub fn with_schema_policy(mut self, policy: AgentSchemaPolicy) -> Self {
         self.policy = policy;
         self.host = self.host.with_schema_policy(policy);
+        self
+    }
+
+    /// Wires the durable wake-timer parker the settle pass parks
+    /// controller-originated re-wakes through.
+    ///
+    /// Without one, owed re-wakes stay durably owed on the controller state —
+    /// visible through the operational query — and are parked by whichever
+    /// wiring later supplies the parker: an honest degraded mode, never a
+    /// silent loss.
+    #[must_use]
+    pub fn with_wake_timers(mut self, parker: Arc<dyn AgentWakeRewakeParker>) -> Self {
+        self.rewake_parker = Some(parker);
         self
     }
 
@@ -5209,6 +5635,21 @@ where
         // on what was read is pure.
         let readiness = self.resolve_readiness(&command, now).await?;
 
+        // Bounded metric labels captured before the command moves: the
+        // outcome alone cannot distinguish a resume from a renewal, and the
+        // disposition does not carry the trigger that delivered it.
+        let lifecycle_transition = match &command {
+            AgentTaskEntityCommand::SuspendContinuousGoal { .. } => Some("suspended"),
+            AgentTaskEntityCommand::ResumeContinuousGoal { .. } => Some("resumed"),
+            AgentTaskEntityCommand::RenewContinuousGoal { .. } => Some("renewed"),
+            AgentTaskEntityCommand::RetireContinuousGoal { .. } => Some("retired"),
+            _ => None,
+        };
+        let wake_trigger = match &command {
+            AgentTaskEntityCommand::AdmitWake { binding, .. } => Some(binding.trigger().as_label()),
+            _ => None,
+        };
+
         let reply = match command {
             AgentTaskEntityCommand::Describe => unreachable!("handled above"),
             AgentTaskEntityCommand::Create {
@@ -5242,7 +5683,7 @@ where
                     // outstanding escrow; it owes its terminal result to the
                     // controller in this same transition, exactly as a
                     // cancellation does.
-                    let owed = owed_epoch_result(state, now).into_iter().collect();
+                    let owed = owed_epoch_result(state, now)?.into_iter().collect();
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -5263,7 +5704,7 @@ where
                     // A cancelled epoch with no outstanding escrow owes its
                     // terminal result to the controller in this same
                     // transition.
-                    let owed = owed_epoch_result(state, now).into_iter().collect();
+                    let owed = owed_epoch_result(state, now)?.into_iter().collect();
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -5280,7 +5721,8 @@ where
             }
             AgentTaskEntityCommand::CompleteWakeOccurrence { operation_id, wake } => {
                 self.transition(now, None, move |state| {
-                    let (outcome, owed) = complete_wake_occurrence(state, &wake, now)?;
+                    let (outcome, owed) =
+                        complete_wake_occurrence(state, &operation_id, &wake, now)?;
                     Ok((operation_id, Some(outcome), owed))
                 })
                 .await?
@@ -5293,6 +5735,7 @@ where
                 self.transition(now, None, move |state| {
                     let outcome = update_continuous_schedule(
                         state,
+                        &operation_id,
                         schedule_revision,
                         wake_policy.map(|policy| *policy),
                         now,
@@ -5301,10 +5744,169 @@ where
                 })
                 .await?
             }
+            AgentTaskEntityCommand::SuspendContinuousGoal {
+                operation_id,
+                expected_lifecycle_revision,
+                reason,
+                provenance,
+            } => {
+                self.transition(now, None, move |state| {
+                    let outcome = suspend_continuous_goal(
+                        state,
+                        &operation_id,
+                        expected_lifecycle_revision,
+                        reason,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, Some(outcome), Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::ResumeContinuousGoal {
+                operation_id,
+                expected_lifecycle_revision,
+                provenance,
+            } => {
+                self.transition(now, None, move |state| {
+                    let (outcome, owed) = resume_continuous_goal(
+                        state,
+                        &operation_id,
+                        expected_lifecycle_revision,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, Some(outcome), owed))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::RenewContinuousGoal {
+                operation_id,
+                expected_lifecycle_revision,
+                new_expires_at,
+                provenance,
+            } => {
+                self.transition(now, None, move |state| {
+                    let outcome = renew_continuous_goal(
+                        state,
+                        &operation_id,
+                        expected_lifecycle_revision,
+                        new_expires_at,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, Some(outcome), Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::RetireContinuousGoal {
+                operation_id,
+                expected_lifecycle_revision,
+                provenance,
+            } => {
+                self.transition(now, None, move |state| {
+                    let outcome = retire_continuous_goal(
+                        state,
+                        &operation_id,
+                        expected_lifecycle_revision,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, Some(outcome), Vec::new()))
+                })
+                .await?
+            }
         };
 
+        self.record_command_metrics(&reply, lifecycle_transition, wake_trigger);
         self.settle_side_effects(router, now).await?;
         Ok(reply)
+    }
+
+    /// Emits the bounded wake-disposition and lifecycle counters for a command
+    /// reply. Only `Applied` replies count — a `Duplicate` answers from the
+    /// dedup record without a new transition, so counting it would break the
+    /// once-per-transition rule ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
+    fn record_command_metrics(
+        &self,
+        reply: &AgentTaskEntityReply,
+        lifecycle_transition: Option<&'static str>,
+        wake_trigger: Option<&'static str>,
+    ) {
+        let AgentTaskEntityReply::Applied { outcome } = reply else {
+            return;
+        };
+        match &outcome.wake {
+            Some(AgentWakeOutcome::Disposition(disposition)) => {
+                let trigger = wake_trigger.unwrap_or("controller");
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_WAKE_DISPOSITIONS,
+                    1,
+                    &[("outcome", disposition.as_label()), ("trigger", trigger)],
+                )
+                .ok();
+            }
+            Some(AgentWakeOutcome::Lifecycle { .. }) => {
+                if let Some(transition) = lifecycle_transition {
+                    record_agent_domain_counter(
+                        self.metrics.as_ref(),
+                        METRIC_AGENT_GOAL_LIFECYCLE,
+                        1,
+                        &[("transition", transition)],
+                    )
+                    .ok();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Emits the settled-epoch counter for a freshly accepted epoch-result
+    /// exchange. A replayed delivery answers from the journal without a new
+    /// transition, so it emits nothing.
+    fn record_epoch_settlement(
+        &self,
+        envelope: &AgentExchangeEnvelope,
+        reply: &AgentExchangeReply,
+    ) {
+        if envelope.kind() != AgentExchangeKind::EpochResult
+            || reply.is_replayed()
+            || !reply.result().is_accepted()
+        {
+            return;
+        }
+        let Ok(result) = envelope
+            .payload()
+            .decode::<AgentEpochResult>(AGENT_EPOCH_RESULT_PAYLOAD_TYPE)
+        else {
+            return;
+        };
+        let class = match result.status {
+            AgentTaskStatus::Completed => AgentEpochOutcomeClass::Completed,
+            AgentTaskStatus::Failed => AgentEpochOutcomeClass::Failed,
+            _ => AgentEpochOutcomeClass::Cancelled,
+        };
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
+            METRIC_AGENT_EPOCHS,
+            1,
+            &[("outcome", class.as_label())],
+        )
+        .ok();
+    }
+
+    /// The controller's monotone admission count, read from the durable state.
+    ///
+    /// Epoch-admission metrics are a difference of this count across a
+    /// committed transition — the one source that sees a promotion made in
+    /// the same breath as a fresh delivery, a release, or a resume.
+    fn wake_admitted_total(&self) -> u64 {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .and_then(|task| task.wake_controller.as_ref())
+            .map_or(0, |controller| controller.counters().admitted)
     }
 
     /// Reads the agent facts an assignment decision would need, when this command
@@ -5333,7 +5935,11 @@ where
             | AgentTaskEntityCommand::Cancel { .. }
             | AgentTaskEntityCommand::AdmitWake { .. }
             | AgentTaskEntityCommand::CompleteWakeOccurrence { .. }
-            | AgentTaskEntityCommand::UpdateContinuousSchedule { .. } => return Ok(None),
+            | AgentTaskEntityCommand::UpdateContinuousSchedule { .. }
+            | AgentTaskEntityCommand::SuspendContinuousGoal { .. }
+            | AgentTaskEntityCommand::ResumeContinuousGoal { .. }
+            | AgentTaskEntityCommand::RenewContinuousGoal { .. }
+            | AgentTaskEntityCommand::RetireContinuousGoal { .. } => return Ok(None),
             _ => {
                 let Some(task) = self.state()?.task() else {
                     return Ok(None);
@@ -5397,7 +6003,10 @@ where
         // transition leaves the exchange outstanding on its initiator instead,
         // which re-drives it once the sink is back.
         self.require_history_headroom(now).await?;
+        let admitted_before = self.wake_admitted_total();
         let reply = self.host.accept(envelope, now).await?;
+        self.record_admitted_epochs(admitted_before);
+        self.record_epoch_settlement(envelope, &reply);
         // Accepting a delivered exchange makes *local* progress only: it may
         // decide an assignment freed escrow now permits and flush the history it
         // owes, both of which touch only the task's own state and its history
@@ -5426,6 +6035,7 @@ where
         self.require_history_headroom(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
+        self.park_owed_rewakes(now).await?;
         Ok(())
     }
 
@@ -5469,6 +6079,7 @@ where
         self.require_history_headroom(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
+        let rewakes_parked = self.park_owed_rewakes(now).await?;
         let report = drive_pending_exchanges(&mut self.host, router, now).await?;
         Ok(AgentTaskProgress {
             assigned,
@@ -5476,7 +6087,100 @@ where
             settled: report.settled,
             failed: report.failed,
             outstanding: self.host.outstanding()?.len(),
+            rewakes_parked,
         })
+    }
+
+    /// Parks the controller-originated re-wakes the controller owes, when a
+    /// wake-timer parker is wired.
+    ///
+    /// The transition that owed a re-wake recorded it unparked; this pass
+    /// parks the derived retry occurrence idempotently and then marks the
+    /// slot parked in its own small transition. A crash between the two
+    /// re-parks the identical entry — answered as a duplicate — and marks;
+    /// a schedule update in between leaves one fenced orphan entry, which a
+    /// later delivery answers as fenced and the store marks terminal.
+    async fn park_owed_rewakes(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<usize> {
+        let Some(parker) = self.rewake_parker.clone() else {
+            return Ok(0);
+        };
+        let owed: Vec<(crate::wake::AgentWakeRewakeCause, AgentTimestampMillis)> = {
+            let state = self.state()?;
+            let Some(task) = state.task() else {
+                return Ok(0);
+            };
+            let Some(controller) = task.wake_controller.as_ref() else {
+                return Ok(0);
+            };
+            if !controller.lifecycle().rewakes().owes_parking() {
+                return Ok(0);
+            }
+            let rewakes = controller.lifecycle().rewakes();
+            [
+                (crate::wake::AgentWakeRewakeCause::Backoff, rewakes.backoff),
+                (
+                    crate::wake::AgentWakeRewakeCause::WindowTurn,
+                    rewakes.window_turn,
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(cause, slot)| {
+                slot.filter(|slot| !slot.parked)
+                    .map(|slot| (cause, slot.due_at))
+            })
+            .collect()
+        };
+
+        let (goal, schedule_revision, policy_revision) = {
+            let state = self.state()?;
+            let task = state.task().expect("checked above");
+            let spec = task
+                .goal_mode
+                .continuous()
+                .expect("a controller exists only on a continuous task");
+            (
+                task.goal.clone().expect("a continuous task binds its goal"),
+                spec.schedule_revision,
+                spec.wake_policy.revision(),
+            )
+        };
+
+        let mut parked = 0;
+        for (cause, due_at) in owed {
+            let binding = AgentWakeBinding::new(
+                self.scope.tenant().clone(),
+                goal.clone(),
+                schedule_revision,
+                crate::wake::AgentWakeOccurrence::Retry { due_at, cause },
+                crate::wake::AgentWakeTriggerKind::Controller,
+                now,
+                policy_revision,
+            )?;
+            let entry = crate::wake_timers::AgentWakeTimerEntry::new(
+                binding,
+                self.scope.task().clone(),
+                now,
+            );
+            parker
+                .park(entry)
+                .await
+                .map_err(AgentTaskError::WakeTimer)?;
+            self.host
+                .initiate(now, |state| {
+                    if let Some(controller) = state
+                        .task
+                        .as_mut()
+                        .and_then(|task| task.wake_controller.as_mut())
+                    {
+                        controller.mark_rewake_parked(cause, due_at);
+                    }
+                    state.updated_at = now;
+                    Ok(Vec::new())
+                })
+                .await?;
+            parked += 1;
+        }
+        Ok(parked)
     }
 
     /// Reads the agent's durable admission state and, if the task awaits one,
@@ -5598,6 +6302,7 @@ where
     {
         let mut outcome = None;
         let mut rejection = None;
+        let admitted_before = self.wake_admitted_total();
         let committed = self
             .host
             .initiate(now, |state| {
@@ -5638,9 +6343,27 @@ where
             return Err(rejection);
         }
         committed?;
+        self.record_admitted_epochs(admitted_before);
         Ok(AgentTaskEntityReply::Applied {
             outcome: outcome.expect("an accepted transition produces an outcome"),
         })
+    }
+
+    /// Emits one `admitted` epoch count per admission the just-committed
+    /// transition made, measured as the difference of the controller's
+    /// monotone admission counter. A transition that did not commit never
+    /// reaches this, so a replay or a lost compare-and-set emits nothing.
+    fn record_admitted_epochs(&self, admitted_before: u64) {
+        let admitted = self.wake_admitted_total().saturating_sub(admitted_before);
+        if admitted > 0 {
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_EPOCHS,
+                admitted,
+                &[("outcome", "admitted")],
+            )
+            .ok();
+        }
     }
 
     async fn ensure_recovered(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
@@ -5667,6 +6390,9 @@ pub struct AgentTaskProgress {
     pub failed: usize,
     /// How many exchanges the task still owes.
     pub outstanding: usize,
+    /// How many controller-originated re-wakes it parked durably.
+    #[serde(default)]
+    pub rewakes_parked: usize,
 }
 
 /// The serializable command protocol of the typed-task entity.
@@ -5746,6 +6472,51 @@ pub enum AgentTaskEntityCommand {
         /// the policy changes too.
         wake_policy: Option<Box<AgentWakePolicyRevision>>,
     },
+    /// Suspend the continuous goal: triggers coalesce or drop per the
+    /// suspension policy until an authorized resume. Fenced on the monotonic
+    /// lifecycle revision, so a stale replay cannot reorder over a later
+    /// transition.
+    SuspendContinuousGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The lifecycle revision this command expects to advance.
+        expected_lifecycle_revision: AgentRevisionNumber,
+        /// A bounded operator reason, when one is given.
+        reason: Option<String>,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
+    /// Resume a suspended continuous goal, clearing its failure backoff and
+    /// promoting whatever the suspension parked.
+    ResumeContinuousGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The lifecycle revision this command expects to advance.
+        expected_lifecycle_revision: AgentRevisionNumber,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
+    /// Extend the continuous goal's effective expiry, inside the renewal
+    /// window its policy requires.
+    RenewContinuousGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The lifecycle revision this command expects to advance.
+        expected_lifecycle_revision: AgentRevisionNumber,
+        /// The strictly later effective expiry.
+        new_expires_at: AgentTimestampMillis,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
+    /// Retire the continuous goal. Absorbing: no further admission, ever.
+    RetireContinuousGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The lifecycle revision this command expects to advance.
+        expected_lifecycle_revision: AgentRevisionNumber,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
     /// Read the task's bounded durable projection.
     Describe,
 }
@@ -5761,7 +6532,11 @@ impl AgentTaskEntityCommand {
             | Self::Cancel { operation_id, .. }
             | Self::AdmitWake { operation_id, .. }
             | Self::CompleteWakeOccurrence { operation_id, .. }
-            | Self::UpdateContinuousSchedule { operation_id, .. } => Some(operation_id),
+            | Self::UpdateContinuousSchedule { operation_id, .. }
+            | Self::SuspendContinuousGoal { operation_id, .. }
+            | Self::ResumeContinuousGoal { operation_id, .. }
+            | Self::RenewContinuousGoal { operation_id, .. }
+            | Self::RetireContinuousGoal { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -5914,6 +6689,22 @@ where
         }
     }
 
+    /// Wires the durable wake-timer parker the hosted entity's settle passes
+    /// park controller-originated re-wakes through.
+    #[must_use]
+    pub fn with_wake_timers(mut self, parker: Arc<dyn AgentWakeRewakeParker>) -> Self {
+        self.entity = self.entity.map(|store| store.with_wake_timers(parker));
+        self
+    }
+
+    /// Wires a metrics recorder for the hosted entity's bounded wake, epoch,
+    /// and lifecycle counters.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.entity = self.entity.map(|store| store.with_metrics(metrics));
+        self
+    }
+
     fn store(
         &mut self,
     ) -> Result<&mut AgentTaskEntityStore<Store, Agents, History>, AgentTaskError> {
@@ -6001,6 +6792,8 @@ pub struct AgentTaskEntityShardingSettings {
     passivation_buffer_duration: Duration,
     schema_policy: AgentSchemaPolicy,
     clock: AgentTaskClock,
+    rewake_parker: Option<Arc<dyn AgentWakeRewakeParker>>,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl Debug for AgentTaskEntityShardingSettings {
@@ -6026,7 +6819,25 @@ impl AgentTaskEntityShardingSettings {
             passivation_buffer_duration: DEFAULT_AGENT_TASK_PASSIVATION_BUFFER_DURATION,
             schema_policy: AgentSchemaPolicy::default(),
             clock: system_task_clock(),
+            rewake_parker: None,
+            metrics: Arc::new(NoopMetricsRecorder),
         }
+    }
+
+    /// Wires the durable wake-timer parker every hosted entity's settle
+    /// passes park controller-originated re-wakes through.
+    #[must_use]
+    pub fn with_wake_timers(mut self, parker: Arc<dyn AgentWakeRewakeParker>) -> Self {
+        self.rewake_parker = Some(parker);
+        self
+    }
+
+    /// Wires a metrics recorder for every hosted entity's bounded wake,
+    /// epoch, and lifecycle counters.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Uses an explicit clock for the timestamps hosted entities persist.
@@ -6195,8 +7006,10 @@ where
 {
     let schema_policy = settings.schema_policy;
     let clock = settings.clock.clone();
+    let rewake_parker = settings.rewake_parker.clone();
+    let metrics = settings.metrics.clone();
     let mut entity = Entity::of(settings.key.clone(), move |context: EntityContext<_>| {
-        AgentTaskEntity::new(
+        let mut entity = AgentTaskEntity::new(
             context.entity_id(),
             store.clone(),
             agents.clone(),
@@ -6205,6 +7018,11 @@ where
             clock.clone(),
             schema_policy,
         )
+        .with_metrics(metrics.clone());
+        if let Some(parker) = rewake_parker.clone() {
+            entity = entity.with_wake_timers(parker);
+        }
+        entity
     })
     .with_actor_options(settings.actor_options.clone())
     .with_passivation_buffer_duration(settings.passivation_buffer_duration);
@@ -6293,6 +7111,8 @@ pub enum AgentTaskError {
     EpochUndefined,
     /// The wake contract itself refused the command.
     Wake(AgentWakeError),
+    /// The durable wake-timer store refused a re-wake parking.
+    WakeTimer(AgentWakeTimerError),
     /// A wake command was delivered to a task that does not coordinate a
     /// continuous goal.
     WakeNotContinuous,
@@ -6438,6 +7258,7 @@ impl AgentTaskError {
             Self::EpochWithoutParent => "task-epoch-without-parent",
             Self::EpochUndefined => "task-epoch-undefined",
             Self::Wake(error) => error.code(),
+            Self::WakeTimer(error) => error.code(),
             Self::WakeNotContinuous => "task-wake-not-continuous",
             Self::WakeGoalMismatch { .. } => "task-wake-goal-mismatch",
             Self::WakeOperationMismatch => "task-wake-operation-mismatch",
@@ -6496,6 +7317,7 @@ impl Display for AgentTaskError {
                 "the continuous goal declares no epoch contract, so no epoch can be admitted"
             ),
             Self::Wake(error) => Display::fmt(error, f),
+            Self::WakeTimer(error) => Display::fmt(error, f),
             Self::WakeNotContinuous => write!(
                 f,
                 "a wake command addresses a task that does not coordinate a continuous goal"

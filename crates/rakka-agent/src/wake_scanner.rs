@@ -47,6 +47,7 @@ use rakka_sharding::ClusterSharding;
 
 use crate::choreography::AgentExchangeDeliveryError;
 use crate::identity::{AgentIdentityError, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId};
+use crate::observability::record_agent_domain_counter;
 use crate::task::{
     agent_task_entity_ref, AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityReply,
     AgentTaskEntityTypeKey,
@@ -316,11 +317,13 @@ where
     }
 
     fn record_wake_metric(&self, outcome: &'static str, trigger: &'static str) {
-        self.metrics.increment_counter(
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
             METRIC_AGENT_WAKES,
             1,
             &[("outcome", outcome), ("trigger", trigger)],
-        );
+        )
+        .ok();
     }
 }
 
