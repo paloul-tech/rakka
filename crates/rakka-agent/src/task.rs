@@ -5202,6 +5202,11 @@ fn record_goal_decision(
             controller.retire_by_policy();
         }
     }
+    // The decision spends growth headroom admission reserved, so it checks
+    // the full bound: `decide` truncated the reason strings, but the
+    // evaluation reference carries caller-sized artifact fields the record
+    // must still be able to hold.
+    task.check_bounds(0)?;
     state.updated_at = now;
     record_wake_history(
         state,

@@ -80,7 +80,24 @@ pub const AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH: usize = 128;
 
 /// Maximum length, in bytes, of a bounded reason or code string carried by a
 /// goal decision.
+///
+/// [`AgentGoalState::decide`] truncates a decision's string payloads to this
+/// bound before persisting them — the operator-reason idiom the wake
+/// lifecycle and task cancellation already follow — so a caller-supplied
+/// reason can never grow the durable record unboundedly.
 pub const AGENT_GOAL_REASON_MAX_LENGTH: usize = 256;
+
+/// Truncates a decision reason to its bound on a character boundary.
+fn bounded_reason_text(mut value: String) -> String {
+    if value.len() > AGENT_GOAL_REASON_MAX_LENGTH {
+        let mut end = AGENT_GOAL_REASON_MAX_LENGTH;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
 
 /// Whether a goal terminates after one evaluation of its criteria or operates
 /// as bounded durable epochs
@@ -1066,7 +1083,10 @@ impl AgentGoalState {
     /// criteria revision in force
     /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)). From
     /// `Proposed` only `Cancelled` and `Expired` are reachable: no work
-    /// happened, so no execution failure and no evaluation can exist.
+    /// happened, so no execution failure and no evaluation can exist. The
+    /// reason's string payloads are truncated to
+    /// [`AGENT_GOAL_REASON_MAX_LENGTH`] before they are persisted, so a
+    /// caller-supplied reason cannot grow the durable record unboundedly.
     pub fn decide(
         &mut self,
         decision: AgentGoalDecision,
@@ -1098,10 +1118,27 @@ impl AgentGoalState {
                 });
             }
         }
+        // The record stays bounded whatever the caller sent: a decision's
+        // string payloads are operator text, and operator text is truncated —
+        // the wake-lifecycle and task-cancellation idiom — never trusted to
+        // size the durable record.
+        let reason = match decision.reason {
+            AgentGoalTerminalReason::ExecutionFailed { code } => {
+                AgentGoalTerminalReason::ExecutionFailed {
+                    code: bounded_reason_text(code),
+                }
+            }
+            AgentGoalTerminalReason::CancellationRequested { reason } => {
+                AgentGoalTerminalReason::CancellationRequested {
+                    reason: bounded_reason_text(reason),
+                }
+            }
+            other => other,
+        };
         self.status = outcome;
         self.wait = None;
         self.terminal = Some(Box::new(AgentGoalTerminalDecision {
-            reason: decision.reason,
+            reason,
             evaluation: decision.evaluation,
         }));
         self.changed_by = decision.provenance;
@@ -1784,6 +1821,51 @@ mod tests {
         }
         let error = crowded.validate().expect_err("an oversized set is refused");
         assert_eq!(error.code(), "goal-collection-too-large");
+    }
+
+    #[test]
+    fn decision_reason_strings_are_truncated_to_their_bound() {
+        // A decision's string payloads are operator text: persisted truncated,
+        // never trusted to size the durable record.
+        let mut state = active_state();
+        state
+            .decide(
+                decision(
+                    AgentGoalTerminalReason::CancellationRequested {
+                        reason: "r".repeat(AGENT_GOAL_REASON_MAX_LENGTH * 4),
+                    },
+                    None,
+                    AgentRevisionNumber::INITIAL,
+                ),
+                LATER,
+            )
+            .expect("the decision applies");
+        let Some(AgentGoalTerminalReason::CancellationRequested { reason }) =
+            state.terminal().map(|decision| decision.reason.clone())
+        else {
+            panic!("expected the cancellation reason on record");
+        };
+        assert_eq!(reason.len(), AGENT_GOAL_REASON_MAX_LENGTH);
+
+        let mut state = active_state();
+        state
+            .decide(
+                decision(
+                    AgentGoalTerminalReason::ExecutionFailed {
+                        code: "c".repeat(AGENT_GOAL_REASON_MAX_LENGTH + 100),
+                    },
+                    None,
+                    AgentRevisionNumber::INITIAL,
+                ),
+                LATER,
+            )
+            .expect("the decision applies");
+        let Some(AgentGoalTerminalReason::ExecutionFailed { code }) =
+            state.terminal().map(|decision| decision.reason.clone())
+        else {
+            panic!("expected the failure code on record");
+        };
+        assert_eq!(code.len(), AGENT_GOAL_REASON_MAX_LENGTH);
     }
 
     #[test]

@@ -283,6 +283,73 @@ async fn satisfaction_requires_an_evaluation_of_the_current_criteria() {
 }
 
 #[tokio::test]
+async fn an_oversized_decision_payload_is_refused_whole() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec(), true),
+    ))
+    .await
+    .expect("the creation applies");
+
+    // The reason strings are truncated by the goal record itself, but the
+    // evaluation reference carries caller-sized artifact fields — a payload
+    // the bounded task record cannot hold refuses the whole decision, and
+    // the goal stays decidable.
+    let mut evaluation = goal_evaluation();
+    evaluation.evidence = Some(rakka_agent_workflow::ArtifactRef {
+        artifact_id: "evidence-1".to_string(),
+        kind: rakka_agent_workflow::ArtifactKind::File,
+        uri: format!("s3://evidence/{}", "x".repeat(64 * 1024)),
+        checksum: None,
+        content_type: None,
+        byte_len: None,
+        retention_class: None,
+        encryption: None,
+        redaction: rakka_agent_workflow::RedactionStatus::Unredacted,
+        created_at: rakka_agent_workflow::AgentTimestampMillis::new(1),
+        metadata: rakka_agent_workflow::AgentAttributes::default(),
+    });
+    let refusal = fx
+        .apply_task_command(AgentTaskEntityCommand::RecordGoalDecision {
+            operation_id: operation("satisfy-oversized"),
+            decision: Box::new(AgentGoalDecision {
+                reason: AgentGoalTerminalReason::CriteriaSatisfied,
+                evaluation: Some(Box::new(evaluation)),
+                provenance: Some(Box::new(provenance(35))),
+                expected_status_revision: AgentRevisionNumber::INITIAL,
+            }),
+        })
+        .await;
+    assert_eq!(refused_code(refusal), "task-state-too-large");
+
+    // Nothing was persisted: the goal is still active, and a bounded
+    // decision under the same expected revision still applies.
+    let view = snapshot(&fx).await;
+    assert_eq!(
+        view.goal_state.expect("the goal view exists").status,
+        AgentGoalStatus::Active
+    );
+    let outcome = applied(
+        fx.apply_task_command(AgentTaskEntityCommand::RecordGoalDecision {
+            operation_id: operation("satisfy-bounded"),
+            decision: Box::new(AgentGoalDecision {
+                reason: AgentGoalTerminalReason::CriteriaSatisfied,
+                evaluation: Some(Box::new(goal_evaluation())),
+                provenance: Some(Box::new(provenance(36))),
+                expected_status_revision: AgentRevisionNumber::INITIAL,
+            }),
+        })
+        .await,
+    );
+    assert_eq!(
+        outcome.goal.expect("the goal outcome rides").status,
+        AgentGoalStatus::Satisfied
+    );
+}
+
+#[tokio::test]
 async fn an_unsatisfied_decision_records_the_evaluator_not_a_failure() {
     let fx = fixture();
     fx.instantiate_agent().await;
