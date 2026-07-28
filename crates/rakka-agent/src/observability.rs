@@ -639,6 +639,13 @@ pub const METRIC_AGENT_EPOCHS: &str = "rakka.agent.epochs";
 
 /// Counter: continuous-goal lifecycle transitions, labeled by the bounded
 /// transition (`suspended` / `resumed` / `renewed` / `expired` / `retired`).
+///
+/// Status-changing transitions are counted as the difference of the goal's
+/// lifecycle status across the committed transition, so observed flips —
+/// expiry, retirement by policy, escalation into suspension — count exactly
+/// like the commanded ones, from whatever transition first recorded them.
+/// `renewed` is the one transition that leaves the status unchanged and is
+/// counted from its command.
 pub const METRIC_AGENT_GOAL_LIFECYCLE: &str = "rakka.agent.goal.lifecycle";
 
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.

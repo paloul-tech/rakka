@@ -5635,14 +5635,15 @@ where
         // on what was read is pure.
         let readiness = self.resolve_readiness(&command, now).await?;
 
-        // Bounded metric labels captured before the command moves: the
-        // outcome alone cannot distinguish a resume from a renewal, and the
-        // disposition does not carry the trigger that delivered it.
+        // Bounded metric labels captured before the command moves. Renewal is
+        // the one lifecycle transition the status difference across the
+        // committed transition cannot see — it extends the goal without
+        // changing the status — so it alone is counted from its command;
+        // every status-changing transition, commanded or observed, is counted
+        // by the difference. The disposition does not carry the trigger that
+        // delivered it, so that too is captured here.
         let lifecycle_transition = match &command {
-            AgentTaskEntityCommand::SuspendContinuousGoal { .. } => Some("suspended"),
-            AgentTaskEntityCommand::ResumeContinuousGoal { .. } => Some("resumed"),
             AgentTaskEntityCommand::RenewContinuousGoal { .. } => Some("renewed"),
-            AgentTaskEntityCommand::RetireContinuousGoal { .. } => Some("retired"),
             _ => None,
         };
         let wake_trigger = match &command {
@@ -5909,6 +5910,20 @@ where
             .map_or(0, |controller| controller.counters().admitted)
     }
 
+    /// The goal's lifecycle status, read from the durable state.
+    ///
+    /// Lifecycle metrics are a difference of this status across a committed
+    /// transition — the one source that sees an observed flip (expiry,
+    /// retirement by policy, escalation) made inside whatever transition
+    /// first saw it true, alongside the commanded ones.
+    fn goal_lifecycle_status(&self) -> Option<AgentGoalLifecycleStatus> {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .and_then(|task| task.wake_controller.as_ref())
+            .map(|controller| controller.lifecycle().status())
+    }
+
     /// Reads the agent facts an assignment decision would need, when this command
     /// could make the task assignable.
     ///
@@ -6004,8 +6019,10 @@ where
         // which re-drives it once the sink is back.
         self.require_history_headroom(now).await?;
         let admitted_before = self.wake_admitted_total();
+        let lifecycle_before = self.goal_lifecycle_status();
         let reply = self.host.accept(envelope, now).await?;
         self.record_admitted_epochs(admitted_before);
+        self.record_lifecycle_transition(lifecycle_before);
         self.record_epoch_settlement(envelope, &reply);
         // Accepting a delivered exchange makes *local* progress only: it may
         // decide an assignment freed escrow now permits and flush the history it
@@ -6307,6 +6324,7 @@ where
         let mut outcome = None;
         let mut rejection = None;
         let admitted_before = self.wake_admitted_total();
+        let lifecycle_before = self.goal_lifecycle_status();
         let committed = self
             .host
             .initiate(now, |state| {
@@ -6348,6 +6366,7 @@ where
         }
         committed?;
         self.record_admitted_epochs(admitted_before);
+        self.record_lifecycle_transition(lifecycle_before);
         Ok(AgentTaskEntityReply::Applied {
             outcome: outcome.expect("an accepted transition produces an outcome"),
         })
@@ -6368,6 +6387,35 @@ where
             )
             .ok();
         }
+    }
+
+    /// Emits one lifecycle-transition count when the just-committed
+    /// transition changed the goal's lifecycle status — a command or an
+    /// observed flip (expiry, retirement by policy, escalation) alike. The
+    /// label is the status arrived at; a controller that first appears in
+    /// the transition emits nothing, because creation is not a transition
+    /// out of any prior status. Renewal leaves the status unchanged and is
+    /// counted from its command instead.
+    fn record_lifecycle_transition(&self, before: Option<AgentGoalLifecycleStatus>) {
+        let (Some(before), Some(after)) = (before, self.goal_lifecycle_status()) else {
+            return;
+        };
+        if before == after {
+            return;
+        }
+        let transition = match after {
+            AgentGoalLifecycleStatus::Active => "resumed",
+            AgentGoalLifecycleStatus::Suspended => "suspended",
+            AgentGoalLifecycleStatus::Expired => "expired",
+            AgentGoalLifecycleStatus::Retired => "retired",
+        };
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
+            METRIC_AGENT_GOAL_LIFECYCLE,
+            1,
+            &[("transition", transition)],
+        )
+        .ok();
     }
 
     async fn ensure_recovered(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {

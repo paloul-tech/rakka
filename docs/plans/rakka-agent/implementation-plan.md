@@ -2372,8 +2372,13 @@ an example with fault injection across pod restart and shard movement.
   are counted as the difference of the controller's monotone `admitted`
   counter across the committed transition — the one source that sees a
   promotion made in the same breath as a fresh delivery, a release, or a
-  resume. The scanner's existing raw counter now goes through the
-  agent-domain label validator like every other instrument.
+  resume. Lifecycle transitions are counted the same way: the difference of
+  the goal's lifecycle status across the committed transition, so observed
+  flips — expiry, retirement by policy, escalation into suspension — count
+  exactly like commanded ones, from whatever transition first recorded
+  them; `renewed` alone is counted from its command, because renewal leaves
+  the status unchanged. The scanner's existing raw counter now goes through
+  the agent-domain label validator like every other instrument.
 - **Audit is task history** (judgment against 17.13's `AgentAuditSink`
   wording, approved): new `AgentTaskHistoryKind` entries — wake
   dispositioned, epoch admitted/settled, goal
