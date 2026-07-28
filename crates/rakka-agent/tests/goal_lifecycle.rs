@@ -493,6 +493,91 @@ async fn a_crash_between_parking_and_marking_converges() {
     assert_eq!(entries, 1);
 }
 
+#[tokio::test]
+async fn a_crash_after_the_park_write_converges_on_the_durable_entry() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+    let first = scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(first.clone()).expect("the command derives"))
+        .await
+        .expect("the first admission applies");
+    let second = scheduled_wake_binding(10, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(second.clone()).expect("the command derives"))
+        .await
+        .expect("the second delivery coalesces");
+
+    // Kill the owner right after the park write commits: the timer entry
+    // exists durably, but the mark transition never ran, so the slot is
+    // owed-unparked while the store already holds the entry. The next settle
+    // pass rebuilds the binding at a later accepted time — the store must
+    // answer that re-park as a duplicate of the durable entry, never as a
+    // disagreement.
+    fx.wakes
+        .crash_at(1, rakka_agent::testkit::CrashPoint::AfterWrite);
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    let _ = root
+        .accept(
+            &epoch_result(&first, AgentTaskStatus::Failed),
+            &fx.router,
+            fx.now(),
+        )
+        .await;
+    fx.wakes
+        .assert_crash_fired(1, rakka_agent::testkit::CrashPoint::AfterWrite);
+    fx.wakes.survive();
+    let state = controller(&fx).await;
+    let slot = state
+        .lifecycle()
+        .rewakes()
+        .backoff
+        .expect("the re-wake stayed owed");
+    assert!(!slot.parked, "the crash left the mark uncommitted");
+
+    // The next settle pass — any node's — re-parks onto the existing entry
+    // and marks.
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("the recovery settle converges on the parked entry");
+    let state = controller(&fx).await;
+    assert!(
+        state
+            .lifecycle()
+            .rewakes()
+            .backoff
+            .expect("the slot survives")
+            .parked
+    );
+    // Exactly one durable entry exists for it.
+    let entries = fx
+        .wake_scanner()
+        .timers_mut()
+        .recover(AgentTimestampMillis::new(0))
+        .await
+        .expect("the store recovers")
+        .entries()
+        .values()
+        .filter(|entry| {
+            matches!(
+                entry.binding().occurrence(),
+                AgentWakeOccurrence::Retry {
+                    cause: AgentWakeRewakeCause::Backoff,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(entries, 1);
+}
+
 /// Every wake-audit entry of the root task, as `(kind, detail)` in sequence
 /// order.
 async fn history_entries(fx: &Fixture) -> Vec<(rakka_agent::AgentTaskHistoryKind, String)> {

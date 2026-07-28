@@ -531,6 +531,18 @@ impl AgentWakeBinding {
         &self.wake
     }
 
+    /// Whether `other` binds the same occurrence identity — the components
+    /// the wake id is derived from — regardless of delivery metadata
+    /// (trigger, source, accepted time, policy revision), which legitimately
+    /// differs between two deliveries of one occurrence.
+    #[must_use]
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.tenant == other.tenant
+            && self.goal == other.goal
+            && self.schedule_revision == other.schedule_revision
+            && self.occurrence == other.occurrence
+    }
+
     /// The stable operation id this wake's admission deduplicates on.
     pub fn admission_operation_id(&self) -> AgentWakeResult<AgentOperationId> {
         wake_admission_operation_id(&self.tenant, &self.goal, &self.wake)

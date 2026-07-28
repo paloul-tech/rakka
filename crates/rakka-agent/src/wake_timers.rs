@@ -268,10 +268,10 @@ impl VersionedAgentRecord for AgentWakeTimerStoreState {
 /// What scheduling one occurrence did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentWakeTimerScheduled {
-    /// The durable entry: freshly parked, or the identical entry an earlier
-    /// scheduling already parked.
+    /// The durable entry: freshly parked, or the entry an earlier scheduling
+    /// of the same occurrence already parked.
     pub entry: AgentWakeTimerEntry,
-    /// Whether an identical entry already existed.
+    /// Whether an entry for the same occurrence and task already existed.
     pub duplicate: bool,
 }
 
@@ -360,12 +360,16 @@ where
 
     /// Parks one occurrence durably.
     ///
-    /// Scheduling is idempotent on the derived wake id: parking the identical
-    /// occurrence again returns the existing entry as a duplicate, while an
-    /// entry that collides on the wake id but differs in binding or target
-    /// task fails closed — that is not a redelivery, it is a disagreement.
-    /// A lost compare-and-set re-recovers and retries, so racing a concurrent
-    /// scanner or parker converges instead of failing.
+    /// Scheduling is idempotent on the derived wake id: parking the same
+    /// occurrence for the same task again returns the existing entry as a
+    /// duplicate, however the re-park's delivery metadata (trigger, source,
+    /// accepted time, policy revision) differs — a settle pass re-parking
+    /// after a crash builds a fresh binding, and the durable entry is the
+    /// truth it converges on. An entry that collides on the wake id but
+    /// disagrees on the occurrence identity or the target task fails closed —
+    /// that is not a redelivery, it is a disagreement. A lost compare-and-set
+    /// re-recovers and retries, so racing a concurrent scanner or parker
+    /// converges instead of failing.
     pub async fn schedule_occurrence(
         &mut self,
         entry: AgentWakeTimerEntry,
@@ -377,7 +381,7 @@ where
             }
             let record = self.current_record()?;
             if let Some(existing) = record.state.entries.get(entry.wake_id()) {
-                if existing.binding == entry.binding && existing.task == entry.task {
+                if existing.binding.same_identity(&entry.binding) && existing.task == entry.task {
                     return Ok(AgentWakeTimerScheduled {
                         entry: existing.clone(),
                         duplicate: true,
@@ -595,8 +599,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentWakeTimerError {
-    /// An entry already exists under this wake id with a different binding or
-    /// target task.
+    /// An entry already exists under this wake id for a different occurrence
+    /// identity or target task.
     Mismatch {
         /// The colliding wake id.
         wake: AgentWakeId,
@@ -633,7 +637,7 @@ impl Display for AgentWakeTimerError {
         match self {
             Self::Mismatch { wake } => write!(
                 f,
-                "an entry for the wake {wake} already exists with a different binding or task"
+                "an entry for the wake {wake} already exists with a different occurrence or task"
             ),
             Self::NotFound { wake } => write!(f, "no wake-timer entry exists for the wake {wake}"),
             Self::Schema(error) => write!(f, "wake-timer state failed its schema check: {error:?}"),
@@ -666,8 +670,9 @@ pub type AgentWakeRewakeParkFuture<'a> =
 /// store generic through every construction site.
 ///
 /// Parking is idempotent on the derived wake id: a settle pass that crashes
-/// between parking and marking re-parks the identical entry and gets it back
-/// as a duplicate.
+/// between parking and marking re-parks the same occurrence — with fresh
+/// delivery metadata, since the re-park is a new act at a later time — and
+/// gets the durable entry back as a duplicate.
 pub trait AgentWakeRewakeParker: Send + Sync {
     /// Parks one entry idempotently.
     fn park<'a>(&'a self, entry: AgentWakeTimerEntry) -> AgentWakeRewakeParkFuture<'a>;
@@ -740,7 +745,7 @@ mod tests {
     use crate::identity::{AgentGoalId, TenantId};
     use crate::wake::{AgentWakeOccurrence, AgentWakeTriggerKind, ScheduleRevision};
 
-    fn entry(due_at: u64) -> AgentWakeTimerEntry {
+    fn entry_for(due_at: u64, accepted_at: u64, task: &str) -> AgentWakeTimerEntry {
         let binding = AgentWakeBinding::new(
             TenantId::new("acme"),
             AgentGoalId::new("nightly-reconciliation").expect("goal id should be valid"),
@@ -749,12 +754,16 @@ mod tests {
                 due_at: AgentTimestampMillis::new(due_at),
             },
             AgentWakeTriggerKind::DurableTimer,
-            AgentTimestampMillis::new(due_at),
+            AgentTimestampMillis::new(accepted_at),
             AgentRevisionNumber::INITIAL,
         )
         .expect("the binding derives");
-        let task = AgentTaskId::new("task-root").expect("task id should be valid");
-        AgentWakeTimerEntry::new(binding, task, AgentTimestampMillis::new(due_at))
+        let task = AgentTaskId::new(task).expect("task id should be valid");
+        AgentWakeTimerEntry::new(binding, task, AgentTimestampMillis::new(accepted_at))
+    }
+
+    fn entry(due_at: u64) -> AgentWakeTimerEntry {
+        entry_for(due_at, due_at, "task-root")
     }
 
     fn shared_stores() -> (
@@ -831,5 +840,48 @@ mod tests {
             .expect("the race loser converges in one call");
         assert_eq!(marked.status(), AgentWakeTimerStatus::Fired);
         assert_eq!(marked.fired_at(), Some(AgentTimestampMillis::new(1_500)));
+    }
+
+    #[tokio::test]
+    async fn a_re_park_with_fresh_delivery_metadata_is_a_duplicate() {
+        // A settle pass that crashed between parking and marking re-parks the
+        // same occurrence later: same derived identity, later accepted time.
+        // The re-park must converge on the durable entry as a duplicate — the
+        // wake identity deliberately excludes delivery metadata, so a binding
+        // rebuilt at a later moment is the same wake, not a disagreement.
+        let (mut store, _) = shared_stores();
+        let first = store
+            .schedule_occurrence(entry(1_000))
+            .await
+            .expect("the first park applies");
+        assert!(!first.duplicate);
+
+        let reparked = store
+            .schedule_occurrence(entry_for(1_000, 4_000, "task-root"))
+            .await
+            .expect("the re-park converges");
+        assert!(reparked.duplicate);
+        assert_eq!(
+            reparked.entry, first.entry,
+            "the durable entry is the truth the re-park converges on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_same_wake_bound_to_another_task_fails_closed() {
+        // Same derived wake id aimed at a different root task is not a
+        // redelivery — it is a wiring disagreement, and it stays an error.
+        let (mut store, _) = shared_stores();
+        store
+            .schedule_occurrence(entry(1_000))
+            .await
+            .expect("the entry parks");
+
+        let error = store
+            .schedule_occurrence(entry_for(1_000, 1_000, "task-other"))
+            .await
+            .expect_err("a different target task fails closed");
+        assert!(matches!(error, AgentWakeTimerError::Mismatch { .. }));
+        assert_eq!(error.code(), "wake-timer-mismatch");
     }
 }
