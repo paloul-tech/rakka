@@ -155,6 +155,25 @@ pub const CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION: StateSchemaVersion =
 /// ([specification 12.2](../../../docs/plans/rakka-agent/spec.md)).
 pub const CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted
+/// [`crate::wake::AgentWakePolicyRevision`].
+///
+/// A wake-policy revision outlives every wake constructed under it — a wake
+/// binds the policy revision in force at construction, and an operator reads
+/// that contract back long after the policy moved on — so it carries its own
+/// version rather than the goal or task state's, and fails closed on one this
+/// binary cannot read.
+pub const CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of the persisted
+/// [`crate::wake_timers::AgentWakeTimerStoreState`].
+///
+/// The wake-timer store is the shared scanner's durable index of parked
+/// occurrences. It is scanned by whichever pod hosts a scanner, so it
+/// versions independently of any entity's state and fails closed on a record
+/// this binary cannot read.
+pub const CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
 /// Result type for schema compatibility checks.
 pub type AgentSchemaResult<T> = Result<T, AgentSchemaError>;
 
@@ -211,11 +230,15 @@ pub enum AgentRecordKind {
     DecisionEvent,
     /// One agent-private long-term memory, scoped `(TenantId, AgentId)`.
     PrivateMemory,
+    /// One accepted revision of a continuous goal's wake policy.
+    WakePolicyRevision,
+    /// The shared scanner's durable index of parked wake occurrences.
+    WakeTimerState,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -237,6 +260,8 @@ impl AgentRecordKind {
         Self::MemoryContextSnapshot,
         Self::DecisionEvent,
         Self::PrivateMemory,
+        Self::WakePolicyRevision,
+        Self::WakeTimerState,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -264,6 +289,8 @@ impl AgentRecordKind {
             Self::MemoryContextSnapshot => "agent-memory-context-snapshot",
             Self::DecisionEvent => "agent-decision-event",
             Self::PrivateMemory => "agent-private-memory",
+            Self::WakePolicyRevision => "agent-wake-policy-revision",
+            Self::WakeTimerState => "agent-wake-timer-state",
         }
     }
 
@@ -292,6 +319,8 @@ impl AgentRecordKind {
             Self::MemoryContextSnapshot => CURRENT_AGENT_MEMORY_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
             Self::DecisionEvent => CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
             Self::PrivateMemory => CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION,
+            Self::WakePolicyRevision => CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
+            Self::WakeTimerState => CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
         }
     }
 
@@ -318,6 +347,8 @@ impl AgentRecordKind {
             Self::MemoryContextSnapshot => 18,
             Self::DecisionEvent => 19,
             Self::PrivateMemory => 20,
+            Self::WakePolicyRevision => 21,
+            Self::WakeTimerState => 22,
         }
     }
 }

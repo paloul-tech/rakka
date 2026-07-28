@@ -231,8 +231,11 @@ impl Fixture {
                 .expect("the input is inline-bounded"),
             assignee: Some(agent_id()),
             goal: None,
+            goal_mode: Default::default(),
             parent: None,
             dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
             telemetry: Default::default(),
         };
 

@@ -33,13 +33,15 @@ use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind, AgentCheckpointSt
 use crate::choreography::AgentExchangeState;
 use crate::definition::AgentEffectSafetyClass;
 use crate::effect::{AgentEffectGeneration, AgentRunEffectKind, AgentRunEffectStatus};
-use crate::identity::AgentRunScope;
+use crate::identity::{AgentRunScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId};
 use crate::loop_runtime::AgentLoopState;
 use crate::observability::{
     AgentDecisionEvent, AgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
 };
 use crate::run::{AgentRun, AgentRunResult, AgentRunSnapshot, AgentRunState, AgentRunStatus};
 use crate::schema::AgentSchemaPolicy;
+use crate::task::{AgentTaskResult, AgentTaskSnapshot, AgentTaskState};
+use crate::wake_timers::{AgentWakeTimerStatus, AgentWakeTimerStoreState};
 
 /// How far a requested cancellation has actually got
 /// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md), following
@@ -344,6 +346,123 @@ where
         record.revision,
         observed_at,
     )))
+}
+
+/// The authoritative operational answer for one task scope
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)'s
+/// continuous-goal half).
+///
+/// For a continuous root, the embedded wake view answers the M3 checklist's
+/// operational facts in one read: schedule and policy revisions in force,
+/// lifecycle status and revision, the failure streak and any backoff, the
+/// active epochs, the parked occurrences, the goal-window ledger, the monotone
+/// counters, and the owed or parked controller-originated re-wakes. It is
+/// derived from the durable record alone, so it answers identically while the
+/// entity is passivated and while every telemetry path is down. "Next wake"
+/// lives in the wake-timer store, not the task record — join it with
+/// [`next_pending_wake_for_task`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentTaskOperationalSnapshot {
+    /// The durable state revision this answer was derived from.
+    pub revision: Revision,
+    /// When the answer was derived.
+    pub observed_at: AgentTimestampMillis,
+    /// The task's scope.
+    pub scope: AgentTaskScope,
+    /// The task's bounded projection, absent if it was never created.
+    ///
+    /// Content-redacted: the accepted result's content is stripped, because
+    /// the operational answer is an observability surface and content stays
+    /// in durable state and protected artifacts
+    /// ([specification 17.14](../../../docs/plans/rakka-agent/spec.md)).
+    /// [`Self::has_accepted_result`] carries the bounded fact an operator
+    /// needs.
+    pub task: Option<AgentTaskSnapshot>,
+    /// Whether the task holds an accepted typed result.
+    pub has_accepted_result: bool,
+    /// History entries recorded but not yet flushed to the history sink.
+    pub owed_history: usize,
+}
+
+impl AgentTaskOperationalSnapshot {
+    /// Derives the snapshot from one durable task record.
+    ///
+    /// Pure over the record: deriving twice from the same revision yields the
+    /// same answer.
+    #[must_use]
+    pub fn derive(
+        state: &AgentTaskState,
+        revision: Revision,
+        observed_at: AgentTimestampMillis,
+    ) -> Self {
+        let (task, has_accepted_result) = match state.snapshot() {
+            Some(mut snapshot) => {
+                let has_accepted_result = snapshot.accepted_result.is_some();
+                snapshot.accepted_result = None;
+                (Some(snapshot), has_accepted_result)
+            }
+            None => (None, false),
+        };
+        Self {
+            revision,
+            observed_at,
+            scope: state.scope().clone(),
+            task,
+            has_accepted_result,
+            owed_history: state.pending_history().len(),
+        }
+    }
+}
+
+/// Answers the authoritative point query for one task scope.
+///
+/// One durable read, one derivation, no entity activation. `Ok(None)` means no
+/// record exists for the scope; an unsupported schema version fails closed
+/// exactly as the entity's own recovery would.
+pub async fn agent_task_operational_snapshot<Store>(
+    store: &Store,
+    scope: &AgentTaskScope,
+    policy: &AgentSchemaPolicy,
+    observed_at: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentTaskOperationalSnapshot>>
+where
+    Store: DurableStateStore<AgentTaskState>,
+{
+    let Some(record) = store.load(&scope.persistence_id()).await? else {
+        return Ok(None);
+    };
+    record.state.check_schema(policy)?;
+    Ok(Some(AgentTaskOperationalSnapshot::derive(
+        &record.state,
+        record.revision,
+        observed_at,
+    )))
+}
+
+/// The earliest pending wake-timer entry of one task: the "next wake" an
+/// operator asks about, joined from the wake-timer store's durable state.
+///
+/// Pure over the recovered timer state, so any node — including one that owns
+/// neither the task nor a scanner — computes the same answer from the same
+/// record. `None` means no pending entry exists for the task; fired, fenced,
+/// and cancelled entries never surface.
+#[must_use]
+pub fn next_pending_wake_for_task(
+    timers: &AgentWakeTimerStoreState,
+    tenant: &TenantId,
+    task: &AgentTaskId,
+) -> Option<(AgentWakeId, AgentTimestampMillis)> {
+    timers
+        .entries()
+        .values()
+        .filter(|entry| {
+            entry.status() == AgentWakeTimerStatus::Pending
+                && entry.binding().tenant() == tenant
+                && entry.task() == task
+        })
+        .map(|entry| (entry.wake_id().clone(), entry.due_time()))
+        .min_by_key(|(_, due)| *due)
 }
 
 /// Where a persisted trace segment was collected from.

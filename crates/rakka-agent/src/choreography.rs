@@ -419,17 +419,23 @@ pub enum AgentExchangeKind {
     BudgetSettlement,
     /// Return of unconsumed budget to the parent scope. Initiated by the child.
     BudgetReturn,
+    /// A completed epoch task returning its terminal outcome, consumption, and
+    /// evidence reference to the continuous root control task that admitted
+    /// its wake ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
+    /// Initiated by the epoch task; the reply is the controller's release.
+    EpochResult,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
         Self::BudgetAllocation,
         Self::BudgetSettlement,
         Self::BudgetReturn,
+        Self::EpochResult,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -442,6 +448,7 @@ impl AgentExchangeKind {
             Self::BudgetAllocation => "budget-allocation",
             Self::BudgetSettlement => "budget-settlement",
             Self::BudgetReturn => "budget-return",
+            Self::EpochResult => "epoch-result",
         }
     }
 }

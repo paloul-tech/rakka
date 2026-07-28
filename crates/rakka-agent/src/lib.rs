@@ -83,6 +83,8 @@ pub mod task;
 pub mod testkit;
 pub mod tools;
 pub mod wake;
+pub mod wake_scanner;
+pub mod wake_timers;
 pub mod workflow_tool;
 
 pub use admission::{
@@ -202,9 +204,9 @@ pub use observability::{
     InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
     AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
     METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
@@ -217,9 +219,10 @@ pub use otel::{
     ATTR_RAKKA_AGENT_DELEGATION_ID, ATTR_RAKKA_AGENT_GOAL_ID, ATTR_RAKKA_AGENT_TASK_ID,
 };
 pub use query::{
-    agent_operational_snapshot, assemble_agent_session_view, AgentCancellationProgress,
-    AgentCheckpointView, AgentOperationalSnapshot, AgentPendingEffectView,
-    AgentSessionSegmentSource, AgentSessionTraceSegment, AgentSessionView,
+    agent_operational_snapshot, agent_task_operational_snapshot, assemble_agent_session_view,
+    next_pending_wake_for_task, AgentCancellationProgress, AgentCheckpointView,
+    AgentOperationalSnapshot, AgentPendingEffectView, AgentSessionSegmentSource,
+    AgentSessionTraceSegment, AgentSessionView, AgentTaskOperationalSnapshot,
 };
 pub use retrieval::{
     assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
@@ -244,6 +247,33 @@ pub use run::{
     AGENT_RUN_MAX_LOOP_STEPS_PER_PASS, AGENT_RUN_MAX_SETTLE_ROUNDS,
     AGENT_RUN_OPERATION_LOG_CAPACITY, AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
     DEFAULT_AGENT_RUN_ENTITY_TYPE,
+};
+
+pub use goal::{AgentContinuousGoalSpec, AgentEpochSpec, AgentGoalMode};
+pub use wake::{
+    epoch_admission_operation_id, epoch_result_operation_id, epoch_task_id_for_wake,
+    wake_admission_operation_id, wake_id_for_occurrence, AgentActiveWake, AgentBudgetWindow,
+    AgentCalendarUnit, AgentEpochOutcomeClass, AgentEpochRef, AgentGoalLifecycleState,
+    AgentGoalLifecycleStatus, AgentGoalWindowCeiling, AgentMissedOccurrencePolicy,
+    AgentWakeBackoffPolicy, AgentWakeBinding, AgentWakeCallbackId, AgentWakeControllerState,
+    AgentWakeCounters, AgentWakeDisposition, AgentWakeError, AgentWakeEventId,
+    AgentWakeLifecyclePolicy, AgentWakeOccurrence, AgentWakeOutcome, AgentWakeOverlapPolicy,
+    AgentWakePolicy, AgentWakePolicyRevision, AgentWakeRelease, AgentWakeRenewalPolicy,
+    AgentWakeResult, AgentWakeRetirementPolicy, AgentWakeRewake, AgentWakeRewakeCause,
+    AgentWakeRewakes, AgentWakeStatusView, AgentWakeSuspensionPolicy, AgentWakeTriggerKind,
+    AgentWakeWindowLedger, ScheduleRevision, AGENT_WAKE_ACTIVE_CAPACITY, AGENT_WAKE_ID_PREFIX,
+    AGENT_WAKE_PENDING_CAPACITY, AGENT_WAKE_REASON_MAX_LENGTH, AGENT_WAKE_RECENT_CAPACITY,
+};
+pub use wake_scanner::{
+    wake_admission_command, AgentWakeDelivery, AgentWakeDeliveryFuture, AgentWakeScan,
+    AgentWakeScanError, AgentWakeScanOutcome, AgentWakeScanResult, AgentWakeScanner,
+    AgentWakeScannerSettings, ShardedWakeDelivery, METRIC_AGENT_WAKES,
+};
+pub use wake_timers::{
+    agent_wake_timer_store_persistence_id, AgentWakeRewakeParkFuture, AgentWakeRewakeParker,
+    AgentWakeTimerEntry, AgentWakeTimerError, AgentWakeTimerResult, AgentWakeTimerScheduled,
+    AgentWakeTimerStatus, AgentWakeTimerStore, AgentWakeTimerStoreState, SharedWakeTimerParker,
+    AGENT_WAKE_TIMER_PERSISTENCE_PREFIX, DEFAULT_AGENT_WAKE_TIMER_STORE_ID,
 };
 
 pub use definition::{
@@ -278,6 +308,7 @@ pub use schema::{
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
     CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
     CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION, CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
 };
 pub use task::{
     agent_task_entity_id, agent_task_entity_persistence_id, agent_task_entity_ref,
@@ -287,11 +318,11 @@ pub use task::{
     AgentAcceptedResult, AgentAssignmentGeneration, AgentAssignmentReadiness,
     AgentAssignmentRefusal, AgentAssignmentRefusalReason, AgentAssignmentStatus,
     AgentBudgetLedgerOutcome, AgentBudgetReturn, AgentBudgetSettlement, AgentBudgetTopUpRequest,
-    AgentContentDigest, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentRunAcceptance,
-    AgentRunAssignment, AgentSchemaId, AgentSchemaRef, AgentTask, AgentTaskClock, AgentTaskContent,
-    AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition, AgentTaskDependency,
-    AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntity,
-    AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef,
+    AgentContentDigest, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentEpochResult,
+    AgentRunAcceptance, AgentRunAssignment, AgentSchemaId, AgentSchemaRef, AgentTask,
+    AgentTaskClock, AgentTaskContent, AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition,
+    AgentTaskDependency, AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome,
+    AgentTaskEntity, AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef,
     AgentTaskEntityRegistration, AgentTaskEntityReply, AgentTaskEntityShardingSettings,
     AgentTaskEntityStore, AgentTaskEntityTypeKey, AgentTaskError, AgentTaskHistoryCursor,
     AgentTaskHistoryEntry, AgentTaskHistoryFuture, AgentTaskHistoryKind, AgentTaskHistoryPage,
@@ -302,6 +333,7 @@ pub use task::{
     AgentTaskState, AgentTaskStatus, AgentTaskTerminalReason, InMemoryAgentTaskHistoryStore,
     TypedTask, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
     AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE, AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
+    AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE, AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
     AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
     AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH, AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE,
     AGENT_TASK_CREATION_PAYLOAD_TYPE, AGENT_TASK_DECISION_PAYLOAD_TYPE,

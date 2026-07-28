@@ -612,3 +612,189 @@ async fn the_snapshot_reports_the_reference_facts_after_any_owner_loss() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Task-scoped operational query (M3)
+
+/// A legitimate epoch-result envelope for one admitted wake.
+fn epoch_result_envelope(
+    binding: &rakka_agent::AgentWakeBinding,
+    status: rakka_agent::AgentTaskStatus,
+) -> rakka_agent::AgentExchangeEnvelope {
+    let epoch_task =
+        rakka_agent::epoch_task_id_for_wake(binding.wake_id()).expect("the epoch derives");
+    let epoch_scope =
+        rakka_agent::AgentTaskScope::new(tenant(), epoch_task.clone()).expect("the scope is valid");
+    let operation_id =
+        rakka_agent::epoch_result_operation_id(&tenant(), &goal_id(), binding.wake_id())
+            .expect("the operation id derives");
+    let result = rakka_agent::AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: epoch_task,
+        status,
+        consumed: rakka_agent::AgentBudgetConsumption::zero(),
+        result_digest: None,
+    };
+    rakka_agent::AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        rakka_agent::AgentExchangeKind::EpochResult,
+        rakka_agent::AgentEntityAddress::Task(epoch_scope),
+        rakka_agent::AgentEntityAddress::Task(task_scope()),
+        rakka_agent::AgentExchangePayload::encode(
+            rakka_agent::AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+            &result,
+        )
+        .expect("the payload encodes"),
+        rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+        AgentTimestampMillis::new(9_000),
+    )
+    .expect("the envelope builds")
+}
+
+/// The M3 operational facts, answered from the durable task record alone —
+/// no entity is resident when the query runs, which is exactly the
+/// passivated case — and the "next wake" joined purely from the wake-timer
+/// store's state.
+#[tokio::test]
+async fn the_task_snapshot_answers_the_continuous_checklist_while_passivated() {
+    use rakka_agent::ScheduleRevision;
+
+    let fx = Fixture::new(ScriptedDispatcher::new());
+    fx.instantiate_agent().await;
+    fx.create_continuous_control_task(continuous_goal_mode(wake_policy()))
+        .await;
+
+    // One occurrence admits and attaches its epoch; a second coalesces
+    // behind it.
+    let first = scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(first.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the first admission applies");
+    let second = scheduled_wake_binding(10, ScheduleRevision::INITIAL);
+    fx.apply_task_command(
+        rakka_agent::wake_admission_command(second.clone()).expect("the command derives"),
+    )
+    .await
+    .expect("the second delivery coalesces");
+
+    // Every entity store built by the fixture was dropped after its call:
+    // the answer below is derived from the durable record alone.
+    let snapshot = rakka_agent::agent_task_operational_snapshot(
+        &fx.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the root exists");
+    assert_eq!(snapshot.observed_at, AgentTimestampMillis::new(9_999));
+    assert!(!snapshot.has_accepted_result);
+    let task = snapshot.task.as_ref().expect("the root is created");
+    let wake = task.wake.as_ref().expect("the goal has a wake view");
+    assert_eq!(wake.schedule_revision, ScheduleRevision::INITIAL);
+    assert_eq!(wake.active, vec![first.wake_id().clone()]);
+    assert_eq!(wake.pending, vec![second.wake_id().clone()]);
+    assert_eq!(wake.counters.admitted, 1);
+    assert_eq!(wake.counters.coalesced, 1);
+    let (epoch_task, epoch_run) = epoch_scopes_for(first.wake_id());
+    assert_eq!(
+        wake.epochs,
+        vec![rakka_agent::AgentEpochRef {
+            task: epoch_task.task().clone(),
+            run: epoch_run.run().clone(),
+        }],
+        "the active occurrence's epoch is the view's epoch"
+    );
+    let lifecycle = wake.lifecycle.as_ref().expect("the lifecycle view rides");
+    assert_eq!(
+        lifecycle.status(),
+        rakka_agent::AgentGoalLifecycleStatus::Active
+    );
+    assert_eq!(lifecycle.consecutive_failures(), 0);
+
+    // The epoch fails: the streak, the backoff, and the parked backoff
+    // re-wake all surface in the same one-read answer.
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    let reply = root
+        .accept(
+            &epoch_result_envelope(&first, rakka_agent::AgentTaskStatus::Failed),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect("the result is answered");
+    assert!(reply.result().is_accepted());
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("the root settles");
+    drop(root);
+
+    let snapshot = rakka_agent::agent_task_operational_snapshot(
+        &fx.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(10_000),
+    )
+    .await
+    .expect("the point query answers")
+    .expect("the root exists");
+    assert_eq!(snapshot.owed_history, 0, "the settle pass flushed history");
+    let task = snapshot.task.as_ref().expect("the root is created");
+    let wake = task.wake.as_ref().expect("the goal has a wake view");
+    assert!(wake.active.is_empty(), "the failed wake released");
+    assert_eq!(wake.pending, vec![second.wake_id().clone()]);
+    assert!(wake.epochs.is_empty());
+    let lifecycle = wake.lifecycle.as_ref().expect("the lifecycle view rides");
+    assert_eq!(lifecycle.consecutive_failures(), 1);
+    let until = lifecycle.backoff_until().expect("the backoff is in force");
+    let slot = lifecycle
+        .rewakes()
+        .backoff
+        .expect("the backoff re-wake is owed");
+    assert!(slot.parked, "the settle pass parked it durably");
+    assert_eq!(slot.due_at, until);
+
+    // "Next wake" joins from the wake-timer store: the parked backoff
+    // re-wake is the earliest pending entry for this task.
+    let mut scanner = fx.wake_scanner();
+    let timer_state = scanner
+        .timers_mut()
+        .recover(AgentTimestampMillis::new(0))
+        .await
+        .expect("the timer store recovers")
+        .clone();
+    let (next_wake, next_due) =
+        rakka_agent::next_pending_wake_for_task(&timer_state, &tenant(), task_scope().task())
+            .expect("the parked re-wake is pending");
+    assert_eq!(next_due, until);
+    assert!(
+        next_wake.as_str().starts_with("wake-"),
+        "the joined id is a derived wake identity"
+    );
+
+    // A scope that was never created answers `None`, not an error.
+    let absent = rakka_agent::AgentTaskScope::new(
+        tenant(),
+        rakka_agent::AgentTaskId::new("task-operational-query-absent").expect("the id is valid"),
+    )
+    .expect("the scope is valid");
+    assert!(rakka_agent::agent_task_operational_snapshot(
+        &fx.tasks,
+        &absent,
+        &AgentSchemaPolicy::default(),
+        AgentTimestampMillis::new(10_001),
+    )
+    .await
+    .expect("the point query answers")
+    .is_none());
+}

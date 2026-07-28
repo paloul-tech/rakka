@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use a2a::{Message, PartContent};
 use a2a_server::ServiceParams;
 use rakka_agent::{
-    AgentOperationId, AgentOperationKind, AgentTaskContent, AgentTaskCreation,
+    AgentGoalMode, AgentOperationId, AgentOperationKind, AgentTaskContent, AgentTaskCreation,
     AgentTaskEntityCommand, AgentTaskId, TenantId,
 };
 use rakka_agent_workflow::{
@@ -297,8 +297,15 @@ pub fn agent_task_create_command(
             input: AgentTaskContent::inline(input)?,
             assignee: Some(target.agent.clone()),
             goal: None,
+            // An A2A message creates a finite unit of work; a continuous root
+            // control task is instituted by the goal surface, never by
+            // ingress — and never an epoch, whose creation only the admitting
+            // controller owes.
+            goal_mode: AgentGoalMode::Finite,
             parent: None,
             dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
             telemetry: normalized.telemetry.clone(),
         }),
     })

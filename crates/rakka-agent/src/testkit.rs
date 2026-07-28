@@ -78,7 +78,7 @@ use crate::effect::{
     AgentRunEffect, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
     AgentRunEffectStatus,
 };
-use crate::identity::{AgentOperationId, AgentRunScope};
+use crate::identity::{AgentOperationId, AgentRunScope, AgentTaskScope};
 use crate::loop_runtime::{AgentLoopState, CURRENT_AGENT_LOOP_ADAPTER_VERSION};
 use crate::memory::{AgentContextSnapshotRef, AgentRunMemory, MemoryError};
 use crate::model::{
@@ -91,10 +91,12 @@ use crate::run::{
 };
 use crate::schema::{AgentSchemaError, AgentSchemaPolicy};
 use crate::task::{
-    AgentRunAcceptance, AgentRunAssignment, AgentTaskContent, AgentTaskEntityStore, AgentTaskError,
-    AgentTaskHistoryStore, AgentTaskState, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE,
-    AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
+    AgentRunAcceptance, AgentRunAssignment, AgentTaskContent, AgentTaskEntityCommand,
+    AgentTaskEntityReply, AgentTaskEntityStore, AgentTaskError, AgentTaskHistoryStore,
+    AgentTaskState, AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
 };
+use crate::wake_scanner::{AgentWakeDelivery, AgentWakeDeliveryFuture};
+use crate::wake_timers::AgentWakeRewakeParker;
 
 /// Payload type of a [`ProbeCreation`] command.
 pub const PROBE_CREATION_TYPE: &str = "rakka.agent.testkit.ProbeCreation";
@@ -372,6 +374,9 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
+            // An epoch result is a durable transition but not a balance
+            // movement: the probe records the application without crediting.
+            AgentExchangeKind::EpochResult => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -983,6 +988,184 @@ where
 
 fn task_delivery_error(error: AgentTaskError) -> AgentExchangeDeliveryError {
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
+/// Delivers wake admission commands to a real [`AgentTaskEntityStore`] over a
+/// shared durable store.
+///
+/// Every delivery re-materializes the entity from durable state alone — which
+/// is what a scanner delivering to a passivated controller looks like from the
+/// outside. The same [`ExchangeFault`] queue the exchange transports use
+/// injects the wake failure windows: a command lost before the entity, a
+/// duplicate delivery of the same derived operation id, and a reply lost after
+/// the controller dispositioned the wake — the window that leaves a timer
+/// entry pending for the next pass to redeliver.
+pub struct InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    store: Store,
+    agents: Agents,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    deliveries: Arc<AtomicUsize>,
+    rewake_parker: Option<Arc<dyn AgentWakeRewakeParker>>,
+}
+
+impl<Store, Agents, History> Clone for InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            agents: self.agents.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            deliveries: self.deliveries.clone(),
+            rewake_parker: self.rewake_parker.clone(),
+        }
+    }
+}
+
+impl<Store, Agents, History> InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    /// Creates a delivery into task entities over one durable store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        agents: Agents,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            agents,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            deliveries: Arc::new(AtomicUsize::new(0)),
+            rewake_parker: None,
+        }
+    }
+
+    /// Wires the wake-timer parker the delivered entities' settle passes park
+    /// controller-originated re-wakes through.
+    #[must_use]
+    pub fn with_wake_timers(mut self, parker: Arc<dyn AgentWakeRewakeParker>) -> Self {
+        self.rewake_parker = Some(parker);
+        self
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many commands reached a task entity's durable apply path, including
+    /// the ones whose reply was then lost.
+    #[must_use]
+    pub fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+
+    async fn apply_once(
+        &self,
+        scope: &AgentTaskScope,
+        command: AgentTaskEntityCommand,
+    ) -> AgentTaskEntityReply {
+        let mut entity = AgentTaskEntityStore::new(
+            scope.clone(),
+            self.store.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        if let Some(parker) = self.rewake_parker.clone() {
+            entity = entity.with_wake_timers(parker);
+        }
+        self.deliveries.fetch_add(1, Ordering::SeqCst);
+        let now = self.now();
+        match entity.apply(command, &self.router, now).await {
+            Ok(reply) => reply,
+            // The entity actor answers a domain refusal as a rejection reply,
+            // so the delivery does too: a scanner must see the same protocol
+            // either way.
+            Err(error) => AgentTaskEntityReply::Rejected {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+impl<Store, Agents, History> AgentWakeDelivery for InProcessWakeDelivery<Store, Agents, History>
+where
+    Store: DurableStateStore<AgentTaskState>,
+    Agents: DurableStateStore<AgentEntityState>,
+    History: AgentTaskHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        scope: &'a AgentTaskScope,
+        command: AgentTaskEntityCommand,
+    ) -> AgentWakeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-command",
+                    "the command never reached the task entity",
+                ));
+            }
+
+            let mut reply = self.apply_once(scope, command.clone()).await;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                // The same command arrives again at the same durable receiver.
+                // The reply the scanner sees is the second one, which must
+                // carry the same logical result as the first.
+                reply = self.apply_once(scope, command).await;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the controller dispositioned the wake, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
 }
 
 fn run_delivery_error(error: AgentRunError) -> AgentExchangeDeliveryError {
