@@ -143,9 +143,10 @@ pub use dispatch::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe,
     AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
     AgentEffectCredentialResolver, AgentEffectReconciler, AgentEntityAuthority,
-    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
-    SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
+    AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding, AgentMemoryPromotionExecutor,
+    AgentMemoryPromotionFinding, AgentReconciliationFinding, AgentRunEffectDispatcher,
+    AgentRunResultDelivery, AgentRunSetupResolver, SessionMemoryPromotionExecutor,
+    WorkflowAgentRunEffectSink,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentEffectError,
@@ -161,6 +162,13 @@ pub use effect::{
     ATTR_AGENT_EFFECT_SAFETY_CLASS, ATTR_AGENT_EFFECT_SETTINGS_REVISION,
     ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_SUPERSEDED_GENERATION,
 };
+pub use evaluation::{
+    goal_evaluation_record_id, AgentGoalEvaluationError, AgentGoalEvaluationMethod,
+    AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvaluationRecord,
+    AgentGoalEvaluationRequest, AgentGoalEvaluationResult, AgentGoalEvidenceRef,
+    AgentGoalStagnationAction, AgentGoalStagnationPolicy, AgentStagnationTrigger,
+    AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS, AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+};
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
     AgentGuardrailDecision, AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome,
@@ -169,8 +177,9 @@ pub use guardrails::{
     AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
 pub use loop_runtime::{
-    AgentLoopPhase, AgentLoopState, AgentMemoryPromotionRecord, AgentPendingTopUp,
-    AgentRunProposal, AGENT_RUN_MAX_MEMORY_PROMOTIONS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState, AgentMemoryPromotionRecord,
+    AgentPendingTopUp, AgentRunProposal, AGENT_RUN_MAX_MEMORY_PROMOTIONS,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 pub use memory::{
     assemble_session_context, check_memory_schema, check_private_memory_schema,
@@ -204,8 +213,8 @@ pub use observability::{
     InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
     AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
     METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STATUS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION,
+    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
@@ -235,7 +244,7 @@ pub use retrieval::{
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
-    agent_run_entity_type_key, init_agent_run_entity_remote_sharding,
+    agent_run_entity_type_key, evaluation_operation_id, init_agent_run_entity_remote_sharding,
     init_agent_run_entity_sharding, ledger_operation_id, load_agent_run_state,
     passivate_agent_run_entity, promotion_operation_id, proposal_operation_id,
     registered_agent_run_entity_ref, system_run_clock, AgentRun, AgentRunClock, AgentRunEntity,
@@ -313,13 +322,13 @@ pub use schema::{
     CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
     CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
-    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION,
-    CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION, CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION,
-    CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION, CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION,
-    CURRENT_AGENT_SETTINGS_SCHEMA_VERSION, CURRENT_AGENT_SETUP_SCHEMA_VERSION,
-    CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION,
-    CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION, CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
-    CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
+    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION,
+    CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION, CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
+    CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
+    CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
+    CURRENT_AGENT_TASK_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION, CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
 };
 pub use task::{
     agent_task_entity_id, agent_task_entity_persistence_id, agent_task_entity_ref,
@@ -345,6 +354,7 @@ pub use task::{
     TypedTask, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
     AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE, AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
     AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE, AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+    AGENT_GOAL_EVALUATION_OUTCOME_PAYLOAD_TYPE, AGENT_GOAL_EVALUATION_PAYLOAD_TYPE,
     AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
     AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH, AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE,
     AGENT_TASK_CREATION_PAYLOAD_TYPE, AGENT_TASK_DECISION_PAYLOAD_TYPE,

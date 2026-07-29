@@ -619,6 +619,7 @@ pub struct AgentEffectPolicies {
     default_tool: AgentEffectSpec,
     compensation: AgentEffectSpec,
     memory_promotion: AgentEffectSpec,
+    goal_evaluation: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
@@ -637,6 +638,20 @@ impl AgentEffectPolicies {
             memory_promotion: AgentEffectSpec {
                 safety_class: AgentEffectSafetyClass::Idempotent,
                 max_attempts: AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // An evaluation judges evidence and never mutates the world:
+            // read-only is what makes a crash-retry safe and keeps an
+            // ambiguous loss off the reconciliation path.
+            goal_evaluation: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::ReadOnly,
+                max_attempts: crate::evaluation::AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS,
                 reconciliation_protocol: None,
                 credential_binding: None,
                 timeout_ms: None,
@@ -707,6 +722,17 @@ impl AgentEffectPolicies {
         Ok(self)
     }
 
+    /// Sets the spec goal evaluations dispatch under
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::evaluation::AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS`]
+    /// read-only attempts.
+    pub fn with_goal_evaluation_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.goal_evaluation = spec;
+        Ok(self)
+    }
+
     /// Pins every spec — model, registered tools, and the unclassified
     /// default — to the guardrail chain revision the deployment evaluates at
     /// dispatch, so each committed intent records the policy its transforms
@@ -718,6 +744,7 @@ impl AgentEffectPolicies {
         self.model.guardrail_revision = Some(revision);
         self.default_tool.guardrail_revision = Some(revision);
         self.memory_promotion.guardrail_revision = Some(revision);
+        self.goal_evaluation.guardrail_revision = Some(revision);
         for spec in self.tools.values_mut() {
             spec.guardrail_revision = Some(revision);
         }
@@ -734,6 +761,7 @@ impl AgentEffectPolicies {
             }
             AgentRunEffectRequest::Compensation { .. } => &self.compensation,
             AgentRunEffectRequest::MemoryPromotion { .. } => &self.memory_promotion,
+            AgentRunEffectRequest::Evaluation { .. } => &self.goal_evaluation,
         }
     }
 }
@@ -776,6 +804,9 @@ pub enum AgentRunEffectKind {
     /// A promotion of session-memory entries into the agent's private
     /// long-term store ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
     MemoryPromotionCall,
+    /// An evaluation of the goal's success criteria against durable evidence
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    GoalEvaluationCall,
 }
 
 impl AgentRunEffectKind {
@@ -787,6 +818,7 @@ impl AgentRunEffectKind {
             Self::ToolCall => "tool-call",
             Self::CompensationCall => "compensation-call",
             Self::MemoryPromotionCall => "memory-promotion-call",
+            Self::GoalEvaluationCall => "goal-evaluation-call",
         }
     }
 
@@ -795,13 +827,14 @@ impl AgentRunEffectKind {
     pub const fn workflow_kind(self) -> AgentEffectKind {
         match self {
             Self::ModelCall => AgentEffectKind::ModelCall,
-            // A compensation or memory promotion dispatches through the same
-            // adapter surface as a tool call: the outbox ticket's target type
-            // (`compensation`, `memory-promotion`) is what routes it to its
-            // executor.
-            Self::ToolCall | Self::CompensationCall | Self::MemoryPromotionCall => {
-                AgentEffectKind::ToolCall
-            }
+            // A compensation, memory promotion, or goal evaluation dispatches
+            // through the same adapter surface as a tool call: the outbox
+            // ticket's target type (`compensation`, `memory-promotion`,
+            // `goal-evaluation`) is what routes it to its executor.
+            Self::ToolCall
+            | Self::CompensationCall
+            | Self::MemoryPromotionCall
+            | Self::GoalEvaluationCall => AgentEffectKind::ToolCall,
         }
     }
 }
@@ -1042,6 +1075,15 @@ pub enum AgentRunEffectRequest {
         /// What to promote and where.
         promotion: Box<AgentMemoryPromotionRequest>,
     },
+    /// Evaluate the goal's current success-criteria revision against durable
+    /// evidence ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// a read-only durable effect, committed by a deduplicated run command and
+    /// executed by the dispatcher's evaluation executor. Its completed record
+    /// is what a criteria decision rests on.
+    Evaluation {
+        /// What to evaluate, as which evaluator, by which method.
+        evaluation: Box<crate::evaluation::AgentGoalEvaluationRequest>,
+    },
 }
 
 impl AgentRunEffectRequest {
@@ -1053,6 +1095,7 @@ impl AgentRunEffectRequest {
             Self::Tool { .. } => AgentRunEffectKind::ToolCall,
             Self::Compensation { .. } => AgentRunEffectKind::CompensationCall,
             Self::MemoryPromotion { .. } => AgentRunEffectKind::MemoryPromotionCall,
+            Self::Evaluation { .. } => AgentRunEffectKind::GoalEvaluationCall,
         }
     }
 
@@ -1060,7 +1103,10 @@ impl AgentRunEffectRequest {
     #[must_use]
     pub fn tool_call(&self) -> Option<&AgentToolCallRequest> {
         match self {
-            Self::Model { .. } | Self::Compensation { .. } | Self::MemoryPromotion { .. } => None,
+            Self::Model { .. }
+            | Self::Compensation { .. }
+            | Self::MemoryPromotion { .. }
+            | Self::Evaluation { .. } => None,
             Self::Tool { call } => Some(call),
         }
     }
@@ -1123,6 +1169,12 @@ impl AgentRunEffectRequest {
             Self::MemoryPromotion { promotion } => AgentEffectTarget {
                 target_type: "memory-promotion".to_string(),
                 name: promotion.kind.as_label().to_string(),
+                address: None,
+                attributes: BTreeMap::new(),
+            },
+            Self::Evaluation { evaluation } => AgentEffectTarget {
+                target_type: "goal-evaluation".to_string(),
+                name: evaluation.evaluator.to_string(),
                 address: None,
                 attributes: BTreeMap::new(),
             },
@@ -1604,6 +1656,13 @@ pub enum AgentRunEffectOutcome {
         /// The bounded receipt: identities and revisions only, never content.
         promoted: Vec<AgentPromotedMemoryRef>,
     },
+    /// A goal evaluation completed with a verdict
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    Evaluation {
+        /// The durable record: outcome, evidence references, and the criteria
+        /// revision it assessed.
+        record: Box<crate::evaluation::AgentGoalEvaluationRecord>,
+    },
     /// The generation failed definitively.
     Failed {
         /// Stable machine-readable code.
@@ -1640,7 +1699,10 @@ impl AgentRunEffectOutcome {
     pub const fn is_completed(&self) -> bool {
         matches!(
             self,
-            Self::Model { .. } | Self::Tool { .. } | Self::MemoryPromotion { .. }
+            Self::Model { .. }
+                | Self::Tool { .. }
+                | Self::MemoryPromotion { .. }
+                | Self::Evaluation { .. }
         )
     }
 
@@ -1648,9 +1710,10 @@ impl AgentRunEffectOutcome {
     #[must_use]
     pub const fn resolved_status(&self) -> AgentRunEffectStatus {
         match self {
-            Self::Model { .. } | Self::Tool { .. } | Self::MemoryPromotion { .. } => {
-                AgentRunEffectStatus::Succeeded
-            }
+            Self::Model { .. }
+            | Self::Tool { .. }
+            | Self::MemoryPromotion { .. }
+            | Self::Evaluation { .. } => AgentRunEffectStatus::Succeeded,
             Self::Failed { .. } => AgentRunEffectStatus::Failed,
             Self::Exhausted { .. } => AgentRunEffectStatus::Exhausted,
             Self::Indeterminate { .. } => AgentRunEffectStatus::Indeterminate,
@@ -1680,6 +1743,9 @@ impl AgentRunEffectOutcome {
     pub fn check_schema(&self, policy: &AgentSchemaPolicy) -> Result<(), AgentSchemaError> {
         if let Self::Model { turn } = self {
             policy.check_record(turn.as_ref())?;
+        }
+        if let Self::Evaluation { record } = self {
+            policy.check_record(record.as_ref())?;
         }
         Ok(())
     }
@@ -1714,6 +1780,13 @@ impl AgentRunEffectOutcome {
                     });
                 }
                 Ok(())
+            }
+            Self::Evaluation { record } => {
+                record
+                    .validate()
+                    .map_err(|error| AgentEffectError::InvalidPolicy {
+                        message: error.to_string(),
+                    })
             }
             Self::Failed { .. }
             | Self::Exhausted { .. }

@@ -107,7 +107,7 @@ use rakka_agent_workflow::{
     agent_effect_to_outbox_command, AgentDispatchClaim, AgentDispatcherError, AgentDispatcherFleet,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEffect,
     AgentEphemeralCredential, AgentInboxError, AgentOutboxError, AgentRunId as WorkflowRunId,
-    AgentRunInbox, AgentTimestampMillis,
+    AgentRunInbox, AgentTimestampMillis, PrincipalRef,
 };
 use rakka_persistence::DurableStateStore;
 
@@ -374,6 +374,61 @@ pub trait AgentMemoryPromotionExecutor: Send + Sync {
         promotion: &'a AgentMemoryPromotionRequest,
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding>;
+}
+
+/// What one bounded goal-evaluation attempt established
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentGoalEvaluationFinding {
+    /// The evaluation reached a verdict. The evidence is the *complete*
+    /// classed set the verdict rests on — the executor starts from the
+    /// request's evidence and may extend it — references and stable codes
+    /// only, never content.
+    Evaluated {
+        /// The verdict.
+        outcome: crate::evaluation::AgentGoalEvaluationOutcome,
+        /// Bounded, stable reason code for the verdict.
+        reason_code: String,
+        /// The complete classed evidence the verdict rests on.
+        evidence: Vec<crate::evaluation::AgentGoalEvidenceRef>,
+        /// The human principal whose authorized decision produced the
+        /// verdict, when one did.
+        evaluated_by: Option<PrincipalRef>,
+    },
+    /// Definitively refused: no retry can change the answer. The generation
+    /// settles `Failed` under the stable code, the goal stays undecided, and
+    /// the caller re-evaluates.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one goal-evaluation effect inside a bounded dispatch attempt
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): judges the
+/// request's criteria revision against durable evidence, as the deterministic
+/// assertion, authoritative query, or evaluator model the request names. The
+/// evaluator-model contract is the request's pinned profile — the authority
+/// resolved it from the request alone, so the agent's turn-bound settings
+/// profile never stands in for it.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the effect's
+/// read-only attempt bound; a [`AgentGoalEvaluationFinding::Refused`] is
+/// definitive. An absent executor fails closed at `invoke`. Human review never
+/// reaches this trait — the effect-bound approval grant is its verdict.
+pub trait AgentGoalEvaluationExecutor: Send + Sync {
+    /// Performs the evaluation and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        evaluation: &'a crate::evaluation::AgentGoalEvaluationRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentGoalEvaluationFinding>;
 }
 
 /// The runtime-provided promotion executor: the session store in, the private
@@ -1077,6 +1132,7 @@ where
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
     compensations: Option<Arc<dyn AgentCompensationExecutor>>,
     memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
+    goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -1132,6 +1188,7 @@ where
             reconciler: None,
             compensations: None,
             memory_promotions: None,
+            goal_evaluations: None,
             delivery,
             probe: None,
         }
@@ -1199,6 +1256,19 @@ where
         memory_promotions: Arc<dyn AgentMemoryPromotionExecutor>,
     ) -> Self {
         self.memory_promotions = Some(memory_promotions);
+        self
+    }
+
+    /// Executes goal-evaluation effects through the given application-owned
+    /// executor ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    /// Without one, an evaluation dispatch fails closed with a stable code —
+    /// except human review, whose effect-bound approval grant is its verdict.
+    #[must_use]
+    pub fn with_goal_evaluation_executor(
+        mut self,
+        goal_evaluations: Arc<dyn AgentGoalEvaluationExecutor>,
+    ) -> Self {
+        self.goal_evaluations = Some(goal_evaluations);
         self
     }
 
@@ -2231,6 +2301,131 @@ where
                         Ok(AgentRunEffectOutcome::Failed { code, message })
                     }
                 }
+            }
+            AgentRunEffectRequest::Evaluation { evaluation } => {
+                self.invoke_goal_evaluation(scope, intent, granted, evaluation, credential)
+                    .await
+            }
+        }
+    }
+
+    /// The goal-evaluation arm of [`Self::invoke`]
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Human review never calls an executor: the effect-bound approval grant
+    /// the authority validated *is* the verdict, and the record it produces
+    /// names the resolver and carries the durable human decision as its
+    /// evidence. Every other method runs through the application-owned
+    /// executor, or fails closed definitively when none is configured. A
+    /// verification workflow fails closed until workflows-as-tools land —
+    /// defense in depth behind the commit-time refusal.
+    async fn invoke_goal_evaluation(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        granted: &AgentGrantedDispatch,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        credential: Option<&AgentEphemeralCredential>,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        use crate::evaluation::{
+            goal_evaluation_record_id, AgentGoalEvaluationMethod, AgentGoalEvaluationOutcome,
+            AgentGoalEvaluationRecord, AgentGoalEvidenceRef,
+        };
+
+        let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+        let evaluation_id =
+            goal_evaluation_record_id(scope, intent.turn, intent.slot, intent.generation).map_err(
+                |error| AgentDispatchError::Invocation {
+                    code: "evaluation-identity-invalid",
+                    message: error.to_string(),
+                },
+            )?;
+        let build = |outcome: AgentGoalEvaluationOutcome,
+                     reason_code: String,
+                     evidence: Vec<AgentGoalEvidenceRef>,
+                     evaluated_by| {
+            AgentGoalEvaluationRecord::new(
+                evaluation_id.clone(),
+                evaluation.goal.clone(),
+                evaluation.evaluator.clone(),
+                evaluation.method.kind(),
+                evaluation.criteria_revision,
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+                intent.effect_id.clone(),
+                intent.generation,
+                now,
+            )
+        };
+        let finding = match &evaluation.method {
+            AgentGoalEvaluationMethod::HumanReview => {
+                let Some(grant) = granted.checkpoint.as_deref() else {
+                    // The commit marked the effect checkpoint-required, so an
+                    // approved dispatch always carries its grant; an absent
+                    // one is a definitive wiring failure, never a retry.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "evaluation-grant-missing".to_string(),
+                        message: "a human-review evaluation dispatched without its approval \
+                                  grant"
+                            .to_string(),
+                    });
+                };
+                let mut evidence = evaluation.evidence.clone();
+                evidence.push(AgentGoalEvidenceRef {
+                    class: "human-decision".to_string(),
+                    artifact: None,
+                    digest: Some(grant.argument_digest.clone()),
+                });
+                AgentGoalEvaluationFinding::Evaluated {
+                    outcome: AgentGoalEvaluationOutcome::Satisfied,
+                    reason_code: "human-approved".to_string(),
+                    evidence,
+                    evaluated_by: Some(grant.resolver.clone()),
+                }
+            }
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
+                return Ok(AgentRunEffectOutcome::Failed {
+                    code: "evaluation-workflow-deferred".to_string(),
+                    message: "a verification-workflow evaluation cannot execute until \
+                              workflows-as-tools land"
+                        .to_string(),
+                });
+            }
+            _ => {
+                let Some(executor) = self.goal_evaluations.as_ref() else {
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "evaluation-executor-missing".to_string(),
+                        message: "no goal-evaluation executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                executor
+                    .execute(scope, intent, evaluation, credential, now)
+                    .await?
+            }
+        };
+        match finding {
+            AgentGoalEvaluationFinding::Evaluated {
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+            } => {
+                let record =
+                    build(outcome, reason_code, evidence, evaluated_by).map_err(|error| {
+                        AgentDispatchError::Invocation {
+                            code: "evaluation-record-invalid",
+                            message: error.to_string(),
+                        }
+                    })?;
+                Ok(AgentRunEffectOutcome::Evaluation {
+                    record: Box::new(record),
+                })
+            }
+            AgentGoalEvaluationFinding::Refused { code, message } => {
+                Ok(AgentRunEffectOutcome::Failed { code, message })
             }
         }
     }

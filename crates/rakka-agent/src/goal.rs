@@ -50,6 +50,10 @@ use crate::definition::{
     AgentCapabilityId, AgentPolicyRef, AgentRevisionNumber, AgentRevisionProvenance, AgentToolId,
     AgentWorkflowToolId,
 };
+use crate::evaluation::{
+    AgentGoalEvaluationMethodKind, AgentGoalEvidenceRef, AgentGoalStagnationAction,
+    AgentGoalStagnationPolicy, AgentStagnationTrigger, AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+};
 use crate::identity::{AgentEnvironmentRef, AgentId, AgentRunId, KnowledgeSpaceId};
 use crate::schema::{
     AgentRecordKind, VersionedAgentRecord, CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION,
@@ -88,7 +92,7 @@ pub const AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH: usize = 128;
 pub const AGENT_GOAL_REASON_MAX_LENGTH: usize = 256;
 
 /// Truncates a decision reason to its bound on a character boundary.
-fn bounded_reason_text(mut value: String) -> String {
+pub(crate) fn bounded_reason_text(mut value: String) -> String {
     if value.len() > AGENT_GOAL_REASON_MAX_LENGTH {
         let mut end = AGENT_GOAL_REASON_MAX_LENGTH;
         while !value.is_char_boundary(end) {
@@ -307,6 +311,17 @@ pub enum AgentGoalTerminalReason {
     /// The continuous goal's schedule expiry passed without the renewal its
     /// policy required.
     ScheduleExpired,
+    /// A stagnation threshold tripped under a `Terminate` action
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A policy decision, so the goal ends `Failed` — never `Unsatisfied`,
+    /// which stays unconstructible without an evaluation of the criteria.
+    Stagnant {
+        /// The condition that tripped.
+        trigger: AgentStagnationTrigger,
+        /// The streak length at the trip.
+        epochs: u32,
+    },
 }
 
 impl AgentGoalTerminalReason {
@@ -323,6 +338,7 @@ impl AgentGoalTerminalReason {
             Self::Retired => "retired",
             Self::DeadlineExpired => "deadline-expired",
             Self::ScheduleExpired => "schedule-expired",
+            Self::Stagnant { .. } => "stagnant",
         }
     }
 
@@ -332,7 +348,9 @@ impl AgentGoalTerminalReason {
         match self {
             Self::CriteriaSatisfied => AgentGoalStatus::Satisfied,
             Self::CriteriaNotMet => AgentGoalStatus::Unsatisfied,
-            Self::ExecutionFailed { .. } | Self::BudgetExhausted { .. } => AgentGoalStatus::Failed,
+            Self::ExecutionFailed { .. } | Self::BudgetExhausted { .. } | Self::Stagnant { .. } => {
+                AgentGoalStatus::Failed
+            }
             Self::CancellationRequested { .. } | Self::RootTaskCancelled | Self::Retired => {
                 AgentGoalStatus::Cancelled
             }
@@ -370,6 +388,17 @@ pub enum AgentGoalWaitReason {
     /// The continuous goal's admission gate was suspended; the goal contract
     /// waits until an authorized resume lifts the suspension.
     AdmissionSuspended,
+    /// A stagnation threshold tripped under a `Wait` or `Escalate` action;
+    /// an authorized `ResumeGoal` reactivates and resets the detector.
+    ///
+    /// Deliberately no streak count in the payload: a raced epoch settlement
+    /// after the park re-parks on the identical reason as a no-op instead of
+    /// burning a status revision per late settle. The streak lives in the wake
+    /// controller's durable counters and the history detail.
+    Stagnant {
+        /// The condition that tripped.
+        trigger: AgentStagnationTrigger,
+    },
 }
 
 impl AgentGoalWaitReason {
@@ -380,6 +409,7 @@ impl AgentGoalWaitReason {
             Self::BudgetExhausted { .. } => "budget-exhausted",
             Self::Escalated { .. } => "escalated",
             Self::AdmissionSuspended => "admission-suspended",
+            Self::Stagnant { .. } => "stagnant",
         }
     }
 
@@ -390,7 +420,7 @@ impl AgentGoalWaitReason {
             Self::BudgetExhausted { exhaustion } | Self::Escalated { exhaustion } => {
                 Some(exhaustion)
             }
-            Self::AdmissionSuspended => None,
+            Self::AdmissionSuspended | Self::Stagnant { .. } => None,
         }
     }
 }
@@ -535,11 +565,11 @@ pub struct AgentGoalDelegationBudget {
 /// agent definitions involved already authorize; an empty set means no
 /// goal-level narrowing. They are typed but inert until the slice that owns
 /// each flow enforces them: skills and tools in 4.3, workflows in 4.5,
-/// knowledge spaces and environments in 4.6. The evaluator, required-evidence,
-/// terminal-decision, and stagnation references are consumed by slice 4.2;
-/// stagnation's numeric thresholds deliberately wait for 4.2 to define the
-/// detector whose shape they bound. The escalation reference is recorded by
-/// this slice's `Escalate` exhaustion action.
+/// knowledge spaces and environments in 4.6. The evaluator and
+/// required-evidence references are enforced at the decision door, and the
+/// stagnation thresholds bound the wake controller's detector (slice 4.2);
+/// the terminal-decision reference stays recorded-only. The escalation
+/// reference is recorded by the `Escalate` exhaustion and stagnation actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentGoalSpec {
     /// The owner or principal the goal is accountable to.
@@ -599,9 +629,15 @@ pub struct AgentGoalSpec {
     /// The terminal-decision policy reference (slice 4.2).
     #[serde(default)]
     pub terminal_decision: Option<AgentPolicyRef>,
-    /// The stagnation policy reference (slice 4.2).
+    /// The application-owned stagnation policy reference, recorded when a
+    /// stagnation action fires.
     #[serde(default)]
     pub stagnation: Option<AgentPolicyRef>,
+    /// The deterministic stagnation thresholds and actions the wake
+    /// controller's detector enforces. Detection is disabled unless a
+    /// threshold is set.
+    #[serde(default)]
+    pub stagnation_policy: AgentGoalStagnationPolicy,
     /// The settings revision the goal was accepted under, when pinned.
     #[serde(default)]
     pub settings_revision: Option<AgentRevisionNumber>,
@@ -649,6 +685,44 @@ impl AgentGoalSpec {
                 length: class.len(),
                 maximum: AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH,
             });
+        }
+        // A spec that requires more evidence classes than one evaluation may
+        // present is statically unsatisfiable, so it is refused at the door
+        // it would later dead-lock.
+        if self.required_evidence.len() > AGENT_GOAL_EVALUATION_MAX_EVIDENCE {
+            return Err(AgentGoalError::CollectionTooLarge {
+                field: "required_evidence",
+                length: self.required_evidence.len(),
+                maximum: AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+            });
+        }
+        if let Some(threshold) = self.stagnation_policy.repeated_result_epochs {
+            if threshold < 2 {
+                return Err(AgentGoalError::StagnationThresholdTooLow {
+                    field: "repeated_result_epochs",
+                    value: threshold,
+                    minimum: 2,
+                });
+            }
+        }
+        if let Some(threshold) = self.stagnation_policy.no_progress_epochs {
+            if threshold < 1 {
+                return Err(AgentGoalError::StagnationThresholdTooLow {
+                    field: "no_progress_epochs",
+                    value: threshold,
+                    minimum: 1,
+                });
+            }
+        }
+        // Replan is typed for later slices and refused until one can execute
+        // it honestly: nothing re-issues an epoch with changed input yet, and
+        // mapping it to a park would silently change behavior when real
+        // replanning lands.
+        if self
+            .stagnation_policy
+            .selects(AgentGoalStagnationAction::Replan)
+        {
+            return Err(AgentGoalError::StagnationReplanUnsupported);
         }
         let bytes = serde_json::to_vec(self)
             .map(|bytes| bytes.len())
@@ -708,6 +782,8 @@ impl<'de> Deserialize<'de> for AgentGoalSpec {
             #[serde(default)]
             stagnation: Option<AgentPolicyRef>,
             #[serde(default)]
+            stagnation_policy: AgentGoalStagnationPolicy,
+            #[serde(default)]
             settings_revision: Option<AgentRevisionNumber>,
             #[serde(default)]
             policy_revision: Option<AgentRevisionNumber>,
@@ -735,6 +811,7 @@ impl<'de> Deserialize<'de> for AgentGoalSpec {
             escalation: record.escalation,
             terminal_decision: record.terminal_decision,
             stagnation: record.stagnation,
+            stagnation_policy: record.stagnation_policy,
             settings_revision: record.settings_revision,
             policy_revision: record.policy_revision,
         };
@@ -841,17 +918,31 @@ fn default_activate_on_creation() -> bool {
 /// the evaluator, the criteria revision it assessed, and its evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentGoalEvaluationRef {
-    /// The evaluator or deciding policy.
+    /// The evaluator or deciding policy. When the spec configures an
+    /// evaluator, the decision door refuses a mismatch.
     pub evaluator: AgentPolicyRef,
     /// The criteria revision the evaluation assessed. A decision carrying a
     /// revision other than the one in force is refused.
     pub criteria_revision: AgentRevisionNumber,
-    /// The evidence the evaluation rests on, when captured out of line.
+    /// The evidence the evaluation rests on, when captured out of line as one
+    /// unclassed artifact. Classed evidence lives in `evidence_items`.
     #[serde(default)]
     pub evidence: Option<ArtifactRef>,
-    /// Content digest of the evaluation record, when fingerprinted.
+    /// Attestation digest of the full evaluation record — the cryptographic
+    /// binding between this reference and the record that produced it.
     #[serde(default)]
     pub digest: Option<AgentContentDigest>,
+    /// The derived identity of the evaluation, when one produced this
+    /// reference.
+    #[serde(default)]
+    pub evaluation_id: Option<crate::identity::AgentOperationId>,
+    /// How the evaluation executed, when one produced this reference.
+    #[serde(default)]
+    pub method: Option<AgentGoalEvaluationMethodKind>,
+    /// The classed evidence the verdict rests on; what the spec's
+    /// `required_evidence` classes are checked against.
+    #[serde(default)]
+    pub evidence_items: Vec<AgentGoalEvidenceRef>,
 }
 
 /// A terminal goal decision
@@ -1110,11 +1201,52 @@ impl AgentGoalState {
                     reason: decision.reason.code(),
                 });
             };
-            let current = self.spec.spec().criteria.revision;
+            let spec = self.spec.spec();
+            let current = spec.criteria.revision;
             if evaluation.criteria_revision != current {
                 return Err(AgentGoalError::EvaluationStale {
                     evaluated: evaluation.criteria_revision,
                     current,
+                });
+            }
+            // A configured evaluator is the only judge the contract accepts;
+            // the reference's evaluator is recorded either way, but under a
+            // configured one it must match. Without one, the commander's
+            // authority is the application's, and any evaluator is recorded.
+            if let Some(expected) = spec.evaluator.as_ref() {
+                if evaluation.evaluator != *expected {
+                    return Err(AgentGoalError::EvaluatorMismatch {
+                        expected: expected.clone(),
+                        presented: evaluation.evaluator.clone(),
+                    });
+                }
+            }
+            if evaluation.evidence_items.len() > AGENT_GOAL_EVALUATION_MAX_EVIDENCE {
+                return Err(AgentGoalError::EvaluationEvidenceInvalid {
+                    length: evaluation.evidence_items.len(),
+                    maximum: AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+                });
+            }
+            for item in &evaluation.evidence_items {
+                if item.class.is_empty() || item.class.len() > AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH
+                {
+                    return Err(AgentGoalError::EvaluationEvidenceInvalid {
+                        length: item.class.len(),
+                        maximum: AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH,
+                    });
+                }
+            }
+            // Every required class must be covered by a classed item. The
+            // legacy unclassed artifact covers nothing: a class the spec
+            // demands is a class the evaluation must name.
+            if let Some(class) = spec.required_evidence.iter().find(|class| {
+                !evaluation
+                    .evidence_items
+                    .iter()
+                    .any(|item| item.class == **class)
+            }) {
+                return Err(AgentGoalError::EvidenceMissing {
+                    class: class.clone(),
                 });
             }
         }
@@ -1169,6 +1301,49 @@ impl AgentGoalState {
         self.status_revision = self.status_revision.next();
         Some(AgentGoalStatus::Expired)
     }
+
+    /// Accepts a revised success criteria under an authorized command,
+    /// advancing both the criteria revision and the spec revision
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md): if the
+    /// goal changes, evaluations against the old revision are invalid).
+    ///
+    /// The command fences on the criteria revision it read, not the status
+    /// revision — the status does not move, so a concurrent park or resume
+    /// must not refuse a criteria revision, and a stale criteria read must
+    /// refuse even when the status never moved. An in-flight evaluation is
+    /// invalidated purely by the existing staleness fence: it completes,
+    /// arrives, and is refused `goal-evaluation-stale`.
+    ///
+    /// Returns the criteria revision now in force.
+    pub fn revise_criteria(
+        &mut self,
+        expected_criteria_revision: AgentRevisionNumber,
+        source: AgentGoalCriteriaSource,
+        digest: Option<AgentContentDigest>,
+        provenance: AgentRevisionProvenance,
+    ) -> AgentGoalResult<AgentRevisionNumber> {
+        if self.status.is_terminal() {
+            return Err(AgentGoalError::Terminal {
+                status: self.status,
+            });
+        }
+        let current = self.spec.spec().criteria.revision;
+        if expected_criteria_revision != current {
+            return Err(AgentGoalError::StaleCriteriaRevision {
+                expected: expected_criteria_revision,
+                current,
+            });
+        }
+        let mut spec = self.spec.spec().clone();
+        let revision = current.next();
+        spec.criteria = AgentGoalCriteria {
+            source,
+            revision,
+            digest,
+        };
+        self.spec = self.spec.updated(spec, provenance)?;
+        Ok(revision)
+    }
 }
 
 /// The compact goal result a task outcome carries, so a replayed command
@@ -1194,6 +1369,10 @@ pub struct AgentGoalStatusView {
     pub spec_revision: AgentRevisionNumber,
     /// The criteria revision a completion evaluation must assess.
     pub criteria_revision: AgentRevisionNumber,
+    /// The configured completion evaluator a criteria decision must come
+    /// from, when the spec names one.
+    #[serde(default)]
+    pub evaluator: Option<AgentPolicyRef>,
     /// Why the goal is waiting, while it is.
     pub wait: Option<AgentGoalWaitReason>,
     /// Why the goal ended, once it did.
@@ -1257,6 +1436,45 @@ pub enum AgentGoalError {
         /// The revision in force.
         current: AgentRevisionNumber,
     },
+    /// A criteria decision's evaluation names an evaluator other than the
+    /// configured one.
+    EvaluatorMismatch {
+        /// The evaluator the spec configures.
+        expected: AgentPolicyRef,
+        /// The evaluator the reference presented.
+        presented: AgentPolicyRef,
+    },
+    /// A required evidence class is not covered by the evaluation's classed
+    /// evidence.
+    EvidenceMissing {
+        /// The uncovered class.
+        class: String,
+    },
+    /// The evaluation's classed evidence violates a bounded invariant.
+    EvaluationEvidenceInvalid {
+        /// The offending count or length.
+        length: usize,
+        /// The bound.
+        maximum: usize,
+    },
+    /// A criteria revision command read a revision that has moved on.
+    StaleCriteriaRevision {
+        /// The revision the command expected.
+        expected: AgentRevisionNumber,
+        /// The revision in force.
+        current: AgentRevisionNumber,
+    },
+    /// A stagnation threshold is below its minimum.
+    StagnationThresholdTooLow {
+        /// The offending field.
+        field: &'static str,
+        /// The configured value.
+        value: u32,
+        /// The minimum a set threshold may take.
+        minimum: u32,
+    },
+    /// The stagnation policy selects `Replan`, which no slice can execute yet.
+    StagnationReplanUnsupported,
     /// The objective summary exceeds its bound.
     SummaryTooLong {
         /// Actual length in bytes.
@@ -1304,6 +1522,12 @@ impl AgentGoalError {
             Self::DecisionFromProposed { .. } => "goal-decision-from-proposed",
             Self::CriteriaDecisionWithoutEvaluation { .. } => "goal-decision-without-evaluation",
             Self::EvaluationStale { .. } => "goal-evaluation-stale",
+            Self::EvaluatorMismatch { .. } => "goal-evaluator-mismatch",
+            Self::EvidenceMissing { .. } => "goal-evidence-missing",
+            Self::EvaluationEvidenceInvalid { .. } => "goal-evaluation-evidence-invalid",
+            Self::StaleCriteriaRevision { .. } => "goal-stale-criteria-revision",
+            Self::StagnationThresholdTooLow { .. } => "goal-stagnation-threshold-too-low",
+            Self::StagnationReplanUnsupported => "goal-stagnation-replan-unsupported",
             Self::SummaryTooLong { .. } => "goal-summary-too-long",
             Self::CollectionTooLarge { .. } => "goal-collection-too-large",
             Self::LabelTooLong { .. } => "goal-label-too-long",
@@ -1342,6 +1566,37 @@ impl Display for AgentGoalError {
             Self::EvaluationStale { evaluated, current } => write!(
                 f,
                 "the evaluation assessed criteria revision {evaluated} but {current} is in force"
+            ),
+            Self::EvaluatorMismatch {
+                expected,
+                presented,
+            } => write!(
+                f,
+                "the evaluation names evaluator {presented} but the spec configures {expected}"
+            ),
+            Self::EvidenceMissing { class } => write!(
+                f,
+                "the required evidence class {class} is not covered by the evaluation"
+            ),
+            Self::EvaluationEvidenceInvalid { length, maximum } => write!(
+                f,
+                "the evaluation's classed evidence violates a bound: {length} against {maximum}"
+            ),
+            Self::StaleCriteriaRevision { expected, current } => write!(
+                f,
+                "the command expected criteria revision {expected} but {current} is in force"
+            ),
+            Self::StagnationThresholdTooLow {
+                field,
+                value,
+                minimum,
+            } => write!(
+                f,
+                "the stagnation threshold {field} is {value}, below its minimum of {minimum}"
+            ),
+            Self::StagnationReplanUnsupported => write!(
+                f,
+                "the stagnation policy selects replan, which no slice can execute yet"
             ),
             Self::SummaryTooLong { length, maximum } => write!(
                 f,
@@ -1429,6 +1684,7 @@ mod tests {
             escalation: None,
             terminal_decision: None,
             stagnation: None,
+            stagnation_policy: AgentGoalStagnationPolicy::default(),
             settings_revision: None,
             policy_revision: None,
         }
@@ -1452,6 +1708,9 @@ mod tests {
             criteria_revision: AgentRevisionNumber::INITIAL,
             evidence: None,
             digest: None,
+            evaluation_id: None,
+            method: None,
+            evidence_items: Vec::new(),
         }
     }
 
@@ -1472,7 +1731,7 @@ mod tests {
         AgentBudgetExhaustion::new(AgentBudgetDimension::ModelCalls, 10, 10)
     }
 
-    const TERMINAL_REASONS: [fn() -> AgentGoalTerminalReason; 5] = [
+    const TERMINAL_REASONS: [fn() -> AgentGoalTerminalReason; 6] = [
         || AgentGoalTerminalReason::CriteriaSatisfied,
         || AgentGoalTerminalReason::CriteriaNotMet,
         || AgentGoalTerminalReason::ExecutionFailed {
@@ -1482,6 +1741,10 @@ mod tests {
             reason: "operator".to_string(),
         },
         || AgentGoalTerminalReason::DeadlineExpired,
+        || AgentGoalTerminalReason::Stagnant {
+            trigger: AgentStagnationTrigger::RepeatedResult,
+            epochs: 3,
+        },
     ];
 
     #[test]
@@ -1866,6 +2129,71 @@ mod tests {
             panic!("expected the failure code on record");
         };
         assert_eq!(code.len(), AGENT_GOAL_REASON_MAX_LENGTH);
+    }
+
+    #[test]
+    fn pre_slice_4_2_records_still_decode_to_the_disabled_defaults() {
+        // An evaluation reference persisted before the additive fields — the
+        // exact old shape, simulated by stripping the new keys from the
+        // current encoding.
+        let mut old = serde_json::to_value(evaluation()).expect("the ref encodes");
+        let map = old.as_object_mut().expect("the ref is an object");
+        map.remove("evaluation_id");
+        map.remove("method");
+        map.remove("evidence_items");
+        let decoded: AgentGoalEvaluationRef =
+            serde_json::from_value(old).expect("the old shape decodes");
+        assert!(decoded.evaluation_id.is_none());
+        assert!(decoded.method.is_none());
+        assert!(decoded.evidence_items.is_empty());
+
+        // A goal spec persisted before the stagnation policy loads with
+        // detection disabled.
+        let mut old = serde_json::to_value(spec()).expect("the spec encodes");
+        let map = old.as_object_mut().expect("the spec is an object");
+        map.remove("stagnation_policy");
+        let decoded: AgentGoalSpec = serde_json::from_value(old).expect("the old shape decodes");
+        assert!(!decoded.stagnation_policy.is_enabled());
+    }
+
+    #[test]
+    fn stagnation_validation_fails_closed_at_construction() {
+        let mut low = spec();
+        low.stagnation_policy.repeated_result_epochs = Some(1);
+        assert_eq!(
+            low.validate()
+                .expect_err("a repeat count of one refuses")
+                .code(),
+            "goal-stagnation-threshold-too-low"
+        );
+
+        let mut replan = spec();
+        replan.stagnation_policy.no_progress_epochs = Some(2);
+        replan.stagnation_policy.overrides.insert(
+            AgentStagnationTrigger::NoProgress,
+            AgentGoalStagnationAction::Replan,
+        );
+        assert_eq!(
+            replan
+                .validate()
+                .expect_err("a replan selection refuses")
+                .code(),
+            "goal-stagnation-replan-unsupported"
+        );
+
+        let mut unsatisfiable = spec();
+        for index in 0..(AGENT_GOAL_EVALUATION_MAX_EVIDENCE + 1) {
+            unsatisfiable
+                .required_evidence
+                .insert(format!("class-{index:02}"));
+        }
+        assert_eq!(
+            unsatisfiable
+                .validate()
+                .expect_err("an unsatisfiable evidence demand refuses")
+                .code(),
+            "goal-collection-too-large"
+        );
     }
 
     #[test]

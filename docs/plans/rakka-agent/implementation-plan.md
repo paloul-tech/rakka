@@ -2544,6 +2544,99 @@ Guidance: [Verify Progress and Completion](technical-guidance.md#verify-progress
 Done when: scenario 30 passes (goal `Satisfied` only after evaluation of the
 current criteria revision against durable evidence).
 
+**Amended as implemented (2026-07-28):**
+
+- **Evaluation is a run-side durable effect, and the exchange is the
+  attestation.** `EvaluateGoal` commits a read-only `Evaluation` effect
+  (`GoalEvaluationCall`, default two attempts) in a deduplicated bounded
+  transition; the application-owned `AgentGoalEvaluationExecutor` judges it;
+  the completed `AgentGoalEvaluationRecord` (own fail-closed
+  `AgentRecordKind::GoalEvaluation`) parks in the run's one durable
+  evaluation cell and crosses to the root task as the eighth
+  `AgentExchangeKind::GoalEvaluation`, owed from durable state under a
+  derived operation id so any crash re-owes the identical exchange. Under a
+  configured `spec.evaluator` the open `RecordGoalDecision` command refuses
+  criteria decisions (`task-goal-decision-unattested`); the exchange —
+  sender-fenced to the currently assigned run
+  (`task-goal-evaluation-forged`) — is the only ingress, and both ingresses
+  share one decision core so their fences can never diverge. A door refusal
+  becomes the exchange's refused reply and settles the cell with the door's
+  code: the caller re-evaluates, never a crash loop.
+- **All five evaluator methods are typed; four execute.** Deterministic
+  assertion, authoritative query, and the evaluator model run through the
+  executor; human review is an `Approval` checkpoint bound to the evaluation
+  effect itself — the digest-bound grant is the verdict, the record carries
+  the resolver and the durable decision as its evidence, a denial is a
+  *failed evaluation* (the goal stays `Active`), and expiry never
+  auto-approves. A verification workflow is refused closed at commit
+  (`run-goal-evaluation-workflow-deferred`) until 4.5 lands
+  workflows-as-tools — the ChildWorkflow autonomy-classifier gap makes
+  anything else unsound now. The evaluator model's "distinct policy" is the
+  request's pinned profile: `authorize_goal_evaluation` resolves it from the
+  request alone against the definition and setup envelopes, so the agent's
+  turn-bound settings profile never clobbers it. A failed evaluation is the
+  second exception (beside memory promotion) to the run's effect-failure
+  wind-down: the coordinator must outlive it so the goal stays decidable.
+- **The decision door grew its remaining fences.** Beside 4.1's revision
+  fence: evaluator identity (`goal-evaluator-mismatch`; `evaluator: None`
+  keeps the 4.1 allow-any-commander contract), required-evidence coverage
+  over the new classed `evidence_items` (`goal-evidence-missing`), and
+  evidence bounds (`AGENT_GOAL_EVALUATION_MAX_EVIDENCE = 16`; a spec
+  requiring more classes than one evaluation may present is refused as
+  statically unsatisfiable). `AgentGoalEvaluationRef` grew additively:
+  evaluation id, method, evidence items, and the SHA-256 attestation digest
+  of the full record — the cryptographic one, never the FNV fingerprint.
+  The new criteria-only `ReviseGoalCriteria` command (fenced on the criteria
+  revision itself, exercising the previously dead
+  `AgentGoalSpecRevision::updated`) makes the staleness fence real; an
+  in-flight evaluation is invalidated purely by that existing fence.
+- **Stagnation detects at the epoch settlement, and only there.** The
+  detector needs no settle-pass observation: no stagnation fact becomes true
+  by time passing, so `record_epoch_progress` accounts each settlement beside
+  the failure streak — completed epochs only, `result_digest` as the
+  repetition fingerprint (previously dropped at settle), streaks and trip
+  counters additive on `AgentGoalLifecycleState`/`AgentWakeCounters`, trips
+  exactly at a set threshold, `RepeatedResult` before `NoProgress`. The
+  thresholds live in `AgentGoalStagnationPolicy` on the spec (disabled by
+  default — the `escalate_after_failures` posture; user-approved), `Replan`
+  is typed but refused at validation until a slice can execute it honestly
+  (user-approved), and the actions execute in `apply_goal_stagnation`, a
+  parallel of the exhaustion executor under the same infallibility
+  obligation: `Continue` records only; `Wait`/`Escalate` park
+  `Waiting(Stagnant)` and close the gate *before* the release so a coalesced
+  occurrence is never promoted; `Terminate` fails goal
+  (`Stagnant` → `Failed`, never `Unsatisfied`), task (`goal-stagnant`), and
+  gate together. `ResumeGoal` owns the wait and performs the one deliberate
+  non-progress reset; widening the gate-resume fence to refuse *any* wait it
+  does not own fixed a real 4.1 gap — a stagnation park (exhaustion-free)
+  would have slipped the old `exhaustion().is_some()` fence and split the
+  two records permanently. Worst-case history stays inside the
+  `max_dependencies + 3` headroom: a terminate settlement records
+  detection + decision + termination + settlement, and stagnation rows are
+  mutually exclusive with failure-escalation rows (one outcome class per
+  settlement).
+- **Deliberately out of scope, documented:** finite-goal stagnation (no
+  epoch signal; the finite root's repeated units are already bounded by
+  rejection/assignment ceilings — delegation slices extend the detector),
+  within-run repetition (the loop's iteration budget bounds it), stale
+  environmental assumptions (needs 4.6's environment surface), goal-scope
+  HITL beyond the evaluation checkpoint, and a post-completion evaluation
+  path: a finite goal's coordinator evaluates before proposing its result —
+  after `ResultAccepted` clears the assignment, the sender fence refuses,
+  and an unevaluated completed root's goal remains decidable by
+  cancellation/expiry until later slices own reassignment.
+- **Bookkeeping.** New audit kinds `GoalStagnationDetected` (repeated
+  fingerprint in the digest slot) and `GoalCriteriaRevised`; `EpochSettled`
+  rows carry the epoch's result fingerprint (history stays observability —
+  the durable counters are the correctness record); the
+  `rakka.agent.goal.stagnation{trigger}` counter counts trips by
+  durable-counter difference (an observe-only `Continue` trip is visible;
+  replays count nothing); `AgentGoalStatusView` gained the configured
+  `evaluator`; the goal-evaluation target class routes as substrate
+  `ToolCall` with target type `"goal-evaluation"` and classifies `Other` in
+  the autonomy catalog — the memory-promotion posture, failing closed under
+  strict autonomy policies.
+
 ### Slice 4.3 — Durable delegation and A2A collaboration metadata
 
 Spec: [8.4](spec.md#84-specialization-and-durable-delegation),

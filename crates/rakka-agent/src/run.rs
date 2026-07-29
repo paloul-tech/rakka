@@ -970,6 +970,51 @@ pub fn promotion_operation_id(
     )
 }
 
+/// Derives the stable operation id of one goal-evaluation command
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The caller supplies a discriminator it can reconstruct after a crash — a
+/// policy epoch, a criteria revision — so a retried command deduplicates
+/// against the evaluation it already committed instead of evaluating twice.
+pub fn evaluation_operation_id(
+    scope: &AgentRunScope,
+    discriminator: impl AsRef<str>,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::GoalEvaluation,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            "evaluate",
+            discriminator.as_ref(),
+        ],
+    )
+}
+
+/// Derives the operation id of the exchange that reports one completed
+/// evaluation: pure per the effect generation that produced the record, so a
+/// re-driven transition re-owes the identical exchange.
+fn goal_evaluation_exchange_operation_id(
+    scope: &AgentRunScope,
+    turn: u64,
+    slot: usize,
+    generation: AgentEffectGeneration,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::GoalEvaluation,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            "exchange",
+            &format!("t{turn}"),
+            &format!("s{slot}"),
+            &format!("g{generation}"),
+        ],
+    )
+}
+
 fn bounded_detail(detail: impl Into<String>) -> String {
     let mut detail = detail.into();
     if detail.len() > AGENT_RUN_DETAIL_MAX_LENGTH {
@@ -1301,6 +1346,80 @@ fn owed_ledger_exchange(
     Ok(vec![envelope])
 }
 
+/// The goal-evaluation exchange the run owes its task, if it owes one
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed from the durable cell alone — a completed record whose exchange has
+/// not settled — so a run lost at any point after the outcome committed
+/// re-owes the identical envelope and the journal deduplicates it. A terminal
+/// run still owes it: the record must reach the coordinating task however the
+/// run itself ended, and the decision door fences whatever no longer applies.
+fn owed_goal_evaluation_exchange(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let Some(run) = state.run.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(cell) = run.loop_state.goal_evaluation() else {
+        return Ok(Vec::new());
+    };
+    if cell.reported {
+        return Ok(Vec::new());
+    }
+    let task = AgentTaskScope::new(scope.tenant().clone(), run.task().clone())?;
+    let payload = AgentExchangePayload::encode(
+        crate::task::AGENT_GOAL_EVALUATION_PAYLOAD_TYPE,
+        cell.record.as_ref(),
+    )?;
+    let operation_id = cell.exchange_operation_id.clone();
+    let envelope = AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::GoalEvaluation,
+        AgentEntityAddress::Run(scope.clone()),
+        AgentEntityAddress::Task(task),
+        payload,
+        AgentCorrelationId::new(operation_id.as_str()),
+        now,
+    )?;
+    Ok(vec![envelope])
+}
+
+/// Every exchange the run owes right now: the ledger steps, plus the
+/// goal-evaluation report.
+fn owed_run_exchanges(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    let mut owed = owed_ledger_exchange(state, now)?;
+    owed.extend(owed_goal_evaluation_exchange(state, now)?);
+    Ok(owed)
+}
+
+/// Records the decision door's answer to the reported evaluation: accepted, or
+/// refused under the door's own code. Either way the cell settles — a refused
+/// evaluation is never re-driven; the caller re-evaluates at the current
+/// criteria revision.
+fn settle_goal_evaluation_exchange(
+    state: &mut AgentRunState,
+    result: &AgentExchangeResult,
+    now: AgentTimestampMillis,
+) {
+    let Some(run) = state.run.as_mut() else {
+        return;
+    };
+    let refusal = if result.is_accepted() {
+        None
+    } else {
+        Some(bounded_detail(
+            result.status().rejection_code().unwrap_or("refused"),
+        ))
+    };
+    run.loop_state.settle_goal_evaluation(refusal);
+    state.updated_at = now;
+}
+
 /// Applies the parent's decision on a top-up request
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -1443,7 +1562,7 @@ fn advance_once(
     // effect or wait it decided ([specification 9.7]). The settlement rides the
     // run's own journal and is delivered by the courier, never from inside this
     // transition.
-    owed.extend(owed_ledger_exchange(state, now)?);
+    owed.extend(owed_run_exchanges(state, now)?);
     Ok(owed)
 }
 
@@ -1933,6 +2052,7 @@ fn apply_effect_outcome(
     outcome: &AgentRunEffectOutcome,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
     // Whether the run is already winding down: recording the outcome of work
     // already in flight is not further dispatch, but it must not resume a run
     // that is quiescing ([specification 8.7]).
@@ -1988,6 +2108,21 @@ fn apply_effect_outcome(
             run.loop_state
                 .record_memory_promotion(effect_id.clone(), promoted.clone(), now);
         }
+        AgentRunEffectOutcome::Evaluation { record } => {
+            // An evaluation is not part of the turn either: the completed
+            // record parks in its cell until the settle pass owes its
+            // exchange to the coordinating task. No phase, no status, no
+            // resumption — the goal moves only when the task's decision door
+            // accepts the record. The exchange operation id derives from the
+            // producing generation here, in the same compare-and-set, so a
+            // re-driven resolution re-owes the identical exchange.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let (turn, slot, generation) = (effect.turn, effect.slot, effect.generation);
+            let exchange_operation_id =
+                goal_evaluation_exchange_operation_id(&scope, turn, slot, generation)?;
+            run.loop_state
+                .record_goal_evaluation((**record).clone(), exchange_operation_id, now);
+        }
         AgentRunEffectOutcome::Failed { code, .. }
         | AgentRunEffectOutcome::Exhausted { code, .. } => {
             // Final for the generation: the dispatch layer already applied the
@@ -2000,13 +2135,19 @@ fn apply_effect_outcome(
             effect.last_error_code = Some(bounded_detail(code.clone()));
             let failed_kind = effect.kind();
             let code = code.clone();
-            // A failed memory promotion is the one exception to the wind-down:
+            // A failed memory promotion is one exception to the wind-down:
             // memory is never the correctness source
             // ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)),
             // so a memory-store outage must not kill a live run. The failure
             // stays on the effect record, and the initiator may re-issue the
-            // promotion under a new operation id.
-            if failed_kind != AgentRunEffectKind::MemoryPromotionCall {
+            // promotion under a new operation id. A failed goal evaluation is
+            // the other: the coordinator run must outlive a refused or
+            // unwired evaluation so the goal stays decidable — the failure
+            // stays on the effect record and the caller re-evaluates
+            // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+            if failed_kind != AgentRunEffectKind::MemoryPromotionCall
+                && failed_kind != AgentRunEffectKind::GoalEvaluationCall
+            {
                 let run = state.run_mut()?;
                 run.loop_state.fence_unsent_effects();
                 if run.terminal_reason.is_none() {
@@ -2711,6 +2852,113 @@ fn promote_memory(
     Ok(())
 }
 
+/// Commits one goal-evaluation effect from a deduplicated command
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The transition is bounded and performs no I/O: it fences, reserves the
+/// evaluation's attempt budget, and records the read-only effect — the
+/// promotion idiom. The run's status and phase do not move; a human review
+/// additionally opens the approval checkpoint whose grant is its verdict, in
+/// this same compare-and-set, so the effect stays `Pending` until an
+/// authorized decision exists.
+///
+/// The fences, in order: a terminal or winding-down run evaluates nothing
+/// (`run-goal-evaluation-fenced` — an evaluation is new work); the run must be
+/// bound to exactly the goal under evaluation (`run-goal-evaluation-unbound`);
+/// a verification workflow is typed but refused until workflows-as-tools land
+/// (`run-goal-evaluation-workflow-deferred`); and one evaluation is open at a
+/// time (`run-goal-evaluation-outstanding`) — the goal's decision door is
+/// serial, so a second in-flight evaluation could only race the first.
+fn evaluate_goal(
+    state: &mut AgentRunState,
+    evaluation: crate::evaluation::AgentGoalEvaluationRequest,
+    policies: &AgentEffectPolicies,
+    decision_events: bool,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    use crate::evaluation::AgentGoalEvaluationMethod;
+
+    let scope = state.scope.clone();
+    let checkpoint_owed = {
+        let run = state.run_mut()?;
+        if run.status.is_terminal() {
+            return Err(AgentRunError::Terminal { status: run.status });
+        }
+        if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
+            return Err(AgentRunError::GoalEvaluationFenced { status: run.status });
+        }
+        evaluation
+            .validate()
+            .map_err(|error| AgentRunError::GoalEvaluationInvalid {
+                message: error.to_string(),
+            })?;
+        if run.loop_state.goal() != Some(&evaluation.goal) {
+            return Err(AgentRunError::GoalEvaluationUnbound {
+                goal: evaluation.goal.clone(),
+            });
+        }
+        if matches!(
+            evaluation.method,
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. }
+        ) {
+            return Err(AgentRunError::GoalEvaluationWorkflowDeferred);
+        }
+        if run.loop_state.has_open_goal_evaluation() {
+            return Err(AgentRunError::GoalEvaluationOutstanding);
+        }
+
+        let human_review = matches!(evaluation.method, AgentGoalEvaluationMethod::HumanReview);
+        let request = AgentRunEffectRequest::Evaluation {
+            evaluation: Box::new(evaluation),
+        };
+        let mut spec = policies.spec_for(&request).clone();
+        if human_review {
+            // The authorized decision is the verdict, so the effect must not
+            // dispatch until one exists — whatever the deployment's spec says.
+            spec.checkpoint_required = true;
+        }
+        if let Err(exhaustion) = run
+            .loop_state
+            .budget_mut()
+            .reserve_attempts(spec.max_attempts)
+        {
+            return Err(AgentRunError::GoalEvaluationUnaffordable { exhaustion });
+        }
+
+        let turn = run.loop_state.turn();
+        let slot = run.loop_state.next_effect_slot();
+        let settings_revision = run.loop_state.agent_settings_revision();
+        let effect =
+            AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+        let effect_id = effect.effect_id.clone();
+        let checkpoint_owed = effect.checkpoint_required;
+        run.loop_state.record_effect(effect)?;
+        if decision_events {
+            run.loop_state.record_decision(
+                &scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::Evaluate,
+                    AgentDecisionSource::DeterministicPolicy,
+                    "goal-evaluation",
+                ),
+                now,
+            );
+        }
+        checkpoint_owed.then_some(effect_id)
+    };
+    if let Some(effect_id) = checkpoint_owed {
+        open_effect_checkpoint(
+            state,
+            policies,
+            &effect_id,
+            AgentCheckpointKind::Approval,
+            now,
+        )?;
+    }
+    state.updated_at = now;
+    Ok(())
+}
+
 /// Fires the durable SLA and expiration timers on every open checkpoint
 /// ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -3013,9 +3261,15 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 // the original exhaustion.
                 apply_top_up_grant(state, result, now);
             }
+            AgentExchangeKind::GoalEvaluation => {
+                // The decision door answered — accepted, or refused under its
+                // own code. Either way the report settles; a refusal is the
+                // caller's signal to re-evaluate, never a crash loop.
+                settle_goal_evaluation_exchange(state, result, now);
+            }
             _ => {}
         }
-        owed_ledger_exchange(state, now).unwrap_or_default()
+        owed_run_exchanges(state, now).unwrap_or_default()
     }
 }
 
@@ -3361,6 +3615,18 @@ where
                 let session_wired = self.memory.is_some();
                 self.transition(now, move |state| {
                     promote_memory(state, *promotion, session_wired, &policies, now)?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
+            AgentRunEntityCommand::EvaluateGoal {
+                operation_id,
+                evaluation,
+            } => {
+                let policies = self.policies.clone();
+                let decision_events = self.decisions.is_some();
+                self.transition(now, move |state| {
+                    evaluate_goal(state, *evaluation, &policies, decision_events, now)?;
                     Ok(operation_id)
                 })
                 .await?
@@ -3879,7 +4145,7 @@ where
                             .record(operation_id, result.clone());
                         state.updated_at = now;
                         outcome = Some(result);
-                        owed_ledger_exchange(state, now)
+                        owed_run_exchanges(state, now)
                     };
 
                 match apply(state) {
@@ -4021,6 +4287,21 @@ pub enum AgentRunEntityCommand {
         /// What to promote and where.
         promotion: Box<AgentMemoryPromotionRequest>,
     },
+    /// Evaluate the bound goal's current success-criteria revision against
+    /// durable evidence
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): commits
+    /// one read-only durable `Evaluation` effect in a bounded transition. Its
+    /// completed record crosses to the coordinating task as the
+    /// goal-evaluation exchange — under a configured evaluator, the only
+    /// ingress a criteria decision has. Application- or policy-initiated;
+    /// model-visible evaluation tools are a later slice.
+    EvaluateGoal {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`evaluation_operation_id`].
+        operation_id: AgentOperationId,
+        /// What to evaluate, as which evaluator, by which method.
+        evaluation: Box<crate::evaluation::AgentGoalEvaluationRequest>,
+    },
     /// Read the run's bounded durable projection.
     Describe,
 }
@@ -4035,7 +4316,8 @@ impl AgentRunEntityCommand {
             | Self::ResolveCheckpoint { operation_id, .. }
             | Self::FireCheckpointTimers { operation_id }
             | Self::Cancel { operation_id, .. }
-            | Self::PromoteMemory { operation_id, .. } => Some(operation_id),
+            | Self::PromoteMemory { operation_id, .. }
+            | Self::EvaluateGoal { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -4740,6 +5022,35 @@ pub enum AgentRunError {
         /// The ceiling the reservation would cross.
         exhaustion: AgentBudgetExhaustion,
     },
+    /// An evaluation was requested of a run that is winding down; an
+    /// evaluation is new work, which the wind-down fence forbids.
+    GoalEvaluationFenced {
+        /// The status the run held.
+        status: AgentRunStatus,
+    },
+    /// An evaluation named a goal this run is not bound to — or the run is
+    /// bound to no goal at all.
+    GoalEvaluationUnbound {
+        /// The goal the request named.
+        goal: crate::identity::AgentGoalId,
+    },
+    /// An evaluation request violated a bounded invariant.
+    GoalEvaluationInvalid {
+        /// What the validation refused.
+        message: String,
+    },
+    /// An evaluation is already open — committed and unresolved, or completed
+    /// and not yet reported. One at a time.
+    GoalEvaluationOutstanding,
+    /// A verification-workflow evaluation is typed but cannot execute until
+    /// workflows-as-tools land.
+    GoalEvaluationWorkflowDeferred,
+    /// An evaluation could not reserve its attempt bound from the run's
+    /// budget.
+    GoalEvaluationUnaffordable {
+        /// The ceiling the reservation would cross.
+        exhaustion: AgentBudgetExhaustion,
+    },
 }
 
 impl AgentRunError {
@@ -4770,6 +5081,12 @@ impl AgentRunError {
             Self::MemorySelectionOutOfRange { .. } => "run-memory-selection-out-of-range",
             Self::MemoryConsolidationInvalid => "run-memory-consolidation-invalid",
             Self::MemoryPromotionUnaffordable { .. } => "run-memory-promotion-unaffordable",
+            Self::GoalEvaluationFenced { .. } => "run-goal-evaluation-fenced",
+            Self::GoalEvaluationUnbound { .. } => "run-goal-evaluation-unbound",
+            Self::GoalEvaluationInvalid { .. } => "run-goal-evaluation-invalid",
+            Self::GoalEvaluationOutstanding => "run-goal-evaluation-outstanding",
+            Self::GoalEvaluationWorkflowDeferred => "run-goal-evaluation-workflow-deferred",
+            Self::GoalEvaluationUnaffordable { .. } => "run-goal-evaluation-unaffordable",
         }
     }
 }
@@ -4847,6 +5164,29 @@ impl Display for AgentRunError {
             Self::MemoryPromotionUnaffordable { exhaustion } => write!(
                 f,
                 "the promotion cannot reserve its attempt bound ({exhaustion})"
+            ),
+            Self::GoalEvaluationFenced { status } => write!(
+                f,
+                "the run is {status} and winding down; an evaluation is new work the fence forbids"
+            ),
+            Self::GoalEvaluationUnbound { goal } => write!(
+                f,
+                "the evaluation names goal {goal}, which this run is not bound to"
+            ),
+            Self::GoalEvaluationInvalid { message } => {
+                write!(f, "the evaluation request is invalid: {message}")
+            }
+            Self::GoalEvaluationOutstanding => write!(
+                f,
+                "an evaluation is already open; the goal is evaluated one evaluation at a time"
+            ),
+            Self::GoalEvaluationWorkflowDeferred => write!(
+                f,
+                "a verification-workflow evaluation cannot execute until workflows-as-tools land"
+            ),
+            Self::GoalEvaluationUnaffordable { exhaustion } => write!(
+                f,
+                "the evaluation cannot reserve its attempt bound ({exhaustion})"
             ),
         }
     }

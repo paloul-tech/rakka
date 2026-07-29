@@ -424,11 +424,17 @@ pub enum AgentExchangeKind {
     /// its wake ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
     /// Initiated by the epoch task; the reply is the controller's release.
     EpochResult,
+    /// A completed goal evaluation carried to the coordinating root task
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    /// Initiated by the run that committed the evaluation effect; the reply is
+    /// the decision door's acceptance or its refusal, and under a configured
+    /// evaluator this exchange is the only ingress a criteria decision has.
+    GoalEvaluation,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -436,6 +442,7 @@ impl AgentExchangeKind {
         Self::BudgetSettlement,
         Self::BudgetReturn,
         Self::EpochResult,
+        Self::GoalEvaluation,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -449,6 +456,7 @@ impl AgentExchangeKind {
             Self::BudgetSettlement => "budget-settlement",
             Self::BudgetReturn => "budget-return",
             Self::EpochResult => "epoch-result",
+            Self::GoalEvaluation => "goal-evaluation",
         }
     }
 }

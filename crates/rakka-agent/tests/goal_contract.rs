@@ -563,3 +563,178 @@ async fn a_passed_deadline_expires_the_goal_from_the_settle_pass() {
         .await;
     assert_eq!(refused_code(refusal), "goal-terminal");
 }
+
+#[tokio::test]
+async fn revise_goal_criteria_is_fenced_and_versioned() {
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    fx.apply_task_command(goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec(), true),
+    ))
+    .await
+    .expect("the creation applies");
+
+    // The revision advances both counters the contract versions: the criteria
+    // revision a future evaluation must assess, and the spec revision that
+    // carries it — finally through the spec's own `updated` door. The status
+    // does not move: revising what success means is not a lifecycle event.
+    let outcome = applied(
+        fx.apply_task_command(AgentTaskEntityCommand::ReviseGoalCriteria {
+            operation_id: operation("revise"),
+            expected_criteria_revision: AgentRevisionNumber::INITIAL,
+            source: rakka_agent::AgentGoalCriteriaSource::Policy(
+                rakka_agent::AgentPolicyRef::new("ticket-resolved-v2")
+                    .expect("the policy ref is valid"),
+            ),
+            digest: None,
+            provenance: Box::new(provenance(80)),
+        })
+        .await,
+    );
+    assert_eq!(
+        outcome.goal.expect("the goal outcome rides").status,
+        AgentGoalStatus::Active
+    );
+    let view = snapshot(&fx).await;
+    let goal = view.goal_state.expect("the goal view exists");
+    assert_eq!(goal.criteria_revision, AgentRevisionNumber::INITIAL.next());
+    assert_eq!(goal.spec_revision, AgentRevisionNumber::INITIAL.next());
+    assert_eq!(goal.status_revision, AgentRevisionNumber::INITIAL);
+
+    // The fence is the criteria revision itself: a stale read refuses.
+    let refusal = fx
+        .apply_task_command(AgentTaskEntityCommand::ReviseGoalCriteria {
+            operation_id: operation("revise-stale"),
+            expected_criteria_revision: AgentRevisionNumber::INITIAL,
+            source: rakka_agent::AgentGoalCriteriaSource::Policy(
+                rakka_agent::AgentPolicyRef::new("ticket-resolved-v3")
+                    .expect("the policy ref is valid"),
+            ),
+            digest: None,
+            provenance: Box::new(provenance(81)),
+        })
+        .await;
+    assert_eq!(refused_code(refusal), "goal-stale-criteria-revision");
+
+    // A terminal goal's criteria are history, not a contract to revise.
+    applied(
+        fx.apply_task_command(AgentTaskEntityCommand::RecordGoalDecision {
+            operation_id: operation("cancel"),
+            decision: Box::new(cancellation(AgentRevisionNumber::INITIAL, 82)),
+        })
+        .await,
+    );
+    let refusal = fx
+        .apply_task_command(AgentTaskEntityCommand::ReviseGoalCriteria {
+            operation_id: operation("revise-terminal"),
+            expected_criteria_revision: AgentRevisionNumber::INITIAL.next(),
+            source: rakka_agent::AgentGoalCriteriaSource::Policy(
+                rakka_agent::AgentPolicyRef::new("ticket-resolved-v3")
+                    .expect("the policy ref is valid"),
+            ),
+            digest: None,
+            provenance: Box::new(provenance(83)),
+        })
+        .await;
+    assert_eq!(refused_code(refusal), "goal-terminal");
+}
+
+#[tokio::test]
+async fn an_epoch_settlement_projects_an_observed_expiry_onto_the_goal() {
+    // The slice 4.1 projection, exercised through the epoch-settle flip site
+    // it actually runs in: a schedule expiry observed while settling an
+    // epoch's result — not a command — decides the goal contract `Expired`
+    // with the structured schedule reason, in that same transition.
+    use rakka_agent::{
+        epoch_result_operation_id, epoch_task_id_for_wake, wake_admission_command,
+        AgentBudgetConsumption, AgentEntityAddress, AgentEpochResult, AgentExchangeEnvelope,
+        AgentExchangeKind, AgentExchangePayload, AgentTaskScope, AgentTaskStatus,
+        AgentWakeLifecyclePolicy, ScheduleRevision, AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+    };
+    use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis};
+
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    let policy = wake_policy()
+        .with_lifecycle(AgentWakeLifecyclePolicy {
+            expires_at: Some(AgentTimestampMillis::new(50_000)),
+            ..AgentWakeLifecyclePolicy::DEFAULT
+        })
+        .expect("the lifecycle policy is valid");
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(policy),
+        goal_spec_draft(goal_spec(), true),
+    ))
+    .await
+    .expect("the creation applies");
+
+    // One occurrence admits before the expiry.
+    let binding = common::scheduled_wake_binding(5, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(binding.clone()).expect("the command derives"))
+        .await
+        .expect("the admission applies");
+
+    // Its epoch settles after the expiry passed: the settle-time observation
+    // flips the gate, and the flip projects onto the contract in the same
+    // compare-and-set.
+    fx.clock.store(60_000, Ordering::SeqCst);
+    let epoch_task = epoch_task_id_for_wake(binding.wake_id()).expect("the epoch derives");
+    let epoch_scope =
+        AgentTaskScope::new(common::tenant(), epoch_task.clone()).expect("the scope is valid");
+    let operation_id =
+        epoch_result_operation_id(&common::tenant(), &common::goal_id(), binding.wake_id())
+            .expect("the operation id derives");
+    let result = AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: epoch_task,
+        status: AgentTaskStatus::Completed,
+        consumed: AgentBudgetConsumption::zero(),
+        result_digest: None,
+    };
+    let envelope = AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::EpochResult,
+        AgentEntityAddress::Task(epoch_scope),
+        AgentEntityAddress::Task(task_scope()),
+        AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)
+            .expect("the payload encodes"),
+        AgentCorrelationId::new(operation_id.as_str()),
+        AgentTimestampMillis::new(60_000),
+    )
+    .expect("the envelope builds");
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    let reply = root
+        .accept(&envelope, &fx.router, fx.now())
+        .await
+        .expect("the result is answered");
+    assert!(reply.result().is_accepted(), "the epoch result lands");
+
+    let state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads")
+        .expect("the state exists");
+    let task = state.task().expect("the task is created");
+    let goal = task.goal_state.as_deref().expect("the goal record exists");
+    assert_eq!(goal.status(), AgentGoalStatus::Expired);
+    assert_eq!(
+        goal.terminal().map(|decision| decision.reason.code()),
+        Some("schedule-expired")
+    );
+    assert!(
+        task.wake_controller
+            .as_ref()
+            .expect("the controller exists")
+            .lifecycle()
+            .status()
+            .is_terminal(),
+        "the gate expired in the same transition"
+    );
+}
