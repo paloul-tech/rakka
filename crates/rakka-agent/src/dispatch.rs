@@ -385,8 +385,13 @@ pub enum AgentGoalEvaluationFinding {
     /// classed set the verdict rests on — the executor starts from the
     /// request's evidence and may extend it — references and stable codes
     /// only, never content.
+    ///
+    /// Both verdicts end the goal: `Satisfied` decides it satisfied,
+    /// `NotSatisfied` decides it unsatisfied, and neither is reversible. An
+    /// executor that means *not met yet, keep working* returns
+    /// [`Self::Refused`] instead, which leaves the goal `Active`.
     Evaluated {
-        /// The verdict.
+        /// The verdict. Terminal either way — see the variant's own note.
         outcome: crate::evaluation::AgentGoalEvaluationOutcome,
         /// Bounded, stable reason code for the verdict.
         reason_code: String,
@@ -2372,9 +2377,12 @@ where
                             .to_string(),
                     });
                 };
+                // The commit door reserved this slot, so the append always
+                // fits ([`AgentGoalEvaluationMethod::evidence_reserve`]).
                 let mut evidence = evaluation.evidence.clone();
                 evidence.push(AgentGoalEvidenceRef {
-                    class: "human-decision".to_string(),
+                    class: crate::evaluation::AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS
+                        .to_string(),
                     artifact: None,
                     digest: Some(grant.argument_digest.clone()),
                 });

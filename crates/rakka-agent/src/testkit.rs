@@ -2031,7 +2031,8 @@ where
                 Some(grant) => {
                     let mut evidence = evaluation.evidence.clone();
                     evidence.push(AgentGoalEvidenceRef {
-                        class: "human-decision".to_string(),
+                        class: crate::evaluation::AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS
+                            .to_string(),
                         artifact: None,
                         digest: Some(grant.argument_digest.clone()),
                     });

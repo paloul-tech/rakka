@@ -13,11 +13,12 @@ use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     evaluation_operation_id, AgentDispatchFuture, AgentGoalDecision, AgentGoalEvaluationExecutor,
     AgentGoalEvaluationFinding, AgentGoalEvaluationMethod, AgentGoalEvaluationMethodKind,
-    AgentGoalEvaluationOutcome, AgentGoalEvaluationRequest, AgentGoalStatus,
+    AgentGoalEvaluationOutcome, AgentGoalEvaluationRequest, AgentGoalEvidenceRef, AgentGoalStatus,
     AgentGoalTerminalReason, AgentModelTurn, AgentModelUsage, AgentOperationId, AgentOperationKind,
     AgentPolicyRef, AgentRevisionNumber, AgentRunEffect, AgentRunEffectKind, AgentRunEffectRequest,
     AgentRunEntityCommand, AgentRunEntityReply, AgentRunScope, AgentRunStatus,
-    AgentTaskEntityCommand, AgentTaskEntityReply, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentTaskEntityCommand, AgentTaskEntityReply, AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS,
+    AGENT_GOAL_EVALUATION_MAX_EVIDENCE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis, PrincipalRef};
 
@@ -204,6 +205,61 @@ fn operation(step: &str) -> AgentOperationId {
         .expect("the operation id derives")
 }
 
+/// `count` classed evidence items, the first covering the fixture spec's
+/// required `artifact` class so only the *bound* is under test.
+fn evidence_filling(count: usize) -> Vec<AgentGoalEvidenceRef> {
+    (0..count)
+        .map(|index| AgentGoalEvidenceRef {
+            class: if index == 0 {
+                "artifact".to_string()
+            } else {
+                format!("filler-{index:02}")
+            },
+            artifact: None,
+            digest: None,
+        })
+        .collect()
+}
+
+/// Approves the one open evaluation checkpoint as an authorized human.
+async fn approve_open_review(fx: &Fixture) {
+    let effect = evaluation_effect(fx).await;
+    let checkpoint = run_loop_state(fx)
+        .await
+        .open_checkpoints()
+        .iter()
+        .find(|checkpoint| checkpoint.bound_effect.effect_id == effect.effect_id)
+        .expect("the approval checkpoint is open")
+        .checkpoint_id
+        .clone();
+    apply_run(
+        fx,
+        AgentRunEntityCommand::ResolveCheckpoint {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::CheckpointResolution,
+                &agent_scope(),
+                "bounded-review",
+            )
+            .expect("the decision key derives"),
+            checkpoint_id: checkpoint,
+            resolver: PrincipalRef {
+                principal_type: "user".to_string(),
+                principal_id: "goal-approver".to_string(),
+                display_name: None,
+            },
+            decision: Box::new(rakka_agent::AgentCheckpointDecision::Approval(
+                rakka_agent::AgentApprovalDecision::Approve {
+                    credential_binding: None,
+                    expires_at: AgentTimestampMillis::new(1_000_000),
+                    allowed_use_count: 1,
+                },
+            )),
+        },
+    )
+    .await
+    .expect("the approval applies");
+}
+
 #[tokio::test]
 async fn scenario_30_satisfied_only_via_evaluation_of_current_revision_against_durable_evidence() {
     let fx = satisfying_fixture();
@@ -304,6 +360,124 @@ async fn scenario_30_satisfied_only_via_evaluation_of_current_revision_against_d
     let revision = goal_view(&fx).await.status_revision;
     fx.pump().await.expect("the settled world stays settled");
     assert_eq!(goal_view(&fx).await.status_revision, revision);
+}
+
+#[tokio::test]
+async fn a_not_satisfied_verdict_ends_the_goal_unsatisfied() {
+    // Both verdicts are terminal. `NotSatisfied` is the evaluator's
+    // conclusive "the criteria are not met", not a progress report, and it
+    // ends the contract `Unsatisfied` through the same attested door a
+    // satisfying verdict uses. An evaluator that means "not met *yet*" refuses
+    // instead — `a_failed_evaluation_leaves_the_run_and_goal_live` pins that
+    // path, and the two together are the whole outcome surface.
+    let fx = fixture_with(Some(Arc::new(ScriptedEvaluator {
+        outcome: AgentGoalEvaluationOutcome::NotSatisfied,
+    })));
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+
+    apply_run(
+        &fx,
+        evaluate_command("1", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the evaluation commits");
+    answer_evaluation(&fx).await;
+
+    let goal = goal_view(&fx).await;
+    assert_eq!(goal.status, AgentGoalStatus::Unsatisfied);
+    assert_eq!(goal.terminal, Some(AgentGoalTerminalReason::CriteriaNotMet));
+
+    // The door *accepted* it — an unsatisfying verdict is a decision, not a
+    // refusal — so the cell settled clean, with the verdict on the record.
+    let loop_state = run_loop_state(&fx).await;
+    let cell = loop_state
+        .goal_evaluation()
+        .expect("the cell holds the record");
+    assert!(cell.reported, "the exchange settled");
+    assert_eq!(cell.refusal, None, "the door accepted the verdict");
+    assert_eq!(
+        cell.record.outcome,
+        AgentGoalEvaluationOutcome::NotSatisfied
+    );
+
+    // Terminal and absorbing: a second evaluation cannot reopen the contract,
+    // and the run learns so from the door rather than by crashing.
+    apply_run(
+        &fx,
+        evaluate_command("2", goal_evaluation_request(AgentRevisionNumber::INITIAL)),
+    )
+    .await
+    .expect("the second evaluation commits");
+    answer_evaluation(&fx).await;
+    let loop_state = run_loop_state(&fx).await;
+    assert_eq!(
+        loop_state
+            .goal_evaluation()
+            .expect("the cell holds the second report")
+            .refusal
+            .as_deref(),
+        Some("goal-terminal")
+    );
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Unsatisfied);
+}
+
+#[tokio::test]
+async fn a_human_review_reserves_the_evidence_slot_its_decision_needs() {
+    // The dispatcher appends the authorized decision as one classed evidence
+    // item, so a human review may present at most `MAX_EVIDENCE - 1` of its
+    // own. The commit door reserves that slot: a request filling the whole
+    // bound is refused *before* anyone is asked to approve, instead of being
+    // approved and only then failing to build its over-full record — which
+    // would spend the grant for nothing.
+    let fx = satisfying_fixture();
+    create_goal_task(&fx, goal_spec_with_evaluator()).await;
+
+    let mut request = goal_evaluation_request(AgentRevisionNumber::INITIAL);
+    request.method = AgentGoalEvaluationMethod::HumanReview;
+    request.evidence = evidence_filling(AGENT_GOAL_EVALUATION_MAX_EVIDENCE);
+    let refused = apply_run(&fx, evaluate_command("1", request.clone())).await;
+    assert_eq!(
+        refused
+            .expect_err("a full evidence list leaves no room for the decision")
+            .code(),
+        "run-goal-evaluation-invalid"
+    );
+    // Nothing was committed, so no checkpoint was opened and no human was
+    // asked: the refusal is the whole consequence.
+    assert!(
+        run_loop_state(&fx).await.open_checkpoints().is_empty(),
+        "a refused commit opens no approval"
+    );
+
+    // One slot short of the bound is exactly enough. The same review commits,
+    // an authorized human approves it, and the appended decision lands the
+    // record on the bound rather than over it.
+    request.evidence = evidence_filling(AGENT_GOAL_EVALUATION_MAX_EVIDENCE - 1);
+    apply_run(&fx, evaluate_command("2", request))
+        .await
+        .expect("the evaluation commits with room for the decision");
+    approve_open_review(&fx).await;
+    answer_evaluation(&fx).await;
+
+    let goal = goal_view(&fx).await;
+    assert_eq!(goal.status, AgentGoalStatus::Satisfied);
+    let loop_state = run_loop_state(&fx).await;
+    let cell = loop_state
+        .goal_evaluation()
+        .expect("the cell holds the record");
+    assert_eq!(cell.refusal, None, "the record built and the door accepted");
+    assert_eq!(
+        cell.record.evidence.len(),
+        AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+        "the appended decision fills the reserved slot exactly"
+    );
+    assert!(
+        cell.record
+            .evidence
+            .iter()
+            .any(|item| item.class == AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS),
+        "the authorized decision is the appended evidence"
+    );
 }
 
 #[tokio::test]

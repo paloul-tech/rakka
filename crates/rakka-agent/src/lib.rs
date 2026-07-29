@@ -167,7 +167,8 @@ pub use evaluation::{
     AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvaluationRecord,
     AgentGoalEvaluationRequest, AgentGoalEvaluationResult, AgentGoalEvidenceRef,
     AgentGoalStagnationAction, AgentGoalStagnationPolicy, AgentStagnationTrigger,
-    AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS, AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+    AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS, AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS,
+    AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
 };
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,

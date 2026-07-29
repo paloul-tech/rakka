@@ -2863,8 +2863,12 @@ fn promote_memory(
 /// authorized decision exists.
 ///
 /// The fences, in order: a terminal or winding-down run evaluates nothing
-/// (`run-goal-evaluation-fenced` — an evaluation is new work); the run must be
-/// bound to exactly the goal under evaluation (`run-goal-evaluation-unbound`);
+/// (`run-goal-evaluation-fenced` — an evaluation is new work); the request's
+/// evidence must fit its bound *with the dispatcher's own appends reserved*
+/// (`run-goal-evaluation-invalid`), so a human review that would overflow the
+/// record is refused here rather than after a human already approved it; the
+/// run must be bound to exactly the goal under evaluation
+/// (`run-goal-evaluation-unbound`);
 /// a verification workflow is typed but refused until workflows-as-tools land
 /// (`run-goal-evaluation-workflow-deferred`); and one evaluation is open at a
 /// time (`run-goal-evaluation-outstanding`) — the goal's decision door is

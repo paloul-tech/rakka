@@ -65,6 +65,14 @@ pub const AGENT_GOAL_EVALUATION_MAX_EVIDENCE: usize = 16;
 /// a transient executor failure.
 pub const AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS: u32 = 2;
 
+/// Evidence class of the authorized human decision a human-review evaluation
+/// rests on.
+///
+/// The dispatcher appends exactly one item of this class from the approval
+/// grant, which is why [`AgentGoalEvaluationMethod::evidence_reserve`] holds a
+/// slot back for it.
+pub const AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS: &str = "human-decision";
+
 /// Derives the identity of the evaluation one effect generation produced.
 ///
 /// Pure per `(run, turn, slot, generation)`, so a crash-retry of the dispatch
@@ -95,13 +103,28 @@ pub fn goal_evaluation_record_id(
 /// Deliberately two-valued: an evaluation that could not run to a verdict is a
 /// *failed effect*, not an outcome — the goal stays `Active` and the caller
 /// re-evaluates, rather than a half-verdict entering the durable record.
+///
+/// **Both values end the goal.** The decision door maps `Satisfied` to
+/// [`crate::goal::AgentGoalTerminalReason::CriteriaSatisfied`] and
+/// `NotSatisfied` to [`crate::goal::AgentGoalTerminalReason::CriteriaNotMet`],
+/// so either verdict is terminal and absorbing — there is no "not yet" in this
+/// enum. An evaluator that means *the criteria are not met so far, keep
+/// working* must return
+/// [`crate::dispatch::AgentGoalEvaluationFinding::Refused`] instead: that
+/// fails the effect definitively, leaves the goal `Active` and decidable, and
+/// lets the caller re-evaluate once the evidence has moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum AgentGoalEvaluationOutcome {
-    /// The current criteria revision is met by the presented evidence.
+    /// The current criteria revision is met by the presented evidence; the
+    /// goal ends `Satisfied`.
     Satisfied,
-    /// The current criteria revision is not met by the presented evidence.
+    /// The current criteria revision is not met by the presented evidence and
+    /// the evaluator says so conclusively; the goal ends `Unsatisfied`.
+    ///
+    /// This is a verdict, not a progress report — see the type's own note on
+    /// what to return for "not yet".
     NotSatisfied,
 }
 
@@ -163,6 +186,28 @@ pub enum AgentGoalEvaluationMethod {
 }
 
 impl AgentGoalEvaluationMethod {
+    /// How many evidence slots the dispatcher holds back for the items *it*
+    /// appends when this method executes.
+    ///
+    /// Human review contributes the authorized decision itself as one classed
+    /// [`AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS`] item, so a request under
+    /// that method may present at most
+    /// [`AGENT_GOAL_EVALUATION_MAX_EVIDENCE`] `- 1` of its own. Reserving the
+    /// slot at the commit door is what keeps the refusal *ahead* of the human:
+    /// without it, a request that filled the whole bound would be approved
+    /// first and only then fail to build its record, spending the grant for
+    /// nothing.
+    #[must_use]
+    pub const fn evidence_reserve(&self) -> usize {
+        match self {
+            Self::HumanReview => 1,
+            Self::DeterministicAssertion { .. }
+            | Self::AuthoritativeQuery { .. }
+            | Self::VerificationWorkflow { .. }
+            | Self::EvaluatorModel { .. } => 0,
+        }
+    }
+
     /// The label-only kind of this method.
     #[must_use]
     pub const fn kind(&self) -> AgentGoalEvaluationMethodKind {
@@ -250,18 +295,29 @@ impl AgentGoalEvidenceRef {
     }
 }
 
-/// Validates one bounded evidence list.
-fn validate_evidence(evidence: &[AgentGoalEvidenceRef]) -> AgentGoalEvaluationResult<()> {
-    if evidence.len() > AGENT_GOAL_EVALUATION_MAX_EVIDENCE {
+/// Validates one bounded evidence list, holding `reserve` slots back for the
+/// items the dispatcher appends itself.
+fn validate_evidence_with_reserve(
+    evidence: &[AgentGoalEvidenceRef],
+    reserve: usize,
+) -> AgentGoalEvaluationResult<()> {
+    let maximum = AGENT_GOAL_EVALUATION_MAX_EVIDENCE.saturating_sub(reserve);
+    if evidence.len() > maximum {
         return Err(AgentGoalEvaluationError::EvidenceTooLarge {
             length: evidence.len(),
-            maximum: AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
+            maximum,
         });
     }
     for item in evidence {
         item.validate()?;
     }
     Ok(())
+}
+
+/// Validates one bounded evidence list against the whole bound: what a
+/// completed record — appended items included — must fit inside.
+fn validate_evidence(evidence: &[AgentGoalEvidenceRef]) -> AgentGoalEvaluationResult<()> {
+    validate_evidence_with_reserve(evidence, 0)
 }
 
 /// What a committed goal-evaluation effect asks the executor to judge.
@@ -290,8 +346,14 @@ pub struct AgentGoalEvaluationRequest {
 
 impl AgentGoalEvaluationRequest {
     /// Rejects a request that violates a bounded invariant.
+    ///
+    /// The evidence bound is checked against the room the *method* leaves: a
+    /// request must fit inside [`AGENT_GOAL_EVALUATION_MAX_EVIDENCE`] once the
+    /// dispatcher has appended its own items
+    /// ([`AgentGoalEvaluationMethod::evidence_reserve`]), so the record it
+    /// will build is already known to be constructible here.
     pub fn validate(&self) -> AgentGoalEvaluationResult<()> {
-        validate_evidence(&self.evidence)
+        validate_evidence_with_reserve(&self.evidence, self.method.evidence_reserve())
     }
 }
 
