@@ -232,6 +232,7 @@ impl Fixture {
             assignee: Some(agent_id()),
             goal: None,
             goal_mode: Default::default(),
+            goal_spec: None,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,

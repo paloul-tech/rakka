@@ -105,9 +105,9 @@ use serde_json::Value;
 use crate::admission::AgentAdmissionRefusal;
 use crate::agent::{load_agent_entity_state, AgentEntityState, AgentLifecycleStatus};
 use crate::budget::{
-    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetExhaustion, AgentBudgetGrant,
-    AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger, AGENT_ESCROW_CHILD_CAPACITY,
-    AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
+    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension, AgentBudgetExhaustion,
+    AgentBudgetGrant, AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger,
+    AGENT_ESCROW_CHILD_CAPACITY, AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
 };
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
@@ -119,7 +119,11 @@ use crate::definition::{
     AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
     AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
 };
-use crate::goal::AgentGoalMode;
+use crate::goal::{
+    AgentGoalDecision, AgentGoalError, AgentGoalExhaustionAction, AgentGoalMode, AgentGoalOutcome,
+    AgentGoalSpecDraft, AgentGoalSpecRevision, AgentGoalState, AgentGoalStatus,
+    AgentGoalStatusView, AgentGoalTerminalReason, AgentGoalWaitReason,
+};
 use crate::identity::{
     validated_id, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
     AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId,
@@ -127,7 +131,7 @@ use crate::identity::{
 };
 use crate::observability::{
     record_agent_domain_counter, METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE,
-    METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -227,11 +231,12 @@ pub const AGENT_TASK_PENDING_HISTORY_CAPACITY: usize = 64;
 /// The most history entries any one transition can record.
 ///
 /// A creation is the worst case: one row for the task, one for each dependency
-/// it declares, and one for the assignment its own eligibility may decide. The
-/// entity requires this much headroom before it runs a transition, which is what
-/// lets recording an entry be infallible — an owed entry is never dropped, and a
-/// backed-up sink is refused at the entity's door instead.
-pub const AGENT_TASK_MAX_HISTORY_PER_TRANSITION: usize = AGENT_TASK_MAX_DEPENDENCIES + 2;
+/// it declares, one for the goal contract it may institute active, and one for
+/// the assignment its own eligibility may decide. The entity requires this much
+/// headroom before it runs a transition, which is what lets recording an entry
+/// be infallible — an owed entry is never dropped, and a backed-up sink is
+/// refused at the entity's door instead.
+pub const AGENT_TASK_MAX_HISTORY_PER_TRANSITION: usize = AGENT_TASK_MAX_DEPENDENCIES + 3;
 
 /// Largest page one history cursor may request.
 pub const AGENT_TASK_HISTORY_MAX_PAGE_SIZE: usize = 64;
@@ -1707,6 +1712,13 @@ pub enum AgentTaskTerminalReason {
         /// Bounded, stable reason.
         reason: String,
     },
+    /// The goal this task coordinates exhausted its budget under a
+    /// `Terminate` exhaustion policy
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    GoalBudgetExhausted {
+        /// The ceiling that was reached.
+        exhaustion: AgentBudgetExhaustion,
+    },
 }
 
 impl AgentTaskTerminalReason {
@@ -1719,6 +1731,7 @@ impl AgentTaskTerminalReason {
             Self::AssignmentsExhausted { .. } => "assignments-exhausted",
             Self::DependencyNotSatisfied { .. } => "dependency-not-satisfied",
             Self::CancellationRequested { .. } => "cancellation-requested",
+            Self::GoalBudgetExhausted { .. } => "goal-budget-exhausted",
         }
     }
 
@@ -1731,9 +1744,9 @@ impl AgentTaskTerminalReason {
     pub const fn status(&self) -> AgentTaskStatus {
         match self {
             Self::ResultAccepted => AgentTaskStatus::Completed,
-            Self::ResultRejectionsExhausted { .. } | Self::AssignmentsExhausted { .. } => {
-                AgentTaskStatus::Failed
-            }
+            Self::ResultRejectionsExhausted { .. }
+            | Self::AssignmentsExhausted { .. }
+            | Self::GoalBudgetExhausted { .. } => AgentTaskStatus::Failed,
             Self::DependencyNotSatisfied { .. } | Self::CancellationRequested { .. } => {
                 AgentTaskStatus::Cancelled
             }
@@ -2163,6 +2176,19 @@ pub enum AgentTaskHistoryKind {
     GoalRetired,
     /// A schedule update took force.
     ScheduleUpdated,
+    /// The goal contract was activated: `Proposed` became `Active`, in the
+    /// creating transition or by command. The `Goal*` kinds above are the
+    /// continuous admission gate's; these four are the goal-contract status
+    /// of [specification 8.1](../../../docs/plans/rakka-agent/spec.md).
+    GoalActivated,
+    /// The goal contract was parked `Waiting` under a persisted policy
+    /// decision; the detail carries the structured reason code.
+    GoalParked,
+    /// The goal contract was reactivated from `Waiting`.
+    GoalReactivated,
+    /// The goal contract reached a terminal decision; the detail carries the
+    /// terminal status and reason code.
+    GoalDecided,
 }
 
 impl AgentTaskHistoryKind {
@@ -2190,6 +2216,10 @@ impl AgentTaskHistoryKind {
             Self::GoalExpired => "goal-expired",
             Self::GoalRetired => "goal-retired",
             Self::ScheduleUpdated => "schedule-updated",
+            Self::GoalActivated => "goal-activated",
+            Self::GoalParked => "goal-parked",
+            Self::GoalReactivated => "goal-reactivated",
+            Self::GoalDecided => "goal-decided",
         }
     }
 }
@@ -2524,6 +2554,15 @@ pub struct AgentTaskCreation {
     /// before this field load as finite.
     #[serde(default)]
     pub goal_mode: AgentGoalMode,
+    /// The goal contract this creation institutes, making the created task the
+    /// goal's root coordinator
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)). Absent,
+    /// the task is a child contributor — or, before slice 4.1, a root without
+    /// a goal record — and carries only the `goal` binding. When present
+    /// without an explicit `goal` binding, the goal id defaults to the created
+    /// task's own id. Records persisted before this field load without one.
+    #[serde(default)]
+    pub goal_spec: Option<Box<AgentGoalSpecDraft>>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
     /// Dependencies declared with the creation.
@@ -2941,6 +2980,15 @@ pub struct AgentTask {
     /// before this field load as finite.
     #[serde(default)]
     pub goal_mode: AgentGoalMode,
+    /// The goal contract this task coordinates as the goal's root
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md),
+    /// [6.3](../../../docs/plans/rakka-agent/spec.md)): the versioned spec and
+    /// its status lifecycle, held as a component of the root task's own record
+    /// so every goal transition commits in the task's compare-and-set. A child
+    /// task carries only the `goal` binding; records persisted before this
+    /// field load without a goal record.
+    #[serde(default)]
+    pub goal_state: Option<Box<AgentGoalState>>,
     /// The wake controller's durable state, once the task coordinates a
     /// continuous goal. Records persisted before this field load with no
     /// controller activity, and a finite task never carries one.
@@ -3015,12 +3063,21 @@ impl AgentTask {
     }
 
     /// Whether the task is waiting for an agent assignment decision.
+    ///
+    /// A goal-bearing root only assigns while its goal permits work: a
+    /// `Proposed` goal spends nothing until activated, and a parked goal
+    /// spends nothing until resumed
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
     #[must_use]
     pub fn awaits_assignment(&self) -> bool {
         self.definition.is_agent_owned()
             && self.status.is_assignable()
             && self.assignment.is_none()
             && self.dependencies_satisfied()
+            && self
+                .goal_state
+                .as_ref()
+                .is_none_or(|goal| goal.status().permits_work())
     }
 
     /// Serialized size of the materialized record, in bytes.
@@ -3078,6 +3135,10 @@ pub struct AgentTaskOutcome {
     /// Outcomes persisted before this field load with no wake record.
     #[serde(default)]
     pub wake: Option<AgentWakeOutcome>,
+    /// The goal contract's status, when this task coordinates one. Outcomes
+    /// persisted before this field load without it.
+    #[serde(default)]
+    pub goal: Option<AgentGoalOutcome>,
 }
 
 /// Bounded log of resolved operation ids and the outcome each produced.
@@ -3220,6 +3281,7 @@ impl AgentTaskState {
                 rejection_count: 0,
                 dependencies_satisfied: true,
                 wake: None,
+                goal: None,
             };
         };
         AgentTaskOutcome {
@@ -3236,6 +3298,10 @@ impl AgentTaskState {
             rejection_count: task.rejection_count,
             dependencies_satisfied: task.dependencies_satisfied(),
             wake: None,
+            goal: task.goal_state.as_deref().map(|goal| AgentGoalOutcome {
+                status: goal.status(),
+                status_revision: goal.status_revision(),
+            }),
         }
     }
 
@@ -3303,6 +3369,20 @@ impl AgentTaskState {
                         .unwrap_or_default(),
                 }
             }),
+            goal_state: task.goal_state.as_ref().map(|goal| AgentGoalStatusView {
+                status: goal.status(),
+                status_revision: goal.status_revision(),
+                spec_revision: goal.spec().revision(),
+                criteria_revision: goal.spec().spec().criteria.revision,
+                wait: goal.wait().cloned(),
+                terminal: goal.terminal().map(|decision| decision.reason.clone()),
+                coordinator: task
+                    .assignment
+                    .as_ref()
+                    .map(|assignment| assignment.run.clone()),
+                activated_at: goal.activated_at(),
+                decided_at: goal.decided_at(),
+            }),
         })
     }
 
@@ -3362,6 +3442,9 @@ impl AgentExchangeState for AgentTaskState {
             if let Some(spec) = task.goal_mode.continuous() {
                 policy.check_record(&spec.wake_policy)?;
             }
+            if let Some(goal) = &task.goal_state {
+                policy.check_record(goal.spec())?;
+            }
         }
         for entry in &self.pending_history {
             policy.check_record(entry)?;
@@ -3420,6 +3503,10 @@ pub struct AgentTaskSnapshot {
     /// Snapshots persisted before this field load without it.
     #[serde(default)]
     pub wake: Option<AgentWakeStatusView>,
+    /// The goal contract's status, when this task is the goal's root
+    /// coordinator. Snapshots persisted before this field load without it.
+    #[serde(default)]
+    pub goal_state: Option<AgentGoalStatusView>,
 }
 
 /// Loads one task's durable state without waking its entity.
@@ -3534,7 +3621,18 @@ fn create_task(
         });
     }
 
-    if creation.goal_mode.is_continuous() && creation.goal.is_none() {
+    // A creation carrying a goal spec institutes the goal on this task, and
+    // the binding defaults to the task's own id — open decision 14's resolved
+    // default ([specification 6.3](../../../docs/plans/rakka-agent/spec.md)).
+    // An explicit binding simply names the goal; the types stay distinct.
+    let goal = creation.goal.or_else(|| {
+        creation
+            .goal_spec
+            .is_some()
+            .then(|| AgentGoalId::for_root_task(state.scope.task()))
+    });
+
+    if creation.goal_mode.is_continuous() && goal.is_none() {
         // A continuous root control task exists to admit epochs for a goal;
         // without the goal binding there is nothing for the wake controller
         // to fence, budget, or retire against.
@@ -3569,12 +3667,20 @@ fn create_task(
     // A creation that rides a parent's transition carries the escrow that
     // parent already debited — the epoch creation the wake controller owes,
     // and later the delegated creations of phase 4. A root creation with no
-    // parent scope to debit is escrowed exactly its ceilings: it is the top
-    // of the hierarchy until the goal scope of phase 4 sits above it
-    // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
-    let escrow = AgentEscrowLedger::new(match creation.escrow {
+    // parent scope to debit is escrowed exactly its ceilings. A goal-bearing
+    // root holds the goal's own allocation instead, narrowed to that base —
+    // the definition-ceiling → goal-allocation → task rung of
+    // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)): the
+    // goal may hold less than the definition permits, never more.
+    let base_grant = match creation.escrow {
         Some(grant) => grant,
         None => AgentBudgetGrant::from_ceilings(&creation.definition.budgets),
+    };
+    let escrow = AgentEscrowLedger::new(match &creation.goal_spec {
+        Some(draft) => {
+            AgentBudgetGrant::new(draft.spec.allocation, draft.spec.limits).narrowed_to(&base_grant)
+        }
+        None => base_grant,
     });
 
     if creation.wake.is_some() && creation.parent.is_none() {
@@ -3584,16 +3690,37 @@ fn create_task(
         return Err(AgentTaskError::EpochWithoutParent);
     }
 
+    // The goal record is instituted in the creating transition, so the goal
+    // exists from its first commit and there is no window in which the root
+    // coordinates a contract it does not hold. Validation runs inside
+    // `AgentGoalSpecRevision::initial`, so a spec that violates a bound
+    // refuses the whole creation.
+    let goal_state = match creation.goal_spec {
+        Some(draft) => {
+            let revision = AgentGoalSpecRevision::initial(draft.spec, draft.provenance)?;
+            Some(Box::new(AgentGoalState::new(
+                revision,
+                draft.activate_on_creation,
+                now,
+            )))
+        }
+        None => None,
+    };
+    let goal_active = goal_state
+        .as_ref()
+        .is_some_and(|goal| goal.status().permits_work());
+
     let wake_controller = creation
         .goal_mode
         .is_continuous()
         .then(AgentWakeControllerState::new);
-    let task = AgentTask {
+    let mut task = AgentTask {
         definition: creation.definition,
         input: creation.input,
         status,
-        goal: creation.goal,
+        goal,
         goal_mode: creation.goal_mode,
+        goal_state,
         wake_controller,
         wake: creation.wake,
         parent: creation.parent,
@@ -3611,6 +3738,16 @@ fn create_task(
         created_at: now,
         telemetry: crate::observability::sanitize_agent_telemetry_context(creation.telemetry),
     };
+    // A continuous root instituted with a `Proposed` goal parks admission
+    // until the goal is activated: a proposed goal spends nothing, and the
+    // gate's own coalescing is what holds triggers that arrive meanwhile.
+    if let (Some(goal_record), Some(controller)) =
+        (task.goal_state.as_deref(), task.wake_controller.as_mut())
+    {
+        if goal_record.status() == AgentGoalStatus::Proposed {
+            controller.suspend_by_policy(GOAL_PROPOSED_GATE_REASON);
+        }
+    }
     // Admission reserves growth headroom: a record accepted here must still be
     // able to hold everything its own lifecycle may add.
     task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
@@ -3626,6 +3763,20 @@ fn create_task(
             now,
         )
     });
+    if goal_active {
+        // A goal activated in the creating transition records its activation
+        // exactly as a commanded activation would, so history reads the same
+        // whichever door activated it.
+        state.record_history(|sequence| {
+            AgentTaskHistoryEntry::new(
+                sequence,
+                AgentTaskHistoryKind::GoalActivated,
+                operation_id.clone(),
+                status,
+                now,
+            )
+        });
+    }
     // Each declared edge is its own history row, so scenario 37's "one
     // dependency edge" is observable in history as well as in state.
     let declared: Vec<AgentTaskId> = state
@@ -3824,6 +3975,47 @@ fn terminate(
     // proposal from it can no longer be validated.
     task.assignment = None;
 
+    // A terminal root coordinator ends the goal it holds: nothing can drive
+    // the contract further. A completion deliberately does not — completion
+    // is evidence, and only the configured evaluator makes a goal `Satisfied`
+    // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)); the
+    // goal's own budget termination already decided itself.
+    let goal_reason = match &reason {
+        AgentTaskTerminalReason::ResultAccepted => None,
+        AgentTaskTerminalReason::CancellationRequested { .. }
+        | AgentTaskTerminalReason::DependencyNotSatisfied { .. } => {
+            Some(AgentGoalTerminalReason::RootTaskCancelled)
+        }
+        AgentTaskTerminalReason::GoalBudgetExhausted { exhaustion } => {
+            Some(AgentGoalTerminalReason::BudgetExhausted {
+                exhaustion: *exhaustion,
+            })
+        }
+        other => Some(AgentGoalTerminalReason::ExecutionFailed {
+            code: other.code().to_string(),
+        }),
+    };
+    let goal_row = match (goal_reason, task.goal_state.as_deref_mut()) {
+        (Some(goal_reason), Some(goal)) if !goal.status().is_terminal() => {
+            let detail = format!("{} {}", goal_reason.status().as_label(), goal_reason.code());
+            goal.decide(
+                AgentGoalDecision {
+                    reason: goal_reason,
+                    evaluation: None,
+                    provenance: None,
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            // Admission closes with the contract.
+            if let Some(controller) = task.wake_controller.as_mut() {
+                controller.retire_by_policy();
+            }
+            Some(detail)
+        }
+        _ => None,
+    };
+
     let status = task.status;
     state.updated_at = now;
     state.record_history(|sequence| {
@@ -3836,6 +4028,15 @@ fn terminate(
         )
         .with_detail(reason.code())
     });
+    if let Some(detail) = goal_row {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::GoalDecided,
+            operation_id,
+            detail,
+            now,
+        );
+    }
     Ok(())
 }
 
@@ -4070,6 +4271,7 @@ fn apply_epoch_result(
         let operation_id = envelope.operation_id();
         if let Some(kind) = lifecycle_flip {
             record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+            project_gate_onto_goal(state, operation_id, None, now)?;
         }
         record_wake_history(
             state,
@@ -4198,6 +4400,9 @@ fn owe_epoch_creation(
         assignee: Some(epoch_spec.assignee.clone()),
         goal: Some(goal),
         goal_mode: AgentGoalMode::Finite,
+        // An epoch task contributes to the goal; it never coordinates it, so
+        // it carries the binding and no goal record of its own.
+        goal_spec: None,
         parent: Some(scope.task().clone()),
         dependencies: Vec::new(),
         escrow: Some(budget),
@@ -4328,6 +4533,7 @@ fn admit_wake(
     state.updated_at = now;
     if let Some(kind) = lifecycle_flip {
         record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        project_gate_onto_goal(state, operation_id, None, now)?;
     }
     record_wake_history(
         state,
@@ -4391,6 +4597,7 @@ fn complete_wake_occurrence(
     state.updated_at = now;
     if let Some(kind) = lifecycle_flip {
         record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        project_gate_onto_goal(state, operation_id, None, now)?;
     }
     if let Some(next) = &release.admitted_next {
         record_wake_history(
@@ -4460,6 +4667,7 @@ fn update_continuous_schedule(
     state.updated_at = now;
     if let Some(kind) = lifecycle_flip {
         record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        project_gate_onto_goal(state, operation_id, None, now)?;
     }
     record_wake_history(
         state,
@@ -4512,6 +4720,7 @@ fn suspend_continuous_goal(
         detail,
         now,
     );
+    project_gate_onto_goal(state, operation_id, None, now)?;
     Ok(AgentWakeOutcome::Lifecycle {
         status,
         lifecycle_revision,
@@ -4529,6 +4738,14 @@ fn resume_continuous_goal(
 ) -> AgentTaskResult<(AgentWakeOutcome, Vec<AgentExchangeEnvelope>)> {
     let scope = state.scope.clone();
     let task = continuous_task_mut(state)?;
+    // A budget park is the goal door's wait: resuming the gate under it would
+    // re-admit spending the contract says is parked. The exhaustion policy's
+    // own resume — `ResumeGoal` — lifts both together.
+    if let Some(wait) = task.goal_state.as_deref().and_then(AgentGoalState::wait) {
+        if wait.exhaustion().is_some() {
+            return Err(AgentTaskError::GoalWaitOwnedElsewhere { code: wait.code() });
+        }
+    }
     let policy = task
         .goal_mode
         .continuous()
@@ -4541,7 +4758,7 @@ fn resume_continuous_goal(
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
         controller.observe_lifecycle(&policy, now);
-        let lifecycle_revision = controller.resume(expected, provenance)?;
+        let lifecycle_revision = controller.resume(expected, provenance.clone())?;
         let promoted = controller.promote_admittable(&policy, now);
         controller.ensure_rewakes(&policy, now);
         (
@@ -4572,6 +4789,7 @@ fn resume_continuous_goal(
             now,
         );
     }
+    project_gate_onto_goal(state, operation_id, Some(&provenance), now)?;
     Ok((
         AgentWakeOutcome::Lifecycle {
             status,
@@ -4640,7 +4858,7 @@ fn retire_continuous_goal(
         .wake_controller
         .get_or_insert_with(AgentWakeControllerState::new);
     controller.observe_lifecycle(&policy, now);
-    let lifecycle_revision = controller.retire(expected, provenance)?;
+    let lifecycle_revision = controller.retire(expected, provenance.clone())?;
     controller.ensure_rewakes(&policy, now);
     let status = controller.lifecycle().status();
     state.updated_at = now;
@@ -4651,10 +4869,459 @@ fn retire_continuous_goal(
         String::new(),
         now,
     );
+    project_gate_onto_goal(state, operation_id, Some(&provenance), now)?;
     Ok(AgentWakeOutcome::Lifecycle {
         status,
         lifecycle_revision,
     })
+}
+
+/// The gate-suspension reason a goal instituted `Proposed` parks continuous
+/// admission under, lifted by [`AgentTaskEntityCommand::ActivateGoal`].
+const GOAL_PROPOSED_GATE_REASON: &str = "goal-proposed";
+
+/// Converges the goal contract with the continuous admission gate, one-way —
+/// gate to contract — inside the same transition that moved the gate.
+///
+/// The wake-side [`AgentGoalLifecycleStatus`] is the admission gate; the goal
+/// record carries the contract status of
+/// [specification 8.1](../../../docs/plans/rakka-agent/spec.md). Where the two
+/// overlap, the gate drives: a retirement cancels the goal with the `Retired`
+/// reason, an observed expiry expires it, a suspension parks it, and a resume
+/// reactivates a goal that was waiting on exactly that suspension — and
+/// nothing else, so a goal parked for budget exhaustion is never silently
+/// reactivated by a gate resume that granted nothing.
+///
+/// Every arm must stay infallible by construction: this runs inside exchange
+/// transitions — the epoch-result apply among them — where an error becomes a
+/// durably recorded refusal that is replayed forever. The guards are what
+/// guarantee it today (`Retired`/`Expired` map to reasons every non-terminal
+/// status accepts, the park and reactivate arms are status-guarded, and the
+/// fence uses the current revision); a future arm inherits the obligation.
+fn project_gate_onto_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    provenance: Option<&AgentRevisionProvenance>,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let Some(task) = state.task.as_mut() else {
+        return Ok(());
+    };
+    let Some(gate) = task
+        .wake_controller
+        .as_ref()
+        .map(|controller| controller.lifecycle().status())
+    else {
+        return Ok(());
+    };
+    let Some(goal) = task.goal_state.as_deref_mut() else {
+        return Ok(());
+    };
+    if goal.status().is_terminal() {
+        return Ok(());
+    }
+    let row = match gate {
+        AgentGoalLifecycleStatus::Retired | AgentGoalLifecycleStatus::Expired => {
+            let reason = if gate == AgentGoalLifecycleStatus::Retired {
+                AgentGoalTerminalReason::Retired
+            } else {
+                AgentGoalTerminalReason::ScheduleExpired
+            };
+            let detail = format!("{} {}", reason.status().as_label(), reason.code());
+            goal.decide(
+                AgentGoalDecision {
+                    reason,
+                    evaluation: None,
+                    provenance: provenance.cloned().map(Box::new),
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            Some((AgentTaskHistoryKind::GoalDecided, detail))
+        }
+        AgentGoalLifecycleStatus::Suspended if goal.status() == AgentGoalStatus::Active => {
+            goal.park(AgentGoalWaitReason::AdmissionSuspended, now)?;
+            Some((
+                AgentTaskHistoryKind::GoalParked,
+                AgentGoalWaitReason::AdmissionSuspended.code().to_string(),
+            ))
+        }
+        AgentGoalLifecycleStatus::Active
+            if matches!(goal.wait(), Some(AgentGoalWaitReason::AdmissionSuspended)) =>
+        {
+            let Some(provenance) = provenance else {
+                return Ok(());
+            };
+            goal.reactivate(goal.status_revision(), provenance.clone(), now)?;
+            Some((AgentTaskHistoryKind::GoalReactivated, String::new()))
+        }
+        _ => None,
+    };
+    if let Some((kind, detail)) = row {
+        state.updated_at = now;
+        record_wake_history(state, kind, operation_id, detail, now);
+    }
+    Ok(())
+}
+
+/// The goal-scope exhaustion the root task's own ledger reports right now:
+/// what is spoken for — consumption and still-outstanding child escrow
+/// together — against the goal's allocation.
+fn goal_scope_exhaustion(
+    task: &AgentTask,
+    dimension: AgentBudgetDimension,
+) -> AgentBudgetExhaustion {
+    let limit = task.escrow.allocation().get(dimension).unwrap_or(0);
+    let available = task.escrow.available(dimension).unwrap_or(0);
+    AgentBudgetExhaustion::new(dimension, limit, limit.saturating_sub(available))
+}
+
+/// The conserved dimension whose assignment refusal no settlement can relieve,
+/// when there is one: zero available headroom and no outstanding child escrow
+/// in that dimension whose return could restore any.
+fn permanent_budget_exhaustion(task: &AgentTask) -> Option<AgentBudgetDimension> {
+    if task.escrow.outstanding().count() >= AGENT_ESCROW_CHILD_CAPACITY {
+        return None;
+    }
+    let request = task.definition.run_allocation_request();
+    let affordable = request.narrowed_to(&task.escrow.available_allocation());
+    let dimension = affordable.first_empty_for(&request)?;
+    let outstanding_holds = task
+        .escrow
+        .outstanding()
+        .any(|(_, escrow)| escrow.allocated().get(dimension).unwrap_or(0) > 0);
+    (!outstanding_holds).then_some(dimension)
+}
+
+/// Applies the goal's persisted budget-exhaustion policy
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): hard
+/// ceilings deterministically park, escalate, or terminate per persisted
+/// policy), inside the transition that observed the exhaustion.
+///
+/// Idempotent: a goal already parked on the same reason, or already terminal,
+/// moves nothing — the consult runs inside command transitions and settle
+/// passes alike, and an unchanged exhaustion is not a new fact.
+fn apply_goal_exhaustion(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    dimension: AgentBudgetDimension,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    let Some(goal) = task.goal_state.as_deref() else {
+        return Ok(());
+    };
+    if goal.status().is_terminal() {
+        return Ok(());
+    }
+    let action = goal.spec().spec().exhaustion.action_for(dimension);
+    let exhaustion = goal_scope_exhaustion(task, dimension);
+    match action {
+        AgentGoalExhaustionAction::Park | AgentGoalExhaustionAction::Escalate => {
+            let reason = match action {
+                AgentGoalExhaustionAction::Park => {
+                    AgentGoalWaitReason::BudgetExhausted { exhaustion }
+                }
+                _ => AgentGoalWaitReason::Escalated { exhaustion },
+            };
+            let escalation = task
+                .goal_state
+                .as_deref()
+                .and_then(|goal| goal.spec().spec().escalation.clone());
+            let goal = task
+                .goal_state
+                .as_deref_mut()
+                .expect("the goal record was read above");
+            // A Proposed goal spends nothing already, so there is nothing to
+            // park; only an authorized goal parks.
+            if !matches!(
+                goal.status(),
+                AgentGoalStatus::Active | AgentGoalStatus::Waiting
+            ) {
+                return Ok(());
+            }
+            let before = goal.status_revision();
+            let code = reason.code();
+            let moved = goal.park(reason, now)? != before;
+            if !moved {
+                return Ok(());
+            }
+            // For a continuous goal the park closes admission in the same
+            // compare-and-set, so triggers coalesce and nothing spends — the
+            // same durable suspension a failure escalation makes.
+            if task.goal_mode.is_continuous() {
+                task.wake_controller
+                    .get_or_insert_with(AgentWakeControllerState::new)
+                    .suspend_by_policy(code);
+            }
+            let detail = match (action, escalation) {
+                (AgentGoalExhaustionAction::Escalate, Some(policy)) => {
+                    format!("{code} {exhaustion} escalation {policy}")
+                }
+                _ => format!("{code} {exhaustion}"),
+            };
+            state.updated_at = now;
+            record_wake_history(
+                state,
+                AgentTaskHistoryKind::GoalParked,
+                operation_id,
+                detail,
+                now,
+            );
+        }
+        AgentGoalExhaustionAction::Terminate => {
+            let goal = task
+                .goal_state
+                .as_deref_mut()
+                .expect("the goal record was read above");
+            let reason = AgentGoalTerminalReason::BudgetExhausted { exhaustion };
+            let detail = format!(
+                "{} {} {exhaustion}",
+                reason.status().as_label(),
+                reason.code()
+            );
+            goal.decide(
+                AgentGoalDecision {
+                    reason,
+                    evaluation: None,
+                    provenance: None,
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            // Admission closes with the contract, and the root task ends with
+            // the goal: durability does not authorize unbounded compute, and a
+            // policy that says terminate means the whole scope stops
+            // ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
+            if task.goal_mode.is_continuous() {
+                if let Some(controller) = task.wake_controller.as_mut() {
+                    controller.retire_by_policy();
+                }
+            }
+            state.updated_at = now;
+            record_wake_history(
+                state,
+                AgentTaskHistoryKind::GoalDecided,
+                operation_id,
+                detail,
+                now,
+            );
+            terminate(
+                state,
+                operation_id,
+                AgentTaskTerminalReason::GoalBudgetExhausted { exhaustion },
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Activates a `Proposed` goal under an authorized command, lifting the
+/// proposed-goal admission park when this is a continuous root.
+fn activate_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    // Every goal entry point observes the deadline: a passed one expires the
+    // goal, and the activation below then refuses it as terminal.
+    goal.observe_deadline(now);
+    goal.activate(expected, provenance.clone(), now)?;
+    let mut promoted = None;
+    let mut owed = Vec::new();
+    if task.goal_mode.is_continuous() {
+        let policy = task
+            .goal_mode
+            .continuous()
+            .expect("the mode was just matched")
+            .wake_policy
+            .policy()
+            .clone();
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        // Lift only the park the proposed goal itself made: an operator's own
+        // suspension stays until the operator resumes it.
+        if controller.lifecycle().status() == AgentGoalLifecycleStatus::Suspended
+            && controller.lifecycle().suspended_reason() == Some(GOAL_PROPOSED_GATE_REASON)
+        {
+            let revision = controller.lifecycle().lifecycle_revision();
+            controller.resume(revision, provenance)?;
+            promoted = controller.promote_admittable(&policy, now);
+            controller.ensure_rewakes(&policy, now);
+            if let Some(wake) = &promoted {
+                owed.push(owe_epoch_creation(&scope, task, wake, now)?);
+            }
+        }
+    }
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalActivated,
+        operation_id,
+        String::new(),
+        now,
+    );
+    if let Some(wake) = &promoted {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            wake.to_string(),
+            now,
+        );
+    }
+    // The gate may still be suspended by an operator, in which case the goal
+    // parks right back — the projection converges the two records either way.
+    project_gate_onto_goal(state, operation_id, None, now)?;
+    Ok(owed)
+}
+
+/// Records a terminal goal decision under an authorized command; a terminal
+/// continuous goal closes admission with the contract.
+fn record_goal_decision(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    decision: AgentGoalDecision,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    goal.observe_deadline(now);
+    let outcome = decision.reason.status();
+    let code = decision.reason.code();
+    goal.decide(decision, now)?;
+    if task.goal_mode.is_continuous() {
+        if let Some(controller) = task.wake_controller.as_mut() {
+            controller.retire_by_policy();
+        }
+    }
+    // The decision spends growth headroom admission reserved, so it checks
+    // the full bound: `decide` truncated the reason strings, but the
+    // evaluation reference carries caller-sized artifact fields the record
+    // must still be able to hold.
+    task.check_bounds(0)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalDecided,
+        operation_id,
+        format!("{} {code}", outcome.as_label()),
+        now,
+    );
+    Ok(())
+}
+
+/// Reactivates a `Waiting` goal under an authorized command — the un-park door
+/// of the goal-scope exhaustion policy. One command widens the ledger under
+/// the definition ceilings, reactivates the contract, and lifts the
+/// goal-driven admission park, in one fenced compare-and-set.
+fn resume_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    top_up: Option<AgentBudgetAllocation>,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    goal.observe_deadline(now);
+    // What the park recorded, before reactivation clears it. An admission
+    // suspension is the gate door's wait: resuming it here would lift a
+    // suspension this command never examined.
+    let wait_code = goal.wait().map(AgentGoalWaitReason::code);
+    if wait_code == Some(AgentGoalWaitReason::AdmissionSuspended.code()) {
+        return Err(AgentTaskError::GoalWaitOwnedElsewhere {
+            code: AgentGoalWaitReason::AdmissionSuspended.code(),
+        });
+    }
+    let parked = goal
+        .wait()
+        .and_then(AgentGoalWaitReason::exhaustion)
+        .copied();
+    goal.reactivate(expected, provenance.clone(), now)?;
+    if let Some(additional) = &top_up {
+        // The widening is the owner's parent-scope allocation decision; the
+        // definition ceiling still bounds it
+        // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+        let ceiling = AgentBudgetAllocation::from_ceilings(&task.definition.budgets);
+        task.escrow.widen(additional, &ceiling);
+    }
+    if let Some(exhaustion) = parked {
+        // The resume must actually relieve what parked the goal; resuming
+        // into the same exhaustion would only re-park on the next decision.
+        if task.escrow.available(exhaustion.dimension) == Some(0) {
+            return Err(AgentTaskError::GoalResumeUnrelieved {
+                exhaustion: goal_scope_exhaustion(task, exhaustion.dimension),
+            });
+        }
+    }
+    let mut promoted = None;
+    let mut owed = Vec::new();
+    if task.goal_mode.is_continuous() {
+        let policy = task
+            .goal_mode
+            .continuous()
+            .expect("the mode was just matched")
+            .wake_policy
+            .policy()
+            .clone();
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        // Lift only the park the goal's own exhaustion policy made.
+        let goal_driven = controller.lifecycle().status() == AgentGoalLifecycleStatus::Suspended
+            && controller.lifecycle().suspended_reason() == wait_code;
+        if goal_driven {
+            let revision = controller.lifecycle().lifecycle_revision();
+            controller.resume(revision, provenance)?;
+            promoted = controller.promote_admittable(&policy, now);
+            controller.ensure_rewakes(&policy, now);
+            if let Some(wake) = &promoted {
+                owed.push(owe_epoch_creation(&scope, task, wake, now)?);
+            }
+        }
+    }
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalReactivated,
+        operation_id,
+        top_up.map(|_| "top-up".to_string()).unwrap_or_default(),
+        now,
+    );
+    if let Some(wake) = &promoted {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            wake.to_string(),
+            now,
+        );
+    }
+    // The gate may still be suspended by an operator, in which case the goal
+    // parks right back — the projection converges the two records either way.
+    project_gate_onto_goal(state, operation_id, None, now)?;
+    Ok(owed)
 }
 
 /// Why the task cannot escrow a run right now, when it cannot.
@@ -4829,7 +5496,15 @@ fn decide_assignment(
     // the headroom, so this takes the same path a suspended agent's refusal
     // takes.
     if let Some((reason, detail)) = task_budget_refusal(task) {
-        return refuse_assignment(state, readiness, reason, detail, now);
+        // A refusal no settlement can relieve — zero headroom and nothing
+        // outstanding to return — is the goal scope's own exhaustion, and the
+        // goal's persisted policy decides what it does about it.
+        let permanent = permanent_budget_exhaustion(task);
+        let refusal = refuse_assignment(state, readiness, reason, detail, now)?;
+        if let Some(dimension) = permanent {
+            apply_goal_exhaustion(state, &operation_id, dimension, now)?;
+        }
+        return Ok(refusal);
     }
     let request = task.definition.run_allocation_request();
     let allocation = task
@@ -5193,7 +5868,7 @@ fn apply_ledger_exchange(
                 .payload()
                 .decode::<AgentBudgetTopUpRequest>(AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE)
             {
-                Ok(request) => apply_top_up(state, &request),
+                Ok(request) => apply_top_up(state, envelope.operation_id(), &request, now),
                 Err(error) => return refuse(state, error.code(), error.to_string()),
             }
         }
@@ -5235,7 +5910,9 @@ fn apply_return(
 
 fn apply_top_up(
     state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
     request: &AgentBudgetTopUpRequest,
+    now: AgentTimestampMillis,
 ) -> AgentTaskResult<Option<AgentBudgetAllocation>> {
     let child = AgentEscrowChildId::for_run(request.run.run())?;
     let task = state.task_mut()?;
@@ -5246,6 +5923,14 @@ fn apply_top_up(
     let granted = task
         .escrow
         .top_up_child(&child, request.sequence, &wanted)?;
+    // The run still receives the honest zero grant and stops with its original
+    // exhaustion; what is new in slice 4.1 is that the *goal* now consults its
+    // exhaustion policy instead of silently idling: the empty grant in the
+    // dimension the run ran out of is the goal scope observing its own ceiling.
+    let dimension = request.exhaustion.dimension;
+    if dimension.is_conserved() && granted.get(dimension) == Some(0) {
+        apply_goal_exhaustion(state, operation_id, dimension, now)?;
+    }
     Ok(Some(granted))
 }
 
@@ -5817,6 +6502,56 @@ where
                 })
                 .await?
             }
+            AgentTaskEntityCommand::ActivateGoal {
+                operation_id,
+                expected_status_revision,
+                provenance,
+            } => {
+                // Activation may make the task assignable, so the readiness
+                // read rides along and the assignment commits with it.
+                self.transition(now, readiness, move |state| {
+                    let owed = activate_goal(
+                        state,
+                        &operation_id,
+                        expected_status_revision,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, None, owed))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::RecordGoalDecision {
+                operation_id,
+                decision,
+            } => {
+                self.transition(now, None, move |state| {
+                    record_goal_decision(state, &operation_id, *decision, now)?;
+                    Ok((operation_id, None, Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::ResumeGoal {
+                operation_id,
+                expected_status_revision,
+                top_up,
+                provenance,
+            } => {
+                // Reactivation may make the task assignable again, so the
+                // readiness read rides along exactly as activation's does.
+                self.transition(now, readiness, move |state| {
+                    let owed = resume_goal(
+                        state,
+                        &operation_id,
+                        expected_status_revision,
+                        top_up.map(|allocation| *allocation),
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, None, owed))
+                })
+                .await?
+            }
         };
 
         self.record_command_metrics(&reply, lifecycle_transition, wake_trigger);
@@ -5954,7 +6689,8 @@ where
             | AgentTaskEntityCommand::SuspendContinuousGoal { .. }
             | AgentTaskEntityCommand::ResumeContinuousGoal { .. }
             | AgentTaskEntityCommand::RenewContinuousGoal { .. }
-            | AgentTaskEntityCommand::RetireContinuousGoal { .. } => return Ok(None),
+            | AgentTaskEntityCommand::RetireContinuousGoal { .. }
+            | AgentTaskEntityCommand::RecordGoalDecision { .. } => return Ok(None),
             _ => {
                 let Some(task) = self.state()?.task() else {
                     return Ok(None);
@@ -6020,9 +6756,11 @@ where
         self.require_history_headroom(now).await?;
         let admitted_before = self.wake_admitted_total();
         let lifecycle_before = self.goal_lifecycle_status();
+        let goal_before = self.goal_contract_status();
         let reply = self.host.accept(envelope, now).await?;
         self.record_admitted_epochs(admitted_before);
         self.record_lifecycle_transition(lifecycle_before);
+        self.record_goal_status_transition(goal_before);
         self.record_epoch_settlement(envelope, &reply);
         // Accepting a delivered exchange makes *local* progress only: it may
         // decide an assignment freed escrow now permits and flush the history it
@@ -6050,9 +6788,86 @@ where
     /// allowed to trigger; see [`Self::accept`] for why the drive half is not.
     async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
         self.require_history_headroom(now).await?;
+        self.observe_goal_deadline(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
         self.park_owed_rewakes(now).await?;
+        Ok(())
+    }
+
+    /// Expires the goal contract when its own deadline has passed
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)): the
+    /// settle pass is the goal entry point that always commits, so a passed
+    /// deadline lands durably here even when no command arrives — a command's
+    /// own observation would be discarded with the command's refusal.
+    ///
+    /// The write is skipped entirely while nothing would flip, so a sweep over
+    /// a healthy goal burns no revision.
+    async fn observe_goal_deadline(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
+        let would_expire = self
+            .state()?
+            .task()
+            .and_then(|task| task.goal_state.as_deref())
+            .is_some_and(|goal| {
+                !goal.status().is_terminal()
+                    && goal
+                        .spec()
+                        .spec()
+                        .deadline
+                        .is_some_and(|deadline| now.as_millis() >= deadline.as_millis())
+            });
+        if !would_expire {
+            return Ok(());
+        }
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::Command,
+            [
+                self.scope.tenant().as_str(),
+                self.scope.task().as_str(),
+                "goal-deadline",
+            ],
+        )?;
+        let goal_before = self.goal_contract_status();
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                let observe = |state: &mut AgentTaskState| -> AgentTaskResult<()> {
+                    let task = state.task_mut()?;
+                    let Some(goal) = task.goal_state.as_deref_mut() else {
+                        return Ok(());
+                    };
+                    if goal.observe_deadline(now).is_none() {
+                        return Ok(());
+                    }
+                    if let Some(controller) = task.wake_controller.as_mut() {
+                        controller.retire_by_policy();
+                    }
+                    state.updated_at = now;
+                    record_wake_history(
+                        state,
+                        AgentTaskHistoryKind::GoalDecided,
+                        &operation_id,
+                        "expired deadline-expired".to_string(),
+                        now,
+                    );
+                    Ok(())
+                };
+                match observe(state) {
+                    Ok(()) => Ok(Vec::new()),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        self.record_goal_status_transition(goal_before);
         Ok(())
     }
 
@@ -6094,6 +6909,7 @@ where
         // refused (after an attempt to drain it) rather than pushed past the
         // pending-history bound.
         self.require_history_headroom(now).await?;
+        self.observe_goal_deadline(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
         let rewakes_parked = self.park_owed_rewakes(now).await?;
@@ -6233,6 +7049,10 @@ where
 
         let mut assigned = false;
         let mut rejection = None;
+        // A settle-pass refusal may consult the goal's exhaustion policy, so
+        // this commit path counts goal-status flips exactly as the command
+        // path does.
+        let goal_before = self.goal_contract_status();
         let committed = self
             .host
             .initiate(now, |state| {
@@ -6254,6 +7074,7 @@ where
             return Err(rejection);
         }
         committed?;
+        self.record_goal_status_transition(goal_before);
         Ok(assigned)
     }
 
@@ -6325,6 +7146,7 @@ where
         let mut rejection = None;
         let admitted_before = self.wake_admitted_total();
         let lifecycle_before = self.goal_lifecycle_status();
+        let goal_before = self.goal_contract_status();
         let committed = self
             .host
             .initiate(now, |state| {
@@ -6367,6 +7189,7 @@ where
         committed?;
         self.record_admitted_epochs(admitted_before);
         self.record_lifecycle_transition(lifecycle_before);
+        self.record_goal_status_transition(goal_before);
         Ok(AgentTaskEntityReply::Applied {
             outcome: outcome.expect("an accepted transition produces an outcome"),
         })
@@ -6396,6 +7219,37 @@ where
     /// the transition emits nothing, because creation is not a transition
     /// out of any prior status. Renewal leaves the status unchanged and is
     /// counted from its command instead.
+    /// The goal contract's status, read from the durable state.
+    ///
+    /// Goal-status metrics are a difference of this status across a committed
+    /// transition, exactly as the admission gate's are: the one source that
+    /// sees a projected or policy-driven move — a budget park, a terminal
+    /// projection, an observed expiry — alongside the commanded ones.
+    fn goal_contract_status(&self) -> Option<AgentGoalStatus> {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .and_then(|task| task.goal_state.as_deref())
+            .map(AgentGoalState::status)
+    }
+
+    fn record_goal_status_transition(&self, before: Option<AgentGoalStatus>) {
+        let after = self.goal_contract_status();
+        if before == after {
+            return;
+        }
+        let Some(after) = after else {
+            return;
+        };
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
+            METRIC_AGENT_GOAL_STATUS,
+            1,
+            &[("transition", after.as_label())],
+        )
+        .ok();
+    }
+
     fn record_lifecycle_transition(&self, before: Option<AgentGoalLifecycleStatus>) {
         let (Some(before), Some(after)) = (before, self.goal_lifecycle_status()) else {
             return;
@@ -6569,6 +7423,49 @@ pub enum AgentTaskEntityCommand {
         /// Who commanded the transition.
         provenance: Box<AgentRevisionProvenance>,
     },
+    /// Activate a `Proposed` goal contract
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)). Fenced
+    /// on the goal's monotonic status revision.
+    ActivateGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The status revision this command expects to advance.
+        expected_status_revision: AgentRevisionNumber,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
+    /// Record a terminal goal decision — the entry point slice 4.2's
+    /// evaluator, an administrative cancellation, and policy terminations
+    /// drive. A criteria decision must carry the evaluation it rests on; the
+    /// decision's own `expected_status_revision` fences it.
+    RecordGoalDecision {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The decision to record.
+        decision: Box<AgentGoalDecision>,
+    },
+    /// Reactivate a `Waiting` goal, optionally widening its ledger under the
+    /// definition ceilings — the un-park door of the goal-scope
+    /// budget-exhaustion policy
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This door lifts only the admission park the goal's own policy made.
+    /// When the gate is also suspended under a reason this command does not
+    /// own — an operator's suspension, or the first reason of a mixed-reason
+    /// park — the goal reactivates and immediately re-parks as
+    /// `AdmissionSuspended`, and the reply honestly reads `Waiting`: resume
+    /// converges in two commands, this one and the gate's own
+    /// [`Self::ResumeContinuousGoal`].
+    ResumeGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The status revision this command expects to advance.
+        expected_status_revision: AgentRevisionNumber,
+        /// The allocation increase the owner grants, when one does.
+        top_up: Option<Box<AgentBudgetAllocation>>,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
     /// Read the task's bounded durable projection.
     Describe,
 }
@@ -6588,7 +7485,10 @@ impl AgentTaskEntityCommand {
             | Self::SuspendContinuousGoal { operation_id, .. }
             | Self::ResumeContinuousGoal { operation_id, .. }
             | Self::RenewContinuousGoal { operation_id, .. }
-            | Self::RetireContinuousGoal { operation_id, .. } => Some(operation_id),
+            | Self::RetireContinuousGoal { operation_id, .. }
+            | Self::ActivateGoal { operation_id, .. }
+            | Self::RecordGoalDecision { operation_id, .. }
+            | Self::ResumeGoal { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -7161,6 +8061,22 @@ pub enum AgentTaskError {
     /// An admission on a continuous goal that never declared its epoch
     /// contract.
     EpochUndefined,
+    /// The goal contract itself refused the transition.
+    Goal(AgentGoalError),
+    /// A goal command was delivered to a task that does not coordinate a goal.
+    GoalNotCoordinated,
+    /// A goal resume that widened nothing in the exhausted dimension.
+    GoalResumeUnrelieved {
+        /// The exhaustion still in force.
+        exhaustion: AgentBudgetExhaustion,
+    },
+    /// A resume arrived at the door that does not own the wait on record: the
+    /// gate's resume for a budget park, or the goal's resume for an admission
+    /// suspension.
+    GoalWaitOwnedElsewhere {
+        /// The wait reason's code.
+        code: &'static str,
+    },
     /// The wake contract itself refused the command.
     Wake(AgentWakeError),
     /// The durable wake-timer store refused a re-wake parking.
@@ -7309,6 +8225,10 @@ impl AgentTaskError {
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::EpochWithoutParent => "task-epoch-without-parent",
             Self::EpochUndefined => "task-epoch-undefined",
+            Self::Goal(error) => error.code(),
+            Self::GoalNotCoordinated => "task-goal-not-coordinated",
+            Self::GoalResumeUnrelieved { .. } => "task-goal-resume-unrelieved",
+            Self::GoalWaitOwnedElsewhere { .. } => "task-goal-wait-owned-elsewhere",
             Self::Wake(error) => error.code(),
             Self::WakeTimer(error) => error.code(),
             Self::WakeNotContinuous => "task-wake-not-continuous",
@@ -7367,6 +8287,19 @@ impl Display for AgentTaskError {
             Self::EpochUndefined => write!(
                 f,
                 "the continuous goal declares no epoch contract, so no epoch can be admitted"
+            ),
+            Self::Goal(error) => Display::fmt(error, f),
+            Self::GoalNotCoordinated => write!(
+                f,
+                "a goal command addresses a task that does not coordinate a goal"
+            ),
+            Self::GoalResumeUnrelieved { exhaustion } => write!(
+                f,
+                "the resume leaves the goal exhausted: {exhaustion}"
+            ),
+            Self::GoalWaitOwnedElsewhere { code } => write!(
+                f,
+                "the wait on record ({code}) is owned by the other resume door"
             ),
             Self::Wake(error) => Display::fmt(error, f),
             Self::WakeTimer(error) => Display::fmt(error, f),
@@ -7473,6 +8406,12 @@ impl Error for AgentTaskError {
 impl From<AgentWakeError> for AgentTaskError {
     fn from(error: AgentWakeError) -> Self {
         Self::Wake(error)
+    }
+}
+
+impl From<AgentGoalError> for AgentTaskError {
+    fn from(error: AgentGoalError) -> Self {
+        Self::Goal(error)
     }
 }
 
@@ -7612,6 +8551,7 @@ mod epoch_result_tests {
             assignee: None,
             goal: Some(AgentGoalId::new("nightly").expect("the goal id is valid")),
             goal_mode: continuous_mode(),
+            goal_spec: None,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,

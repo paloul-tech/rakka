@@ -302,6 +302,7 @@ pub fn agent_task_create_command(
             // ingress — and never an epoch, whose creation only the admitting
             // controller owes.
             goal_mode: AgentGoalMode::Finite,
+            goal_spec: None,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,

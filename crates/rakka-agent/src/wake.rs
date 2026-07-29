@@ -2265,6 +2265,38 @@ impl AgentWakeControllerState {
         Ok(self.lifecycle.lifecycle_revision)
     }
 
+    /// Suspends the goal under a persisted policy decision — the goal-scope
+    /// budget park of slice 4.1, the same class of durable suspension as the
+    /// failure escalation in [`Self::record_epoch_outcome`]. No principal
+    /// decided it, so it records no provenance, and it takes no fence: it runs
+    /// inside the transition that decided it, against the current record.
+    /// Idempotent on an already-suspended or terminal gate.
+    pub fn suspend_by_policy(&mut self, reason: impl Into<String>) -> AgentRevisionNumber {
+        if self.lifecycle.status != AgentGoalLifecycleStatus::Active {
+            return self.lifecycle.lifecycle_revision;
+        }
+        self.lifecycle.status = AgentGoalLifecycleStatus::Suspended;
+        self.lifecycle.suspended_reason = Some(bounded_reason(reason.into()));
+        self.lifecycle.changed_by = None;
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        self.lifecycle.rewakes = AgentWakeRewakes::default();
+        self.lifecycle.lifecycle_revision
+    }
+
+    /// Retires the goal under a persisted policy decision — the transition a
+    /// terminal goal contract drives so admission closes with it. Absorbing;
+    /// idempotent on an already-terminal gate.
+    pub fn retire_by_policy(&mut self) -> AgentRevisionNumber {
+        if self.lifecycle.status.is_terminal() {
+            return self.lifecycle.lifecycle_revision;
+        }
+        self.lifecycle.status = AgentGoalLifecycleStatus::Retired;
+        self.lifecycle.changed_by = None;
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        self.lifecycle.rewakes = AgentWakeRewakes::default();
+        self.lifecycle.lifecycle_revision
+    }
+
     /// Accounts one epoch's terminal outcome: a completion resets the failure
     /// streak, a failure grows it and engages backoff, a cancellation does
     /// neither. Returns whether the failure escalated into an auto-suspend.
