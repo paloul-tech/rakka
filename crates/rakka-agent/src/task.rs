@@ -4891,6 +4891,13 @@ const GOAL_PROPOSED_GATE_REASON: &str = "goal-proposed";
 /// reactivates a goal that was waiting on exactly that suspension — and
 /// nothing else, so a goal parked for budget exhaustion is never silently
 /// reactivated by a gate resume that granted nothing.
+///
+/// Every arm must stay infallible by construction: this runs inside exchange
+/// transitions — the epoch-result apply among them — where an error becomes a
+/// durably recorded refusal that is replayed forever. The guards are what
+/// guarantee it today (`Retired`/`Expired` map to reasons every non-terminal
+/// status accepts, the park and reactivate arms are status-guarded, and the
+/// fence uses the current revision); a future arm inherits the obligation.
 fn project_gate_onto_goal(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -7441,6 +7448,14 @@ pub enum AgentTaskEntityCommand {
     /// definition ceilings — the un-park door of the goal-scope
     /// budget-exhaustion policy
     /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This door lifts only the admission park the goal's own policy made.
+    /// When the gate is also suspended under a reason this command does not
+    /// own — an operator's suspension, or the first reason of a mixed-reason
+    /// park — the goal reactivates and immediately re-parks as
+    /// `AdmissionSuspended`, and the reply honestly reads `Waiting`: resume
+    /// converges in two commands, this one and the gate's own
+    /// [`Self::ResumeContinuousGoal`].
     ResumeGoal {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
