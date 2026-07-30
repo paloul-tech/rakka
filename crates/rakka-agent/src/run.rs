@@ -1403,12 +1403,25 @@ fn owed_run_exchanges(
 /// criteria revision.
 fn settle_goal_evaluation_exchange(
     state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
     result: &AgentExchangeResult,
     now: AgentTimestampMillis,
 ) {
     let Some(run) = state.run.as_mut() else {
         return;
     };
+    // Settle the cell this reply actually answers. The journal deduplicates
+    // replies before a participant sees them, so a mismatch is unreachable
+    // today — but the cell is durable state holding at most one report, and a
+    // reply for an evaluation a successor has already replaced must never mark
+    // that successor reported and strand its own crossing.
+    if run
+        .loop_state
+        .goal_evaluation()
+        .is_none_or(|cell| &cell.exchange_operation_id != envelope.operation_id())
+    {
+        return;
+    }
     let refusal = if result.is_accepted() {
         None
     } else {
@@ -3269,7 +3282,7 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 // The decision door answered — accepted, or refused under its
                 // own code. Either way the report settles; a refusal is the
                 // caller's signal to re-evaluate, never a crash loop.
-                settle_goal_evaluation_exchange(state, result, now);
+                settle_goal_evaluation_exchange(state, envelope, result, now);
             }
             _ => {}
         }

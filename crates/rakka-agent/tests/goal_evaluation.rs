@@ -422,6 +422,47 @@ async fn a_not_satisfied_verdict_ends_the_goal_unsatisfied() {
 }
 
 #[tokio::test]
+async fn an_expired_goal_refuses_as_terminal_rather_than_unattested() {
+    // Two fences meet on a commanded criteria decision past the deadline: the
+    // attestation fence, and the expiry every goal entry point observes. The
+    // honest one must win — the decision is not unattested, the goal is over —
+    // so the deadline is observed *before* the attestation check and `decide`
+    // answers `goal-terminal`.
+    let fx = satisfying_fixture();
+    let mut spec = goal_spec_with_evaluator();
+    spec.deadline = Some(AgentTimestampMillis::new(40_000));
+    create_goal_task(&fx, spec).await;
+    assert_eq!(goal_view(&fx).await.status, AgentGoalStatus::Active);
+
+    fx.clock.store(60_000, Ordering::SeqCst);
+    let refused = fx
+        .apply_task_command(AgentTaskEntityCommand::RecordGoalDecision {
+            operation_id: operation("declare-late"),
+            decision: Box::new(AgentGoalDecision {
+                reason: AgentGoalTerminalReason::CriteriaSatisfied,
+                evaluation: Some(Box::new(goal_evaluation())),
+                provenance: Some(Box::new(provenance(60))),
+                expected_status_revision: AgentRevisionNumber::INITIAL,
+            }),
+        })
+        .await;
+    assert_eq!(
+        refused.expect_err("an expired goal decides nothing").code(),
+        "goal-terminal"
+    );
+
+    // The settle pass is what makes the expiry durable — the refused command
+    // persisted nothing, exactly as every other refused decision does.
+    fx.pump().await.expect("the settle pass runs");
+    let goal = goal_view(&fx).await;
+    assert_eq!(goal.status, AgentGoalStatus::Expired);
+    assert_eq!(
+        goal.terminal,
+        Some(AgentGoalTerminalReason::DeadlineExpired)
+    );
+}
+
+#[tokio::test]
 async fn a_human_review_reserves_the_evidence_slot_its_decision_needs() {
     // The dispatcher appends the authorized decision as one classed evidence
     // item, so a human review may present at most `MAX_EVIDENCE - 1` of its

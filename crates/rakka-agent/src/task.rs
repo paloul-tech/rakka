@@ -4491,9 +4491,17 @@ fn apply_goal_evaluation(
             AgentGoalTerminalReason::CriteriaNotMet
         }
     };
+    // The attestation digest is what binds this decision to this record, so a
+    // reference that cannot be built refuses rather than deciding unbound.
+    let evaluation = match record.to_evaluation_ref() {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            return AgentExchangeTransition::new(refuse(state, error.code(), error.to_string()))
+        }
+    };
     let decision = AgentGoalDecision {
         reason,
-        evaluation: Some(Box::new(record.to_evaluation_ref())),
+        evaluation: Some(Box::new(evaluation)),
         provenance: None,
         expected_status_revision: expected.unwrap_or(AgentRevisionNumber::INITIAL),
     };
@@ -5377,7 +5385,9 @@ fn apply_goal_stagnation(
         return Ok(());
     }
     // A Proposed goal spends nothing already; only an authorized or parked
-    // goal is acted on. The detection itself was still counted durably.
+    // goal is acted on. The streak was still accounted durably — it is a fact
+    // about the epochs — but a suppressed trip is deliberately *not* counted,
+    // because it leaves no detection row for the count to correspond to.
     if !matches!(
         goal.status(),
         AgentGoalStatus::Active | AgentGoalStatus::Waiting
@@ -5388,6 +5398,11 @@ fn apply_goal_stagnation(
     let escalation = goal.spec().spec().escalation.clone();
     let stagnation_ref = goal.spec().spec().stagnation.clone();
     let detection = format!("{} {epochs} {}", trigger.code(), action.as_label());
+    // Past every guard, so the durable counter moves exactly with the
+    // detection row recorded below and the metric counts what happened.
+    if let Some(controller) = task.wake_controller.as_mut() {
+        controller.record_stagnation_trip(trigger);
+    }
 
     let follow_up = match action {
         // Observe-only; `Replan` is refused at spec validation, so its arm is
@@ -5609,9 +5624,20 @@ fn record_goal_decision(
         let task = state.task_mut()?;
         let goal = task
             .goal_state
-            .as_deref()
+            .as_deref_mut()
             .ok_or(AgentTaskError::GoalNotCoordinated)?;
-        if decision.reason.requires_evaluation() && goal.spec().spec().evaluator.is_some() {
+        // Every goal entry point observes the deadline, and this one observes
+        // it *before* the attestation fence: an expired goal is terminal, and
+        // refusing it `task-goal-decision-unattested` would answer the wrong
+        // question — the decision is not unattested, the goal is over. The
+        // now-terminal goal falls through to `decide`, which refuses it
+        // `goal-terminal`. Durability of the expiry itself stays the settle
+        // pass's job, as it is for every other refused decision.
+        goal.observe_deadline(now);
+        if !goal.status().is_terminal()
+            && decision.reason.requires_evaluation()
+            && goal.spec().spec().evaluator.is_some()
+        {
             return Err(AgentTaskError::GoalDecisionUnattested);
         }
     }
@@ -5675,8 +5701,9 @@ fn resume_goal(
     // What the park recorded, before reactivation clears it. An admission
     // suspension is the gate door's wait: resuming it here would lift a
     // suspension this command never examined.
-    let wait_code = goal.wait().map(AgentGoalWaitReason::code);
-    if wait_code == Some(AgentGoalWaitReason::AdmissionSuspended.code()) {
+    let wait = goal.wait().cloned();
+    let wait_code = wait.as_ref().map(AgentGoalWaitReason::code);
+    if matches!(wait, Some(AgentGoalWaitReason::AdmissionSuspended)) {
         return Err(AgentTaskError::GoalWaitOwnedElsewhere {
             code: AgentGoalWaitReason::AdmissionSuspended.code(),
         });
@@ -5702,7 +5729,11 @@ fn resume_goal(
             });
         }
     }
-    let stagnant = wait_code == Some("stagnant");
+    // The structured reason, not its label: the detector reset below is a
+    // durable state change, and a code two reasons could share must not decide
+    // it. `wait_code` stays for the gate's own suspension-reason comparison,
+    // which is string-keyed on the controller side.
+    let stagnant = matches!(wait, Some(AgentGoalWaitReason::Stagnant { .. }));
     let mut promoted = None;
     let mut owed = Vec::new();
     if task.goal_mode.is_continuous() {

@@ -418,6 +418,83 @@ async fn continue_action_detects_without_parking() {
 }
 
 #[tokio::test]
+async fn a_trip_the_goal_never_saw_accounts_its_streak_but_counts_nothing() {
+    // The streaks are facts about the epochs, so they account whatever the
+    // contract does. The *trip counter* is not: it backs
+    // `rakka.agent.goal.stagnation`, and a count with no detection row behind
+    // it would report an event nobody observed.
+    //
+    // The reachable suppression is a schedule expiry projected in the same
+    // settlement: the trip is measured against the goal as it was on entry
+    // (`Active`), the gate's expiry then ends the contract, and
+    // `apply_goal_stagnation` finds a terminal goal and records nothing.
+    use rakka_agent::AgentWakeLifecyclePolicy;
+
+    let fx = fixture();
+    fx.instantiate_agent().await;
+    let policy = wake_policy()
+        .with_lifecycle(AgentWakeLifecyclePolicy {
+            expires_at: Some(AgentTimestampMillis::new(50_000)),
+            ..AgentWakeLifecyclePolicy::DEFAULT
+        })
+        .expect("the lifecycle policy is valid");
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(policy),
+        goal_spec_draft(
+            goal_spec_with_stagnation(2, AgentGoalStagnationAction::Wait),
+            true,
+        ),
+    ))
+    .await
+    .expect("the creation applies");
+
+    // One identical completion before the expiry: the streak starts, nothing
+    // trips at a threshold of two.
+    settle_epoch(&fx, 5, AgentTaskStatus::Completed, Some(digest_of("same"))).await;
+    assert_eq!(controller(&fx).await.counters().stagnation_repeated, 0);
+
+    // The second settles past the expiry. It would trip — and the streak
+    // proves it did reach the threshold — but the projection ended the goal in
+    // this same transition, so no detection was recorded and none is counted.
+    let binding = scheduled_wake_binding(10, ScheduleRevision::INITIAL);
+    fx.apply_task_command(wake_admission_command(binding.clone()).expect("the command derives"))
+        .await
+        .expect("the admission applies");
+    fx.clock.store(60_000, std::sync::atomic::Ordering::SeqCst);
+    accept_on_root(
+        &fx,
+        &epoch_result(
+            &binding,
+            AgentTaskStatus::Completed,
+            Some(digest_of("same")),
+        ),
+    )
+    .await;
+
+    let state = controller(&fx).await;
+    assert_eq!(
+        state.lifecycle().repeated_result_epochs(),
+        2,
+        "the streak accounted: a durable fact about the epochs"
+    );
+    assert_eq!(
+        state.counters().stagnation_repeated,
+        0,
+        "and nothing counted: the goal never saw the trip"
+    );
+    let (status, wait) = goal_status(&fx).await;
+    assert_eq!(status, AgentGoalStatus::Expired);
+    assert_eq!(wait, None, "an expired goal parks on nothing");
+    assert!(
+        !history_entries(&fx)
+            .await
+            .iter()
+            .any(|(kind, _)| *kind == rakka_agent::AgentTaskHistoryKind::GoalStagnationDetected),
+        "no detection row, so the counter must agree"
+    );
+}
+
+#[tokio::test]
 async fn a_no_progress_threshold_trips_on_missing_fingerprints() {
     let fx = fixture();
     fx.instantiate_agent().await;

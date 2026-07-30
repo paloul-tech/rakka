@@ -445,26 +445,37 @@ impl AgentGoalEvaluationRecord {
     /// to exactly this content.
     ///
     /// The attestation digest follows the checkpoint-grant rule: it is the
-    /// collision-resistant one, never the repetition fingerprint.
-    #[must_use]
-    pub fn attestation_digest(&self) -> AgentContentDigest {
-        let value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
-        AgentContentDigest::sha256_of_json(&value)
+    /// collision-resistant one, never the repetition fingerprint. Like
+    /// [`crate::effect::AgentRunEffectRequest::cryptographic_argument_digest`]
+    /// it *propagates* an encoding failure rather than substituting a
+    /// placeholder: a digest computed over anything but this record would bind
+    /// the decision to the wrong content, and every record degrading to the
+    /// same constant would defeat the attestation silently. The decision door
+    /// turns the error into a refusal, so the caller re-evaluates.
+    pub fn attestation_digest(&self) -> AgentGoalEvaluationResult<AgentContentDigest> {
+        let value = serde_json::to_value(self).map_err(|error| {
+            AgentGoalEvaluationError::RecordUnencodable {
+                message: error.to_string(),
+            }
+        })?;
+        Ok(AgentContentDigest::sha256_of_json(&value))
     }
 
     /// Derives the [`AgentGoalEvaluationRef`] a criteria decision carries, so
     /// the coordinating task never hand-builds one.
-    #[must_use]
-    pub fn to_evaluation_ref(&self) -> AgentGoalEvaluationRef {
-        AgentGoalEvaluationRef {
+    ///
+    /// Fails closed with the attestation digest: a reference the door cannot
+    /// bind to this exact record is never constructed.
+    pub fn to_evaluation_ref(&self) -> AgentGoalEvaluationResult<AgentGoalEvaluationRef> {
+        Ok(AgentGoalEvaluationRef {
             evaluator: self.evaluator.clone(),
             criteria_revision: self.criteria_revision,
             evidence: None,
-            digest: Some(self.attestation_digest()),
+            digest: Some(self.attestation_digest()?),
             evaluation_id: Some(self.evaluation_id.clone()),
             method: Some(self.method),
             evidence_items: self.evidence.clone(),
-        }
+        })
     }
 }
 
@@ -545,6 +556,11 @@ pub enum AgentGoalEvaluationError {
         /// The bound.
         maximum: usize,
     },
+    /// The record could not be encoded, so no attestation digest binds it.
+    RecordUnencodable {
+        /// The encoding failure detail.
+        message: String,
+    },
 }
 
 impl AgentGoalEvaluationError {
@@ -555,6 +571,7 @@ impl AgentGoalEvaluationError {
             Self::EvidenceTooLarge { .. } => "evaluation-evidence-too-large",
             Self::EvidenceClassInvalid { .. } => "evaluation-evidence-class-invalid",
             Self::ReasonCodeTooLong { .. } => "evaluation-reason-code-too-long",
+            Self::RecordUnencodable { .. } => "evaluation-record-unencodable",
         }
     }
 }
@@ -573,6 +590,11 @@ impl Display for AgentGoalEvaluationError {
             Self::ReasonCodeTooLong { length, maximum } => write!(
                 f,
                 "the evaluation reason code is {length} bytes, which exceeds the {maximum} byte bound"
+            ),
+            Self::RecordUnencodable { message } => write!(
+                f,
+                "the evaluation record could not be encoded, so no attestation digest binds it: \
+                 {message}"
             ),
         }
     }

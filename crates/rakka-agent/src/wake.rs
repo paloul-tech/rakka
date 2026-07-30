@@ -2400,8 +2400,11 @@ impl AgentWakeControllerState {
     /// | no digest (defensive) | kept        | kept           | `+1`           |
     ///
     /// A trip fires exactly at a set threshold, `RepeatedResult` before
-    /// `NoProgress`, and bumps the matching durable counter so the metric can
-    /// count trips by difference.
+    /// `NoProgress`. Accounting is unconditional — a streak is a durable fact
+    /// about the epochs whatever the contract does with it — but *counting* the
+    /// trip is not: [`Self::record_stagnation_trip`] is the caller's separate
+    /// step, taken only where the trip is durably acted on, so the metric never
+    /// reports a trip that left no record.
     pub fn record_epoch_progress(
         &mut self,
         policy: &AgentGoalStagnationPolicy,
@@ -2429,22 +2432,31 @@ impl AgentWakeControllerState {
                     self.lifecycle.no_progress_epochs.saturating_add(1);
             }
         }
-        let tripped = policy.tripped(
+        policy.tripped(
             self.lifecycle.repeated_result_epochs,
             self.lifecycle.no_progress_epochs,
-        );
-        match tripped {
-            Some(AgentStagnationTrigger::RepeatedResult) => {
+        )
+    }
+
+    /// Counts one stagnation trip the contract durably acted on.
+    ///
+    /// Called in lockstep with the trip's `GoalStagnationDetected` audit row,
+    /// which is what keeps `rakka.agent.goal.stagnation` honest: a trip the
+    /// goal's status suppressed — it is `Proposed`, or a projection in the same
+    /// settlement already ended it — accounts its streak but is never counted,
+    /// because nothing observed it. An observe-only `Continue` trip *is*
+    /// counted: it records a detection.
+    pub fn record_stagnation_trip(&mut self, trigger: AgentStagnationTrigger) {
+        match trigger {
+            AgentStagnationTrigger::RepeatedResult => {
                 self.counters.stagnation_repeated =
                     self.counters.stagnation_repeated.saturating_add(1);
             }
-            Some(AgentStagnationTrigger::NoProgress) => {
+            AgentStagnationTrigger::NoProgress => {
                 self.counters.stagnation_no_progress =
                     self.counters.stagnation_no_progress.saturating_add(1);
             }
-            None => {}
         }
-        tripped
     }
 
     /// Clears the stagnation detector under the authorized resume door — the
