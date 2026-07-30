@@ -145,9 +145,38 @@ pub fn goal_spec() -> rakka_agent::AgentGoalSpec {
         escalation: None,
         terminal_decision: None,
         stagnation: None,
+        stagnation_policy: Default::default(),
         settings_revision: None,
         policy_revision: None,
     }
+}
+
+/// The fixture goal contract with a configured completion evaluator and one
+/// required evidence class: under it, a criteria decision may only arrive
+/// through the goal-evaluation exchange.
+pub fn goal_spec_with_evaluator() -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.evaluator =
+        Some(AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"));
+    spec.required_evidence = ["artifact".to_string()].into_iter().collect();
+    spec
+}
+
+/// The fixture goal contract with a stagnation policy: repeated-result trips
+/// at `repeated` consecutive identical completions under `action`.
+pub fn goal_spec_with_stagnation(
+    repeated: u32,
+    action: rakka_agent::AgentGoalStagnationAction,
+) -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.stagnation = Some(AgentPolicyRef::new("no-repeats").expect("the policy ref is valid"));
+    spec.stagnation_policy = rakka_agent::AgentGoalStagnationPolicy {
+        repeated_result_epochs: Some(repeated),
+        no_progress_epochs: None,
+        default: action,
+        overrides: Default::default(),
+    };
+    spec
 }
 
 /// The creation draft instituting the fixture goal.
@@ -170,6 +199,38 @@ pub fn goal_evaluation() -> rakka_agent::AgentGoalEvaluationRef {
         criteria_revision: AgentRevisionNumber::INITIAL,
         evidence: None,
         digest: None,
+        evaluation_id: None,
+        method: None,
+        evidence_items: Vec::new(),
+    }
+}
+
+/// The evaluation request the fixture's coordinator commits: a deterministic
+/// assertion as the configured evaluator, presenting one classed evidence
+/// artifact at `criteria_revision`.
+pub fn goal_evaluation_request(
+    criteria_revision: AgentRevisionNumber,
+) -> rakka_agent::AgentGoalEvaluationRequest {
+    rakka_agent::AgentGoalEvaluationRequest {
+        // The goal-bearing root task derives its goal identity from its own
+        // value (open decision 14's resolved default), and the run is bound
+        // to that derived id.
+        goal: AgentGoalId::for_root_task(task_scope().task()),
+        evaluator: AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"),
+        criteria_revision,
+        method: rakka_agent::AgentGoalEvaluationMethod::DeterministicAssertion {
+            assertion: AgentPolicyRef::new("ticket-resolved").expect("the policy ref is valid"),
+        },
+        evidence: vec![rakka_agent::AgentGoalEvidenceRef {
+            class: "artifact".to_string(),
+            artifact: None,
+            digest: None,
+        }],
+        requested_by: PrincipalRef {
+            principal_type: "service".to_string(),
+            principal_id: "goal-orchestrator".to_string(),
+            display_name: None,
+        },
     }
 }
 

@@ -137,6 +137,8 @@ pub enum AgentDecisionKind {
     RequestAuthorization,
     /// Apply a reconciliation decision to an indeterminate effect.
     Reconcile,
+    /// Commit a goal-evaluation effect.
+    Evaluate,
 }
 
 impl AgentDecisionKind {
@@ -153,6 +155,7 @@ impl AgentDecisionKind {
             Self::RequestApproval => "request-approval",
             Self::RequestAuthorization => "request-authorization",
             Self::Reconcile => "reconcile",
+            Self::Evaluate => "evaluate",
         }
     }
 }
@@ -659,6 +662,16 @@ pub const METRIC_AGENT_GOAL_LIFECYCLE: &str = "rakka.agent.goal.lifecycle";
 /// the goal record's status across the committed transition, so projected and
 /// policy-driven moves count exactly like commanded ones.
 pub const METRIC_AGENT_GOAL_STATUS: &str = "rakka.agent.goal.status";
+
+/// Counter: stagnation-threshold trips the wake controller detected, labeled
+/// by bounded trigger (`repeated-result` / `no-progress`)
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Counted as the difference of the controller's durable stagnation counters
+/// across the committed transition — the admitted-epoch idiom — so a replayed
+/// settlement emits nothing. A `Continue` action produces no status flip, and
+/// this counter is its only metric visibility.
+pub const METRIC_AGENT_GOAL_STAGNATION: &str = "rakka.agent.goal.stagnation";
 
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///

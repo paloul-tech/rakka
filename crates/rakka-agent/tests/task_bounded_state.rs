@@ -1120,7 +1120,13 @@ async fn a_maximal_goal_bearing_continuous_task_stays_inside_its_bound() {
             rakka_agent::AgentEnvironmentRef::new(format!("env-{index:02}"))
                 .expect("the id is valid"),
         );
-        spec.required_evidence.insert(format!("class-{index:02}"));
+        // Required evidence has its own tighter cap: a spec demanding more
+        // classes than one evaluation may present is statically
+        // unsatisfiable and refused, so the maximal spec fills exactly the
+        // satisfiable bound.
+        if index < rakka_agent::AGENT_GOAL_EVALUATION_MAX_EVIDENCE {
+            spec.required_evidence.insert(format!("class-{index:02}"));
+        }
     }
     spec.delegation = Some(rakka_agent::AgentGoalDelegationBudget {
         max_depth: Some(4),
@@ -1128,6 +1134,21 @@ async fn a_maximal_goal_bearing_continuous_task_stays_inside_its_bound() {
         max_descendants: Some(64),
         max_concurrent: Some(8),
     });
+    // Slice 4.2's addition: a fully populated stagnation policy — both
+    // thresholds and a per-trigger override — rides the same bounded spec.
+    spec.stagnation =
+        Some(rakka_agent::AgentPolicyRef::new("no-repeats").expect("the policy ref is valid"));
+    spec.stagnation_policy = rakka_agent::AgentGoalStagnationPolicy {
+        repeated_result_epochs: Some(3),
+        no_progress_epochs: Some(5),
+        default: rakka_agent::AgentGoalStagnationAction::Wait,
+        overrides: [(
+            rakka_agent::AgentStagnationTrigger::NoProgress,
+            rakka_agent::AgentGoalStagnationAction::Escalate,
+        )]
+        .into_iter()
+        .collect(),
+    };
 
     fx.create_shaped(
         AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
@@ -1175,10 +1196,10 @@ async fn an_oversized_goal_spec_is_refused_at_creation() {
     let mut padded = common::goal_spec();
     padded.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH);
     for index in 0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS {
-        padded.required_evidence.insert(format!(
-            "{index:02}-{}",
-            "e".repeat(rakka_agent::AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH - 3)
-        ));
+        padded.allowed_skills.insert(
+            rakka_agent::AgentCapabilityId::new(format!("{index:02}-{}", "s".repeat(120)))
+                .expect("the id is valid"),
+        );
     }
     let error = fx
         .create_shaped(

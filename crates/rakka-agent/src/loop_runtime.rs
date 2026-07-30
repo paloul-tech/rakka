@@ -376,6 +376,38 @@ pub struct AgentLoopState {
     /// before this field decodes to the empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     memory_promotions: Vec<AgentMemoryPromotionRecord>,
+    /// The completed goal evaluation the run holds until — and after — the
+    /// exchange carrying it to the coordinating task settles
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)). One
+    /// cell: a run evaluates its goal one evaluation at a time, and a new
+    /// evaluation replaces a settled cell. A loop state persisted before this
+    /// field decodes without one.
+    #[serde(default)]
+    goal_evaluation: Option<Box<AgentGoalEvaluationCell>>,
+}
+
+/// One completed goal evaluation and where its report to the coordinating
+/// task stands ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The exchange operation id is derived when the outcome is applied — a pure
+/// function of the effect generation that produced the record — so a re-drive
+/// after any crash re-owes the identical exchange and the journal deduplicates
+/// it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentGoalEvaluationCell {
+    /// The completed record.
+    pub record: Box<crate::evaluation::AgentGoalEvaluationRecord>,
+    /// The derived operation id of the exchange that reports the record.
+    pub exchange_operation_id: AgentOperationId,
+    /// When the evaluation's outcome was applied.
+    pub completed_at: AgentTimestampMillis,
+    /// Whether the exchange settled — the decision door accepted or refused.
+    #[serde(default)]
+    pub reported: bool,
+    /// The decision door's refusal code, when it refused. A refused
+    /// evaluation is settled, never re-driven: the caller re-evaluates.
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 /// Whether a defaulted count is zero, so it is omitted from a run's serialized
@@ -425,6 +457,7 @@ impl AgentLoopState {
             decision_sequence: 0,
             decision_drops: 0,
             memory_promotions: Vec::new(),
+            goal_evaluation: None,
         }
     }
 
@@ -1002,6 +1035,56 @@ impl AgentLoopState {
     #[must_use]
     pub const fn session_sequence(&self) -> u64 {
         self.session_sequence
+    }
+
+    /// The completed goal evaluation the run holds, when one exists.
+    #[must_use]
+    pub fn goal_evaluation(&self) -> Option<&AgentGoalEvaluationCell> {
+        self.goal_evaluation.as_deref()
+    }
+
+    /// Whether an evaluation is open — a committed evaluation effect not yet
+    /// resolved, or a completed record whose exchange has not settled. One
+    /// evaluation at a time: the commit door refuses a second while one is
+    /// open.
+    #[must_use]
+    pub fn has_open_goal_evaluation(&self) -> bool {
+        if self
+            .goal_evaluation
+            .as_deref()
+            .is_some_and(|cell| !cell.reported)
+        {
+            return true;
+        }
+        self.effects.iter().any(|effect| {
+            effect.kind() == crate::effect::AgentRunEffectKind::GoalEvaluationCall
+                && effect.is_outstanding()
+        })
+    }
+
+    /// Records one completed evaluation, replacing any settled predecessor.
+    pub(crate) fn record_goal_evaluation(
+        &mut self,
+        record: crate::evaluation::AgentGoalEvaluationRecord,
+        exchange_operation_id: AgentOperationId,
+        now: AgentTimestampMillis,
+    ) {
+        self.goal_evaluation = Some(Box::new(AgentGoalEvaluationCell {
+            record: Box::new(record),
+            exchange_operation_id,
+            completed_at: now,
+            reported: false,
+            refusal: None,
+        }));
+    }
+
+    /// Marks the held evaluation reported — the exchange settled — with the
+    /// decision door's refusal code when it refused.
+    pub(crate) fn settle_goal_evaluation(&mut self, refusal: Option<String>) {
+        if let Some(cell) = self.goal_evaluation.as_deref_mut() {
+            cell.reported = true;
+            cell.refusal = refusal;
+        }
     }
 
     /// Bounded receipts of the run's settled memory promotions, newest last.

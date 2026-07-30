@@ -175,6 +175,17 @@ pub const CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION: StateSchemaVersion = StateSc
 /// this binary cannot read.
 pub const CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted
+/// [`crate::evaluation::AgentGoalEvaluationRecord`].
+///
+/// An evaluation record outlives the transition that produced it — it crosses
+/// the goal-evaluation exchange, and the terminal decision derived from it is
+/// read back long after the run that held it ended — so it carries its own
+/// version rather than the run state's, and fails closed on one this binary
+/// cannot read.
+pub const CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of the persisted
 /// [`crate::wake_timers::AgentWakeTimerStoreState`].
 ///
@@ -246,11 +257,13 @@ pub enum AgentRecordKind {
     WakeTimerState,
     /// One accepted revision of a goal's spec.
     GoalSpec,
+    /// One completed goal evaluation.
+    GoalEvaluation,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -275,6 +288,7 @@ impl AgentRecordKind {
         Self::WakePolicyRevision,
         Self::WakeTimerState,
         Self::GoalSpec,
+        Self::GoalEvaluation,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -305,6 +319,7 @@ impl AgentRecordKind {
             Self::WakePolicyRevision => "agent-wake-policy-revision",
             Self::WakeTimerState => "agent-wake-timer-state",
             Self::GoalSpec => "agent-goal-spec",
+            Self::GoalEvaluation => "agent-goal-evaluation",
         }
     }
 
@@ -336,6 +351,7 @@ impl AgentRecordKind {
             Self::WakePolicyRevision => CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
             Self::WakeTimerState => CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
             Self::GoalSpec => CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION,
+            Self::GoalEvaluation => CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION,
         }
     }
 
@@ -365,6 +381,7 @@ impl AgentRecordKind {
             Self::WakePolicyRevision => 21,
             Self::WakeTimerState => 22,
             Self::GoalSpec => 23,
+            Self::GoalEvaluation => 24,
         }
     }
 }

@@ -178,6 +178,123 @@ fn epoch_result(
     .expect("the envelope builds")
 }
 
+/// A legitimate epoch-result envelope carrying the accepted result's
+/// fingerprint, for the stagnation detector.
+fn epoch_result_with_digest(
+    binding: &rakka_agent::AgentWakeBinding,
+    status: AgentTaskStatus,
+    result_digest: Option<rakka_agent::AgentContentDigest>,
+) -> AgentExchangeEnvelope {
+    let epoch_task = epoch_task_id_for_wake(binding.wake_id()).expect("the epoch derives");
+    let epoch_scope =
+        AgentTaskScope::new(tenant(), epoch_task.clone()).expect("the scope is valid");
+    let operation_id = epoch_result_operation_id(&tenant(), &goal_id(), binding.wake_id())
+        .expect("the operation id derives");
+    let result = AgentEpochResult {
+        wake: binding.wake_id().clone(),
+        task: epoch_task,
+        status,
+        consumed: AgentBudgetConsumption::zero(),
+        result_digest,
+    };
+    AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::EpochResult,
+        AgentEntityAddress::Task(epoch_scope),
+        AgentEntityAddress::Task(task_scope()),
+        AgentExchangePayload::encode(AGENT_EPOCH_RESULT_PAYLOAD_TYPE, &result)
+            .expect("the payload encodes"),
+        AgentCorrelationId::new(operation_id.as_str()),
+        AgentTimestampMillis::new(9_000),
+    )
+    .expect("the envelope builds")
+}
+
+/// Stagnation trips count as the difference of the controller's durable
+/// counters across the committed settlement, labeled by bounded trigger — and
+/// a replayed settlement, answered from the journal, counts nothing. Under a
+/// `Continue` action no status flips, so this counter is the trip's only
+/// metric visibility.
+#[tokio::test]
+async fn stagnation_trips_count_once_per_settled_epoch() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::new()).with_metrics(metrics.clone());
+    fx.instantiate_agent().await;
+    fx.apply_task_command(continuous_goal_control_creation_command(
+        continuous_goal_mode(wake_policy()),
+        goal_spec_draft(
+            goal_spec_with_stagnation(2, rakka_agent::AgentGoalStagnationAction::Continue),
+            true,
+        ),
+    ))
+    .await
+    .expect("the creation applies");
+
+    let digest = rakka_agent::AgentContentDigest::of_json(&serde_json::json!({
+        "answer": "same"
+    }));
+    let mut last = None;
+    for due in [5_u64, 10] {
+        let binding = scheduled_wake_binding(due, ScheduleRevision::INITIAL);
+        fx.apply_task_command(
+            wake_admission_command(binding.clone()).expect("the command derives"),
+        )
+        .await
+        .expect("the admission applies");
+        let result =
+            epoch_result_with_digest(&binding, AgentTaskStatus::Completed, Some(digest.clone()));
+        let mut root = rakka_agent::AgentTaskEntityStore::new(
+            task_scope(),
+            fx.tasks.clone(),
+            fx.agents.clone(),
+            fx.history.clone(),
+        )
+        .with_wake_timers(fx.rewake_parker.clone())
+        .with_metrics(metrics.clone());
+        root.recover(fx.now()).await.expect("the root recovers");
+        let reply = root
+            .accept(&result, &fx.router, fx.now())
+            .await
+            .expect("the result is answered");
+        assert!(reply.result().is_accepted(), "the epoch result lands");
+        last = Some(result);
+    }
+
+    // The first identical completion started the streak; the second tripped
+    // the threshold: exactly one observation, on the bounded trigger label.
+    assert_eq!(
+        labels_of(
+            &metrics.snapshot(),
+            rakka_agent::METRIC_AGENT_GOAL_STAGNATION
+        ),
+        vec![vec![("trigger".to_string(), "repeated-result".to_string())]],
+        "one trip counted once"
+    );
+
+    // A redelivered settlement answers from the journal and moves nothing.
+    let mut root = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    )
+    .with_wake_timers(fx.rewake_parker.clone())
+    .with_metrics(metrics.clone());
+    root.recover(fx.now()).await.expect("the root recovers");
+    root.accept(&last.expect("an envelope was sent"), &fx.router, fx.now())
+        .await
+        .expect("the replay is answered");
+    assert_eq!(
+        labels_of(
+            &metrics.snapshot(),
+            rakka_agent::METRIC_AGENT_GOAL_STAGNATION
+        )
+        .len(),
+        1,
+        "the replay counted nothing"
+    );
+}
+
 /// The label values of every observation of one instrument, as `(key, value)`
 /// pair lists in recording order.
 fn labels_of(snapshot: &rakka_core::MetricsSnapshot, name: &str) -> Vec<Vec<(String, String)>> {

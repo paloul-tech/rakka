@@ -703,6 +703,9 @@ pub enum AgentOperationKind {
     EpochAdmission,
     /// A completed epoch returning its result to the controller.
     EpochResult,
+    /// One goal evaluation: the committed effect, its record, and the
+    /// exchange that carries the record to the coordinating task.
+    GoalEvaluation,
     /// Append of one communal knowledge-graph claim.
     ClaimAppend,
     /// Durable delegation of work to a specialist agent.
@@ -752,6 +755,7 @@ impl AgentOperationKind {
             Self::WakeAdmission => "wake-admission",
             Self::EpochAdmission => "epoch-admission",
             Self::EpochResult => "epoch-result",
+            Self::GoalEvaluation => "goal-evaluation",
             Self::ClaimAppend => "claim-append",
             Self::Delegation => "delegation",
             Self::Handoff => "handoff",

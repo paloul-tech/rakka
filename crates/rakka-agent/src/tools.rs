@@ -782,6 +782,11 @@ pub struct AgentGrantedDispatch {
     /// Report-only guardrail findings. The dispatch pipeline surfaces these
     /// through its tracing span, which is what makes "recorded" true.
     pub reports: Vec<AgentGuardrailReport>,
+    /// The validated checkpoint grant the attempt dispatches under, when one
+    /// binds the intent. In-memory only — never persisted — it is how the
+    /// human-review evaluation arm reads the resolver whose durable decision
+    /// is the evidence.
+    pub checkpoint: Option<Box<crate::checkpoints::AgentCheckpointGrant>>,
 }
 
 /// A dispatch the authority refused, with a stable reason code.
@@ -991,6 +996,9 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::MemoryPromotion { .. } => {
                 self.authorize_memory_promotion(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::Evaluation { evaluation } => self.authorize_goal_evaluation(
+                context, scope, task, goal, intent, evaluation, attempt, now,
+            ),
         }
     }
 
@@ -1339,6 +1347,7 @@ impl AgentToolAuthority {
             sampling: None,
             transforms,
             reports,
+            checkpoint: None,
         })
     }
 
@@ -1371,7 +1380,8 @@ impl AgentToolAuthority {
                 AgentRunEffectRequest::Model { profile, .. } => profile.clone(),
                 AgentRunEffectRequest::Tool { .. }
                 | AgentRunEffectRequest::Compensation { .. }
-                | AgentRunEffectRequest::MemoryPromotion { .. } => None,
+                | AgentRunEffectRequest::MemoryPromotion { .. }
+                | AgentRunEffectRequest::Evaluation { .. } => None,
             });
 
         if let Some(profile) = &profile {
@@ -1459,6 +1469,7 @@ impl AgentToolAuthority {
             sampling: Some(settings.sampling),
             transforms: Vec::new(),
             reports,
+            checkpoint: None,
         })
     }
 
@@ -1499,6 +1510,7 @@ impl AgentToolAuthority {
             sampling: None,
             transforms: Vec::new(),
             reports: Vec::new(),
+            checkpoint: None,
         })
     }
 
@@ -1541,6 +1553,110 @@ impl AgentToolAuthority {
             sampling: None,
             transforms: Vec::new(),
             reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one goal-evaluation attempt
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the evaluation is its
+    /// authorization, as with a compensation or promotion. What is distinct
+    /// here is the model profile: an evaluator model runs under the profile
+    /// the *request* pins — the "distinct policy" of specification 8.3 —
+    /// validated against the definition and setup envelopes, and the agent's
+    /// current settings profile never enters the resolution, so a worker's
+    /// turn-bound profile cannot silently stand in for the evaluator's. A
+    /// human review dispatches only under the effect-bound approval grant,
+    /// which the granted dispatch carries so the executor arm can record the
+    /// resolver.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_goal_evaluation(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        let profile = match &evaluation.method {
+            crate::evaluation::AgentGoalEvaluationMethod::EvaluatorModel { profile } => {
+                profile.clone()
+            }
+            _ => None,
+        };
+        if let Some(profile) = &profile {
+            if !context
+                .definition
+                .envelope()
+                .model_profiles
+                .contains(profile)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::ModelProfile.as_label(),
+                    format!(
+                        "the evaluator model profile {profile} is not approved by the definition"
+                    ),
+                ));
+            }
+            if let Some(setup) = context.setup {
+                if !setup.envelope().model_profiles.contains(profile) {
+                    return Err(AgentAuthorityRefusal::of(
+                        AgentEnvelopeDimension::ModelProfile.as_label(),
+                        format!(
+                            "the run's setup does not select the evaluator model profile {profile}"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+
+        // The effect-bound checkpoint gate: a human review — or an evaluation
+        // the deployment gates — dispatches only under a digest-bound grant
+        // that binds this exact intent
+        // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+        let (checkpoint_satisfied, checkpoint_grant_refusal) =
+            self.evaluate_checkpoint_grant(context, scope, intent, attempt, now);
+        if intent.checkpoint_required && !checkpoint_satisfied {
+            return Err(checkpoint_grant_refusal.unwrap_or_else(|| {
+                AgentAuthorityRefusal::of(
+                    "checkpoint-required",
+                    "the goal evaluation requires an effect-bound checkpoint grant, and none \
+                     exists",
+                )
+            }));
+        }
+        let checkpoint = if checkpoint_satisfied {
+            context.checkpoint_grant.cloned().map(Box::new)
+        } else {
+            None
+        };
+
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: profile,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint,
         })
     }
 
