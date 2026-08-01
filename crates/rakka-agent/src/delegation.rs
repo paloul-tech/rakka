@@ -89,6 +89,15 @@ pub const AGENT_DELEGATION_RECORD_MAX_BYTES: usize = 8 * 1024;
 /// long before any policy ceiling could see it.
 pub const AGENT_DELEGATION_MAX_LINEAGE: usize = 16;
 
+/// Maximum serialized bytes of one [`AgentTaskDelegationProvenance`].
+///
+/// The provenance arrives over the network and rides the child task's
+/// bounded durable record, so the receiving surface holds it to the same
+/// discipline the parent's own record obeys: a peer cannot inflate a child's
+/// durable state with scope or binding collections the parent-side byte
+/// bound would never have admitted.
+pub const AGENT_DELEGATION_PROVENANCE_MAX_BYTES: usize = 8 * 1024;
+
 /// Maximum bytes of one resolved logical endpoint reference.
 pub const AGENT_DELEGATION_ENDPOINT_MAX_BYTES: usize = 256;
 
@@ -630,12 +639,28 @@ pub struct AgentTaskDelegationProvenance {
 }
 
 impl AgentTaskDelegationProvenance {
-    /// Rejects a provenance whose lineage exceeds its structural bound.
+    /// Rejects a provenance whose lineage or serialized size exceeds its
+    /// structural bounds.
+    ///
+    /// The size bound is the receiving side of the parent's own record
+    /// bound: every field here arrived from a peer, so the whole provenance
+    /// refuses rather than truncating, exactly as the record does.
     pub fn validate(&self) -> AgentDelegationResult<()> {
         if self.lineage.len() > AGENT_DELEGATION_MAX_LINEAGE {
             return Err(AgentDelegationError::LineageTooDeep {
                 length: self.lineage.len(),
                 maximum: AGENT_DELEGATION_MAX_LINEAGE,
+            });
+        }
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| AgentDelegationError::Encoding {
+                message: error.to_string(),
+            })?
+            .len();
+        if bytes > AGENT_DELEGATION_PROVENANCE_MAX_BYTES {
+            return Err(AgentDelegationError::ProvenanceTooLarge {
+                bytes,
+                maximum: AGENT_DELEGATION_PROVENANCE_MAX_BYTES,
             });
         }
         Ok(())
@@ -796,6 +821,13 @@ pub enum AgentDelegationError {
         /// The bound.
         maximum: usize,
     },
+    /// The provenance exceeds its serialized-size bound.
+    ProvenanceTooLarge {
+        /// Actual serialized bytes.
+        bytes: usize,
+        /// The bound.
+        maximum: usize,
+    },
     /// The resolved target is structurally invalid.
     TargetInvalid {
         /// The validation failure detail.
@@ -821,6 +853,7 @@ impl AgentDelegationError {
             Self::LimitExceeded { .. } => "delegation-limit-exceeded",
             Self::LineageTooDeep { .. } => "delegation-lineage-too-deep",
             Self::RecordTooLarge { .. } => "delegation-record-too-large",
+            Self::ProvenanceTooLarge { .. } => "delegation-provenance-too-large",
             Self::TargetInvalid { .. } => "delegation-target-invalid",
             Self::Encoding { .. } => "delegation-record-unencodable",
             Self::Identity(_) => "delegation-identity-invalid",
@@ -856,6 +889,11 @@ impl Display for AgentDelegationError {
                 f,
                 "the delegation record is {bytes} serialized bytes, which exceeds the {maximum} \
                  byte bound"
+            ),
+            Self::ProvenanceTooLarge { bytes, maximum } => write!(
+                f,
+                "the delegation provenance is {bytes} serialized bytes, which exceeds the \
+                 {maximum} byte bound"
             ),
             Self::TargetInvalid { message } => {
                 write!(f, "the resolved delegation target is invalid: {message}")
@@ -915,6 +953,35 @@ mod tests {
         });
         let error = AgentDelegationToolCall::parse(&arguments).expect_err("unknown field");
         assert_eq!(error.code(), "delegation-invalid-arguments");
+    }
+
+    #[test]
+    fn an_oversized_provenance_fails_closed() {
+        // Every collection below is individually valid; only their combined
+        // serialized weight crosses the bound — the abuse shape a hostile
+        // peer would send, refused whole rather than truncated.
+        let provenance = AgentTaskDelegationProvenance {
+            delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
+            parent_task: AgentTaskId::new("ticket-1").expect("task id"),
+            parent_run: scope(),
+            lineage: Vec::new(),
+            depth: 1,
+            requested_skill: AgentCapabilityId::new("translation").expect("capability"),
+            capability_scopes: (0..256)
+                .map(|index| {
+                    AgentCapabilityId::new(format!("scope-{index:03}-{}", "x".repeat(32)))
+                        .expect("capability")
+                })
+                .collect(),
+            credential_bindings: Vec::new(),
+            result_schema: None,
+            budget: None,
+            deadline: None,
+        };
+        let error = provenance
+            .validate()
+            .expect_err("the provenance is oversized");
+        assert_eq!(error.code(), "delegation-provenance-too-large");
     }
 
     #[test]

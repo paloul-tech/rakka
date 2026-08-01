@@ -2727,6 +2727,30 @@ Done when: scenarios 28 and 39 pass.
   A2A half, the fail-closed matrix, plain-client compatibility, credential
   hygiene); the whole M3, 4.1, and 4.2 suites pass unchanged.
 
+**Amended after review (2026-08-01):** three review findings closed before
+4.4 builds on this state.
+
+- **Every fence settles the cell.** The in-place fence
+  (`fence_unsent_effects`, reached by cancellation and the failed-effect
+  wind-down) and the winding-down `ConfirmedNotExecuted` reconciliation now
+  settle a fenced send's cell `Failed { run-winding-down }` exactly as the
+  dispatch-layer fence always did — no `Pending` cell can survive under a
+  cancelled effect for 4.4's fan-in to misread as an in-flight child.
+- **Ingress provenance is byte-bounded.**
+  `AgentTaskDelegationProvenance::validate()` enforces
+  `AGENT_DELEGATION_PROVENANCE_MAX_BYTES` (8 KiB, the receiving side of the
+  parent's record bound) besides the lineage cap, so a peer's scope and
+  binding collections cannot inflate the child's durable record; the
+  creation refuses whole under `task-delegation-provenance-invalid`.
+- **`task-already-created` is disambiguated, not presumed a conflict.** The
+  child's deduplication window is bounded
+  (`AGENT_TASK_OPERATION_LOG_CAPACITY`), so an aged-out replay of a
+  delegation's own send earns the same refusal a genuine conflict does. The
+  executor now fetches the held task and compares its collaboration echo
+  first: an echoing child converges as a replay, and only a foreign child is
+  `delegation-child-conflict` — this supersedes the unconditional mapping
+  described in the 2026-07-31 note above.
+
 ### Slice 4.4 — Fan-out/fan-in, lineage, and coordinator limits
 
 Spec: [8.4](spec.md#84-specialization-and-durable-delegation),

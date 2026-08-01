@@ -718,12 +718,32 @@ impl AgentLoopState {
     /// `Pending` proves no dispatch ticket exists and no invocation can be
     /// abandoned by the fence
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
-    pub(crate) fn fence_unsent_effects(&mut self) -> usize {
+    ///
+    /// A fenced delegation send settles its cell as failed in the same pass:
+    /// the send provably never left the run, so the winding-down parent never
+    /// spawned the child, and recovery after the wind-down uses a new
+    /// delegation, never this one. Fencing anywhere else would leave a
+    /// `Pending` cell under a cancelled effect — exactly the disagreement the
+    /// cell's commit discipline forbids.
+    pub(crate) fn fence_unsent_effects(&mut self, now: AgentTimestampMillis) -> usize {
         let mut fenced = 0;
+        let mut fenced_sends = Vec::new();
         for effect in &mut self.effects {
             if effect.is_pending() {
                 effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
+                if effect.kind() == crate::effect::AgentRunEffectKind::A2aSendCall {
+                    fenced_sends.push(effect.effect_id.clone());
+                }
                 fenced += 1;
+            }
+        }
+        for effect_id in fenced_sends {
+            if let Some(cell) = self
+                .delegations
+                .values_mut()
+                .find(|cell| cell.record.effect == effect_id)
+            {
+                cell.settle_failed("run-winding-down", now);
             }
         }
         fenced

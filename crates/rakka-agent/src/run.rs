@@ -2467,7 +2467,7 @@ fn apply_effect_outcome(
                 && failed_kind != AgentRunEffectKind::GoalEvaluationCall
             {
                 let run = state.run_mut()?;
-                run.loop_state.fence_unsent_effects();
+                run.loop_state.fence_unsent_effects(now);
                 if run.terminal_reason.is_none() {
                     run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
                         effect_id: effect_id.clone(),
@@ -2699,8 +2699,24 @@ fn apply_indeterminate_resolution(
         AgentEffectResolution::ConfirmedNotExecuted => {
             if winding_down {
                 // Proven never executed, and the run wants nothing further:
-                // the fence holds and the generation settles as cancelled.
+                // the fence holds and the generation settles as cancelled. A
+                // reconciled delegation send settles its cell in the same
+                // compare-and-set — proven never executed means the child was
+                // never created, and recovery after the wind-down uses a new
+                // delegation, never this one.
                 effect.status = AgentRunEffectStatus::Cancelled;
+                let cancelled_kind = effect.kind();
+                if cancelled_kind == AgentRunEffectKind::A2aSendCall {
+                    let run = state.run_mut()?;
+                    let held = run.loop_state.delegations().iter().find_map(|(id, cell)| {
+                        (cell.record.effect == *effect_id).then(|| id.clone())
+                    });
+                    if let Some(delegation_id) = held {
+                        if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                            cell.settle_failed("run-winding-down", now);
+                        }
+                    }
+                }
                 state.updated_at = now;
             } else {
                 // A new invocation is authorized, and it is a new generation:
@@ -2779,7 +2795,7 @@ fn cancel(
         return Err(AgentRunError::Terminal { status: run.status });
     }
 
-    run.loop_state.fence_unsent_effects();
+    run.loop_state.fence_unsent_effects(now);
     run.loop_state.cancel_open_checkpoints(now);
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
@@ -3089,7 +3105,7 @@ fn schedule_compensation(
     // Wind down first, then commit the compensation: the fence cancels only
     // what was pending before it, and the effect recorded after it is exactly
     // the one piece of new work the decision authorizes.
-    run.loop_state.fence_unsent_effects();
+    run.loop_state.fence_unsent_effects(now);
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::EffectCompensated {
             effect_id: effect_id.clone(),

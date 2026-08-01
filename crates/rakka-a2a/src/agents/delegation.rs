@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use a2a::{Message, Part, PartContent, Role, SendMessageRequest};
+use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task};
 use a2a_server::ServiceParams;
 use rakka_agent::{
     AgentA2aSendExecutor, AgentA2aSendFinding, AgentDelegationRecord, AgentDispatchError,
@@ -139,22 +139,32 @@ where
     }
 }
 
+/// Whether the task's collaboration echo names this delegation.
+///
+/// The echo is recorded at the child's durable creation, so it answers the
+/// ownership question even after the create operation aged out of the
+/// child's bounded deduplication window.
+fn echoes_delegation(task: &Task, delegation: &AgentDelegationRecord) -> bool {
+    task.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(META_COLLABORATION))
+        .and_then(|echo| echo.get("delegation"))
+        .and_then(Value::as_str)
+        == Some(delegation.delegation.as_str())
+}
+
 /// Maps one service outcome onto the executor's finding vocabulary.
 ///
-/// Definitive answers — a conflict, a version refusal, an authorization or
-/// normalization failure — become findings; store and read failures become
-/// retryable attempt errors under the effect's idempotent attempt bound,
-/// which the derived deduplication key makes safe.
+/// Definitive answers — a version refusal, an authorization or normalization
+/// failure — become findings; store and read failures become retryable
+/// attempt errors under the effect's idempotent attempt bound, which the
+/// derived deduplication key makes safe. `task-already-created` never reaches
+/// this map from the send path: the executor disambiguates it against the
+/// held task's collaboration echo first, because the child's deduplication
+/// window is bounded and an aged-out replay of this delegation's own send
+/// earns the same refusal a genuine conflict does.
 fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, AgentDispatchError> {
     match error {
-        RakkaAgentA2AError::Task(AgentTaskError::AlreadyCreated { .. }) => {
-            Ok(AgentA2aSendFinding::Conflict {
-                code: "delegation-child-conflict".to_string(),
-                message: "the peer holds an already-created task this delegation's identity does \
-                          not own"
-                    .to_string(),
-            })
-        }
         RakkaAgentA2AError::Unsupported {
             operation: "agent-collaboration",
             reason,
@@ -216,6 +226,42 @@ where
                 .await
             {
                 Ok(task) => task,
+                Err(RakkaAgentA2AError::Task(AgentTaskError::AlreadyCreated { scope })) => {
+                    // The child's deduplication window is bounded, so this
+                    // refusal has two honest readings: a genuine conflict, or
+                    // a replay of this delegation's own send whose create
+                    // operation aged out of the child's operation log. The
+                    // held task's collaboration echo — recorded at its
+                    // durable creation — decides which: an echoing child is
+                    // this delegation's, converged exactly as an in-window
+                    // replay would have been, and only a child this identity
+                    // does not own is reported as the conflict of
+                    // specification 6.6.
+                    let held = match self
+                        .service
+                        .get_task(
+                            &ServiceParams::new(),
+                            Some(scope.tenant().as_str()),
+                            scope.task().as_str(),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(held) => held,
+                        Err(error) => return finding_for_error(error),
+                    };
+                    if !echoes_delegation(&held, delegation) {
+                        return Ok(AgentA2aSendFinding::Conflict {
+                            code: "delegation-child-conflict".to_string(),
+                            message: format!(
+                                "the peer holds already-created task {}, which this delegation's \
+                                 identity does not own",
+                                held.id
+                            ),
+                        });
+                    }
+                    held
+                }
                 Err(error) => return finding_for_error(error),
             };
             // The identity check behind the deduplication key: the answering
@@ -223,13 +269,7 @@ where
             // the echo, or under another delegation, is a child this
             // delegation does not own — the explicit conflict, never an
             // adoption.
-            let echoed = task
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get(META_COLLABORATION))
-                .and_then(|echo| echo.get("delegation"))
-                .and_then(Value::as_str);
-            if echoed != Some(delegation.delegation.as_str()) {
+            if !echoes_delegation(&task, delegation) {
                 return Ok(AgentA2aSendFinding::Conflict {
                     code: "delegation-child-mismatch".to_string(),
                     message: format!(

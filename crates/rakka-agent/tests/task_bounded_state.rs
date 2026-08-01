@@ -1336,3 +1336,81 @@ async fn the_widest_delegation_provenance_fits_the_task_record() {
         "delegation-lineage-too-deep"
     );
 }
+
+/// A provenance that is lineage-valid but oversized — peer-supplied scope
+/// collections past the serialized byte bound — refuses the whole creation:
+/// the receiving surface holds network-supplied provenance to the same byte
+/// discipline the parent-side record obeys, so a hostile peer cannot inflate
+/// a child task's durable state.
+#[tokio::test]
+async fn an_oversized_delegation_provenance_refuses_the_creation() {
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let parent_run = rakka_agent::AgentRunScope::new(
+        tenant(),
+        agent_id(),
+        rakka_agent::AgentRunId::new("parent-run-gen-1").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
+            .expect("the delegation id derives"),
+        parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
+        parent_run,
+        lineage: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("translation")
+            .expect("capability id should be valid"),
+        capability_scopes: (0..256)
+            .map(|index| {
+                rakka_agent::AgentCapabilityId::new(format!("scope-{index:03}-{}", "x".repeat(32)))
+                    .expect("capability id should be valid")
+            })
+            .collect(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    };
+    assert_eq!(
+        provenance
+            .validate()
+            .expect_err("the provenance is oversized")
+            .code(),
+        "delegation-provenance-too-large"
+    );
+
+    let creation = AgentTaskCreation {
+        definition: task_definition(),
+        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        assignee: Some(agent_id()),
+        goal: None,
+        goal_mode: Default::default(),
+        goal_spec: None,
+        parent: Some(AgentTaskId::new("goal-root").expect("task id should be valid")),
+        dependencies: Vec::new(),
+        escrow: None,
+        wake: None,
+        delegation: Some(Box::new(provenance)),
+        telemetry: Default::default(),
+    };
+    let mut entity = fx.entity().await;
+    let error = entity
+        .apply(
+            AgentTaskEntityCommand::Create {
+                operation_id: AgentOperationId::new(
+                    AgentOperationKind::TaskCreation,
+                    [TENANT, TASK, "1"],
+                )
+                .expect("operation id should be derivable"),
+                creation: Box::new(creation),
+            },
+            &fx.task_router,
+            fx.now(),
+        )
+        .await
+        .expect_err("the oversized provenance refuses the creation");
+    assert_eq!(error.code(), "task-delegation-provenance-invalid");
+}

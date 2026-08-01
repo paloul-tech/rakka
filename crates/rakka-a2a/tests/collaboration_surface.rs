@@ -30,21 +30,22 @@ use rakka_agent::testkit::{
     InProcessRunEntityTransport, InProcessTaskEntityTransport, ScriptedDispatcher,
 };
 use rakka_agent::{
-    delegation_id_for, run_id_for_assignment, AgentAssignmentGeneration, AgentAuthorityEnvelope,
-    AgentCapabilityId, AgentCoordinationCapabilityKind, AgentDefinition, AgentDefinitionId,
-    AgentDelegationStatus, AgentDelegationTarget, AgentEntityClass, AgentEntityCommand,
-    AgentEntityState, AgentEntityStore, AgentExchangeRouter, AgentId, AgentModelTurn,
-    AgentOperationId, AgentOperationKind, AgentRevisionNumber, AgentRevisionProvenance,
-    AgentRunDelegationConfig, AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaId,
-    AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskDefinition,
-    AgentTaskDefinitionId, AgentTaskEntityStore, AgentTaskId, AgentTaskLimits,
-    AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskState,
-    AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, StaticAgentDelegationCatalog,
-    TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    delegation_id_for, effect_id_for, run_id_for_assignment, AgentA2aSendExecutor,
+    AgentA2aSendFinding, AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentCapabilityId,
+    AgentCoordinationCapabilityKind, AgentDefinition, AgentDefinitionId, AgentDelegationRecord,
+    AgentDelegationStatus, AgentDelegationTarget, AgentEffectSpec, AgentEntityClass,
+    AgentEntityCommand, AgentEntityState, AgentEntityStore, AgentExchangeRouter, AgentId,
+    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRevisionNumber,
+    AgentRevisionProvenance, AgentRunDelegationConfig, AgentRunEffect, AgentRunEffectRequest,
+    AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaId, AgentSchemaRef, AgentScope,
+    AgentSettings, AgentTaskContent, AgentTaskDefinition, AgentTaskDefinitionId,
+    AgentTaskEntityStore, AgentTaskId, AgentTaskLimits, AgentTaskResultCheck, AgentTaskResultRule,
+    AgentTaskRuleId, AgentTaskScope, AgentTaskState, AgentTaskStatus, AgentToolCallId,
+    AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore,
+    StaticAgentDelegationCatalog, TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
-use rakka_persistence::InMemoryDurableStateStore;
+use rakka_agent_workflow::{AgentTelemetryContext, AgentTimestampMillis};
+use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
 
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
@@ -650,6 +651,151 @@ async fn replayed_delegation_sends_converge_on_one_child_or_an_explicit_conflict
         .await
         .expect("the sibling delegation creates its own child");
     assert_ne!(second.id, first.id);
+}
+
+/// Scenario 28's aged-out edge: the child's deduplication window is bounded
+/// ([`rakka_agent::AGENT_TASK_OPERATION_LOG_CAPACITY`] operations), so a
+/// parent that recovers slowly can replay its send after the create
+/// operation left the window and be answered `task-already-created` — about
+/// its own child. The executor disambiguates against the child's
+/// collaboration echo before declaring anything: the aged-out replay
+/// converges on the original child exactly as an in-window replay would,
+/// and only a child the delegation's identity does not own is the explicit
+/// conflict of specification 6.6.
+#[tokio::test]
+async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    let parent_run = fixture.run_scope(&coordinator(), PARENT_TASK);
+    let original_key = delegation_id_for(&parent_run, 9, 0)
+        .expect("the delegation id derives")
+        .into_string();
+    // The record exactly as the parent's interception persists it, keyed by
+    // the derived `(turn, slot)` coordinate; the foreign record below shares
+    // the deduplication key but not the delegation identity.
+    let record_for = |slot: usize| {
+        let delegation =
+            delegation_id_for(&parent_run, 9, slot).expect("the delegation id derives");
+        AgentDelegationRecord {
+            a2a_message_id: delegation.as_str().to_string(),
+            deduplication_key: original_key.clone(),
+            delegation,
+            goal: None,
+            parent_task: AgentTaskId::new(PARENT_TASK).expect("task id should be valid"),
+            parent_run: parent_run.clone(),
+            lineage: Vec::new(),
+            depth: 1,
+            requested_skill: AgentCapabilityId::new(SKILL).expect("capability id should be valid"),
+            resolved: AgentDelegationTarget::new(
+                specialist(),
+                AgentTaskDefinitionId::new(SPECIALIST_DEFINITION)
+                    .expect("definition id should be valid"),
+            ),
+            turn: 9,
+            slot,
+            effect: effect_id_for(&parent_run, 9, slot).expect("the effect id derives"),
+            call_id: AgentToolCallId::new("call-1").expect("call id should be valid"),
+            input: AgentTaskContent::inline(json!({ "text": "hello" }))
+                .expect("the input is inline-bounded"),
+            result_schema: None,
+            budget: None,
+            deadline: None,
+            definition_revision: AgentRevisionNumber::new(1),
+            settings_revision: AgentRevisionNumber::new(1),
+            telemetry: AgentTelemetryContext::default(),
+            created_at: AgentTimestampMillis::new(1),
+        }
+    };
+    let spec = AgentEffectSpec::idempotent(3).expect("the spec is valid");
+    let intent_for = |record: &AgentDelegationRecord| {
+        AgentRunEffect::new(
+            &parent_run,
+            record.turn,
+            record.slot,
+            AgentRunEffectRequest::A2aSend {
+                delegation: Box::new(record.clone()),
+            },
+            &spec,
+            AgentRevisionNumber::new(1),
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the intent builds")
+    };
+    let executor = A2AAgentDelegationSendExecutor::new(fixture.service.clone());
+
+    let record = record_for(0);
+    let first = executor
+        .execute(&parent_run, &intent_for(&record), &record, None)
+        .await
+        .expect("the first send executes");
+    let AgentA2aSendFinding::Sent { child_task, .. } = first else {
+        panic!("the first send creates the child, got {first:?}");
+    };
+
+    // Age the create operation out of the child's deduplication window: the
+    // durable shape after `AGENT_TASK_OPERATION_LOG_CAPACITY` later
+    // operations is exactly this state — the task record intact, the log
+    // without the create — produced here directly so the test does not have
+    // to manufacture sixty-four unrelated transitions.
+    let child_scope =
+        AgentTaskScope::new(tenant(), child_task.clone()).expect("the child scope is valid");
+    let persistence_id = child_scope.persistence_id();
+    let held = fixture
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the child state loads")
+        .expect("the child exists");
+    let mut encoded = serde_json::to_value(&held.state).expect("the state encodes");
+    let log = encoded
+        .get_mut("applied_operations")
+        .expect("the operation log field exists");
+    assert!(
+        !log.as_array().expect("an array").is_empty(),
+        "the create operation is in the window before eviction"
+    );
+    *log = json!([]);
+    let evicted: AgentTaskState = serde_json::from_value(encoded).expect("the state decodes");
+    fixture
+        .tasks
+        .compare_and_set(&persistence_id, held.revision, evicted)
+        .await
+        .expect("the evicted state stores");
+
+    // The aged-out replay is told `task-already-created`; the echo proves the
+    // child is this delegation's own, and the replay converges instead of
+    // winding the parent down over a false conflict.
+    let replay = executor
+        .execute(&parent_run, &intent_for(&record), &record, None)
+        .await
+        .expect("the aged-out replay executes");
+    match replay {
+        AgentA2aSendFinding::Sent {
+            child_task: replayed,
+            ..
+        } => assert_eq!(replayed, child_task),
+        other => panic!("the aged-out replay converges on its own child, got {other:?}"),
+    }
+
+    // A different delegation under the same key meets the same refusal — and
+    // the echo, naming the original delegation, makes it the genuine
+    // conflict.
+    let foreign = record_for(1);
+    let answer = executor
+        .execute(&parent_run, &intent_for(&foreign), &foreign, None)
+        .await
+        .expect("the foreign send executes");
+    match answer {
+        AgentA2aSendFinding::Conflict { code, .. } => {
+            assert_eq!(code, "delegation-child-conflict");
+        }
+        other => {
+            panic!("a child this delegation does not own is an explicit conflict, got {other:?}")
+        }
+    }
 }
 
 /// The fail-closed version matrix of specification 14.4: every half-formed
