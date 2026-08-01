@@ -2638,6 +2638,16 @@ without one remain open.
 15. **Who selects a specialist agent?** Recommended: the model/planner requests
     a skill, while an application-owned authorized catalog resolves the
     concrete `AgentId`, endpoint, compatible contract, and scopes.
+    *Disposition (M4): accepted — model output can only name an
+    `AgentCapabilityId` skill through the one declared coordination tool the
+    loop intercepts (unknown fields fail the parse, so an agent id or
+    endpoint in model output is refused rather than ignored); the
+    application-wired `AgentDelegationCatalog` resolves the concrete agent,
+    logical endpoint, task definition, scopes, and compatibility inside the
+    same compare-and-set that persists the delegation record, replays reuse
+    the recorded resolution verbatim, and the resolved selection travels as
+    `io.rakka.agent.id`/`io.rakka.agent.task-definition` on the send
+    (slice 4.3).*
 16. **How does a compiled workflow appear as a tool?** Recommended: a versioned
     descriptor creates or adopts an independently durable child workflow run;
     never treat the whole workflow as one opaque retryable external effect.

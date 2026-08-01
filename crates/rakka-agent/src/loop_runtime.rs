@@ -70,6 +70,7 @@
 //!   validation outcome, and the run's state is the source of truth only for
 //!   what the run does about it.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::{
@@ -81,10 +82,13 @@ use serde::{Deserialize, Serialize};
 use crate::budget::{AgentBudgetExhaustion, AgentRunBudget};
 use crate::checkpoints::{AgentCheckpoint, AgentCheckpointGrant};
 use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId};
+use crate::delegation::{AgentDelegationCell, AgentRunDelegationEnvelope};
 use crate::effect::{
     AgentEffectError, AgentRunEffect, AgentToolResult, AGENT_RUN_MAX_PENDING_EFFECTS,
 };
-use crate::identity::{AgentGoalId, AgentOperationId, AgentRunScope, AgentTaskId};
+use crate::identity::{
+    AgentDelegationId, AgentGoalId, AgentOperationId, AgentRunScope, AgentTaskId,
+};
 use crate::memory::{
     AgentContextSnapshotRef, AgentPromotedMemoryRef, MemoryClassification, MemoryEntryId,
     MemoryEntryRole, MemoryError, MemoryOperationId, MemorySequence, SessionMemoryEntry,
@@ -384,6 +388,21 @@ pub struct AgentLoopState {
     /// field decodes without one.
     #[serde(default)]
     goal_evaluation: Option<Box<AgentGoalEvaluationCell>>,
+    /// The delegations this run has committed, keyed by their derived
+    /// identity ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+    /// Each cell holds the record persisted before its send and where the
+    /// delegation stands; the map is bounded by
+    /// [`crate::delegation::AGENT_RUN_MAX_DELEGATIONS`] at the interception
+    /// door. A loop state persisted before this field decodes to the empty
+    /// map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    delegations: BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
+    /// The delegation authority the assignment carried: goal-scope skill and
+    /// tool narrowing, advisory ceilings, and the lineage/depth of the task
+    /// this run serves. A loop state persisted before this field decodes
+    /// without one, which means no goal narrowing.
+    #[serde(default)]
+    delegation_envelope: Option<Box<AgentRunDelegationEnvelope>>,
 }
 
 /// One completed goal evaluation and where its report to the coordinating
@@ -458,6 +477,8 @@ impl AgentLoopState {
             decision_drops: 0,
             memory_promotions: Vec::new(),
             goal_evaluation: None,
+            delegations: BTreeMap::new(),
+            delegation_envelope: None,
         }
     }
 
@@ -1085,6 +1106,54 @@ impl AgentLoopState {
             cell.reported = true;
             cell.refusal = refusal;
         }
+    }
+
+    /// The delegations this run has committed, keyed by their identity.
+    #[must_use]
+    pub const fn delegations(&self) -> &BTreeMap<AgentDelegationId, Box<AgentDelegationCell>> {
+        &self.delegations
+    }
+
+    /// One delegation's cell, when the run holds it.
+    #[must_use]
+    pub fn delegation(&self, delegation: &AgentDelegationId) -> Option<&AgentDelegationCell> {
+        self.delegations.get(delegation).map(Box::as_ref)
+    }
+
+    /// Mutable access to one delegation's cell, for the outcome transition
+    /// that settles it.
+    pub(crate) fn delegation_mut(
+        &mut self,
+        delegation: &AgentDelegationId,
+    ) -> Option<&mut AgentDelegationCell> {
+        self.delegations.get_mut(delegation).map(Box::as_mut)
+    }
+
+    /// Commits one delegation cell alongside its send effect.
+    ///
+    /// Idempotent on the delegation identity: a replayed transition finds the
+    /// cell already present and leaves the original in place.
+    pub(crate) fn record_delegation(&mut self, cell: AgentDelegationCell) {
+        self.delegations
+            .entry(cell.record.delegation.clone())
+            .or_insert_with(|| Box::new(cell));
+    }
+
+    /// How many delegation cells this run retains.
+    #[must_use]
+    pub fn delegation_count(&self) -> usize {
+        self.delegations.len()
+    }
+
+    /// The delegation authority the assignment carried, when it carried one.
+    #[must_use]
+    pub fn delegation_envelope(&self) -> Option<&AgentRunDelegationEnvelope> {
+        self.delegation_envelope.as_deref()
+    }
+
+    /// Stores the delegation authority the accepted assignment carried.
+    pub(crate) fn set_delegation_envelope(&mut self, envelope: AgentRunDelegationEnvelope) {
+        self.delegation_envelope = Some(Box::new(envelope));
     }
 
     /// Bounded receipts of the run's settled memory promotions, newest last.

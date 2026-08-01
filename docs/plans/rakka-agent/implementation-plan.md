@@ -2657,6 +2657,76 @@ Guidance: [Durable Delegation Graph](technical-guidance.md#durable-delegation-gr
 
 Done when: scenarios 28 and 39 pass.
 
+**Amended as implemented (2026-07-31):**
+
+- **Initiation is a model-visible coordination tool; child results defer to
+  4.4.** The loop's `evaluate_model_output` intercepts calls to the one
+  declared coordination tool (wired via
+  `AgentRunEntityStore::with_delegation(AgentRunDelegationConfig)`; the
+  config refuses construction without the `Delegation` capability) and
+  commits the `AgentDelegationRecord` plus its
+  `AgentRunEffectKind::A2aSendCall` effect in one compare-and-set — the
+  record lives in the run's bounded cell map
+  (`AGENT_RUN_MAX_DELEGATIONS = 16`), not on the task, which makes scenario
+  39's "parent task identity and ownership unchanged" a construction
+  property. This slice ends when the child task/run is durably created and
+  the send outcome settles the cell (`ChildCreated`/`Conflicted`/`Failed`);
+  no child→parent result return, no fan-in, no parent wait-for-children, and
+  the continuation-send ingress stays refused. No new exchange kind: the
+  send is an effect through the outbox and `rakka-a2a`, and
+  `AgentOperationKind::{Delegation, A2aSend}` remain reserved — convergence
+  rests on the derived deduplication key through the single task-creation
+  ingress, so a delegated and a plain creation cannot diverge.
+- **Every identity is a pure derivation.** `delegation_id_for(scope, turn,
+  slot)` (the wake-id digest construction) doubles as the A2A message id and
+  the deduplication key; the receiving surface derives the child
+  `AgentTaskId` from the key, so `rakka-a2a`'s id derivation stays out of
+  `rakka-agent` and the child ids fill in from the send receipt. The send's
+  policy defaults idempotent, three attempts, no reconciliation protocol —
+  an ambiguous loss retries safely under the same key. Explicit conflict is
+  a settled cell status: the peer's `task-already-created` maps to
+  `delegation-child-conflict`, and a child answering under another
+  delegation (detected by the projection's `io.rakka.collaboration` echo) to
+  `delegation-child-mismatch`; catalog drift cannot mint a second child
+  because resolution happens once, inside the committing compare-and-set,
+  and replays reuse the recorded `AgentDelegationTarget` verbatim.
+- **Refusals let the run survive (user-approved divergence from the
+  dispatch-authority wind-down).** Parse, cap, skill-narrowing, catalog, and
+  bounds refusals become failed tool results under stable codes; the model
+  corrects course inside the existing iteration/budget ceilings, and
+  stagnation detection catches futile retries. `delegation-not-configured`
+  turned out unreachable and was dropped: an unwired run cannot recognize
+  the tool, so its calls take the generic path where the authority's
+  defense-in-depth refusal `coordination-tool-not-intercepted` (real
+  enforced code, not just structure) answers. `allowed_tools` enforcement
+  joined the slice as approved: goal-scope narrowing rides the new
+  `AgentRunAssignment.delegation` envelope (`AgentRunDelegationEnvelope`,
+  copied from the goal spec at the root or from the child's own
+  `AgentTaskDelegationProvenance`, which also gives every run its
+  lineage/depth so 4.4 enforces ceilings without schema change); an empty
+  set means no narrowing — declaredness is not recorded, so empty-set
+  fail-closed was not implementable honestly.
+- **The extension is one metadata object, not a data part.**
+  `urn:rakka:a2a-extension:collaboration:v1` +
+  `io.rakka.collaboration` carrying `AgentCollaborationMetadata` (the
+  management-extension versioning pattern: version in the URI, schema number
+  in the envelope, fail-closed on every half-formed engagement including the
+  reserved key without the declaration); the message's parts stay the
+  child's input. Ingress converts the envelope to the child's recorded
+  provenance and parent/goal bindings; `escrow` stays `None` — the
+  envelope's budget is advisory provenance because a conserved grant cannot
+  ride A2A (4.4 enforces). `A2AAgentDelegationSendExecutor` implements the
+  `AgentA2aSendExecutor` port in-process over the same service core an
+  external caller uses; `AgentDispatchTargetClass::A2aPeer` accepts the
+  executor-routed tool family so a declared `a2a-peer` target classifies
+  truthfully. Open decision 15's disposition is recorded in spec 21.3.
+- Proof roster: `tests/delegation_record.rs`, `tests/delegation_dispatch.rs`,
+  the `tools.rs` authority pin, the `task_bounded_state.rs` provenance
+  bounds, the substrate's `A2aPeer` classification pin, and `rakka-a2a`'s
+  `tests/collaboration_surface.rs` (scenario 39 end to end and scenario 28's
+  A2A half, the fail-closed matrix, plain-client compatibility, credential
+  hygiene); the whole M3, 4.1, and 4.2 suites pass unchanged.
+
 ### Slice 4.4 — Fan-out/fan-in, lineage, and coordinator limits
 
 Spec: [8.4](spec.md#84-specialization-and-durable-delegation),

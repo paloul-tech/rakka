@@ -280,6 +280,7 @@ async fn a_permanent_assignment_refusal_parks_a_continuous_goal_and_suspends_adm
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         }),
     };

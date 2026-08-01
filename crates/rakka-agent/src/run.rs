@@ -64,8 +64,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentEffectId, AgentTimestampMillis, HumanCheckpointId,
-    PrincipalRef, StateSchemaVersion,
+    AgentCausationId, AgentCorrelationId, AgentEffectId, AgentTelemetryContext,
+    AgentTimestampMillis, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
@@ -95,14 +95,14 @@ use crate::choreography::{
 };
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
-    AgentEffectError, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
-    AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect, AgentRunEffectKind,
-    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus,
-    AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectPolicies,
+    AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
+    AgentRunEffectStatus, AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
 };
 use crate::identity::{
-    AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
-    AgentRunScope, AgentTaskId, AgentTaskScope, TenantId,
+    AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
+    AgentRunBinding, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, TenantId,
 };
 use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
 use crate::memory::{
@@ -1158,7 +1158,7 @@ fn accept_assignment(
     // spend the task's whole budget again
     // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
     let budget = AgentRunBudget::allocate(assignment.budget, now);
-    let loop_state = AgentLoopState::started(
+    let mut loop_state = AgentLoopState::started(
         assignment.task.task().clone(),
         assignment.goal.clone(),
         assignment.agent_definition_revision,
@@ -1166,6 +1166,12 @@ fn accept_assignment(
         assignment.definition.version,
         budget,
     );
+    if let Some(envelope) = assignment.delegation {
+        // The delegation authority the task copied from its own durable
+        // state; the run enforces goal-scope narrowing from here, never by
+        // reading the goal spec.
+        loop_state.set_delegation_envelope(*envelope);
+    }
 
     let run = AgentRun {
         binding,
@@ -1533,6 +1539,7 @@ fn advance_once(
     policies: &AgentEffectPolicies,
     session_memory: bool,
     decision_events: bool,
+    delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1554,7 +1561,7 @@ fn advance_once(
         )
         .map(|()| Vec::new()),
         AgentLoopPhase::EvaluatingModelOutput => {
-            evaluate_model_output(state, &scope, policies, decision_events, now)
+            evaluate_model_output(state, &scope, policies, decision_events, delegation, now)
                 .map(|()| Vec::new())
         }
         AgentLoopPhase::RecordingTurn => {
@@ -1674,11 +1681,116 @@ fn prepare_context(
 
 /// Acts on the turn the model produced: persist its tool effects, or move on to
 /// record it.
+/// Plans one delegation the model requested through the declared coordination
+/// tool ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Everything that can refuse, refuses here — parse, cell cap, goal skill
+/// narrowing, catalog resolution, input bounds, record bounds — before the
+/// turn commits anything, and the refusal is `(code, message)` for the failed
+/// tool result the model sees. On success the returned record carries the one
+/// catalog resolution this delegation ever performs: replays reuse it
+/// verbatim and never re-resolve.
+#[allow(clippy::too_many_arguments)]
+fn plan_delegation_call(
+    scope: &AgentRunScope,
+    config: &crate::delegation::AgentRunDelegationConfig,
+    envelope: Option<&crate::delegation::AgentRunDelegationEnvelope>,
+    call: &crate::model::AgentToolCallRequest,
+    held_delegations: usize,
+    turn: u64,
+    slot: usize,
+    goal: Option<AgentGoalId>,
+    task: AgentTaskId,
+    definition_revision: AgentRevisionNumber,
+    settings_revision: AgentRevisionNumber,
+    telemetry: AgentTelemetryContext,
+    now: AgentTimestampMillis,
+) -> Result<Box<crate::delegation::AgentDelegationRecord>, (String, String)> {
+    use crate::delegation::{
+        delegation_id_for, AgentDelegationRecord, AgentDelegationToolCall,
+        AGENT_RUN_MAX_DELEGATIONS,
+    };
+
+    let refuse = |error: &dyn std::fmt::Display, code: &str| (code.to_string(), error.to_string());
+    let parsed = AgentDelegationToolCall::parse(&call.arguments)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    if held_delegations >= AGENT_RUN_MAX_DELEGATIONS {
+        return Err((
+            "delegation-limit-exceeded".to_string(),
+            format!(
+                "the run already retains its maximum of {AGENT_RUN_MAX_DELEGATIONS} delegations"
+            ),
+        ));
+    }
+    if let Some(env) = envelope {
+        if !env.allowed_skills.is_empty() && !env.allowed_skills.contains(&parsed.skill) {
+            return Err((
+                "delegation-skill-not-allowed".to_string(),
+                format!(
+                    "the goal does not allow delegating the skill {}",
+                    parsed.skill
+                ),
+            ));
+        }
+    }
+    let target = config
+        .catalog
+        .resolve(scope.tenant(), &parsed.skill)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    target
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    let input = AgentTaskContent::inline(parsed.input.clone())
+        .map_err(|error| refuse(&error, "delegation-invalid-arguments"))?;
+    let delegation_id = delegation_id_for(scope, turn, slot)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    let effect = effect_id_for(scope, turn, slot)
+        .map_err(|error| refuse(&error, "delegation-identity-invalid"))?;
+    let (lineage, depth, budget, envelope_deadline) = envelope
+        .map(|env| (env.lineage.clone(), env.depth, env.budget, env.deadline))
+        .unwrap_or_default();
+    // The child never outlives the goal: the earlier of the model's deadline
+    // and the envelope's.
+    let deadline = match (parsed.deadline, envelope_deadline) {
+        (Some(requested), Some(goal_deadline)) => Some(requested.min(goal_deadline)),
+        (requested, goal_deadline) => requested.or(goal_deadline),
+    };
+    let record = AgentDelegationRecord {
+        delegation: delegation_id.clone(),
+        goal,
+        parent_task: task,
+        parent_run: scope.clone(),
+        lineage,
+        depth: depth.saturating_add(1),
+        requested_skill: parsed.skill,
+        result_schema: target.result_schema.clone(),
+        resolved: target,
+        a2a_message_id: delegation_id.as_str().to_string(),
+        deduplication_key: delegation_id.as_str().to_string(),
+        turn,
+        slot,
+        effect,
+        call_id: call.call_id.clone(),
+        input,
+        budget,
+        deadline,
+        definition_revision,
+        settings_revision,
+        telemetry,
+        created_at: now,
+    };
+    record
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    Ok(Box::new(record))
+}
+
 fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     decision_events: bool,
+    delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let (turn, calls) = {
@@ -1705,55 +1817,180 @@ fn evaluate_model_output(
 
     let selected: Vec<_> = calls.iter().map(|call| call.tool.clone()).collect();
 
+    // What one planned call becomes: an effect the turn commits, or a refusal
+    // recorded as a failed tool result — the run survives a refusal and the
+    // model corrects course, bounded by the iteration and budget ceilings the
+    // run already enforces.
+    enum PlannedCall {
+        Effect(AgentRunEffectRequest, AgentEffectSpec),
+        Refused {
+            call_id: crate::model::AgentToolCallId,
+            code: String,
+            message: String,
+        },
+    }
+
     // Each tool's spec — safety class, attempt bound, protocol — comes from its
     // registration, defaulting to a single non-idempotent attempt for a tool the
     // deployment has not classified: the model asked for the call, but it cannot
     // choose how failure and ambiguity are handled ([specification 11.2]).
-    let requests: Vec<(AgentRunEffectRequest, AgentEffectSpec)> = calls
-        .into_iter()
-        .map(|call| {
-            let request = AgentRunEffectRequest::Tool {
-                call: Box::new(call),
-            };
-            let spec = policies.spec_for(&request).clone();
-            (request, spec)
-        })
-        .collect();
+    //
+    // Two doors are decided per call before anything commits. A call naming
+    // the declared coordination tool is intercepted into a delegation: parsed
+    // under the closed vocabulary, narrowed by the goal's allowed skills,
+    // resolved through the application-owned catalog, and committed as the
+    // delegation record plus its send effect — in this one compare-and-set,
+    // which is what "persisted before send" means
+    // ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)). A
+    // generic call is narrowed by the goal's allowed tools
+    // ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)); the
+    // delegation tool itself is governed by the skill set, never the tool
+    // set. Slots are planned in call order over the calls that commit
+    // effects, exactly as the commit loop below re-derives them.
+    let (slot_base, held_delegations, envelope, run_goal, run_task, definition_revision, telemetry) = {
+        let run = state.run_mut()?;
+        (
+            run.loop_state.next_effect_slot(),
+            run.loop_state.delegation_count(),
+            run.loop_state.delegation_envelope().cloned(),
+            run.loop_state.goal().cloned(),
+            run.loop_state.task().clone(),
+            run.loop_state.agent_definition_revision(),
+            run.loop_state.telemetry().clone(),
+        )
+    };
+    let settings_revision = state.run_mut()?.loop_state.agent_settings_revision();
+    let mut planned: Vec<PlannedCall> = Vec::with_capacity(calls.len());
+    let mut next_slot = slot_base;
+    let mut planned_delegations = 0_usize;
+    for call in calls {
+        if let Some(config) = delegation {
+            if call.tool == config.tool {
+                match plan_delegation_call(
+                    scope,
+                    config,
+                    envelope.as_ref(),
+                    &call,
+                    held_delegations + planned_delegations,
+                    turn,
+                    next_slot,
+                    run_goal.clone(),
+                    run_task.clone(),
+                    definition_revision,
+                    settings_revision,
+                    telemetry.clone(),
+                    now,
+                ) {
+                    Ok(record) => {
+                        let request = AgentRunEffectRequest::A2aSend { delegation: record };
+                        let spec = policies.spec_for(&request).clone();
+                        next_slot += 1;
+                        planned_delegations += 1;
+                        planned.push(PlannedCall::Effect(request, spec));
+                    }
+                    Err((code, message)) => planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code,
+                        message,
+                    }),
+                }
+                continue;
+            }
+        }
+        if let Some(env) = envelope.as_ref() {
+            if !env.allowed_tools.is_empty() && !env.allowed_tools.contains(&call.tool) {
+                planned.push(PlannedCall::Refused {
+                    call_id: call.call_id.clone(),
+                    code: "goal-tool-not-allowed".to_string(),
+                    message: format!("the goal does not allow the tool {}", call.tool),
+                });
+                continue;
+            }
+        }
+        let request = AgentRunEffectRequest::Tool {
+            call: Box::new(call),
+        };
+        let spec = policies.spec_for(&request).clone();
+        next_slot += 1;
+        planned.push(PlannedCall::Effect(request, spec));
+    }
 
     // The whole fan-out is reserved before any effect is recorded, all-or-nothing:
     // one tool call and one effect per tool, plus the sum of their attempt bounds,
     // checked against the concurrency ceiling. A turn either fits its budget or
     // commits none of it, so the record never holds a partial fan-out; a run that
     // cannot afford it parks with nothing charged and re-attempts this exact
-    // fan-out once its parent tops it up ([specification 9.7]).
+    // fan-out once its parent tops it up ([specification 9.7]). Refused calls
+    // commit no effect and reserve nothing.
     {
-        let count = u64::try_from(requests.len()).unwrap_or(u64::MAX);
-        let total_attempts = requests
+        let effects = planned
             .iter()
-            .map(|(_, spec)| u64::from(spec.max_attempts))
+            .filter(|call| matches!(call, PlannedCall::Effect(..)))
+            .count();
+        let count = u64::try_from(effects).unwrap_or(u64::MAX);
+        let total_attempts = planned
+            .iter()
+            .filter_map(|call| match call {
+                PlannedCall::Effect(_, spec) => Some(u64::from(spec.max_attempts)),
+                PlannedCall::Refused { .. } => None,
+            })
             .fold(0, u64::saturating_add);
-        let run = state.run_mut()?;
-        let outstanding = run.loop_state.outstanding_effects().count();
-        if let Err(exhaustion) =
-            run.loop_state
-                .budget_mut()
-                .reserve_tool_turn(count, total_attempts, outstanding, now)
-        {
-            return park_or_terminate(state, exhaustion, now);
+        if count > 0 {
+            let run = state.run_mut()?;
+            let outstanding = run.loop_state.outstanding_effects().count();
+            if let Err(exhaustion) = run.loop_state.budget_mut().reserve_tool_turn(
+                count,
+                total_attempts,
+                outstanding,
+                now,
+            ) {
+                return park_or_terminate(state, exhaustion, now);
+            }
         }
     }
 
-    for (request, spec) in requests {
-        let (slot, settings_revision) = {
-            let run = state.run_mut()?;
-            (
-                run.loop_state.next_effect_slot(),
-                run.loop_state.agent_settings_revision(),
-            )
-        };
-        let effect =
-            AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
-        state.run_mut()?.loop_state.record_effect(effect)?;
+    for planned_call in planned {
+        match planned_call {
+            PlannedCall::Effect(request, spec) => {
+                let (slot, settings_revision) = {
+                    let run = state.run_mut()?;
+                    (
+                        run.loop_state.next_effect_slot(),
+                        run.loop_state.agent_settings_revision(),
+                    )
+                };
+                if let AgentRunEffectRequest::A2aSend { delegation } = &request {
+                    // The delegation record and its cell commit with the send
+                    // effect in this one compare-and-set — persisted strictly
+                    // before the settle pass can hand anything to the sink.
+                    state.run_mut()?.loop_state.record_delegation(
+                        crate::delegation::AgentDelegationCell::pending(delegation.clone()),
+                    );
+                }
+                let effect =
+                    AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
+                state.run_mut()?.loop_state.record_effect(effect)?;
+            }
+            PlannedCall::Refused {
+                call_id,
+                code,
+                message,
+            } => {
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "error": code,
+                    "message": message,
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                state
+                    .run_mut()?
+                    .loop_state
+                    .record_tool_result(AgentToolResult {
+                        call_id,
+                        content,
+                        recorded_at: now,
+                    });
+            }
+        }
     }
 
     // The model's decision, recorded in the same compare-and-set that commits
@@ -1806,8 +2043,16 @@ fn evaluate_model_output(
     }
 
     let run = state.run_mut()?;
-    run.loop_state.set_phase(AgentLoopPhase::AwaitingTools);
-    run.status = checkpoint_wait_status(&run.loop_state);
+    if run.loop_state.awaits_effect() {
+        run.loop_state.set_phase(AgentLoopPhase::AwaitingTools);
+        run.status = checkpoint_wait_status(&run.loop_state);
+    } else {
+        // Every call this turn was refused before any effect committed; the
+        // refusals are already recorded as failed tool results, so the turn
+        // is complete.
+        run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+        run.status = AgentRunStatus::Running;
+    }
     run.check_bounds(0)?;
     state.updated_at = now;
     Ok(())
@@ -2136,6 +2381,41 @@ fn apply_effect_outcome(
             run.loop_state
                 .record_goal_evaluation((**record).clone(), exchange_operation_id, now);
         }
+        AgentRunEffectOutcome::A2aSend { receipt } => {
+            // The send returned its one logical child. The effect succeeds
+            // and the delegation cell settles in this same compare-and-set,
+            // so the record, the effect, and the status can never disagree.
+            // The model sees a bounded confirmation as the tool result of the
+            // call that requested the delegation, which is how the turn
+            // completes — waiting for the child's *result* is not this
+            // slice's wait, and the run does not hold one.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let run = state.run_mut()?;
+            let Some(cell) = run.loop_state.delegation_mut(&receipt.delegation) else {
+                return Err(AgentRunError::UnknownDelegation {
+                    delegation: receipt.delegation.clone(),
+                });
+            };
+            cell.settle_child_created(receipt.child_task.clone(), receipt.child_run.clone(), now);
+            let call_id = cell.record.call_id.clone();
+            let content = AgentTaskContent::inline(serde_json::json!({
+                "delegation": receipt.delegation.as_str(),
+                "child_task": receipt.child_task.as_str(),
+                "status": receipt.peer_status,
+            }))
+            .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+            run.loop_state.record_tool_result(AgentToolResult {
+                call_id,
+                content,
+                recorded_at: now,
+            });
+            if !winding_down && !run.loop_state.awaits_effect() {
+                // The last effect of the turn came back, so the turn is
+                // complete.
+                run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+                run.status = AgentRunStatus::Running;
+            }
+        }
         AgentRunEffectOutcome::Failed { code, .. }
         | AgentRunEffectOutcome::Exhausted { code, .. } => {
             // Final for the generation: the dispatch layer already applied the
@@ -2158,6 +2438,31 @@ fn apply_effect_outcome(
             // unwired evaluation so the goal stays decidable — the failure
             // stays on the effect record and the caller re-evaluates
             // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+            // A definitively failed send settles its delegation cell in this
+            // same compare-and-set — as an explicit conflict when the peer
+            // reported one, else as a failure. The wind-down below still
+            // applies: a parent whose delegation failed does not keep
+            // dispatching as if the child existed.
+            if failed_kind == AgentRunEffectKind::A2aSendCall {
+                let run = state.run_mut()?;
+                let held =
+                    run.loop_state.delegations().iter().find_map(|(id, cell)| {
+                        (cell.record.effect == *effect_id).then(|| id.clone())
+                    });
+                if let Some(delegation_id) = held {
+                    let conflict = matches!(
+                        code.as_str(),
+                        "delegation-child-conflict" | "delegation-child-mismatch"
+                    );
+                    if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                        if conflict {
+                            cell.settle_conflicted(code.clone(), now);
+                        } else {
+                            cell.settle_failed(code.clone(), now);
+                        }
+                    }
+                }
+            }
             if failed_kind != AgentRunEffectKind::MemoryPromotionCall
                 && failed_kind != AgentRunEffectKind::GoalEvaluationCall
             {
@@ -2184,8 +2489,24 @@ fn apply_effect_outcome(
         }
         AgentRunEffectOutcome::Cancelled { .. } => {
             // The dispatch layer fenced and settled the generation without
-            // invocation. Recording that never resumes the run.
+            // invocation. Recording that never resumes the run. A fenced
+            // delegation send settles its cell as failed: the winding-down
+            // parent never spawned the child, and recovery after the wind-down
+            // uses a new delegation, never this one.
+            let cancelled_kind = effect.kind();
             effect.status = AgentRunEffectStatus::Cancelled;
+            if cancelled_kind == AgentRunEffectKind::A2aSendCall {
+                let run = state.run_mut()?;
+                let held =
+                    run.loop_state.delegations().iter().find_map(|(id, cell)| {
+                        (cell.record.effect == *effect_id).then(|| id.clone())
+                    });
+                if let Some(delegation_id) = held {
+                    if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                        cell.settle_failed("run-winding-down", now);
+                    }
+                }
+            }
         }
     }
 
@@ -3315,6 +3636,7 @@ where
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
     metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
@@ -3360,6 +3682,7 @@ where
             policies: AgentEffectPolicies::default(),
             memory: None,
             decisions: None,
+            delegation: None,
             metrics: Arc::new(NoopMetricsRecorder),
             recovered: false,
         }
@@ -3429,6 +3752,24 @@ where
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.policies = policies;
+        self
+    }
+
+    /// Wires the run to serve delegation
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run intercepts calls to the configured coordination tool and
+    /// converts each into a durable delegation record plus its outbound A2A
+    /// send effect, committed in one compare-and-set. An unwired run cannot
+    /// recognize the tool, so its calls take the generic path — where the
+    /// dispatch authority refuses a registered coordination-kind tool with
+    /// `coordination-tool-not-intercepted`, the defense in depth behind the
+    /// structural guarantee. The configuration itself refuses construction
+    /// without the delegation capability, so a deployment cannot wire the
+    /// tool while forgetting the authority that permits it.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
         self
     }
 
@@ -4007,6 +4348,7 @@ where
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
             let decision_events = self.decisions.is_some();
+            let delegation = self.delegation.clone();
             let phase = self
                 .state()?
                 .loop_state()
@@ -4014,7 +4356,14 @@ where
             let committed = self
                 .host
                 .initiate(now, |state| {
-                    match advance_once(state, &policies, session_memory, decision_events, now) {
+                    match advance_once(
+                        state,
+                        &policies,
+                        session_memory,
+                        decision_events,
+                        delegation.as_ref(),
+                        now,
+                    ) {
                         Ok(owed) => Ok(owed),
                         Err(error) => {
                             let carried = AgentChoreographyError::from(error.clone());
@@ -4956,6 +5305,11 @@ pub enum AgentRunError {
         /// The effect the result named.
         effect_id: AgentEffectId,
     },
+    /// A send receipt named a delegation the run does not hold.
+    UnknownDelegation {
+        /// The delegation the receipt named.
+        delegation: crate::identity::AgentDelegationId,
+    },
     /// A checkpoint decision could not be applied.
     Checkpoint(Box<AgentCheckpointError>),
     /// A decision arrived for a checkpoint the run does not hold, or has already
@@ -5085,6 +5439,7 @@ impl AgentRunError {
             Self::NotAccepted { .. } => "run-not-accepted",
             Self::Terminal { .. } => "run-terminal",
             Self::UnknownEffect { .. } => "run-unknown-effect",
+            Self::UnknownDelegation { .. } => "run-unknown-delegation",
             Self::Checkpoint(error) => error.code(),
             Self::UnknownCheckpoint { .. } => "run-unknown-checkpoint",
             Self::StaleEffectResult { .. } => "run-stale-effect-result",
@@ -5128,6 +5483,10 @@ impl Display for AgentRunError {
             Self::UnknownEffect { effect_id } => write!(
                 f,
                 "a result arrived for effect {effect_id}, which this run does not hold"
+            ),
+            Self::UnknownDelegation { delegation } => write!(
+                f,
+                "a send receipt named delegation {delegation}, which this run does not hold"
             ),
             Self::Checkpoint(error) => Display::fmt(error, f),
             Self::UnknownCheckpoint { checkpoint_id } => write!(

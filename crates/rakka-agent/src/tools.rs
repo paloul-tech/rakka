@@ -999,6 +999,9 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::Evaluation { evaluation } => self.authorize_goal_evaluation(
                 context, scope, task, goal, intent, evaluation, attempt, now,
             ),
+            AgentRunEffectRequest::A2aSend { .. } => {
+                self.authorize_a2a_send(context, scope, task, goal, intent, now)
+            }
         }
     }
 
@@ -1060,6 +1063,23 @@ impl AgentToolAuthority {
                 ),
             ));
         };
+        // A coordination tool is never a generic tool: its calls exist only
+        // as the loop's delegation interception, which converts them into
+        // durable records and outbound A2A effects before dispatch. A generic
+        // `Tool` intent naming one means the run was not wired for the
+        // coordination the registry declares — defense in depth behind the
+        // structural guarantee that model output cannot construct a peer
+        // send ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+        if binding.descriptor().kind == AgentToolKind::AgentCoordination {
+            return Err(AgentAuthorityRefusal::of(
+                "coordination-tool-not-intercepted",
+                format!(
+                    "the coordination tool {} reached generic dispatch; wire the run entity's \
+                     delegation configuration so the loop intercepts it",
+                    call.tool
+                ),
+            ));
+        }
 
         // The definition must declare the tool, and the run's setup — a
         // narrowing — must not have excluded it. Checking both fails closed
@@ -1381,7 +1401,8 @@ impl AgentToolAuthority {
                 AgentRunEffectRequest::Tool { .. }
                 | AgentRunEffectRequest::Compensation { .. }
                 | AgentRunEffectRequest::MemoryPromotion { .. }
-                | AgentRunEffectRequest::Evaluation { .. } => None,
+                | AgentRunEffectRequest::Evaluation { .. }
+                | AgentRunEffectRequest::A2aSend { .. } => None,
             });
 
         if let Some(profile) = &profile {
@@ -1525,6 +1546,50 @@ impl AgentToolAuthority {
     /// credential binding and execution-policy routability the intent
     /// carries, and issues the per-attempt grant.
     fn authorize_memory_promotion(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one outbound A2A send attempt
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the delegation record is
+    /// its authorization, as with a compensation or promotion: the loop's
+    /// interception already parsed the closed vocabulary, applied the goal's
+    /// skill narrowing, and recorded the catalog's resolution, all inside the
+    /// committing compare-and-set. What remains at dispatch time is the
+    /// immediate-safety layer every attempt passes — lifecycle, guardrail
+    /// policy, credential class, execution policy — under the revisions the
+    /// intent pinned.
+    fn authorize_a2a_send(
         &self,
         context: &AgentAuthorityContext<'_>,
         scope: &AgentRunScope,
@@ -2170,6 +2235,54 @@ mod tests {
         let mut settings = AgentSettings::default();
         settings.revoked_tools.insert(tool_id("charge-card"));
         assert!(registry.model_visible(&envelope, &settings).is_empty());
+    }
+
+    #[test]
+    fn a_coordination_tool_never_dispatches_as_a_generic_tool() {
+        // A deployment that registers the delegation tool but does not wire
+        // the run's delegation configuration lets its calls fall through to
+        // the generic path — where this refusal is the defense in depth
+        // behind the structural guarantee that model output cannot construct
+        // a peer send ([specification 14.4]).
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent);
+        let coordination = AgentToolDescriptor::new(
+            tool_id("delegate"),
+            AgentToolKind::AgentCoordination,
+            "Delegates a skill to a specialist.",
+            schema("delegate-input"),
+            schema("delegate-output"),
+        )
+        .expect("the descriptor is valid");
+        let registry = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(coordination, declaration.clone(), 1))
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("delegate"), declaration)]));
+        let settings = settings_for(&definition);
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+        };
+
+        let authority = AgentToolAuthority::new(registry);
+        let intent = tool_intent(
+            "delegate",
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+        );
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("a coordination tool on the generic path is refused");
+        assert_eq!(refusal.code, "coordination-tool-not-intercepted");
     }
 
     #[test]

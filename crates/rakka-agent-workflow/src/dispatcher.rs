@@ -303,7 +303,17 @@ impl AgentDispatchTargetClass {
             Self::Tool => matches!(kind, AgentEffectKind::ToolCall),
             Self::Process => matches!(kind, AgentEffectKind::ProcessCall),
             Self::A2aPeer => {
-                matches!(kind, AgentEffectKind::HttpCall | AgentEffectKind::GrpcCall)
+                // `ToolCall` joined the accepted kinds when the agent domain's
+                // outbound A2A send landed: its run effects ride the
+                // executor-routed tool family with target type `a2a-peer`,
+                // and refusing the refinement would misclassify a genuine
+                // peer send as a plain tool.
+                matches!(
+                    kind,
+                    AgentEffectKind::HttpCall
+                        | AgentEffectKind::GrpcCall
+                        | AgentEffectKind::ToolCall
+                )
             }
             Self::Http => matches!(kind, AgentEffectKind::HttpCall),
             Self::Grpc => matches!(kind, AgentEffectKind::GrpcCall),

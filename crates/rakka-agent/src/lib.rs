@@ -139,14 +139,14 @@ pub use client::{
     RakkaAgentClient,
 };
 pub use dispatch::{
-    workflow_run_id, AgentCompensationExecutor, AgentDispatchAuthority, AgentDispatchDecision,
-    AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe,
-    AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
-    AgentEffectCredentialResolver, AgentEffectReconciler, AgentEntityAuthority,
-    AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding, AgentMemoryPromotionExecutor,
-    AgentMemoryPromotionFinding, AgentReconciliationFinding, AgentRunEffectDispatcher,
-    AgentRunResultDelivery, AgentRunSetupResolver, SessionMemoryPromotionExecutor,
-    WorkflowAgentRunEffectSink,
+    workflow_run_id, AgentA2aSendExecutor, AgentA2aSendFinding, AgentCompensationExecutor,
+    AgentDispatchAuthority, AgentDispatchDecision, AgentDispatchError, AgentDispatchFuture,
+    AgentDispatchPass, AgentDispatchProbe, AgentDispatchResult, AgentDispatchToolExecutor,
+    AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
+    AgentEntityAuthority, AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding,
+    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
+    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
+    SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentEffectError,
@@ -307,6 +307,16 @@ pub use definition::{
     AgentTaskDefinitionId, AgentToolDeclaration, AgentToolId, AgentWorkflowToolId,
     SettingsRevision, SettingsTimingClass, AGENT_DESCRIPTION_MAX_LENGTH,
     AGENT_SETTINGS_MAX_CHANGES,
+};
+pub use delegation::{
+    delegation_id_for, AgentA2aSendReceipt, AgentDelegationCatalog, AgentDelegationCell,
+    AgentDelegationError, AgentDelegationRecord, AgentDelegationResolutionError,
+    AgentDelegationResult, AgentDelegationStatus, AgentDelegationTarget, AgentDelegationToolCall,
+    AgentRunDelegationConfig, AgentRunDelegationEnvelope, AgentTaskDelegationProvenance,
+    StaticAgentDelegationCatalog, AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS,
+    AGENT_A2A_SEND_STATUS_MAX_BYTES, AGENT_DELEGATION_ENDPOINT_MAX_BYTES,
+    AGENT_DELEGATION_ID_PREFIX, AGENT_DELEGATION_MAX_LINEAGE, AGENT_DELEGATION_RECORD_MAX_BYTES,
+    AGENT_RUN_MAX_DELEGATIONS,
 };
 pub use identity::{
     validate_identity_segment, validate_tenant, AgentDelegationId, AgentEnvironmentRef,

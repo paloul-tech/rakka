@@ -76,5 +76,9 @@ required-features = ["testkit", "sharding"]
 name = "agents_surface"
 required-features = ["agents"]
 
+[[test]]
+name = "collaboration_surface"
+required-features = ["agents"]
+
 [lints]
 workspace = true

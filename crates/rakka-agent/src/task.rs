@@ -2613,6 +2613,12 @@ pub struct AgentTaskCreation {
     /// without one.
     #[serde(default)]
     pub wake: Option<AgentWakeId>,
+    /// The delegation provenance the collaboration metadata carried, when a
+    /// parent run's delegation created this task
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)). Records
+    /// persisted before this field load without one.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
     /// Trace context of the ingress that created the task — what the A2A
     /// surface extracted before durable acceptance
     /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
@@ -2656,6 +2662,15 @@ pub struct AgentRunAssignment {
     pub agent_definition_revision: AgentRevisionNumber,
     /// The agent settings revision the assignment was decided against.
     pub agent_settings_revision: AgentRevisionNumber,
+    /// The delegation authority the run enforces
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)): the
+    /// goal's skill and tool narrowing, its advisory ceilings, and the
+    /// lineage/depth of the task this run serves. Copied from the task's own
+    /// durable state by the assignment decision, because the run never reads
+    /// the goal spec. Commands persisted before this field load without one,
+    /// which means no goal narrowing.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentRunDelegationEnvelope>>,
     /// When the decision was recorded.
     pub assigned_at: AgentTimestampMillis,
 }
@@ -3033,6 +3048,12 @@ pub struct AgentTask {
     pub wake: Option<AgentWakeId>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
+    /// The delegation provenance recorded at creation, when a parent run's
+    /// delegation created this task
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)). Records
+    /// persisted before this field load without one.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
     /// The agent the task is meant for, when it is agent-owned.
     pub assignee: Option<AgentId>,
     /// The bounded dependency summary.
@@ -3347,6 +3368,7 @@ impl AgentTaskState {
             status: task.status,
             goal: task.goal.clone(),
             parent: task.parent.clone(),
+            delegation: task.delegation.clone(),
             assignment: task.assignment.clone(),
             assignment_generation: task.assignment_generation,
             dependencies: task.dependencies.values().cloned().collect(),
@@ -3508,6 +3530,10 @@ pub struct AgentTaskSnapshot {
     pub goal: Option<AgentGoalId>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
+    /// The delegation provenance recorded at creation, when a delegation
+    /// created it. Snapshots persisted before this field load without one.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
     /// Its current assignment.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation it has decided.
@@ -3601,6 +3627,42 @@ pub fn assignment_operation_id(
 /// It is the one transition both creation paths reach: the ingress
 /// [`AgentTaskEntityCommand::Create`] and the delegating run's
 /// [`AgentExchangeKind::Creation`] exchange.
+/// The delegation authority one assignment carries to its run.
+///
+/// A goal-bearing root projects its spec's skill and tool narrowing, its
+/// delegation ceilings, and its deadline; a delegated child projects its own
+/// creation provenance — the full ancestor chain including the delegation
+/// that created it, at the depth the parent recorded. A task that is neither
+/// carries nothing, and its run enforces no goal narrowing.
+fn delegation_envelope_for(
+    task: &AgentTask,
+) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
+    if let Some(goal_state) = task.goal_state.as_deref() {
+        let spec = goal_state.spec().spec();
+        return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: spec.allowed_skills.clone(),
+            allowed_tools: spec.allowed_tools.clone(),
+            budget: spec.delegation,
+            lineage: Vec::new(),
+            depth: 0,
+            deadline: spec.deadline,
+        }));
+    }
+    if let Some(provenance) = task.delegation.as_deref() {
+        let mut lineage = provenance.lineage.clone();
+        lineage.push(provenance.delegation.clone());
+        return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: BTreeSet::new(),
+            allowed_tools: BTreeSet::new(),
+            budget: provenance.budget,
+            lineage,
+            depth: provenance.depth,
+            deadline: provenance.deadline,
+        }));
+    }
+    None
+}
+
 fn create_task(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -3620,6 +3682,13 @@ fn create_task(
     // persisted.
     creation.definition.validate()?;
     creation.input.validate()?;
+    if let Some(provenance) = creation.delegation.as_deref() {
+        provenance
+            .validate()
+            .map_err(|error| AgentTaskError::DelegationProvenanceInvalid {
+                message: error.to_string(),
+            })?;
+    }
 
     let mut dependencies = BTreeMap::new();
     for declaration in &creation.dependencies {
@@ -3756,6 +3825,7 @@ fn create_task(
         wake_controller,
         wake: creation.wake,
         parent: creation.parent,
+        delegation: creation.delegation,
         assignee: creation.assignee,
         dependencies,
         escrow,
@@ -4618,6 +4688,8 @@ fn owe_epoch_creation(
         dependencies: Vec::new(),
         escrow: Some(budget),
         wake: Some(wake.clone()),
+        // An epoch is admitted by its own controller, never delegated.
+        delegation: None,
         telemetry: task.telemetry.clone(),
     };
     let payload = AgentExchangePayload::encode(AGENT_TASK_CREATION_PAYLOAD_TYPE, &creation)?;
@@ -6013,6 +6085,7 @@ fn decide_assignment(
         budget,
         agent_definition_revision,
         agent_settings_revision,
+        delegation: delegation_envelope_for(task),
         assigned_at: now,
     };
     // The payload is bounded by the substrate. A definition and input that do
@@ -8625,6 +8698,12 @@ pub enum AgentTaskError {
     },
     /// An agent-owned task was created without an assignee.
     MissingAssignee,
+    /// A creation carried delegation provenance that violates its structural
+    /// bounds.
+    DelegationProvenanceInvalid {
+        /// The validation failure detail.
+        message: String,
+    },
     /// A continuous-mode task was created without a goal binding.
     ContinuousWithoutGoal,
     /// An epoch task was created without the parent controller that admitted
@@ -8799,6 +8878,7 @@ impl AgentTaskError {
             Self::AlreadyCreated { .. } => "task-already-created",
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
+            Self::DelegationProvenanceInvalid { .. } => "task-delegation-provenance-invalid",
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::EpochWithoutParent => "task-epoch-without-parent",
             Self::EpochUndefined => "task-epoch-undefined",
@@ -8854,6 +8934,9 @@ impl Display for AgentTaskError {
             ),
             Self::MissingAssignee => {
                 write!(f, "an agent-owned task must name the agent it is created for")
+            }
+            Self::DelegationProvenanceInvalid { message } => {
+                write!(f, "the creation's delegation provenance is invalid: {message}")
             }
             Self::ContinuousWithoutGoal => {
                 write!(f, "a continuous-mode task must bind the goal its controller drives")
@@ -9139,6 +9222,7 @@ mod epoch_result_tests {
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         };
         create_task(&mut state, &create_op, creation, ts(1)).expect("the control task creates");
