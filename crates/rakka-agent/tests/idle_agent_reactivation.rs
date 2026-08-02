@@ -183,6 +183,7 @@ async fn an_idle_agent_with_a_blocked_task_auto_passivates_and_reactivates() {
                         )],
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 }),

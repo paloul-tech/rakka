@@ -1194,6 +1194,7 @@ where
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
+    delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     acceptances: Arc<AtomicUsize>,
 }
@@ -1213,6 +1214,7 @@ where
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
             metrics: self.metrics.clone(),
+            delegation: self.delegation.clone(),
             faults: self.faults.clone(),
             acceptances: self.acceptances.clone(),
         }
@@ -1241,6 +1243,7 @@ where
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
+            delegation: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
@@ -1280,6 +1283,17 @@ where
             .metrics
             .lock()
             .expect("the metrics slot should not be poisoned") = Some(metrics);
+    }
+
+    /// Wires every run entity this transport builds to serve delegation,
+    /// under the same shared-slot rule as [`Self::install_memory`]: every
+    /// driver of a run must share one wiring, because an entity that
+    /// advances the loop unwired refuses the coordination tool.
+    pub fn install_delegation(&self, config: crate::delegation::AgentRunDelegationConfig) {
+        *self
+            .delegation
+            .lock()
+            .expect("the delegation slot should not be poisoned") = Some(config);
     }
 
     /// Uses explicit effect specs for the effects hosted runs commit.
@@ -1372,6 +1386,14 @@ where
                 .clone();
             if let Some(metrics) = metrics {
                 entity = entity.with_metrics(metrics);
+            }
+            let delegation = self
+                .delegation
+                .lock()
+                .expect("the delegation slot should not be poisoned")
+                .clone();
+            if let Some(delegation) = delegation {
+                entity = entity.with_delegation(delegation);
             }
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);
@@ -1584,6 +1606,7 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     compensations: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
     evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
+    a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
@@ -1675,6 +1698,7 @@ where
             compensations: Arc::new(Mutex::new(BTreeMap::new())),
             promotions: Arc::new(Mutex::new(None)),
             evaluations: Arc::new(Mutex::new(None)),
+            a2a_sends: Arc::new(Mutex::new(None)),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1748,6 +1772,22 @@ where
             .evaluations
             .lock()
             .expect("the evaluation executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes outbound A2A send effects through the given executor. An
+    /// unwired send fails with the real pipeline's
+    /// `a2a-send-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_a2a_send_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentA2aSendExecutor>,
+    ) -> Self {
+        *self
+            .a2a_sends
+            .lock()
+            .expect("the A2A send executor slot should not be poisoned") = Some(executor);
         self
     }
 
@@ -1913,6 +1953,57 @@ where
                               evaluation_outcome, which carry the run scope"
                         .to_string(),
                 }
+            }
+            AgentRunEffectRequest::A2aSend { delegation } => {
+                // The record carries its own parent scope, so the send needs
+                // nothing `answer` does not hold. Memoized like a tool call:
+                // a re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived deduplication
+                // key promises.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .a2a_sends
+                    .lock()
+                    .expect("the A2A send executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "a2a-send-executor-missing".to_string(),
+                        message: "no A2A send executor is wired into this dispatcher".to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&delegation.parent_run, effect, delegation, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentA2aSendFinding::Sent {
+                            child_task,
+                            child_run,
+                            peer_status,
+                        }) => AgentRunEffectOutcome::A2aSend {
+                            receipt: crate::delegation::AgentA2aSendReceipt {
+                                delegation: delegation.delegation.clone(),
+                                child_task,
+                                child_run,
+                                peer_status,
+                            },
+                        },
+                        Ok(crate::dispatch::AgentA2aSendFinding::Conflict { code, message })
+                        | Ok(crate::dispatch::AgentA2aSendFinding::Refused { code, message }) => {
+                            AgentRunEffectOutcome::Failed { code, message }
+                        }
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::Failed {
+                            code: "a2a-send-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
             }
         }
     }

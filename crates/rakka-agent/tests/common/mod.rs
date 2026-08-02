@@ -256,9 +256,62 @@ pub fn goal_task_creation_command(
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         }),
     }
+}
+
+/// The coordination tool the delegation fixture declares.
+pub const DELEGATION_TOOL: &str = "delegate";
+
+/// The skill the fixture goal may delegate.
+pub const SKILL: &str = "translation";
+
+/// The specialist agent the fixture catalog resolves the skill to.
+pub const SPECIALIST: &str = "translator";
+
+/// The specialist's typed task definition.
+pub const SPECIALIST_DEFINITION: &str = "translate-document";
+
+pub fn delegation_tool_id() -> rakka_agent::AgentToolId {
+    rakka_agent::AgentToolId::new(DELEGATION_TOOL).expect("tool id should be valid")
+}
+
+pub fn skill_id() -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(SKILL).expect("capability id should be valid")
+}
+
+/// The target the fixture catalog resolves [`skill_id`] to.
+pub fn delegation_target() -> rakka_agent::AgentDelegationTarget {
+    rakka_agent::AgentDelegationTarget::new(
+        AgentId::new(SPECIALIST).expect("agent id should be valid"),
+        AgentTaskDefinitionId::new(SPECIALIST_DEFINITION).expect("definition id should be valid"),
+    )
+}
+
+/// The delegation wiring the fixture run entity serves: the declared
+/// coordination tool, a static catalog serving [`skill_id`], and the
+/// delegation capability.
+pub fn delegation_config() -> rakka_agent::AgentRunDelegationConfig {
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(skill_id(), delegation_target()),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+}
+
+/// The fixture goal contract narrowed to delegating [`skill_id`] only.
+pub fn goal_spec_with_delegation() -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.allowed_skills = std::collections::BTreeSet::from([skill_id()]);
+    spec
 }
 
 /// The default continuous wake policy: durable-timer trigger, a bounded
@@ -319,6 +372,7 @@ pub fn continuous_control_creation_command(goal_mode: AgentGoalMode) -> AgentTas
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         }),
     }
@@ -345,6 +399,7 @@ pub fn continuous_goal_control_creation_command(
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         }),
     }
@@ -518,6 +573,9 @@ pub struct Fixture<
     /// The metrics recorder the run entity is wired with, when a test enables
     /// it. Absent by default, so the run records no metrics.
     pub metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
+    /// The delegation wiring the run entity serves, when a test enables it.
+    /// Absent by default, so the run refuses the coordination tool.
+    pub delegation: Option<rakka_agent::AgentRunDelegationConfig>,
 }
 
 impl<A: AgentModelAdapter> Fixture<A> {
@@ -597,6 +655,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             memory: None,
             decisions: None,
             metrics: None,
+            delegation: None,
         }
     }
 
@@ -610,6 +669,16 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
         self.run_transport.install_memory(memory.clone());
         self.memory = Some(memory);
+        self
+    }
+
+    /// Wires the run entity to serve delegation, under the same every-driver
+    /// rule as [`Self::with_memory`]: an entity that advances the loop
+    /// unwired refuses the coordination tool.
+    #[must_use]
+    pub fn with_delegation(mut self, config: rakka_agent::AgentRunDelegationConfig) -> Self {
+        self.run_transport.install_delegation(config.clone());
+        self.delegation = Some(config);
         self
     }
 
@@ -728,6 +797,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         escrow: None,
                         wake: None,
                         telemetry,
+                        delegation: None,
                     }),
                 },
                 &self.router,
@@ -791,6 +861,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         dependencies: Vec::new(),
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 },
@@ -862,6 +933,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
+        }
+        if let Some(delegation) = &self.delegation {
+            entity = entity.with_delegation(delegation.clone());
         }
         entity
     }
@@ -950,6 +1024,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
+        }
+        if let Some(delegation) = &self.delegation {
+            entity = entity.with_delegation(delegation.clone());
         }
         entity
     }

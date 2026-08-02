@@ -75,6 +75,7 @@ async fn the_controller_passivates_between_wakes_and_a_durable_wake_reactivates_
                         dependencies: Vec::new(),
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 }),

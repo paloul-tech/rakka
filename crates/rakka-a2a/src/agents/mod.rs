@@ -17,6 +17,8 @@
 
 pub mod catalog;
 pub mod client;
+pub mod collaboration;
+pub mod delegation;
 pub mod error;
 pub mod ingress;
 pub mod management;
@@ -26,6 +28,13 @@ mod sync;
 
 pub use catalog::{A2AAgentCatalog, A2AAgentSelector, A2AAgentTarget, A2AStaticAgentCatalog};
 pub use client::A2AAgentClientTransport;
+pub use collaboration::{
+    agent_collaboration_extension, collaboration_echo, is_collaboration_message,
+    parse_collaboration_metadata, AgentCollaborationBudget, AgentCollaborationMetadata,
+    AgentCollaborationSchemaRef, AGENT_COLLABORATION_EXTENSION_PREFIX,
+    AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION, META_COLLABORATION,
+};
+pub use delegation::A2AAgentDelegationSendExecutor;
 pub use error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 pub use ingress::{NormalizedAgentCommand, META_AGENT_ID, META_TASK_DEFINITION};
 pub use management::{

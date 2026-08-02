@@ -838,6 +838,33 @@ fn kind_incompatible_target_class_refinement_falls_back_to_kind_class() {
         AgentDispatchTargetClass::classify(AgentEffectKind::HttpCall, &http_with_peer_label),
         AgentDispatchTargetClass::A2aPeer
     );
+
+    // The agent domain's outbound A2A send: an executor-routed tool-family
+    // effect whose declared `a2a-peer` target type classifies it truthfully
+    // as a peer send, not a plain tool.
+    let tool_with_peer_target = AgentEffectTarget {
+        target_type: "a2a-peer".to_string(),
+        name: "translator".to_string(),
+        address: None,
+        attributes: BTreeMap::new(),
+    };
+    assert_eq!(
+        AgentDispatchTargetClass::classify(AgentEffectKind::ToolCall, &tool_with_peer_target),
+        AgentDispatchTargetClass::A2aPeer
+    );
+
+    // A plain tool without the declaration stays a tool: the widened
+    // acceptance changes nothing for an undeclared target.
+    let plain_tool = AgentEffectTarget {
+        target_type: "tool".to_string(),
+        name: "search".to_string(),
+        address: None,
+        attributes: BTreeMap::new(),
+    };
+    assert_eq!(
+        AgentDispatchTargetClass::classify(AgentEffectKind::ToolCall, &plain_tool),
+        AgentDispatchTargetClass::Tool
+    );
 }
 
 #[tokio::test]

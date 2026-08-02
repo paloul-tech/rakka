@@ -700,6 +700,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                         dependencies: Vec::new(),
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 }),

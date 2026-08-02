@@ -56,6 +56,14 @@ pub(crate) fn agent_projection_from_snapshot(
             Value::String(assignment.agent.as_str().to_string()),
         );
     }
+    if let Some(provenance) = snapshot.delegation.as_deref() {
+        // The bounded collaboration echo: enough for observability and the
+        // delegating sender's identity check, never the whole envelope.
+        metadata.insert(
+            super::collaboration::META_COLLABORATION.to_string(),
+            super::collaboration::collaboration_echo(provenance),
+        );
+    }
     metadata.insert(
         META_PROJECTION_REVISION.to_string(),
         Value::Number(projection_revision.into()),

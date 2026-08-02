@@ -620,6 +620,7 @@ pub struct AgentEffectPolicies {
     compensation: AgentEffectSpec,
     memory_promotion: AgentEffectSpec,
     goal_evaluation: AgentEffectSpec,
+    a2a_send: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
@@ -652,6 +653,22 @@ impl AgentEffectPolicies {
             goal_evaluation: AgentEffectSpec {
                 safety_class: AgentEffectSafetyClass::ReadOnly,
                 max_attempts: crate::evaluation::AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // The send's deduplication key is a pure derivation of the
+            // delegation identity, so every retry converges on the same
+            // logical child: idempotent by construction, and an ambiguous
+            // loss retries safely under the same key instead of parking for
+            // reconciliation.
+            a2a_send: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: crate::delegation::AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS,
                 reconciliation_protocol: None,
                 credential_binding: None,
                 timeout_ms: None,
@@ -733,6 +750,17 @@ impl AgentEffectPolicies {
         Ok(self)
     }
 
+    /// Sets the spec outbound A2A sends dispatch under
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::delegation::AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS`] idempotent
+    /// attempts.
+    pub fn with_a2a_send_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.a2a_send = spec;
+        Ok(self)
+    }
+
     /// Pins every spec — model, registered tools, and the unclassified
     /// default — to the guardrail chain revision the deployment evaluates at
     /// dispatch, so each committed intent records the policy its transforms
@@ -745,6 +773,7 @@ impl AgentEffectPolicies {
         self.default_tool.guardrail_revision = Some(revision);
         self.memory_promotion.guardrail_revision = Some(revision);
         self.goal_evaluation.guardrail_revision = Some(revision);
+        self.a2a_send.guardrail_revision = Some(revision);
         for spec in self.tools.values_mut() {
             spec.guardrail_revision = Some(revision);
         }
@@ -762,6 +791,7 @@ impl AgentEffectPolicies {
             AgentRunEffectRequest::Compensation { .. } => &self.compensation,
             AgentRunEffectRequest::MemoryPromotion { .. } => &self.memory_promotion,
             AgentRunEffectRequest::Evaluation { .. } => &self.goal_evaluation,
+            AgentRunEffectRequest::A2aSend { .. } => &self.a2a_send,
         }
     }
 }
@@ -807,6 +837,9 @@ pub enum AgentRunEffectKind {
     /// An evaluation of the goal's success criteria against durable evidence
     /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
     GoalEvaluationCall,
+    /// An outbound agent-to-agent send carrying one durable delegation
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    A2aSendCall,
 }
 
 impl AgentRunEffectKind {
@@ -819,6 +852,7 @@ impl AgentRunEffectKind {
             Self::CompensationCall => "compensation-call",
             Self::MemoryPromotionCall => "memory-promotion-call",
             Self::GoalEvaluationCall => "goal-evaluation-call",
+            Self::A2aSendCall => "a2a-send-call",
         }
     }
 
@@ -827,14 +861,16 @@ impl AgentRunEffectKind {
     pub const fn workflow_kind(self) -> AgentEffectKind {
         match self {
             Self::ModelCall => AgentEffectKind::ModelCall,
-            // A compensation, memory promotion, or goal evaluation dispatches
-            // through the same adapter surface as a tool call: the outbox
-            // ticket's target type (`compensation`, `memory-promotion`,
-            // `goal-evaluation`) is what routes it to its executor.
+            // A compensation, memory promotion, goal evaluation, or A2A send
+            // dispatches through the same adapter surface as a tool call: the
+            // outbox ticket's target type (`compensation`, `memory-promotion`,
+            // `goal-evaluation`, `a2a-peer`) is what routes it to its
+            // executor.
             Self::ToolCall
             | Self::CompensationCall
             | Self::MemoryPromotionCall
-            | Self::GoalEvaluationCall => AgentEffectKind::ToolCall,
+            | Self::GoalEvaluationCall
+            | Self::A2aSendCall => AgentEffectKind::ToolCall,
         }
     }
 }
@@ -1084,6 +1120,19 @@ pub enum AgentRunEffectRequest {
         /// What to evaluate, as which evaluator, by which method.
         evaluation: Box<crate::evaluation::AgentGoalEvaluationRequest>,
     },
+    /// Send one durable delegation to a specialist agent over `rakka-a2a`
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)): an
+    /// idempotent durable effect whose payload *is* the delegation record
+    /// persisted alongside it — what was persisted is exactly what is sent,
+    /// and a replay re-sends it verbatim.
+    ///
+    /// This variant is constructible only by the loop's delegation
+    /// interception; model output can never produce it, which is one half of
+    /// why a generic tool cannot reach a peer.
+    A2aSend {
+        /// The delegation record the send carries.
+        delegation: Box<crate::delegation::AgentDelegationRecord>,
+    },
 }
 
 impl AgentRunEffectRequest {
@@ -1096,6 +1145,7 @@ impl AgentRunEffectRequest {
             Self::Compensation { .. } => AgentRunEffectKind::CompensationCall,
             Self::MemoryPromotion { .. } => AgentRunEffectKind::MemoryPromotionCall,
             Self::Evaluation { .. } => AgentRunEffectKind::GoalEvaluationCall,
+            Self::A2aSend { .. } => AgentRunEffectKind::A2aSendCall,
         }
     }
 
@@ -1106,7 +1156,8 @@ impl AgentRunEffectRequest {
             Self::Model { .. }
             | Self::Compensation { .. }
             | Self::MemoryPromotion { .. }
-            | Self::Evaluation { .. } => None,
+            | Self::Evaluation { .. }
+            | Self::A2aSend { .. } => None,
             Self::Tool { call } => Some(call),
         }
     }
@@ -1177,6 +1228,15 @@ impl AgentRunEffectRequest {
                 name: evaluation.evaluator.to_string(),
                 address: None,
                 attributes: BTreeMap::new(),
+            },
+            Self::A2aSend { delegation } => AgentEffectTarget {
+                target_type: "a2a-peer".to_string(),
+                name: delegation.resolved.agent.to_string(),
+                address: delegation.resolved.endpoint.clone(),
+                attributes: BTreeMap::from([
+                    ("skill".to_string(), delegation.requested_skill.to_string()),
+                    ("delegation".to_string(), delegation.delegation.to_string()),
+                ]),
             },
         }
     }
@@ -1663,6 +1723,12 @@ pub enum AgentRunEffectOutcome {
         /// revision it assessed.
         record: Box<crate::evaluation::AgentGoalEvaluationRecord>,
     },
+    /// An outbound A2A send durably created — or replayed to — its one
+    /// logical child ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    A2aSend {
+        /// The bounded receipt: identities and a status label only.
+        receipt: crate::delegation::AgentA2aSendReceipt,
+    },
     /// The generation failed definitively.
     Failed {
         /// Stable machine-readable code.
@@ -1703,6 +1769,7 @@ impl AgentRunEffectOutcome {
                 | Self::Tool { .. }
                 | Self::MemoryPromotion { .. }
                 | Self::Evaluation { .. }
+                | Self::A2aSend { .. }
         )
     }
 
@@ -1713,7 +1780,8 @@ impl AgentRunEffectOutcome {
             Self::Model { .. }
             | Self::Tool { .. }
             | Self::MemoryPromotion { .. }
-            | Self::Evaluation { .. } => AgentRunEffectStatus::Succeeded,
+            | Self::Evaluation { .. }
+            | Self::A2aSend { .. } => AgentRunEffectStatus::Succeeded,
             Self::Failed { .. } => AgentRunEffectStatus::Failed,
             Self::Exhausted { .. } => AgentRunEffectStatus::Exhausted,
             Self::Indeterminate { .. } => AgentRunEffectStatus::Indeterminate,
@@ -1783,6 +1851,13 @@ impl AgentRunEffectOutcome {
             }
             Self::Evaluation { record } => {
                 record
+                    .validate()
+                    .map_err(|error| AgentEffectError::InvalidPolicy {
+                        message: error.to_string(),
+                    })
+            }
+            Self::A2aSend { receipt } => {
+                receipt
                     .validate()
                     .map_err(|error| AgentEffectError::InvalidPolicy {
                         message: error.to_string(),

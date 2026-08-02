@@ -436,6 +436,67 @@ pub trait AgentGoalEvaluationExecutor: Send + Sync {
     ) -> AgentDispatchFuture<'a, AgentGoalEvaluationFinding>;
 }
 
+/// What one outbound A2A send established
+/// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentA2aSendFinding {
+    /// The peer durably created — or replayed to — the delegation's one
+    /// logical child.
+    Sent {
+        /// The child task the peer reported.
+        child_task: crate::identity::AgentTaskId,
+        /// The child's initial run, when the peer reported one.
+        child_run: Option<crate::identity::AgentRunId>,
+        /// The peer's bounded task-state label.
+        peer_status: String,
+    },
+    /// The peer holds a child this delegation's identity does not own — the
+    /// explicit conflict of
+    /// [specification 6.6](../../../docs/plans/rakka-agent/spec.md). The
+    /// generation settles `Failed` under the code and the cell records the
+    /// conflict; recovery uses a new delegation, never this one.
+    Conflict {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without creating a child: no retry can change
+    /// the answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one outbound A2A send inside a bounded dispatch attempt
+/// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)): carries
+/// the delegation record — verbatim, exactly as it was persisted — to the
+/// peer surface with the versioned collaboration metadata, the record's
+/// message id, and its deduplication key, so a retried attempt converges on
+/// the same logical child.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a [`AgentA2aSendFinding::Conflict`] or
+/// [`AgentA2aSendFinding::Refused`] is definitive. An absent executor fails
+/// closed at `invoke`. The `rakka-a2a` crate provides the in-process
+/// implementation over its agents surface; this crate deliberately has no
+/// A2A dependency, which is one half of why a generic tool cannot reach a
+/// peer.
+pub trait AgentA2aSendExecutor: Send + Sync {
+    /// Performs the send and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        delegation: &'a crate::delegation::AgentDelegationRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding>;
+}
+
 /// The runtime-provided promotion executor: the session store in, the private
 /// store out, every identity derived
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
@@ -1138,6 +1199,7 @@ where
     compensations: Option<Arc<dyn AgentCompensationExecutor>>,
     memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
     goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
+    a2a_sends: Option<Arc<dyn AgentA2aSendExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -1194,6 +1256,7 @@ where
             compensations: None,
             memory_promotions: None,
             goal_evaluations: None,
+            a2a_sends: None,
             delivery,
             probe: None,
         }
@@ -1274,6 +1337,17 @@ where
         goal_evaluations: Arc<dyn AgentGoalEvaluationExecutor>,
     ) -> Self {
         self.goal_evaluations = Some(goal_evaluations);
+        self
+    }
+
+    /// Executes outbound A2A sends through the given executor
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)) —
+    /// usually `rakka-a2a`'s in-process delegation-send executor over the
+    /// deployment's agents surface. Without one, a send dispatch fails
+    /// closed with a stable code.
+    #[must_use]
+    pub fn with_a2a_send_executor(mut self, a2a_sends: Arc<dyn AgentA2aSendExecutor>) -> Self {
+        self.a2a_sends = Some(a2a_sends);
         self
     }
 
@@ -2310,6 +2384,39 @@ where
             AgentRunEffectRequest::Evaluation { evaluation } => {
                 self.invoke_goal_evaluation(scope, intent, granted, evaluation, credential)
                     .await
+            }
+            AgentRunEffectRequest::A2aSend { delegation } => {
+                let Some(executor) = self.a2a_sends.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "a2a-send-executor-missing".to_string(),
+                        message: "no A2A send executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor
+                    .execute(scope, intent, delegation, credential)
+                    .await?
+                {
+                    AgentA2aSendFinding::Sent {
+                        child_task,
+                        child_run,
+                        peer_status,
+                    } => Ok(AgentRunEffectOutcome::A2aSend {
+                        receipt: crate::delegation::AgentA2aSendReceipt {
+                            delegation: delegation.delegation.clone(),
+                            child_task,
+                            child_run,
+                            peer_status,
+                        },
+                    }),
+                    AgentA2aSendFinding::Conflict { code, message }
+                    | AgentA2aSendFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
             }
         }
     }

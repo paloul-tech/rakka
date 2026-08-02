@@ -129,6 +129,7 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         dependencies,
         escrow: None,
         wake: None,
+        delegation: None,
         telemetry: Default::default(),
     }
 }
