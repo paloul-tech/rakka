@@ -141,6 +141,25 @@ pub fn delegation_id_for(
     ))?)
 }
 
+/// Rejects a depth that does not agree with the lineage.
+///
+/// A coherent chain records the full lineage above the delegation, so the
+/// depth is always the ancestor count plus one. The check keeps the depth
+/// the enforcement slices ceiling against non-forgeable: a sender cannot
+/// claim an arbitrary depth while presenting a shorter chain.
+fn check_depth_coherence(depth: u32, lineage: &[AgentDelegationId]) -> AgentDelegationResult<()> {
+    let expected = u32::try_from(lineage.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    if depth != expected {
+        return Err(AgentDelegationError::DepthIncoherent {
+            depth,
+            ancestors: lineage.len(),
+        });
+    }
+    Ok(())
+}
+
 /// The concrete target an application-owned catalog resolved for a requested
 /// skill ([specification 8.4](../../../docs/plans/rakka-agent/spec.md), open
 /// decision 15).
@@ -400,7 +419,9 @@ pub struct AgentDelegationRecord {
     /// Ancestor delegations, oldest first. Empty for a root's own children.
     #[serde(default)]
     pub lineage: Vec<AgentDelegationId>,
-    /// Depth of the child below the root: the parent's own depth plus one.
+    /// Depth of the child below the root: the parent's own depth plus one,
+    /// which is always the lineage length plus one — validation refuses a
+    /// depth that does not agree with the recorded chain.
     pub depth: u32,
     /// The skill the model requested.
     pub requested_skill: AgentCapabilityId,
@@ -448,7 +469,8 @@ pub struct AgentDelegationRecord {
 }
 
 impl AgentDelegationRecord {
-    /// Rejects a record that exceeds its structural bounds.
+    /// Rejects a record that exceeds its structural bounds, or whose depth
+    /// does not agree with its lineage.
     ///
     /// The whole record refuses rather than truncating: a delegation whose
     /// input does not fit inline belongs behind an artifact reference, and a
@@ -462,6 +484,7 @@ impl AgentDelegationRecord {
                 maximum: AGENT_DELEGATION_MAX_LINEAGE,
             });
         }
+        check_depth_coherence(self.depth, &self.lineage)?;
         let bytes = serde_json::to_vec(self)
             .map_err(|error| AgentDelegationError::Encoding {
                 message: error.to_string(),
@@ -616,7 +639,9 @@ pub struct AgentTaskDelegationProvenance {
     /// [`Self::delegation`], which is not repeated here.
     #[serde(default)]
     pub lineage: Vec<AgentDelegationId>,
-    /// Depth of this task below the root.
+    /// Depth of this task below the root: always the lineage length plus
+    /// one — validation refuses a depth that does not agree with the
+    /// recorded chain.
     pub depth: u32,
     /// The skill the parent requested.
     pub requested_skill: AgentCapabilityId,
@@ -640,11 +665,13 @@ pub struct AgentTaskDelegationProvenance {
 
 impl AgentTaskDelegationProvenance {
     /// Rejects a provenance whose lineage or serialized size exceeds its
-    /// structural bounds.
+    /// structural bounds, or whose depth does not agree with its lineage.
     ///
     /// The size bound is the receiving side of the parent's own record
     /// bound: every field here arrived from a peer, so the whole provenance
-    /// refuses rather than truncating, exactly as the record does.
+    /// refuses rather than truncating, exactly as the record does. Depth
+    /// coherence is the enforcement slices' input hygiene: a peer cannot
+    /// claim an arbitrary depth while presenting a shorter chain.
     pub fn validate(&self) -> AgentDelegationResult<()> {
         if self.lineage.len() > AGENT_DELEGATION_MAX_LINEAGE {
             return Err(AgentDelegationError::LineageTooDeep {
@@ -652,6 +679,7 @@ impl AgentTaskDelegationProvenance {
                 maximum: AGENT_DELEGATION_MAX_LINEAGE,
             });
         }
+        check_depth_coherence(self.depth, &self.lineage)?;
         let bytes = serde_json::to_vec(self)
             .map_err(|error| AgentDelegationError::Encoding {
                 message: error.to_string(),
@@ -711,15 +739,15 @@ impl AgentA2aSendReceipt {
 /// The run never reads the goal spec: the task's assignment decision copies
 /// the goal's skill and tool sets, its delegation budget, and the task's own
 /// provenance into this envelope, so the loop enforces goal-scope narrowing
-/// from durable state it owns. Absent envelope means absent goal narrowing —
-/// generic tools stay unrestricted and delegation falls back to refusing for
-/// want of an allowed skill set only when the goal declared one.
+/// from durable state it owns. Absent envelope means absent goal narrowing,
+/// and an empty set inside the envelope means the same: the goal spec's sets
+/// carry no declaredness, so narrowing is enforced only when a set is
+/// non-empty — an empty set never fails closed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRunDelegationEnvelope {
-    /// Skills the goal may delegate to. Empty means the goal declared none —
-    /// delegation of any skill is refused under an empty set only when the
-    /// goal itself was declared with `allowed_skills`; an envelope-free run
-    /// carries no goal narrowing at all.
+    /// Skills the goal may delegate to. A non-empty set closes delegation to
+    /// exactly these skills; an empty set means the goal declared no skill
+    /// narrowing, and any skill the catalog resolves may be requested.
     #[serde(default)]
     pub allowed_skills: BTreeSet<AgentCapabilityId>,
     /// Tools the goal may use. Empty means no goal-scope tool narrowing.
@@ -814,6 +842,13 @@ pub enum AgentDelegationError {
         /// The bound.
         maximum: usize,
     },
+    /// The declared depth does not agree with the lineage.
+    DepthIncoherent {
+        /// The declared depth.
+        depth: u32,
+        /// The recorded ancestor count.
+        ancestors: usize,
+    },
     /// The record exceeds its serialized-size bound.
     RecordTooLarge {
         /// Actual serialized bytes.
@@ -852,6 +887,7 @@ impl AgentDelegationError {
             Self::InvalidArguments { .. } => "delegation-invalid-arguments",
             Self::LimitExceeded { .. } => "delegation-limit-exceeded",
             Self::LineageTooDeep { .. } => "delegation-lineage-too-deep",
+            Self::DepthIncoherent { .. } => "delegation-depth-incoherent",
             Self::RecordTooLarge { .. } => "delegation-record-too-large",
             Self::ProvenanceTooLarge { .. } => "delegation-provenance-too-large",
             Self::TargetInvalid { .. } => "delegation-target-invalid",
@@ -884,6 +920,12 @@ impl Display for AgentDelegationError {
                 f,
                 "the delegation lineage carries {length} ancestors, which exceeds the {maximum} \
                  bound"
+            ),
+            Self::DepthIncoherent { depth, ancestors } => write!(
+                f,
+                "the declared depth {depth} does not agree with the {ancestors} recorded \
+                 ancestors; a coherent chain declares depth {}",
+                ancestors + 1
             ),
             Self::RecordTooLarge { bytes, maximum } => write!(
                 f,
@@ -982,6 +1024,30 @@ mod tests {
             .validate()
             .expect_err("the provenance is oversized");
         assert_eq!(error.code(), "delegation-provenance-too-large");
+    }
+
+    #[test]
+    fn an_incoherent_depth_fails_closed() {
+        // Depth is a pure function of the chain: a claimed depth with no
+        // lineage behind it is a forgery the enforcement slices must never
+        // ceiling against.
+        let provenance = AgentTaskDelegationProvenance {
+            delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
+            parent_task: AgentTaskId::new("ticket-1").expect("task id"),
+            parent_run: scope(),
+            lineage: Vec::new(),
+            depth: 5,
+            requested_skill: AgentCapabilityId::new("translation").expect("capability"),
+            capability_scopes: BTreeSet::new(),
+            credential_bindings: Vec::new(),
+            result_schema: None,
+            budget: None,
+            deadline: None,
+        };
+        let error = provenance
+            .validate()
+            .expect_err("the depth does not agree with the lineage");
+        assert_eq!(error.code(), "delegation-depth-incoherent");
     }
 
     #[test]

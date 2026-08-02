@@ -3622,11 +3622,6 @@ pub fn assignment_operation_id(
     )
 }
 
-/// Creates the task, or fails closed.
-///
-/// It is the one transition both creation paths reach: the ingress
-/// [`AgentTaskEntityCommand::Create`] and the delegating run's
-/// [`AgentExchangeKind::Creation`] exchange.
 /// The delegation authority one assignment carries to its run.
 ///
 /// A goal-bearing root projects its spec's skill and tool narrowing, its
@@ -3663,6 +3658,11 @@ fn delegation_envelope_for(
     None
 }
 
+/// Creates the task, or fails closed.
+///
+/// It is the one transition both creation paths reach: the ingress
+/// [`AgentTaskEntityCommand::Create`] and the delegating run's
+/// [`AgentExchangeKind::Creation`] exchange.
 fn create_task(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -3688,6 +3688,21 @@ fn create_task(
             .map_err(|error| AgentTaskError::DelegationProvenanceInvalid {
                 message: error.to_string(),
             })?;
+        // A delegated child lives in its parent's tenant: the delegating
+        // executor always creates the child under the parent run's tenant,
+        // so a provenance naming a foreign one is a forgery or a
+        // misrouting — refused, never recorded for the enforcement slices
+        // to trust.
+        if provenance.parent_run.tenant() != state.scope.tenant() {
+            return Err(AgentTaskError::DelegationProvenanceInvalid {
+                message: format!(
+                    "the provenance names a parent run in tenant {}, but the task is created in \
+                     tenant {}",
+                    provenance.parent_run.tenant(),
+                    state.scope.tenant()
+                ),
+            });
+        }
     }
 
     let mut dependencies = BTreeMap::new();

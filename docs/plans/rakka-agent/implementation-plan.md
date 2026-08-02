@@ -2750,6 +2750,27 @@ Done when: scenarios 28 and 39 pass.
   first: an echoing child converges as a replay, and only a foreign child is
   `delegation-child-conflict` — this supersedes the unconditional mapping
   described in the 2026-07-31 note above.
+- **Delegation admission is priced against the materialized bound.** A
+  committed delegation is held twice in the run's durable record (cell and
+  effect payload), so the interception refuses
+  `delegation-headroom-exceeded` when twice the record's serialized bytes
+  plus a fixed commit overhead would cross the run's remaining
+  `AGENT_RUN_MATERIALIZED_MAX_BYTES` headroom — a failed tool result the
+  model corrects course from, never a committed turn the bound check wedges
+  afterwards on every re-drive.
+- **Refusal text is bounded at the recording door.** A catalog's
+  `Unavailable` refusal carries application text of unchecked length; the
+  refusal tool result passes both code and message through the run's
+  bounded-detail truncation, so an oversized message cannot fail the inline
+  content bound and poison the transition.
+- **Forged parent bindings refuse at the creation door.** The provenance's
+  declared depth must agree with its presented lineage (depth is always the
+  ancestor count plus one; `delegation-depth-incoherent` otherwise — the
+  record enforces the same coherence), and the parent run must live in the
+  child's own tenant. 4.4's ceiling and cycle enforcement reads these fields
+  as validated inputs, never as peer assertions. The envelope's `allowed_*`
+  rustdoc now states the enforced empty-means-no-narrowing semantics, and
+  `create_task`'s doc comment is back on `create_task`.
 
 ### Slice 4.4 — Fan-out/fan-in, lineage, and coordinator limits
 

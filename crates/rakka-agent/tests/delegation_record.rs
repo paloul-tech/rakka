@@ -316,6 +316,63 @@ async fn interception_refusals_fail_the_call_and_the_run_survives() {
     }
 }
 
+/// A catalog refusal of unchecked length is bounded at the refusal door: the
+/// run records a truncated failed tool result under the catalog's own stable
+/// code and survives. Unbounded, the oversized text would fail the inline
+/// content bound and turn a refusal the run corrects course from into a
+/// transition failure every re-drive repeats.
+#[tokio::test]
+async fn an_unbounded_catalog_refusal_is_truncated_and_survived() {
+    struct UnavailableCatalog;
+    impl rakka_agent::AgentDelegationCatalog for UnavailableCatalog {
+        fn resolve(
+            &self,
+            _tenant: &rakka_agent::TenantId,
+            _skill: &rakka_agent::AgentCapabilityId,
+        ) -> Result<rakka_agent::AgentDelegationTarget, rakka_agent::AgentDelegationResolutionError>
+        {
+            Err(rakka_agent::AgentDelegationResolutionError::Unavailable {
+                code: "catalog-backend-down".to_string(),
+                message: "x".repeat(64 * 1024),
+            })
+        }
+    }
+    let config = rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(UnavailableCatalog),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability");
+
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn(delegating_turn(json!({
+                "skill": SKILL,
+                "input": { "text": "hello" },
+            })))
+            .with_turn(proposing_turn()),
+    ))
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots))
+    .with_delegation(config);
+    create_goal_task(&fixture).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    assert_eq!(state.status(), Some(AgentRunStatus::Completed));
+    let loop_state = state.loop_state().expect("loop state");
+    assert_eq!(loop_state.delegation_count(), 0);
+    assert_eq!(
+        session_refusal_code(&session).await.as_deref(),
+        Some("catalog-backend-down")
+    );
+}
+
 /// Goal-scope tool narrowing: a generic tool outside the goal's non-empty
 /// `allowed_tools` set is refused with a stable code and the run survives.
 #[tokio::test]

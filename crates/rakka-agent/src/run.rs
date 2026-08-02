@@ -197,6 +197,12 @@ pub const AGENT_RUN_MAX_SETTLE_ROUNDS: usize = 4;
 /// proposal returned.
 pub const AGENT_RUN_DETAIL_MAX_LENGTH: usize = 512;
 
+/// What one committed delegation adds to the run's durable record beyond
+/// twice its serialized record bytes: the effect envelope around the payload,
+/// the cell's status fields, and the send receipt later recorded as the
+/// call's bounded tool result.
+const AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES: usize = 2 * 1024;
+
 const DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
 /// The source of the durable timestamps a run's transitions are stamped with.
@@ -1860,6 +1866,20 @@ fn evaluate_model_output(
         )
     };
     let settings_revision = state.run_mut()?.loop_state.agent_settings_revision();
+    // A committed delegation is held twice in the run's durable record — the
+    // cell and the effect payload — so its admission is priced against the
+    // materialized bound before anything commits. Refusing here keeps an
+    // unaffordable delegation a failed tool result the model corrects course
+    // from; letting it commit would wedge the run afterwards, when the bound
+    // check fails a transition whose model turn is already durably pending
+    // and every re-drive fails the same way.
+    let mut delegation_headroom = if delegation.is_some() {
+        let run = state.run_mut()?;
+        AGENT_RUN_MATERIALIZED_MAX_BYTES.saturating_sub(run.materialized_size_bytes())
+    } else {
+        // No coordination tool is wired, so no call below prices against it.
+        0
+    };
     let mut planned: Vec<PlannedCall> = Vec::with_capacity(calls.len());
     let mut next_slot = slot_base;
     let mut planned_delegations = 0_usize;
@@ -1882,11 +1902,30 @@ fn evaluate_model_output(
                     now,
                 ) {
                     Ok(record) => {
-                        let request = AgentRunEffectRequest::A2aSend { delegation: record };
-                        let spec = policies.spec_for(&request).clone();
-                        next_slot += 1;
-                        planned_delegations += 1;
-                        planned.push(PlannedCall::Effect(request, spec));
+                        let record_bytes = serde_json::to_vec(record.as_ref())
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        let cost = record_bytes
+                            .saturating_mul(2)
+                            .saturating_add(AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES);
+                        if cost > delegation_headroom {
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: "delegation-headroom-exceeded".to_string(),
+                                message: format!(
+                                    "committing this delegation would add {cost} bytes to the \
+                                     run's durable record, which exceeds its \
+                                     {delegation_headroom} bytes of remaining headroom"
+                                ),
+                            });
+                        } else {
+                            delegation_headroom -= cost;
+                            let request = AgentRunEffectRequest::A2aSend { delegation: record };
+                            let spec = policies.spec_for(&request).clone();
+                            next_slot += 1;
+                            planned_delegations += 1;
+                            planned.push(PlannedCall::Effect(request, spec));
+                        }
                     }
                     Err((code, message)) => planned.push(PlannedCall::Refused {
                         call_id: call.call_id,
@@ -1976,9 +2015,14 @@ fn evaluate_model_output(
                 code,
                 message,
             } => {
+                // The code and message pass through `bounded_detail` because
+                // a catalog's `Unavailable` refusal carries application text
+                // of unchecked length: unbounded, it could fail the inline
+                // bound and turn a refusal the run survives into a
+                // deterministic transition failure the run cannot escape.
                 let content = AgentTaskContent::inline(serde_json::json!({
-                    "error": code,
-                    "message": message,
+                    "error": bounded_detail(code),
+                    "message": bounded_detail(message),
                 }))
                 .map_err(|error| AgentRunError::Task(Box::new(error)))?;
                 state

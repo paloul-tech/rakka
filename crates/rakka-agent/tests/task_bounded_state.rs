@@ -1243,7 +1243,9 @@ async fn the_widest_delegation_provenance_fits_the_task_record() {
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
         parent_run,
         lineage,
-        depth: rakka_agent::AGENT_DELEGATION_MAX_LINEAGE as u32,
+        // The chain above the delegation plus the delegation itself: depth
+        // is always the lineage length plus one, which validation enforces.
+        depth: rakka_agent::AGENT_DELEGATION_MAX_LINEAGE as u32 + 1,
         requested_skill: rakka_agent::AgentCapabilityId::new("translation")
             .expect("capability id should be valid"),
         capability_scopes: (0..8)
@@ -1412,5 +1414,73 @@ async fn an_oversized_delegation_provenance_refuses_the_creation() {
         )
         .await
         .expect_err("the oversized provenance refuses the creation");
+    assert_eq!(error.code(), "task-delegation-provenance-invalid");
+}
+
+/// A provenance whose parent run lives in a foreign tenant refuses the whole
+/// creation: a delegated child lives in its parent's tenant, so a claim
+/// otherwise is a forgery or a misrouting — never recorded for the
+/// enforcement slices to trust.
+#[tokio::test]
+async fn a_cross_tenant_parent_run_refuses_the_creation() {
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let foreign_parent = rakka_agent::AgentRunScope::new(
+        TenantId::new("evil"),
+        agent_id(),
+        rakka_agent::AgentRunId::new("parent-run-gen-1").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        delegation: rakka_agent::delegation_id_for(&foreign_parent, 2, 0)
+            .expect("the delegation id derives"),
+        parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
+        parent_run: foreign_parent,
+        lineage: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("translation")
+            .expect("capability id should be valid"),
+        capability_scopes: BTreeSet::new(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    };
+    provenance
+        .validate()
+        .expect("the provenance itself is structurally valid");
+
+    let creation = AgentTaskCreation {
+        definition: task_definition(),
+        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        assignee: Some(agent_id()),
+        goal: None,
+        goal_mode: Default::default(),
+        goal_spec: None,
+        parent: Some(AgentTaskId::new("goal-root").expect("task id should be valid")),
+        dependencies: Vec::new(),
+        escrow: None,
+        wake: None,
+        delegation: Some(Box::new(provenance)),
+        telemetry: Default::default(),
+    };
+    let mut entity = fx.entity().await;
+    let error = entity
+        .apply(
+            AgentTaskEntityCommand::Create {
+                operation_id: AgentOperationId::new(
+                    AgentOperationKind::TaskCreation,
+                    [TENANT, TASK, "1"],
+                )
+                .expect("operation id should be derivable"),
+                creation: Box::new(creation),
+            },
+            &fx.task_router,
+            fx.now(),
+        )
+        .await
+        .expect_err("the cross-tenant parent run refuses the creation");
     assert_eq!(error.code(), "task-delegation-provenance-invalid");
 }

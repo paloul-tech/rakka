@@ -851,6 +851,59 @@ async fn half_formed_collaboration_engagements_fail_closed() {
     }
 }
 
+/// Forged parent bindings fail closed at the creation door: a depth that
+/// does not agree with the presented lineage, and a parent run in a foreign
+/// tenant, are both refused before anything durable records them — the
+/// enforcement slices ceiling against these fields, so they are validated
+/// where they enter, never trusted because a peer asserted them.
+#[tokio::test]
+async fn forged_parent_bindings_fail_closed_at_ingress() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    // A claimed depth with no chain behind it.
+    let deep = wire_delegation_id(&fixture, 4);
+    let mut incoherent = collaboration_message(&deep, &deep);
+    if let Some(metadata) = incoherent.metadata.as_mut() {
+        if let Some(Value::Object(envelope)) = metadata.get_mut(META_COLLABORATION) {
+            envelope.insert("depth".to_string(), json!(4_000_000));
+        }
+    }
+
+    // A parent run claimed in a tenant the child is not created in.
+    let foreign = wire_delegation_id(&fixture, 5);
+    let mut cross_tenant = collaboration_message(&foreign, &foreign);
+    if let Some(metadata) = cross_tenant.metadata.as_mut() {
+        if let Some(Value::Object(envelope)) = metadata.get_mut(META_COLLABORATION) {
+            envelope.insert(
+                "parent-run".to_string(),
+                json!(format!("evil/{COORDINATOR}/{PARENT_TASK}-gen-1")),
+            );
+        }
+    }
+
+    for (label, message) in [
+        ("incoherent depth", incoherent),
+        ("cross-tenant parent run", cross_tenant),
+    ] {
+        let error = fixture
+            .service
+            .send_message(&params(), &send_request(message))
+            .await
+            .expect_err(label);
+        match &error {
+            RakkaAgentA2AError::Task(inner) => assert_eq!(
+                inner.code(),
+                "task-delegation-provenance-invalid",
+                "{label} should refuse at the provenance door"
+            ),
+            other => panic!("{label} should refuse as a task error, got {other}"),
+        }
+    }
+}
+
 /// The unknown-optional compatibility of specification 14.4: an ordinary A2A
 /// client that never engages the extension is untouched, and its child
 /// carries no delegation provenance.
