@@ -673,6 +673,17 @@ pub const METRIC_AGENT_GOAL_STATUS: &str = "rakka.agent.goal.status";
 /// this counter is its only metric visibility.
 pub const METRIC_AGENT_GOAL_STAGNATION: &str = "rakka.agent.goal.stagnation";
 
+/// Counter: delegated children's terminal results accepted or refused at the
+/// parent run's door, labeled by bounded `outcome`
+/// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+pub const METRIC_AGENT_DELEGATION_RESULTS: &str = "rakka.agent.delegation.results";
+
+/// Counter: fan-in groups resolved, labeled by the bounded resolution code
+/// (`all-settled` / `any-satisfied` / `quorum-satisfied` / `unsatisfiable` /
+/// `timed-out`) as `outcome`
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+pub const METRIC_AGENT_FAN_IN_RESOLUTIONS: &str = "rakka.agent.fan_in.resolutions";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the

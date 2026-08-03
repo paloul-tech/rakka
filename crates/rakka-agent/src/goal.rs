@@ -535,7 +535,12 @@ pub struct AgentGoalCriteria {
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md) descendant
 /// dimensions). `None` means unbounded.
 ///
-/// Typed but inert until slice 4.4 lands fan-out/fan-in and lineage ceilings.
+/// Enforced at the delegation door (slice 4.4): depth, fan-out, and
+/// concurrency are checked against the run's envelope and durable delegation
+/// cells before a delegation commits, and the descendants ceiling seeds the
+/// conserved [`AgentBudgetDimension::Descendants`](crate::AgentBudgetDimension)
+/// dimension of the root task's escrow ledger. Every refusal is a failed tool
+/// result the model corrects course from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentGoalDelegationBudget {
     /// Maximum delegation depth below the root.
@@ -547,9 +552,39 @@ pub struct AgentGoalDelegationBudget {
     /// Maximum descendants across the whole delegation graph.
     #[serde(default)]
     pub max_descendants: Option<u32>,
-    /// Maximum concurrently active descendants.
+    /// Maximum concurrently unsettled direct children of one delegating run.
+    ///
+    /// Per-run and direct, not tree-global: a tree-wide *level* cannot be
+    /// enforced by single-entity transitions
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md) forbids
+    /// dispatch-time cross-entity reads), and tree-wide *mass* is what
+    /// `max_descendants` bounds. A child counts until its send settles
+    /// definitively or its terminal result is recorded.
     #[serde(default)]
     pub max_concurrent: Option<u32>,
+}
+
+impl AgentGoalDelegationBudget {
+    /// These ceilings narrowed to `ceiling`: the smaller of the two per field,
+    /// with `None` as the unbounded identity — exactly
+    /// [`AgentBudgetAllocation::narrowed_to`]'s rule, so a child's delegation
+    /// authority can never widen what its parent or definition permits.
+    #[must_use]
+    pub fn narrowed_to(&self, ceiling: &Self) -> Self {
+        fn tighter(held: Option<u32>, bound: Option<u32>) -> Option<u32> {
+            match (held, bound) {
+                (None, bound) => bound,
+                (held, None) => held,
+                (Some(held), Some(bound)) => Some(held.min(bound)),
+            }
+        }
+        Self {
+            max_depth: tighter(self.max_depth, ceiling.max_depth),
+            max_fan_out: tighter(self.max_fan_out, ceiling.max_fan_out),
+            max_descendants: tighter(self.max_descendants, ceiling.max_descendants),
+            max_concurrent: tighter(self.max_concurrent, ceiling.max_concurrent),
+        }
+    }
 }
 
 /// The durable, versioned goal contract
@@ -596,9 +631,16 @@ pub struct AgentGoalSpec {
     /// The non-conserved limits the goal runs under.
     #[serde(default)]
     pub limits: AgentBudgetLimits,
-    /// Delegation ceilings, inert until slice 4.4.
+    /// Delegation ceilings, enforced at the delegation door (slice 4.4).
     #[serde(default)]
     pub delegation: Option<AgentGoalDelegationBudget>,
+    /// The fan-in policy this goal's fan-out groups open under, when the
+    /// goal declares one; the run wiring's default applies otherwise. Fixed
+    /// in durable state at group open — the model chooses when to await,
+    /// never what the rule is
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    #[serde(default)]
+    pub fan_in: Option<crate::fan_in::AgentFanInPolicy>,
     /// What a goal-scope budget exhaustion does. Active in this slice.
     #[serde(default)]
     pub exhaustion: AgentGoalExhaustionPolicy,
@@ -724,6 +766,15 @@ impl AgentGoalSpec {
         {
             return Err(AgentGoalError::StagnationReplanUnsupported);
         }
+        // A quorum that can never resolve is refused at the door it would
+        // later dead-lock, exactly as a statically unsatisfiable evidence
+        // demand is.
+        if let Some(crate::fan_in::AgentFanInPolicy::Quorum { n }) = self.fan_in {
+            let maximum = crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS as u32;
+            if n < 1 || n > maximum {
+                return Err(AgentGoalError::FanInQuorumInvalid { n, maximum });
+            }
+        }
         let bytes = serde_json::to_vec(self)
             .map(|bytes| bytes.len())
             .unwrap_or(0);
@@ -759,6 +810,8 @@ impl<'de> Deserialize<'de> for AgentGoalSpec {
             limits: AgentBudgetLimits,
             #[serde(default)]
             delegation: Option<AgentGoalDelegationBudget>,
+            #[serde(default)]
+            fan_in: Option<crate::fan_in::AgentFanInPolicy>,
             #[serde(default)]
             exhaustion: AgentGoalExhaustionPolicy,
             #[serde(default)]
@@ -800,6 +853,7 @@ impl<'de> Deserialize<'de> for AgentGoalSpec {
             allocation: record.allocation,
             limits: record.limits,
             delegation: record.delegation,
+            fan_in: record.fan_in,
             exhaustion: record.exhaustion,
             allowed_skills: record.allowed_skills,
             allowed_tools: record.allowed_tools,
@@ -1475,6 +1529,13 @@ pub enum AgentGoalError {
     },
     /// The stagnation policy selects `Replan`, which no slice can execute yet.
     StagnationReplanUnsupported,
+    /// The declared fan-in quorum can never resolve.
+    FanInQuorumInvalid {
+        /// The declared quorum.
+        n: u32,
+        /// The structural membership bound.
+        maximum: u32,
+    },
     /// The objective summary exceeds its bound.
     SummaryTooLong {
         /// Actual length in bytes.
@@ -1528,6 +1589,7 @@ impl AgentGoalError {
             Self::StaleCriteriaRevision { .. } => "goal-stale-criteria-revision",
             Self::StagnationThresholdTooLow { .. } => "goal-stagnation-threshold-too-low",
             Self::StagnationReplanUnsupported => "goal-stagnation-replan-unsupported",
+            Self::FanInQuorumInvalid { .. } => "fan-in-quorum-invalid",
             Self::SummaryTooLong { .. } => "goal-summary-too-long",
             Self::CollectionTooLarge { .. } => "goal-collection-too-large",
             Self::LabelTooLong { .. } => "goal-label-too-long",
@@ -1597,6 +1659,11 @@ impl Display for AgentGoalError {
             Self::StagnationReplanUnsupported => write!(
                 f,
                 "the stagnation policy selects replan, which no slice can execute yet"
+            ),
+            Self::FanInQuorumInvalid { n, maximum } => write!(
+                f,
+                "a fan-in quorum of {n} can never resolve: the quorum must be between 1 and the \
+                 {maximum}-member structural bound"
             ),
             Self::SummaryTooLong { length, maximum } => write!(
                 f,
@@ -1673,6 +1740,7 @@ mod tests {
             allocation: AgentBudgetAllocation::unbounded(),
             limits: AgentBudgetLimits::unbounded(),
             delegation: None,
+            fan_in: None,
             exhaustion: AgentGoalExhaustionPolicy::default(),
             allowed_skills: BTreeSet::new(),
             allowed_tools: BTreeSet::new(),

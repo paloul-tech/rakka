@@ -710,6 +710,9 @@ pub enum AgentOperationKind {
     ClaimAppend,
     /// Durable delegation of work to a specialist agent.
     Delegation,
+    /// A delegated child task returning its terminal outcome to the parent
+    /// run that created it.
+    DelegationResult,
     /// Durable handoff of a task to another agent.
     Handoff,
     /// A team member's claim on a shared task-board item.
@@ -758,6 +761,7 @@ impl AgentOperationKind {
             Self::GoalEvaluation => "goal-evaluation",
             Self::ClaimAppend => "claim-append",
             Self::Delegation => "delegation",
+            Self::DelegationResult => "delegation-result",
             Self::Handoff => "handoff",
             Self::TeamClaim => "team-claim",
             Self::ConversationTurn => "conversation-turn",

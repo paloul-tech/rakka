@@ -217,12 +217,26 @@ async fn a_cancellation_fence_settles_the_unsent_delegation_cell() {
 }
 
 /// The peer's explicit conflict settles the cell `Conflicted` — never a
-/// silent second child, and never an adoption — and the parent winds down.
+/// silent second child, and never an adoption. Since slice 4.4 the failed
+/// send is a fan-in disposition, not a coordinator failure
+/// ([specification 8.7](../../docs/plans/rakka-agent/spec.md): failed
+/// children are handled explicitly by policy): the conflict reaches the
+/// model as the call's failed tool result, and the coordinator survives to
+/// finish with the children it has.
 #[tokio::test]
-async fn a_peer_conflict_settles_the_cell_as_conflicted() {
+async fn a_peer_conflict_settles_the_cell_and_the_coordinator_survives() {
     let fixture = Fixture::new(
         ScriptedDispatcher::with_adapter(
-            DeterministicModelAdapter::new().with_turn(delegating_turn()),
+            DeterministicModelAdapter::new()
+                .with_turn(delegating_turn())
+                .with_turn(
+                    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                        .with_text("Correcting course without the specialist.")
+                        .with_proposal(
+                            rakka_agent::AgentTaskContent::inline(json!({ "answer": "solo" }))
+                                .expect("the proposal is inline-bounded"),
+                        ),
+                ),
         )
         .with_a2a_send_executor(Arc::new(ConflictExecutor)),
     )
@@ -235,5 +249,9 @@ async fn a_peer_conflict_settles_the_cell_as_conflicted() {
             code: "delegation-child-conflict".to_string()
         }
     );
-    assert_eq!(run_status, Some(AgentRunStatus::Failed));
+    assert_eq!(
+        run_status,
+        Some(AgentRunStatus::Completed),
+        "the conflicted delegation is a disposition the model corrects from"
+    );
 }

@@ -26,14 +26,24 @@
 //! diverge, and the delegation's own convergence rests on the derived
 //! deduplication key instead of a second operation class.
 //!
-//! The durable fan-out groups and deterministic fan-in policy, the depth,
-//! fan-out, descendant, and concurrency ceilings enforced through the escrow
-//! ledger, lineage-based cycle rejection, and durable cancellation propagation
-//! to children remain later work: the record already carries lineage, depth,
-//! and budget so those slices enforce without changing this shape.
+//! Slice 4.4 enforces the coordinator limits against this shape: depth,
+//! fan-out, and concurrency ceilings check the run's envelope and durable
+//! cells at the delegation door; the descendants ceiling is the conserved
+//! [`crate::AgentBudgetDimension::Descendants`] escrow dimension, spent one
+//! plus [`AgentDelegationRecord::granted_descendants`] per committed
+//! delegation; and cycle rejection compares a resolved target against the
+//! validated ancestor-agent chain ([`AgentDelegationRecord::ancestors`]) at
+//! agent-identity granularity — the escape hatch for deliberately bounded
+//! iterative protocols ([specification 8.4]) is deferred with a refusal-only
+//! default. Unused child sub-quota is *not* credited back on a child's
+//! terminal result yet: the spend is the grant, conservatively, until a
+//! later slice turns crediting on inside the result-ingestion transition.
+//! Durable cancellation propagation to children remains slice 4.6.
 //!
 //! Specification: sections 8.4, 6.6, 8.7, and 14.4. Filled by slices 4.3
-//! (this shape), 4.4, and 4.6.
+//! (this shape), 4.4 (fan-in and limits), and 4.6.
+//!
+//! [specification 8.4]: ../../../docs/plans/rakka-agent/spec.md
 //!
 //! [specification 6.6]: ../../../docs/plans/rakka-agent/spec.md
 
@@ -52,10 +62,10 @@ use crate::definition::{
 };
 use crate::goal::AgentGoalDelegationBudget;
 use crate::identity::{
-    validate_tenant, AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError, AgentRunId,
-    AgentRunScope, AgentTaskId, TenantId,
+    validate_tenant, AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId,
+    AgentOperationKind, AgentRunId, AgentRunScope, AgentTaskId, TenantId,
 };
-use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent};
+use crate::task::{AgentContentDigest, AgentSchemaRef, AgentTaskContent, AgentTaskStatus};
 
 /// Result type for delegation construction and validation.
 pub type AgentDelegationResult<T> = Result<T, AgentDelegationError>;
@@ -141,6 +151,23 @@ pub fn delegation_id_for(
     ))?)
 }
 
+/// Derives the stable operation id of the one delegation-result exchange a
+/// child ever owes its parent.
+///
+/// Pure over `(tenant, delegation)`: the child's terminal status is
+/// absorbing, so one logical result exists per delegation, ever, and every
+/// re-drive after any loss owes the identical operation
+/// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+pub fn delegation_result_operation_id(
+    tenant: &TenantId,
+    delegation: &AgentDelegationId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::DelegationResult,
+        [tenant.as_str(), delegation.as_str(), "result"],
+    )
+}
+
 /// Rejects a depth that does not agree with the lineage.
 ///
 /// A coherent chain records the full lineage above the delegation, so the
@@ -155,6 +182,27 @@ fn check_depth_coherence(depth: u32, lineage: &[AgentDelegationId]) -> AgentDele
         return Err(AgentDelegationError::DepthIncoherent {
             depth,
             ancestors: lineage.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Rejects an ancestor-agent chain that does not agree with the lineage.
+///
+/// The two chains are parallel: `ancestors[i]` is the agent that committed
+/// `lineage[i]`, so a non-empty ancestry must match the lineage entry for
+/// entry. An empty ancestry is tolerated for compatibility — a chain recorded
+/// before the field existed — and the cycle check then refuses to *extend*
+/// such a chain ([`AgentDelegationError::AncestryUnknown`]) rather than
+/// trusting a gap a peer could hide an ancestor in.
+fn check_ancestry_coherence(
+    ancestors: &[AgentId],
+    lineage: &[AgentDelegationId],
+) -> AgentDelegationResult<()> {
+    if !ancestors.is_empty() && ancestors.len() != lineage.len() {
+        return Err(AgentDelegationError::AncestryIncoherent {
+            ancestors: ancestors.len(),
+            lineage: lineage.len(),
         });
     }
     Ok(())
@@ -419,6 +467,14 @@ pub struct AgentDelegationRecord {
     /// Ancestor delegations, oldest first. Empty for a root's own children.
     #[serde(default)]
     pub lineage: Vec<AgentDelegationId>,
+    /// The agent that committed each lineage entry, oldest first — parallel to
+    /// [`Self::lineage`], entry for entry. The delegating run's own agent is
+    /// not repeated here: it rides as [`Self::parent_run`], which is what
+    /// closes the chain for cycle rejection. Empty on a record committed
+    /// before the field existed; validation refuses a non-empty ancestry
+    /// whose length disagrees with the lineage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<AgentId>,
     /// Depth of the child below the root: the parent's own depth plus one,
     /// which is always the lineage length plus one — validation refuses a
     /// depth that does not agree with the recorded chain.
@@ -449,11 +505,23 @@ pub struct AgentDelegationRecord {
     /// resolution carries one.
     #[serde(default)]
     pub result_schema: Option<AgentSchemaRef>,
-    /// The advisory delegation budget the parent's envelope carried. Recorded
-    /// for the child's provenance; a conserved escrow grant cannot ride A2A
-    /// yet, so nothing here debits a ledger.
+    /// The narrowed delegation budget the child runs under: the parent's own
+    /// ceilings min-narrowed per field, with `max_descendants` replaced by the
+    /// escrowed sub-quota ([`Self::granted_descendants`]). It crosses A2A as
+    /// validated provenance the child's own admission caps against — never a
+    /// conserved escrow grant, which cannot ride A2A.
     #[serde(default)]
     pub budget: Option<AgentGoalDelegationBudget>,
+    /// The conserved descendant sub-quota this delegation debited from the
+    /// parent run's ledger *beyond* the child itself: the child's own subtree
+    /// allowance, carried to the child as the wire budget's `max_descendants`.
+    /// The delegation's total descendant cost is therefore one plus this.
+    ///
+    /// `None` on a record committed before the dimension existed. Under a
+    /// bounded parent an untagged live cell makes the remaining headroom
+    /// unknowable, and further delegation refuses — deny-when-unknown.
+    #[serde(default)]
+    pub granted_descendants: Option<u64>,
     /// The child's deadline, in epoch milliseconds.
     #[serde(default)]
     pub deadline: Option<AgentTimestampMillis>,
@@ -485,6 +553,7 @@ impl AgentDelegationRecord {
             });
         }
         check_depth_coherence(self.depth, &self.lineage)?;
+        check_ancestry_coherence(&self.ancestors, &self.lineage)?;
         let bytes = serde_json::to_vec(self)
             .map_err(|error| AgentDelegationError::Encoding {
                 message: error.to_string(),
@@ -553,6 +622,37 @@ impl AgentDelegationStatus {
     }
 }
 
+/// The bounded terminal outcome one child returned through the durable
+/// delegation-result exchange ([specification 8.4]: the record carries the
+/// child's status, result/evidence references, and terminal reason).
+///
+/// References only, never content: the digest fingerprints the child's
+/// accepted result and the child task id — already on the cell's
+/// `ChildCreated` status — is the authorized-query handle for anything more.
+///
+/// [specification 8.4]: ../../../docs/plans/rakka-agent/spec.md
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDelegationChildResult {
+    /// The child task's terminal status.
+    pub status: AgentTaskStatus,
+    /// The child's stable terminal-reason code, when it recorded one.
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    /// Content digest of the child's accepted result, when one was accepted.
+    #[serde(default)]
+    pub result_digest: Option<AgentContentDigest>,
+    /// The child run that served the terminal assignment, when known.
+    #[serde(default)]
+    pub child_run: Option<AgentRunId>,
+    /// Descendant tasks the child's own subtree created, excluding the child
+    /// itself. Recorded for a later slice to credit unused sub-quota back;
+    /// slice 4.4 never credits — the spend stays the grant, conservatively.
+    #[serde(default)]
+    pub descendants_created: u64,
+    /// When the parent recorded the result.
+    pub recorded_at: AgentTimestampMillis,
+}
+
 /// One delegation's durable home on the parent run's loop state.
 ///
 /// The cell commits with the send effect and settles in the same
@@ -567,6 +667,10 @@ pub struct AgentDelegationCell {
     /// When the status settled, when it has.
     #[serde(default)]
     pub settled_at: Option<AgentTimestampMillis>,
+    /// The child's terminal outcome, once its result returned. First writer
+    /// wins: one logical result per delegation, ever.
+    #[serde(default)]
+    pub result: Option<AgentDelegationChildResult>,
 }
 
 impl AgentDelegationCell {
@@ -577,6 +681,25 @@ impl AgentDelegationCell {
             record,
             status: AgentDelegationStatus::Pending,
             settled_at: None,
+            result: None,
+        }
+    }
+
+    /// Whether the child this cell created has recorded its terminal outcome.
+    ///
+    /// A cell that never created a child — settled `Conflicted` or `Failed` —
+    /// answers `false`; its settlement, not a child result, is what released
+    /// its debits.
+    #[must_use]
+    pub const fn child_settled(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Records the child's terminal outcome, first-writer-wins: a duplicate
+    /// delivery of one logical result cannot rewrite history.
+    pub fn record_child_result(&mut self, result: AgentDelegationChildResult) {
+        if self.result.is_none() {
+            self.result = Some(result);
         }
     }
 
@@ -639,6 +762,15 @@ pub struct AgentTaskDelegationProvenance {
     /// [`Self::delegation`], which is not repeated here.
     #[serde(default)]
     pub lineage: Vec<AgentDelegationId>,
+    /// The agent that committed each lineage entry, oldest first — parallel
+    /// to [`Self::lineage`]. The delegating agent itself rides as
+    /// [`Self::parent_run`], which closes the chain: this task's own runs
+    /// reject a delegation that resolves back to any agent in
+    /// `ancestors ∪ {parent_run.agent()}` ∪ their own. Empty when the parent
+    /// predates the field; validation refuses a non-empty ancestry whose
+    /// length disagrees with the lineage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<AgentId>,
     /// Depth of this task below the root: always the lineage length plus
     /// one — validation refuses a depth that does not agree with the
     /// recorded chain.
@@ -654,8 +786,11 @@ pub struct AgentTaskDelegationProvenance {
     /// The versioned output schema the parent expects.
     #[serde(default)]
     pub result_schema: Option<AgentSchemaRef>,
-    /// The advisory delegation budget the parent carried. Never a conserved
-    /// escrow grant: budgets cannot ride A2A yet.
+    /// The narrowed delegation budget the parent granted, validated at the
+    /// creation door. Its `max_descendants` is the parent-escrowed sub-quota
+    /// this task's own delegation authority is capped to — a cap the child's
+    /// admission min-narrows below its own definition ceilings, never a
+    /// conserved escrow grant: budgets cannot ride A2A.
     #[serde(default)]
     pub budget: Option<AgentGoalDelegationBudget>,
     /// The deadline the parent set for this task.
@@ -680,6 +815,7 @@ impl AgentTaskDelegationProvenance {
             });
         }
         check_depth_coherence(self.depth, &self.lineage)?;
+        check_ancestry_coherence(&self.ancestors, &self.lineage)?;
         let bytes = serde_json::to_vec(self)
             .map_err(|error| AgentDelegationError::Encoding {
                 message: error.to_string(),
@@ -753,18 +889,35 @@ pub struct AgentRunDelegationEnvelope {
     /// Tools the goal may use. Empty means no goal-scope tool narrowing.
     #[serde(default)]
     pub allowed_tools: BTreeSet<AgentToolId>,
-    /// The goal's delegation ceilings, advisory until the enforcement slice.
+    /// The delegation ceilings this run enforces at the delegation door:
+    /// the goal spec's (root) or the task's granted provenance budget
+    /// (delegated child), min-narrowed by the task definition's own ceilings
+    /// either way.
     #[serde(default)]
     pub budget: Option<AgentGoalDelegationBudget>,
     /// Ancestor delegations of the task this run serves, oldest first.
     #[serde(default)]
     pub lineage: Vec<AgentDelegationId>,
+    /// The agent that committed each lineage entry, oldest first — parallel
+    /// to [`Self::lineage`]. For a delegated child this is the provenance's
+    /// ancestry plus the delegating parent's own agent, so the cycle check
+    /// compares a resolved target against `ancestors` plus the run's own
+    /// agent and covers the whole chain. Empty at the root, and empty when
+    /// the chain predates the field — in which case sub-delegation refuses
+    /// rather than trusting a gap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<AgentId>,
     /// Depth of the task this run serves below the root. Zero for a root.
     #[serde(default)]
     pub depth: u32,
     /// The goal's own deadline, carried so children never outlive it.
     #[serde(default)]
     pub deadline: Option<AgentTimestampMillis>,
+    /// The fan-in policy the goal declares for this run's fan-out groups,
+    /// when it declares one; the wiring's default applies otherwise. Trusted
+    /// state fixed at group open — never model output.
+    #[serde(default)]
+    pub fan_in: Option<crate::fan_in::AgentFanInPolicy>,
 }
 
 /// The wiring one run entity needs to serve delegation
@@ -779,6 +932,13 @@ pub struct AgentRunDelegationEnvelope {
 pub struct AgentRunDelegationConfig {
     /// The one declared coordination tool the loop intercepts.
     pub tool: AgentToolId,
+    /// The declared await verb the loop intercepts into a fan-in close, when
+    /// the deployment wires one. Unwired, the run delegates but never waits:
+    /// the pre-fan-in behavior.
+    pub fan_in_tool: Option<AgentToolId>,
+    /// The fan-in policy a group opens under when the goal's envelope
+    /// declares none. Trusted wiring, never model output.
+    pub default_fan_in: crate::fan_in::AgentFanInPolicy,
     /// The application-owned catalog that resolves requested skills.
     pub catalog: Arc<dyn AgentDelegationCatalog>,
     /// The coordination capabilities the agent definition declares.
@@ -798,9 +958,29 @@ impl AgentRunDelegationConfig {
         }
         Ok(Self {
             tool,
+            fan_in_tool: None,
+            default_fan_in: crate::fan_in::AgentFanInPolicy::default(),
             catalog,
             coordination,
         })
+    }
+
+    /// Declares the await verb the loop intercepts into a fan-in close.
+    #[must_use]
+    pub fn with_fan_in_tool(mut self, tool: AgentToolId) -> Self {
+        self.fan_in_tool = Some(tool);
+        self
+    }
+
+    /// Sets the fan-in policy used when the goal's envelope declares none,
+    /// refusing one that can never resolve.
+    pub fn with_default_fan_in(
+        mut self,
+        policy: crate::fan_in::AgentFanInPolicy,
+    ) -> AgentDelegationResult<Self> {
+        policy.validate()?;
+        self.default_fan_in = policy;
+        Ok(self)
     }
 }
 
@@ -849,6 +1029,66 @@ pub enum AgentDelegationError {
         /// The recorded ancestor count.
         ancestors: usize,
     },
+    /// The ancestor-agent chain does not agree with the lineage.
+    AncestryIncoherent {
+        /// The presented ancestor-agent count.
+        ancestors: usize,
+        /// The presented lineage length.
+        lineage: usize,
+    },
+    /// The chain carries lineage without ancestor agents, so cycle rejection
+    /// cannot see who is above — sub-delegation refuses rather than trusting
+    /// the gap.
+    AncestryUnknown {
+        /// The lineage length whose ancestry is missing.
+        lineage: usize,
+    },
+    /// The child would exceed the maximum delegation depth
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+    DepthExceeded {
+        /// The depth the child would take.
+        depth: u32,
+        /// The ceiling in force.
+        maximum: u32,
+    },
+    /// The run would exceed its maximum direct children.
+    FanOutExceeded {
+        /// Direct children already committed, the planned one included.
+        committed: u64,
+        /// The ceiling in force.
+        maximum: u32,
+    },
+    /// The run would exceed its maximum concurrently unsettled children.
+    ConcurrencyExceeded {
+        /// Children currently unsettled, the planned one included.
+        active: u64,
+        /// The ceiling in force.
+        maximum: u32,
+    },
+    /// The run's escrowed descendant allocation cannot cover another child
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    DescendantsExhausted {
+        /// The descendants allocation the run holds.
+        limit: u64,
+        /// What is already spent or held by live children, or `None` when a
+        /// pre-slice cell makes the spend unaccountable — refused all the
+        /// same: deny-when-unknown.
+        spent: Option<u64>,
+    },
+    /// The resolved target already appears in the delegation chain
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md):
+    /// repeated delegation lineage).
+    CycleDetected {
+        /// The agent the resolution cycled back to.
+        agent: AgentId,
+    },
+    /// A quorum fan-in policy that can never resolve.
+    QuorumInvalid {
+        /// The declared quorum.
+        n: u32,
+        /// The structural membership bound.
+        maximum: u32,
+    },
     /// The record exceeds its serialized-size bound.
     RecordTooLarge {
         /// Actual serialized bytes.
@@ -888,6 +1128,14 @@ impl AgentDelegationError {
             Self::LimitExceeded { .. } => "delegation-limit-exceeded",
             Self::LineageTooDeep { .. } => "delegation-lineage-too-deep",
             Self::DepthIncoherent { .. } => "delegation-depth-incoherent",
+            Self::AncestryIncoherent { .. } => "delegation-ancestry-incoherent",
+            Self::AncestryUnknown { .. } => "delegation-ancestry-unknown",
+            Self::DepthExceeded { .. } => "delegation-depth-exceeded",
+            Self::FanOutExceeded { .. } => "delegation-fan-out-exceeded",
+            Self::ConcurrencyExceeded { .. } => "delegation-concurrency-exceeded",
+            Self::DescendantsExhausted { .. } => "delegation-descendants-exhausted",
+            Self::CycleDetected { .. } => "delegation-cycle-detected",
+            Self::QuorumInvalid { .. } => "fan-in-quorum-invalid",
             Self::RecordTooLarge { .. } => "delegation-record-too-large",
             Self::ProvenanceTooLarge { .. } => "delegation-provenance-too-large",
             Self::TargetInvalid { .. } => "delegation-target-invalid",
@@ -926,6 +1174,56 @@ impl Display for AgentDelegationError {
                 "the declared depth {depth} does not agree with the {ancestors} recorded \
                  ancestors; a coherent chain declares depth {}",
                 ancestors + 1
+            ),
+            Self::AncestryIncoherent { ancestors, lineage } => write!(
+                f,
+                "the chain presents {ancestors} ancestor agents against {lineage} lineage \
+                 entries; a coherent chain records one agent per entry"
+            ),
+            Self::AncestryUnknown { lineage } => write!(
+                f,
+                "the chain carries {lineage} lineage entries without their ancestor agents, so \
+                 cycle rejection cannot see the chain; a run under an unaccounted chain may \
+                 finish its own work but not delegate further"
+            ),
+            Self::DepthExceeded { depth, maximum } => write!(
+                f,
+                "the child would sit at delegation depth {depth}, which exceeds the maximum \
+                 depth {maximum}"
+            ),
+            Self::FanOutExceeded { committed, maximum } => write!(
+                f,
+                "the delegation would be this run's direct child {committed}, which exceeds the \
+                 maximum fan-out {maximum}"
+            ),
+            Self::ConcurrencyExceeded { active, maximum } => write!(
+                f,
+                "the delegation would make {active} concurrently unsettled children, which \
+                 exceeds the maximum {maximum}; a child counts until its send settles or its \
+                 terminal result is recorded"
+            ),
+            Self::DescendantsExhausted { limit, spent } => match spent {
+                Some(spent) => write!(
+                    f,
+                    "the run's descendants allocation of {limit} cannot cover another child: \
+                     {spent} already spent or held by live children"
+                ),
+                None => write!(
+                    f,
+                    "the run's descendants allocation of {limit} cannot admit another child: a \
+                     delegation committed before the descendants dimension existed makes the \
+                     spend unaccountable, and unknown headroom is refused"
+                ),
+            },
+            Self::CycleDetected { agent } => write!(
+                f,
+                "the resolved target {agent} already appears in the delegation chain; repeated \
+                 delegation lineage is refused"
+            ),
+            Self::QuorumInvalid { n, maximum } => write!(
+                f,
+                "a fan-in quorum of {n} can never resolve: the quorum must be between 1 and the \
+                 {maximum}-member structural bound"
             ),
             Self::RecordTooLarge { bytes, maximum } => write!(
                 f,
@@ -1007,6 +1305,7 @@ mod tests {
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
             lineage: Vec::new(),
+            ancestors: Vec::new(),
             depth: 1,
             requested_skill: AgentCapabilityId::new("translation").expect("capability"),
             capability_scopes: (0..256)
@@ -1036,6 +1335,7 @@ mod tests {
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
             lineage: Vec::new(),
+            ancestors: Vec::new(),
             depth: 5,
             requested_skill: AgentCapabilityId::new("translation").expect("capability"),
             capability_scopes: BTreeSet::new(),
@@ -1069,6 +1369,7 @@ mod tests {
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
             lineage: Vec::new(),
+            ancestors: Vec::new(),
             depth: 1,
             requested_skill: AgentCapabilityId::new("translation").expect("capability"),
             resolved: AgentDelegationTarget::new(
@@ -1085,6 +1386,7 @@ mod tests {
                 .expect("bounded input"),
             result_schema: None,
             budget: None,
+            granted_descendants: None,
             deadline: None,
             definition_revision: AgentRevisionNumber::new(1),
             settings_revision: AgentRevisionNumber::new(1),

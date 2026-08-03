@@ -2785,6 +2785,86 @@ Spec: [8.4](spec.md#84-specialization-and-durable-delegation),
 
 Done when: scenarios 27 and 34 pass, including coordinator loss and resume.
 
+**Amended as implemented (2026-08-02):**
+
+- **The cells are the membership; the group is one cell beside them.**
+  `AgentFanInCell` on the loop state opens in the same CAS as the first
+  committed delegation — the policy (`AgentFanInPolicy::{All, Any, Quorum}`,
+  non-exhaustive for the deferred policy-evaluator variant) comes from the
+  goal spec's new `fan_in` field or the wiring's `default_fan_in`, never
+  model output, so "fixed in durable state before results are accepted" is a
+  construction property with no early-result window. The model's second
+  declared coordination verb (`with_fan_in_tool`; closed vocabulary carrying
+  only an optional deadline) closes membership; the run rests in the new
+  `AwaitingChildren` phase under status `Running` (the documented honest
+  non-residency status — no new `AgentRunStatus`), holding no effect and no
+  residency; a resolved group is absorbing and the next delegation replaces
+  it, so sequential rounds are one cell, not a history. `evaluate_fan_in` is
+  a pure function of durable cells + policy + parent-side `timed_out` marks;
+  the bounded resolution table (no child content, no repeated child ids, the
+  reason codes truncated — the growth-reserve test caught the unbounded
+  shape) answers the awaiting call, and the model still proposes: fan-in
+  never completes the parent task. `FireFanInDeadline` marks stragglers
+  timed out and resolves; chasing them is 4.6.
+- **Result return = ninth exchange, user-approved divergence from spec
+  8.4's letter.** `AgentExchangeKind::DelegationResult`, child task → parent
+  run over the courier (the epoch-result template verbatim): owed exactly
+  once from the transition that closes the terminal child's ledger, pure
+  operation id `delegation_result_operation_id(tenant, delegation)`,
+  `AgentDelegationReport` references only. Parent-side fences: sender must
+  be the very child the cell created; `Pending` cell → `delegation-result-
+  early` (re-drivable); settled-non-created → `-not-owned`; unknown →
+  `-unknown-delegation`/`-unknown-run`; the cell's `result` field is the
+  first-writer-wins durable fence past the journal window; a terminal or
+  winding-down parent records evidence and resumes nothing. The child-side
+  settle rule advances only on the four definitive codes. The 9.8
+  failure-window table lives on the kind's rustdoc. The remote A2A carrier
+  (a collaboration result envelope + the `ContinueTask` lift) is reserved
+  for federation, when a remote forward executor exists at all.
+- **Limits split by conservation.** Descendants is the 8th conserved
+  `AgentBudgetDimension`: seeded at `create_task` from min(goal spec,
+  definition's new `AgentTaskDefinition.delegation` ceilings — the forged-
+  root-child defense, approved in-slice — spec allocation), escrowed
+  task→run via the existing `open_child`, spent 1 + `granted_descendants`
+  per live cell at the door (settled-failed sends release; pending counts),
+  folded into consumption once at `terminate` so the existing ledger
+  exchanges conserve it across generations. The new `WORK` set keeps
+  `first_empty_for` from refusing assignments over `descendants: Some(0)`
+  (verified hazard). Depth/fan-out/concurrency stay door checks off the
+  envelope + cells, priced per planned call; `max_concurrent` re-documented
+  as per-run unsettled direct children. The even-split sub-quota crosses
+  A2A as the child's narrowed `max_descendants` (a validated cap the child's
+  seed min-narrows below its own ceilings — never a conserved grant);
+  credit-back of unused sub-quota is deliberately off, `descendants_created`
+  recorded on the cell for a later slice.
+- **Cycle rejection reads a validated ancestor-agent chain.** Lineage
+  entries are delegation digests, so the parallel `ancestors: Vec<AgentId>`
+  (record/provenance/envelope/collaboration metadata; skip-if-empty keeps
+  root sends v1-wire-compatible, deeper chains fail closed cross-version;
+  coherence `len == lineage.len()` enforced at every door,
+  `delegation-ancestry-incoherent`) is what makes direct and indirect
+  rejection implementable: resolved target ∈ ancestors ∪ {own agent} →
+  `delegation-cycle-detected`. An unaccounted chain (pre-4.4 parent) works
+  but cannot sub-delegate (`delegation-ancestry-unknown`). The bounded-
+  iterative escape hatch stays deferred, refusal-only.
+- **A failed send became a fan-in disposition.** With every delegation now a
+  group member, a definitive send failure settles the cell, reaches the
+  model as the call's failed tool result, and the coordinator survives —
+  superseding 4.3's unconditional wind-down (which still governs sends
+  outside a live group); `delegation_dispatch.rs`'s conflict test now pins
+  the survival.
+- Proof roster: `tests/fan_out_fan_in.rs` (scenario 27's loop and fabric
+  halves, with real child task entities and re-driven settles),
+  `tests/delegation_limits.rs` (scenario 34's six classes, each fail-closed
+  and re-derived across the fixture's per-command restarts), the pre-4.4
+  decode pin, the two-part growth-reserve/door-price empirical test,
+  `fan_in.rs`'s policy/order-invariance units, and
+  `collaboration_surface.rs`'s ancestors round-trip and forged-ancestry
+  refusals. Owed onward: snapshot/projection views (4.7), cancellation
+  propagation and straggler chase (4.6), workflow members reusing the
+  member-disposition interface (4.5), descendant credit-back, and the
+  federated A2A result carrier.
+
 ### Slice 4.5 — Workflows as tools
 
 Spec: [8.6](spec.md#86-workflows-as-tools),

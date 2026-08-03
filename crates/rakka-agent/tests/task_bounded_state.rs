@@ -1237,12 +1237,22 @@ async fn the_widest_delegation_provenance_fits_the_task_record() {
             rakka_agent::delegation_id_for(&parent_run, 1, slot).expect("the delegation id derives")
         })
         .collect();
+    // The ancestry is parallel to the lineage — one committing agent per
+    // entry — so the widest provenance carries a full chain of realistic
+    // agent identities besides the digests.
+    let ancestors: Vec<_> = (0..rakka_agent::AGENT_DELEGATION_MAX_LINEAGE)
+        .map(|index| {
+            rakka_agent::AgentId::new(format!("specialist-coordinator-{index:02}"))
+                .expect("agent id should be valid")
+        })
+        .collect();
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
         parent_run,
         lineage,
+        ancestors,
         // The chain above the delegation plus the delegation itself: depth
         // is always the lineage length plus one, which validation enforces.
         depth: rakka_agent::AGENT_DELEGATION_MAX_LINEAGE as u32 + 1,
@@ -1361,6 +1371,7 @@ async fn an_oversized_delegation_provenance_refuses_the_creation() {
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
         parent_run,
         lineage: Vec::new(),
+        ancestors: Vec::new(),
         depth: 1,
         requested_skill: rakka_agent::AgentCapabilityId::new("translation")
             .expect("capability id should be valid"),
@@ -1438,6 +1449,7 @@ async fn a_cross_tenant_parent_run_refuses_the_creation() {
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
         parent_run: foreign_parent,
         lineage: Vec::new(),
+        ancestors: Vec::new(),
         depth: 1,
         requested_skill: rakka_agent::AgentCapabilityId::new("translation")
             .expect("capability id should be valid"),

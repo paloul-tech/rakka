@@ -30,8 +30,8 @@ use serde_json::Value;
 use a2a::AgentExtension;
 use rakka_agent::{
     AgentCapabilityId, AgentCredentialBindingRef, AgentDelegationId, AgentDelegationRecord,
-    AgentGoalDelegationBudget, AgentGoalId, AgentRevisionNumber, AgentRunScope, AgentSchemaId,
-    AgentSchemaRef, AgentTaskDelegationProvenance, AgentTaskId,
+    AgentGoalDelegationBudget, AgentGoalId, AgentId, AgentRevisionNumber, AgentRunScope,
+    AgentSchemaId, AgentSchemaRef, AgentTaskDelegationProvenance, AgentTaskId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -70,11 +70,14 @@ pub fn agent_collaboration_extension() -> AgentExtension {
     }
 }
 
-/// The advisory delegation budget the envelope carries.
+/// The delegation-ceiling budget the envelope carries.
 ///
-/// Advisory, never conserved: a real escrow grant cannot ride A2A, so these
-/// ceilings are recorded provenance the enforcement slices read — nothing
-/// here debits a ledger.
+/// A validated cap, never a conserved grant: a real escrow grant cannot ride
+/// A2A, so the receiving surface min-narrows the child's own ledger and
+/// delegation authority below these ceilings — a peer can only shrink what a
+/// child may do, and nothing here debits a ledger across the wire. The
+/// `max_descendants` a delegating parent sends is the sub-quota it escrowed
+/// parent-side for the child's whole subtree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AgentCollaborationBudget {
@@ -84,10 +87,10 @@ pub struct AgentCollaborationBudget {
     /// Maximum direct children of one delegating run.
     #[serde(default)]
     pub max_fan_out: Option<u32>,
-    /// Maximum descendants across the whole delegation graph.
+    /// Maximum descendants across the child's whole subtree.
     #[serde(default)]
     pub max_descendants: Option<u32>,
-    /// Maximum concurrently active descendants.
+    /// Maximum concurrently unsettled direct children of one delegating run.
     #[serde(default)]
     pub max_concurrent: Option<u32>,
 }
@@ -148,6 +151,13 @@ pub struct AgentCollaborationMetadata {
     /// [`Self::delegation`], which is not repeated.
     #[serde(default)]
     pub lineage: Vec<String>,
+    /// The agent that committed each lineage entry, oldest first — parallel
+    /// to [`Self::lineage`]. Omitted when empty, which keeps a root-level
+    /// send parseable by a receiver that predates the field; a deeper chain
+    /// carries it and fails closed on such a receiver, exactly the
+    /// half-understood-metadata posture of this extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<String>,
     /// Depth of the child below the root.
     pub depth: u32,
     /// The skill the parent requested.
@@ -184,6 +194,11 @@ impl AgentCollaborationMetadata {
                 .lineage
                 .iter()
                 .map(|ancestor| ancestor.as_str().to_string())
+                .collect(),
+            ancestors: record
+                .ancestors
+                .iter()
+                .map(|agent| agent.as_str().to_string())
                 .collect(),
             depth: record.depth,
             requested_skill: record.requested_skill.as_str().to_string(),
@@ -234,6 +249,10 @@ impl AgentCollaborationMetadata {
         for ancestor in &self.lineage {
             lineage.push(AgentDelegationId::new(ancestor)?);
         }
+        let mut ancestors = Vec::with_capacity(self.ancestors.len());
+        for agent in &self.ancestors {
+            ancestors.push(AgentId::new(agent)?);
+        }
         let mut capability_scopes = std::collections::BTreeSet::new();
         for scope in &self.capability_scopes {
             capability_scopes.insert(AgentCapabilityId::new(scope)?);
@@ -247,6 +266,7 @@ impl AgentCollaborationMetadata {
             parent_task: AgentTaskId::new(&self.parent_task)?,
             parent_run,
             lineage,
+            ancestors,
             depth: self.depth,
             requested_skill: AgentCapabilityId::new(&self.requested_skill)?,
             capability_scopes,

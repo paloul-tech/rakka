@@ -687,6 +687,7 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
             parent_task: AgentTaskId::new(PARENT_TASK).expect("task id should be valid"),
             parent_run: parent_run.clone(),
             lineage: Vec::new(),
+            ancestors: Vec::new(),
             depth: 1,
             requested_skill: AgentCapabilityId::new(SKILL).expect("capability id should be valid"),
             resolved: AgentDelegationTarget::new(
@@ -702,6 +703,7 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
                 .expect("the input is inline-bounded"),
             result_schema: None,
             budget: None,
+            granted_descendants: None,
             deadline: None,
             definition_revision: AgentRevisionNumber::new(1),
             settings_revision: AgentRevisionNumber::new(1),
@@ -1017,4 +1019,101 @@ async fn credential_binding_references_survive_as_references_only() {
         vec!["translation-api-binding".to_string()]
     );
     assert_eq!(provenance.capability_scopes.len(), 1);
+}
+
+/// The ancestor-agent chain rides the v1 envelope, parallel to the lineage:
+/// present, it validates into typed provenance; empty, it is omitted from
+/// the wire entirely — which is what keeps a root-level send parseable by a
+/// strict receiver that predates the field.
+#[tokio::test]
+async fn ancestors_ride_the_wire_and_omit_when_empty() {
+    use rakka_a2a::agents::{AgentCollaborationBudget, AgentCollaborationMetadata};
+
+    let chained = AgentCollaborationMetadata {
+        schema: AGENT_COLLABORATION_SCHEMA_VERSION,
+        delegation: format!("delegation-{}", "c".repeat(64)),
+        parent_task: PARENT_TASK.to_string(),
+        parent_run: format!("{TENANT}/{COORDINATOR}/{PARENT_TASK}-gen-1"),
+        goal: None,
+        lineage: vec![format!("delegation-{}", "d".repeat(64))],
+        ancestors: vec!["root-coordinator".to_string()],
+        depth: 2,
+        requested_skill: SKILL.to_string(),
+        capability_scopes: Vec::new(),
+        credential_bindings: Vec::new(),
+        budget: Some(AgentCollaborationBudget {
+            max_descendants: Some(0),
+            ..Default::default()
+        }),
+        deadline: None,
+        result_schema: None,
+    };
+    let wire = chained.to_value();
+    assert_eq!(wire["ancestors"], json!(["root-coordinator"]));
+    assert_eq!(wire["budget"]["max-descendants"], json!(0));
+    let provenance = chained
+        .to_provenance()
+        .expect("the chained envelope validates");
+    assert_eq!(provenance.ancestors.len(), 1);
+    assert_eq!(provenance.ancestors[0].as_str(), "root-coordinator");
+    assert_eq!(
+        provenance
+            .budget
+            .expect("the narrowed budget arrives as the child's cap")
+            .max_descendants,
+        Some(0)
+    );
+
+    let rootward = AgentCollaborationMetadata {
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        ..chained
+    };
+    let wire = rootward.to_value();
+    assert!(
+        wire.get("ancestors").is_none(),
+        "an empty ancestry is omitted, so a v1-strict receiver still parses \
+         a root-level send"
+    );
+}
+
+/// An ancestry that disagrees with the presented lineage fails closed at the
+/// creation door: the ceilings and the cycle check read these fields as
+/// validated inputs, so a gap a peer could hide an ancestor in never becomes
+/// durable provenance.
+#[tokio::test]
+async fn a_forged_ancestry_fails_closed_at_ingress() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    let delegation = wire_delegation_id(&fixture, 6);
+    let lineage_entry = wire_delegation_id(&fixture, 7);
+    let mut forged = collaboration_message(&delegation, &delegation);
+    if let Some(metadata) = forged.metadata.as_mut() {
+        if let Some(Value::Object(envelope)) = metadata.get_mut(META_COLLABORATION) {
+            envelope.insert(
+                "lineage".to_string(),
+                json!([lineage_entry, wire_delegation_id(&fixture, 8)]),
+            );
+            envelope.insert("depth".to_string(), json!(3));
+            // Two lineage entries, one claimed agent.
+            envelope.insert("ancestors".to_string(), json!(["root-coordinator"]));
+        }
+    }
+    let error = fixture
+        .service
+        .send_message(&params(), &send_request(forged))
+        .await
+        .expect_err("the forged ancestry refuses");
+    match &error {
+        RakkaAgentA2AError::Task(inner) => assert_eq!(
+            inner.code(),
+            "task-delegation-provenance-invalid",
+            "the ancestry refuses at the provenance door"
+        ),
+        other => panic!("the forged ancestry should refuse as a task error, got {other}"),
+    }
 }
