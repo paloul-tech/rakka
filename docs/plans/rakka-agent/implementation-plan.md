@@ -2851,8 +2851,12 @@ Done when: scenarios 27 and 34 pass, including coordinator loss and resume.
   group member, a definitive send failure settles the cell, reaches the
   model as the call's failed tool result, and the coordinator survives —
   superseding 4.3's unconditional wind-down (which still governs sends
-  outside a live group); `delegation_dispatch.rs`'s conflict test now pins
-  the survival.
+  outside any fan-out group). Membership alone is the test, never a
+  still-unresolved group: an `Any` satisfied by its first child while a
+  sibling's send was still in flight must not be wound down by that
+  straggler's later failure. `delegation_dispatch.rs`'s conflict test pins
+  the survival, and `fan_out_fan_in.rs`'s post-resolution straggler pins the
+  resolved-group half.
 - Proof roster: `tests/fan_out_fan_in.rs` (scenario 27's loop and fabric
   halves, with real child task entities and re-driven settles),
   `tests/delegation_limits.rs` (scenario 34's six classes, each fail-closed

@@ -170,8 +170,9 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
 /// resolution ([`crate::fan_in::AgentFanInCell`]); and the resolution's
 /// bounded result table recorded as the awaiting call's tool result. The
 /// per-delegation share of that growth is priced at the interception door
-/// ([`AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES`]), and the reserve covers it
-/// again so a result arriving after acceptance can always be recorded.
+/// (the crate-private `AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES`), and the
+/// reserve covers it again so a result arriving after acceptance can always
+/// be recorded.
 ///
 /// Acceptance therefore enforces the materialized bound *minus* this reserve,
 /// so a run the entity admits can never later be unable to record the very turn
@@ -2953,19 +2954,25 @@ fn apply_effect_outcome(
                             cell.settle_failed(code.clone(), now);
                         }
                     }
-                    // A send whose delegation belongs to the run's live
-                    // fan-out group is a *child that failed to exist* — an
-                    // explicit fan-in disposition, not a coordinator failure
+                    // A send whose delegation belongs to the run's fan-out
+                    // group is a *child that failed to exist* — an explicit
+                    // fan-in disposition, not a coordinator failure
                     // ([specification 8.7]: failed children are handled
                     // explicitly by policy). The failure reaches the model as
                     // the call's failed tool result, the policy branches on
                     // it, and the coordinator survives to work with the
-                    // children it has. A send outside any live group keeps
+                    // children it has. Membership alone is the test, never a
+                    // still-unresolved group: a policy that resolved early —
+                    // an `Any` satisfied by the first child while its
+                    // siblings' sends were still in flight — has already
+                    // decided what it waited for, and its own stragglers must
+                    // not then wind it down. A send outside any group keeps
                     // the pre-fan-in wind-down below.
                     group_member_send = !winding_down
-                        && run.loop_state.fan_in().is_some_and(|group| {
-                            group.resolution.is_none() && group.members.contains(&delegation_id)
-                        });
+                        && run
+                            .loop_state
+                            .fan_in()
+                            .is_some_and(|group| group.members.contains(&delegation_id));
                     if group_member_send {
                         if let Some(call_id) = call_id {
                             let content = AgentTaskContent::inline(serde_json::json!({
@@ -4430,7 +4437,27 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunEntityReply> {
         self.ensure_recovered(now).await?;
+        // Counted across the whole operation, not at one resolving site: a
+        // command resolves a group from three different places — the deadline
+        // timer, a member send that failed definitively, and an await that
+        // closed over members which had all already settled — and the
+        // transition functions that reach them hold no metrics handle. The
+        // reply is carried through unchanged, including an error: the
+        // transition commits before the settle pass, so a resolution can be
+        // durable even when the call fails.
+        let resolution_before = self.fan_in_resolution();
+        let reply = self.apply_command(command, router, now).await;
+        self.record_fan_in_resolution(resolution_before);
+        reply
+    }
 
+    /// [`Self::apply`] without its metric bookkeeping.
+    async fn apply_command(
+        &mut self,
+        command: AgentRunEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<AgentRunEntityReply> {
         if let Some(operation_id) = command.operation_id() {
             if let Some(outcome) = self
                 .state()?
@@ -4607,14 +4634,7 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentExchangeReply> {
         self.ensure_recovered(now).await?;
-        let resolved_before = envelope.kind() == AgentExchangeKind::DelegationResult
-            && self.state().ok().is_some_and(|state| {
-                state
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.loop_state.fan_in())
-                    .is_some_and(|group| group.resolution.is_some())
-            });
+        let resolution_before = self.fan_in_resolution();
         let reply = self.host.accept(envelope, now).await?;
         if envelope.kind() == AgentExchangeKind::DelegationResult {
             let outcome = if reply.result().is_accepted() {
@@ -4629,24 +4649,6 @@ where
                 &[("outcome", outcome)],
             )
             .ok();
-            let resolution = self.state().ok().and_then(|state| {
-                state
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.loop_state.fan_in())
-                    .and_then(|group| group.resolution.as_ref())
-                    .map(|resolution| resolution.code.clone())
-            });
-            if let Some(code) = resolution.filter(|_| !resolved_before) {
-                let code: &str = &code;
-                record_agent_domain_counter(
-                    self.metrics.as_ref(),
-                    METRIC_AGENT_FAN_IN_RESOLUTIONS,
-                    1,
-                    &[("outcome", code)],
-                )
-                .ok();
-            }
         }
         // Accepting a delivered exchange makes *local* progress only: it cranks
         // the loop and hands new effects to the sink. It does **not** deliver the
@@ -4664,8 +4666,50 @@ where
         // reply lets the initiator settle first, exactly as a durable outbox
         // drains on a later turn rather than inside the transition that filled
         // it.
-        self.make_local_progress(now).await?;
+        // The delivered result may have resolved the group here, or the crank
+        // below may resolve it from a member send that failed on the way out.
+        let progress = self.make_local_progress(now).await;
+        self.record_fan_in_resolution(resolution_before);
+        progress?;
         Ok(reply)
+    }
+
+    /// The identity of the fan-in resolution the run currently holds: the
+    /// group that produced it, and its bounded code.
+    ///
+    /// The group is part of the identity, not just the code. A resolution is
+    /// absorbing and the next committed delegation replaces the whole group,
+    /// so two rounds of fan-out that resolve the same way are two
+    /// resolutions, while re-reading one resolved group is not.
+    fn fan_in_resolution(&self) -> Option<(u64, AgentTimestampMillis, String)> {
+        let group = self.state().ok()?.run.as_ref()?.loop_state.fan_in()?;
+        let resolution = group.resolution.as_ref()?;
+        Some((group.opened_turn, group.opened_at, resolution.code.clone()))
+    }
+
+    /// Counts a fan-in resolution this operation persisted, exactly once.
+    ///
+    /// Every path that can resolve a group — an awaited child's result, the
+    /// deadline timer, a member send that failed definitively, and an await
+    /// that closed over members which had all already settled — runs through
+    /// [`Self::apply`] or [`Self::accept`], so comparing the resolution
+    /// identity across the whole operation reaches all five bounded codes
+    /// while the transitions themselves stay free of a metrics handle. An
+    /// unchanged identity is a re-read or a replay and counts nothing.
+    fn record_fan_in_resolution(&self, before: Option<(u64, AgentTimestampMillis, String)>) {
+        let after = self.fan_in_resolution();
+        if after == before {
+            return;
+        }
+        if let Some((.., code)) = after {
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_FAN_IN_RESOLUTIONS,
+                1,
+                &[("outcome", code.as_str())],
+            )
+            .ok();
+        }
     }
 
     /// Cranks the loop and dispatches effects, without delivering any owed

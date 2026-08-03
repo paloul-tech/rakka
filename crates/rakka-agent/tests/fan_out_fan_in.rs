@@ -26,12 +26,13 @@ use rakka_agent::{
     delegation_result_operation_id, AgentA2aSendExecutor, AgentA2aSendFinding,
     AgentDelegationRecord, AgentDelegationReport, AgentDelegationStatus, AgentDispatchFuture,
     AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload,
-    AgentFanInPolicy, AgentLoopPhase, AgentModelTurn, AgentRunEffect, AgentRunEntityCommand,
-    AgentRunScope, AgentRunStatus, AgentTaskContent, AgentTaskId, AgentTaskScope, AgentTaskStatus,
-    AgentToolCallId, AgentToolCallRequest, TenantId, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
-    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentFanInPolicy, AgentLoopPhase, AgentModelTurn, AgentRunEffect, AgentRunEffectOutcome,
+    AgentRunEffectRequest, AgentRunEntityCommand, AgentRunScope, AgentRunStatus, AgentTaskContent,
+    AgentTaskId, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest, TenantId,
+    AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 use rakka_agent_workflow::{AgentCorrelationId, AgentEphemeralCredential};
+use rakka_core::InMemoryMetricsRecorder;
 use serde_json::json;
 
 /// A send executor that names each child after the skill it serves, so a
@@ -667,6 +668,272 @@ async fn a_failed_send_is_a_fan_in_disposition_not_a_coordinator_failure() {
         .clone()
         .expect("the group resolved");
     assert!(!resolution.satisfied);
+}
+
+/// The run's dispatched-but-unanswered effects, each paired with the skill it
+/// delegates when it is an A2A send.
+async fn dispatched_effects(fixture: &Fixture) -> Vec<(AgentRunEffect, Option<String>)> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let Some(loop_state) = state.loop_state() else {
+        return Vec::new();
+    };
+    loop_state
+        .effects()
+        .iter()
+        .filter(|effect| effect.is_outstanding())
+        .map(|effect| {
+            let skill = match &effect.request {
+                AgentRunEffectRequest::A2aSend { delegation } => {
+                    Some(delegation.requested_skill.as_str().to_string())
+                }
+                _ => None,
+            };
+            (effect.clone(), skill)
+        })
+        .collect()
+}
+
+/// Records one effect's outcome exactly as the dispatcher's driver would,
+/// without touching its siblings — the lever the interleaving below needs.
+async fn record_outcome(
+    fixture: &Fixture,
+    effect: &AgentRunEffect,
+    outcome: AgentRunEffectOutcome,
+) {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::RecordEffectResult {
+            operation_id: effect
+                .result_operation_id(&run_scope())
+                .expect("the result operation id derives"),
+            effect_id: effect.effect_id.clone(),
+            generation: effect.generation,
+            attempt: effect.attempts.saturating_add(1),
+            fence: 0,
+            outcome: Box::new(outcome),
+        },
+        &fixture.router,
+        fixture.now(),
+    )
+    .await
+    .expect("the effect result applies");
+}
+
+/// Drives the task and the run the way [`Fixture::pump`] does, except that a
+/// send serving one of `held` skills stays with its peer: dispatched, and
+/// unanswered. That is the interleaving a real peer surface produces when one
+/// specialist replies while another is still working.
+async fn pump_holding(fixture: &Fixture, held: &[&str]) {
+    for _round in 0..32 {
+        fixture
+            .settle_task_at(&task_scope())
+            .await
+            .expect("the task settles");
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let progress = run
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await
+            .expect("the run settles");
+        let mut answered = 0;
+        for (effect, skill) in dispatched_effects(fixture).await {
+            if skill.is_some_and(|skill| held.contains(&skill.as_str())) {
+                continue;
+            }
+            let outcome = fixture.dispatcher.answer(&effect).await;
+            record_outcome(fixture, &effect, outcome).await;
+            answered += 1;
+        }
+        if answered == 0
+            && progress.transitions == 0
+            && progress.effects_dispatched == 0
+            && progress.settled == 0
+            && progress.failed == 0
+        {
+            return;
+        }
+    }
+    panic!("the held pump did not quiesce");
+}
+
+/// A straggler whose send fails *after* the group already resolved is still a
+/// fan-in disposition, not a coordinator failure.
+///
+/// `Any` resolves on the first child's result while its sibling's send is
+/// still in flight — the run is `AwaitingTools`, not `AwaitingChildren`, so
+/// the resolution does not resume it. When that sibling's send then fails
+/// definitively, the coordinator must survive: it already has what it waited
+/// for, and its own straggler must not wind it down. Membership in the group,
+/// not a still-unresolved group, is what makes the failure a disposition.
+#[tokio::test]
+async fn a_straggler_send_failing_after_the_resolution_does_not_wind_the_run_down() {
+    let executor = SkillNamedExecutor::new();
+    let fixture = fan_out_fixture(executor.clone());
+    create_fan_out_task(&fixture, Some(AgentFanInPolicy::Any)).await;
+
+    // The first specialist answers and creates its child; the second's send
+    // is still with its peer.
+    pump_holding(&fixture, &[SKILL_2]).await;
+    let children = committed_children(&fixture).await;
+    assert_eq!(children.len(), 1, "only the answered send created a child");
+    let result = child_result_envelope(
+        &fixture,
+        &children[0].0,
+        &children[0].1,
+        AgentTaskStatus::Completed,
+    );
+    assert!(deliver(&fixture, &result).await);
+    let (phase, _, outstanding) = parked_phase(&fixture).await;
+    assert_eq!(
+        phase,
+        AgentLoopPhase::AwaitingTools,
+        "the straggler's send keeps the turn on its effect wait"
+    );
+    assert_eq!(outstanding, 1);
+    assert_eq!(
+        resolution_code(&fixture).await.as_deref(),
+        Some("any-satisfied"),
+        "the first child's result resolved the group already"
+    );
+
+    // Now the straggler's send fails definitively. The coordinator survives.
+    let straggler = dispatched_effects(&fixture)
+        .await
+        .into_iter()
+        .find(|(_, skill)| skill.as_deref() == Some(SKILL_2))
+        .map(|(effect, _)| effect)
+        .expect("the straggler's send is still outstanding");
+    record_outcome(
+        &fixture,
+        &straggler,
+        AgentRunEffectOutcome::Failed {
+            code: "peer-unavailable".to_string(),
+            message: "the specialist surface refused the send".to_string(),
+        },
+    )
+    .await;
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let status = run
+        .state()
+        .expect("state")
+        .status()
+        .expect("the run exists");
+    assert!(
+        !status.is_terminal(),
+        "a resolved group's own straggler is a disposition, not a wind-down; the run \
+         is {status}"
+    );
+
+    fixture.pump().await.expect("the loop should converge");
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert_eq!(
+        run.state().expect("state").status(),
+        Some(AgentRunStatus::Completed),
+        "the coordinator finishes with the child it has"
+    );
+}
+
+/// The fan-in group's persisted resolution code, when it has one.
+async fn resolution_code(fixture: &Fixture) -> Option<String> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    let loop_state = state.loop_state().expect("the loop is running");
+    loop_state
+        .fan_in()
+        .and_then(|group| group.resolution.as_ref())
+        .map(|resolution| resolution.code.clone())
+}
+
+/// Every path that resolves a group counts one bounded
+/// `rakka.agent.fan_in.resolutions` observation, not just the one an arriving
+/// child result takes: the deadline timer's `timed-out` resolution is
+/// reachable only from `FireFanInDeadline`, so a counter emitted at the
+/// result door alone could never observe it.
+#[tokio::test]
+async fn a_deadline_resolution_is_counted_like_a_result_resolution() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let executor = SkillNamedExecutor::new();
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(fan_out_turn_with_deadline())
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(executor),
+    )
+    .with_delegation(delegation_config_with_fan_in())
+    .with_metrics(metrics.clone());
+    create_fan_out_task(&fixture, None).await;
+    fixture.pump().await.expect("the loop should converge");
+    assert_eq!(
+        parked_phase(&fixture).await.0,
+        AgentLoopPhase::AwaitingChildren
+    );
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(
+        AgentRunEntityCommand::FireFanInDeadline {
+            operation_id: rakka_agent::AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Command,
+                [TENANT, "fan-in-deadline", "counted"],
+            )
+            .expect("the operation id derives"),
+        },
+        &fixture.router,
+        fixture.now(),
+    )
+    .await
+    .expect("the deadline fires");
+
+    assert_eq!(
+        resolution_code(&fixture).await.as_deref(),
+        Some("timed-out")
+    );
+    let resolutions = metrics
+        .snapshot()
+        .observations_named(rakka_agent::METRIC_AGENT_FAN_IN_RESOLUTIONS)
+        .len();
+    assert_eq!(
+        resolutions, 1,
+        "the deadline's resolution is counted once, at the command that made it"
+    );
+}
+
+/// The fan-out turn with a wait deadline the parked group can time out on.
+fn fan_out_turn_with_deadline() -> AgentModelTurn {
+    AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Fanning out to both specialists and awaiting them briefly.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-2").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL_2, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({ "deadline": 1 }),
+            )
+            .expect("the tool call is bounded"),
+        )
 }
 
 /// An await with nothing to wait for refuses as a failed tool result the run
