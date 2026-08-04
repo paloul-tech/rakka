@@ -1076,6 +1076,17 @@ async fn ancestors_ride_the_wire_and_omit_when_empty() {
         "an empty ancestry is omitted, so a v1-strict receiver still parses \
          a root-level send"
     );
+
+    // The decode side of the same omission: wire JSON with no `ancestors`
+    // key — a pre-4.4 sender — parses into an empty chain and validates
+    // into provenance with an empty chain.
+    let decoded: AgentCollaborationMetadata =
+        serde_json::from_value(wire).expect("a wire envelope without the key decodes");
+    assert!(decoded.ancestors.is_empty());
+    let provenance = decoded
+        .to_provenance()
+        .expect("the rootward envelope validates");
+    assert!(provenance.ancestors.is_empty());
 }
 
 /// An ancestry that disagrees with the presented lineage fails closed at the

@@ -768,10 +768,12 @@ impl AgentGoalSpec {
         }
         // A quorum that can never resolve is refused at the door it would
         // later dead-lock, exactly as a statically unsatisfiable evidence
-        // demand is.
-        if let Some(crate::fan_in::AgentFanInPolicy::Quorum { n }) = self.fan_in {
-            let maximum = crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS as u32;
-            if n < 1 || n > maximum {
+        // demand is. The policy owns the rule; this door only translates
+        // its refusal into the goal's vocabulary.
+        if let Some(policy) = self.fan_in {
+            if let Err(crate::delegation::AgentDelegationError::QuorumInvalid { n, maximum }) =
+                policy.validate()
+            {
                 return Err(AgentGoalError::FanInQuorumInvalid { n, maximum });
             }
         }

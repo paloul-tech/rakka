@@ -145,7 +145,10 @@ pub struct AgentFanInResolution {
     /// Whether the policy's predicate held.
     pub satisfied: bool,
     /// The members whose success satisfied it, in deterministic set order;
-    /// empty when unsatisfied.
+    /// empty when unsatisfied. Evidence, not decision: under `Any` and
+    /// `Quorum` it holds the successes recorded when resolution first ran,
+    /// so its contents can vary with arrival timing even though `satisfied`
+    /// and `code` — the decision — cannot.
     pub satisfied_by: Vec<AgentDelegationId>,
     /// Stable resolution code ([`resolution_code`]).
     pub code: String,

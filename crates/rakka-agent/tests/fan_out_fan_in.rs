@@ -238,6 +238,22 @@ async fn deliver(fixture: &Fixture, envelope: &AgentExchangeEnvelope) -> bool {
     reply.result().is_accepted()
 }
 
+/// Delivers one exchange and returns the refusal code it was answered with,
+/// when it was refused.
+async fn deliver_code(fixture: &Fixture, envelope: &AgentExchangeEnvelope) -> Option<String> {
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let reply = run
+        .accept(envelope, &fixture.router, fixture.now())
+        .await
+        .expect("the delivery succeeds");
+    reply
+        .result()
+        .status()
+        .rejection_code()
+        .map(ToString::to_string)
+}
+
 /// The fan-out turn opens the group with the trusted policy, the await verb
 /// closes it, and the run rests `AwaitingChildren` — status `Running`, no
 /// outstanding effect, nothing resident. The first child result records
@@ -384,9 +400,11 @@ async fn any_resolves_on_the_first_success_and_the_straggler_records_quietly() {
     assert_eq!(resolution.code, "any-satisfied");
 }
 
-/// A duplicate delivery of one logical result — same operation id, and a
-/// replay past the journal window under a fresh envelope — converges on the
-/// recorded result without a second transition.
+/// A duplicate delivery of one logical result converges on the recorded
+/// result without a second transition — and a conflicting later delivery
+/// under the same derived operation id cannot overwrite the first writer:
+/// the journal answers in-window replays, and the cell's recorded result is
+/// the durable fence behind it.
 #[tokio::test]
 async fn duplicate_results_accept_idempotently() {
     let executor = SkillNamedExecutor::new();
@@ -404,10 +422,17 @@ async fn duplicate_results_accept_idempotently() {
     assert!(deliver(&fixture, &envelope).await);
     // In-window duplicate: the journal answers the replay.
     assert!(deliver(&fixture, &envelope).await);
-    // Past-window shape: the same logical result under the same derived id
-    // delivered again after other traffic — the cell's recorded result is
-    // the durable fence either way.
     assert!(deliver(&fixture, &envelope).await);
+    // A conflicting duplicate — the same derived operation id claiming a
+    // different outcome — cannot become the recorded result: first writer
+    // wins, whichever layer answers the replay.
+    let conflicting = child_result_envelope(
+        &fixture,
+        &children[0].0,
+        &children[0].1,
+        AgentTaskStatus::Cancelled,
+    );
+    let _ = deliver(&fixture, &conflicting).await;
 
     let mut run = fixture.run();
     run.recover(fixture.now()).await.expect("recover");
@@ -455,7 +480,13 @@ async fn forged_reports_refuse_on_the_parents_durable_state() {
         fixture.now(),
     )
     .expect("the envelope is valid");
-    assert!(!deliver(&fixture, &forged).await);
+    // The exact code matters: it is one of the four definitive answers the
+    // child-side settle rule advances on, so a misrouted report can never
+    // leave a real child retrying forever.
+    assert_eq!(
+        deliver_code(&fixture, &forged).await.as_deref(),
+        Some("delegation-result-forged")
+    );
 
     // A delegation this run never committed.
     let foreign = rakka_agent::delegation_id_for(&run_scope(), 99, 0).expect("derives");
@@ -465,7 +496,10 @@ async fn forged_reports_refuse_on_the_parents_durable_state() {
         &AgentTaskId::new("child-somewhere").expect("task id should be valid"),
         AgentTaskStatus::Completed,
     );
-    assert!(!deliver(&fixture, &unknown).await);
+    assert_eq!(
+        deliver_code(&fixture, &unknown).await.as_deref(),
+        Some("delegation-result-unknown-delegation")
+    );
 
     // The cell records nothing from either refusal.
     let mut run = fixture.run();
@@ -507,6 +541,7 @@ async fn a_wound_down_parent_records_evidence_without_resuming() {
     .await
     .expect("the cancellation applies");
 
+    let (phase_before, _, outstanding_before) = parked_phase(&fixture).await;
     let envelope = child_result_envelope(
         &fixture,
         &children[0].0,
@@ -530,6 +565,14 @@ async fn a_wound_down_parent_records_evidence_without_resuming() {
         .expect("the cell exists")
         .clone();
     assert!(cell.result.is_some());
+    // "Resumes nothing" pinned by state, not status alone: the loop phase
+    // did not advance and no new effect was committed.
+    let (phase_after, _, outstanding_after) = parked_phase(&fixture).await;
+    assert_eq!(
+        phase_after, phase_before,
+        "the late evidence advanced nothing"
+    );
+    assert_eq!(outstanding_after, outstanding_before);
 }
 
 /// The parked deadline fires through the durable command: before it is due
@@ -619,6 +662,45 @@ async fn the_deadline_marks_stragglers_and_resolves_timed_out() {
         .expect("the deadline resolved the group");
     assert!(!resolution.satisfied);
     assert_eq!(resolution.code, "timed-out");
+
+    // A late result racing the fired deadline is still accepted as
+    // evidence: the cell records it, and the absorbing resolution does not
+    // change — timed out is what the parent decided from, however the
+    // straggler answers afterwards.
+    let children = committed_children(&fixture).await;
+    let late = child_result_envelope(
+        &fixture,
+        &children[0].0,
+        &children[0].1,
+        AgentTaskStatus::Completed,
+    );
+    assert!(deliver(&fixture, &late).await);
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    assert_eq!(state.status(), Some(AgentRunStatus::Completed));
+    let loop_state = state.loop_state().expect("loop state");
+    assert_eq!(
+        loop_state
+            .fan_in()
+            .expect("the group is retained")
+            .resolution
+            .as_ref()
+            .expect("still resolved")
+            .code,
+        "timed-out",
+        "the absorbing resolution ignores the late result"
+    );
+    assert_eq!(
+        loop_state
+            .delegation(&children[0].0)
+            .expect("the cell exists")
+            .result
+            .as_ref()
+            .expect("the evidence recorded")
+            .status,
+        AgentTaskStatus::Completed
+    );
 }
 
 /// A definitively failed send is a fan-in disposition, not a coordinator
@@ -876,21 +958,21 @@ async fn a_deadline_resolution_is_counted_like_a_result_resolution() {
         AgentLoopPhase::AwaitingChildren
     );
 
+    fixture
+        .clock
+        .store(10_000, std::sync::atomic::Ordering::SeqCst);
+    let fire = |suffix: &'static str| AgentRunEntityCommand::FireFanInDeadline {
+        operation_id: rakka_agent::AgentOperationId::new(
+            rakka_agent::AgentOperationKind::Command,
+            [TENANT, "fan-in-deadline", suffix],
+        )
+        .expect("the operation id derives"),
+    };
     let mut run = fixture.run();
     run.recover(fixture.now()).await.expect("recover");
-    run.apply(
-        AgentRunEntityCommand::FireFanInDeadline {
-            operation_id: rakka_agent::AgentOperationId::new(
-                rakka_agent::AgentOperationKind::Command,
-                [TENANT, "fan-in-deadline", "counted"],
-            )
-            .expect("the operation id derives"),
-        },
-        &fixture.router,
-        fixture.now(),
-    )
-    .await
-    .expect("the deadline fires");
+    run.apply(fire("counted"), &fixture.router, fixture.now())
+        .await
+        .expect("the deadline fires");
 
     assert_eq!(
         resolution_code(&fixture).await.as_deref(),
@@ -903,6 +985,22 @@ async fn a_deadline_resolution_is_counted_like_a_result_resolution() {
     assert_eq!(
         resolutions, 1,
         "the deadline's resolution is counted once, at the command that made it"
+    );
+
+    // A duplicate fire converges on the absorbing resolution and counts
+    // nothing: an unchanged identity is a replay.
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(fire("counted-again"), &fixture.router, fixture.now())
+        .await
+        .expect("a duplicate fire converges");
+    let resolutions = metrics
+        .snapshot()
+        .observations_named(rakka_agent::METRIC_AGENT_FAN_IN_RESOLUTIONS)
+        .len();
+    assert_eq!(
+        resolutions, 1,
+        "the duplicate fire counted no second resolution"
     );
 }
 
@@ -930,10 +1028,224 @@ fn fan_out_turn_with_deadline() -> AgentModelTurn {
             AgentToolCallRequest::new(
                 AgentToolCallId::new("await-1").expect("call id should be valid"),
                 fan_in_tool_id(),
-                json!({ "deadline": 1 }),
+                json!({ "deadline": 5_000 }),
             )
             .expect("the tool call is bounded"),
         )
+}
+
+/// Scenario 27 under `Quorum`, through the run entity: the goal spec's
+/// declared policy reaches the group via the assignment envelope, one
+/// success does not resolve a two-of-two quorum, the second does, and the
+/// resumed model proposes — the integration twin of `fan_in.rs`'s policy
+/// units.
+#[tokio::test]
+async fn a_goal_declared_quorum_resolves_at_n_through_the_run_entity() {
+    let executor = SkillNamedExecutor::new();
+    let fixture = fan_out_fixture(executor.clone());
+    create_fan_out_task(&fixture, Some(AgentFanInPolicy::Quorum { n: 2 })).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    let group = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is running")
+            .fan_in()
+            .expect("the group exists")
+            .clone()
+    };
+    assert_eq!(group.policy, AgentFanInPolicy::Quorum { n: 2 });
+
+    let children = committed_children(&fixture).await;
+    assert_eq!(children.len(), 2);
+    let first = child_result_envelope(
+        &fixture,
+        &children[0].0,
+        &children[0].1,
+        AgentTaskStatus::Completed,
+    );
+    assert!(deliver(&fixture, &first).await);
+    assert_eq!(
+        parked_phase(&fixture).await.0,
+        AgentLoopPhase::AwaitingChildren,
+        "one success is not a two-of-two quorum"
+    );
+
+    let second = child_result_envelope(
+        &fixture,
+        &children[1].0,
+        &children[1].1,
+        AgentTaskStatus::Completed,
+    );
+    assert!(deliver(&fixture, &second).await);
+    fixture.pump().await.expect("the loop should converge");
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert_eq!(
+        run.state().expect("state").status(),
+        Some(AgentRunStatus::Completed)
+    );
+    assert_eq!(
+        resolution_code(&fixture).await.as_deref(),
+        Some("quorum-satisfied")
+    );
+}
+
+/// A model-supplied await deadline that does not lie in the future refuses
+/// (`fan-in-invalid-arguments`) before it can reach durable timer state —
+/// otherwise the first `FireFanInDeadline` would mark every child timed out
+/// before any could report. The group stays open, the model corrects course
+/// with a plain await, and the run completes.
+#[tokio::test]
+async fn a_past_await_deadline_is_refused_before_it_reaches_the_timer() {
+    let executor = SkillNamedExecutor::new();
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let stale = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating and awaiting under a deadline already past.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({ "deadline": 1 }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let corrected = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Awaiting without the stale deadline.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-2").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(stale)
+                .with_turn(corrected)
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(executor.clone()),
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots))
+    .with_delegation(delegation_config_with_fan_in());
+    create_fan_out_task(&fixture, None).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    // The corrected await parked the group — with no deadline, because the
+    // stale one never reached the timer.
+    let group = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        run.state()
+            .expect("state")
+            .loop_state()
+            .expect("the loop is running")
+            .fan_in()
+            .expect("the group exists")
+            .clone()
+    };
+    assert!(group.closed);
+    assert!(group.deadline.is_none(), "the stale deadline was refused");
+    assert_eq!(
+        parked_phase(&fixture).await.0,
+        AgentLoopPhase::AwaitingChildren
+    );
+
+    let children = committed_children(&fixture).await;
+    assert_eq!(children.len(), 1);
+    let result = child_result_envelope(
+        &fixture,
+        &children[0].0,
+        &children[0].1,
+        AgentTaskStatus::Completed,
+    );
+    assert!(deliver(&fixture, &result).await);
+    fixture.pump().await.expect("the loop should converge");
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert_eq!(
+        run.state().expect("state").status(),
+        Some(AgentRunStatus::Completed)
+    );
+
+    // The refusal reached the model under the await verb's stable code.
+    let codes: Vec<String> = {
+        use rakka_agent::SessionMemoryStore;
+        let page = session
+            .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+            .await
+            .expect("the session should read");
+        page.entries
+            .iter()
+            .filter(|entry| entry.role == rakka_agent::MemoryEntryRole::ToolResult)
+            .filter_map(|entry| {
+                entry
+                    .content
+                    .inline_value()
+                    .and_then(|value| value.get("error"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+            .collect()
+    };
+    assert_eq!(codes, vec!["fan-in-invalid-arguments".to_string()]);
+}
+
+/// Removes every occurrence of the named keys from a JSON tree — the shape
+/// of a record persisted before the field existed.
+fn strip_keys(value: &mut serde_json::Value, keys: &[&str]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys {
+                map.remove(*key);
+            }
+            for entry in map.values_mut() {
+                strip_keys(entry, keys);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_keys(item, keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A pre-4.4 run state — no `fan_in` cell, no `delegation_envelope` on the
+/// loop — still decodes, with both fields defaulting to absent: exactly the
+/// pre-slice semantics.
+#[tokio::test]
+async fn a_pre_slice_run_state_decodes_without_the_fan_out_fields() {
+    let executor = SkillNamedExecutor::new();
+    let fixture = fan_out_fixture(executor.clone());
+    create_fan_out_task(&fixture, None).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let mut encoded = serde_json::to_value(run.state().expect("state")).expect("encodes");
+    strip_keys(&mut encoded, &["fan_in", "delegation_envelope"]);
+    let decoded: rakka_agent::AgentRunState =
+        serde_json::from_value(encoded).expect("a pre-slice run state decodes");
+    let loop_state = decoded.loop_state().expect("loop state");
+    assert!(loop_state.fan_in().is_none());
+    assert!(loop_state.delegation_envelope().is_none());
 }
 
 /// An await with nothing to wait for refuses as a failed tool result the run

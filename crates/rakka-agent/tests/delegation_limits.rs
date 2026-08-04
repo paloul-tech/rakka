@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use common::{
     delegation_config_with_fan_in, delegation_tool_id, goal_spec_draft, goal_spec_with_fan_out,
-    goal_task_creation_command, run_scope, skill_id, task_definition, task_scope, Fixture, SKILL,
-    SKILL_2, TENANT,
+    goal_task_creation_command, run_scope, skill_id, task_definition, Fixture, SKILL, SKILL_2,
+    TENANT,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::SessionMemoryStore;
@@ -585,7 +585,6 @@ async fn an_incoherent_ancestry_refuses_the_child_creation() {
         .await
         .expect_err("the forged ancestry refuses the creation");
     assert_eq!(error.code(), "task-delegation-provenance-invalid");
-    let _ = task_scope();
 }
 
 /// The definition's own delegation ceilings cap what any provenance can
@@ -649,6 +648,44 @@ async fn the_definition_ceiling_caps_a_forged_root_grant() {
     assert_eq!(executor.sent(), 1);
     let codes = session_refusal_codes(&session).await;
     assert_eq!(codes, vec!["delegation-fan-out-exceeded".to_string()]);
+}
+
+/// The even-split sub-quota over numbers that do not divide: a conserved
+/// allocation of ten across a fan-out of three grants the first child
+/// ⌊(10−1)/3⌋ = 3 and prices it 1 + 3; the second call re-prices over the
+/// slots that remain and grants ⌊(6−1)/2⌋ = 2 — the recorded grant and the
+/// wire cap agree at every step, and nothing refuses.
+#[tokio::test]
+async fn the_sub_quota_splits_unevenly_and_re_prices_per_slot() {
+    let world = ceiling_world(AgentGoalDelegationBudget {
+        max_descendants: Some(10),
+        max_fan_out: Some(3),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(committed_cells(&world.fixture).await, 2);
+    assert_eq!(world.executor.sent(), 2);
+    assert!(session_refusal_codes(&world.session).await.is_empty());
+    let seen = world
+        .executor
+        .seen
+        .lock()
+        .expect("the record log should not be poisoned");
+    let grants: Vec<_> = seen
+        .iter()
+        .map(|record| record.granted_descendants)
+        .collect();
+    assert_eq!(grants, vec![Some(3), Some(2)]);
+    let wire_caps: Vec<_> = seen
+        .iter()
+        .map(|record| {
+            record
+                .budget
+                .expect("the wire budget rides the record")
+                .max_descendants
+        })
+        .collect();
+    assert_eq!(wire_caps, vec![Some(3), Some(2)]);
 }
 
 /// The definition's ceilings reach a task with neither a goal record nor

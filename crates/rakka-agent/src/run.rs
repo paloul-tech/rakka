@@ -2255,6 +2255,20 @@ fn evaluate_model_output(
             {
                 match crate::fan_in::AgentFanInToolCall::parse(&call.arguments) {
                     Ok(parsed) => {
+                        // The deadline is the one model-supplied value that
+                        // reaches durable timer state, so it fails closed like
+                        // every other model input: a deadline not in the
+                        // future would let the first `FireFanInDeadline` mark
+                        // every child timed out before any could report. The
+                        // envelope bound is trusted state and stays exempt.
+                        if parsed.deadline.is_some_and(|deadline| deadline <= now) {
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: "fan-in-invalid-arguments".to_string(),
+                                message: "the await deadline must lie in the future".to_string(),
+                            });
+                            continue;
+                        }
                         let deadline = match (
                             parsed.deadline,
                             envelope.as_ref().and_then(|env| env.deadline),
@@ -4490,8 +4504,9 @@ where
                 // settlement failure, so the replay must re-drive the settle
                 // pass the committed transition still owes — answering from
                 // the log alone would leave the run stalled on work it durably
-                // recorded but never dispatched.
-                self.settle_side_effects(router, now).await?;
+                // recorded but never dispatched. The inner pass: `apply`'s
+                // own sampling scope wraps this call.
+                self.settle_side_effects_inner(router, now).await?;
                 return Ok(AgentRunEntityReply::Duplicate { outcome });
             }
         }
@@ -4643,7 +4658,8 @@ where
             }
         };
 
-        self.settle_side_effects(router, now).await?;
+        // The inner pass: `apply`'s own sampling scope wraps this call.
+        self.settle_side_effects_inner(router, now).await?;
         Ok(reply)
     }
 
@@ -4713,10 +4729,15 @@ where
     /// Every path that can resolve a group — an awaited child's result, the
     /// deadline timer, a member send that failed definitively, and an await
     /// that closed over members which had all already settled — runs through
-    /// [`Self::apply`] or [`Self::accept`], so comparing the resolution
+    /// [`Self::apply`], [`Self::accept`], or a direct
+    /// [`Self::settle_side_effects`] sweep, so comparing the resolution
     /// identity across the whole operation reaches all five bounded codes
     /// while the transitions themselves stay free of a metrics handle. An
-    /// unchanged identity is a re-read or a replay and counts nothing.
+    /// unchanged identity is a re-read or a replay and counts nothing. A
+    /// replacement cannot swallow a count: replacing a group requires a
+    /// model-committed delegation, a model turn is answered in its own
+    /// operation, and that operation's starting sample already saw the
+    /// resolved group.
     fn record_fan_in_resolution(&self, before: Option<(u64, AgentTimestampMillis, String)>) {
         let after = self.fan_in_resolution();
         if after == before {
@@ -4779,7 +4800,24 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunProgress> {
         self.ensure_recovered(now).await?;
+        // A sweep can resolve the group too — an await that closed over
+        // members which had all already settled advances here, and a member
+        // send that fails definitively settles here — so a direct sweep
+        // counts its resolution exactly as `apply` and `accept` do. The
+        // inner pass carries no sampling of its own, because `apply` calls
+        // it inside its whole-operation scope.
+        let resolution_before = self.fan_in_resolution();
+        let progress = self.settle_side_effects_inner(router, now).await;
+        self.record_fan_in_resolution(resolution_before);
+        progress
+    }
 
+    /// [`Self::settle_side_effects`] without its metric bookkeeping.
+    async fn settle_side_effects_inner(
+        &mut self,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<AgentRunProgress> {
         let mut progress = AgentRunProgress::default();
         for _round in 0..AGENT_RUN_MAX_SETTLE_ROUNDS {
             let advanced = self.advance_loop(now).await?;
@@ -5344,13 +5382,18 @@ pub enum AgentRunEntityCommand {
     },
     /// Fire the parked fan-in wait's deadline
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md):
-    /// timed-out children are handled explicitly by policy). A scheduler
-    /// delivers it at the closed group's deadline; it marks the still-
-    /// unresolved members timed out — a parent-side disposition, never a
-    /// forged child result — and resolves the group deterministically. A
-    /// deadline not yet due, a group already resolved, or no group at all
-    /// is a no-op, so the command is safe to deliver early, late, or twice.
-    /// Chasing or cancelling the stragglers themselves is slice 4.6.
+    /// timed-out children are handled explicitly by policy). **The hosting
+    /// application owes the scheduler**: exactly as with
+    /// [`Self::FireCheckpointTimers`], nothing in this crate delivers the
+    /// command — the deadline is readable from the parked group
+    /// (`loop_state.fan_in()`), and an `All`-policy wait whose child is
+    /// lost parks until this fires or slice 4.6's straggler chase lands.
+    /// It marks the still-unresolved members timed out — a parent-side
+    /// disposition, never a forged child result — and resolves the group
+    /// deterministically. A deadline not yet due, a group already resolved,
+    /// or no group at all is a no-op, so the command is safe to deliver
+    /// early, late, or twice. Chasing or cancelling the stragglers
+    /// themselves is slice 4.6.
     FireFanInDeadline {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,

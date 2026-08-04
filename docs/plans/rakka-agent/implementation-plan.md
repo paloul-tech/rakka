@@ -2883,6 +2883,22 @@ Done when: scenarios 27 and 34 pass, including coordinator loss and resume.
   `a_delegation_planned_after_the_await_is_refused_and_the_run_survives`,
   `a_plain_tasks_definition_ceilings_enforce_at_the_door`, and
   `a_delegated_creation_carrying_a_goal_spec_is_refused`.
+- **Minor-findings pass (2026-08-04).** A model-supplied await deadline must
+  lie in the future (`fan-in-invalid-arguments` otherwise; the envelope
+  bound stays trusted); a direct `settle_side_effects` sweep counts its
+  fan-in resolution (public wrapper + unsampled inner pass); the
+  `FireFanInDeadline` rustdoc states the hosting application owes the
+  scheduler — record that obligation wherever ops docs grow; the goal
+  door's quorum bound delegates to `AgentFanInPolicy::validate`;
+  `satisfied_by` documented as timing-dependent evidence. Coverage added:
+  quorum through the run entity, deadline-vs-late-result absorption, uneven
+  sub-quota split per slot, conflicting-duplicate first-writer fence, exact
+  forged-report codes, wound-down pinned by phase+effects, duplicate
+  deadline counts once, pre-4.4 run-state decode, ancestors-key-omitted
+  wire decode. Still owed from the review: a descendants-conservation test
+  across an actual replacement generation (the terminal fold is pinned;
+  driving a real second generation through a failed run is not), and
+  crash-point sweeps over the new fan-in compare-and-sets.
 
 ### Slice 4.5 — Workflows as tools
 
