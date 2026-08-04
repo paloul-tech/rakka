@@ -505,3 +505,101 @@ fn pre_slice_records_decode_without_the_delegation_fields() {
         serde_json::from_value(encoded).expect("a pre-slice creation decodes");
     assert!(decoded.delegation.is_none());
 }
+
+/// Records persisted before slice 4.4 decode without its additive fields:
+/// the ledger's descendants dimension, the record's ancestry and sub-quota,
+/// the provenance's ancestry, the envelope's ancestry and fan-in policy, and
+/// the goal spec's fan-in declaration all default — and default to the
+/// pre-slice semantics.
+#[test]
+fn pre_slice_records_decode_without_the_fan_out_fields() {
+    // The conserved allocation and consumption: a pre-4.4 ledger record has
+    // no descendants field, and decodes as unbounded / zero.
+    let mut allocation =
+        serde_json::to_value(rakka_agent::AgentBudgetAllocation::nothing()).expect("encodes");
+    allocation
+        .as_object_mut()
+        .expect("an object")
+        .remove("descendants");
+    let allocation: rakka_agent::AgentBudgetAllocation =
+        serde_json::from_value(allocation).expect("a pre-slice allocation decodes");
+    assert!(allocation.descendants.is_none(), "unbounded, as before");
+    let mut consumption =
+        serde_json::to_value(rakka_agent::AgentBudgetConsumption::zero()).expect("encodes");
+    consumption
+        .as_object_mut()
+        .expect("an object")
+        .remove("descendants");
+    let consumption: rakka_agent::AgentBudgetConsumption =
+        serde_json::from_value(consumption).expect("a pre-slice consumption decodes");
+    assert_eq!(consumption.descendants, 0);
+
+    // The delegation record: ancestry and the descendant sub-quota default,
+    // and the untagged grant is what the bounded door refuses over.
+    let parent_run = run_scope();
+    let delegation = delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
+    let record = AgentDelegationRecord {
+        delegation: delegation.clone(),
+        goal: None,
+        parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
+        parent_run: parent_run.clone(),
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new(SKILL).expect("capability id"),
+        resolved: common::delegation_target(),
+        a2a_message_id: delegation.as_str().to_string(),
+        deduplication_key: delegation.as_str().to_string(),
+        turn: 1,
+        slot: 0,
+        effect: rakka_agent_workflow::AgentEffectId::new("effect-1"),
+        call_id: AgentToolCallId::new("call-1").expect("call id"),
+        input: AgentTaskContent::inline(json!({ "text": "hello" })).expect("bounded"),
+        result_schema: None,
+        budget: None,
+        granted_descendants: Some(3),
+        deadline: None,
+        definition_revision: rakka_agent::AgentRevisionNumber::INITIAL,
+        settings_revision: rakka_agent::AgentRevisionNumber::INITIAL,
+        telemetry: Default::default(),
+        created_at: rakka_agent_workflow::AgentTimestampMillis::new(1),
+    };
+    let mut encoded = serde_json::to_value(&record).expect("encodes");
+    let object = encoded.as_object_mut().expect("an object");
+    object.remove("ancestors");
+    object.remove("granted_descendants");
+    let decoded: AgentDelegationRecord =
+        serde_json::from_value(encoded).expect("a pre-slice record decodes");
+    assert!(decoded.ancestors.is_empty());
+    assert!(decoded.granted_descendants.is_none());
+    decoded.validate().expect("the decoded record is coherent");
+
+    // The cell: a pre-slice cell has no child result.
+    let mut cell = serde_json::to_value(rakka_agent::AgentDelegationCell::pending(Box::new(
+        record.clone(),
+    )))
+    .expect("encodes");
+    cell.as_object_mut().expect("an object").remove("result");
+    let cell: rakka_agent::AgentDelegationCell =
+        serde_json::from_value(cell).expect("a pre-slice cell decodes");
+    assert!(cell.result.is_none());
+    assert!(!cell.child_settled());
+
+    // The envelope: ancestry and the fan-in declaration default.
+    let mut envelope =
+        serde_json::to_value(rakka_agent::AgentRunDelegationEnvelope::default()).expect("encodes");
+    let object = envelope.as_object_mut().expect("an object");
+    object.remove("ancestors");
+    object.remove("fan_in");
+    let envelope: rakka_agent::AgentRunDelegationEnvelope =
+        serde_json::from_value(envelope).expect("a pre-slice envelope decodes");
+    assert!(envelope.ancestors.is_empty());
+    assert!(envelope.fan_in.is_none());
+
+    // The goal spec: a pre-slice spec declares no fan-in policy.
+    let mut spec = serde_json::to_value(goal_spec_with_delegation()).expect("encodes");
+    spec.as_object_mut().expect("an object").remove("fan_in");
+    let spec: rakka_agent::AgentGoalSpec =
+        serde_json::from_value(spec).expect("a pre-slice goal spec decodes");
+    assert!(spec.fan_in.is_none());
+}

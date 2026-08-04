@@ -82,7 +82,7 @@ use serde::{Deserialize, Serialize};
 use crate::budget::{AgentBudgetExhaustion, AgentRunBudget};
 use crate::checkpoints::{AgentCheckpoint, AgentCheckpointGrant};
 use crate::definition::{AgentRevisionNumber, AgentTaskDefinitionId};
-use crate::delegation::{AgentDelegationCell, AgentRunDelegationEnvelope};
+use crate::delegation::{AgentDelegationCell, AgentDelegationStatus, AgentRunDelegationEnvelope};
 use crate::effect::{
     AgentEffectError, AgentRunEffect, AgentToolResult, AGENT_RUN_MAX_PENDING_EFFECTS,
 };
@@ -175,6 +175,13 @@ pub enum AgentLoopPhase {
     EvaluatingModelOutput,
     /// One or more tool effects are outstanding. The run is not executing.
     AwaitingTools,
+    /// A closed fan-in group awaits its children's durable results. The run
+    /// is not executing and not resident: each result is an inter-entity
+    /// exchange that re-activates the owner, and the fan-in resolution is
+    /// what completes the awaiting turn ([specification 8.7]).
+    ///
+    /// [specification 8.7]: ../../../docs/plans/rakka-agent/spec.md
+    AwaitingChildren,
     /// Fold the turn into the durable session.
     RecordingTurn,
     /// Decide what follows the turn: propose the result, or iterate again.
@@ -194,6 +201,7 @@ impl AgentLoopPhase {
             Self::AwaitingModel => "awaiting-model",
             Self::EvaluatingModelOutput => "evaluating-model-output",
             Self::AwaitingTools => "awaiting-tools",
+            Self::AwaitingChildren => "awaiting-children",
             Self::RecordingTurn => "recording-turn",
             Self::DecidingContinuation => "deciding-continuation",
             Self::Suspended => "suspended",
@@ -222,10 +230,13 @@ impl AgentLoopPhase {
         )
     }
 
-    /// Whether the phase is a durable wait on an effect.
+    /// Whether the phase is a durable wait on an effect or on children.
     #[must_use]
     pub const fn is_waiting(self) -> bool {
-        matches!(self, Self::AwaitingModel | Self::AwaitingTools)
+        matches!(
+            self,
+            Self::AwaitingModel | Self::AwaitingTools | Self::AwaitingChildren
+        )
     }
 }
 
@@ -403,6 +414,14 @@ pub struct AgentLoopState {
     /// without one, which means no goal narrowing.
     #[serde(default)]
     delegation_envelope: Option<Box<AgentRunDelegationEnvelope>>,
+    /// The run's one durable fan-out group, opened in the compare-and-set
+    /// that commits its first delegation and replaced by the next delegation
+    /// after resolution ([specification 8.7]). A loop state persisted before
+    /// this field decodes without one.
+    ///
+    /// [specification 8.7]: ../../../docs/plans/rakka-agent/spec.md
+    #[serde(default)]
+    fan_in: Option<Box<crate::fan_in::AgentFanInCell>>,
 }
 
 /// One completed goal evaluation and where its report to the coordinating
@@ -479,6 +498,7 @@ impl AgentLoopState {
             goal_evaluation: None,
             delegations: BTreeMap::new(),
             delegation_envelope: None,
+            fan_in: None,
         }
     }
 
@@ -1165,6 +1185,82 @@ impl AgentLoopState {
         self.delegations.len()
     }
 
+    /// Direct children this run has spent against its fan-out ceiling: every
+    /// cell whose send is pending or created a child. A `Failed` or
+    /// `Conflicted` cell provably created nothing, which is the known terminal
+    /// send outcome that releases its debit.
+    #[must_use]
+    pub fn delegation_fan_out_spent(&self) -> u64 {
+        self.delegations
+            .values()
+            .filter(|cell| {
+                matches!(
+                    cell.status,
+                    AgentDelegationStatus::Pending | AgentDelegationStatus::ChildCreated { .. }
+                )
+            })
+            .count() as u64
+    }
+
+    /// Concurrently unsettled direct children: a pending send counts —
+    /// deny-when-unknown — and a created child counts until its terminal
+    /// result is recorded.
+    #[must_use]
+    pub fn delegation_active_children(&self) -> u64 {
+        self.delegations
+            .values()
+            .filter(|cell| match cell.status {
+                AgentDelegationStatus::Pending => true,
+                AgentDelegationStatus::ChildCreated { .. } => !cell.child_settled(),
+                _ => false,
+            })
+            .count() as u64
+    }
+
+    /// The descendants this run's live delegations hold: one per child plus
+    /// its granted sub-quota, over every cell whose send is pending or created
+    /// a child.
+    ///
+    /// `None` when the spend is unaccountable: a live cell committed before
+    /// the descendants dimension existed carries no grant, and a bounded run
+    /// cannot know what that child's subtree may still create — the door then
+    /// refuses further delegation, deny-when-unknown. A run whose allocation
+    /// is unbounded never consults this.
+    #[must_use]
+    pub fn delegation_descendants_spent(&self) -> Option<u64> {
+        let mut spent = 0_u64;
+        for cell in self.delegations.values() {
+            if !matches!(
+                cell.status,
+                AgentDelegationStatus::Pending | AgentDelegationStatus::ChildCreated { .. }
+            ) {
+                continue;
+            }
+            let granted = cell.record.granted_descendants?;
+            spent = spent.saturating_add(1).saturating_add(granted);
+        }
+        Some(spent)
+    }
+
+    /// The descendants spend the run's terminal transition folds into its
+    /// consumption: the same live cells as
+    /// [`Self::delegation_descendants_spent`], with an unaccountable pre-slice
+    /// grant folded at its known floor of one — the child itself — rather than
+    /// blocking the settlement the parent is owed.
+    #[must_use]
+    pub fn delegation_descendants_consumed(&self) -> u64 {
+        self.delegations
+            .values()
+            .filter(|cell| {
+                matches!(
+                    cell.status,
+                    AgentDelegationStatus::Pending | AgentDelegationStatus::ChildCreated { .. }
+                )
+            })
+            .map(|cell| 1_u64.saturating_add(cell.record.granted_descendants.unwrap_or(0)))
+            .fold(0, u64::saturating_add)
+    }
+
     /// The delegation authority the assignment carried, when it carried one.
     #[must_use]
     pub fn delegation_envelope(&self) -> Option<&AgentRunDelegationEnvelope> {
@@ -1174,6 +1270,94 @@ impl AgentLoopState {
     /// Stores the delegation authority the accepted assignment carried.
     pub(crate) fn set_delegation_envelope(&mut self, envelope: AgentRunDelegationEnvelope) {
         self.delegation_envelope = Some(Box::new(envelope));
+    }
+
+    /// The run's one durable fan-out group, when it holds one.
+    #[must_use]
+    pub fn fan_in(&self) -> Option<&crate::fan_in::AgentFanInCell> {
+        self.fan_in.as_deref()
+    }
+
+    /// Mutable access to the group, for the transitions that close, mark, and
+    /// resolve it.
+    pub(crate) fn fan_in_mut(&mut self) -> Option<&mut crate::fan_in::AgentFanInCell> {
+        self.fan_in.as_deref_mut()
+    }
+
+    /// Whether a closed, unresolved group awaits its children — the run's
+    /// non-resident wait between the await verb and the fan-in resolution.
+    #[must_use]
+    pub fn awaits_fan_in(&self) -> bool {
+        self.fan_in.as_deref().is_some_and(|cell| cell.awaiting())
+    }
+
+    /// Joins one committed delegation to the group, opening it — or replacing
+    /// a resolved, absorbing predecessor — with the policy fixed from trusted
+    /// state in the same compare-and-set
+    /// ([specification 8.7]: the fan-in rule is durable before any child can
+    /// report). Idempotent on the member: a replayed transition re-inserts
+    /// into the same set.
+    ///
+    /// A closed-but-unresolved group is unreachable here — the planner
+    /// refuses a delegation planned after the same turn's await
+    /// (`delegation-after-await`), and a parked run plans nothing — and left
+    /// untouched if it ever were.
+    ///
+    /// [specification 8.7]: ../../../docs/plans/rakka-agent/spec.md
+    pub(crate) fn join_fan_in(
+        &mut self,
+        policy: crate::fan_in::AgentFanInPolicy,
+        member: AgentDelegationId,
+        turn: u64,
+        now: AgentTimestampMillis,
+    ) {
+        match self.fan_in.as_deref_mut() {
+            Some(cell) if cell.resolution.is_none() => {
+                if !cell.closed {
+                    cell.members.insert(member);
+                }
+            }
+            _ => {
+                self.fan_in = Some(Box::new(crate::fan_in::AgentFanInCell::open(
+                    policy, member, turn, now,
+                )));
+            }
+        }
+    }
+
+    /// Closes the group's membership under the model's await call, returning
+    /// whether an open group with members was there to close. Replay-
+    /// idempotent: a group already closed under the same call reports closed.
+    pub(crate) fn close_fan_in(
+        &mut self,
+        call_id: crate::model::AgentToolCallId,
+        deadline: Option<AgentTimestampMillis>,
+        turn: u64,
+    ) -> bool {
+        let Some(cell) = self.fan_in.as_deref_mut() else {
+            return false;
+        };
+        if cell.resolution.is_some() || cell.members.is_empty() {
+            return false;
+        }
+        if cell.closed {
+            return cell.await_call.as_ref() == Some(&call_id);
+        }
+        cell.closed = true;
+        cell.await_call = Some(call_id);
+        cell.await_turn = Some(turn);
+        cell.deadline = deadline;
+        true
+    }
+
+    /// Persists the group's resolution, first-writer-wins: the resolution is
+    /// absorbing, and a recomputation can never rewrite it.
+    pub(crate) fn resolve_fan_in(&mut self, resolution: crate::fan_in::AgentFanInResolution) {
+        if let Some(cell) = self.fan_in.as_deref_mut() {
+            if cell.resolution.is_none() {
+                cell.resolution = Some(resolution);
+            }
+        }
     }
 
     /// Bounded receipts of the run's settled memory promotions, newest last.

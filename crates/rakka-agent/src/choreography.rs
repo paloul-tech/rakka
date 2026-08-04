@@ -430,11 +430,45 @@ pub enum AgentExchangeKind {
     /// the decision door's acceptance or its refusal, and under a configured
     /// evaluator this exchange is the only ingress a criteria decision has.
     GoalEvaluation,
+    /// A delegated child task returning its terminal outcome to the parent
+    /// run that created it, as bounded references only
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md): child
+    /// results return durably deduplicated and participate in deterministic
+    /// fan-in). Initiated by the child task once terminal with its ledger
+    /// closed; the reply is the parent run's acceptance, or a refusal the
+    /// child's settle rule classifies as definitive or re-drivable.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: nothing is
+    ///   owed yet; recovery re-reaches the terminal state whose transition
+    ///   owes the identical envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the cell
+    ///   result and the acceptance committed in one compare-and-set; the
+    ///   re-driven envelope hits the receiver's journal deduplication and
+    ///   returns the original reply.
+    /// - **Reply loss**: identical to the previous window — re-drive,
+    ///   deduplicate, original outcome.
+    /// - **Duplicate delivery inside the deduplication window**: the journal
+    ///   answers the replay; no second transition runs.
+    /// - **Duplicate delivery past the bounded window**: the cell's recorded
+    ///   result is the durable fence — the arm finds it present and accepts
+    ///   idempotently with no state change.
+    /// - **Stale shard owner**: the durable-state compare-and-set refuses
+    ///   the stale write; the new owner converges.
+    /// - **Parent gone, forged, or never assigned**: a settled refusal the
+    ///   child's settle rule accepts as definitive, so the child stops
+    ///   re-driving; a wound-down parent instead records the result as
+    ///   evidence and resumes nothing.
+    DelegationResult,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -443,6 +477,7 @@ impl AgentExchangeKind {
         Self::BudgetReturn,
         Self::EpochResult,
         Self::GoalEvaluation,
+        Self::DelegationResult,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -457,6 +492,7 @@ impl AgentExchangeKind {
             Self::BudgetReturn => "budget-return",
             Self::EpochResult => "epoch-result",
             Self::GoalEvaluation => "goal-evaluation",
+            Self::DelegationResult => "delegation-result",
         }
     }
 }

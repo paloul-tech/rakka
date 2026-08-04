@@ -124,14 +124,15 @@ use crate::evaluation::{
     AgentStagnationTrigger,
 };
 use crate::goal::{
-    AgentGoalCriteriaSource, AgentGoalDecision, AgentGoalError, AgentGoalExhaustionAction,
-    AgentGoalMode, AgentGoalOutcome, AgentGoalSpecDraft, AgentGoalSpecRevision, AgentGoalState,
-    AgentGoalStatus, AgentGoalStatusView, AgentGoalTerminalReason, AgentGoalWaitReason,
+    AgentGoalCriteriaSource, AgentGoalDecision, AgentGoalDelegationBudget, AgentGoalError,
+    AgentGoalExhaustionAction, AgentGoalMode, AgentGoalOutcome, AgentGoalSpecDraft,
+    AgentGoalSpecRevision, AgentGoalState, AgentGoalStatus, AgentGoalStatusView,
+    AgentGoalTerminalReason, AgentGoalWaitReason,
 };
 use crate::identity::{
-    validated_id, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
-    AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId,
-    AGENT_IDENTITY_MAX_LENGTH,
+    validated_id, AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId,
+    AgentOperationKind, AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope,
+    AgentWakeId, TenantId, AGENT_IDENTITY_MAX_LENGTH,
 };
 use crate::observability::{
     record_agent_domain_counter, METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE,
@@ -256,6 +257,13 @@ pub const AGENT_EPOCH_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.EpochResult";
 
 /// Payload type of the controller's reply to an epoch result.
 pub const AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.EpochResultOutcome";
+
+/// Payload type of an [`AgentExchangeKind::DelegationResult`] exchange.
+pub const AGENT_DELEGATION_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.DelegationResult";
+
+/// Payload type of the parent run's reply to a delegation result.
+pub const AGENT_DELEGATION_RESULT_OUTCOME_PAYLOAD_TYPE: &str =
+    "rakka.agent.DelegationResultOutcome";
 
 /// Payload type of an [`AgentExchangeKind::GoalEvaluation`] exchange: the
 /// full [`crate::evaluation::AgentGoalEvaluationRecord`].
@@ -1289,6 +1297,16 @@ pub struct AgentTaskDefinition {
     /// parent-local allocation decision
     /// [specification 9.7](../../../docs/plans/rakka-agent/spec.md) describes.
     pub run_allocation: Option<AgentBudgetAllocation>,
+    /// The definition's own delegation ceilings, which every delegation
+    /// authority a task of this definition receives is min-narrowed to
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): parent
+    /// *and definition* ceilings enforce at allocation and admission time).
+    ///
+    /// This is the one cap a forged or inflated provenance cannot escape: a
+    /// peer minting a "root child" under this definition still delegates only
+    /// what the definition permits. `None` bounds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<AgentGoalDelegationBudget>,
     /// What happens to this task when a dependency does not complete.
     pub dependency_policy: AgentDependencyFailurePolicy,
     /// Who may complete the task.
@@ -1328,6 +1346,7 @@ impl AgentTaskDefinition {
             limits: AgentTaskLimits::new(),
             budgets: AgentBudgetCeilings::unbounded(),
             run_allocation: None,
+            delegation: None,
             dependency_policy: AgentDependencyFailurePolicy::default(),
             ownership: AgentTaskOwnership::default(),
             // Attended is the safe default: an unattended class is the one that
@@ -1366,6 +1385,13 @@ impl AgentTaskDefinition {
     #[must_use]
     pub const fn with_run_allocation(mut self, allocation: AgentBudgetAllocation) -> Self {
         self.run_allocation = Some(allocation);
+        self
+    }
+
+    /// Sets the definition's own delegation ceilings.
+    #[must_use]
+    pub const fn with_delegation(mut self, delegation: AgentGoalDelegationBudget) -> Self {
+        self.delegation = Some(delegation);
         self
     }
 
@@ -1512,6 +1538,8 @@ impl<'de> Deserialize<'de> for AgentTaskDefinition {
             limits: AgentTaskLimits,
             budgets: AgentBudgetCeilings,
             run_allocation: Option<AgentBudgetAllocation>,
+            #[serde(default)]
+            delegation: Option<AgentGoalDelegationBudget>,
             dependency_policy: AgentDependencyFailurePolicy,
             ownership: AgentTaskOwnership,
             operation_class: AgentOperationClass,
@@ -1531,6 +1559,7 @@ impl<'de> Deserialize<'de> for AgentTaskDefinition {
             limits: wire.limits,
             budgets: wire.budgets,
             run_allocation: wire.run_allocation,
+            delegation: wire.delegation,
             dependency_policy: wire.dependency_policy,
             ownership: wire.ownership,
             operation_class: wire.operation_class,
@@ -3622,13 +3651,33 @@ pub fn assignment_operation_id(
     )
 }
 
+/// The granted delegation ceilings min-narrowed to the definition's own
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): parent and
+/// definition ceilings enforce at allocation and admission time). `None` on
+/// either side is the unbounded identity.
+fn narrowed_delegation_budget(
+    granted: Option<AgentGoalDelegationBudget>,
+    definition: Option<AgentGoalDelegationBudget>,
+) -> Option<AgentGoalDelegationBudget> {
+    match (granted, definition) {
+        (Some(granted), Some(definition)) => Some(granted.narrowed_to(&definition)),
+        (granted, definition) => granted.or(definition),
+    }
+}
+
 /// The delegation authority one assignment carries to its run.
 ///
 /// A goal-bearing root projects its spec's skill and tool narrowing, its
 /// delegation ceilings, and its deadline; a delegated child projects its own
 /// creation provenance — the full ancestor chain including the delegation
-/// that created it, at the depth the parent recorded. A task that is neither
-/// carries nothing, and its run enforces no goal narrowing.
+/// that created it, at the depth the parent recorded, with the ancestor-agent
+/// chain extended by the delegating parent's own agent so the run's cycle
+/// check sees the whole chain. Either way the ceilings are min-narrowed to
+/// the task definition's own, which is the cap no provenance can escape. A
+/// task that is neither — an epoch task, or a plain agent-owned task —
+/// carries no goal narrowing and no chain, but still carries its
+/// definition's own ceilings when the definition declares any: without an
+/// envelope the delegation door would enforce nothing for these runs.
 fn delegation_envelope_for(
     task: &AgentTask,
 ) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
@@ -3637,25 +3686,57 @@ fn delegation_envelope_for(
         return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
             allowed_skills: spec.allowed_skills.clone(),
             allowed_tools: spec.allowed_tools.clone(),
-            budget: spec.delegation,
+            budget: narrowed_delegation_budget(spec.delegation, task.definition.delegation),
             lineage: Vec::new(),
+            ancestors: Vec::new(),
             depth: 0,
             deadline: spec.deadline,
+            fan_in: spec.fan_in,
         }));
     }
     if let Some(provenance) = task.delegation.as_deref() {
         let mut lineage = provenance.lineage.clone();
         lineage.push(provenance.delegation.clone());
+        // The ancestry stays parallel to the lineage: the delegating parent
+        // committed `provenance.delegation`, so its agent closes the chain.
+        // A provenance whose own ancestry predates the field carries lineage
+        // without agents; the envelope then carries the same gap, and the
+        // run's cycle check refuses to extend it rather than trusting it.
+        let mut ancestors = provenance.ancestors.clone();
+        if !ancestors.is_empty() || provenance.lineage.is_empty() {
+            ancestors.push(provenance.parent_run.agent().clone());
+        }
         return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
             allowed_skills: BTreeSet::new(),
             allowed_tools: BTreeSet::new(),
-            budget: provenance.budget,
+            budget: narrowed_delegation_budget(provenance.budget, task.definition.delegation),
             lineage,
+            ancestors,
             depth: provenance.depth,
             deadline: provenance.deadline,
+            // A delegated child's own fan-out groups open under its wiring's
+            // default: the parent's policy governs the parent's group, not
+            // the child's.
+            fan_in: None,
         }));
     }
-    None
+    // The definition is the cap no creation shape escapes: a run with no
+    // envelope at all would enforce no depth, fan-out, or concurrency
+    // ceiling at its delegation door. Root position — no chain, no
+    // narrowing, no deadline — and its fan-out groups open under the
+    // wiring's default.
+    task.definition.delegation.map(|ceilings| {
+        Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: BTreeSet::new(),
+            allowed_tools: BTreeSet::new(),
+            budget: Some(ceilings),
+            lineage: Vec::new(),
+            ancestors: Vec::new(),
+            depth: 0,
+            deadline: None,
+            fan_in: None,
+        })
+    })
 }
 
 /// Creates the task, or fails closed.
@@ -3701,6 +3782,19 @@ fn create_task(
                     provenance.parent_run.tenant(),
                     state.scope.tenant()
                 ),
+            });
+        }
+        // A delegated child cannot institute a goal of its own: a goal record
+        // would win the run's delegation envelope and re-root the chain —
+        // empty lineage, empty ancestors, depth zero — so the ceilings and
+        // the cycle set the parent committed would vanish from every door
+        // check. One creation shape carries one authority chain.
+        if creation.goal_spec.is_some() {
+            return Err(AgentTaskError::DelegationProvenanceInvalid {
+                message: "a creation carrying delegation provenance cannot also carry a goal \
+                          spec: a delegated child contributes to its parent's goal and may not \
+                          re-root the delegation chain"
+                    .to_string(),
             });
         }
     }
@@ -3792,12 +3886,44 @@ fn create_task(
         Some(grant) => grant,
         None => AgentBudgetGrant::from_ceilings(&creation.definition.budgets),
     };
-    let escrow = AgentEscrowLedger::new(match &creation.goal_spec {
+    let mut seed = match &creation.goal_spec {
         Some(draft) => {
             AgentBudgetGrant::new(draft.spec.allocation, draft.spec.limits).narrowed_to(&base_grant)
         }
         None => base_grant,
-    });
+    };
+    // The conserved descendants seed: the escrow this task holds in the
+    // descendants dimension is min-narrowed to every delegation ceiling in
+    // scope — the definition's own, the goal spec's at a root, and the
+    // parent-granted provenance budget at a delegated child. The provenance
+    // is a validated cap, never a conserved grant riding A2A: the ledger
+    // builds from the task's own ceilings, and a peer can only shrink it.
+    let descendants_ceiling = [
+        creation
+            .definition
+            .delegation
+            .and_then(|d| d.max_descendants),
+        creation
+            .goal_spec
+            .as_ref()
+            .and_then(|draft| draft.spec.delegation.and_then(|d| d.max_descendants)),
+        creation
+            .delegation
+            .as_deref()
+            .and_then(|p| p.budget.and_then(|b| b.max_descendants)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(u64::from)
+    .min();
+    if let Some(ceiling) = descendants_ceiling {
+        let bounded = seed
+            .allocation
+            .descendants
+            .map_or(ceiling, |held| held.min(ceiling));
+        seed.allocation.descendants = Some(bounded);
+    }
+    let escrow = AgentEscrowLedger::new(seed);
 
     if creation.wake.is_some() && creation.parent.is_none() {
         // An epoch task exists to return its result to the controller that
@@ -4268,6 +4394,118 @@ fn owed_epoch_result(
         )?
         .with_telemetry(task.telemetry.clone()),
     ))
+}
+
+/// The payload an [`AgentExchangeKind::DelegationResult`] exchange carries to
+/// the parent run: one delegated child task's terminal outcome, as bounded
+/// references only ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A child's terminal state is evidence returned to the parent — never a goal
+/// decision, and never the child's content: the digest fingerprints the
+/// accepted result, and the child task id is the authorized-query handle for
+/// anything more.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentDelegationReport {
+    /// The delegation whose child reports.
+    pub delegation: AgentDelegationId,
+    /// The reporting child task.
+    pub child_task: AgentTaskId,
+    /// The run that served the child's terminal assignment, when it was ever
+    /// assigned one.
+    #[serde(default)]
+    pub child_run: Option<AgentRunId>,
+    /// The child task's terminal status.
+    pub status: AgentTaskStatus,
+    /// The child's stable terminal-reason code, when it recorded one.
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    /// The accepted result's fingerprint, when the child produced one.
+    #[serde(default)]
+    pub result_digest: Option<AgentContentDigest>,
+    /// Descendant tasks the child's own subtree created, from its settled
+    /// ledger. Recorded on the parent's cell for a later slice to credit
+    /// unused sub-quota; slice 4.4 never credits.
+    #[serde(default)]
+    pub descendants_created: u64,
+}
+
+/// The delegation-result exchange one terminal delegated child owes its
+/// parent run, when it owes one now.
+///
+/// Owed exactly once, after the child's own ledger closed — the run's
+/// settlement and return have both applied, so the consumption-derived
+/// fields are final. The journal's initiation record is the once-guard,
+/// exactly as the epoch result's.
+fn owed_delegation_result(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    if !task.status.is_terminal() {
+        return Ok(None);
+    }
+    let Some(provenance) = task.delegation.as_deref() else {
+        return Ok(None);
+    };
+    if task.escrow.outstanding().count() > 0 {
+        // The child's run has not settled and returned its escrow yet;
+        // reporting now would carry a non-final consumption.
+        return Ok(None);
+    }
+    let operation_id = crate::delegation::delegation_result_operation_id(
+        state.scope.tenant(),
+        &provenance.delegation,
+    )?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let child_run = (task.assignment_generation != AgentAssignmentGeneration::UNASSIGNED)
+        .then(|| run_id_for_assignment(state.scope.task(), task.assignment_generation))
+        .transpose()?;
+    let report = AgentDelegationReport {
+        delegation: provenance.delegation.clone(),
+        child_task: state.scope.task().clone(),
+        child_run,
+        status: task.status,
+        terminal_reason: task
+            .terminal_reason
+            .as_ref()
+            .map(|reason| reason.code().to_string()),
+        result_digest: task
+            .accepted_result
+            .as_ref()
+            .map(|accepted| accepted.digest.clone()),
+        descendants_created: task.escrow.consumed().descendants,
+    };
+    let payload = AgentExchangePayload::encode(AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, &report)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::DelegationResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Run(provenance.parent_run.clone()),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Every child report a terminal task owes right now: the epoch result to a
+/// wake controller, the delegation result to a delegating parent run. One
+/// consult point, so every transition that can close a terminal task's
+/// ledger owes both from the same compare-and-set.
+fn owed_child_reports(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let mut owed = Vec::new();
+    owed.extend(owed_epoch_result(state, now)?);
+    owed.extend(owed_delegation_result(state, now)?);
+    Ok(owed)
 }
 
 /// Applies one epoch's result to the controller that admitted its wake:
@@ -6007,7 +6245,10 @@ fn refuse_assignment(
 }
 
 /// Decides one assignment against the agent facts the entity read from durable
-/// state, and returns the run-creation exchange the decision owes.
+/// state, and returns the exchanges the decision owes: the run-creation
+/// command of a decided assignment, or — when the decision exhausts the
+/// task's assignments instead — the terminal reports the newly terminal task
+/// owes upward, from this same compare-and-set.
 ///
 /// The transition is idempotent on the task's own state: a task that already has
 /// an assignment is not assignable, so a replay produces no second generation.
@@ -6015,15 +6256,17 @@ fn decide_assignment(
     state: &mut AgentTaskState,
     readiness: &AgentAssignmentReadiness,
     now: AgentTimestampMillis,
-) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
     let task = state.task_mut()?;
     if !task.awaits_assignment() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     if let Some((reason, detail)) = readiness.refusal() {
-        return refuse_assignment(state, readiness, reason, detail, now);
+        return Ok(refuse_assignment(state, readiness, reason, detail, now)?
+            .into_iter()
+            .collect());
     }
 
     if task.assignments >= task.definition.limits.max_assignments {
@@ -6035,7 +6278,12 @@ fn decide_assignment(
             AgentTaskTerminalReason::AssignmentsExhausted { assignments },
             now,
         )?;
-        return Ok(None);
+        // The exhaustion closed this task's ledger — every refused
+        // generation's escrow was released at its settle, so nothing is
+        // outstanding — and a delegated child's parent is parked awaiting
+        // exactly this outcome: the reports the terminal task owes upward
+        // are accurate now, and owed from this same compare-and-set.
+        return owed_child_reports(state, now);
     }
 
     let (agent_definition_revision, agent_settings_revision) =
@@ -6071,7 +6319,7 @@ fn decide_assignment(
         if let Some(dimension) = permanent {
             apply_goal_exhaustion(state, &operation_id, dimension, now)?;
         }
-        return Ok(refusal);
+        return Ok(refusal.into_iter().collect());
     }
     let request = task.definition.run_allocation_request();
     let allocation = task
@@ -6141,7 +6389,7 @@ fn decide_assignment(
         )
         .with_assignment(&assignment)
     });
-    Ok(Some(envelope))
+    Ok(vec![envelope])
 }
 
 /// Validates one proposed result by deterministic rules alone, and records the
@@ -6565,14 +6813,18 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             | AgentExchangeKind::BudgetSettlement
             | AgentExchangeKind::BudgetReturn => {
                 let result = apply_ledger_exchange(state, envelope, now);
-                // A ledger exchange may have closed a terminal epoch's own
+                // A ledger exchange may have closed a terminal child's own
                 // ledger: the run's settlement and return both applied, so
-                // the result this epoch owes its controller is now accurate —
-                // and owed in this same compare-and-set.
+                // the reports this child owes upward — the epoch result to
+                // its controller, the delegation result to its parent run —
+                // are now accurate, and owed in this same compare-and-set.
                 let mut transition = AgentExchangeTransition::new(result);
-                match owed_epoch_result(state, now) {
-                    Ok(Some(owed)) => transition = transition.owing(owed),
-                    Ok(None) => {}
+                match owed_child_reports(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
                     Err(error) => {
                         // Owing cannot fail for records this binary wrote; a
                         // failure is a bug. The settlement itself is applied
@@ -6581,7 +6833,7 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                         // the owe is skipped loudly instead. The strict
                         // propagation on the cancellation paths catches
                         // systematic construction bugs in tests.
-                        debug_assert!(false, "epoch-result construction failed: {error}");
+                        debug_assert!(false, "child-report construction failed: {error}");
                     }
                 }
                 return transition;
@@ -6597,6 +6849,41 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             ),
         };
         AgentExchangeTransition::new(result)
+    }
+
+    fn check_settle(
+        &self,
+        envelope: &AgentExchangeEnvelope,
+        result: &AgentExchangeResult,
+    ) -> Result<(), crate::choreography::AgentChoreographyError> {
+        match envelope.kind() {
+            AgentExchangeKind::DelegationResult if !result.is_accepted() => {
+                // A refused delegation result settles only under the parent's
+                // definitive answers: the delegation is unknown, forged, not
+                // owned, or the run never existed — undeliverable however
+                // often it is re-driven. Every other refusal is the
+                // receiver's inability — a `delegation-result-early` receipt
+                // race, an `unsupported-exchange` from an owner that predates
+                // the kind, a payload it could not decode — and the exchange
+                // stays outstanding for re-drive until an owner that can
+                // answer it does.
+                match result.status().rejection_code() {
+                    Some(
+                        "delegation-result-unknown-run"
+                        | "delegation-result-unknown-delegation"
+                        | "delegation-result-forged"
+                        | "delegation-result-not-owned",
+                    ) => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DelegationResult,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     fn settle(
@@ -6644,8 +6931,9 @@ fn apply_creation_exchange(
 /// Settles the run's answer to an assignment.
 ///
 /// An acceptance moves the task to `InProgress`. A refusal retires the
-/// generation and leaves the task assignable, so the next decision creates a new
-/// run rather than reusing a run that refused.
+/// generation, releases its escrow — the run never accepted, so nothing was
+/// consumed — and leaves the task assignable, so the next decision creates a
+/// new run rather than reusing a run that refused.
 fn settle_assignment(
     state: &mut AgentTaskState,
     envelope: &AgentExchangeEnvelope,
@@ -6704,6 +6992,27 @@ fn settle_assignment(
         detail: bounded_detail(code.clone()),
         refused_at: now,
     });
+    // The refused generation's escrow debit is released in this same settle:
+    // the run never accepted, so it consumed nothing, and a child left
+    // outstanding would both shrink the headroom every later generation is
+    // decided against and hold the ledger gate closed over the terminal
+    // reports an exhausted child owes upward. Idempotent: a re-driven settle
+    // finds the assignment already retired and never reaches here.
+    if let Ok(child) = AgentEscrowChildId::for_run(&assignment.run) {
+        if task
+            .escrow
+            .settle_child(&child, &AgentBudgetConsumption::default())
+            .is_ok()
+        {
+            // Returning a child this transition just settled cannot fail for
+            // records this binary wrote; a failure is a construction bug.
+            let returned = task.escrow.return_child(&child);
+            debug_assert!(
+                returned.is_ok(),
+                "refused-generation escrow return failed: {returned:?}"
+            );
+        }
+    }
     state.updated_at = now;
     state.record_history(|sequence| {
         AgentTaskHistoryEntry::new(
@@ -6936,11 +7245,11 @@ where
             } => {
                 self.transition(now, readiness, move |state| {
                     record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
-                    // A failed dependency can terminate an epoch with no
-                    // outstanding escrow; it owes its terminal result to the
-                    // controller in this same transition, exactly as a
-                    // cancellation does.
-                    let owed = owed_epoch_result(state, now)?.into_iter().collect();
+                    // A failed dependency can terminate a child task with no
+                    // outstanding escrow; it owes its terminal reports — the
+                    // epoch result, the delegation result — in this same
+                    // transition, exactly as a cancellation does.
+                    let owed = owed_child_reports(state, now)?;
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -6958,10 +7267,11 @@ where
                         },
                         now,
                     )?;
-                    // A cancelled epoch with no outstanding escrow owes its
-                    // terminal result to the controller in this same
+                    // A cancelled child with no outstanding escrow owes its
+                    // terminal reports — the epoch result to its controller,
+                    // the delegation result to its parent run — in this same
                     // transition.
-                    let owed = owed_epoch_result(state, now)?.into_iter().collect();
+                    let owed = owed_child_reports(state, now)?;
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -7652,9 +7962,14 @@ where
             .host
             .initiate(now, |state| {
                 match decide_assignment(state, &readiness, now) {
-                    Ok(envelope) => {
-                        assigned = envelope.is_some();
-                        Ok(envelope.into_iter().collect())
+                    Ok(envelopes) => {
+                        // The decision may instead have exhausted the task's
+                        // assignments and owed its terminal reports; only a
+                        // run-creation command counts as an assignment made.
+                        assigned = envelopes
+                            .iter()
+                            .any(|envelope| envelope.kind() == AgentExchangeKind::Assignment);
+                        Ok(envelopes)
                     }
                     Err(error) => {
                         let carried = AgentChoreographyError::from(error.clone());

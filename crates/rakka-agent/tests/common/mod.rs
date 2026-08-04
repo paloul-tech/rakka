@@ -134,6 +134,7 @@ pub fn goal_spec() -> rakka_agent::AgentGoalSpec {
         allocation: AgentBudgetAllocation::unbounded(),
         limits: rakka_agent::AgentBudgetLimits::unbounded(),
         delegation: None,
+        fan_in: None,
         exhaustion: rakka_agent::AgentGoalExhaustionPolicy::default(),
         allowed_skills: Default::default(),
         allowed_tools: Default::default(),
@@ -307,10 +308,67 @@ pub fn delegation_config() -> rakka_agent::AgentRunDelegationConfig {
     .expect("the delegation configuration declares the capability")
 }
 
+/// The await verb the fan-in fixture declares.
+pub const FAN_IN_TOOL: &str = "await_children";
+
+/// The second skill the fan-out fixture may delegate, resolved to a second
+/// specialist so scenario 27's "multiple specialist agents" is two distinct
+/// targets, not one twice.
+pub const SKILL_2: &str = "summarization";
+
+/// The second specialist agent.
+pub const SPECIALIST_2: &str = "summarizer";
+
+pub fn fan_in_tool_id() -> rakka_agent::AgentToolId {
+    rakka_agent::AgentToolId::new(FAN_IN_TOOL).expect("tool id should be valid")
+}
+
+pub fn skill_2_id() -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(SKILL_2).expect("capability id should be valid")
+}
+
+/// The delegation wiring with the await verb declared and both specialist
+/// skills resolvable.
+pub fn delegation_config_with_fan_in() -> rakka_agent::AgentRunDelegationConfig {
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(skill_id(), delegation_target())
+                .with_target(
+                    skill_2_id(),
+                    rakka_agent::AgentDelegationTarget::new(
+                        AgentId::new(SPECIALIST_2).expect("agent id should be valid"),
+                        AgentTaskDefinitionId::new("summarize-document")
+                            .expect("definition id should be valid"),
+                    ),
+                ),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+    .with_fan_in_tool(fan_in_tool_id())
+}
+
 /// The fixture goal contract narrowed to delegating [`skill_id`] only.
 pub fn goal_spec_with_delegation() -> rakka_agent::AgentGoalSpec {
     let mut spec = goal_spec();
     spec.allowed_skills = std::collections::BTreeSet::from([skill_id()]);
+    spec
+}
+
+/// The fixture goal contract allowing both specialist skills, with an
+/// explicit fan-in policy and delegation ceilings for the fan-out tests.
+pub fn goal_spec_with_fan_out(
+    fan_in: Option<rakka_agent::AgentFanInPolicy>,
+    delegation: Option<rakka_agent::AgentGoalDelegationBudget>,
+) -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.allowed_skills = std::collections::BTreeSet::from([skill_id(), skill_2_id()]);
+    spec.fan_in = fan_in;
+    spec.delegation = delegation;
     spec
 }
 
@@ -938,6 +996,28 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             entity = entity.with_delegation(delegation.clone());
         }
         entity
+    }
+
+    /// Applies one command to a task entity at an explicit scope — the
+    /// delegated child tasks the fan-out tests create and cancel.
+    pub async fn apply_task_command_at(
+        &self,
+        scope: &AgentTaskScope,
+        command: AgentTaskEntityCommand,
+    ) -> Result<rakka_agent::AgentTaskEntityReply, rakka_agent::AgentTaskError> {
+        let mut task = AgentTaskEntityStore::new(
+            scope.clone(),
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        task.recover(now).await?;
+        task.apply(command, &self.router, self.now()).await
     }
 
     /// Settles one task entity at an explicit scope, the way a recovery sweep
