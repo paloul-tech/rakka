@@ -2868,6 +2868,21 @@ Done when: scenarios 27 and 34 pass, including coordinator loss and resume.
   propagation and straggler chase (4.6), workflow members reusing the
   member-disposition interface (4.5), descendant credit-back, and the
   federated A2A result carrier.
+- **Review fixes (2026-08-03).** Four findings closed after review: (1) an
+  `AssignmentsExhausted` terminal now owes the child's terminal reports from
+  the terminating transition, and a run-refused generation releases its
+  escrow at its settle — without both, an `All` parent with no deadline
+  parked forever over a definitively failed child; (2) the planner refuses a
+  delegation planned after the same turn's await (`delegation-after-await`)
+  — the orphan member would have revived the superseded wind-down;
+  (3) `delegation_envelope_for` grew a third, definition-only arm so epoch
+  and plain tasks enforce `AgentTaskDefinition::delegation` at the door;
+  (4) `create_task` refuses a creation carrying both a goal spec and
+  delegation provenance, closing the lineage re-rooting door. Pinned by
+  `an_assignments_exhausted_delegated_child_owes_its_delegation_result`,
+  `a_delegation_planned_after_the_await_is_refused_and_the_run_survives`,
+  `a_plain_tasks_definition_ceilings_enforce_at_the_door`, and
+  `a_delegated_creation_carrying_a_goal_spec_is_refused`.
 
 ### Slice 4.5 — Workflows as tools
 

@@ -1104,6 +1104,125 @@ async fn real_child_tasks_return_results_through_the_exchange_fabric() {
     }
 }
 
+/// A delegation the model plans after the same turn's await is refused
+/// (`delegation-after-await`): the await closes the run's one fan-out group,
+/// so a later call could join nothing — a member no await covers, whose
+/// definitive send failure would wind the coordinator down over a child the
+/// group never held. The await still parks over the membership committed
+/// before it, the refusal reaches the model as the call's failed tool
+/// result, and the run survives to resolution.
+#[tokio::test]
+async fn a_delegation_planned_after_the_await_is_refused_and_the_run_survives() {
+    let executor = SkillNamedExecutor::new();
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let sandwich = AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("Delegating, awaiting, then delegating out of order.")
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-1").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("await-1").expect("call id should be valid"),
+                fan_in_tool_id(),
+                json!({}),
+            )
+            .expect("the tool call is bounded"),
+        )
+        .with_tool_call(
+            AgentToolCallRequest::new(
+                AgentToolCallId::new("delegate-2").expect("call id should be valid"),
+                delegation_tool_id(),
+                json!({ "skill": SKILL_2, "input": { "text": "hello" } }),
+            )
+            .expect("the tool call is bounded"),
+        );
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(sandwich)
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(executor.clone()),
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots))
+    .with_delegation(delegation_config_with_fan_in());
+    create_fan_out_task(&fixture, None).await;
+    fixture.pump().await.expect("the loop should converge");
+
+    // Only the delegation planned before the await committed and crossed.
+    let children = committed_children(&fixture).await;
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        executor
+            .seen
+            .lock()
+            .expect("the record log should not be poisoned")
+            .len(),
+        1,
+        "the refused delegation never reached the executor"
+    );
+
+    // The run parked over that single member.
+    let (phase, status, outstanding) = parked_phase(&fixture).await;
+    assert_eq!(phase, AgentLoopPhase::AwaitingChildren);
+    assert_eq!(status, Some(AgentRunStatus::Running));
+    assert_eq!(outstanding, 0);
+
+    // The one member's result resolves the group and the coordinator
+    // finishes with the children it has.
+    let result = child_result_envelope(
+        &fixture,
+        &children[0].0,
+        &children[0].1,
+        AgentTaskStatus::Completed,
+    );
+    assert!(deliver(&fixture, &result).await);
+    fixture.pump().await.expect("the loop should converge");
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    let state = run.state().expect("state");
+    assert_eq!(state.status(), Some(AgentRunStatus::Completed));
+
+    // The refusal reached the resumed model under its stable code — the
+    // session records what the model actually saw.
+    let codes: Vec<String> = {
+        use rakka_agent::SessionMemoryStore;
+        let page = session
+            .read(&run_scope(), rakka_agent::SessionMemoryCursor::start())
+            .await
+            .expect("the session should read");
+        page.entries
+            .iter()
+            .filter(|entry| entry.role == rakka_agent::MemoryEntryRole::ToolResult)
+            .filter_map(|entry| {
+                entry
+                    .content
+                    .inline_value()
+                    .and_then(|value| value.get("error"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+            .collect()
+    };
+    assert_eq!(codes, vec!["delegation-after-await".to_string()]);
+    let resolution = state
+        .loop_state()
+        .expect("loop state")
+        .fan_in()
+        .expect("the group is retained")
+        .resolution
+        .clone()
+        .expect("the group resolved");
+    assert!(resolution.satisfied);
+    assert_eq!(resolution.code, "all-settled");
+}
+
 /// The child-side settle rule: a refused report settles only under the
 /// parent's definitive answers — unknown, forged, not owned, or a run that
 /// never existed. A receipt race, an undecodable payload, and an owner that

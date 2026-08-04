@@ -3674,8 +3674,10 @@ fn narrowed_delegation_budget(
 /// chain extended by the delegating parent's own agent so the run's cycle
 /// check sees the whole chain. Either way the ceilings are min-narrowed to
 /// the task definition's own, which is the cap no provenance can escape. A
-/// task that is neither carries nothing, and its run enforces no goal
-/// narrowing.
+/// task that is neither — an epoch task, or a plain agent-owned task —
+/// carries no goal narrowing and no chain, but still carries its
+/// definition's own ceilings when the definition declares any: without an
+/// envelope the delegation door would enforce nothing for these runs.
 fn delegation_envelope_for(
     task: &AgentTask,
 ) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
@@ -3718,7 +3720,23 @@ fn delegation_envelope_for(
             fan_in: None,
         }));
     }
-    None
+    // The definition is the cap no creation shape escapes: a run with no
+    // envelope at all would enforce no depth, fan-out, or concurrency
+    // ceiling at its delegation door. Root position — no chain, no
+    // narrowing, no deadline — and its fan-out groups open under the
+    // wiring's default.
+    task.definition.delegation.map(|ceilings| {
+        Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: BTreeSet::new(),
+            allowed_tools: BTreeSet::new(),
+            budget: Some(ceilings),
+            lineage: Vec::new(),
+            ancestors: Vec::new(),
+            depth: 0,
+            deadline: None,
+            fan_in: None,
+        })
+    })
 }
 
 /// Creates the task, or fails closed.
@@ -3764,6 +3782,19 @@ fn create_task(
                     provenance.parent_run.tenant(),
                     state.scope.tenant()
                 ),
+            });
+        }
+        // A delegated child cannot institute a goal of its own: a goal record
+        // would win the run's delegation envelope and re-root the chain —
+        // empty lineage, empty ancestors, depth zero — so the ceilings and
+        // the cycle set the parent committed would vanish from every door
+        // check. One creation shape carries one authority chain.
+        if creation.goal_spec.is_some() {
+            return Err(AgentTaskError::DelegationProvenanceInvalid {
+                message: "a creation carrying delegation provenance cannot also carry a goal \
+                          spec: a delegated child contributes to its parent's goal and may not \
+                          re-root the delegation chain"
+                    .to_string(),
             });
         }
     }
@@ -6214,7 +6245,10 @@ fn refuse_assignment(
 }
 
 /// Decides one assignment against the agent facts the entity read from durable
-/// state, and returns the run-creation exchange the decision owes.
+/// state, and returns the exchanges the decision owes: the run-creation
+/// command of a decided assignment, or — when the decision exhausts the
+/// task's assignments instead — the terminal reports the newly terminal task
+/// owes upward, from this same compare-and-set.
 ///
 /// The transition is idempotent on the task's own state: a task that already has
 /// an assignment is not assignable, so a replay produces no second generation.
@@ -6222,15 +6256,17 @@ fn decide_assignment(
     state: &mut AgentTaskState,
     readiness: &AgentAssignmentReadiness,
     now: AgentTimestampMillis,
-) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
     let task = state.task_mut()?;
     if !task.awaits_assignment() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     if let Some((reason, detail)) = readiness.refusal() {
-        return refuse_assignment(state, readiness, reason, detail, now);
+        return Ok(refuse_assignment(state, readiness, reason, detail, now)?
+            .into_iter()
+            .collect());
     }
 
     if task.assignments >= task.definition.limits.max_assignments {
@@ -6242,7 +6278,12 @@ fn decide_assignment(
             AgentTaskTerminalReason::AssignmentsExhausted { assignments },
             now,
         )?;
-        return Ok(None);
+        // The exhaustion closed this task's ledger — every refused
+        // generation's escrow was released at its settle, so nothing is
+        // outstanding — and a delegated child's parent is parked awaiting
+        // exactly this outcome: the reports the terminal task owes upward
+        // are accurate now, and owed from this same compare-and-set.
+        return owed_child_reports(state, now);
     }
 
     let (agent_definition_revision, agent_settings_revision) =
@@ -6278,7 +6319,7 @@ fn decide_assignment(
         if let Some(dimension) = permanent {
             apply_goal_exhaustion(state, &operation_id, dimension, now)?;
         }
-        return Ok(refusal);
+        return Ok(refusal.into_iter().collect());
     }
     let request = task.definition.run_allocation_request();
     let allocation = task
@@ -6348,7 +6389,7 @@ fn decide_assignment(
         )
         .with_assignment(&assignment)
     });
-    Ok(Some(envelope))
+    Ok(vec![envelope])
 }
 
 /// Validates one proposed result by deterministic rules alone, and records the
@@ -6890,8 +6931,9 @@ fn apply_creation_exchange(
 /// Settles the run's answer to an assignment.
 ///
 /// An acceptance moves the task to `InProgress`. A refusal retires the
-/// generation and leaves the task assignable, so the next decision creates a new
-/// run rather than reusing a run that refused.
+/// generation, releases its escrow — the run never accepted, so nothing was
+/// consumed — and leaves the task assignable, so the next decision creates a
+/// new run rather than reusing a run that refused.
 fn settle_assignment(
     state: &mut AgentTaskState,
     envelope: &AgentExchangeEnvelope,
@@ -6950,6 +6992,27 @@ fn settle_assignment(
         detail: bounded_detail(code.clone()),
         refused_at: now,
     });
+    // The refused generation's escrow debit is released in this same settle:
+    // the run never accepted, so it consumed nothing, and a child left
+    // outstanding would both shrink the headroom every later generation is
+    // decided against and hold the ledger gate closed over the terminal
+    // reports an exhausted child owes upward. Idempotent: a re-driven settle
+    // finds the assignment already retired and never reaches here.
+    if let Ok(child) = AgentEscrowChildId::for_run(&assignment.run) {
+        if task
+            .escrow
+            .settle_child(&child, &AgentBudgetConsumption::default())
+            .is_ok()
+        {
+            // Returning a child this transition just settled cannot fail for
+            // records this binary wrote; a failure is a construction bug.
+            let returned = task.escrow.return_child(&child);
+            debug_assert!(
+                returned.is_ok(),
+                "refused-generation escrow return failed: {returned:?}"
+            );
+        }
+    }
     state.updated_at = now;
     state.record_history(|sequence| {
         AgentTaskHistoryEntry::new(
@@ -7899,9 +7962,14 @@ where
             .host
             .initiate(now, |state| {
                 match decide_assignment(state, &readiness, now) {
-                    Ok(envelope) => {
-                        assigned = envelope.is_some();
-                        Ok(envelope.into_iter().collect())
+                    Ok(envelopes) => {
+                        // The decision may instead have exhausted the task's
+                        // assignments and owed its terminal reports; only a
+                        // run-creation command counts as an assignment made.
+                        assigned = envelopes
+                            .iter()
+                            .any(|envelope| envelope.kind() == AgentExchangeKind::Assignment);
+                        Ok(envelopes)
                     }
                     Err(error) => {
                         let carried = AgentChoreographyError::from(error.clone());

@@ -2240,6 +2240,7 @@ fn evaluate_model_output(
     };
     let mut planned: Vec<PlannedCall> = Vec::with_capacity(calls.len());
     let mut next_slot = slot_base;
+    let mut await_planned = false;
     for call in calls {
         if let Some(config) = delegation {
             // The declared await verb closes the fan-in group: parsed under
@@ -2265,6 +2266,7 @@ fn evaluate_model_output(
                             call_id: call.call_id,
                             deadline,
                         });
+                        await_planned = true;
                     }
                     Err(error) => planned.push(PlannedCall::Refused {
                         call_id: call.call_id,
@@ -2275,6 +2277,25 @@ fn evaluate_model_output(
                 continue;
             }
             if call.tool == config.tool {
+                if await_planned {
+                    // The await planned earlier in this turn closes the run's
+                    // one fan-out group, and the commit loop applies calls in
+                    // this same order: a delegation committed after the close
+                    // could join nothing — the cell stays closed and
+                    // unresolved until the wait ends — leaving a member no
+                    // await can ever cover, whose definitive send failure
+                    // would wind the coordinator down over a child the group
+                    // never held. Refused instead; the model delegates before
+                    // awaiting, or in the turn the resolution resumes.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-after-await".to_string(),
+                        message: "this turn already closed its fan-out group; plan delegations \
+                                  before the await, or in the turn after the fan-in resolves"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 match plan_delegation_call(
                     scope,
                     config,

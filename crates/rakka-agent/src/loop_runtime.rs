@@ -1298,8 +1298,10 @@ impl AgentLoopState {
     /// report). Idempotent on the member: a replayed transition re-inserts
     /// into the same set.
     ///
-    /// A closed-but-unresolved group is unreachable here — the run is parked
-    /// and no interception can plan — and left untouched if it ever were.
+    /// A closed-but-unresolved group is unreachable here — the planner
+    /// refuses a delegation planned after the same turn's await
+    /// (`delegation-after-await`), and a parked run plans nothing — and left
+    /// untouched if it ever were.
     ///
     /// [specification 8.7]: ../../../docs/plans/rakka-agent/spec.md
     pub(crate) fn join_fan_in(

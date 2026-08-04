@@ -650,3 +650,71 @@ async fn the_definition_ceiling_caps_a_forged_root_grant() {
     let codes = session_refusal_codes(&session).await;
     assert_eq!(codes, vec!["delegation-fan-out-exceeded".to_string()]);
 }
+
+/// The definition's ceilings reach a task with neither a goal record nor
+/// delegation provenance: a plain agent-owned task's runs — an epoch task's
+/// equally — carry the definition-only envelope, so
+/// `AgentTaskDefinition::delegation` enforces at the door instead of
+/// enforcing nothing for the very tasks that have no other authority source.
+#[tokio::test]
+async fn a_plain_tasks_definition_ceilings_enforce_at_the_door() {
+    let executor = CountingExecutor::new();
+    let session = Arc::new(rakka_agent::InMemorySessionMemoryStore::new());
+    let snapshots = Arc::new(rakka_agent::InMemoryContextSnapshotStore::new());
+    let fixture = Fixture::new(
+        ScriptedDispatcher::with_adapter(
+            DeterministicModelAdapter::new()
+                .with_turn(two_delegation_turn())
+                .with_turn(proposing_turn()),
+        )
+        .with_a2a_send_executor(executor.clone()),
+    )
+    .with_memory(rakka_agent::AgentRunMemory::new(session.clone(), snapshots))
+    .with_delegation(delegation_config_with_fan_in());
+    fixture.instantiate_agent().await;
+    fixture
+        .create_task_with(
+            task_definition().with_delegation(AgentGoalDelegationBudget {
+                max_fan_out: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await;
+    fixture.pump().await.expect("the loop should converge");
+
+    assert_eq!(committed_cells(&fixture).await, 1);
+    assert_eq!(executor.sent(), 1);
+    let codes = session_refusal_codes(&session).await;
+    assert_eq!(codes, vec!["delegation-fan-out-exceeded".to_string()]);
+}
+
+/// A creation carrying both a goal spec and delegation provenance refuses:
+/// the goal record would win the run's envelope and re-root the chain —
+/// empty ancestors, depth zero — voiding the parent's ceilings and the
+/// cycle set at every later door.
+#[tokio::test]
+async fn a_delegated_creation_carrying_a_goal_spec_is_refused() {
+    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new().with_turn(proposing_turn()),
+    ))
+    .with_delegation(delegation_config_with_fan_in());
+    fixture.instantiate_agent().await;
+
+    let mut command = goal_task_creation_command(
+        task_definition(),
+        goal_spec_draft(goal_spec_with_fan_out(None, None), true),
+    );
+    let rakka_agent::AgentTaskEntityCommand::Create { creation, .. } = &mut command else {
+        panic!("the goal creation command is a create");
+    };
+    creation.delegation = Some(Box::new(chain_provenance(
+        vec![rakka_agent::AgentId::new("root-coordinator").expect("agent id")],
+        None,
+    )));
+
+    let error = fixture
+        .apply_task_command(command)
+        .await
+        .expect_err("a delegated child cannot institute its own goal");
+    assert_eq!(error.code(), "task-delegation-provenance-invalid");
+}
