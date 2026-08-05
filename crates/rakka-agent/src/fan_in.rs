@@ -23,23 +23,149 @@
 //! and the goal's evaluator still judge
 //! ([specification 8.3 and 14.4](../../../docs/plans/rakka-agent/spec.md)).
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::AgentTimestampMillis;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeserializeError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::delegation::{
     AgentDelegationCell, AgentDelegationError, AgentDelegationResult, AgentDelegationStatus,
     AGENT_RUN_MAX_DELEGATIONS,
 };
-use crate::identity::AgentDelegationId;
+use crate::identity::{AgentDelegationId, AgentWorkflowInvocationId};
 use crate::model::AgentToolCallId;
 use crate::task::AgentTaskStatus;
+use crate::workflow_tool::{
+    AgentWorkflowInvocationCell, AgentWorkflowInvocationStatus, AgentWorkflowTerminalStatus,
+    AGENT_WORKFLOW_INVOCATION_ID_PREFIX,
+};
 
 /// Maximum members one fan-in group holds: the delegation cell bound, since
-/// members are cell keys.
+/// members are cell keys. Slice 4.5 widens membership across the delegation
+/// and workflow-invocation cell maps, and this bound spans their *combined*
+/// count — sixteen rows of digest-length identities is what the bounded
+/// result table's growth reserve was measured against.
 pub const AGENT_RUN_MAX_FAN_IN_MEMBERS: usize = AGENT_RUN_MAX_DELEGATIONS;
+
+/// One fan-in group member: the key of a delegation cell or of a
+/// workflow-invocation cell ([specification 8.6 and 8.7]).
+///
+/// On the wire a member is the raw derived id string — the disjoint
+/// derivation prefixes are what distinguish the kinds — so a delegation-only
+/// group persisted by slice 4.4 round-trips byte-identically, and a pre-4.5
+/// node reading a mixed group sees a valid-but-unknown delegation id whose
+/// absent cell reads `Unresolved`: deny-when-unknown parks the group rather
+/// than resolving it early. An id under any *other* prefix decodes as a
+/// delegation member for the same reason — an unknown member can park a
+/// group, never resolve one.
+///
+/// [specification 8.6 and 8.7]: ../../../docs/plans/rakka-agent/spec.md
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AgentFanInMemberId {
+    /// A delegated specialist child, keyed by its delegation cell.
+    Delegation(AgentDelegationId),
+    /// A child workflow run, keyed by its invocation cell.
+    WorkflowInvocation(AgentWorkflowInvocationId),
+}
+
+impl AgentFanInMemberId {
+    /// The member's raw derived id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Delegation(delegation) => delegation.as_str(),
+            Self::WorkflowInvocation(invocation) => invocation.as_str(),
+        }
+    }
+
+    /// The delegation id, when the member is a delegation.
+    #[must_use]
+    pub const fn delegation(&self) -> Option<&AgentDelegationId> {
+        match self {
+            Self::Delegation(delegation) => Some(delegation),
+            Self::WorkflowInvocation(_) => None,
+        }
+    }
+
+    /// The invocation id, when the member is a workflow invocation.
+    #[must_use]
+    pub const fn workflow_invocation(&self) -> Option<&AgentWorkflowInvocationId> {
+        match self {
+            Self::Delegation(_) => None,
+            Self::WorkflowInvocation(invocation) => Some(invocation),
+        }
+    }
+}
+
+impl From<AgentDelegationId> for AgentFanInMemberId {
+    fn from(delegation: AgentDelegationId) -> Self {
+        Self::Delegation(delegation)
+    }
+}
+
+impl From<AgentWorkflowInvocationId> for AgentFanInMemberId {
+    fn from(invocation: AgentWorkflowInvocationId) -> Self {
+        Self::WorkflowInvocation(invocation)
+    }
+}
+
+impl Display for AgentFanInMemberId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialOrd for AgentFanInMemberId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AgentFanInMemberId {
+    /// Raw-string order, so a widened member set iterates exactly as the
+    /// 4.4 delegation-id set did; the variant only tie-breaks a string
+    /// collision honest derivation cannot produce.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str()
+            .cmp(other.as_str())
+            .then_with(|| match (self, other) {
+                (Self::Delegation(_), Self::WorkflowInvocation(_)) => Ordering::Less,
+                (Self::WorkflowInvocation(_), Self::Delegation(_)) => Ordering::Greater,
+                _ => Ordering::Equal,
+            })
+    }
+}
+
+impl Serialize for AgentFanInMemberId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentFanInMemberId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value.starts_with(AGENT_WORKFLOW_INVOCATION_ID_PREFIX) {
+            AgentWorkflowInvocationId::new(value)
+                .map(Self::WorkflowInvocation)
+                .map_err(DeserializeError::custom)
+        } else {
+            AgentDelegationId::new(value)
+                .map(Self::Delegation)
+                .map_err(DeserializeError::custom)
+        }
+    }
+}
 
 /// When a fan-in group's wait ends
 /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md): all, an
@@ -149,7 +275,7 @@ pub struct AgentFanInResolution {
     /// `Quorum` it holds the successes recorded when resolution first ran,
     /// so its contents can vary with arrival timing even though `satisfied`
     /// and `code` — the decision — cannot.
-    pub satisfied_by: Vec<AgentDelegationId>,
+    pub satisfied_by: Vec<AgentFanInMemberId>,
     /// Stable resolution code ([`resolution_code`]).
     pub code: String,
     /// When the resolution was computed and persisted.
@@ -167,8 +293,9 @@ pub struct AgentFanInResolution {
 pub struct AgentFanInCell {
     /// The policy fixed at group open, from trusted state.
     pub policy: AgentFanInPolicy,
-    /// The member delegations; keys of the run's delegation cells.
-    pub members: BTreeSet<AgentDelegationId>,
+    /// The members; keys of the run's delegation and workflow-invocation
+    /// cells.
+    pub members: BTreeSet<AgentFanInMemberId>,
     /// The turn that opened the group.
     pub opened_turn: u64,
     /// When the group opened.
@@ -188,7 +315,7 @@ pub struct AgentFanInCell {
     /// Members the parent marked timed out — a parent-side disposition,
     /// never a forged child result.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub timed_out: BTreeSet<AgentDelegationId>,
+    pub timed_out: BTreeSet<AgentFanInMemberId>,
     /// The deterministic resolution, once computed — absorbing.
     #[serde(default)]
     pub resolution: Option<AgentFanInResolution>,
@@ -199,7 +326,7 @@ impl AgentFanInCell {
     #[must_use]
     pub fn open(
         policy: AgentFanInPolicy,
-        member: AgentDelegationId,
+        member: AgentFanInMemberId,
         turn: u64,
         now: AgentTimestampMillis,
     ) -> Self {
@@ -224,17 +351,17 @@ impl AgentFanInCell {
     }
 }
 
-/// One member's disposition, read from its durable delegation cell.
+/// One member's disposition, read from its durable cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemberDisposition {
-    /// Nothing decidable yet: the send is pending, or the child exists and
-    /// has not reported. An indeterminate child rests here until it
-    /// reconciles child-side or the parent's deadline marks it timed out —
+    /// Nothing decidable yet: the send or start is pending, or the child
+    /// exists and has not reported. An indeterminate child rests here until
+    /// it reconciles child-side or the parent's deadline marks it timed out —
     /// the honest branch for an unknowable outcome.
     Unresolved,
-    /// The child completed its task.
+    /// The child completed its task or workflow run.
     Succeeded,
-    /// The child failed, or the send settled without creating one.
+    /// The child failed, or the send or start settled without reaching one.
     Failed,
     /// The child was cancelled.
     Cancelled,
@@ -257,31 +384,54 @@ impl MemberDisposition {
 
 fn member_disposition(
     cell: &AgentFanInCell,
-    member: &AgentDelegationId,
+    member: &AgentFanInMemberId,
     delegations: &BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
+    workflow_invocations: &BTreeMap<AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>>,
 ) -> MemberDisposition {
     if cell.timed_out.contains(member) {
         return MemberDisposition::TimedOut;
     }
-    // A member without a cell is unreachable by construction — members are
-    // cell keys — but an absent cell must never resolve a policy, so it
-    // reads unresolved: deny-when-unknown.
-    let Some(delegation) = delegations.get(member) else {
-        return MemberDisposition::Unresolved;
-    };
-    match &delegation.status {
-        AgentDelegationStatus::Pending => MemberDisposition::Unresolved,
-        AgentDelegationStatus::Conflicted { .. } | AgentDelegationStatus::Failed { .. } => {
-            MemberDisposition::Failed
+    match member {
+        // A member without a cell is unreachable by construction — members
+        // are cell keys — but an absent cell must never resolve a policy, so
+        // it reads unresolved: deny-when-unknown.
+        AgentFanInMemberId::Delegation(delegation) => {
+            let Some(delegation) = delegations.get(delegation) else {
+                return MemberDisposition::Unresolved;
+            };
+            match &delegation.status {
+                AgentDelegationStatus::Pending => MemberDisposition::Unresolved,
+                AgentDelegationStatus::Conflicted { .. } | AgentDelegationStatus::Failed { .. } => {
+                    MemberDisposition::Failed
+                }
+                AgentDelegationStatus::ChildCreated { .. } => match &delegation.result {
+                    None => MemberDisposition::Unresolved,
+                    Some(result) => match result.status {
+                        AgentTaskStatus::Completed => MemberDisposition::Succeeded,
+                        AgentTaskStatus::Cancelled => MemberDisposition::Cancelled,
+                        _ => MemberDisposition::Failed,
+                    },
+                },
+            }
         }
-        AgentDelegationStatus::ChildCreated { .. } => match &delegation.result {
-            None => MemberDisposition::Unresolved,
-            Some(result) => match result.status {
-                AgentTaskStatus::Completed => MemberDisposition::Succeeded,
-                AgentTaskStatus::Cancelled => MemberDisposition::Cancelled,
-                _ => MemberDisposition::Failed,
-            },
-        },
+        AgentFanInMemberId::WorkflowInvocation(invocation) => {
+            let Some(invocation) = workflow_invocations.get(invocation) else {
+                return MemberDisposition::Unresolved;
+            };
+            match &invocation.status {
+                AgentWorkflowInvocationStatus::Pending => MemberDisposition::Unresolved,
+                AgentWorkflowInvocationStatus::Conflicted { .. }
+                | AgentWorkflowInvocationStatus::Failed { .. } => MemberDisposition::Failed,
+                AgentWorkflowInvocationStatus::Started { .. } => match &invocation.result {
+                    None => MemberDisposition::Unresolved,
+                    Some(result) => match result.status {
+                        AgentWorkflowTerminalStatus::Completed => MemberDisposition::Succeeded,
+                        AgentWorkflowTerminalStatus::Cancelled => MemberDisposition::Cancelled,
+                        AgentWorkflowTerminalStatus::Failed => MemberDisposition::Failed,
+                    },
+                },
+            }
+        }
     }
 }
 
@@ -299,6 +449,7 @@ fn member_disposition(
 pub fn evaluate_fan_in(
     cell: &AgentFanInCell,
     delegations: &BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
+    workflow_invocations: &BTreeMap<AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>>,
     now: AgentTimestampMillis,
 ) -> Option<AgentFanInResolution> {
     if !cell.awaiting() {
@@ -308,7 +459,7 @@ pub fn evaluate_fan_in(
     let mut unresolved = 0_usize;
     let mut timed_out = 0_usize;
     for member in &cell.members {
-        match member_disposition(cell, member, delegations) {
+        match member_disposition(cell, member, delegations, workflow_invocations) {
             MemberDisposition::Succeeded => succeeded.push(member.clone()),
             MemberDisposition::Unresolved => unresolved += 1,
             MemberDisposition::TimedOut => timed_out += 1,
@@ -316,7 +467,7 @@ pub fn evaluate_fan_in(
         }
     }
 
-    let resolve = |satisfied: bool, satisfied_by: Vec<AgentDelegationId>, code: &str| {
+    let resolve = |satisfied: bool, satisfied_by: Vec<AgentFanInMemberId>, code: &str| {
         Some(AgentFanInResolution {
             satisfied,
             satisfied_by,
@@ -376,11 +527,13 @@ pub fn evaluate_fan_in(
 pub fn unresolved_members(
     cell: &AgentFanInCell,
     delegations: &BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
-) -> Vec<AgentDelegationId> {
+    workflow_invocations: &BTreeMap<AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>>,
+) -> Vec<AgentFanInMemberId> {
     cell.members
         .iter()
         .filter(|member| {
-            member_disposition(cell, member, delegations) == MemberDisposition::Unresolved
+            member_disposition(cell, member, delegations, workflow_invocations)
+                == MemberDisposition::Unresolved
         })
         .cloned()
         .collect()
@@ -408,37 +561,59 @@ const FAN_IN_TABLE_REASON_MAX_BYTES: usize = 64;
 pub fn fan_in_result_table(
     cell: &AgentFanInCell,
     delegations: &BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
+    workflow_invocations: &BTreeMap<AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>>,
 ) -> Value {
+    let bounded_reason = |reason: &str| {
+        let mut reason = reason.to_string();
+        if reason.len() > FAN_IN_TABLE_REASON_MAX_BYTES {
+            let mut cut = FAN_IN_TABLE_REASON_MAX_BYTES;
+            while !reason.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            reason.truncate(cut);
+        }
+        reason
+    };
     let children: Vec<Value> = cell
         .members
         .iter()
         .map(|member| {
-            let disposition = member_disposition(cell, member, delegations);
-            let result = delegations
-                .get(member)
-                .and_then(|cell| cell.result.as_ref());
-            let reason = result
-                .and_then(|result| result.terminal_reason.as_deref())
-                .map(|reason| {
-                    let mut reason = reason.to_string();
-                    if reason.len() > FAN_IN_TABLE_REASON_MAX_BYTES {
-                        let mut cut = FAN_IN_TABLE_REASON_MAX_BYTES;
-                        while !reason.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        reason.truncate(cut);
-                    }
-                    reason
-                });
-            serde_json::json!({
-                "delegation": member.as_str(),
-                "disposition": disposition.as_label(),
-                "status": result.map(|result| result.status.as_label()),
-                "terminal-reason": reason,
-                "result-digest": result
-                    .and_then(|result| result.result_digest.as_ref())
-                    .map(|digest| digest.value.clone()),
-            })
+            let disposition = member_disposition(cell, member, delegations, workflow_invocations);
+            match member {
+                AgentFanInMemberId::Delegation(delegation) => {
+                    let result = delegations
+                        .get(delegation)
+                        .and_then(|cell| cell.result.as_ref());
+                    serde_json::json!({
+                        "delegation": member.as_str(),
+                        "disposition": disposition.as_label(),
+                        "status": result.map(|result| result.status.as_label()),
+                        "terminal-reason": result
+                            .and_then(|result| result.terminal_reason.as_deref())
+                            .map(bounded_reason),
+                        "result-digest": result
+                            .and_then(|result| result.result_digest.as_ref())
+                            .map(|digest| digest.value.clone()),
+                    })
+                }
+                AgentFanInMemberId::WorkflowInvocation(invocation) => {
+                    let invocation_cell = workflow_invocations.get(invocation);
+                    let result = invocation_cell.and_then(|cell| cell.result.as_ref());
+                    serde_json::json!({
+                        "workflow-invocation": member.as_str(),
+                        "workflow-tool": invocation_cell
+                            .map(|cell| cell.record.workflow_tool.as_str()),
+                        "disposition": disposition.as_label(),
+                        "status": result.map(|result| result.status.as_label()),
+                        "terminal-reason": result
+                            .and_then(|result| result.terminal_reason.as_deref())
+                            .map(bounded_reason),
+                        "result-digest": result
+                            .and_then(|result| result.result_digest.as_ref())
+                            .map(|digest| digest.value.clone()),
+                    })
+                }
+            }
         })
         .collect();
     let resolution = cell.resolution.as_ref().map(|resolution| {
@@ -534,6 +709,7 @@ mod tests {
     struct Group {
         cell: AgentFanInCell,
         delegations: BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
+        workflow_invocations: BTreeMap<AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>>,
     }
 
     fn make_group(policy: AgentFanInPolicy, size: usize) -> Group {
@@ -545,13 +721,13 @@ mod tests {
                 None => {
                     cell = Some(AgentFanInCell::open(
                         policy,
-                        id.clone(),
+                        AgentFanInMemberId::from(id.clone()),
                         1,
                         AgentTimestampMillis::new(1),
                     ));
                 }
                 Some(cell) => {
-                    cell.members.insert(id.clone());
+                    cell.members.insert(AgentFanInMemberId::from(id.clone()));
                 }
             }
             delegations.insert(id, delegation);
@@ -559,17 +735,27 @@ mod tests {
         let mut cell = cell.expect("at least one member");
         cell.closed = true;
         cell.await_call = Some(crate::model::AgentToolCallId::new("await-1").expect("call id"));
-        Group { cell, delegations }
+        Group {
+            cell,
+            delegations,
+            workflow_invocations: BTreeMap::new(),
+        }
     }
 
     fn member_ids(group: &Group) -> Vec<AgentDelegationId> {
-        group.cell.members.iter().cloned().collect()
+        group
+            .cell
+            .members
+            .iter()
+            .filter_map(|member| member.delegation().cloned())
+            .collect()
     }
 
     fn evaluate(group: &Group) -> Option<AgentFanInResolution> {
         evaluate_fan_in(
             &group.cell,
             &group.delegations,
+            &group.workflow_invocations,
             AgentTimestampMillis::new(9),
         )
     }
@@ -708,7 +894,10 @@ mod tests {
         child_created(group.delegations.get_mut(&members[1]).expect("cell"), 1);
         assert_eq!(evaluate(&group), None, "the straggler still counts");
 
-        group.cell.timed_out.insert(members[1].clone());
+        group
+            .cell
+            .timed_out
+            .insert(AgentFanInMemberId::from(members[1].clone()));
         let resolution = evaluate(&group).expect("timeout resolves");
         assert!(!resolution.satisfied);
         assert_eq!(resolution.code, resolution_code::TIMED_OUT);
@@ -781,6 +970,134 @@ mod tests {
         assert_eq!(
             AgentFanInToolCall::parse(&Value::Null).expect("null parses"),
             AgentFanInToolCall::default()
+        );
+    }
+
+    fn workflow_cell(slot: usize) -> (AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>) {
+        let invocation =
+            crate::workflow_tool::workflow_invocation_id_for(&scope(), 1, slot).expect("id");
+        let record = crate::workflow_tool::AgentWorkflowInvocationRecord {
+            invocation: invocation.clone(),
+            goal: None,
+            parent_task: AgentTaskId::new("ticket-1").expect("task id"),
+            parent_run: scope(),
+            workflow_tool: crate::definition::AgentWorkflowToolId::new("refund-flow")
+                .expect("tool id"),
+            descriptor_version: crate::definition::AgentRevisionNumber::new(1),
+            descriptor_digest: AgentContentDigest::sha256_of_bytes(b"descriptor"),
+            workflow_type: "refund".to_string(),
+            definition_version: rakka_agent_workflow::WorkflowDefinitionVersion::new("v1"),
+            required_capabilities: std::collections::BTreeSet::new(),
+            child_run: crate::workflow_tool::child_workflow_run_id(&invocation),
+            deduplication_key: invocation.as_str().to_string(),
+            turn: 1,
+            slot,
+            effect: AgentEffectId::new(format!("effect-wf-{slot}")),
+            call_id: crate::model::AgentToolCallId::new(format!("call-wf-{slot}"))
+                .expect("call id"),
+            input: crate::task::AgentTaskContent::inline(serde_json::json!({"order": "o-1"}))
+                .expect("bounded input"),
+            deadline: None,
+            definition_revision: crate::definition::AgentRevisionNumber::new(1),
+            settings_revision: crate::definition::AgentRevisionNumber::new(1),
+            telemetry: AgentTelemetryContext::default(),
+            created_at: AgentTimestampMillis::new(1),
+        };
+        (
+            invocation,
+            Box::new(AgentWorkflowInvocationCell::pending(Box::new(record))),
+        )
+    }
+
+    #[test]
+    fn a_mixed_group_evaluates_workflow_members_by_the_same_dispositions() {
+        let mut group = make_group(AgentFanInPolicy::All, 1);
+        let members = member_ids(&group);
+        let (invocation, mut cell) = workflow_cell(1);
+        cell.settle_started(false, AgentTimestampMillis::new(2));
+        group
+            .cell
+            .members
+            .insert(AgentFanInMemberId::from(invocation.clone()));
+        group.workflow_invocations.insert(invocation.clone(), cell);
+
+        child_created(group.delegations.get_mut(&members[0]).expect("cell"), 0);
+        with_result(
+            group.delegations.get_mut(&members[0]).expect("cell"),
+            AgentTaskStatus::Completed,
+        );
+        assert_eq!(
+            evaluate(&group),
+            None,
+            "the started workflow member is still unresolved"
+        );
+
+        group
+            .workflow_invocations
+            .get_mut(&invocation)
+            .expect("cell")
+            .record_child_result(crate::workflow_tool::AgentWorkflowChildResult {
+                status: AgentWorkflowTerminalStatus::Completed,
+                terminal_reason: None,
+                result_ref: None,
+                result_digest: Some(AgentContentDigest::sha256_of_bytes(b"result")),
+                descendants_created: 0,
+                recorded_at: AgentTimestampMillis::new(3),
+            });
+        let resolution = evaluate(&group).expect("all settled");
+        assert!(resolution.satisfied);
+        assert_eq!(resolution.satisfied_by.len(), 2);
+
+        let table =
+            fan_in_result_table(&group.cell, &group.delegations, &group.workflow_invocations);
+        let rows = table["children"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.get("workflow-invocation").is_some()
+                    && row["workflow-tool"] == "refund-flow"
+                    && row["disposition"] == "succeeded"),
+            "the workflow member has its own row shape: {table}"
+        );
+        assert!(
+            rows.iter().any(|row| row.get("delegation").is_some()),
+            "the delegation row shape is unchanged: {table}"
+        );
+    }
+
+    #[test]
+    fn a_delegation_only_member_set_round_trips_byte_identically() {
+        // The 4.4 wire shape: a set of raw delegation-id strings. The widened
+        // member type must decode it and re-encode the identical bytes.
+        let group = make_group(AgentFanInPolicy::All, 2);
+        let encoded = serde_json::to_string(&group.cell.members).expect("encode");
+        let raw: Vec<String> = group
+            .cell
+            .members
+            .iter()
+            .map(|member| member.as_str().to_string())
+            .collect();
+        assert_eq!(
+            encoded,
+            serde_json::to_string(&raw).expect("raw encode"),
+            "members serialize as the raw id strings"
+        );
+        let decoded: BTreeSet<AgentFanInMemberId> = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, group.cell.members);
+        assert!(decoded
+            .iter()
+            .all(|member| matches!(member, AgentFanInMemberId::Delegation(_))));
+    }
+
+    #[test]
+    fn a_workflow_member_decodes_by_its_prefix() {
+        let (invocation, _) = workflow_cell(0);
+        let encoded = serde_json::to_string(invocation.as_str()).expect("encode");
+        let decoded: AgentFanInMemberId = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(
+            decoded,
+            AgentFanInMemberId::WorkflowInvocation(invocation),
+            "the workflow prefix selects the workflow member kind"
         );
     }
 }

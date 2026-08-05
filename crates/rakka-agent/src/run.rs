@@ -65,7 +65,7 @@ use std::time::Duration;
 
 use rakka_agent_workflow::{
     AgentCausationId, AgentCorrelationId, AgentEffectId, AgentTelemetryContext,
-    AgentTimestampMillis, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
+    AgentTimestampMillis, ArtifactRef, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
@@ -102,7 +102,8 @@ use crate::effect::{
 };
 use crate::identity::{
     AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
-    AgentRunBinding, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, TenantId,
+    AgentRunBinding, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope,
+    AgentWorkflowInvocationId, TenantId,
 };
 use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
 use crate::memory::{
@@ -115,7 +116,7 @@ use crate::observability::{
     METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
     METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
     METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WORKFLOW_RESULTS,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -213,6 +214,14 @@ pub const AGENT_RUN_DETAIL_MAX_LENGTH: usize = 512;
 /// cell, the fan-in group's membership entry, and the delegation's share of
 /// the resolution table recorded as the awaiting call's tool result.
 const AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
+
+/// What one committed workflow invocation adds to the run's durable record
+/// beyond twice its serialized record bytes: the effect envelope around the
+/// payload, the cell's status fields, the start receipt later recorded as the
+/// call's bounded tool result, the child's terminal result later recorded on
+/// the cell, the fan-in group's membership entry, and the invocation's share
+/// of the resolution table recorded as the awaiting call's tool result.
+const AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
 
 const DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
@@ -1257,8 +1266,12 @@ fn try_resolve_fan_in(run: &mut AgentRun, now: AgentTimestampMillis) -> bool {
     let Some(cell) = run.loop_state.fan_in() else {
         return false;
     };
-    let Some(resolution) = crate::fan_in::evaluate_fan_in(cell, run.loop_state.delegations(), now)
-    else {
+    let Some(resolution) = crate::fan_in::evaluate_fan_in(
+        cell,
+        run.loop_state.delegations(),
+        run.loop_state.workflow_invocations(),
+        now,
+    ) else {
         return false;
     };
     let await_call = cell.await_call.clone();
@@ -1269,6 +1282,7 @@ fn try_resolve_fan_in(run: &mut AgentRun, now: AgentTimestampMillis) -> bool {
                 .fan_in()
                 .expect("the group just resolved and is retained"),
             run.loop_state.delegations(),
+            run.loop_state.workflow_invocations(),
         );
         match AgentTaskContent::inline(table) {
             Ok(content) => run.loop_state.record_tool_result(AgentToolResult {
@@ -1747,6 +1761,7 @@ fn advance_once(
     session_memory: bool,
     decision_events: bool,
     delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
+    workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1767,10 +1782,16 @@ fn advance_once(
             now,
         )
         .map(|()| Vec::new()),
-        AgentLoopPhase::EvaluatingModelOutput => {
-            evaluate_model_output(state, &scope, policies, decision_events, delegation, now)
-                .map(|()| Vec::new())
-        }
+        AgentLoopPhase::EvaluatingModelOutput => evaluate_model_output(
+            state,
+            &scope,
+            policies,
+            decision_events,
+            delegation,
+            workflow,
+            now,
+        )
+        .map(|()| Vec::new()),
         AgentLoopPhase::RecordingTurn => {
             record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
         }
@@ -2138,12 +2159,118 @@ fn plan_delegation_call(
     Ok(Box::new(record))
 }
 
+/// Plans one workflow-tool call into its durable invocation record, or the
+/// refusal the model corrects course from
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every check is envelope-local or cell-derived, like the delegation door:
+/// the combined membership bound, the goal's workflow narrowing, and the
+/// bounded input — then the pure identity derivations and the descriptor's
+/// shape copied at commit, so a replay never re-resolves and a descriptor
+/// upgrade mid-flight is a visible conflict rather than a silently different
+/// child.
+#[allow(clippy::too_many_arguments)]
+fn plan_workflow_call(
+    scope: &AgentRunScope,
+    descriptor: &crate::workflow_tool::AgentWorkflowToolDescriptor,
+    envelope: Option<&crate::delegation::AgentRunDelegationEnvelope>,
+    call: &crate::model::AgentToolCallRequest,
+    combined_members: usize,
+    turn: u64,
+    slot: usize,
+    goal: Option<AgentGoalId>,
+    task: AgentTaskId,
+    definition_revision: AgentRevisionNumber,
+    settings_revision: AgentRevisionNumber,
+    telemetry: AgentTelemetryContext,
+    now: AgentTimestampMillis,
+) -> Result<Box<crate::workflow_tool::AgentWorkflowInvocationRecord>, (String, String)> {
+    use crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS;
+    use crate::workflow_tool::{
+        child_workflow_run_id, workflow_invocation_id_for, AgentWorkflowInvocationRecord,
+        AgentWorkflowToolError,
+    };
+
+    // Refusal codes and messages come from the one error type that defines
+    // them, so the stable code surface cannot drift from a restated literal.
+    if combined_members >= AGENT_RUN_MAX_FAN_IN_MEMBERS {
+        let error = AgentWorkflowToolError::LimitExceeded {
+            maximum: AGENT_RUN_MAX_FAN_IN_MEMBERS,
+        };
+        return Err((error.code().to_string(), error.to_string()));
+    }
+    if let Some(env) = envelope {
+        if !env.allowed_workflows.is_empty()
+            && !env.allowed_workflows.contains(&descriptor.workflow_tool)
+        {
+            let error = AgentWorkflowToolError::NotAllowed {
+                tool: descriptor.workflow_tool.clone(),
+            };
+            return Err((error.code().to_string(), error.to_string()));
+        }
+    }
+    let input = AgentTaskContent::inline(call.arguments.clone()).map_err(|error| {
+        (
+            "workflow-invocation-invalid-arguments".to_string(),
+            error.to_string(),
+        )
+    })?;
+    let invocation = workflow_invocation_id_for(scope, turn, slot)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    let effect = effect_id_for(scope, turn, slot).map_err(|error| {
+        (
+            "workflow-invocation-identity-invalid".to_string(),
+            error.to_string(),
+        )
+    })?;
+    // The child never outlives the goal: the earlier of the descriptor's
+    // default deadline and the envelope's. Both are trusted state — the model
+    // supplies no deadline through a workflow call.
+    let descriptor_deadline = descriptor
+        .default_deadline_ms
+        .map(|deadline_ms| AgentTimestampMillis::new(now.as_millis().saturating_add(deadline_ms)));
+    let envelope_deadline = envelope.and_then(|env| env.deadline);
+    let deadline = match (descriptor_deadline, envelope_deadline) {
+        (Some(declared), Some(bound)) => Some(declared.min(bound)),
+        (declared, bound) => declared.or(bound),
+    };
+    let record = AgentWorkflowInvocationRecord {
+        invocation: invocation.clone(),
+        goal,
+        parent_task: task,
+        parent_run: scope.clone(),
+        workflow_tool: descriptor.workflow_tool.clone(),
+        descriptor_version: descriptor.version,
+        descriptor_digest: descriptor.schema_digest(),
+        workflow_type: descriptor.workflow_type.clone(),
+        definition_version: descriptor.definition_version.clone(),
+        required_capabilities: descriptor.required_capabilities.clone(),
+        child_run: child_workflow_run_id(&invocation),
+        deduplication_key: invocation.as_str().to_string(),
+        turn,
+        slot,
+        effect,
+        call_id: call.call_id.clone(),
+        input,
+        deadline,
+        definition_revision,
+        settings_revision,
+        telemetry,
+        created_at: now,
+    };
+    record
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    Ok(Box::new(record))
+}
+
 fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     decision_events: bool,
     delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
+    workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let (turn, calls) = {
@@ -2223,6 +2350,12 @@ fn evaluate_model_output(
             run.loop_state.telemetry().clone(),
         )
     };
+    // Fan-in membership spans both cell maps, so the combined count is what
+    // the workflow door bounds; it advances with every invocation planned
+    // this turn, exactly as the delegation ceilings advance with each commit.
+    let mut combined_members = ceilings
+        .held
+        .saturating_add(state.run_mut()?.loop_state.workflow_invocation_count());
     let settings_revision = state.run_mut()?.loop_state.agent_settings_revision();
     // A committed delegation is held twice in the run's durable record — the
     // cell and the effect payload — so its admission is priced against the
@@ -2231,11 +2364,14 @@ fn evaluate_model_output(
     // from; letting it commit would wedge the run afterwards, when the bound
     // check fails a transition whose model turn is already durably pending
     // and every re-drive fails the same way.
-    let mut delegation_headroom = if delegation.is_some() {
+    let mut delegation_headroom = if delegation.is_some() || workflow.is_some() {
         let run = state.run_mut()?;
         AGENT_RUN_MATERIALIZED_MAX_BYTES.saturating_sub(run.materialized_size_bytes())
     } else {
-        // No coordination tool is wired, so no call below prices against it.
+        // No coordination or workflow tool is wired, so no call below prices
+        // against it. Delegations and workflow invocations share this one
+        // accumulator: two doors over one record must not each spend the
+        // same remaining bytes.
         0
     };
     let mut planned: Vec<PlannedCall> = Vec::with_capacity(calls.len());
@@ -2310,6 +2446,21 @@ fn evaluate_model_output(
                     });
                     continue;
                 }
+                if combined_members >= crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS {
+                    // Fan-in membership spans the delegation and workflow
+                    // cell maps under one bound: sixteen rows of identities
+                    // is what the result table's growth reserve was measured
+                    // against, whichever kind fills them.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-limit-exceeded".to_string(),
+                        message: format!(
+                            "the run already retains its maximum of {} combined fan-out members",
+                            crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS
+                        ),
+                    });
+                    continue;
+                }
                 match plan_delegation_call(
                     scope,
                     config,
@@ -2345,8 +2496,100 @@ fn evaluate_model_output(
                         } else {
                             delegation_headroom -= cost;
                             ceilings.commit(record.granted_descendants);
+                            combined_members = combined_members.saturating_add(1);
                             let request = AgentRunEffectRequest::A2aSend { delegation: record };
                             let spec = policies.spec_for(&request).clone();
+                            next_slot += 1;
+                            planned.push(PlannedCall::Effect(request, spec));
+                        }
+                    }
+                    Err((code, message)) => planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code,
+                        message,
+                    }),
+                }
+                continue;
+            }
+        }
+        // A call naming a configured workflow tool is intercepted into a
+        // durable invocation: the descriptor's shape is copied at commit, the
+        // derived identities make create-or-adopt an identity property, and
+        // the invocation joins the run's one fan-out group exactly as a
+        // delegation does ([specification 8.6]). Narrowed by the goal's
+        // allowed workflows, never its allowed tools.
+        if let Some(config) = workflow {
+            let descriptor = crate::definition::AgentWorkflowToolId::new(call.tool.as_str())
+                .ok()
+                .and_then(|id| config.descriptor(&id));
+            if let Some(descriptor) = descriptor {
+                if await_planned {
+                    // The delegation-after-await rationale, verbatim: a
+                    // member committed after the close could join nothing,
+                    // and its definitive start failure would wind the
+                    // coordinator down over a child the group never held.
+                    // The model-facing message stays instructive; the code
+                    // comes from the error type that defines it.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: crate::workflow_tool::AgentWorkflowToolError::AfterAwait
+                            .code()
+                            .to_string(),
+                        message: "this turn already closed its fan-out group; invoke workflows \
+                                  before the await, or in the turn after the fan-in resolves"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                match plan_workflow_call(
+                    scope,
+                    descriptor,
+                    envelope.as_ref(),
+                    &call,
+                    combined_members,
+                    turn,
+                    next_slot,
+                    run_goal.clone(),
+                    run_task.clone(),
+                    definition_revision,
+                    settings_revision,
+                    telemetry.clone(),
+                    now,
+                ) {
+                    Ok(record) => {
+                        let record_bytes = serde_json::to_vec(record.as_ref())
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        let cost = record_bytes
+                            .saturating_mul(2)
+                            .saturating_add(AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES);
+                        if cost > delegation_headroom {
+                            let error =
+                                crate::workflow_tool::AgentWorkflowToolError::HeadroomExceeded {
+                                    needed: cost,
+                                    available: delegation_headroom,
+                                };
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: error.code().to_string(),
+                                message: error.to_string(),
+                            });
+                        } else {
+                            delegation_headroom -= cost;
+                            combined_members = combined_members.saturating_add(1);
+                            let request =
+                                AgentRunEffectRequest::WorkflowStart { invocation: record };
+                            // The descriptor's gates and bindings overlay the
+                            // start's cloned spec at commit, so the existing
+                            // gated-checkpoint machinery and the credential
+                            // resolution boundary cover consequential
+                            // workflows unchanged.
+                            let mut spec = policies.spec_for(&request).clone();
+                            spec.checkpoint_required |= descriptor.checkpoint_required;
+                            spec.authorization_required |= descriptor.authorization_required;
+                            if spec.credential_binding.is_none() {
+                                spec.credential_binding = descriptor.credential_binding.clone();
+                            }
                             next_slot += 1;
                             planned.push(PlannedCall::Effect(request, spec));
                         }
@@ -2436,10 +2679,28 @@ fn evaluate_model_output(
                     // before the settle pass can hand anything to the sink —
                     // and the cell joins the run's fan-out group, opening it
                     // with the trusted policy when none is open.
-                    let member = delegation.delegation.clone();
+                    let member =
+                        crate::fan_in::AgentFanInMemberId::from(delegation.delegation.clone());
                     let run = state.run_mut()?;
                     run.loop_state.record_delegation(
                         crate::delegation::AgentDelegationCell::pending(delegation.clone()),
+                    );
+                    run.loop_state.join_fan_in(fan_in_policy, member, turn, now);
+                }
+                if let AgentRunEffectRequest::WorkflowStart { invocation } = &request {
+                    // The invocation record and its cell commit with the
+                    // start effect in this same discipline, and the cell
+                    // joins the run's one fan-out group: workflow members
+                    // reuse the member-disposition interface, so mixed
+                    // delegation-and-workflow groups fall out of the same
+                    // policy evaluation.
+                    let member =
+                        crate::fan_in::AgentFanInMemberId::from(invocation.invocation.clone());
+                    let run = state.run_mut()?;
+                    run.loop_state.record_workflow_invocation(
+                        crate::workflow_tool::AgentWorkflowInvocationCell::pending(
+                            invocation.clone(),
+                        ),
                     );
                     run.loop_state.join_fan_in(fan_in_policy, member, turn, now);
                 }
@@ -2941,6 +3202,72 @@ fn apply_effect_outcome(
                 run.status = status;
             }
         }
+        AgentRunEffectOutcome::WorkflowStart { receipt } => {
+            // The start durably reached — or adopted — its one logical child
+            // run. The effect succeeds and the invocation cell settles in
+            // this same compare-and-set. The model sees a bounded receipt as
+            // the tool result of the call that invoked the workflow; the
+            // child's *result* is the fan-in wait's business.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let run = state.run_mut()?;
+            let Some(cell) = run.loop_state.workflow_invocation(&receipt.invocation) else {
+                return Err(AgentRunError::UnknownWorkflowInvocation {
+                    invocation: receipt.invocation.clone(),
+                });
+            };
+            let call_id = cell.record.call_id.clone();
+            // The one child this invocation may ever bind is derived on the
+            // record: a receipt naming any other run is a broken executor,
+            // and the cell settles failed rather than grafting a foreign
+            // child onto the invocation. Every invocation is a group member,
+            // so the failure is a fan-in disposition and the coordinator
+            // survives it.
+            if receipt.child_run != cell.record.child_run {
+                if let Some(cell) = run.loop_state.workflow_invocation_mut(&receipt.invocation) {
+                    cell.settle_failed("workflow-start-run-mismatch", now);
+                }
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "error": "workflow-start-run-mismatch",
+                    "message": "the start receipt named a child run the invocation does not own",
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+            } else {
+                if let Some(cell) = run.loop_state.workflow_invocation_mut(&receipt.invocation) {
+                    cell.settle_started(receipt.adopted, now);
+                }
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "invocation": receipt.invocation.as_str(),
+                    "child_run": receipt.child_run.as_str(),
+                    "adopted": receipt.adopted,
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+            }
+            // There is no early window for a workflow result, so the child's
+            // outcome may already be on the cell when this receipt settles it
+            // `Started` — and a member whose disposition just became decidable
+            // may resolve a closed group in this same compare-and-set. The
+            // delegation arm needs no such step: an early delegation result
+            // is refused, so its dispositions only change through paths that
+            // already run the fan-in step.
+            try_resolve_fan_in(run, now);
+            if !winding_down && !run.loop_state.awaits_effect() {
+                // The last effect of the turn came back, so the turn rests:
+                // complete, or awaiting a closed fan-in group's children.
+                let (phase, status) = turn_rest(&run.loop_state);
+                run.loop_state.set_phase(phase);
+                run.status = status;
+            }
+        }
         AgentRunEffectOutcome::Failed { code, .. }
         | AgentRunEffectOutcome::Exhausted { code, .. } => {
             // Final for the generation: the dispatch layer already applied the
@@ -3003,11 +3330,12 @@ fn apply_effect_outcome(
                     // decided what it waited for, and its own stragglers must
                     // not then wind it down. A send outside any group keeps
                     // the pre-fan-in wind-down below.
+                    let member = crate::fan_in::AgentFanInMemberId::from(delegation_id.clone());
                     group_member_send = !winding_down
                         && run
                             .loop_state
                             .fan_in()
-                            .is_some_and(|group| group.members.contains(&delegation_id));
+                            .is_some_and(|group| group.members.contains(&member));
                     if group_member_send {
                         if let Some(call_id) = call_id {
                             let content = AgentTaskContent::inline(serde_json::json!({
@@ -3032,6 +3360,65 @@ fn apply_effect_outcome(
                             run.status = status;
                         }
                     }
+                }
+            }
+            // A definitively failed workflow start is the same shape: a
+            // *child that failed to exist* — the invocation cell settles as
+            // an explicit conflict when the executor reported one, else as a
+            // failure, and a group member becomes a fan-in disposition the
+            // coordinator survives.
+            if failed_kind == AgentRunEffectKind::WorkflowStartCall {
+                let run = state.run_mut()?;
+                let held = run
+                    .loop_state
+                    .workflow_invocations()
+                    .iter()
+                    .find_map(|(id, cell)| (cell.record.effect == *effect_id).then(|| id.clone()));
+                if let Some(invocation_id) = held {
+                    // The canonical code the dispatch layer normalizes every
+                    // conflict finding onto — structural, not an executor
+                    // string convention.
+                    let conflict = code.as_str()
+                        == crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE;
+                    let call_id = run
+                        .loop_state
+                        .workflow_invocation(&invocation_id)
+                        .map(|cell| cell.record.call_id.clone());
+                    if let Some(cell) = run.loop_state.workflow_invocation_mut(&invocation_id) {
+                        if conflict {
+                            cell.settle_conflicted(code.clone(), now);
+                        } else {
+                            cell.settle_failed(code.clone(), now);
+                        }
+                    }
+                    let member = crate::fan_in::AgentFanInMemberId::from(invocation_id.clone());
+                    let group_member_start = !winding_down
+                        && run
+                            .loop_state
+                            .fan_in()
+                            .is_some_and(|group| group.members.contains(&member));
+                    if group_member_start {
+                        if let Some(call_id) = call_id {
+                            let content = AgentTaskContent::inline(serde_json::json!({
+                                "error": bounded_detail(code.clone()),
+                                "message": "the workflow start failed definitively; no child \
+                                            run was reached",
+                            }))
+                            .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                            run.loop_state.record_tool_result(AgentToolResult {
+                                call_id,
+                                content,
+                                recorded_at: now,
+                            });
+                        }
+                        try_resolve_fan_in(run, now);
+                        if !run.loop_state.awaits_effect() {
+                            let (phase, status) = turn_rest(&run.loop_state);
+                            run.loop_state.set_phase(phase);
+                            run.status = status;
+                        }
+                    }
+                    group_member_send = group_member_send || group_member_start;
                 }
             }
             if failed_kind != AgentRunEffectKind::MemoryPromotionCall
@@ -3075,6 +3462,21 @@ fn apply_effect_outcome(
                     });
                 if let Some(delegation_id) = held {
                     if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                        cell.settle_failed("run-winding-down", now);
+                    }
+                }
+            }
+            // A fenced workflow start settles its cell the same way: the
+            // winding-down parent never reached the child run.
+            if cancelled_kind == AgentRunEffectKind::WorkflowStartCall {
+                let run = state.run_mut()?;
+                let held = run
+                    .loop_state
+                    .workflow_invocations()
+                    .iter()
+                    .find_map(|(id, cell)| (cell.record.effect == *effect_id).then(|| id.clone()));
+                if let Some(invocation_id) = held {
+                    if let Some(cell) = run.loop_state.workflow_invocation_mut(&invocation_id) {
                         cell.settle_failed("run-winding-down", now);
                     }
                 }
@@ -3791,7 +4193,8 @@ fn promote_memory(
 /// record is refused here rather than after a human already approved it; the
 /// run must be bound to exactly the goal under evaluation
 /// (`run-goal-evaluation-unbound`);
-/// a verification workflow is typed but refused until workflows-as-tools land
+/// a verification workflow is typed but refused until a slice bridges the
+/// evaluation cell to the workflow-tool invocation path
 /// (`run-goal-evaluation-workflow-deferred`); and one evaluation is open at a
 /// time (`run-goal-evaluation-outstanding`) — the goal's decision door is
 /// serial, so a second in-flight evaluation could only race the first.
@@ -3971,7 +4374,11 @@ fn fire_fan_in_deadline(
     if now.as_millis() < deadline.as_millis() {
         return Ok(());
     }
-    let stragglers = crate::fan_in::unresolved_members(group, run.loop_state.delegations());
+    let stragglers = crate::fan_in::unresolved_members(
+        group,
+        run.loop_state.delegations(),
+        run.loop_state.workflow_invocations(),
+    );
     if let Some(group) = run.loop_state.fan_in_mut() {
         group.timed_out.extend(stragglers);
     }
@@ -3985,6 +4392,106 @@ fn fire_fan_in_deadline(
         run.status = AgentRunStatus::Running;
     }
     state.updated_at = now;
+    Ok(())
+}
+
+/// Records one child workflow run's terminal outcome on the invocation cell
+/// that owns it, runs the deterministic fan-in step, and — when the policy
+/// resolves a parked wait — completes the awaiting turn
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md): workflow
+/// completion returns a deduplicated result/evidence reference).
+///
+/// Every fence below is the run's own durable state, refused as a
+/// non-committing error so a refused delivery is never journaled and a
+/// corrected re-send applies. There is deliberately no early window: the
+/// child's identity is derived on the record at commit, so a result arriving
+/// before the start receipt authenticates against the record and records
+/// first-writer-wins — the receipt later settles the effect independently.
+/// A duplicate inside the journal's bounded window answers from the
+/// operation log; past it, the cell's recorded result is the durable fence
+/// and the delivery accepts idempotently with no second transition. A
+/// superseded effect generation needs no extra fence: the invocation id is
+/// generation-free, and the cell's status decides.
+#[allow(clippy::too_many_arguments)]
+fn record_workflow_result(
+    state: &mut AgentRunState,
+    invocation: &AgentWorkflowInvocationId,
+    child_run: &rakka_agent_workflow::AgentRunId,
+    status: crate::workflow_tool::AgentWorkflowTerminalStatus,
+    terminal_reason: Option<String>,
+    result_ref: Option<ArtifactRef>,
+    result_digest: Option<crate::task::AgentContentDigest>,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    use crate::workflow_tool::{AgentWorkflowChildResult, AgentWorkflowInvocationStatus};
+
+    let Some(run) = state.run.as_mut() else {
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-unknown-run",
+            message: "the addressed run was never assigned, so it owns no workflow invocations"
+                .to_string(),
+        });
+    };
+    let Some(cell) = run.loop_state.workflow_invocation(invocation) else {
+        // Cells live for the run's lifetime — the map is never pruned — so an
+        // unknown invocation is a forgery or a misroute, not aging.
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-unknown-invocation",
+            message: format!("the run holds no workflow invocation {invocation}"),
+        });
+    };
+    if *child_run != cell.record.child_run {
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-forged",
+            message: format!(
+                "the invocation's child run is {}, not {child_run}",
+                cell.record.child_run
+            ),
+        });
+    }
+    if matches!(
+        cell.status,
+        AgentWorkflowInvocationStatus::Conflicted { .. }
+            | AgentWorkflowInvocationStatus::Failed { .. }
+    ) {
+        // A settled non-started cell owns no child: whatever run produced
+        // this result was not started by this invocation.
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-not-owned",
+            message: "the invocation settled without a child run this run owns".to_string(),
+        });
+    }
+    if !cell.child_settled() {
+        let result = AgentWorkflowChildResult {
+            status,
+            terminal_reason: terminal_reason.map(bounded_detail),
+            result_ref,
+            result_digest,
+            descendants_created: 0,
+            recorded_at: now,
+        };
+        if let Some(cell) = run.loop_state.workflow_invocation_mut(invocation) {
+            cell.record_child_result(result);
+        }
+        // The deterministic fan-in step, in this same compare-and-set. A
+        // resolution completes a parked wait only on a run that is still
+        // going somewhere: a terminal or winding-down parent records the
+        // evidence and resumes nothing.
+        let resolved = try_resolve_fan_in(run, now);
+        if resolved
+            && run.loop_state.phase() == AgentLoopPhase::AwaitingChildren
+            && !run.status.is_terminal()
+            && run.status != AgentRunStatus::Cancelling
+            && run.terminal_reason.is_none()
+        {
+            run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+            run.status = AgentRunStatus::Running;
+        }
+        state.updated_at = now;
+    }
+    // A result already recorded — a conflicting duplicate past the journal's
+    // bounded window — accepts idempotently with no further transition: the
+    // cell is the durable fence, first writer wins.
     Ok(())
 }
 
@@ -4276,6 +4783,7 @@ where
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
     delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
@@ -4322,6 +4830,7 @@ where
             memory: None,
             decisions: None,
             delegation: None,
+            workflow_tools: None,
             metrics: Arc::new(NoopMetricsRecorder),
             recovered: false,
         }
@@ -4409,6 +4918,25 @@ where
     #[must_use]
     pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
         self.delegation = Some(config);
+        self
+    }
+
+    /// Wires the run to serve workflow tools
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run intercepts calls naming a configured workflow tool and
+    /// converts each into a durable invocation record plus its start effect,
+    /// committed in one compare-and-set. An unwired run cannot recognize the
+    /// tool, so its calls take the generic path — where the dispatch
+    /// authority refuses a registered kind-`Workflow` tool with
+    /// `workflow-tool-requires-interception`, the defense in depth behind
+    /// the structural guarantee.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
         self
     }
 
@@ -4621,6 +5149,42 @@ where
                     Ok(operation_id)
                 })
                 .await?
+            }
+            AgentRunEntityCommand::RecordWorkflowResult {
+                operation_id,
+                invocation,
+                child_run,
+                status,
+                terminal_reason,
+                result_ref,
+                result_digest,
+            } => {
+                let reply = self
+                    .transition(now, move |state| {
+                        record_workflow_result(
+                            state,
+                            &invocation,
+                            &child_run,
+                            status,
+                            terminal_reason,
+                            result_ref.map(|reference| *reference),
+                            result_digest,
+                            now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                // Counted after the recording transition committed; a
+                // replayed result answers from the operation log above and
+                // never reaches this arm.
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_WORKFLOW_RESULTS,
+                    1,
+                    &[("outcome", "accepted")],
+                )
+                .ok();
+                reply
             }
             AgentRunEntityCommand::Cancel {
                 operation_id,
@@ -5096,6 +5660,7 @@ where
             let session_memory = self.memory.is_some();
             let decision_events = self.decisions.is_some();
             let delegation = self.delegation.clone();
+            let workflow = self.workflow_tools.clone();
             let phase = self
                 .state()?
                 .loop_state()
@@ -5109,6 +5674,7 @@ where
                         session_memory,
                         decision_events,
                         delegation.as_ref(),
+                        workflow.as_ref(),
                         now,
                     ) {
                         Ok(owed) => Ok(owed),
@@ -5398,6 +5964,57 @@ pub enum AgentRunEntityCommand {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
     },
+    /// One child workflow run's terminal outcome, recorded on the invocation
+    /// cell that owns it
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    /// **The hosting application owes the relay**: exactly as with
+    /// [`Self::FireFanInDeadline`], nothing in this crate delivers the
+    /// command — the application observes the child's durable terminal state
+    /// (its own outbox addressed at this entity, or an observer it re-drives
+    /// from durable state; runtime events may trigger the relay but are never
+    /// its correctness source) and constructs the command with
+    /// [`Self::record_workflow_result`], whose operation id is pure over
+    /// `(tenant, invocation)` so every re-drive owes the identical operation.
+    ///
+    /// Failure-window table: a delivery lost before the transition commits
+    /// re-sends and applies; a duplicate inside the journal's bounded window
+    /// answers from the operation log; a conflicting duplicate past it
+    /// re-runs the transition and the cell's first-writer-wins result keeps
+    /// the original; a refusal is a non-committing error, so a corrected
+    /// re-send applies rather than replaying the refusal. Refusal codes:
+    /// `workflow-result-unknown-run`, `workflow-result-unknown-invocation`,
+    /// `workflow-result-forged` (a child run the invocation does not own; a
+    /// non-terminal status is unrepresentable by construction), and
+    /// `workflow-result-not-owned` (a cell settled without reaching a
+    /// child). A terminal or winding-down parent records the result as
+    /// evidence and resumes nothing.
+    RecordWorkflowResult {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`crate::workflow_tool::workflow_result_operation_id`], or
+        /// construct the whole command with
+        /// [`Self::record_workflow_result`].
+        operation_id: AgentOperationId,
+        /// The invocation whose child reports.
+        invocation: AgentWorkflowInvocationId,
+        /// The child workflow run that reached the terminal status: must be
+        /// the invocation's derived child run, or the command is refused as
+        /// forged.
+        child_run: rakka_agent_workflow::AgentRunId,
+        /// The child's terminal status.
+        status: crate::workflow_tool::AgentWorkflowTerminalStatus,
+        /// The child's stable terminal-reason code, when it recorded one.
+        /// Truncated to [`AGENT_RUN_DETAIL_MAX_LENGTH`] bytes at recording —
+        /// the run's uniform detail bound — never refused over its wording.
+        #[serde(default)]
+        terminal_reason: Option<String>,
+        /// The child's result artifact reference, when one exists. Boxed to
+        /// keep the command enum's variants close in size.
+        #[serde(default)]
+        result_ref: Option<Box<ArtifactRef>>,
+        /// Content digest of the child's result, when one exists.
+        #[serde(default)]
+        result_digest: Option<crate::task::AgentContentDigest>,
+    },
     /// Request cancellation of the run.
     Cancel {
         /// The stable operation id this command deduplicates on.
@@ -5447,11 +6064,37 @@ impl AgentRunEntityCommand {
             | Self::ResolveCheckpoint { operation_id, .. }
             | Self::FireCheckpointTimers { operation_id }
             | Self::FireFanInDeadline { operation_id }
+            | Self::RecordWorkflowResult { operation_id, .. }
             | Self::Cancel { operation_id, .. }
             | Self::PromoteMemory { operation_id, .. }
             | Self::EvaluateGoal { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
+    }
+
+    /// Builds one child workflow run's result command with its derived
+    /// operation id, so the relay cannot mis-derive the identity every
+    /// re-drive must share.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_workflow_result(
+        tenant: &TenantId,
+        invocation: AgentWorkflowInvocationId,
+        child_run: rakka_agent_workflow::AgentRunId,
+        status: crate::workflow_tool::AgentWorkflowTerminalStatus,
+        terminal_reason: Option<String>,
+        result_ref: Option<ArtifactRef>,
+        result_digest: Option<crate::task::AgentContentDigest>,
+    ) -> Result<Self, AgentIdentityError> {
+        let operation_id = crate::workflow_tool::workflow_result_operation_id(tenant, &invocation)?;
+        Ok(Self::RecordWorkflowResult {
+            operation_id,
+            invocation,
+            child_run,
+            status,
+            terminal_reason,
+            result_ref: result_ref.map(Box::new),
+            result_digest,
+        })
     }
 }
 
@@ -6076,6 +6719,22 @@ pub enum AgentRunError {
         /// The delegation the receipt named.
         delegation: crate::identity::AgentDelegationId,
     },
+    /// A start receipt named a workflow invocation the run does not hold.
+    UnknownWorkflowInvocation {
+        /// The invocation the receipt named.
+        invocation: AgentWorkflowInvocationId,
+    },
+    /// A workflow result could not be applied to the invocation it named.
+    ///
+    /// Refused as a non-committing error so a corrected re-send applies; the
+    /// code is one of the stable `workflow-result-*` refusals documented on
+    /// [`AgentRunEntityCommand::RecordWorkflowResult`].
+    WorkflowResultRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
     /// A checkpoint decision could not be applied.
     Checkpoint(Box<AgentCheckpointError>),
     /// A decision arrived for a checkpoint the run does not hold, or has already
@@ -6180,7 +6839,8 @@ pub enum AgentRunError {
     /// and not yet reported. One at a time.
     GoalEvaluationOutstanding,
     /// A verification-workflow evaluation is typed but cannot execute until
-    /// workflows-as-tools land.
+    /// a slice bridges the evaluation cell to the workflow-tool invocation
+    /// path that slice 4.5 landed.
     GoalEvaluationWorkflowDeferred,
     /// An evaluation could not reserve its attempt bound from the run's
     /// budget.
@@ -6206,6 +6866,8 @@ impl AgentRunError {
             Self::Terminal { .. } => "run-terminal",
             Self::UnknownEffect { .. } => "run-unknown-effect",
             Self::UnknownDelegation { .. } => "run-unknown-delegation",
+            Self::UnknownWorkflowInvocation { .. } => "run-unknown-workflow-invocation",
+            Self::WorkflowResultRefused { code, .. } => code,
             Self::Checkpoint(error) => error.code(),
             Self::UnknownCheckpoint { .. } => "run-unknown-checkpoint",
             Self::StaleEffectResult { .. } => "run-stale-effect-result",
@@ -6254,6 +6916,14 @@ impl Display for AgentRunError {
                 f,
                 "a send receipt named delegation {delegation}, which this run does not hold"
             ),
+            Self::UnknownWorkflowInvocation { invocation } => write!(
+                f,
+                "a start receipt named workflow invocation {invocation}, which this run does \
+                 not hold"
+            ),
+            Self::WorkflowResultRefused { code, message } => {
+                write!(f, "the workflow result was refused ({code}): {message}")
+            }
             Self::Checkpoint(error) => Display::fmt(error, f),
             Self::UnknownCheckpoint { checkpoint_id } => write!(
                 f,
@@ -6324,7 +6994,8 @@ impl Display for AgentRunError {
             ),
             Self::GoalEvaluationWorkflowDeferred => write!(
                 f,
-                "a verification-workflow evaluation cannot execute until workflows-as-tools land"
+                "a verification-workflow evaluation cannot execute until the evaluation cell is \
+                 bridged to the workflow-tool invocation path"
             ),
             Self::GoalEvaluationUnaffordable { exhaustion } => write!(
                 f,
@@ -6701,11 +7372,15 @@ mod tests {
             run.loop_state.record_delegation(cell);
             run.loop_state.join_fan_in(
                 crate::fan_in::AgentFanInPolicy::Quorum { n: 16 },
-                delegation,
+                crate::fan_in::AgentFanInMemberId::from(delegation),
                 turn,
                 now,
             );
         }
+        let members: Vec<crate::fan_in::AgentFanInMemberId> = members
+            .into_iter()
+            .map(crate::fan_in::AgentFanInMemberId::from)
+            .collect();
         run.loop_state.close_fan_in(
             AgentToolCallId::new("await-children").expect("the call id is valid"),
             Some(now),
@@ -6724,6 +7399,7 @@ mod tests {
         let table = crate::fan_in::fan_in_result_table(
             run.loop_state.fan_in().expect("the group is retained"),
             run.loop_state.delegations(),
+            run.loop_state.workflow_invocations(),
         );
         run.loop_state.record_tool_result(AgentToolResult {
             call_id: AgentToolCallId::new("await-children").expect("the call id is valid"),

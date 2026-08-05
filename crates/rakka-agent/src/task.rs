@@ -3686,6 +3686,7 @@ fn delegation_envelope_for(
         return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
             allowed_skills: spec.allowed_skills.clone(),
             allowed_tools: spec.allowed_tools.clone(),
+            allowed_workflows: spec.allowed_workflows.clone(),
             budget: narrowed_delegation_budget(spec.delegation, task.definition.delegation),
             lineage: Vec::new(),
             ancestors: Vec::new(),
@@ -3709,6 +3710,7 @@ fn delegation_envelope_for(
         return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
             allowed_skills: BTreeSet::new(),
             allowed_tools: BTreeSet::new(),
+            allowed_workflows: BTreeSet::new(),
             budget: narrowed_delegation_budget(provenance.budget, task.definition.delegation),
             lineage,
             ancestors,
@@ -3729,6 +3731,7 @@ fn delegation_envelope_for(
         Box::new(crate::delegation::AgentRunDelegationEnvelope {
             allowed_skills: BTreeSet::new(),
             allowed_tools: BTreeSet::new(),
+            allowed_workflows: BTreeSet::new(),
             budget: Some(ceilings),
             lineage: Vec::new(),
             ancestors: Vec::new(),

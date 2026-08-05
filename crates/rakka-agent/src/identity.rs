@@ -239,6 +239,18 @@ validated_id! {
 }
 
 validated_id! {
+    /// Identity of one durable workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived by [`crate::workflow_tool::workflow_invocation_id_for`] as a
+    /// pure function of the parent run's `(turn, slot)` coordinate. It doubles
+    /// verbatim as the child workflow run id and the `StartRun` deduplication
+    /// key, so replaying one invocation creates or adopts the same durable
+    /// child run rather than a second one.
+    pub AgentWorkflowInvocationId, "agent_workflow_invocation_id"
+}
+
+validated_id! {
     /// Identity of one durable logical wake occurrence that may admit a
     /// continuous-goal epoch
     /// ([specification 6.9](../../../docs/plans/rakka-agent/spec.md)).
@@ -713,6 +725,9 @@ pub enum AgentOperationKind {
     /// A delegated child task returning its terminal outcome to the parent
     /// run that created it.
     DelegationResult,
+    /// A child workflow run returning its terminal outcome to the parent run
+    /// that invoked it.
+    WorkflowResult,
     /// Durable handoff of a task to another agent.
     Handoff,
     /// A team member's claim on a shared task-board item.
@@ -762,6 +777,7 @@ impl AgentOperationKind {
             Self::ClaimAppend => "claim-append",
             Self::Delegation => "delegation",
             Self::DelegationResult => "delegation-result",
+            Self::WorkflowResult => "workflow-result",
             Self::Handoff => "handoff",
             Self::TeamClaim => "team-claim",
             Self::ConversationTurn => "conversation-turn",

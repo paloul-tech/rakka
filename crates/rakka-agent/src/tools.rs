@@ -1002,6 +1002,9 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::A2aSend { .. } => {
                 self.authorize_a2a_send(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                self.authorize_workflow_start(context, scope, task, goal, intent, invocation, now)
+            }
         }
     }
 
@@ -1076,6 +1079,22 @@ impl AgentToolAuthority {
                 format!(
                     "the coordination tool {} reached generic dispatch; wire the run entity's \
                      delegation configuration so the loop intercepts it",
+                    call.tool
+                ),
+            ));
+        }
+        // The same discipline for a workflow tool: its calls exist only as
+        // the loop's workflow interception, which converts them into durable
+        // invocation records and start effects before dispatch
+        // ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). A
+        // kind-`Workflow` registration is model-visible toolset projection,
+        // never a generic dispatch path.
+        if binding.descriptor().kind == AgentToolKind::Workflow {
+            return Err(AgentAuthorityRefusal::of(
+                "workflow-tool-requires-interception",
+                format!(
+                    "the workflow tool {} reached generic dispatch; wire the run entity's \
+                     workflow-tool configuration so the loop intercepts it",
                     call.tool
                 ),
             ));
@@ -1402,7 +1421,8 @@ impl AgentToolAuthority {
                 | AgentRunEffectRequest::Compensation { .. }
                 | AgentRunEffectRequest::MemoryPromotion { .. }
                 | AgentRunEffectRequest::Evaluation { .. }
-                | AgentRunEffectRequest::A2aSend { .. } => None,
+                | AgentRunEffectRequest::A2aSend { .. }
+                | AgentRunEffectRequest::WorkflowStart { .. } => None,
             });
 
         if let Some(profile) = &profile {
@@ -1611,6 +1631,87 @@ impl AgentToolAuthority {
                 intent,
                 None,
                 BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one workflow-start attempt
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the invocation record is
+    /// its authorization, as with an A2A send: the loop's interception
+    /// already resolved the descriptor and applied the goal's workflow
+    /// narrowing inside the committing compare-and-set. What remains at
+    /// dispatch time is the immediate-safety layer every attempt passes —
+    /// lifecycle, guardrail policy, credential class, execution policy — plus
+    /// the envelope door re-checked here per attempt, so dropping the
+    /// workflow tool from the definition or setup revokes the very next
+    /// attempt ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)).
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_workflow_start(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        invocation: &crate::workflow_tool::AgentWorkflowInvocationRecord,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .workflow_tools
+            .contains(&invocation.workflow_tool)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::WorkflowTool.as_label(),
+                format!(
+                    "the workflow tool {} is not declared by the definition",
+                    invocation.workflow_tool
+                ),
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup
+                .envelope()
+                .workflow_tools
+                .contains(&invocation.workflow_tool)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::WorkflowTool.as_label(),
+                    format!(
+                        "the run's setup does not select the workflow tool {}",
+                        invocation.workflow_tool
+                    ),
+                ));
+            }
+        }
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            // The grant carries the capability surface the descriptor
+            // declared, copied onto the record at commit — the regular tool
+            // binding's discipline. The definition envelope declares workflow
+            // tools by id only, so the per-tool capability subset check
+            // awaits an envelope-side declaration (recorded follow-up work).
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                invocation.required_capabilities.clone(),
                 now,
             ),
             tool_call: None,

@@ -497,6 +497,74 @@ pub trait AgentA2aSendExecutor: Send + Sync {
     ) -> AgentDispatchFuture<'a, AgentA2aSendFinding>;
 }
 
+/// What one workflow start established
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentWorkflowStartFinding {
+    /// The derived `StartRun` was durably accepted by the child run's inbox:
+    /// the invocation's one logical child now exists.
+    Started,
+    /// The child already existed and the derived `StartRun` deduplicated
+    /// against its inbox or run state: adoption, not an error.
+    Adopted,
+    /// A child run exists that this invocation's identity does not own — a
+    /// deduplication-key match under a foreign command id, or an existing run
+    /// whose workflow type or definition version differs from what the record
+    /// pinned. The dispatch layer normalizes every conflict onto
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE`] —
+    /// this code is detail folded into the failure message, so the executor
+    /// may report any code it likes and the cell still settles `Conflicted`;
+    /// recovery uses a new invocation, never this one.
+    Conflict {
+        /// Machine-readable detail code, preserved in the failure message.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without reaching the child: no retry can change
+    /// the answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one workflow start inside a bounded dispatch attempt
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)): delivers
+/// the derived, generation-free `StartRun` command —
+/// [`crate::workflow_tool::workflow_start_command`] builds it verbatim from
+/// the persisted record — to the child workflow run's own durable inbox.
+///
+/// The hosting application owes this executor: resolving the record's pinned
+/// workflow type and definition version against its workflow registry,
+/// delivering the command to the sharded child `AgentRunInbox` entity,
+/// mapping acceptance to [`AgentWorkflowStartFinding::Started`] and duplicate
+/// acceptance to [`AgentWorkflowStartFinding::Adopted`], driving accepted
+/// `StartRun` entries into its workflow runner, and later relaying the
+/// child's terminal outcome back as the parent's deduplicated
+/// `RecordWorkflowResult` command. A deduplication-key match under a
+/// different command id — or an existing run whose pinned fields disagree —
+/// must return [`AgentWorkflowStartFinding::Conflict`], never adopt.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`. The receipt is derived from the record,
+/// never from the acceptance, so `Started` and `Adopted` produce
+/// byte-identical outcomes apart from the adoption flag.
+pub trait AgentWorkflowStartExecutor: Send + Sync {
+    /// Performs the start and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        invocation: &'a crate::workflow_tool::AgentWorkflowInvocationRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentWorkflowStartFinding>;
+}
+
 /// The runtime-provided promotion executor: the session store in, the private
 /// store out, every identity derived
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
@@ -1200,6 +1268,7 @@ where
     memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
     goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
     a2a_sends: Option<Arc<dyn AgentA2aSendExecutor>>,
+    workflow_starts: Option<Arc<dyn AgentWorkflowStartExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -1257,6 +1326,7 @@ where
             memory_promotions: None,
             goal_evaluations: None,
             a2a_sends: None,
+            workflow_starts: None,
             delivery,
             probe: None,
         }
@@ -1348,6 +1418,20 @@ where
     #[must_use]
     pub fn with_a2a_send_executor(mut self, a2a_sends: Arc<dyn AgentA2aSendExecutor>) -> Self {
         self.a2a_sends = Some(a2a_sends);
+        self
+    }
+
+    /// Executes workflow starts through the given executor
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// application-owned bridge that delivers the derived `StartRun` to the
+    /// child workflow run's inbox. Without one, a workflow start dispatch
+    /// fails closed with a stable code.
+    #[must_use]
+    pub fn with_workflow_start_executor(
+        mut self,
+        workflow_starts: Arc<dyn AgentWorkflowStartExecutor>,
+    ) -> Self {
+        self.workflow_starts = Some(workflow_starts);
         self
     }
 
@@ -2418,6 +2502,50 @@ where
                     }
                 }
             }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                let Some(executor) = self.workflow_starts.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "workflow-start-executor-missing".to_string(),
+                        message: "no workflow start executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor
+                    .execute(scope, intent, invocation, credential)
+                    .await?
+                {
+                    // The receipt derives from the record, never from the
+                    // acceptance: started and adopted outcomes are identical
+                    // apart from the flag, which is what keeps a replayed
+                    // start's outcome convergent.
+                    finding @ (AgentWorkflowStartFinding::Started
+                    | AgentWorkflowStartFinding::Adopted) => {
+                        Ok(AgentRunEffectOutcome::WorkflowStart {
+                            receipt: crate::workflow_tool::AgentWorkflowStartReceipt {
+                                invocation: invocation.invocation.clone(),
+                                child_run: invocation.child_run.clone(),
+                                adopted: matches!(finding, AgentWorkflowStartFinding::Adopted),
+                            },
+                        })
+                    }
+                    // Conflict-ness is normalized onto the canonical code
+                    // here, so the run entity's `Conflicted` settlement never
+                    // depends on an executor picking the right string.
+                    AgentWorkflowStartFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed {
+                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            message: format!("{code}: {message}"),
+                        })
+                    }
+                    AgentWorkflowStartFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
         }
     }
 
@@ -2429,8 +2557,9 @@ where
     /// names the resolver and carries the durable human decision as its
     /// evidence. Every other method runs through the application-owned
     /// executor, or fails closed definitively when none is configured. A
-    /// verification workflow fails closed until workflows-as-tools land —
-    /// defense in depth behind the commit-time refusal.
+    /// verification workflow fails closed until the evaluation cell is
+    /// bridged to the workflow-tool invocation path — defense in depth
+    /// behind the commit-time refusal.
     async fn invoke_goal_evaluation(
         &self,
         scope: &AgentRunScope,
@@ -2503,8 +2632,8 @@ where
             AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
                 return Ok(AgentRunEffectOutcome::Failed {
                     code: "evaluation-workflow-deferred".to_string(),
-                    message: "a verification-workflow evaluation cannot execute until \
-                              workflows-as-tools land"
+                    message: "a verification-workflow evaluation cannot execute until the \
+                              evaluation cell is bridged to the workflow-tool invocation path"
                         .to_string(),
                 });
             }

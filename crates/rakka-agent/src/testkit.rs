@@ -1195,6 +1195,7 @@ where
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
     delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
+    workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     acceptances: Arc<AtomicUsize>,
 }
@@ -1215,6 +1216,7 @@ where
             decisions: self.decisions.clone(),
             metrics: self.metrics.clone(),
             delegation: self.delegation.clone(),
+            workflow_tools: self.workflow_tools.clone(),
             faults: self.faults.clone(),
             acceptances: self.acceptances.clone(),
         }
@@ -1244,6 +1246,7 @@ where
             decisions: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
             delegation: Arc::new(Mutex::new(None)),
+            workflow_tools: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
@@ -1294,6 +1297,15 @@ where
             .delegation
             .lock()
             .expect("the delegation slot should not be poisoned") = Some(config);
+    }
+
+    /// Wires every run entity this transport builds to serve workflow tools,
+    /// under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_workflow_tools(&self, config: crate::workflow_tool::AgentRunWorkflowConfig) {
+        *self
+            .workflow_tools
+            .lock()
+            .expect("the workflow-tool slot should not be poisoned") = Some(config);
     }
 
     /// Uses explicit effect specs for the effects hosted runs commit.
@@ -1394,6 +1406,14 @@ where
                 .clone();
             if let Some(delegation) = delegation {
                 entity = entity.with_delegation(delegation);
+            }
+            let workflow_tools = self
+                .workflow_tools
+                .lock()
+                .expect("the workflow-tool slot should not be poisoned")
+                .clone();
+            if let Some(workflow_tools) = workflow_tools {
+                entity = entity.with_workflow_tools(workflow_tools);
             }
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);
@@ -1607,6 +1627,7 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
     evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
     a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
+    workflow_starts: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
@@ -1699,6 +1720,7 @@ where
             promotions: Arc::new(Mutex::new(None)),
             evaluations: Arc::new(Mutex::new(None)),
             a2a_sends: Arc::new(Mutex::new(None)),
+            workflow_starts: Arc::new(Mutex::new(None)),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1788,6 +1810,22 @@ where
             .a2a_sends
             .lock()
             .expect("the A2A send executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes workflow start effects through the given executor. An
+    /// unwired start fails with the real pipeline's
+    /// `workflow-start-executor-missing` code, exactly as the real
+    /// dispatcher fails closed.
+    #[must_use]
+    pub fn with_workflow_start_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>,
+    ) -> Self {
+        *self
+            .workflow_starts
+            .lock()
+            .expect("the workflow start executor slot should not be poisoned") = Some(executor);
         self
     }
 
@@ -2005,6 +2043,70 @@ where
                 };
                 self.memoize(effect, outcome)
             }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                // The record carries its own parent scope, so the start needs
+                // nothing `answer` does not hold. Memoized like a send: a
+                // re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived generation-free
+                // `StartRun` identities promise.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .workflow_starts
+                    .lock()
+                    .expect("the workflow start executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "workflow-start-executor-missing".to_string(),
+                        message: "no workflow start executor is wired into this dispatcher"
+                            .to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&invocation.parent_run, effect, invocation, None)
+                        .await
+                    {
+                        Ok(
+                            finding @ (crate::dispatch::AgentWorkflowStartFinding::Started
+                            | crate::dispatch::AgentWorkflowStartFinding::Adopted),
+                        ) => AgentRunEffectOutcome::WorkflowStart {
+                            receipt: crate::workflow_tool::AgentWorkflowStartReceipt {
+                                invocation: invocation.invocation.clone(),
+                                child_run: invocation.child_run.clone(),
+                                adopted: matches!(
+                                    finding,
+                                    crate::dispatch::AgentWorkflowStartFinding::Adopted
+                                ),
+                            },
+                        },
+                        // The real dispatcher's conflict normalization,
+                        // verbatim: the cell's `Conflicted` settlement is
+                        // structural, never an executor string convention.
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Conflict {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::Failed {
+                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            message: format!("{code}: {message}"),
+                        },
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Refused {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::Failed { code, message },
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::Failed {
+                            code: "workflow-start-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
         }
     }
 
@@ -2140,8 +2242,8 @@ where
                     effect,
                     AgentRunEffectOutcome::Failed {
                         code: "evaluation-workflow-deferred".to_string(),
-                        message: "a verification-workflow evaluation cannot execute until \
-                                  workflows-as-tools land"
+                        message: "a verification-workflow evaluation cannot execute until the \
+                                  evaluation cell is bridged to the workflow-tool invocation path"
                             .to_string(),
                     },
                 );
@@ -2288,6 +2390,7 @@ where
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -2309,6 +2412,7 @@ where
             router,
             clock,
             policies: AgentEffectPolicies::default(),
+            workflow_tools: None,
         }
     }
 
@@ -2316,6 +2420,18 @@ where
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.policies = policies;
+        self
+    }
+
+    /// Wires the entities this delivery builds to serve workflow tools —
+    /// the delivered model result is what the loop evaluates, so the
+    /// interception must be wired on this path too.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
         self
     }
 }
@@ -2334,6 +2450,9 @@ where
             let mut entity =
                 AgentRunEntityStore::new(scope.clone(), self.store.clone(), self.effects.clone())
                     .with_effect_policies(self.policies.clone());
+            if let Some(config) = &self.workflow_tools {
+                entity = entity.with_workflow_tools(config.clone());
+            }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
                 .apply(command, &self.router, now)

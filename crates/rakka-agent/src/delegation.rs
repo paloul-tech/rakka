@@ -889,6 +889,12 @@ pub struct AgentRunDelegationEnvelope {
     /// Tools the goal may use. Empty means no goal-scope tool narrowing.
     #[serde(default)]
     pub allowed_tools: BTreeSet<AgentToolId>,
+    /// Workflow tools the goal may invoke
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). Empty
+    /// means no goal-scope workflow narrowing. An envelope persisted before
+    /// the field decodes to the empty set — the same no-narrowing meaning.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub allowed_workflows: BTreeSet<crate::definition::AgentWorkflowToolId>,
     /// The delegation ceilings this run enforces at the delegation door:
     /// the goal spec's (root) or the task's granted provenance budget
     /// (delegated child), min-narrowed by the task definition's own ceilings

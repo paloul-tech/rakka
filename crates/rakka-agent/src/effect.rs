@@ -621,6 +621,7 @@ pub struct AgentEffectPolicies {
     memory_promotion: AgentEffectSpec,
     goal_evaluation: AgentEffectSpec,
     a2a_send: AgentEffectSpec,
+    workflow_start: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
@@ -669,6 +670,22 @@ impl AgentEffectPolicies {
             a2a_send: AgentEffectSpec {
                 safety_class: AgentEffectSafetyClass::Idempotent,
                 max_attempts: crate::delegation::AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // The start's command id and deduplication key are pure,
+            // generation-free derivations of the invocation identity, so
+            // every retry converges on the same child run: idempotent by
+            // construction — the workflow *behind* the start keeps its own
+            // declared safety, which the descriptor overlays at commit.
+            workflow_start: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: crate::workflow_tool::AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS,
                 reconciliation_protocol: None,
                 credential_binding: None,
                 timeout_ms: None,
@@ -761,6 +778,17 @@ impl AgentEffectPolicies {
         Ok(self)
     }
 
+    /// Sets the spec workflow starts dispatch under
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS`]
+    /// idempotent attempts.
+    pub fn with_workflow_start_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.workflow_start = spec;
+        Ok(self)
+    }
+
     /// Pins every spec — model, registered tools, and the unclassified
     /// default — to the guardrail chain revision the deployment evaluates at
     /// dispatch, so each committed intent records the policy its transforms
@@ -774,6 +802,7 @@ impl AgentEffectPolicies {
         self.memory_promotion.guardrail_revision = Some(revision);
         self.goal_evaluation.guardrail_revision = Some(revision);
         self.a2a_send.guardrail_revision = Some(revision);
+        self.workflow_start.guardrail_revision = Some(revision);
         for spec in self.tools.values_mut() {
             spec.guardrail_revision = Some(revision);
         }
@@ -792,6 +821,7 @@ impl AgentEffectPolicies {
             AgentRunEffectRequest::MemoryPromotion { .. } => &self.memory_promotion,
             AgentRunEffectRequest::Evaluation { .. } => &self.goal_evaluation,
             AgentRunEffectRequest::A2aSend { .. } => &self.a2a_send,
+            AgentRunEffectRequest::WorkflowStart { .. } => &self.workflow_start,
         }
     }
 }
@@ -840,6 +870,11 @@ pub enum AgentRunEffectKind {
     /// An outbound agent-to-agent send carrying one durable delegation
     /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
     A2aSendCall,
+    /// The start-or-adopt command of one durable workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). The
+    /// effect is the start, never the workflow: the child run's internal
+    /// effects keep their own durable boundaries.
+    WorkflowStartCall,
 }
 
 impl AgentRunEffectKind {
@@ -853,6 +888,7 @@ impl AgentRunEffectKind {
             Self::MemoryPromotionCall => "memory-promotion-call",
             Self::GoalEvaluationCall => "goal-evaluation-call",
             Self::A2aSendCall => "a2a-send-call",
+            Self::WorkflowStartCall => "workflow-start-call",
         }
     }
 
@@ -861,16 +897,17 @@ impl AgentRunEffectKind {
     pub const fn workflow_kind(self) -> AgentEffectKind {
         match self {
             Self::ModelCall => AgentEffectKind::ModelCall,
-            // A compensation, memory promotion, goal evaluation, or A2A send
-            // dispatches through the same adapter surface as a tool call: the
-            // outbox ticket's target type (`compensation`, `memory-promotion`,
-            // `goal-evaluation`, `a2a-peer`) is what routes it to its
-            // executor.
+            // A compensation, memory promotion, goal evaluation, A2A send, or
+            // workflow start dispatches through the same adapter surface as a
+            // tool call: the outbox ticket's target type (`compensation`,
+            // `memory-promotion`, `goal-evaluation`, `a2a-peer`,
+            // `workflow-tool`) is what routes it to its executor.
             Self::ToolCall
             | Self::CompensationCall
             | Self::MemoryPromotionCall
             | Self::GoalEvaluationCall
-            | Self::A2aSendCall => AgentEffectKind::ToolCall,
+            | Self::A2aSendCall
+            | Self::WorkflowStartCall => AgentEffectKind::ToolCall,
         }
     }
 }
@@ -1133,6 +1170,19 @@ pub enum AgentRunEffectRequest {
         /// The delegation record the send carries.
         delegation: Box<crate::delegation::AgentDelegationRecord>,
     },
+    /// Start — or adopt — the one durable child workflow run of a
+    /// workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)): an
+    /// idempotent durable effect whose payload *is* the invocation record
+    /// persisted alongside it, and whose derived, generation-free `StartRun`
+    /// identities make every replay converge on the same child run.
+    ///
+    /// This variant is constructible only by the loop's workflow-tool
+    /// interception; model output can never produce it.
+    WorkflowStart {
+        /// The invocation record the start carries.
+        invocation: Box<crate::workflow_tool::AgentWorkflowInvocationRecord>,
+    },
 }
 
 impl AgentRunEffectRequest {
@@ -1146,6 +1196,7 @@ impl AgentRunEffectRequest {
             Self::MemoryPromotion { .. } => AgentRunEffectKind::MemoryPromotionCall,
             Self::Evaluation { .. } => AgentRunEffectKind::GoalEvaluationCall,
             Self::A2aSend { .. } => AgentRunEffectKind::A2aSendCall,
+            Self::WorkflowStart { .. } => AgentRunEffectKind::WorkflowStartCall,
         }
     }
 
@@ -1157,7 +1208,8 @@ impl AgentRunEffectRequest {
             | Self::Compensation { .. }
             | Self::MemoryPromotion { .. }
             | Self::Evaluation { .. }
-            | Self::A2aSend { .. } => None,
+            | Self::A2aSend { .. }
+            | Self::WorkflowStart { .. } => None,
             Self::Tool { call } => Some(call),
         }
     }
@@ -1236,6 +1288,23 @@ impl AgentRunEffectRequest {
                 attributes: BTreeMap::from([
                     ("skill".to_string(), delegation.requested_skill.to_string()),
                     ("delegation".to_string(), delegation.delegation.to_string()),
+                ]),
+            },
+            Self::WorkflowStart { invocation } => AgentEffectTarget {
+                target_type: "workflow-tool".to_string(),
+                name: invocation.workflow_tool.to_string(),
+                address: None,
+                attributes: BTreeMap::from([
+                    (
+                        "workflow-type".to_string(),
+                        invocation.workflow_type.clone(),
+                    ),
+                    (
+                        "definition-version".to_string(),
+                        invocation.definition_version.as_str().to_string(),
+                    ),
+                    ("invocation".to_string(), invocation.invocation.to_string()),
+                    ("child-run".to_string(), invocation.child_run.to_string()),
                 ]),
             },
         }
@@ -1729,6 +1798,12 @@ pub enum AgentRunEffectOutcome {
         /// The bounded receipt: identities and a status label only.
         receipt: crate::delegation::AgentA2aSendReceipt,
     },
+    /// A workflow start durably created — or adopted — its one logical child
+    /// run ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    WorkflowStart {
+        /// The bounded receipt: identities and the adoption flag only.
+        receipt: crate::workflow_tool::AgentWorkflowStartReceipt,
+    },
     /// The generation failed definitively.
     Failed {
         /// Stable machine-readable code.
@@ -1770,6 +1845,7 @@ impl AgentRunEffectOutcome {
                 | Self::MemoryPromotion { .. }
                 | Self::Evaluation { .. }
                 | Self::A2aSend { .. }
+                | Self::WorkflowStart { .. }
         )
     }
 
@@ -1781,7 +1857,8 @@ impl AgentRunEffectOutcome {
             | Self::Tool { .. }
             | Self::MemoryPromotion { .. }
             | Self::Evaluation { .. }
-            | Self::A2aSend { .. } => AgentRunEffectStatus::Succeeded,
+            | Self::A2aSend { .. }
+            | Self::WorkflowStart { .. } => AgentRunEffectStatus::Succeeded,
             Self::Failed { .. } => AgentRunEffectStatus::Failed,
             Self::Exhausted { .. } => AgentRunEffectStatus::Exhausted,
             Self::Indeterminate { .. } => AgentRunEffectStatus::Indeterminate,
@@ -1863,6 +1940,9 @@ impl AgentRunEffectOutcome {
                         message: error.to_string(),
                     })
             }
+            // The start receipt is identities and a flag: bounded by
+            // construction.
+            Self::WorkflowStart { .. } => Ok(()),
             Self::Failed { .. }
             | Self::Exhausted { .. }
             | Self::Indeterminate { .. }
