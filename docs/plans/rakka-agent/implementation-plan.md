@@ -2917,6 +2917,89 @@ Guidance: [Workflows as Tools](technical-guidance.md#workflows-as-tools).
 Done when: scenario 32 passes (replayed invocation adopts one child run, no
 duplicated internal effects).
 
+**Amended as implemented (2026-08-04):**
+
+- **Create-or-adopt is an identity property, not a protocol.** The
+  interception commits — in one CAS, the 4.3/4.4 discipline — the
+  `AgentWorkflowInvocationRecord`, its cell, its fan-in membership, and the
+  new `WorkflowStartCall` effect. The derived
+  `workflow_invocation_id_for(scope, turn, slot)` (delegation-digest
+  construction, disjoint `workflow-invocation-` prefix) *is* the child
+  workflow run id and the `StartRun` deduplication key, and the command id
+  (`{invocation}#start-run`) is **generation-free**: a reconciled new effect
+  generation re-derives the identical `StartRun`, so recovery can never mint
+  a second child run — the scenario-32 keystone. The descriptor's shape
+  (version, digest, workflow type and definition version) is copied at
+  commit; a replay never re-resolves, and a mid-flight descriptor upgrade is
+  a `Conflict`, never an adopt (dedup-key match under a foreign command id
+  likewise). The effect is the start, never the workflow; it completes at
+  the durable start receipt, and the wait is fan-in membership.
+- **The model surface is the config map, not the registry.** Each configured
+  `AgentWorkflowToolDescriptor` (in `AgentRunWorkflowConfig`, wired via
+  `with_workflow_tools`) appears as its own named tool; the planner
+  intercepts by map lookup after the coordination arm and before the goal
+  tool narrowing. A kind-`Workflow` registry entry that reaches generic
+  dispatch refuses `workflow-tool-requires-interception` — defense in depth.
+  The dead placeholders now enforce: `workflow_tools` on the envelope
+  per attempt (`undeclared-workflow-tool`), `allowed_workflows` at the door
+  (`goal-workflow-not-allowed`) via the delegation envelope.
+- **Workflow members reuse the member-disposition interface** (the 4.4 owed
+  item): `AgentFanInMemberId` widens members/timed-out/satisfied-by as raw
+  prefixed id strings — a delegation-only 4.4 group round-trips
+  byte-identically, and a pre-4.5 node reading a mixed group parks
+  deny-when-unknown: the load-bearing cross-version fence, since a turn's
+  effects clear when it records (while retained, the `workflow-start`
+  request variant additionally fails a pre-4.5 binary loudly as
+  unknown-variant). No schema bump. One group, one
+  CAS join, `AwaitingChildren` reused, `workflow-after-await` mirrors 4.4's
+  refusal, combined membership bounded at both doors, failed/conflicted/
+  unwired starts are surviving fan-in dispositions, wind-down fences settle
+  unsent starts' cells. Deliberate: workflow invocations never debit
+  `Descendants` (no agent-task creation path; `descendants_created`
+  recorded for a later credit fold) and never count against
+  `max_concurrent` (delegation-envelope ceiling; the membership bound is
+  the cap until a descriptor-level ceiling exists).
+- **The result path is an entity command, not a tenth exchange.** A workflow
+  run is not a choreography participant, so
+  `AgentRunEntityCommand::RecordWorkflowResult` (pure
+  `workflow_result_operation_id(tenant, invocation)`; the hosting
+  application owes the relay, the `FireFanInDeadline` obligation idiom)
+  carries the terminal status, bounded reason, and result reference/digest.
+  Refusals are non-committing errors (`workflow-result-unknown-run`/
+  `-unknown-invocation`/`-forged`/`-not-owned`; non-terminal statuses are
+  unrepresentable), duplicates answer from the journal and the cell's
+  first-writer-wins result behind it, a wound-down parent records evidence
+  and resumes nothing — and there is deliberately **no early window**,
+  diverging from `delegation-result-early`: the child's identity is derived
+  at commit, so an early result authenticates against the record and
+  records first-writer-wins while the receipt settles the effect
+  independently.
+- **The classifier gap is closed minimally.**
+  `AgentAutonomyTargetClass::ChildWorkflow` is first-class
+  (`from_dispatch_class`, `from_label`, phase-5 catalog under
+  `DeduplicationKey` idempotency, policy allowance, concurrency seed);
+  dispatcher registration and the compiled-plan node stay out of scope, and
+  an unregistered class still fails closed. `VerificationWorkflow` stays
+  refused (`run-goal-evaluation-workflow-deferred`), re-worded to name the
+  remaining work: bridging the evaluation cell to this invocation path.
+- Proof roster: `tests/workflow_tool.rs` — the derived-identity commit, the
+  scenario-32 crash sweep (one invocation/child-run/`StartRun` identity
+  across every owner-loss window's executor sightings), the end-to-end
+  adopt over a **real** child `AgentRunInbox` (replayed invocations
+  deduplicate in the child's own durable inbox before and after its one
+  internal step executes exactly once; the relayed result resumes the
+  parent to completion), duplicate/conflicting/forged/not-owned results,
+  the no-early-window proof, the wound-down parent, the after-await and
+  goal-narrowing refusals, the mixed group, and the pre-4.5 decode +
+  wire-tag pins; `fan_in.rs` member round-trip/prefix/mixed-group units;
+  `workflow_tool.rs` (src) identity and bounds units; the classifier pins
+  in `rakka-agent-workflow`. Owed onward: cancellation propagation to child
+  workflows (4.6), the evaluation-cell bridge for `VerificationWorkflow`,
+  descriptor-level concurrency ceilings, descendant credit for
+  `descendants_created`, a combined-membership 17-member integration sweep
+  (the bound is door-enforced and unit-covered; a full 17-effect turn
+  exceeds the per-turn effect bound), and snapshot/projection views (4.7).
+
 ### Slice 4.6 — Cancellation propagation and shared environment
 
 Spec: [8.7](spec.md#87-cancellation-failure-and-waiting),

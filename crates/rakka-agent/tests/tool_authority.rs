@@ -483,6 +483,39 @@ async fn a_registered_but_undeclared_tool_is_undispatchable() {
 }
 
 // ---------------------------------------------------------------------------
+// Specification 8.6: a kind-`Workflow` registration is model-visible toolset
+// projection, never a generic dispatch path. Its calls exist only as the
+// loop's workflow interception — a generic `Tool` intent naming one means the
+// run was not wired for workflow tools, and the authority refuses it before
+// anything is invoked.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_workflow_kind_registration_never_dispatches_generically() {
+    let registry = AgentToolRegistry::new()
+        .register(rakka_agent::AgentToolBinding::unclassified(
+            rakka_agent::AgentToolDescriptor::new(
+                tool_id(),
+                rakka_agent::AgentToolKind::Workflow,
+                "The refund workflow, projected into the toolset.",
+                schema("workflow-input"),
+                schema("workflow-output"),
+            )
+            .expect("the descriptor is valid"),
+        ))
+        .expect("the tool registers");
+    let fx = AuthorityFixture::over(tool_then_proposal(), registry, None);
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.terminal_failure_code().await,
+        "workflow-tool-requires-interception"
+    );
+    assert_eq!(fx.tools.invocation_count(TOOL), 0, "nothing was invoked");
+}
+
+// ---------------------------------------------------------------------------
 // Scenario 54: the immediate-safety check. A model-visible tool revoked by a
 // settings update stays undispatchable from the very next attempt.
 // ---------------------------------------------------------------------------

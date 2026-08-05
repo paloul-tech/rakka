@@ -372,6 +372,50 @@ pub fn goal_spec_with_fan_out(
     spec
 }
 
+/// The workflow tool the workflow fixture declares.
+pub const WORKFLOW_TOOL: &str = "refund-flow";
+
+/// The workflow type the descriptor pins.
+pub const WORKFLOW_TYPE: &str = "refund";
+
+/// The workflow definition version the descriptor pins.
+pub const WORKFLOW_VERSION: &str = "v1";
+
+pub fn workflow_tool_id() -> rakka_agent::AgentWorkflowToolId {
+    rakka_agent::AgentWorkflowToolId::new(WORKFLOW_TOOL).expect("workflow tool id should be valid")
+}
+
+/// The versioned descriptor under which the fixture's compiled workflow
+/// appears in the agent's toolset.
+pub fn workflow_tool_descriptor() -> rakka_agent::AgentWorkflowToolDescriptor {
+    rakka_agent::AgentWorkflowToolDescriptor::new(
+        workflow_tool_id(),
+        WORKFLOW_TYPE,
+        rakka_agent_workflow::WorkflowDefinitionVersion::new(WORKFLOW_VERSION),
+        "Runs the compiled refund workflow.",
+        schema("refund-input"),
+        schema("refund-output"),
+    )
+    .expect("the workflow-tool descriptor should be valid")
+}
+
+/// The workflow-tool wiring the fixture run entity serves.
+pub fn workflow_config() -> rakka_agent::AgentRunWorkflowConfig {
+    rakka_agent::AgentRunWorkflowConfig::new()
+        .with_descriptor(workflow_tool_descriptor())
+        .expect("the workflow configuration should accept the descriptor")
+}
+
+/// The fixture goal contract narrowed to the declared workflow tool, over the
+/// fan-out spec so mixed delegation-and-workflow turns stay authorized.
+pub fn goal_spec_with_workflow(
+    fan_in: Option<rakka_agent::AgentFanInPolicy>,
+) -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec_with_fan_out(fan_in, None);
+    spec.allowed_workflows = std::collections::BTreeSet::from([workflow_tool_id()]);
+    spec
+}
+
 /// The default continuous wake policy: durable-timer trigger, a bounded
 /// per-epoch budget, and a one-minute epoch deadline — the resolved defaults
 /// everywhere else.
@@ -634,6 +678,9 @@ pub struct Fixture<
     /// The delegation wiring the run entity serves, when a test enables it.
     /// Absent by default, so the run refuses the coordination tool.
     pub delegation: Option<rakka_agent::AgentRunDelegationConfig>,
+    /// The workflow-tool wiring the run entity serves, when a test enables
+    /// it. Absent by default, so workflow-tool calls take the generic path.
+    pub workflow_tools: Option<rakka_agent::AgentRunWorkflowConfig>,
 }
 
 impl<A: AgentModelAdapter> Fixture<A> {
@@ -714,6 +761,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             decisions: None,
             metrics: None,
             delegation: None,
+            workflow_tools: None,
         }
     }
 
@@ -737,6 +785,15 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     pub fn with_delegation(mut self, config: rakka_agent::AgentRunDelegationConfig) -> Self {
         self.run_transport.install_delegation(config.clone());
         self.delegation = Some(config);
+        self
+    }
+
+    /// Wires the run entity to serve workflow tools, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_workflow_tools(mut self, config: rakka_agent::AgentRunWorkflowConfig) -> Self {
+        self.run_transport.install_workflow_tools(config.clone());
+        self.workflow_tools = Some(config);
         self
     }
 
@@ -995,6 +1052,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(delegation) = &self.delegation {
             entity = entity.with_delegation(delegation.clone());
         }
+        if let Some(workflow_tools) = &self.workflow_tools {
+            entity = entity.with_workflow_tools(workflow_tools.clone());
+        }
         entity
     }
 
@@ -1107,6 +1167,9 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(delegation) = &self.delegation {
             entity = entity.with_delegation(delegation.clone());
+        }
+        if let Some(workflow_tools) = &self.workflow_tools {
+            entity = entity.with_workflow_tools(workflow_tools.clone());
         }
         entity
     }

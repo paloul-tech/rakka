@@ -684,6 +684,12 @@ pub const METRIC_AGENT_DELEGATION_RESULTS: &str = "rakka.agent.delegation.result
 /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
 pub const METRIC_AGENT_FAN_IN_RESOLUTIONS: &str = "rakka.agent.fan_in.resolutions";
 
+/// Counter: child workflow runs' terminal results accepted at the parent
+/// run's door, labeled by bounded `outcome`
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). A refused
+/// delivery is a non-committing error and is not counted here.
+pub const METRIC_AGENT_WORKFLOW_RESULTS: &str = "rakka.agent.workflow.results";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the

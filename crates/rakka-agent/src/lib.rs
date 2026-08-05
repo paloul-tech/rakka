@@ -147,7 +147,8 @@ pub use dispatch::{
     AgentEntityAuthority, AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding,
     AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
     AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
-    SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
+    AgentWorkflowStartExecutor, AgentWorkflowStartFinding, SessionMemoryPromotionExecutor,
+    WorkflowAgentRunEffectSink,
 };
 pub use effect::{
     compensation_call_id, effect_id_for, external_idempotency_key_for, AgentEffectError,
@@ -220,6 +221,7 @@ pub use observability::{
     METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
     METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_WORKFLOW_RESULTS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
@@ -322,16 +324,17 @@ pub use delegation::{
     AGENT_RUN_MAX_DELEGATIONS,
 };
 pub use fan_in::{
-    evaluate_fan_in, AgentFanInCell, AgentFanInPolicy, AgentFanInResolution, AgentFanInToolCall,
-    AGENT_RUN_MAX_FAN_IN_MEMBERS,
+    evaluate_fan_in, AgentFanInCell, AgentFanInMemberId, AgentFanInPolicy, AgentFanInResolution,
+    AgentFanInToolCall, AGENT_RUN_MAX_FAN_IN_MEMBERS,
 };
 pub use identity::{
     validate_identity_segment, validate_tenant, AgentDelegationId, AgentEnvironmentRef,
     AgentGoalId, AgentId, AgentIdentityError, AgentIdentityResult, AgentMemoryNamespace,
     AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId, AgentRunScope, AgentScope,
-    AgentTaskId, AgentTaskScope, AgentWakeId, KnowledgeSpaceId, TenantId,
-    AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_NAMESPACE_PREFIX,
-    AGENT_PERSISTENCE_SEPARATOR, AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
+    AgentTaskId, AgentTaskScope, AgentWakeId, AgentWorkflowInvocationId, KnowledgeSpaceId,
+    TenantId, AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH,
+    AGENT_MEMORY_NAMESPACE_PREFIX, AGENT_PERSISTENCE_SEPARATOR,
+    AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
     AGENT_TASK_ENTITY_PERSISTENCE_PREFIX,
 };
 pub use schema::{
@@ -395,4 +398,14 @@ pub use tools::{
     AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
     AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
     AGENT_TOOL_REGISTRY_MAX_TOOLS,
+};
+pub use workflow_tool::{
+    child_workflow_run_id, workflow_invocation_id_for, workflow_result_operation_id,
+    workflow_start_command, workflow_start_command_id, AgentRunWorkflowConfig,
+    AgentWorkflowChildResult, AgentWorkflowInvocationCell, AgentWorkflowInvocationRecord,
+    AgentWorkflowInvocationStatus, AgentWorkflowStartReceipt, AgentWorkflowTerminalStatus,
+    AgentWorkflowToolDescriptor, AgentWorkflowToolError, AgentWorkflowToolResult,
+    AGENT_RUN_MAX_WORKFLOW_INVOCATIONS, AGENT_RUN_MAX_WORKFLOW_TOOLS,
+    AGENT_WORKFLOW_INVOCATION_ID_PREFIX, AGENT_WORKFLOW_INVOCATION_RECORD_MAX_BYTES,
+    AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS, AGENT_WORKFLOW_TOOL_DESCRIPTOR_MAX_BYTES,
 };

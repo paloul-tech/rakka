@@ -2651,6 +2651,16 @@ without one remain open.
 16. **How does a compiled workflow appear as a tool?** Recommended: a versioned
     descriptor creates or adopts an independently durable child workflow run;
     never treat the whole workflow as one opaque retryable external effect.
+    *Disposition (M4): accepted — the versioned `AgentWorkflowToolDescriptor`
+    is trusted deployment wiring the loop intercepts by name; the derived
+    invocation id is the child workflow run id and the generation-free
+    `StartRun` deduplication key, so create-or-adopt is an identity property
+    (a replay deduplicates in the child run's own durable inbox and adopts);
+    only the start-or-adopt is an agent-side effect, the child's internal
+    effects keep their own durable boundaries, the parent waits as fan-in
+    membership, and the child's terminal outcome returns as the deduplicated
+    `RecordWorkflowResult` command the hosting application relays
+    (slice 4.5).*
 17. **What maps to A2A `Task.id`?** Recommended: `AgentTaskId`; preserve it
     across handoff while each assignee execution receives a new `AgentRunId`.
     *Disposition (M1): accepted as the equal mapping — A2A `Task.id` is the

@@ -793,6 +793,7 @@ impl AgentDispatchConcurrencyLimits {
             AgentDispatchTargetClass::Webhook,
             AgentDispatchTargetClass::Notification,
             AgentDispatchTargetClass::PushNotification,
+            AgentDispatchTargetClass::ChildWorkflow,
         ] {
             class_limits.insert(class, default_limit);
         }

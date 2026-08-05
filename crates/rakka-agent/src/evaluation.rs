@@ -149,9 +149,14 @@ impl Display for AgentGoalEvaluationOutcome {
 /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md),
 /// technical guidance "Verify Progress and Completion").
 ///
-/// All five kinds are typed from day one; `VerificationWorkflow` is refused at
-/// effect commit until workflows-as-tools land in slice 4.5, because a
-/// workflow invocation the autonomy classifier cannot class fails closed.
+/// All five kinds are typed from day one; `VerificationWorkflow` remains
+/// refused at effect commit. Slice 4.5 landed the workflow-tool invocation
+/// path, but the evaluation effect is a read-only judgment while a workflow
+/// invocation is a separate start effect with fan-in-wait semantics: executing
+/// the method honestly means teaching the evaluation cell a durable workflow
+/// wait and folding the child's terminal outcome into the evaluation record's
+/// evidence — deliberately deferred follow-up work, kept refused-closed until
+/// a slice owns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -166,7 +171,8 @@ pub enum AgentGoalEvaluationMethod {
         /// The application-owned query policy.
         query: AgentPolicyRef,
     },
-    /// A compiled verification workflow. Typed but refused until slice 4.5.
+    /// A compiled verification workflow. Typed but refused until a slice
+    /// bridges the evaluation cell to the workflow-tool invocation path.
     VerificationWorkflow {
         /// The workflow tool that would verify the goal.
         workflow: AgentWorkflowToolId,

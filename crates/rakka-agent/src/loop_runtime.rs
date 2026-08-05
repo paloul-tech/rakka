@@ -88,6 +88,7 @@ use crate::effect::{
 };
 use crate::identity::{
     AgentDelegationId, AgentGoalId, AgentOperationId, AgentRunScope, AgentTaskId,
+    AgentWorkflowInvocationId,
 };
 use crate::memory::{
     AgentContextSnapshotRef, AgentPromotedMemoryRef, MemoryClassification, MemoryEntryId,
@@ -422,6 +423,16 @@ pub struct AgentLoopState {
     /// [specification 8.7]: ../../../docs/plans/rakka-agent/spec.md
     #[serde(default)]
     fan_in: Option<Box<crate::fan_in::AgentFanInCell>>,
+    /// The workflow invocations this run has committed, keyed by their
+    /// derived identity ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    /// Each cell holds the record persisted before its start and where the
+    /// invocation stands; the combined delegation-and-invocation count is
+    /// bounded by [`crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS`] at the
+    /// interception door. A loop state persisted before this field decodes to
+    /// the empty map.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    workflow_invocations:
+        BTreeMap<AgentWorkflowInvocationId, Box<crate::workflow_tool::AgentWorkflowInvocationCell>>,
 }
 
 /// One completed goal evaluation and where its report to the coordinating
@@ -499,6 +510,7 @@ impl AgentLoopState {
             delegations: BTreeMap::new(),
             delegation_envelope: None,
             fan_in: None,
+            workflow_invocations: BTreeMap::new(),
         }
     }
 
@@ -739,20 +751,27 @@ impl AgentLoopState {
     /// abandoned by the fence
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// A fenced delegation send settles its cell as failed in the same pass:
-    /// the send provably never left the run, so the winding-down parent never
-    /// spawned the child, and recovery after the wind-down uses a new
-    /// delegation, never this one. Fencing anywhere else would leave a
-    /// `Pending` cell under a cancelled effect — exactly the disagreement the
-    /// cell's commit discipline forbids.
+    /// A fenced delegation send or workflow start settles its cell as failed
+    /// in the same pass: the send provably never left the run, so the
+    /// winding-down parent never spawned the child, and recovery after the
+    /// wind-down uses a new delegation or invocation, never this one. Fencing
+    /// anywhere else would leave a `Pending` cell under a cancelled effect —
+    /// exactly the disagreement the cell's commit discipline forbids.
     pub(crate) fn fence_unsent_effects(&mut self, now: AgentTimestampMillis) -> usize {
         let mut fenced = 0;
         let mut fenced_sends = Vec::new();
+        let mut fenced_starts = Vec::new();
         for effect in &mut self.effects {
             if effect.is_pending() {
                 effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
-                if effect.kind() == crate::effect::AgentRunEffectKind::A2aSendCall {
-                    fenced_sends.push(effect.effect_id.clone());
+                match effect.kind() {
+                    crate::effect::AgentRunEffectKind::A2aSendCall => {
+                        fenced_sends.push(effect.effect_id.clone());
+                    }
+                    crate::effect::AgentRunEffectKind::WorkflowStartCall => {
+                        fenced_starts.push(effect.effect_id.clone());
+                    }
+                    _ => {}
                 }
                 fenced += 1;
             }
@@ -760,6 +779,15 @@ impl AgentLoopState {
         for effect_id in fenced_sends {
             if let Some(cell) = self
                 .delegations
+                .values_mut()
+                .find(|cell| cell.record.effect == effect_id)
+            {
+                cell.settle_failed("run-winding-down", now);
+            }
+        }
+        for effect_id in fenced_starts {
+            if let Some(cell) = self
+                .workflow_invocations
                 .values_mut()
                 .find(|cell| cell.record.effect == effect_id)
             {
@@ -1261,6 +1289,55 @@ impl AgentLoopState {
             .fold(0, u64::saturating_add)
     }
 
+    /// The workflow invocations this run has committed, keyed by their
+    /// identity.
+    #[must_use]
+    pub const fn workflow_invocations(
+        &self,
+    ) -> &BTreeMap<AgentWorkflowInvocationId, Box<crate::workflow_tool::AgentWorkflowInvocationCell>>
+    {
+        &self.workflow_invocations
+    }
+
+    /// One workflow invocation's cell, when the run holds it.
+    #[must_use]
+    pub fn workflow_invocation(
+        &self,
+        invocation: &AgentWorkflowInvocationId,
+    ) -> Option<&crate::workflow_tool::AgentWorkflowInvocationCell> {
+        self.workflow_invocations.get(invocation).map(Box::as_ref)
+    }
+
+    /// Mutable access to one workflow invocation's cell, for the outcome and
+    /// result transitions that settle it.
+    pub(crate) fn workflow_invocation_mut(
+        &mut self,
+        invocation: &AgentWorkflowInvocationId,
+    ) -> Option<&mut crate::workflow_tool::AgentWorkflowInvocationCell> {
+        self.workflow_invocations
+            .get_mut(invocation)
+            .map(Box::as_mut)
+    }
+
+    /// Commits one workflow-invocation cell alongside its start effect.
+    ///
+    /// Idempotent on the invocation identity: a replayed transition finds the
+    /// cell already present and leaves the original in place.
+    pub(crate) fn record_workflow_invocation(
+        &mut self,
+        cell: crate::workflow_tool::AgentWorkflowInvocationCell,
+    ) {
+        self.workflow_invocations
+            .entry(cell.record.invocation.clone())
+            .or_insert_with(|| Box::new(cell));
+    }
+
+    /// How many workflow-invocation cells this run retains.
+    #[must_use]
+    pub fn workflow_invocation_count(&self) -> usize {
+        self.workflow_invocations.len()
+    }
+
     /// The delegation authority the assignment carried, when it carried one.
     #[must_use]
     pub fn delegation_envelope(&self) -> Option<&AgentRunDelegationEnvelope> {
@@ -1307,7 +1384,7 @@ impl AgentLoopState {
     pub(crate) fn join_fan_in(
         &mut self,
         policy: crate::fan_in::AgentFanInPolicy,
-        member: AgentDelegationId,
+        member: crate::fan_in::AgentFanInMemberId,
         turn: u64,
         now: AgentTimestampMillis,
     ) {

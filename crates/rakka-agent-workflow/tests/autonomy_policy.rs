@@ -243,6 +243,70 @@ fn autonomy_classification_agrees_with_dispatch_classification() {
 }
 
 #[test]
+fn a_child_workflow_start_is_a_first_class_autonomy_target() {
+    // The classifier gap closed by agent-domain workflows-as-tools: a
+    // `ChildWorkflowCommand` no longer collapses into the fail-closed
+    // `Other`, and the default catalog admits it under the outbox
+    // deduplication key — the derived invocation identity the child run's
+    // own inbox deduplicates on.
+    let start = effect(
+        "child-workflow-start",
+        AgentEffectKind::ChildWorkflowCommand,
+        "child-workflow",
+        "refund-flow",
+        [],
+        Some(artifact("workflow-input")),
+    );
+    assert_eq!(
+        AgentAutonomyTargetClass::for_effect(&start),
+        AgentAutonomyTargetClass::ChildWorkflow
+    );
+    assert_eq!(
+        AgentAutonomyTargetClass::from_dispatch_class(AgentDispatchTargetClass::ChildWorkflow),
+        AgentAutonomyTargetClass::ChildWorkflow
+    );
+    assert_eq!(
+        AgentAutonomyTargetClass::from_label("child-workflow"),
+        Some(AgentAutonomyTargetClass::ChildWorkflow),
+        "the label parses, closing the asymmetry with the dispatcher and the query index"
+    );
+
+    let catalog = AgentEffectTargetCatalog::phase5_default();
+    let policy = AgentAutonomyPolicy::phase5_default("phase5.v1");
+    let allowed = catalog
+        .validate_effect(
+            &policy,
+            &AgentAutonomyUsage::new(),
+            &start,
+            None,
+            AgentTimestampMillis::new(100),
+        )
+        .expect("policy decision");
+    assert!(allowed.is_allowed(), "{allowed:?}");
+
+    // The remaining `Other` lump still fails closed: the widening was the
+    // one class, not the posture.
+    let other = effect(
+        "notify-ops",
+        AgentEffectKind::Notification,
+        "notification",
+        "ops-alert",
+        [],
+        None,
+    );
+    let denied = catalog
+        .validate_effect(
+            &policy,
+            &AgentAutonomyUsage::new(),
+            &other,
+            None,
+            AgentTimestampMillis::new(100),
+        )
+        .expect("policy decision");
+    assert_eq!(denied.reason_code, "unsupported-target-class");
+}
+
+#[test]
 fn policy_decisions_carry_bounded_audit_attributes() {
     let decision = AgentAutonomyPolicy::phase5_default("phase5.v1")
         .max_autonomous_steps(1)
