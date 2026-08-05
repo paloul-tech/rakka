@@ -385,8 +385,13 @@ pub fn workflow_tool_id() -> rakka_agent::AgentWorkflowToolId {
     rakka_agent::AgentWorkflowToolId::new(WORKFLOW_TOOL).expect("workflow tool id should be valid")
 }
 
+/// The capability the workflow fixture's descriptor declares.
+pub const WORKFLOW_CAPABILITY: &str = "issue-refunds";
+
 /// The versioned descriptor under which the fixture's compiled workflow
-/// appears in the agent's toolset.
+/// appears in the agent's toolset. Declares one required capability, so
+/// tests can observe the descriptor's capability surface copied onto the
+/// invocation record at commit.
 pub fn workflow_tool_descriptor() -> rakka_agent::AgentWorkflowToolDescriptor {
     rakka_agent::AgentWorkflowToolDescriptor::new(
         workflow_tool_id(),
@@ -397,6 +402,11 @@ pub fn workflow_tool_descriptor() -> rakka_agent::AgentWorkflowToolDescriptor {
         schema("refund-output"),
     )
     .expect("the workflow-tool descriptor should be valid")
+    .with_capability(
+        rakka_agent::AgentCapabilityId::new(WORKFLOW_CAPABILITY)
+            .expect("the capability id should be valid"),
+    )
+    .expect("the descriptor should accept the capability")
 }
 
 /// The workflow-tool wiring the fixture run entity serves.

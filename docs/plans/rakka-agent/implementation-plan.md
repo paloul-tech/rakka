@@ -2998,7 +2998,13 @@ duplicated internal effects).
   descriptor-level concurrency ceilings, descendant credit for
   `descendants_created`, a combined-membership 17-member integration sweep
   (the bound is door-enforced and unit-covered; a full 17-effect turn
-  exceeds the per-turn effect bound), and snapshot/projection views (4.7).
+  exceeds the per-turn effect bound), snapshot/projection views (4.7), and
+  an envelope-side per-workflow-tool capability declaration — the review
+  pass made `required_capabilities` flow (copied onto the record at commit,
+  carried on the dispatch grant per attempt), but the definition envelope
+  declares workflow tools by id only, so the regular tool declaration's
+  capability *subset* check has no definition-side set to check against
+  yet.
 
 ### Slice 4.6 — Cancellation propagation and shared environment
 

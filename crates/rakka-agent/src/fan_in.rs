@@ -987,6 +987,7 @@ mod tests {
             descriptor_digest: AgentContentDigest::sha256_of_bytes(b"descriptor"),
             workflow_type: "refund".to_string(),
             definition_version: rakka_agent_workflow::WorkflowDefinitionVersion::new("v1"),
+            required_capabilities: std::collections::BTreeSet::new(),
             child_run: crate::workflow_tool::child_workflow_run_id(&invocation),
             deduplication_key: invocation.as_str().to_string(),
             turn: 1,

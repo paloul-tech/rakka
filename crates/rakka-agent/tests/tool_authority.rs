@@ -217,6 +217,13 @@ impl AuthorityFixture {
         self
     }
 
+    /// Wires the run entity to serve workflow tools, so the loop intercepts
+    /// the calls and the dispatch gate sees real `WorkflowStart` intents.
+    fn with_workflow_tools(mut self, config: rakka_agent::AgentRunWorkflowConfig) -> Self {
+        self.fx = self.fx.with_workflow_tools(config);
+        self
+    }
+
     async fn start(&self) {
         self.fx
             .instantiate_agent_with_envelope(self.envelope.clone())
@@ -235,6 +242,16 @@ impl AuthorityFixture {
         } else {
             Arc::new(gate)
         };
+        let mut delivery = InProcessRunResultDelivery::new(
+            self.fx.runs.clone(),
+            self.fx.effects.clone(),
+            self.fx.router.clone(),
+            self.fx.clock.clone(),
+        )
+        .with_effect_policies(self.fx.policies.clone());
+        if let Some(config) = &self.fx.workflow_tools {
+            delivery = delivery.with_workflow_tools(config.clone());
+        }
         AgentRunEffectDispatcher::new(
             AgentDispatcherWorkerId::new("worker-1"),
             self.workflow_store.clone(),
@@ -244,15 +261,7 @@ impl AuthorityFixture {
             Arc::new(self.adapter.clone()),
             Arc::new(self.tools.clone()),
             gate,
-            Arc::new(
-                InProcessRunResultDelivery::new(
-                    self.fx.runs.clone(),
-                    self.fx.effects.clone(),
-                    self.fx.router.clone(),
-                    self.fx.clock.clone(),
-                )
-                .with_effect_policies(self.fx.policies.clone()),
-            ),
+            Arc::new(delivery),
         )
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
@@ -354,6 +363,26 @@ impl AuthorityFixture {
             }
         }
         panic!("the dispatch pump did not quiesce");
+    }
+
+    /// The failure code of the run's one workflow-invocation cell, read from
+    /// durable state. A definitively failed workflow start is a fan-in
+    /// disposition the coordinator survives, so the cell — not the run's
+    /// terminal reason — is where its refusal code lands.
+    async fn workflow_cell_failure_code(&self) -> Option<String> {
+        let state = rakka_agent::load_agent_run_state(
+            &self.fx.runs,
+            &run_scope(),
+            &rakka_agent::AgentSchemaPolicy::default(),
+        )
+        .await
+        .expect("the run state loads")?;
+        let loop_state = state.loop_state()?;
+        let cell = loop_state.workflow_invocations().values().next()?;
+        match &cell.status {
+            rakka_agent::AgentWorkflowInvocationStatus::Failed { code } => Some(code.clone()),
+            _ => None,
+        }
     }
 
     /// The stable code of the effect failure that stopped the run.
@@ -513,6 +542,71 @@ async fn a_workflow_kind_registration_never_dispatches_generically() {
         "workflow-tool-requires-interception"
     );
     assert_eq!(fx.tools.invocation_count(TOOL), 0, "nothing was invoked");
+}
+
+// ---------------------------------------------------------------------------
+// Specification 8.6 / 7.3: the workflow-tool envelope door, per attempt. The
+// loop's interception commits the invocation on wiring alone — authority is
+// the dispatch gate's business, and `AgentAuthorityEnvelope::workflow_tools`
+// is what it re-checks on every attempt.
+// ---------------------------------------------------------------------------
+
+fn workflow_then_proposal() -> DeterministicModelAdapter {
+    DeterministicModelAdapter::new()
+        .with_turn(
+            AgentModelTurn::new(CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+                .with_text("Invoking the refund workflow.")
+                .with_tool_call(
+                    AgentToolCallRequest::new(
+                        AgentToolCallId::new("invoke-1").expect("call id should be valid"),
+                        AgentToolId::new(WORKFLOW_TOOL).expect("tool id should be valid"),
+                        serde_json::json!({ "order": "o-1" }),
+                    )
+                    .expect("the tool call is bounded"),
+                ),
+        )
+        .with_turn(proposing_turn("workflow-evidence"))
+}
+
+#[tokio::test]
+async fn a_workflow_start_is_undispatchable_until_the_definition_declares_it() {
+    // Undeclared: the envelope never lists the workflow tool, so the dispatch
+    // authority refuses the attempt with `undeclared-workflow-tool` before
+    // any executor could be reached. The refusal is a fan-in disposition the
+    // coordinator survives — the cell, not the run's terminal reason, holds
+    // the code.
+    let mut envelope = AgentAuthorityEnvelope::empty();
+    envelope.task_definitions.insert(task_definition_id());
+    let fx = AuthorityFixture::over(workflow_then_proposal(), AgentToolRegistry::new(), None)
+        .with_envelope(envelope)
+        .with_workflow_tools(workflow_config());
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.workflow_cell_failure_code().await.as_deref(),
+        Some("undeclared-workflow-tool")
+    );
+    assert_eq!(fx.tools.invocation_count(WORKFLOW_TOOL), 0);
+
+    // Declared: the same shape with the envelope naming the tool passes the
+    // door — the attempt proceeds to invocation, where this pipeline's absent
+    // start executor is what fails it. The code moving from the envelope
+    // refusal to the executor failure is the gate admitting the attempt.
+    let mut envelope = AgentAuthorityEnvelope::empty();
+    envelope.task_definitions.insert(task_definition_id());
+    envelope.workflow_tools.insert(workflow_tool_id());
+    let fx = AuthorityFixture::over(workflow_then_proposal(), AgentToolRegistry::new(), None)
+        .with_envelope(envelope)
+        .with_workflow_tools(workflow_config());
+    fx.start().await;
+    fx.pump().await;
+
+    assert_eq!(
+        fx.workflow_cell_failure_code().await.as_deref(),
+        Some("workflow-start-executor-missing"),
+        "the envelope door admitted the attempt; only the unwired executor failed it"
+    );
 }
 
 // ---------------------------------------------------------------------------

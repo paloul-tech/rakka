@@ -2081,11 +2081,18 @@ where
                                 ),
                             },
                         },
+                        // The real dispatcher's conflict normalization,
+                        // verbatim: the cell's `Conflicted` settlement is
+                        // structural, never an executor string convention.
                         Ok(crate::dispatch::AgentWorkflowStartFinding::Conflict {
                             code,
                             message,
-                        })
-                        | Ok(crate::dispatch::AgentWorkflowStartFinding::Refused {
+                        }) => AgentRunEffectOutcome::Failed {
+                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            message: format!("{code}: {message}"),
+                        },
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Refused {
                             code,
                             message,
                         }) => AgentRunEffectOutcome::Failed { code, message },
@@ -2383,6 +2390,7 @@ where
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -2404,6 +2412,7 @@ where
             router,
             clock,
             policies: AgentEffectPolicies::default(),
+            workflow_tools: None,
         }
     }
 
@@ -2411,6 +2420,18 @@ where
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.policies = policies;
+        self
+    }
+
+    /// Wires the entities this delivery builds to serve workflow tools —
+    /// the delivered model result is what the loop evaluates, so the
+    /// interception must be wired on this path too.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
         self
     }
 }
@@ -2429,6 +2450,9 @@ where
             let mut entity =
                 AgentRunEntityStore::new(scope.clone(), self.store.clone(), self.effects.clone())
                     .with_effect_policies(self.policies.clone());
+            if let Some(config) = &self.workflow_tools {
+                entity = entity.with_workflow_tools(config.clone());
+            }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
                 .apply(command, &self.router, now)

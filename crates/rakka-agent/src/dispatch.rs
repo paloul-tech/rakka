@@ -511,10 +511,13 @@ pub enum AgentWorkflowStartFinding {
     /// A child run exists that this invocation's identity does not own — a
     /// deduplication-key match under a foreign command id, or an existing run
     /// whose workflow type or definition version differs from what the record
-    /// pinned. The generation settles `Failed` under the code and the cell
-    /// records the conflict; recovery uses a new invocation, never this one.
+    /// pinned. The dispatch layer normalizes every conflict onto
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE`] —
+    /// this code is detail folded into the failure message, so the executor
+    /// may report any code it likes and the cell still settles `Conflicted`;
+    /// recovery uses a new invocation, never this one.
     Conflict {
-        /// Stable machine-readable code.
+        /// Machine-readable detail code, preserved in the failure message.
         code: String,
         /// Human-readable detail.
         message: String,
@@ -2528,8 +2531,17 @@ where
                             },
                         })
                     }
-                    AgentWorkflowStartFinding::Conflict { code, message }
-                    | AgentWorkflowStartFinding::Refused { code, message } => {
+                    // Conflict-ness is normalized onto the canonical code
+                    // here, so the run entity's `Conflicted` settlement never
+                    // depends on an executor picking the right string.
+                    AgentWorkflowStartFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed {
+                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            message: format!("{code}: {message}"),
+                        })
+                    }
+                    AgentWorkflowStartFinding::Refused { code, message } => {
                         Ok(AgentRunEffectOutcome::Failed { code, message })
                     }
                 }

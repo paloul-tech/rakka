@@ -64,10 +64,12 @@ pub const AGENT_WORKFLOW_INVOCATION_ID_PREFIX: &str = "workflow-invocation-";
 
 /// Maximum workflow-invocation cells one run retains.
 ///
-/// A structural bound on the run's durable state, sized with
-/// [`crate::delegation::AGENT_RUN_MAX_DELEGATIONS`] because fan-in membership
-/// spans both cell maps under one combined bound.
-pub const AGENT_RUN_MAX_WORKFLOW_INVOCATIONS: usize = 16;
+/// Defined as [`crate::delegation::AGENT_RUN_MAX_DELEGATIONS`] — not restated —
+/// because the enforced door bound is the *combined* fan-in membership count
+/// ([`crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS`], the same value): a run's
+/// workflow-invocation count can never exceed the combined bound, so the two
+/// constants must move together rather than drift apart.
+pub const AGENT_RUN_MAX_WORKFLOW_INVOCATIONS: usize = crate::delegation::AGENT_RUN_MAX_DELEGATIONS;
 
 /// Maximum workflow-tool descriptors one run's wiring declares.
 pub const AGENT_RUN_MAX_WORKFLOW_TOOLS: usize = 32;
@@ -94,8 +96,15 @@ pub const AGENT_WORKFLOW_TOOL_TYPE_MAX_BYTES: usize = 256;
 /// Maximum capabilities one descriptor requires.
 pub const AGENT_WORKFLOW_TOOL_MAX_CAPABILITIES: usize = 32;
 
-/// Maximum bytes of the terminal-reason code one workflow result carries.
-pub const AGENT_WORKFLOW_RESULT_REASON_MAX_BYTES: usize = 256;
+/// The canonical code under which a workflow start's conflict settles.
+///
+/// The dispatch layer normalizes every
+/// [`crate::dispatch::AgentWorkflowStartFinding::Conflict`] onto this code —
+/// folding the executor's own code into the failure message — so the run
+/// entity's conflict classification is structural, never an executor
+/// convention: whatever code the application reports, a conflict settles the
+/// cell [`AgentWorkflowInvocationStatus::Conflicted`] under this one code.
+pub const AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE: &str = "workflow-invocation-conflict";
 
 /// Default attempt ceiling of the workflow start effect.
 ///
@@ -214,6 +223,11 @@ pub struct AgentWorkflowToolDescriptor {
     #[serde(default)]
     pub parameters: Option<Value>,
     /// Scoped capabilities the workflow's contained effects may exercise.
+    /// Copied onto every invocation record at commit and carried on the
+    /// dispatch grant per attempt. The definition envelope declares workflow
+    /// tools by id only, so a per-workflow-tool capability *narrowing* check
+    /// (the regular tool declaration's subset discipline) awaits an
+    /// envelope-side declaration — recorded follow-up work.
     #[serde(default)]
     pub required_capabilities: BTreeSet<AgentCapabilityId>,
     /// Logical credential binding the start dispatch may resolve.
@@ -523,6 +537,12 @@ pub struct AgentWorkflowInvocationRecord {
     /// The workflow definition version the invocation pins, copied from the
     /// descriptor at commit.
     pub definition_version: WorkflowDefinitionVersion,
+    /// The scoped capabilities the descriptor declared for the workflow's
+    /// contained effects, copied at commit so the dispatch grant carries the
+    /// authorized surface every attempt. A record persisted before this field
+    /// decodes to the empty set.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_capabilities: BTreeSet<AgentCapabilityId>,
     /// The child workflow run this invocation creates or adopts: the
     /// invocation id verbatim ([`child_workflow_run_id`]).
     pub child_run: WorkflowRunId,
@@ -691,7 +711,11 @@ impl Display for AgentWorkflowTerminalStatus {
 pub struct AgentWorkflowChildResult {
     /// The child run's terminal status.
     pub status: AgentWorkflowTerminalStatus,
-    /// The child's stable terminal-reason code, when it recorded one.
+    /// The child's stable terminal-reason code, when it recorded one. The
+    /// recording transition truncates it to
+    /// [`crate::run::AGENT_RUN_DETAIL_MAX_LENGTH`] bytes — the run's uniform
+    /// detail bound — rather than refusing the child's report over its
+    /// wording.
     #[serde(default)]
     pub terminal_reason: Option<String>,
     /// The child's result artifact reference, when one exists.
@@ -912,13 +936,6 @@ pub enum AgentWorkflowToolError {
         /// The coherence failure detail.
         message: String,
     },
-    /// The terminal-reason code exceeds its bound.
-    ReasonTooLong {
-        /// Actual bytes.
-        bytes: usize,
-        /// The bound.
-        maximum: usize,
-    },
     /// A value could not be encoded.
     Encoding {
         /// The encoding failure detail.
@@ -948,7 +965,6 @@ impl AgentWorkflowToolError {
             Self::HeadroomExceeded { .. } => "workflow-invocation-headroom-exceeded",
             Self::RecordTooLarge { .. } => "workflow-invocation-record-too-large",
             Self::RecordIncoherent { .. } => "workflow-invocation-incoherent",
-            Self::ReasonTooLong { .. } => "workflow-result-reason-too-long",
             Self::Encoding { .. } => "workflow-tool-encoding",
             Self::Command { .. } => "workflow-start-command-invalid",
             Self::Identity(_) => "workflow-tool-identity",
@@ -1002,11 +1018,6 @@ impl Display for AgentWorkflowToolError {
             Self::RecordIncoherent { message } => {
                 write!(f, "the invocation record is incoherent: {message}")
             }
-            Self::ReasonTooLong { bytes, maximum } => write!(
-                f,
-                "the terminal-reason code is {bytes} bytes, which exceeds the {maximum} byte \
-                 bound"
-            ),
             Self::Encoding { message } => write!(f, "encoding failed: {message}"),
             Self::Command { message } => {
                 write!(f, "the start command could not be built: {message}")
@@ -1078,6 +1089,7 @@ mod tests {
             descriptor_digest: descriptor.schema_digest(),
             workflow_type: descriptor.workflow_type.clone(),
             definition_version: descriptor.definition_version.clone(),
+            required_capabilities: descriptor.required_capabilities.clone(),
             child_run: child_workflow_run_id(&invocation),
             deduplication_key: invocation.as_str().to_string(),
             turn: 1,

@@ -2188,28 +2188,25 @@ fn plan_workflow_call(
     use crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS;
     use crate::workflow_tool::{
         child_workflow_run_id, workflow_invocation_id_for, AgentWorkflowInvocationRecord,
+        AgentWorkflowToolError,
     };
 
+    // Refusal codes and messages come from the one error type that defines
+    // them, so the stable code surface cannot drift from a restated literal.
     if combined_members >= AGENT_RUN_MAX_FAN_IN_MEMBERS {
-        return Err((
-            "workflow-invocation-limit-exceeded".to_string(),
-            format!(
-                "the run already retains its maximum of {AGENT_RUN_MAX_FAN_IN_MEMBERS} combined \
-                 fan-out members"
-            ),
-        ));
+        let error = AgentWorkflowToolError::LimitExceeded {
+            maximum: AGENT_RUN_MAX_FAN_IN_MEMBERS,
+        };
+        return Err((error.code().to_string(), error.to_string()));
     }
     if let Some(env) = envelope {
         if !env.allowed_workflows.is_empty()
             && !env.allowed_workflows.contains(&descriptor.workflow_tool)
         {
-            return Err((
-                "goal-workflow-not-allowed".to_string(),
-                format!(
-                    "the goal does not allow the workflow tool {}",
-                    descriptor.workflow_tool
-                ),
-            ));
+            let error = AgentWorkflowToolError::NotAllowed {
+                tool: descriptor.workflow_tool.clone(),
+            };
+            return Err((error.code().to_string(), error.to_string()));
         }
     }
     let input = AgentTaskContent::inline(call.arguments.clone()).map_err(|error| {
@@ -2247,6 +2244,7 @@ fn plan_workflow_call(
         descriptor_digest: descriptor.schema_digest(),
         workflow_type: descriptor.workflow_type.clone(),
         definition_version: descriptor.definition_version.clone(),
+        required_capabilities: descriptor.required_capabilities.clone(),
         child_run: child_workflow_run_id(&invocation),
         deduplication_key: invocation.as_str().to_string(),
         turn,
@@ -2530,9 +2528,13 @@ fn evaluate_model_output(
                     // member committed after the close could join nothing,
                     // and its definitive start failure would wind the
                     // coordinator down over a child the group never held.
+                    // The model-facing message stays instructive; the code
+                    // comes from the error type that defines it.
                     planned.push(PlannedCall::Refused {
                         call_id: call.call_id,
-                        code: "workflow-after-await".to_string(),
+                        code: crate::workflow_tool::AgentWorkflowToolError::AfterAwait
+                            .code()
+                            .to_string(),
                         message: "this turn already closed its fan-out group; invoke workflows \
                                   before the await, or in the turn after the fan-in resolves"
                             .to_string(),
@@ -2562,14 +2564,15 @@ fn evaluate_model_output(
                             .saturating_mul(2)
                             .saturating_add(AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES);
                         if cost > delegation_headroom {
+                            let error =
+                                crate::workflow_tool::AgentWorkflowToolError::HeadroomExceeded {
+                                    needed: cost,
+                                    available: delegation_headroom,
+                                };
                             planned.push(PlannedCall::Refused {
                                 call_id: call.call_id,
-                                code: "workflow-invocation-headroom-exceeded".to_string(),
-                                message: format!(
-                                    "committing this invocation would add {cost} bytes to the \
-                                     run's durable record, which exceeds its \
-                                     {delegation_headroom} bytes of remaining headroom"
-                                ),
+                                code: error.code().to_string(),
+                                message: error.to_string(),
                             });
                         } else {
                             delegation_headroom -= cost;
@@ -3372,7 +3375,11 @@ fn apply_effect_outcome(
                     .iter()
                     .find_map(|(id, cell)| (cell.record.effect == *effect_id).then(|| id.clone()));
                 if let Some(invocation_id) = held {
-                    let conflict = code.as_str() == "workflow-invocation-conflict";
+                    // The canonical code the dispatch layer normalizes every
+                    // conflict finding onto — structural, not an executor
+                    // string convention.
+                    let conflict = code.as_str()
+                        == crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE;
                     let call_id = run
                         .loop_state
                         .workflow_invocation(&invocation_id)
@@ -5996,6 +6003,8 @@ pub enum AgentRunEntityCommand {
         /// The child's terminal status.
         status: crate::workflow_tool::AgentWorkflowTerminalStatus,
         /// The child's stable terminal-reason code, when it recorded one.
+        /// Truncated to [`AGENT_RUN_DETAIL_MAX_LENGTH`] bytes at recording —
+        /// the run's uniform detail bound — never refused over its wording.
         #[serde(default)]
         terminal_reason: Option<String>,
         /// The child's result artifact reference, when one exists. Boxed to

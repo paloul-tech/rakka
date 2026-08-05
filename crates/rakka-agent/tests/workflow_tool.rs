@@ -114,7 +114,11 @@ impl AgentWorkflowStartExecutor for RecordingWorkflowExecutor {
                     message: "the registry serves no such workflow".to_string(),
                 },
                 StartMode::Conflict => AgentWorkflowStartFinding::Conflict {
-                    code: "workflow-invocation-conflict".to_string(),
+                    // Deliberately not the canonical code: the dispatch layer
+                    // must normalize any conflict finding onto
+                    // `workflow-invocation-conflict`, whatever the executor
+                    // reports.
+                    code: "child-run-pins-mismatch".to_string(),
                     message: "a child run exists that this invocation does not own".to_string(),
                 },
             })
@@ -356,6 +360,11 @@ async fn a_workflow_call_commits_one_invocation_with_its_derived_identity() {
         "the child run id is the invocation id verbatim"
     );
     assert_eq!(cell.record.deduplication_key, expected.as_str());
+    assert_eq!(
+        cell.record.required_capabilities,
+        common::workflow_tool_descriptor().required_capabilities,
+        "the descriptor's capability surface is copied onto the record at commit"
+    );
     let group = loop_state.fan_in().expect("the group exists");
     assert!(group
         .members
@@ -723,7 +732,10 @@ async fn a_failed_start_is_a_fan_in_disposition_not_a_coordinator_failure() {
 
 /// An executor conflict settles the cell `Conflicted`: a child exists that
 /// this invocation's identity does not own, and recovery uses a new
-/// invocation, never this one.
+/// invocation, never this one. The executor reported its own detail code —
+/// the dispatch layer normalizes every conflict finding onto the canonical
+/// code, so the `Conflicted` settlement is structural, never a string
+/// convention.
 #[tokio::test]
 async fn a_conflicting_child_settles_the_cell_conflicted() {
     let executor = RecordingWorkflowExecutor::new(StartMode::Conflict);
@@ -735,8 +747,9 @@ async fn a_conflicting_child_settles_the_cell_conflicted() {
     assert_eq!(
         cell_status,
         AgentWorkflowInvocationStatus::Conflicted {
-            code: "workflow-invocation-conflict".to_string()
-        }
+            code: rakka_agent::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE.to_string()
+        },
+        "the executor's own conflict code normalized onto the canonical code"
     );
     let mut run = fixture.run();
     run.recover(fixture.now()).await.expect("recover");
@@ -773,18 +786,9 @@ async fn an_unwired_start_fails_closed() {
     );
 }
 
-/// A result arriving before the start receipt records first-writer-wins:
-/// there is deliberately no early window, because the child's identity is
-/// derived on the record at commit — status and result are separate cell
-/// fields, and the receipt later settles the effect independently.
-#[tokio::test]
-async fn a_result_arriving_before_the_receipt_records_first_writer_wins() {
-    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
-    let fixture = workflow_fixture(executor, workflow_await_turn());
-    create_workflow_task(&fixture).await;
-
-    // Advance by hand: answer only the model effect, so the start effect is
-    // committed — the cell is durable and `Pending` — but unanswered.
+/// Advances by hand, answering only model effects, so the start effect is
+/// committed — the cell is durable and `Pending` — but unanswered.
+async fn drive_model_turn_only(fixture: &Fixture) {
     let scope = run_scope();
     let mut answered = 0;
     for _round in 0..8 {
@@ -826,6 +830,18 @@ async fn a_result_arriving_before_the_receipt_records_first_writer_wins() {
         answered += 1;
     }
     assert!(answered >= 1, "the model turn was answered");
+}
+
+/// A result arriving before the start receipt records first-writer-wins:
+/// there is deliberately no early window, because the child's identity is
+/// derived on the record at commit — status and result are separate cell
+/// fields, and the receipt later settles the effect independently.
+#[tokio::test]
+async fn a_result_arriving_before_the_receipt_records_first_writer_wins() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let fixture = workflow_fixture(executor, workflow_await_turn());
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
 
     let (invocation, cell_status) = committed_invocation(&fixture).await;
     assert_eq!(
@@ -867,6 +883,85 @@ async fn a_result_arriving_before_the_receipt_records_first_writer_wins() {
     assert_eq!(
         cell.result.expect("the early result stands").status,
         AgentWorkflowTerminalStatus::Completed
+    );
+}
+
+/// A start receipt naming a child run the invocation does not own — a broken
+/// executor — settles the cell `Failed { workflow-start-run-mismatch }`
+/// instead of grafting the foreign child onto the invocation, and the
+/// coordinator survives it as a fan-in disposition.
+#[tokio::test]
+async fn a_mismatched_start_receipt_settles_the_cell_failed_and_the_run_survives() {
+    let executor = RecordingWorkflowExecutor::new(StartMode::Started);
+    let fixture = workflow_fixture(executor, workflow_await_turn());
+    create_workflow_task(&fixture).await;
+    drive_model_turn_only(&fixture).await;
+
+    let (invocation, cell_status) = committed_invocation(&fixture).await;
+    assert_eq!(
+        cell_status,
+        AgentWorkflowInvocationStatus::Pending,
+        "the start effect is committed but unanswered"
+    );
+
+    // The forged receipt, applied exactly as a dispatch worker reports its
+    // outcome — but naming a child run the record never derived.
+    let scope = run_scope();
+    let effect = {
+        let mut run = fixture.run();
+        run.recover(fixture.now()).await.expect("recover");
+        let state = run.state().expect("state");
+        state
+            .loop_state()
+            .expect("loop state")
+            .effects()
+            .iter()
+            .find(|effect| {
+                matches!(
+                    effect.request,
+                    rakka_agent::AgentRunEffectRequest::WorkflowStart { .. }
+                )
+            })
+            .expect("the start effect is committed")
+            .clone()
+    };
+    let command = AgentRunEntityCommand::RecordEffectResult {
+        operation_id: effect.result_operation_id(&scope).expect("derives"),
+        effect_id: effect.effect_id.clone(),
+        generation: effect.generation,
+        attempt: effect.attempts.saturating_add(1),
+        fence: 0,
+        outcome: Box::new(rakka_agent::AgentRunEffectOutcome::WorkflowStart {
+            receipt: rakka_agent::AgentWorkflowStartReceipt {
+                invocation: invocation.clone(),
+                child_run: rakka_agent_workflow::AgentRunId::new("foreign-run"),
+                adopted: false,
+            },
+        }),
+    };
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    run.apply(command, &fixture.router, fixture.now())
+        .await
+        .expect("the forged receipt applies as a definitive disposition");
+    drop(run);
+
+    let (_, cell_status) = committed_invocation(&fixture).await;
+    assert_eq!(
+        cell_status,
+        AgentWorkflowInvocationStatus::Failed {
+            code: "workflow-start-run-mismatch".to_string()
+        },
+        "the foreign child is never grafted onto the invocation"
+    );
+
+    fixture.pump().await.expect("the loop should converge");
+    let mut run = fixture.run();
+    run.recover(fixture.now()).await.expect("recover");
+    assert_eq!(
+        run.state().expect("state").status(),
+        Some(AgentRunStatus::Completed),
+        "the mismatch is a fan-in disposition the coordinator survives"
     );
 }
 

@@ -1699,6 +1699,11 @@ impl AgentToolAuthority {
         }
         self.check_execution_policy(intent.execution_policy.as_ref())?;
         Ok(AgentGrantedDispatch {
+            // The grant carries the capability surface the descriptor
+            // declared, copied onto the record at commit — the regular tool
+            // binding's discipline. The definition envelope declares workflow
+            // tools by id only, so the per-tool capability subset check
+            // awaits an envelope-side declaration (recorded follow-up work).
             grant: self.grant(
                 context,
                 scope,
@@ -1706,7 +1711,7 @@ impl AgentToolAuthority {
                 goal,
                 intent,
                 None,
-                BTreeSet::new(),
+                invocation.required_capabilities.clone(),
                 now,
             ),
             tool_call: None,
