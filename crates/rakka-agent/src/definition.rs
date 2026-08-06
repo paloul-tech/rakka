@@ -349,6 +349,19 @@ pub struct AgentToolDeclaration {
     /// its absence — cannot be proven stricter, and a setup must keep the
     /// routing the definition declared.
     pub execution_policy: Option<AgentExecutionPolicyRef>,
+    /// The shared environments this tool observes or mutates
+    /// ([specification 6.7 and 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A logical, authorized reference set, never resolved credentials.
+    /// Whether an access *observes* or *mutates* is the safety class's
+    /// business — `ReadOnly` is observation; every other class mutates — so
+    /// there is deliberately no second mode axis for the two to disagree on.
+    /// Every declared ref must also sit inside the definition envelope's
+    /// `environments`, and a run's goal-scope narrowing may shrink what a
+    /// dispatch may touch further. Declarations persisted before this field
+    /// load without one.
+    #[serde(default)]
+    pub environments: BTreeSet<AgentEnvironmentRef>,
 }
 
 impl AgentToolDeclaration {
@@ -360,6 +373,7 @@ impl AgentToolDeclaration {
             capabilities: BTreeSet::new(),
             credential_binding: None,
             execution_policy: None,
+            environments: BTreeSet::new(),
         }
     }
 
@@ -367,6 +381,14 @@ impl AgentToolDeclaration {
     #[must_use]
     pub fn with_capability(mut self, capability: AgentCapabilityId) -> Self {
         self.capabilities.insert(capability);
+        self
+    }
+
+    /// Declares a shared environment this tool observes or mutates
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn with_environment(mut self, environment: AgentEnvironmentRef) -> Self {
+        self.environments.insert(environment);
         self
     }
 
@@ -711,6 +733,13 @@ impl AgentAuthorityEnvelope {
                         execution_policy_label(declared.execution_policy.as_ref()),
                         execution_policy_label(declaration.execution_policy.as_ref()),
                     ),
+                ));
+            }
+
+            for environment in declaration.environments.difference(&declared.environments) {
+                violations.push(AgentEnvelopeViolation::new(
+                    AgentEnvelopeDimension::Environment,
+                    format!("tool {tool} is not granted the environment {environment}"),
                 ));
             }
         }

@@ -742,6 +742,64 @@ impl AgentLoopState {
         self.effects.iter().any(AgentRunEffect::blocks_settlement) || self.proposal.is_some()
     }
 
+    /// Whether a child this run created has not yet recorded its terminal
+    /// outcome: a delegation or workflow-invocation cell still pending, or
+    /// settled with a live child and no result.
+    ///
+    /// This is the subtree half of the specification-8.7 quiesce condition a
+    /// winding-down parent holds against: every started child is a started
+    /// consequential effect, and the parent must not project terminal
+    /// `Cancelled` until each has a known outcome — a child parked in its own
+    /// reconciliation deliberately holds the whole ancestry nonterminal until
+    /// an explicit decision resolves it. A cell settled `Conflicted` or
+    /// `Failed` never had a child and blocks nothing.
+    ///
+    /// A child whose delegation-cancel was *definitively refused* blocks
+    /// nothing either, and that release is what keeps the wait finite: the
+    /// child's own settle rule accepts only `delegation-cancel-forged` and
+    /// `delegation-cancel-not-delegated` as definitive, and both prove the
+    /// addressed task will never report to this run — it carries no
+    /// provenance naming this delegation, so its terminal transition owes
+    /// this parent nothing. Waiting on it would be waiting for a report that
+    /// cannot arrive.
+    ///
+    /// # The workflow half makes the result relay load-bearing
+    ///
+    /// A started workflow invocation is released only by its recorded child
+    /// result, and nothing in this crate delivers one: the application owes
+    /// [`crate::run::AgentRunEntityCommand::RecordWorkflowResult`]. A
+    /// deployment that invokes workflow tools without wiring that relay
+    /// therefore has no way to complete a cancellation — which is the honest
+    /// reading of [specification 8.7](../../../docs/plans/rakka-agent/spec.md),
+    /// not a regression to route around: the parent genuinely does not know
+    /// whether the child stopped, and terminalizing anyway would be the false
+    /// claim the specification forbids. Delivering the relay command *is* the
+    /// "explicit reconciliation decision" the specification names as the
+    /// other way out, so an operator can always resolve a child whose real
+    /// outcome was established out of band.
+    #[must_use]
+    pub fn awaits_children(&self) -> bool {
+        let delegation_open = self.delegations.values().any(|cell| match &cell.status {
+            crate::delegation::AgentDelegationStatus::Pending => true,
+            crate::delegation::AgentDelegationStatus::ChildCreated { .. } => {
+                !cell.child_settled() && !cell.cancel_refused()
+            }
+            _ => false,
+        });
+        if delegation_open {
+            return true;
+        }
+        self.workflow_invocations
+            .values()
+            .any(|cell| match &cell.status {
+                crate::workflow_tool::AgentWorkflowInvocationStatus::Pending => true,
+                crate::workflow_tool::AgentWorkflowInvocationStatus::Started { .. } => {
+                    !cell.child_settled()
+                }
+                _ => false,
+            })
+    }
+
     /// Fences every effect that provably never reached the sink, marking it
     /// cancelled in place.
     ///
@@ -757,12 +815,21 @@ impl AgentLoopState {
     /// wind-down uses a new delegation or invocation, never this one. Fencing
     /// anywhere else would leave a `Pending` cell under a cancelled effect —
     /// exactly the disagreement the cell's commit discipline forbids.
+    ///
+    /// The two kinds the wind-down itself authorizes — a scheduled
+    /// compensation and a chased workflow-cancel — are exempt
+    /// ([`crate::effect::AgentRunEffectKind::exempt_from_wind_down_fence`]),
+    /// the same exemption the flush and the dispatcher's claim path apply.
+    /// Without it a *re-entered* wind-down (a duplicate run-cancel past the
+    /// journal's bounded window, or a second cancel command) would fence the
+    /// very work the first one committed, and the cell's recorded disposition
+    /// would then claim a request that was never delivered.
     pub(crate) fn fence_unsent_effects(&mut self, now: AgentTimestampMillis) -> usize {
         let mut fenced = 0;
         let mut fenced_sends = Vec::new();
         let mut fenced_starts = Vec::new();
         for effect in &mut self.effects {
-            if effect.is_pending() {
+            if effect.is_pending() && !effect.kind().exempt_from_wind_down_fence() {
                 effect.status = crate::effect::AgentRunEffectStatus::Cancelled;
                 match effect.kind() {
                     crate::effect::AgentRunEffectKind::A2aSendCall => {

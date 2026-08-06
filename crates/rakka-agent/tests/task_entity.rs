@@ -789,6 +789,8 @@ async fn an_assignments_exhausted_delegated_child_owes_its_delegation_result() {
         rakka_agent::delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
     let mut delegated = creation(Vec::new());
     delegated.delegation = Some(Box::new(rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
         delegation,
         parent_task: AgentTaskId::new("parent-task").expect("task id should be valid"),
         parent_run,
@@ -934,6 +936,56 @@ async fn a_failed_dependency_cancels_its_dependents_by_default() {
     );
 }
 
+/// A dependency that fails while a run is live requests the cancellation
+/// rather than terminalizing over it.
+///
+/// The dependent is `InProgress` with an accepted run, which may hold a
+/// started effect whose outcome is unknown: terminalizing here would project
+/// terminal `Cancelled` over it, strand the escrow, and leave the run to
+/// discover the cancellation only if it ever proposed
+/// ([specification 8.7](../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn a_failed_dependency_defers_while_its_dependents_run_is_live() {
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+    applied(fx.apply(create_command(Vec::new())).await);
+    let assigned = fx.snapshot().await;
+    assert_eq!(assigned.status, AgentTaskStatus::InProgress);
+    assert!(assigned.assignment.is_some(), "the run accepted");
+
+    applied(
+        fx.apply(AgentTaskEntityCommand::DeclareDependency {
+            operation_id: operation(AgentOperationKind::Command, "late-dependency"),
+            declaration: Box::new(dependency("upstream")),
+        })
+        .await,
+    );
+    applied(
+        fx.apply(AgentTaskEntityCommand::RecordDependencyOutcome {
+            operation_id: operation(AgentOperationKind::Command, "resolve"),
+            dependency: AgentTaskId::new("upstream").expect("task id should be valid"),
+            outcome: AgentTaskDependencyOutcome::Failed,
+        })
+        .await,
+    );
+
+    let deferred = fx.snapshot().await;
+    assert!(
+        !deferred.status.is_terminal(),
+        "the dependent defers to its live run, got {:?}",
+        deferred.status
+    );
+    let marker = deferred
+        .cancellation
+        .as_ref()
+        .expect("the cancellation request is durable");
+    assert_eq!(marker.reason.code(), "dependency-not-satisfied");
+    assert!(
+        deferred.outstanding_escrow > 0,
+        "the finalization gate is still closed"
+    );
+}
+
 #[tokio::test]
 async fn a_continue_with_evidence_dependency_does_not_cancel_its_dependent() {
     let fx = Fixture::new(RunAcceptanceProbe::accepting());
@@ -1012,7 +1064,22 @@ async fn a_human_owned_task_is_never_assigned_to_an_agent() {
 async fn a_cancelled_task_accepts_no_further_transition() {
     let fx = Fixture::new(RunAcceptanceProbe::accepting());
     fx.instantiate_agent().await;
-    applied(fx.apply(create_command(Vec::new())).await);
+    // Human-owned, so no run ever accepts and the cancel finalizes in its
+    // own transition — the no-active-run arm of specification 8.7. The
+    // deferred half, where an accepted run must wind down first, lives in
+    // `goal_contract.rs` and `cancellation_propagation.rs`.
+    let mut human = creation(Vec::new());
+    human.definition = human
+        .definition
+        .with_ownership(rakka_agent::AgentTaskOwnership::Human);
+    human.assignee = None;
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(human),
+        })
+        .await,
+    );
 
     applied(
         fx.apply(AgentTaskEntityCommand::Cancel {

@@ -30,8 +30,9 @@ use serde_json::Value;
 use a2a::AgentExtension;
 use rakka_agent::{
     AgentCapabilityId, AgentCredentialBindingRef, AgentDelegationId, AgentDelegationRecord,
-    AgentGoalDelegationBudget, AgentGoalId, AgentId, AgentRevisionNumber, AgentRunScope,
-    AgentSchemaId, AgentSchemaRef, AgentTaskDelegationProvenance, AgentTaskId,
+    AgentEnvironmentRef, AgentGoalDelegationBudget, AgentGoalId, AgentId, AgentRevisionNumber,
+    AgentRunScope, AgentSchemaId, AgentSchemaRef, AgentTaskDelegationProvenance, AgentTaskId,
+    KnowledgeSpaceId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
@@ -177,6 +178,18 @@ pub struct AgentCollaborationMetadata {
     /// The versioned output schema the parent expects.
     #[serde(default)]
     pub result_schema: Option<AgentCollaborationSchemaRef>,
+    /// Environments the delegating scope narrows tool use to. Omitted when
+    /// empty, which keeps a scope-free send parseable by a receiver that
+    /// predates the field; a send carrying one fails closed on such a
+    /// receiver, exactly the half-understood-metadata posture of this
+    /// extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<String>,
+    /// The communal knowledge spaces explicitly delegated to the child.
+    /// Omitted when empty, with the same cross-version posture as
+    /// [`Self::environments`]: a grant must never be silently dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knowledge_spaces: Vec<String>,
 }
 
 impl AgentCollaborationMetadata {
@@ -222,6 +235,16 @@ impl AgentCollaborationMetadata {
                     revision: schema.version.get(),
                 }
             }),
+            environments: record
+                .environments
+                .iter()
+                .map(|environment| environment.as_str().to_string())
+                .collect(),
+            knowledge_spaces: record
+                .knowledge_spaces
+                .iter()
+                .map(|space| space.as_str().to_string())
+                .collect(),
         }
     }
 
@@ -261,7 +284,17 @@ impl AgentCollaborationMetadata {
         for binding in &self.credential_bindings {
             credential_bindings.push(AgentCredentialBindingRef::new(binding)?);
         }
+        let mut environments = std::collections::BTreeSet::new();
+        for environment in &self.environments {
+            environments.insert(AgentEnvironmentRef::new(environment)?);
+        }
+        let mut knowledge_spaces = std::collections::BTreeSet::new();
+        for space in &self.knowledge_spaces {
+            knowledge_spaces.insert(KnowledgeSpaceId::new(space)?);
+        }
         Ok(AgentTaskDelegationProvenance {
+            environments,
+            knowledge_spaces,
             delegation: AgentDelegationId::new(&self.delegation)?,
             parent_task: AgentTaskId::new(&self.parent_task)?,
             parent_run,

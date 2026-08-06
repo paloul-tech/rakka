@@ -1205,14 +1205,117 @@ pub async fn capability_report_coherence(store: &dyn KnowledgeGraphStore) {
     assert!(!store.backend_name().is_empty());
 }
 
+/// Concurrent specialist appends ([specification 18](../../docs/plans/rakka-agent/spec.md)
+/// scenario 33): distinct specialists appending into one space concurrently
+/// all coexist, each claim retains exactly its own goal/task/run/delegation
+/// provenance, provenance is a first-class query axis, and a replay of any
+/// one append converges on its original claim.
+pub async fn concurrent_specialist_append_provenance(
+    store: &dyn KnowledgeGraphStore,
+    scopes: ConformanceScopes,
+) {
+    use rakka_agent::{AgentDelegationId, AgentGoalId, AgentRunId, AgentTaskId};
+    let scope = &scopes.primary;
+
+    let specialist_claim = |index: usize| {
+        let operation_id = ClaimOperationId::derive_append(scope, format!("specialist-{index}"))
+            .expect("the operation id derives");
+        let provenance = ClaimProvenance::for_agent(
+            AgentId::new(format!("specialist-{index}")).expect("the agent id is valid"),
+        )
+        .with_goal(AgentGoalId::new("goal-shared").expect("the goal id is valid"))
+        .with_task(AgentTaskId::new(format!("task-{index}")).expect("the task id is valid"))
+        .with_run(AgentRunId::new(format!("run-{index}")).expect("the run id is valid"))
+        .with_delegation(
+            AgentDelegationId::new(format!("delegation-{index}"))
+                .expect("the delegation id is valid"),
+        );
+        Claim::new(
+            scope,
+            operation_id,
+            ClaimNodeId::new("finding").expect("the node id is valid"),
+            ClaimPredicate::new("links").expect("the predicate is valid"),
+            ClaimObject::Node(
+                ClaimNodeId::new(format!("evidence-{index}")).expect("the node id is valid"),
+            ),
+            provenance,
+            5_000,
+            MemoryClassification::Unclassified,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the claim is valid")
+    };
+    let claims: Vec<Claim> = (0..3).map(specialist_claim).collect();
+
+    // Three writers, one statement subject. The clause pins the semantics —
+    // coexistence, per-writer provenance, replay convergence — for any
+    // interleaving; the genuinely racing two-connection proof lives in the
+    // PostgreSQL backend's own test suite, where real concurrency exists.
+    let mut stored = Vec::with_capacity(claims.len());
+    for claim in &claims {
+        stored.push(
+            store
+                .append(scope, claim)
+                .await
+                .expect("the specialist's claim appends"),
+        );
+    }
+
+    // All coexist: identity derives from the append operation, so agreeing
+    // writers never overwrite communal truth.
+    let all = drained_query(store, scope, &ClaimFilter::matching_all()).await;
+    assert_eq!(all.len(), 3, "concurrent appends must all coexist");
+    for (index, stored) in stored.iter().enumerate() {
+        // Each claim retains exactly its own provenance.
+        assert_eq!(
+            stored.provenance.agent.as_str(),
+            format!("specialist-{index}")
+        );
+        assert_eq!(
+            stored.provenance.run,
+            Some(AgentRunId::new(format!("run-{index}")).expect("the run id is valid"))
+        );
+        assert_eq!(
+            stored.provenance.delegation,
+            Some(
+                AgentDelegationId::new(format!("delegation-{index}"))
+                    .expect("the delegation id is valid")
+            )
+        );
+        // Provenance is a first-class query axis: each writer's claim is
+        // findable by its own run and delegation.
+        let by_run = drained_query(
+            store,
+            scope,
+            &ClaimFilter::matching_all()
+                .with_run(AgentRunId::new(format!("run-{index}")).expect("the run id is valid")),
+        )
+        .await;
+        assert_eq!(by_run.len(), 1, "each run's claim is exactly findable");
+        assert_eq!(by_run[0].claim_id, stored.claim_id);
+        // Stable append idempotency: a replay converges on the original.
+        let replayed = store
+            .append(scope, &claims[index])
+            .await
+            .expect("a replay answers");
+        assert_eq!(
+            replayed.claim_id, stored.claim_id,
+            "a replayed append must converge on its original claim"
+        );
+    }
+}
+
 /// Runs every conformance clause with fresh unique scopes.
 ///
 /// Slice 2.4 runs exactly this against a second, structurally different
-/// backend — unchanged (scenario 20).
+/// backend — unchanged (scenario 20). It is the whole contract check: a
+/// backend author calls *this*, never an individual clause.
 pub async fn check_knowledge_graph_contract(store: &dyn KnowledgeGraphStore) {
     claim_identity(store, ConformanceScopes::unique("identity")).await;
     idempotent_append(store, ConformanceScopes::unique("idempotent")).await;
     provenance_preservation(store, ConformanceScopes::unique("provenance")).await;
+    concurrent_specialist_append_provenance(store, ConformanceScopes::unique("concurrent-append"))
+        .await;
     trust_filtering(store, ConformanceScopes::unique("trust")).await;
     born_proposed(store, ConformanceScopes::unique("born-proposed")).await;
     appended_identity_is_derived(store, ConformanceScopes::unique("derived-identity")).await;

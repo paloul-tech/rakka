@@ -539,6 +539,38 @@ pub fn unresolved_members(
         .collect()
 }
 
+/// The members a resolved group stopped waiting for although their child never
+/// reported a terminal outcome: still unresolved, or already marked timed out
+/// by the parent's deadline.
+///
+/// This is the *chase* set of [specification 8.7]: the group has moved on, but
+/// the child it left behind may still be running and spending, so the parent
+/// owes it a cancellation request. It deliberately differs from
+/// [`unresolved_members`], which answers the different question a *firing*
+/// deadline asks — which members to mark timed out. A member the deadline
+/// already marked is no longer unresolved, yet it is exactly the member the
+/// chase must still reach, so reusing that set here would chase nobody after a
+/// deadline fires.
+///
+/// [specification 8.7]: ../../../docs/plans/rakka-agent/spec.md
+#[must_use]
+pub fn unreported_members(
+    cell: &AgentFanInCell,
+    delegations: &BTreeMap<AgentDelegationId, Box<AgentDelegationCell>>,
+    workflow_invocations: &BTreeMap<AgentWorkflowInvocationId, Box<AgentWorkflowInvocationCell>>,
+) -> Vec<AgentFanInMemberId> {
+    cell.members
+        .iter()
+        .filter(|member| {
+            matches!(
+                member_disposition(cell, member, delegations, workflow_invocations),
+                MemberDisposition::Unresolved | MemberDisposition::TimedOut
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 /// Maximum bytes of the terminal-reason code one result-table row repeats.
 ///
 /// The full bounded reason lives on the cell; the table repeats only enough
@@ -652,6 +684,8 @@ mod tests {
     fn cell_for(slot: usize) -> (AgentDelegationId, Box<AgentDelegationCell>) {
         let delegation = delegation_id_for(&scope(), 1, slot).expect("delegation id");
         let record = AgentDelegationRecord {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
             delegation: delegation.clone(),
             goal: None,
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),

@@ -47,10 +47,11 @@ use crate::wake_timers::{AgentWakeTimerStatus, AgentWakeTimerStoreState};
 /// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md), following
 /// [8.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// The vocabulary is complete from M1 even where a state is not yet reachable
-/// (slice 1.13 resolution): [`Self::Propagating`] becomes derivable when
-/// delegation lands in Phase 4, because a single M1 run has no descendants to
-/// propagate to. No state is ever inferred from mere *acceptance* of a
+/// The vocabulary was complete from M1 before every state was reachable
+/// (slice 1.13 resolution), and slice 4.6 made [`Self::Propagating`]
+/// derivable: a cancelled scope with created, unsettled children — or owed
+/// child-cancel exchanges — is propagating until every child's terminal
+/// outcome records. No state is ever inferred from mere *acceptance* of a
 /// cancellation request — the derivation reads what the durable record proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -60,8 +61,9 @@ pub enum AgentCancellationProgress {
     NotRequested,
     /// Cancellation is requested and work the run started is still resolving.
     Requested,
-    /// Cancellation is propagating to descendants. Not derivable before
-    /// delegation exists (Phase 4).
+    /// Cancellation is propagating to descendants: a created child — a
+    /// delegated task or a workflow run — has not yet recorded its terminal
+    /// outcome ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     Propagating,
     /// New work is fenced and nothing the run started is still in flight, but
     /// the terminal transition has not yet committed.
@@ -76,6 +78,13 @@ pub enum AgentCancellationProgress {
 }
 
 impl AgentCancellationProgress {
+    /// The serde default of snapshot fields added after M1: records persisted
+    /// before them decode as not requested.
+    #[must_use]
+    pub const fn not_requested() -> Self {
+        Self::NotRequested
+    }
+
     /// Stable kebab-case label for views and logs.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
@@ -110,6 +119,16 @@ impl AgentCancellationProgress {
         {
             return Self::WaitingForReconciliation;
         }
+        // Propagation: a created child whose terminal outcome has not
+        // returned is a started consequential effect in the cancelled scope
+        // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)); the
+        // parent is propagating — and nonterminal — until every delegation
+        // and workflow cell holds one. A child parked in its own
+        // reconciliation surfaces here as the parent's `Propagating`, and as
+        // `WaitingForReconciliation` on the child's own view.
+        if run.loop_state.awaits_children() {
+            return Self::Propagating;
+        }
         // "Still resolving" is the run's own settlement gate, not the effect set
         // alone: a cancelling run whose effects have all resolved can still owe
         // an outstanding result proposal to its task, which the task may yet
@@ -118,6 +137,41 @@ impl AgentCancellationProgress {
         // still in flight" — while that proposal is exactly such work.
         if run.loop_state.awaits_settlement() {
             return Self::Requested;
+        }
+        Self::Quiesced
+    }
+
+    /// Derives the task-level progress from what the durable task record
+    /// proves ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The task's view spans the assignment: `Propagating` while a live
+    /// generation — an open escrow child, or a standing assignment — has not
+    /// settled back, `Quiesced` once the ledger closed and only the
+    /// finalizing sweep is owed, `Completed` at terminal `Cancelled`.
+    /// Reconciliation is the *run's* condition and surfaces on the run's own
+    /// derivation; the task honestly reports `Propagating` while it waits.
+    ///
+    /// The open-escrow half is load-bearing, not belt-and-braces: the
+    /// finalization gate is escrow closure, and a continuous root control
+    /// task between epoch assignments holds *no* assignment while the epochs
+    /// it admitted are still executing. Reading the assignment alone would
+    /// report `Quiesced` — "nothing the task started is still in flight" —
+    /// over running epoch work, which is exactly the claim an operator acts
+    /// on before touching the resources that work is mutating.
+    #[must_use]
+    pub fn derive_task(task: &crate::task::AgentTaskSnapshot) -> Self {
+        if task.status.is_terminal() {
+            return if task.status == crate::task::AgentTaskStatus::Cancelled {
+                Self::Completed
+            } else {
+                Self::NotRequested
+            };
+        }
+        if task.cancellation.is_none() {
+            return Self::NotRequested;
+        }
+        if task.assignment.is_some() || task.outstanding_escrow > 0 {
+            return Self::Propagating;
         }
         Self::Quiesced
     }
@@ -383,6 +437,12 @@ pub struct AgentTaskOperationalSnapshot {
     pub has_accepted_result: bool,
     /// History entries recorded but not yet flushed to the history sink.
     pub owed_history: usize,
+    /// How far a requested cancellation of this task has actually got,
+    /// derived from the durable record alone
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load as not requested.
+    #[serde(default = "AgentCancellationProgress::not_requested")]
+    pub cancellation: AgentCancellationProgress,
 }
 
 impl AgentTaskOperationalSnapshot {
@@ -404,6 +464,11 @@ impl AgentTaskOperationalSnapshot {
             }
             None => (None, false),
         };
+        let cancellation = task
+            .as_ref()
+            .map_or(AgentCancellationProgress::NotRequested, |snapshot| {
+                AgentCancellationProgress::derive_task(snapshot)
+            });
         Self {
             revision,
             observed_at,
@@ -411,6 +476,7 @@ impl AgentTaskOperationalSnapshot {
             task,
             has_accepted_result,
             owed_history: state.pending_history().len(),
+            cancellation,
         }
     }
 }

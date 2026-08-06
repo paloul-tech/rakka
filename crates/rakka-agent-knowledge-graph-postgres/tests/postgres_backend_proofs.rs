@@ -529,3 +529,73 @@ async fn postgres_doctored_rows_fail_closed_when_dsn_is_set() {
         .expect_err("an edited statement under a stale fingerprint fails closed");
     assert_eq!(error.code(), "claim-statement-digest-mismatch");
 }
+
+#[tokio::test]
+async fn postgres_concurrent_specialist_appends_race_when_dsn_is_set() {
+    // Two connections genuinely race two *distinct* specialist appends into
+    // one space (specification 18 scenario 33). Both land, each retains
+    // exactly its own provenance, and a replay of either — from either
+    // connection — answers its original claim. This is the concurrency half
+    // of the conformance suite's `concurrent_specialist_append_provenance`,
+    // which pins the same semantics for any interleaving.
+    let Some(store_a) = store().await else { return };
+    let Some(store_b) = store().await else { return };
+    let scopes = ConformanceScopes::unique("pg-specialist-race");
+    let scope = scopes.primary.clone();
+
+    let specialist_claim = |index: usize| {
+        use rakka_agent::{AgentDelegationId, AgentId, AgentRunId, MemoryClassification};
+        use rakka_agent_knowledge_graph::{Claim, ClaimObject, ClaimPredicate, ClaimProvenance};
+        let operation_id =
+            ClaimOperationId::derive_append(&scope, format!("pg-specialist-{index}"))
+                .expect("the operation id derives");
+        Claim::new(
+            &scope,
+            operation_id,
+            ClaimNodeId::new("finding").expect("the node id is valid"),
+            ClaimPredicate::new("links").expect("the predicate is valid"),
+            ClaimObject::Node(
+                ClaimNodeId::new(format!("evidence-{index}")).expect("the node id is valid"),
+            ),
+            ClaimProvenance::for_agent(
+                AgentId::new(format!("specialist-{index}")).expect("the agent id is valid"),
+            )
+            .with_run(AgentRunId::new(format!("run-{index}")).expect("the run id is valid"))
+            .with_delegation(
+                AgentDelegationId::new(format!("delegation-{index}"))
+                    .expect("the delegation id is valid"),
+            ),
+            5_000,
+            MemoryClassification::Unclassified,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the claim is valid")
+    };
+    let first = specialist_claim(0);
+    let second = specialist_claim(1);
+
+    let (left, right) = tokio::join!(
+        store_a.append(&scope, &first),
+        store_b.append(&scope, &second),
+    );
+    let left = left.expect("the first specialist's claim appends");
+    let right = right.expect("the second specialist's claim appends");
+    assert_ne!(
+        left.claim_id, right.claim_id,
+        "distinct operations, distinct claims"
+    );
+    assert_eq!(left.provenance.agent.as_str(), "specialist-0");
+    assert_eq!(right.provenance.agent.as_str(), "specialist-1");
+
+    // Cross-connection replays converge on the original claims.
+    let replayed_first = store_b
+        .append(&scope, &first)
+        .await
+        .expect("the replay answers");
+    assert_eq!(replayed_first.claim_id, left.claim_id);
+    let replayed_second = store_a
+        .append(&scope, &second)
+        .await
+        .expect("the replay answers");
+    assert_eq!(replayed_second.claim_id, right.claim_id);
+}

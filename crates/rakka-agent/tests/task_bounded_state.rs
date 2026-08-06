@@ -1246,7 +1246,31 @@ async fn the_widest_delegation_provenance_fits_the_task_record() {
                 .expect("agent id should be valid")
         })
         .collect();
+    // The delegated scopes ride the provenance too, and a goal may declare up
+    // to `AGENT_GOAL_MAX_ALLOWED_REFS` of each: the widest provenance a valid
+    // configuration can produce carries both sets full, at the identity
+    // bound's realistic width, so the record's growth reserve is proven for
+    // the shape production can actually reach.
+    let environments: std::collections::BTreeSet<_> = (0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS)
+        .map(|index| {
+            rakka_agent::AgentEnvironmentRef::new(format!(
+                "shared-production-workspace-environment-{index:02}"
+            ))
+            .expect("environment ref should be valid")
+        })
+        .collect();
+    let knowledge_spaces: std::collections::BTreeSet<_> = (0
+        ..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS)
+        .map(|index| {
+            rakka_agent::KnowledgeSpaceId::new(format!(
+                "communal-knowledge-space-for-specialists-{index:02}"
+            ))
+            .expect("space id should be valid")
+        })
+        .collect();
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments,
+        knowledge_spaces,
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
@@ -1366,6 +1390,8 @@ async fn an_oversized_delegation_provenance_refuses_the_creation() {
     )
     .expect("run scope should be valid");
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
         delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
@@ -1444,6 +1470,8 @@ async fn a_cross_tenant_parent_run_refuses_the_creation() {
     )
     .expect("run scope should be valid");
     let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
         delegation: rakka_agent::delegation_id_for(&foreign_parent, 2, 0)
             .expect("the delegation id derives"),
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),

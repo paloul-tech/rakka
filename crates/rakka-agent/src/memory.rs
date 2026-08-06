@@ -1059,7 +1059,14 @@ pub struct MemoryContextSnapshot {
     pub retrievals: Vec<SnapshotRetrieval>,
     /// The private memory selections, exactly as retrieval selected them.
     pub private_memory: Vec<SnapshotPrivateMemory>,
-    /// The communal claim selections; empty until the phase-2 graph slice.
+    /// The communal claim selections. Always empty today: communal retrieval
+    /// is unwired, and this placeholder deliberately keeps its (wrong)
+    /// private-memory newtype until the retrieval slice replaces it with a
+    /// `SnapshotPrivateMemory`-shaped record carrying claim id, trust state,
+    /// and content references ([specification 13.5](../../../docs/plans/rakka-agent/spec.md))
+    /// — swapping the type now would churn the snapshot schema with no
+    /// producer. Slice 4.6 landed the *append* half (the run-driven claim
+    /// append); retrieval stays owed.
     pub communal_claims: Vec<MemoryEntryId>,
     /// The trust, classification, and ranking policy revision in force.
     pub policy_revision: AgentRevisionNumber,

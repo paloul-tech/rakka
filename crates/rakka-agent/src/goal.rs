@@ -365,6 +365,28 @@ impl AgentGoalTerminalReason {
     pub const fn requires_evaluation(&self) -> bool {
         matches!(self, Self::CriteriaSatisfied | Self::CriteriaNotMet)
     }
+
+    /// Whether this terminal decision requests the root task's cancellation
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+    /// cancel family — an authorized cancellation, a root already cancelled,
+    /// a retirement — and the expiry family — a passed deadline or an
+    /// unrenewed schedule.
+    ///
+    /// The failure families deliberately answer `false`: budget exhaustion
+    /// and stagnation terminate the root task in the same transition that
+    /// decided them, and a criteria decision ends the goal without unmaking
+    /// the coordinator's own completion path.
+    #[must_use]
+    pub const fn requests_root_cancellation(&self) -> bool {
+        matches!(
+            self,
+            Self::CancellationRequested { .. }
+                | Self::RootTaskCancelled
+                | Self::Retired
+                | Self::DeadlineExpired
+                | Self::ScheduleExpired
+        )
+    }
 }
 
 /// Why a goal is `Waiting`.
@@ -620,7 +642,12 @@ pub struct AgentGoalSpec {
     /// entry point: a passed deadline expires the goal.
     #[serde(default)]
     pub deadline: Option<AgentTimestampMillis>,
-    /// The cancellation policy reference, consumed by slice 4.6's propagation.
+    /// The application-owned cancellation policy reference, recorded for
+    /// audit. Propagation itself is unconditional
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): a
+    /// terminal goal decision in the cancel or expiry family always chases
+    /// active children; what an application policy behind this reference may
+    /// refine — grace windows, selective scopes — stays its own concern.
     #[serde(default)]
     pub cancellation: Option<AgentPolicyRef>,
     /// The conserved goal allocation. It seeds the root task's escrow ledger,
@@ -653,10 +680,17 @@ pub struct AgentGoalSpec {
     /// Compiled workflows the goal may invoke as tools (slice 4.5).
     #[serde(default)]
     pub allowed_workflows: BTreeSet<AgentWorkflowToolId>,
-    /// Knowledge spaces the goal may read or contribute to (slice 4.6).
+    /// Knowledge spaces the goal may read or contribute to
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)). The
+    /// root run's claim-append grant, and — intersected with the catalog's
+    /// explicit statement — what its delegations may pass down. Empty means
+    /// no goal-scope grant statement; the definition envelope still governs.
     #[serde(default)]
     pub knowledge_spaces: BTreeSet<KnowledgeSpaceId>,
-    /// Shared environments the goal may reach (slice 4.6).
+    /// Shared environments the goal may reach
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)): a
+    /// narrowing the run's tool authority enforces per attempt. Empty means
+    /// no goal-scope narrowing; the definition envelope still governs.
     #[serde(default)]
     pub environments: BTreeSet<AgentEnvironmentRef>,
     /// The completion evaluator reference (slice 4.2).

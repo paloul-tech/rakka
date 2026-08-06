@@ -374,12 +374,14 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
-            // An epoch result, a goal evaluation, or a delegation result is a
-            // durable transition but not a balance movement: the probe
-            // records the application without crediting.
+            // An epoch result, a goal evaluation, a delegation result, or a
+            // cancellation request is a durable transition but not a balance
+            // movement: the probe records the application without crediting.
             AgentExchangeKind::EpochResult
             | AgentExchangeKind::GoalEvaluation
-            | AgentExchangeKind::DelegationResult => apply_ledger(state, envelope, 0),
+            | AgentExchangeKind::DelegationResult
+            | AgentExchangeKind::RunCancel
+            | AgentExchangeKind::DelegationCancel => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -771,6 +773,31 @@ impl AgentExchangeParticipant for RunAcceptanceProbe {
         envelope: &AgentExchangeEnvelope,
         now: AgentTimestampMillis,
     ) -> AgentExchangeTransition {
+        if envelope.kind() == AgentExchangeKind::RunCancel {
+            // The probe models a run with nothing outstanding: the request
+            // is durably recorded and the wind-down is instantly terminal.
+            let receipt = crate::task::AgentRunCancelReceipt {
+                run: match &state.address {
+                    AgentEntityAddress::Run(scope) => scope.clone(),
+                    other => AgentRunScope::new(
+                        other.tenant().clone(),
+                        crate::AgentId::new("probe").expect("the literal is a valid agent id"),
+                        crate::AgentRunId::new("probe").expect("the literal is a valid run id"),
+                    )
+                    .expect("the probe scope is well formed"),
+                },
+                status: crate::run::AgentRunStatus::Cancelled,
+            };
+            return AgentExchangeTransition::new(AgentExchangeResult::accepted(
+                AgentExchangePayload::encode(
+                    crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE,
+                    &receipt,
+                )
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE)
+                }),
+            ));
+        }
         if envelope.kind() != AgentExchangeKind::Assignment {
             return AgentExchangeTransition::new(AgentExchangeResult::rejected(
                 "unsupported-exchange",
@@ -1628,6 +1655,8 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
     a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
     workflow_starts: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>>>>,
+    workflow_cancels: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>>>>,
+    claim_appends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentClaimAppendExecutor>>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
@@ -1721,6 +1750,8 @@ where
             evaluations: Arc::new(Mutex::new(None)),
             a2a_sends: Arc::new(Mutex::new(None)),
             workflow_starts: Arc::new(Mutex::new(None)),
+            workflow_cancels: Arc::new(Mutex::new(None)),
+            claim_appends: Arc::new(Mutex::new(None)),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1829,6 +1860,38 @@ where
         self
     }
 
+    /// Executes workflow cancel effects through the given executor. An
+    /// unwired cancel fails with the real pipeline's
+    /// `workflow-cancel-executor-missing` code, exactly as the real
+    /// dispatcher fails closed.
+    #[must_use]
+    pub fn with_workflow_cancel_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>,
+    ) -> Self {
+        *self
+            .workflow_cancels
+            .lock()
+            .expect("the workflow cancel executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes communal claim appends through the given executor. An
+    /// unwired append fails with the real pipeline's
+    /// `claim-append-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_claim_append_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentClaimAppendExecutor>,
+    ) -> Self {
+        *self
+            .claim_appends
+            .lock()
+            .expect("the claim-append executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
     /// How many model calls the dispatcher has answered, re-invocations included.
     #[must_use]
     pub fn model_calls(&self) -> usize {
@@ -1871,6 +1934,12 @@ where
                 // needs the scope only `drive` holds.
                 AgentRunEffectRequest::MemoryPromotion { promotion } => {
                     self.promotion_outcome(&scope, &effect, promotion, now)
+                        .await
+                }
+                // An append executor writes under the run scope only `drive`
+                // holds.
+                AgentRunEffectRequest::ClaimAppend { append, provenance } => {
+                    self.claim_append_outcome(&scope, &effect, append, provenance, now)
                         .await
                 }
                 // An evaluation needs the scope, and — for a human review —
@@ -2107,7 +2176,119 @@ where
                 };
                 self.memoize(effect, outcome)
             }
+            AgentRunEffectRequest::WorkflowCancel { invocation, reason } => {
+                // The record carries its own parent scope, so the cancel
+                // needs nothing `answer` does not hold. Memoized like a
+                // start: a re-invocation of the same generation returns the
+                // same outcome, which is exactly what the derived
+                // generation-free `CancelRun` identities promise.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .workflow_cancels
+                    .lock()
+                    .expect("the workflow cancel executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "workflow-cancel-executor-missing".to_string(),
+                        message: "no workflow cancel executor is wired into this dispatcher"
+                            .to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&invocation.parent_run, effect, invocation, reason, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::Requested) => {
+                            AgentRunEffectOutcome::WorkflowCancel {
+                                already_finished: false,
+                            }
+                        }
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::AlreadyFinished) => {
+                            AgentRunEffectOutcome::WorkflowCancel {
+                                already_finished: true,
+                            }
+                        }
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::Refused {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::Failed { code, message },
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::Failed {
+                            code: "workflow-cancel-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::ClaimAppend { .. } => {
+                // An append executor runs under the run scope only `drive`
+                // holds. Answer it through [`Self::drive`] or
+                // [`Self::claim_append_outcome`]. Deliberately not memoized,
+                // so a later scoped answer can still resolve the effect.
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                AgentRunEffectOutcome::Failed {
+                    code: "claim-append-unscoped".to_string(),
+                    message: "a claim append is answered through drive or claim_append_outcome, \
+                              which carry the run scope"
+                        .to_string(),
+                }
+            }
         }
+    }
+
+    /// What this dispatcher returns for one claim-append effect, running the
+    /// wired executor under the run's scope. Memoized on the effect id and
+    /// generation exactly like every other answer.
+    pub async fn claim_append_outcome(
+        &self,
+        scope: &AgentRunScope,
+        effect: &AgentRunEffect,
+        append: &crate::effect::AgentClaimAppendRequest,
+        provenance: &crate::effect::AgentClaimAppendProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEffectOutcome {
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.cached(effect) {
+            return outcome;
+        }
+        let executor = self
+            .claim_appends
+            .lock()
+            .expect("the claim-append executor slot should not be poisoned")
+            .clone();
+        let outcome = match executor {
+            None => AgentRunEffectOutcome::Failed {
+                code: "claim-append-executor-missing".to_string(),
+                message: "no claim-append executor is wired into this dispatcher".to_string(),
+            },
+            Some(executor) => match executor
+                .execute(scope, effect, append, provenance, now)
+                .await
+            {
+                Ok(crate::dispatch::AgentClaimAppendFinding::Appended { claim }) => {
+                    AgentRunEffectOutcome::ClaimAppend { claim }
+                }
+                Ok(crate::dispatch::AgentClaimAppendFinding::Refused { code, message }) => {
+                    AgentRunEffectOutcome::Failed { code, message }
+                }
+                // The in-process driver has no attempt machinery: a
+                // retryable failure surfaces as a failed effect, the
+                // model-adapter precedent above.
+                Err(error) => AgentRunEffectOutcome::Failed {
+                    code: "claim-append-attempt-failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+        };
+        self.memoize(effect, outcome)
     }
 
     /// What this dispatcher returns for one memory-promotion effect, running

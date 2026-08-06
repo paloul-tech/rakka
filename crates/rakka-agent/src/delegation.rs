@@ -38,7 +38,12 @@
 //! default. Unused child sub-quota is *not* credited back on a child's
 //! terminal result yet: the spend is the grant, conservatively, until a
 //! later slice turns crediting on inside the result-ingestion transition.
-//! Durable cancellation propagation to children remains slice 4.6.
+//! Durable cancellation propagation to children rides the in-fabric
+//! `DelegationCancel` exchange: the parent run owes one request per created,
+//! unsettled child when its own scope is cancelled — or when a resolved
+//! fan-in group left the child behind — and the child's terminal outcome
+//! still returns as its `DelegationResult`
+//! ([specification 8.7](../../docs/plans/rakka-agent/spec.md)).
 //!
 //! Specification: sections 8.4, 6.6, 8.7, and 14.4. Filled by slices 4.3
 //! (this shape), 4.4 (fan-in and limits), and 4.6.
@@ -168,6 +173,24 @@ pub fn delegation_result_operation_id(
     )
 }
 
+/// Derives the stable operation id of the one delegation-cancel exchange a
+/// parent run ever owes one delegated child.
+///
+/// Pure over `(tenant, delegation)`: a cancellation request is absorbing —
+/// the child records it once and answers every replay from its marker — so
+/// one logical request exists per delegation, ever, and every re-drive after
+/// any loss owes the identical operation
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+pub fn delegation_cancel_operation_id(
+    tenant: &TenantId,
+    delegation: &AgentDelegationId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::Cancellation,
+        [tenant.as_str(), delegation.as_str(), "delegation-cancel"],
+    )
+}
+
 /// Rejects a depth that does not agree with the lineage.
 ///
 /// A coherent chain records the full lineage above the delegation, so the
@@ -238,6 +261,15 @@ pub struct AgentDelegationTarget {
     /// The target contract revision the catalog resolved as compatible.
     #[serde(default)]
     pub compatibility: Option<AgentRevisionNumber>,
+    /// The communal knowledge spaces the catalog explicitly delegates to
+    /// this specialist ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The application's durable statement of "explicitly delegated": the
+    /// interception intersects it with the parent's own effective grant, so a
+    /// catalog can never widen what the parent holds. Empty means the
+    /// specialist is delegated no communal access.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
 }
 
 impl AgentDelegationTarget {
@@ -252,6 +284,7 @@ impl AgentDelegationTarget {
             credential_bindings: Vec::new(),
             result_schema: None,
             compatibility: None,
+            knowledge_spaces: BTreeSet::new(),
         }
     }
 
@@ -259,6 +292,14 @@ impl AgentDelegationTarget {
     #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Explicitly delegates one communal knowledge space to the specialist
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn with_knowledge_space(mut self, space: crate::identity::KnowledgeSpaceId) -> Self {
+        self.knowledge_spaces.insert(space);
         self
     }
 
@@ -525,6 +566,17 @@ pub struct AgentDelegationRecord {
     /// The child's deadline, in epoch milliseconds.
     #[serde(default)]
     pub deadline: Option<AgentTimestampMillis>,
+    /// Environments the parent's goal scope narrowed tool use to, carried to
+    /// the child verbatim ([specification 8.5](../../../docs/plans/rakka-agent/spec.md));
+    /// empty means no narrowing was carried.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub environments: BTreeSet<crate::identity::AgentEnvironmentRef>,
+    /// The communal knowledge spaces explicitly delegated to the child: the
+    /// catalog's statement intersected with the parent's own effective grant
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)); empty
+    /// means none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
     /// The agent definition revision the parent decided under.
     pub definition_revision: AgentRevisionNumber,
     /// The agent settings revision the parent decided under.
@@ -653,6 +705,32 @@ pub struct AgentDelegationChildResult {
     pub recorded_at: AgentTimestampMillis,
 }
 
+/// The settled outcome of the one delegation-cancel exchange a parent ever
+/// owes one child ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// It is the durable once-guard past the journal's bounded deduplication
+/// window — the reason [`AgentDelegationCell::cancel`] exists at all — and
+/// the observable outcome the propagation request records. Acceptance means
+/// the child durably recorded the request, never that its started effects
+/// stopped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentDelegationCancelOutcome {
+    /// The child durably recorded the request, or was already terminal.
+    Accepted {
+        /// When the receipt settled on the parent.
+        settled_at: AgentTimestampMillis,
+    },
+    /// The child refused definitively under this stable code.
+    Refused {
+        /// The child's refusal code.
+        code: String,
+        /// When the refusal settled on the parent.
+        settled_at: AgentTimestampMillis,
+    },
+}
+
 /// One delegation's durable home on the parent run's loop state.
 ///
 /// The cell commits with the send effect and settles in the same
@@ -671,6 +749,12 @@ pub struct AgentDelegationCell {
     /// wins: one logical result per delegation, ever.
     #[serde(default)]
     pub result: Option<AgentDelegationChildResult>,
+    /// The settled outcome of the delegation-cancel exchange this cell's
+    /// child was chased with, once one settled
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default)]
+    pub cancel: Option<AgentDelegationCancelOutcome>,
 }
 
 impl AgentDelegationCell {
@@ -682,7 +766,31 @@ impl AgentDelegationCell {
             status: AgentDelegationStatus::Pending,
             settled_at: None,
             result: None,
+            cancel: None,
         }
+    }
+
+    /// Records the settled outcome of the child's delegation-cancel exchange,
+    /// first-writer-wins: one logical request per delegation, ever.
+    pub fn record_cancel_outcome(&mut self, outcome: AgentDelegationCancelOutcome) {
+        if self.cancel.is_none() {
+            self.cancel = Some(outcome);
+        }
+    }
+
+    /// Whether this cell's delegation-cancel was definitively refused.
+    ///
+    /// The child's settle rule accepts only the two forged/not-delegated
+    /// codes as definitive, and both prove the addressed task carries no
+    /// provenance naming this delegation — so it will never return a
+    /// delegation result either, and a winding-down parent must not wait on
+    /// it ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub const fn cancel_refused(&self) -> bool {
+        matches!(
+            self.cancel,
+            Some(AgentDelegationCancelOutcome::Refused { .. })
+        )
     }
 
     /// Whether the child this cell created has recorded its terminal outcome.
@@ -796,6 +904,18 @@ pub struct AgentTaskDelegationProvenance {
     /// The deadline the parent set for this task.
     #[serde(default)]
     pub deadline: Option<AgentTimestampMillis>,
+    /// Environments the delegating scope narrowed tool use to
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)); empty
+    /// means no narrowing was carried.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub environments: BTreeSet<crate::identity::AgentEnvironmentRef>,
+    /// The communal knowledge spaces explicitly delegated to this task
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)). Empty
+    /// means none were — including a provenance recorded before the field
+    /// existed, which is exactly the fail-closed reading: nothing that old
+    /// could have appended communally either.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
 }
 
 impl AgentTaskDelegationProvenance {
@@ -924,6 +1044,28 @@ pub struct AgentRunDelegationEnvelope {
     /// state fixed at group open — never model output.
     #[serde(default)]
     pub fan_in: Option<crate::fan_in::AgentFanInPolicy>,
+    /// Environments the goal scope narrows tool use to
+    /// ([specification 8.1 and 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A **narrowing** dimension exactly like the allowed sets: empty means
+    /// no goal-scope narrowing, and the definition/setup envelope still
+    /// authorizes every access. An envelope persisted before the field
+    /// decodes to the empty set — the same no-narrowing meaning.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub environments: BTreeSet<crate::identity::AgentEnvironmentRef>,
+    /// The communal knowledge spaces explicitly delegated to this run
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md):
+    /// children inherit only explicitly delegated access).
+    ///
+    /// A **grant**, deliberately diverging from the absent-means-no-narrowing
+    /// rule above: `None` means no grant statement was recorded — a chain
+    /// persisted before the field, or a task shape carrying none — and a
+    /// claim append then fails closed when lineage exists, the
+    /// deny-when-unknown posture the ancestry gap takes; `Some(set)` is the
+    /// exact set appends may target, still inside the definition and setup
+    /// envelopes; `Some(empty)` is explicitly nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_spaces: Option<BTreeSet<crate::identity::KnowledgeSpaceId>>,
 }
 
 /// The wiring one run entity needs to serve delegation
@@ -1307,6 +1449,8 @@ mod tests {
         // serialized weight crosses the bound — the abuse shape a hostile
         // peer would send, refused whole rather than truncated.
         let provenance = AgentTaskDelegationProvenance {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
             delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
@@ -1337,6 +1481,8 @@ mod tests {
         // lineage behind it is a forgery the enforcement slices must never
         // ceiling against.
         let provenance = AgentTaskDelegationProvenance {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
             delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
             parent_run: scope(),
@@ -1370,6 +1516,8 @@ mod tests {
     #[test]
     fn a_settled_cell_keeps_its_first_outcome() {
         let record = AgentDelegationRecord {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
             delegation: delegation_id_for(&scope(), 1, 0).expect("delegation id"),
             goal: None,
             parent_task: AgentTaskId::new("ticket-1").expect("task id"),
