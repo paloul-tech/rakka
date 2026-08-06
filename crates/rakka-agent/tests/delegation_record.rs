@@ -539,6 +539,8 @@ fn pre_slice_records_decode_without_the_fan_out_fields() {
     let parent_run = run_scope();
     let delegation = delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
     let record = AgentDelegationRecord {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
         delegation: delegation.clone(),
         goal: None,
         parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),

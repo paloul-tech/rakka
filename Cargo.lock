@@ -1767,6 +1767,7 @@ dependencies = [
 name = "rakka-agent-knowledge-graph-postgres"
 version = "0.1.0"
 dependencies = [
+ "rakka-agent",
  "rakka-agent-knowledge-graph",
  "rakka-agent-workflow",
  "serde",

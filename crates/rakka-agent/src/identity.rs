@@ -281,6 +281,16 @@ validated_id! {
     pub KnowledgeSpaceId, "knowledge_space_id"
 }
 
+validated_id! {
+    /// Identity of one appended communal claim, as the graph store recorded
+    /// it ([specification 13.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A mirror newtype: the graph crate owns the derived `ClaimId` and
+    /// depends on this crate, so the append receipt carries the id in this
+    /// crate's own validated form rather than importing the graph's.
+    pub AgentCommunalClaimId, "agent_communal_claim_id"
+}
+
 /// Durable scope of one agent entity: `(TenantId, AgentId)`
 /// ([specification 6.2](../../../docs/plans/rakka-agent/spec.md)).
 ///

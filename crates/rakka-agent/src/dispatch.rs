@@ -565,6 +565,108 @@ pub trait AgentWorkflowStartExecutor: Send + Sync {
     ) -> AgentDispatchFuture<'a, AgentWorkflowStartFinding>;
 }
 
+/// What one workflow-cancel attempt established
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentWorkflowCancelFinding {
+    /// The derived `CancelRun` was durably accepted — or answered as a
+    /// duplicate — by the child run's inbox: the request exists in the
+    /// child's own durable record. Never proof its started internal effects
+    /// stopped.
+    Requested,
+    /// The child was already terminal when the request arrived; its result
+    /// relay carries — or already carried — the outcome.
+    AlreadyFinished,
+    /// Definitively refused without reaching the child: no retry can change
+    /// the answer. The parent then waits for the child's natural terminal
+    /// result.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one workflow cancel inside a bounded dispatch attempt
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): delivers
+/// the derived, generation-free `CancelRun` command —
+/// [`crate::workflow_tool::workflow_cancel_command`] builds it verbatim from
+/// the persisted record — to the child workflow run's own durable inbox.
+///
+/// The hosting application owes this executor, exactly as it owes the start's:
+/// delivering the command to the sharded child `AgentRunInbox` entity, driving
+/// the accepted `CancelRun` into its workflow runner's cancellation surface,
+/// mapping acceptance and duplicate acceptance to
+/// [`AgentWorkflowCancelFinding::Requested`], and still relaying the child's
+/// terminal outcome — `Cancelled` or otherwise — back as the parent's
+/// deduplicated `RecordWorkflowResult` command. Delivery is the whole claim:
+/// the child's scheduler quiesces under its own durable cancellation record,
+/// and its indeterminate internal effects stay in its own reconciliation.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`.
+pub trait AgentWorkflowCancelExecutor: Send + Sync {
+    /// Performs the cancel delivery and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        invocation: &'a crate::workflow_tool::AgentWorkflowInvocationRecord,
+        reason: &'a str,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentWorkflowCancelFinding>;
+}
+
+/// What one claim-append attempt established
+/// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentClaimAppendFinding {
+    /// The claim durably landed — or the derived operation replayed onto the
+    /// original claim, which is the same logical write.
+    Appended {
+        /// The appended claim's stable id, as the store recorded it.
+        claim: crate::identity::AgentCommunalClaimId,
+    },
+    /// Definitively refused without a durable write: no retry can change the
+    /// answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one communal claim append inside a bounded dispatch attempt
+/// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The graph-backed implementation lives beside the knowledge-graph store —
+/// the dependency runs graph → agent, so this crate declares only the trait —
+/// and derives the store's append operation id from the intent's external
+/// idempotency key: stable across every attempt of a generation, so the
+/// store's operation ledger answers a replay with the original claim. The
+/// provenance it writes is the transition-stamped record riding on the
+/// intent, never anything the executor invents.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`.
+pub trait AgentClaimAppendExecutor: Send + Sync {
+    /// Performs the append and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        append: &'a crate::effect::AgentClaimAppendRequest,
+        provenance: &'a crate::effect::AgentClaimAppendProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentClaimAppendFinding>;
+}
+
 /// The runtime-provided promotion executor: the session store in, the private
 /// store out, every identity derived
 /// ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
@@ -1142,6 +1244,17 @@ where
             {
                 context = context.with_checkpoint_grant(grant);
             }
+            // The goal-scope envelope binds per attempt
+            // ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+            // its environment narrowing and knowledge grant are read from the
+            // run's own durable state, so a revised assignment reaches the
+            // very next dispatch.
+            if let Some(envelope) = run
+                .loop_state()
+                .and_then(|loop_state| loop_state.delegation_envelope())
+            {
+                context = context.with_delegation_envelope(envelope);
+            }
             let task = run.run().map(AgentRun::task);
             let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
             let decision = match self
@@ -1269,6 +1382,8 @@ where
     goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
     a2a_sends: Option<Arc<dyn AgentA2aSendExecutor>>,
     workflow_starts: Option<Arc<dyn AgentWorkflowStartExecutor>>,
+    workflow_cancels: Option<Arc<dyn AgentWorkflowCancelExecutor>>,
+    claim_appends: Option<Arc<dyn AgentClaimAppendExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -1327,6 +1442,8 @@ where
             goal_evaluations: None,
             a2a_sends: None,
             workflow_starts: None,
+            workflow_cancels: None,
+            claim_appends: None,
             delivery,
             probe: None,
         }
@@ -1432,6 +1549,34 @@ where
         workflow_starts: Arc<dyn AgentWorkflowStartExecutor>,
     ) -> Self {
         self.workflow_starts = Some(workflow_starts);
+        self
+    }
+
+    /// Executes workflow cancels through the given executor
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// application-owned bridge that delivers the derived `CancelRun` to the
+    /// child workflow run's inbox. Without one, a workflow cancel dispatch
+    /// fails closed with a stable code and the parent waits for the child's
+    /// natural terminal result.
+    #[must_use]
+    pub fn with_workflow_cancel_executor(
+        mut self,
+        workflow_cancels: Arc<dyn AgentWorkflowCancelExecutor>,
+    ) -> Self {
+        self.workflow_cancels = Some(workflow_cancels);
+        self
+    }
+
+    /// Executes communal claim appends through the given executor
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// graph-backed bridge the application wires. Without one, a claim
+    /// append dispatch fails closed with a stable code.
+    #[must_use]
+    pub fn with_claim_append_executor(
+        mut self,
+        claim_appends: Arc<dyn AgentClaimAppendExecutor>,
+    ) -> Self {
+        self.claim_appends = Some(claim_appends);
         self
     }
 
@@ -1621,9 +1766,12 @@ where
                 .await;
         }
 
-        if winding_down {
+        if winding_down && !intent.kind().exempt_from_wind_down_fence() {
             // The fence: a ticket that provably never started is cancelled and
-            // its intent settled, never dispatched after the cancellation.
+            // its intent settled, never dispatched after the cancellation. A
+            // compensation or workflow-cancel is exempt — it is exactly the
+            // work the wind-down authorized after the fence, and cancelling
+            // its ticket here would strand the wind-down on it forever.
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
@@ -2546,6 +2694,61 @@ where
                     }
                 }
             }
+            AgentRunEffectRequest::WorkflowCancel { invocation, reason } => {
+                let Some(executor) = self.workflow_cancels.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation. The parent's wind-down then
+                    // waits for the child's natural terminal result.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "workflow-cancel-executor-missing".to_string(),
+                        message: "no workflow cancel executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor
+                    .execute(scope, intent, invocation, reason, credential)
+                    .await?
+                {
+                    AgentWorkflowCancelFinding::Requested => {
+                        Ok(AgentRunEffectOutcome::WorkflowCancel {
+                            already_finished: false,
+                        })
+                    }
+                    AgentWorkflowCancelFinding::AlreadyFinished => {
+                        Ok(AgentRunEffectOutcome::WorkflowCancel {
+                            already_finished: true,
+                        })
+                    }
+                    AgentWorkflowCancelFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
+            AgentRunEffectRequest::ClaimAppend { append, provenance } => {
+                let Some(executor) = self.claim_appends.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "claim-append-executor-missing".to_string(),
+                        message: "no claim-append executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+                match executor
+                    .execute(scope, intent, append, provenance, now)
+                    .await?
+                {
+                    AgentClaimAppendFinding::Appended { claim } => {
+                        Ok(AgentRunEffectOutcome::ClaimAppend { claim })
+                    }
+                    AgentClaimAppendFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
         }
     }
 
@@ -2804,6 +3007,12 @@ where
         };
 
         for intent in loop_state.ready_effects() {
+            if intent.kind().exempt_from_wind_down_fence() {
+                // The compensation and workflow-cancel the wind-down itself
+                // authorized stay dispatchable; the ordinary flush and claim
+                // paths own them.
+                continue;
+            }
             let ticket_id = intent.dispatch_ticket_id();
             let message_id = OutboxMessageId::new(ticket_id.as_str());
             let mut inbox = self.inbox(scope);

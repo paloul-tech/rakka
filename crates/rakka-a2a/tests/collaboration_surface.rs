@@ -680,6 +680,8 @@ async fn an_aged_out_replay_converges_on_its_own_child_instead_of_conflicting() 
         let delegation =
             delegation_id_for(&parent_run, 9, slot).expect("the delegation id derives");
         AgentDelegationRecord {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
             a2a_message_id: delegation.as_str().to_string(),
             deduplication_key: original_key.clone(),
             delegation,
@@ -1047,15 +1049,30 @@ async fn ancestors_ride_the_wire_and_omit_when_empty() {
         }),
         deadline: None,
         result_schema: None,
+        environments: vec!["workspace-1".to_string()],
+        knowledge_spaces: vec!["space-1".to_string()],
     };
     let wire = chained.to_value();
     assert_eq!(wire["ancestors"], json!(["root-coordinator"]));
+    // The slice-4.6 scope fields ride the same posture as the ancestors:
+    // present, they validate into typed provenance…
+    assert_eq!(wire["environments"], json!(["workspace-1"]));
+    assert_eq!(wire["knowledge-spaces"], json!(["space-1"]));
     assert_eq!(wire["budget"]["max-descendants"], json!(0));
     let provenance = chained
         .to_provenance()
         .expect("the chained envelope validates");
     assert_eq!(provenance.ancestors.len(), 1);
     assert_eq!(provenance.ancestors[0].as_str(), "root-coordinator");
+    assert_eq!(provenance.environments.len(), 1);
+    assert_eq!(
+        provenance
+            .knowledge_spaces
+            .iter()
+            .map(|space| space.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["space-1".to_string()]
+    );
     assert_eq!(
         provenance
             .budget
@@ -1068,6 +1085,8 @@ async fn ancestors_ride_the_wire_and_omit_when_empty() {
         lineage: Vec::new(),
         ancestors: Vec::new(),
         depth: 1,
+        environments: Vec::new(),
+        knowledge_spaces: Vec::new(),
         ..chained
     };
     let wire = rootward.to_value();
@@ -1076,6 +1095,12 @@ async fn ancestors_ride_the_wire_and_omit_when_empty() {
         "an empty ancestry is omitted, so a v1-strict receiver still parses \
          a root-level send"
     );
+    // …and absent, they are omitted from the wire entirely, so a scope-free
+    // send stays parseable by a strict receiver that predates the fields —
+    // while a send carrying a grant fails closed on such a receiver rather
+    // than having the grant silently dropped.
+    assert!(wire.get("environments").is_none());
+    assert!(wire.get("knowledge-spaces").is_none());
 
     // The decode side of the same omission: wire JSON with no `ancestors`
     // key — a pre-4.4 sender — parses into an empty chain and validates

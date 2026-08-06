@@ -464,11 +464,71 @@ pub enum AgentExchangeKind {
     ///   re-driving; a wound-down parent instead records the result as
     ///   evidence and resumes nothing.
     DelegationResult,
+    /// A task pushing a durable cancellation request to the run currently
+    /// assigned to it ([specification 8.7](../../../docs/plans/rakka-agent/spec.md):
+    /// propagation is a request with an observable outcome). Initiated by the
+    /// task entity once its nonterminal cancellation marker is set and a run
+    /// has durably accepted the assignment; the reply is the run's receipt
+    /// carrying the status the wind-down reached — `Cancelling` or
+    /// `WaitingForReconciliation` is an accepted receipt, never proof that a
+    /// started effect stopped.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the cancellation
+    ///   marker committed with the goal decision; the settle pass re-derives
+    ///   the identical owed envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the wind-down
+    ///   and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: a winding-down or
+    ///   terminal run is its own fence — the arm answers idempotently with
+    ///   the current durable status and runs no second transition.
+    /// - **Never assigned or forged sender**: a settled refusal the task's
+    ///   settle rule accepts as definitive; the task finalizes through the
+    ///   no-active-run arm instead of re-driving forever.
+    RunCancel,
+    /// A parent run pushing a durable cancellation request to a delegated
+    /// child task it created ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// In-fabric like [`Self::DelegationResult`] — the A2A carrier stays
+    /// reserved for federation. Initiated by the parent run against the child
+    /// task recorded in its delegation cell; the reply is the child's durable
+    /// acceptance of the *request* — the child's terminal outcome still
+    /// arrives separately as [`Self::DelegationResult`], and an accepted
+    /// cancellation is never proof the child's started effects stopped.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the wind-down
+    ///   that marks the cell cancel-owed committed atomically; recovery
+    ///   re-reaches it and owes the identical envelope under the same
+    ///   derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the child's
+    ///   cancellation marker and journal record committed in one
+    ///   compare-and-set; the re-driven envelope is answered from the
+    ///   applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the child's own
+    ///   cancellation marker or terminal status is the durable fence — the
+    ///   arm accepts idempotently with no state change.
+    /// - **Not delegated or forged sender**: a settled refusal the parent's
+    ///   settle rule accepts as definitive; the cell records the refusal and
+    ///   the parent's quiescence no longer waits on that member.
+    DelegationCancel,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -478,6 +538,8 @@ impl AgentExchangeKind {
         Self::EpochResult,
         Self::GoalEvaluation,
         Self::DelegationResult,
+        Self::RunCancel,
+        Self::DelegationCancel,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -493,6 +555,8 @@ impl AgentExchangeKind {
             Self::EpochResult => "epoch-result",
             Self::GoalEvaluation => "goal-evaluation",
             Self::DelegationResult => "delegation-result",
+            Self::RunCancel => "run-cancel",
+            Self::DelegationCancel => "delegation-cancel",
         }
     }
 }

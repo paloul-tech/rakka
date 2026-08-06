@@ -407,12 +407,27 @@ async fn cancelling_the_root_task_takes_the_goal_with_it() {
         })
         .await,
     );
-    assert_eq!(outcome.status, AgentTaskStatus::Cancelled);
+    // The goal decides at request time, but the task itself stays nonterminal
+    // while its accepted run winds down (specification 8.7): terminal
+    // `Cancelled` is never projected ahead of the run's own quiescence.
+    assert_eq!(outcome.status, AgentTaskStatus::InProgress);
     assert_eq!(
         outcome.goal.expect("the goal outcome rides").status,
         AgentGoalStatus::Cancelled
     );
     let view = snapshot(&fx).await;
+    assert!(view.cancellation.is_some(), "the request marker is durable");
+
+    // The run-cancel exchange winds the run down; its settlement closes the
+    // task's escrow, which is the finalization gate.
+    fx.pump().await.expect("the wind-down drives");
+    fx.pump().await.expect("the settlement drives");
+    let view = snapshot(&fx).await;
+    assert_eq!(view.status, AgentTaskStatus::Cancelled);
+    assert_eq!(
+        view.terminal_reason.as_ref().map(|reason| reason.code()),
+        Some("cancellation-requested")
+    );
     assert_eq!(
         view.goal_state
             .expect("the goal view exists")

@@ -127,8 +127,8 @@ use crate::task::{
     AgentRunAssignment, AgentTaskContent, AgentTaskDecision, AgentTaskDefinition, AgentTaskError,
     AgentTaskResultProposal, AgentTaskStatus, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE,
     AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
-    AGENT_TASK_DECISION_PAYLOAD_TYPE, AGENT_TASK_REFUSAL_STALE_GENERATION,
-    AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
+    AGENT_TASK_DECISION_PAYLOAD_TYPE, AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+    AGENT_TASK_REFUSAL_STALE_GENERATION, AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
 };
 
 /// Default sharded entity type of the run entity.
@@ -211,16 +211,21 @@ pub const AGENT_RUN_DETAIL_MAX_LENGTH: usize = 512;
 /// twice its serialized record bytes: the effect envelope around the payload,
 /// the cell's status fields, the send receipt later recorded as the call's
 /// bounded tool result, the child's terminal result later recorded on the
-/// cell, the fan-in group's membership entry, and the delegation's share of
-/// the resolution table recorded as the awaiting call's tool result.
+/// cell, the settled outcome of the delegation-cancel a wind-down or
+/// straggler chase may record on it, the fan-in group's membership entry, and
+/// the delegation's share of the resolution table recorded as the awaiting
+/// call's tool result. `the_growth_reserve_covers_the_maximal_working_set`
+/// measures that whole lifecycle empirically against this price.
 const AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
 
 /// What one committed workflow invocation adds to the run's durable record
 /// beyond twice its serialized record bytes: the effect envelope around the
 /// payload, the cell's status fields, the start receipt later recorded as the
 /// call's bounded tool result, the child's terminal result later recorded on
-/// the cell, the fan-in group's membership entry, and the invocation's share
-/// of the resolution table recorded as the awaiting call's tool result.
+/// the cell, the cancel disposition a wind-down or straggler chase may record
+/// on it — at most one derived effect id — the fan-in group's membership
+/// entry, and the invocation's share of the resolution table recorded as the
+/// awaiting call's tool result.
 const AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
 
 const DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
@@ -997,6 +1002,29 @@ pub fn promotion_operation_id(
     )
 }
 
+/// Derives the stable operation id of one claim-append command
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md): graph
+/// claim appends carry stable operation ids).
+///
+/// Pure over the scope and the caller's discriminator, so a replayed command
+/// deduplicates in the run's operation log, and the store-side append
+/// operation — derived from the committed effect's external idempotency key —
+/// converges independently.
+pub fn claim_append_operation_id(
+    scope: &AgentRunScope,
+    discriminator: impl AsRef<str>,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ClaimAppend,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            discriminator.as_ref(),
+        ],
+    )
+}
+
 /// Derives the stable operation id of one goal-evaluation command
 /// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -1432,12 +1460,314 @@ fn accept_delegation_result(
         }
         state.updated_at = now;
     }
+    // The recorded result may be the last outcome a winding-down parent
+    // awaited: quiescence is re-checked in this same compare-and-set, so the
+    // final child report terminalizes a cancelling parent
+    // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    if let Err(error) = settle_run_disposition(state, now) {
+        debug_assert!(false, "disposition settle failed: {error}");
+    }
     // A result already recorded — a duplicate past the journal's bounded
     // window — accepts idempotently with no further transition: the cell is
     // the durable fence.
     AgentExchangeResult::accepted(AgentExchangePayload::empty(
         crate::task::AGENT_DELEGATION_RESULT_OUTCOME_PAYLOAD_TYPE,
     ))
+}
+
+/// Applies the task's [`AgentExchangeKind::RunCancel`] request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// receiving half of the task → run propagation leg.
+///
+/// The wind-down and the journal record commit in one compare-and-set, and
+/// the receipt reports the status the wind-down reached — never proof a
+/// started effect stopped. A terminal run answers idempotently with its
+/// terminal status: its own durable record is the fence past the journal's
+/// bounded deduplication window.
+fn accept_run_cancel(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let request: crate::task::AgentRunCancelRequest = match envelope
+        .payload()
+        .decode(crate::task::AGENT_RUN_CANCEL_PAYLOAD_TYPE)
+    {
+        Ok(request) => request,
+        // Version skew, not the receiver answering: the task's settle rule
+        // leaves the exchange outstanding, and it converges after upgrade.
+        Err(error) => return refuse("run-cancel-undecodable", error.to_string()),
+    };
+    // The sender must be the very task this run serves, in its own tenant:
+    // anything else is a forgery, whatever it claims.
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Task(scope) => scope,
+        other => {
+            return refuse(
+                "run-cancel-forged",
+                format!("a run-cancel cannot originate from {other}"),
+            )
+        }
+    };
+    if sender.tenant() != state.scope.tenant() || *sender != request.task {
+        return refuse(
+            "run-cancel-forged",
+            format!(
+                "the run-cancel claims task {}, but was sent by {}",
+                request.task.task(),
+                sender.task()
+            ),
+        );
+    }
+    let Some(run) = state.run.as_ref() else {
+        // Definitive: the task owes a run-cancel only after the run durably
+        // accepted, so an unassigned entity here is a misroute the task
+        // finalizes past rather than re-driving forever.
+        return refuse(
+            "run-cancel-unassigned",
+            "the addressed run was never assigned",
+        );
+    };
+    if *sender.task() != *run.task() {
+        return refuse(
+            "run-cancel-forged",
+            format!("the run serves task {}, not {}", run.task(), sender.task()),
+        );
+    }
+    if request.generation != run.generation {
+        return refuse(
+            "run-cancel-stale-generation",
+            format!(
+                "the run serves generation {}, not {}",
+                run.generation, request.generation
+            ),
+        );
+    }
+    // Already winding down — a duplicate request past the journal's bounded
+    // deduplication window, or a cancellation this run reached on its own —
+    // answers idempotently from the durable record. Re-running the wind-down
+    // would re-fence, and the fence would settle work the first wind-down
+    // authorized after itself (a scheduled compensation, a chased
+    // workflow-cancel) under a cell disposition that already claims it.
+    let winding_down = run.status.is_terminal()
+        || run.terminal_reason.is_some()
+        || run.status == AgentRunStatus::Cancelling;
+    if !winding_down {
+        if let Err(error) = cancel(state, request.reason, now) {
+            // `cancel` fails only on a terminal run, which the guard above
+            // excludes; surfacing the impossible loudly beats masking it.
+            return refuse("run-cancel-failed", error.to_string());
+        }
+    }
+    let run = state.run.as_ref().expect("the run exists on this path");
+    let receipt = crate::task::AgentRunCancelReceipt {
+        run: state.scope.clone(),
+        status: run.status,
+    };
+    AgentExchangeResult::accepted(
+        AgentExchangePayload::encode(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE, &receipt)
+            .unwrap_or_else(|_| {
+                AgentExchangePayload::empty(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE)
+            }),
+    )
+}
+
+/// The bounded reason a chased child's cancellation marker records.
+fn chase_reason(run: &AgentRun) -> String {
+    match &run.terminal_reason {
+        Some(AgentRunTerminalReason::CancellationRequested { reason }) => reason.clone(),
+        Some(other) => other.code().to_string(),
+        None => "fan-in-straggler".to_string(),
+    }
+}
+
+/// The chase context of one run ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+/// whether every created child sits in a cancelled scope, and the members a
+/// resolved fan-in group left behind without a terminal report — the
+/// stragglers a deadline marked timed out, or an early `Any`/`Quorum`
+/// satisfaction moved past.
+///
+/// The straggler set is [`crate::fan_in::unreported_members`], not
+/// `unresolved_members`: a fired deadline marks its stragglers timed out
+/// *before* resolving the group, so the unresolved set is empty by the time
+/// the chase reads it and the deadline branch would chase nobody.
+fn chase_context(run: &AgentRun) -> (bool, Vec<crate::fan_in::AgentFanInMemberId>) {
+    let winding_down_cancelled = matches!(
+        run.terminal_reason,
+        Some(AgentRunTerminalReason::CancellationRequested { .. })
+    ) || matches!(
+        run.status,
+        AgentRunStatus::Cancelling | AgentRunStatus::Cancelled
+    );
+    let stragglers = run
+        .loop_state
+        .fan_in()
+        .filter(|cell| cell.resolution.is_some())
+        .map(|cell| {
+            crate::fan_in::unreported_members(
+                cell,
+                run.loop_state.delegations(),
+                run.loop_state.workflow_invocations(),
+            )
+        })
+        .unwrap_or_default();
+    (winding_down_cancelled, stragglers)
+}
+
+/// The started, unsettled workflow invocations the wind-down or straggler
+/// chase owes a cancel decision for right now
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). The cell's
+/// recorded disposition is the durable once-guard.
+fn chased_workflow_invocations(run: &AgentRun) -> Vec<AgentWorkflowInvocationId> {
+    use crate::workflow_tool::AgentWorkflowInvocationStatus;
+
+    let (winding_down_cancelled, straggler_members) = chase_context(run);
+    let stragglers: std::collections::BTreeSet<AgentWorkflowInvocationId> = straggler_members
+        .into_iter()
+        .filter_map(|member| match member {
+            crate::fan_in::AgentFanInMemberId::WorkflowInvocation(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    if !winding_down_cancelled && stragglers.is_empty() {
+        return Vec::new();
+    }
+    run.loop_state
+        .workflow_invocations()
+        .iter()
+        .filter(|(id, cell)| {
+            matches!(cell.status, AgentWorkflowInvocationStatus::Started { .. })
+                && !cell.child_settled()
+                && cell.cancel.is_none()
+                && (winding_down_cancelled || stragglers.contains(*id))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Every delegation-cancel exchange this run owes right now
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// parent → child propagation leg, and the straggler chase, as one pure
+/// condition over durable state.
+///
+/// A created, unsettled child is chased when the run is winding down under a
+/// cancellation — every child is then in the cancelled scope — or when the
+/// fan-in group has resolved without it: a deadline marked it timed out, or
+/// an early `Any`/`Quorum` satisfaction left it behind, and either way the
+/// group no longer waits for work the parent no longer wants. The cell's
+/// settled cancel outcome is the durable once-guard past the journal's
+/// bounded window; owed cancels never touch the run's own terminal reason,
+/// so a chase can never wind the parent down.
+fn owed_child_cancel_exchanges(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    use crate::delegation::AgentDelegationStatus;
+
+    let Some(run) = state.run.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let (winding_down_cancelled, straggler_members) = chase_context(run);
+    let stragglers: std::collections::BTreeSet<crate::identity::AgentDelegationId> =
+        straggler_members
+            .into_iter()
+            .filter_map(|member| match member {
+                crate::fan_in::AgentFanInMemberId::Delegation(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+    if !winding_down_cancelled && stragglers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut owed = Vec::new();
+    for (id, cell) in run.loop_state.delegations() {
+        let AgentDelegationStatus::ChildCreated { child_task, .. } = &cell.status else {
+            continue;
+        };
+        if cell.child_settled() || cell.cancel.is_some() {
+            continue;
+        }
+        if !(winding_down_cancelled || stragglers.contains(id)) {
+            continue;
+        }
+        let operation_id =
+            crate::delegation::delegation_cancel_operation_id(state.scope.tenant(), id)?;
+        if state.journal.has_initiated(&operation_id) {
+            continue;
+        }
+        let request = crate::task::AgentDelegationCancelRequest {
+            delegation: id.clone(),
+            child_task: child_task.clone(),
+            reason: if winding_down_cancelled {
+                chase_reason(run)
+            } else {
+                "fan-in-straggler".to_string()
+            },
+        };
+        let payload = AgentExchangePayload::encode(
+            crate::task::AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE,
+            &request,
+        )?;
+        let child_scope = AgentTaskScope::new(state.scope.tenant().clone(), child_task.clone())?;
+        owed.push(AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::DelegationCancel,
+            AgentEntityAddress::Run(state.scope.clone()),
+            AgentEntityAddress::Task(child_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?);
+    }
+    Ok(owed)
+}
+
+/// Records the child's answer to a delegation-cancel exchange on its cell:
+/// the durable once-guard, and the request's observable outcome.
+fn settle_delegation_cancel(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    result: &AgentExchangeResult,
+    now: AgentTimestampMillis,
+) {
+    use crate::delegation::AgentDelegationCancelOutcome;
+
+    let request: crate::task::AgentDelegationCancelRequest = match envelope
+        .payload()
+        .decode(crate::task::AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            // This entity encoded the payload it is now settling; a decode
+            // failure is a construction bug surfaced loudly in tests.
+            debug_assert!(false, "delegation-cancel payload undecodable: {error}");
+            return;
+        }
+    };
+    let Some(run) = state.run.as_mut() else {
+        return;
+    };
+    let outcome = if result.is_accepted() {
+        AgentDelegationCancelOutcome::Accepted { settled_at: now }
+    } else {
+        AgentDelegationCancelOutcome::Refused {
+            code: bounded_detail(result.status().rejection_code().unwrap_or("refused")),
+            settled_at: now,
+        }
+    };
+    if let Some(cell) = run.loop_state.delegation_mut(&request.delegation) {
+        cell.record_cancel_outcome(outcome);
+        state.updated_at = now;
+    }
+    // A definitive refusal releases the cell from the subtree quiesce
+    // condition — the child can never report — so it may have been the last
+    // outcome a winding-down parent was waiting on. Re-checking here is what
+    // makes the release terminalize the parent rather than leaving it
+    // `Cancelling` until some unrelated transition happens to run.
+    if let Err(error) = settle_run_disposition(state, now) {
+        debug_assert!(false, "disposition settle failed: {error}");
+    }
 }
 
 /// Derives the stable id of one ledger exchange a run owes its task.
@@ -1621,6 +1951,7 @@ fn owed_run_exchanges(
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let mut owed = owed_ledger_exchange(state, now)?;
     owed.extend(owed_goal_evaluation_exchange(state, now)?);
+    owed.extend(owed_child_cancel_exchanges(state, now)?);
     Ok(owed)
 }
 
@@ -2127,7 +2458,33 @@ fn plan_delegation_call(
             Some(child)
         }
     };
+    // The scopes the child inherits ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+    // the goal's environment narrowing rides verbatim, and the knowledge
+    // grant is the catalog's explicit statement intersected with the
+    // parent's own effective grant — a catalog can never widen what the
+    // parent holds, and a parent with no grant statement of its own passes
+    // the catalog's through only at the root, where the definition envelope
+    // still bounds every append.
+    let environments = envelope
+        .map(|env| env.environments.clone())
+        .unwrap_or_default();
+    let knowledge_spaces = match envelope.and_then(|env| env.knowledge_spaces.as_ref()) {
+        Some(granted) => target
+            .knowledge_spaces
+            .intersection(granted)
+            .cloned()
+            .collect(),
+        None if envelope.is_some_and(|env| !env.lineage.is_empty()) => {
+            // A chain whose own grant statement predates the field cannot
+            // prove what it may re-delegate: deny-when-unknown, the
+            // ancestry-gap posture.
+            std::collections::BTreeSet::new()
+        }
+        None => target.knowledge_spaces.clone(),
+    };
     let record = AgentDelegationRecord {
+        environments,
+        knowledge_spaces,
         delegation: delegation_id.clone(),
         goal,
         parent_task: task,
@@ -3268,6 +3625,21 @@ fn apply_effect_outcome(
                 run.status = status;
             }
         }
+        AgentRunEffectOutcome::ClaimAppend { .. } => {
+            // The claim landed; the receipt's id is on the settled outcome
+            // record. Nothing else moves: an append is not part of the turn,
+            // and whatever wait the run held, it still holds.
+            effect.status = AgentRunEffectStatus::Succeeded;
+        }
+        AgentRunEffectOutcome::WorkflowCancel { .. } => {
+            // The request durably reached the child's inbox, or found it
+            // already finished. Nothing else moves: the disposition recorded
+            // at commit is the durable decision, the child's terminal
+            // outcome still returns through the result relay, and the
+            // winding-down run keeps quiescing until it does
+            // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+            effect.status = AgentRunEffectStatus::Succeeded;
+        }
         AgentRunEffectOutcome::Failed { code, .. }
         | AgentRunEffectOutcome::Exhausted { code, .. } => {
             // Final for the generation: the dispatch layer already applied the
@@ -3544,7 +3916,13 @@ fn settle_run_disposition(
 
     let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
     if winding_down {
-        if run.loop_state.awaits_settlement() {
+        // The quiesce condition spans the subtree ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+        // a created child whose terminal outcome has not returned is a
+        // started consequential effect, so the parent stays `Cancelling`
+        // until every delegation and workflow cell holds one — the last
+        // child result, arriving through its own exchange, re-runs this
+        // settle and terminalizes the parent.
+        if run.loop_state.awaits_settlement() || run.loop_state.awaits_children() {
             run.status = AgentRunStatus::Cancelling;
             state.updated_at = now;
             return Ok(());
@@ -4176,6 +4554,79 @@ fn promote_memory(
     Ok(())
 }
 
+/// Commits one communal claim-append effect from a deduplicated command
+/// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The transition is bounded and performs no I/O: it validates the statement,
+/// checks the space against the run's delegated grant — `Some(set)` must name
+/// it; `None` under a delegated chain fails closed, the deny-when-unknown
+/// posture; `None` at a root defers to the definition envelope the authority
+/// re-checks per attempt — stamps the provenance from durable state alone,
+/// reserves the append's attempt budget, and records the effect. The
+/// dispatcher-side executor performs the store append inside its bounded
+/// attempt.
+fn append_claim(
+    state: &mut AgentRunState,
+    append: crate::effect::AgentClaimAppendRequest,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Err(AgentRunError::Terminal { status: run.status });
+    }
+    if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
+        // An append is new work, which the wind-down fence forbids.
+        return Err(AgentRunError::ClaimAppendFenced { status: run.status });
+    }
+    append
+        .validate()
+        .map_err(|error| AgentRunError::ClaimAppendInvalid {
+            message: error.to_string(),
+        })?;
+    let envelope = run.loop_state.delegation_envelope();
+    let granted = match envelope.and_then(|envelope| envelope.knowledge_spaces.as_ref()) {
+        Some(granted) => granted.contains(&append.space),
+        None => envelope.is_none_or(|envelope| envelope.lineage.is_empty()),
+    };
+    if !granted {
+        return Err(AgentRunError::ClaimSpaceNotDelegated {
+            space: append.space.clone(),
+        });
+    }
+    // The provenance is stamped here and only here, from durable identity:
+    // the command payload carries none, so a hostile initiator cannot assert
+    // work in another scope's name.
+    let provenance = crate::effect::AgentClaimAppendProvenance {
+        agent: scope.agent().clone(),
+        goal: run.loop_state.goal().cloned(),
+        task: run.task().clone(),
+        run: scope.run().clone(),
+        delegation: envelope.and_then(|envelope| envelope.lineage.last().cloned()),
+    };
+    let request = AgentRunEffectRequest::ClaimAppend {
+        append: Box::new(append),
+        provenance: Box::new(provenance),
+    };
+    let spec = policies.spec_for(&request).clone();
+    if let Err(exhaustion) = run
+        .loop_state
+        .budget_mut()
+        .reserve_attempts(spec.max_attempts)
+    {
+        return Err(AgentRunError::ClaimAppendUnaffordable { exhaustion });
+    }
+
+    let turn = run.loop_state.turn();
+    let slot = run.loop_state.next_effect_slot();
+    let settings_revision = run.loop_state.agent_settings_revision();
+    let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    run.loop_state.record_effect(effect)?;
+    state.updated_at = now;
+    Ok(())
+}
+
 /// Commits one goal-evaluation effect from a deduplicated command
 /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -4488,6 +4939,10 @@ fn record_workflow_result(
             run.status = AgentRunStatus::Running;
         }
         state.updated_at = now;
+        // The recorded result may be the last outcome a winding-down parent
+        // awaited: quiescence is re-checked in this same compare-and-set
+        // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+        settle_run_disposition(state, now)?;
     }
     // A result already recorded — a conflicting duplicate past the journal's
     // bounded window — accepts idempotently with no further transition: the
@@ -4584,6 +5039,19 @@ fn settle_proposal(
             // evaluate the proposal, because the run is fenced by a newer
             // generation or the task has moved on. There is nothing for the run
             // to correct, so it stops with the task's own reason on record.
+            if code == AGENT_TASK_REFUSAL_CANCEL_REQUESTED {
+                // The task's cancellation is propagating and this run is the
+                // scope being cancelled: the refusal is the wind-down
+                // reaching the run through the proposal it happened to hold,
+                // so it takes the wind-down path rather than terminalizing
+                // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                // Terminalizing here would project `Failed` (the task's
+                // status is deliberately still nonterminal), skip the
+                // subtree quiesce gate, and leave this run's own children
+                // unchased. `cancel` keeps whatever reason a run-cancel
+                // already recorded, so the two orderings converge.
+                return cancel(state, code, now);
+            }
             terminate(
                 state,
                 if code == AGENT_TASK_REFUSAL_STALE_GENERATION {
@@ -4637,7 +5105,41 @@ impl AgentExchangeParticipant for AgentRunParticipant {
         let result = match envelope.kind() {
             AgentExchangeKind::Assignment => accept_assignment(state, envelope, now),
             AgentExchangeKind::DelegationResult => {
-                return AgentExchangeTransition::new(accept_delegation_result(state, envelope, now))
+                let result = accept_delegation_result(state, envelope, now);
+                // The result may have completed a cancelling parent's
+                // quiescence, terminalizing it: whatever the terminalization
+                // owes — the ledger settlement, a remaining child chase —
+                // commits in this same compare-and-set.
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_run_exchanges(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "owed-exchange construction failed: {error}");
+                    }
+                }
+                return transition;
+            }
+            AgentExchangeKind::RunCancel => {
+                let result = accept_run_cancel(state, envelope, now);
+                // The wind-down owes its children's chase in the same
+                // compare-and-set that accepted the request
+                // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_run_exchanges(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "owed-exchange construction failed: {error}");
+                    }
+                }
+                return transition;
             }
             kind => refuse(
                 "unsupported-exchange",
@@ -4711,6 +5213,22 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                     }),
                 }
             }
+            AgentExchangeKind::DelegationCancel if !result.is_accepted() => {
+                // A refused delegation-cancel settles only under the child's
+                // definitive answers: the sender was not its recorded parent,
+                // or it carries no such delegation. Every other refusal — an
+                // `unsupported-exchange` from an owner that predates the
+                // kind, a payload it could not decode — leaves the exchange
+                // outstanding for re-drive until an owner that can answer it
+                // does (the rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some("delegation-cancel-forged" | "delegation-cancel-not-delegated") => Ok(()),
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::DelegationCancel,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -4750,6 +5268,13 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 // own code. Either way the report settles; a refusal is the
                 // caller's signal to re-evaluate, never a crash loop.
                 settle_goal_evaluation_exchange(state, envelope, result, now);
+            }
+            AgentExchangeKind::DelegationCancel => {
+                // The child answered — accepted, or refused definitively.
+                // Either way the outcome records on the cell: the durable
+                // once-guard, and the observable outcome the propagation
+                // request owes ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                settle_delegation_cancel(state, envelope, result, now);
             }
             _ => {}
         }
@@ -5208,6 +5733,17 @@ where
                 })
                 .await?
             }
+            AgentRunEntityCommand::AppendClaim {
+                operation_id,
+                append,
+            } => {
+                let policies = self.policies.clone();
+                self.transition(now, move |state| {
+                    append_claim(state, *append, &policies, now)?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
             AgentRunEntityCommand::EvaluateGoal {
                 operation_id,
                 evaluation,
@@ -5385,13 +5921,17 @@ where
         let mut progress = AgentRunProgress::default();
         for _round in 0..AGENT_RUN_MAX_SETTLE_ROUNDS {
             let advanced = self.advance_loop(now).await?;
+            // The wind-down's owed workflow-cancel decisions commit before
+            // the flush, so a committed cancel effect reaches the outbox in
+            // this same round ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+            let cancels = self.commit_workflow_cancels(now).await?;
             let flushed = self.flush_session_memory(now).await?;
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
             let decisions = self.flush_decision_events(now).await?;
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
 
-            progress.transitions += advanced;
+            progress.transitions += advanced + cancels;
             progress.effects_dispatched += dispatched;
             progress.session_entries_flushed += flushed;
             progress.snapshots_persisted += snapshotted;
@@ -5400,6 +5940,7 @@ where
             progress.failed += report.failed;
 
             if advanced == 0
+                && cancels == 0
                 && dispatched == 0
                 && flushed == 0
                 && snapshotted == 0
@@ -5703,6 +6244,180 @@ where
         Ok(transitions)
     }
 
+    /// Commits the workflow-cancel decisions a wind-down or straggler chase
+    /// owes ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+    /// for each started, unsettled invocation in a cancelled scope, either
+    /// the `WorkflowCancelCall` effect — gated on the descriptor's declared
+    /// `supports_cancellation`, priced like the compensation it parallels —
+    /// or a durable `Unsupported`/`Unaffordable` disposition: the request's
+    /// observable outcome when no effect may exist, leaving the parent to
+    /// wait for the child's natural terminal result.
+    ///
+    /// Re-derivable: the cell's disposition is the durable once-guard, so a
+    /// pass lost between the wind-down and this commit re-derives the same
+    /// decision, and a re-entered pass commits nothing.
+    ///
+    /// Two bounds are deliberate. A **terminal** run commits nothing: it
+    /// dispatches nothing, so an effect recorded here could never leave, and
+    /// its cell would claim a request that was never made. For a cancelled
+    /// scope that costs nothing — `awaits_children` holds the wind-down open
+    /// until every child settles, so the chase always gets its chance before
+    /// terminal. For a *normally completing* parent the straggler chase is
+    /// therefore best-effort by construction: fan-in never blocks the
+    /// parent's own completion (slice 4.4), so a parent that completes in the
+    /// same window leaves its straggler running, exactly as it did before the
+    /// chase existed. And the batch stops at the per-run outstanding-effect
+    /// bound rather than overflowing it, because an overflow would abort the
+    /// whole transition and re-abort identically on every later pass.
+    async fn commit_workflow_cancels(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<usize> {
+        let owed: Vec<AgentWorkflowInvocationId> = {
+            let state = self.state()?;
+            match state.run() {
+                Some(run) => chased_workflow_invocations(run),
+                None => return Ok(0),
+            }
+        };
+        if owed.is_empty() {
+            return Ok(0);
+        }
+        let scope = self.scope.clone();
+        let policies = self.policies.clone();
+        let config = self.workflow_tools.clone();
+        let mut committed = 0usize;
+        let mut rejection = None;
+        let outcome = self
+            .host
+            .initiate(now, |state| {
+                let mut step = |state: &mut AgentRunState| -> AgentRunResult<()> {
+                    use crate::workflow_tool::{
+                        AgentWorkflowCancelDisposition, AgentWorkflowInvocationStatus,
+                    };
+
+                    let Some(run) = state.run.as_mut() else {
+                        return Ok(());
+                    };
+                    if run.status.is_terminal() {
+                        // A terminal run dispatches nothing, so committing a
+                        // cancel effect here would persist a request that can
+                        // never leave — and its cell disposition would claim
+                        // one was made. The chase is best-effort *before* the
+                        // parent terminalizes; a cancelled scope always gets
+                        // its chance, because `awaits_children` holds the
+                        // wind-down open until every child settles.
+                        return Ok(());
+                    }
+                    let reason = chase_reason(run);
+                    for invocation_id in &owed {
+                        let Some(cell) = run.loop_state.workflow_invocation(invocation_id) else {
+                            continue;
+                        };
+                        if cell.cancel.is_some()
+                            || cell.child_settled()
+                            || !matches!(cell.status, AgentWorkflowInvocationStatus::Started { .. })
+                        {
+                            continue;
+                        }
+                        let record = cell.record.clone();
+                        let supported = config
+                            .as_ref()
+                            .and_then(|config| config.descriptor(&record.workflow_tool))
+                            .is_some_and(|descriptor| descriptor.supports_cancellation);
+                        if !supported {
+                            if let Some(cell) =
+                                run.loop_state.workflow_invocation_mut(invocation_id)
+                            {
+                                cell.record_cancel_disposition(
+                                    AgentWorkflowCancelDisposition::Unsupported,
+                                );
+                            }
+                            committed += 1;
+                            continue;
+                        }
+                        if run.loop_state.outstanding_effects().count()
+                            >= crate::effect::AGENT_RUN_MAX_PENDING_EFFECTS
+                        {
+                            // The per-run outstanding-effect bound is this
+                            // batch's ceiling: a run may hold more chaseable
+                            // invocations than dispatch slots, and committing
+                            // past the bound would abort the whole
+                            // transition — which, re-derived from unchanged
+                            // durable state, would abort identically forever.
+                            // The remaining cells stay undecided and a later
+                            // pass commits them once the dispatched cancels
+                            // settle and free their slots. Progress is
+                            // guaranteed: a cancel is exempt from the
+                            // wind-down flush fence, so it dispatches and
+                            // settles even while the run winds down.
+                            break;
+                        }
+                        let request = AgentRunEffectRequest::WorkflowCancel {
+                            invocation: record,
+                            reason: reason.clone(),
+                        };
+                        let spec = policies.spec_for(&request).clone();
+                        if run
+                            .loop_state
+                            .budget_mut()
+                            .reserve_attempts(spec.max_attempts)
+                            .is_err()
+                        {
+                            // Never block the wind-down on budget: no effect
+                            // exists, and the parent waits for the child's
+                            // natural result instead.
+                            if let Some(cell) =
+                                run.loop_state.workflow_invocation_mut(invocation_id)
+                            {
+                                cell.record_cancel_disposition(
+                                    AgentWorkflowCancelDisposition::Unaffordable,
+                                );
+                            }
+                            committed += 1;
+                            continue;
+                        }
+                        let turn = run.loop_state.turn();
+                        let slot = run.loop_state.next_effect_slot();
+                        let settings_revision = run.loop_state.agent_settings_revision();
+                        let effect = AgentRunEffect::new(
+                            &scope,
+                            turn,
+                            slot,
+                            request,
+                            &spec,
+                            settings_revision,
+                            now,
+                        )?;
+                        let effect_id = effect.effect_id.clone();
+                        run.loop_state.record_effect(effect)?;
+                        if let Some(cell) = run.loop_state.workflow_invocation_mut(invocation_id) {
+                            cell.record_cancel_disposition(
+                                AgentWorkflowCancelDisposition::Committed { effect: effect_id },
+                            );
+                        }
+                        committed += 1;
+                    }
+                    state.updated_at = now;
+                    Ok(())
+                };
+                match step(state) {
+                    Ok(()) => Ok(Vec::new()),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        outcome?;
+        Ok(committed)
+    }
+
     /// Makes the loop's committed effects dispatchable, then hands every
     /// dispatchable, unresolved effect to the sink.
     ///
@@ -5754,8 +6469,7 @@ where
                     .into_iter()
                     .filter(|effect| {
                         loop_state.is_dispatchable(effect)
-                            && (!winding_down
-                                || effect.kind() == AgentRunEffectKind::CompensationCall)
+                            && (!winding_down || effect.kind().exempt_from_wind_down_fence())
                     })
                     .map(|effect| effect.effect_id)
                     .collect()
@@ -5786,7 +6500,7 @@ where
             .map(AgentLoopState::ready_effects)
             .unwrap_or_default();
         for effect in &ready {
-            if winding_down && effect.kind() != AgentRunEffectKind::CompensationCall {
+            if winding_down && !effect.kind().exempt_from_wind_down_fence() {
                 continue;
             }
             let record = effect.to_workflow_effect(&self.scope);
@@ -5953,13 +6667,14 @@ pub enum AgentRunEntityCommand {
     /// [`Self::FireCheckpointTimers`], nothing in this crate delivers the
     /// command — the deadline is readable from the parked group
     /// (`loop_state.fan_in()`), and an `All`-policy wait whose child is
-    /// lost parks until this fires or slice 4.6's straggler chase lands.
-    /// It marks the still-unresolved members timed out — a parent-side
-    /// disposition, never a forged child result — and resolves the group
-    /// deterministically. A deadline not yet due, a group already resolved,
-    /// or no group at all is a no-op, so the command is safe to deliver
-    /// early, late, or twice. Chasing or cancelling the stragglers
-    /// themselves is slice 4.6.
+    /// lost parks until this fires. It marks the still-unresolved members
+    /// timed out — a parent-side disposition, never a forged child result —
+    /// and resolves the group deterministically. A deadline not yet due, a
+    /// group already resolved, or no group at all is a no-op, so the command
+    /// is safe to deliver early, late, or twice. The resolution itself then
+    /// chases the stragglers: a resolved group's unresolved members owe
+    /// their delegation-cancel exchanges and workflow-cancel effects from
+    /// this same transition's settle.
     FireFanInDeadline {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
@@ -5988,6 +6703,20 @@ pub enum AgentRunEntityCommand {
     /// `workflow-result-not-owned` (a cell settled without reaching a
     /// child). A terminal or winding-down parent records the result as
     /// evidence and resumes nothing.
+    ///
+    /// **The relay is load-bearing for cancellation.** A started invocation's
+    /// cell is released only by the result this command records, and a
+    /// winding-down parent stays nonterminal until every child cell holds one
+    /// ([`crate::loop_runtime::AgentLoopState::awaits_children`],
+    /// [specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — so a
+    /// deployment that invokes workflow tools without wiring this relay
+    /// cannot complete a cancellation at all. That is the specification's own
+    /// posture rather than a gap to route around: the parent does not know
+    /// whether the child stopped, and projecting terminal `Cancelled` anyway
+    /// would be the false claim 8.7 forbids. Delivering this command is
+    /// equally the "explicit reconciliation decision" 8.7 names as the other
+    /// way out, so a child whose outcome was established out of band can
+    /// always be resolved.
     RecordWorkflowResult {
         /// The stable operation id this command deduplicates on. Derive it
         /// with [`crate::workflow_tool::workflow_result_operation_id`], or
@@ -6035,6 +6764,19 @@ pub enum AgentRunEntityCommand {
         /// What to promote and where.
         promotion: Box<AgentMemoryPromotionRequest>,
     },
+    /// Append one provenance-bearing claim into a communal knowledge space
+    /// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)):
+    /// commits one idempotent durable `ClaimAppend` effect in a bounded
+    /// transition, with the provenance stamped from durable run identity.
+    /// Application- or policy-initiated; a model-visible claim tool is a
+    /// later slice.
+    AppendClaim {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`claim_append_operation_id`].
+        operation_id: AgentOperationId,
+        /// The statement to append and the space it lands in.
+        append: Box<crate::effect::AgentClaimAppendRequest>,
+    },
     /// Evaluate the bound goal's current success-criteria revision against
     /// durable evidence
     /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): commits
@@ -6067,6 +6809,7 @@ impl AgentRunEntityCommand {
             | Self::RecordWorkflowResult { operation_id, .. }
             | Self::Cancel { operation_id, .. }
             | Self::PromoteMemory { operation_id, .. }
+            | Self::AppendClaim { operation_id, .. }
             | Self::EvaluateGoal { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
@@ -6848,6 +7591,31 @@ pub enum AgentRunError {
         /// The ceiling the reservation would cross.
         exhaustion: AgentBudgetExhaustion,
     },
+    /// A claim append was requested of a run that is winding down; an append
+    /// is new work, which the wind-down fence forbids.
+    ClaimAppendFenced {
+        /// The status the run held.
+        status: AgentRunStatus,
+    },
+    /// A claim-append request violated a bounded invariant.
+    ClaimAppendInvalid {
+        /// What the validation refused.
+        message: String,
+    },
+    /// A claim append named a communal space outside the run's delegated
+    /// grant ([specification 8.5](../../../docs/plans/rakka-agent/spec.md):
+    /// children inherit only explicitly delegated access), or the run's
+    /// chain carries no grant statement at all — deny-when-unknown.
+    ClaimSpaceNotDelegated {
+        /// The space the request named.
+        space: crate::identity::KnowledgeSpaceId,
+    },
+    /// A claim append could not reserve its attempt bound from the run's
+    /// budget.
+    ClaimAppendUnaffordable {
+        /// The ceiling the reservation would cross.
+        exhaustion: AgentBudgetExhaustion,
+    },
 }
 
 impl AgentRunError {
@@ -6887,6 +7655,10 @@ impl AgentRunError {
             Self::GoalEvaluationOutstanding => "run-goal-evaluation-outstanding",
             Self::GoalEvaluationWorkflowDeferred => "run-goal-evaluation-workflow-deferred",
             Self::GoalEvaluationUnaffordable { .. } => "run-goal-evaluation-unaffordable",
+            Self::ClaimAppendFenced { .. } => "run-claim-append-fenced",
+            Self::ClaimAppendInvalid { .. } => "run-claim-append-invalid",
+            Self::ClaimSpaceNotDelegated { .. } => "run-claim-space-not-delegated",
+            Self::ClaimAppendUnaffordable { .. } => "run-claim-append-unaffordable",
         }
     }
 }
@@ -7000,6 +7772,21 @@ impl Display for AgentRunError {
             Self::GoalEvaluationUnaffordable { exhaustion } => write!(
                 f,
                 "the evaluation cannot reserve its attempt bound ({exhaustion})"
+            ),
+            Self::ClaimAppendFenced { status } => write!(
+                f,
+                "the run is {status}; a claim append is new work the wind-down fence forbids"
+            ),
+            Self::ClaimAppendInvalid { message } => {
+                write!(f, "the claim append is invalid: {message}")
+            }
+            Self::ClaimSpaceNotDelegated { space } => write!(
+                f,
+                "the communal space {space} is not delegated to this run"
+            ),
+            Self::ClaimAppendUnaffordable { exhaustion } => write!(
+                f,
+                "the claim append cannot reserve its attempt bound ({exhaustion})"
             ),
         }
     }
@@ -7313,6 +8100,8 @@ mod tests {
                 .expect("the delegation id derives");
             members.push(delegation.clone());
             let record = crate::delegation::AgentDelegationRecord {
+                environments: Default::default(),
+                knowledge_spaces: Default::default(),
                 delegation: delegation.clone(),
                 goal: None,
                 parent_task: AgentTaskId::new(&long).expect("the task id is valid"),
@@ -7368,6 +8157,14 @@ mod tests {
                 child_run: Some(AgentRunId::new(&long).expect("the run id is valid")),
                 descendants_created: u64::MAX,
                 recorded_at: now,
+            });
+            // The wind-down's own growth: every chased cell records the
+            // settled outcome of its delegation-cancel, and a refusal carries
+            // a bounded code besides the timestamp — post-commit growth the
+            // door price must cover just like the result above.
+            cell.record_cancel_outcome(crate::delegation::AgentDelegationCancelOutcome::Refused {
+                code: "c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+                settled_at: now,
             });
             run.loop_state.record_delegation(cell);
             run.loop_state.join_fan_in(

@@ -272,6 +272,20 @@ pub const AGENT_GOAL_EVALUATION_PAYLOAD_TYPE: &str = "rakka.agent.GoalEvaluation
 /// Payload type of the coordinating task's reply to a goal evaluation.
 pub const AGENT_GOAL_EVALUATION_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.GoalEvaluationOutcome";
 
+/// Payload type of an [`AgentExchangeKind::RunCancel`] exchange command.
+pub const AGENT_RUN_CANCEL_PAYLOAD_TYPE: &str = "rakka.agent.RunCancel";
+
+/// Payload type of the run's receipt replying to a [`AgentExchangeKind::RunCancel`].
+pub const AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.RunCancelReceipt";
+
+/// Payload type of an [`AgentExchangeKind::DelegationCancel`] exchange command.
+pub const AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE: &str = "rakka.agent.DelegationCancel";
+
+/// Payload type of the child task's receipt replying to a
+/// [`AgentExchangeKind::DelegationCancel`].
+pub const AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE: &str =
+    "rakka.agent.DelegationCancelReceipt";
+
 /// Payload type of an [`AgentRunAssignment`] exchange command.
 pub const AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE: &str = "rakka.agent.RunAssignment";
 
@@ -292,6 +306,19 @@ pub const AGENT_TASK_DECISION_PAYLOAD_TYPE: &str = "rakka.agent.TaskDecision";
 /// this constant rather than each holding its own copy of the literal. The
 /// string is wire and durable surface — it never changes.
 pub const AGENT_TASK_REFUSAL_STALE_GENERATION: &str = "stale-assignment-generation";
+
+/// Refusal code of a proposal the task would not validate because its
+/// cancellation is propagating
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Like [`AGENT_TASK_REFUSAL_STALE_GENERATION`], it is the one refusal the run
+/// maps to a distinct terminal disposition — here the cancellation wind-down,
+/// not a failure — so both sides name it through this constant rather than
+/// each holding its own copy of the literal. Under the deferred-terminal task
+/// the refusal carries a *nonterminal* status, so the run cannot infer the
+/// cancellation from the status alone; this code is what it reads. The string
+/// is wire and durable surface — it never changes.
+pub const AGENT_TASK_REFUSAL_CANCEL_REQUESTED: &str = "task-cancel-requested";
 
 /// Payload type of the [`AgentTaskOutcome`] an accepted
 /// [`AgentExchangeKind::Creation`] reply carries.
@@ -1975,6 +2002,36 @@ impl Display for AgentAssignmentStatus {
     }
 }
 
+/// One task's durable, nonterminal cancellation request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Set by a direct cancel command, a parent run's delegation-cancel exchange,
+/// or the settle pass observing a terminal goal decision in the cancel or
+/// expiry family. Absorbing: the first request fixes the reason finalization
+/// terminates under, and every later request answers from it. The marker —
+/// never a terminal status — is what keeps the task nonterminal while its
+/// assigned run and delegated children quiesce, so terminal `Cancelled` is
+/// never projected while a started consequential effect's outcome is unknown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTaskCancellation {
+    /// The terminal reason finalization will record.
+    pub reason: AgentTaskTerminalReason,
+    /// When the request was durably recorded.
+    pub requested_at: AgentTimestampMillis,
+}
+
+impl AgentTaskCancellation {
+    /// The bounded human-readable detail the request carried, for the records
+    /// propagation writes downstream.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match &self.reason {
+            AgentTaskTerminalReason::CancellationRequested { reason } => reason.clone(),
+            other => other.code().to_string(),
+        }
+    }
+}
+
 /// The task's *current* assignment.
 ///
 /// Only the current one is materialized. A superseded assignment leaves the
@@ -2205,6 +2262,11 @@ pub enum AgentTaskHistoryKind {
     ResultAccepted,
     /// A proposal was refused by a deterministic rule.
     ResultRejected,
+    /// A durable cancellation request was recorded, leaving the task
+    /// nonterminal while its wind-down propagates
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)); the
+    /// detail carries the terminal-reason code finalization will record.
+    CancellationRequested,
     /// The task reached a terminal status.
     Terminated,
     /// A delivered wake occurrence was dispositioned by the controller.
@@ -2264,6 +2326,7 @@ impl AgentTaskHistoryKind {
             Self::ResultProposed => "result-proposed",
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
+            Self::CancellationRequested => "cancellation-requested",
             Self::Terminated => "terminated",
             Self::WakeDispositioned => "wake-dispositioned",
             Self::EpochAdmitted => "epoch-admitted",
@@ -2715,6 +2778,41 @@ pub struct AgentRunAcceptance {
     pub accepted_at: AgentTimestampMillis,
 }
 
+/// The command an [`AgentExchangeKind::RunCancel`] exchange carries to the run
+/// entity: wind down the run serving one assignment generation
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The request is owed by the task whose nonterminal cancellation marker is
+/// set, and only for a generation whose run durably accepted — a cancellation
+/// can therefore never outrun an in-flight assignment and refuse definitively
+/// against a run that does not exist yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRunCancelRequest {
+    /// The task requesting the wind-down.
+    pub task: AgentTaskScope,
+    /// The assignment generation the request fences against: a run serving a
+    /// different generation refuses rather than winding down on a stale push.
+    pub generation: AgentAssignmentGeneration,
+    /// The bounded reason recorded on the run's terminal record.
+    pub reason: String,
+}
+
+/// The run's durable receipt replying to an [`AgentExchangeKind::RunCancel`].
+///
+/// The receipt reports the status the wind-down reached — an accepted receipt
+/// is the observable outcome of the propagation request, never proof that a
+/// started effect stopped ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRunCancelReceipt {
+    /// The run that recorded the request.
+    pub run: AgentRunScope,
+    /// The status the run held after recording it: `Cancelling` while work
+    /// quiesces, `WaitingForReconciliation` while an ambiguous effect blocks
+    /// terminalization, or a terminal status when the request found the run
+    /// already settled.
+    pub status: crate::run::AgentRunStatus,
+}
+
 /// A run's report of what it finally consumed, carried by an
 /// [`AgentExchangeKind::BudgetSettlement`] exchange
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
@@ -3111,6 +3209,11 @@ pub struct AgentTask {
     pub last_rejection: Option<Box<AgentTaskRejection>>,
     /// Why the task reached its terminal status.
     pub terminal_reason: Option<AgentTaskTerminalReason>,
+    /// The nonterminal cancellation request the task carries while its
+    /// wind-down propagates ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default)]
+    pub cancellation: Option<Box<AgentTaskCancellation>>,
     /// When the creation committed, stamped by the owner that wrote it — never
     /// by the initiator's clock, exactly as
     /// [`crate::choreography::AgentExchangeParticipant::apply`] requires of
@@ -3149,11 +3252,15 @@ impl AgentTask {
     /// `Proposed` goal spends nothing until activated, and a parked goal
     /// spends nothing until resumed
     /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
+    /// A requested cancellation fences the next generation the same way
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+    /// acceptance of the request immediately stops new dispatch.
     #[must_use]
     pub fn awaits_assignment(&self) -> bool {
         self.definition.is_agent_owned()
             && self.status.is_assignable()
             && self.assignment.is_none()
+            && self.cancellation.is_none()
             && self.dependencies_satisfied()
             && self
                 .goal_state
@@ -3407,6 +3514,8 @@ impl AgentTaskState {
             last_refusal: task.last_refusal.clone(),
             accepted_result: task.accepted_result.clone(),
             terminal_reason: task.terminal_reason.clone(),
+            cancellation: task.cancellation.clone(),
+            outstanding_escrow: task.escrow.outstanding().count(),
             history_entries: self.next_history_sequence.get().saturating_sub(1),
             updated_at: self.updated_at,
             wake: task.goal_mode.continuous().map(|spec| {
@@ -3581,6 +3690,23 @@ pub struct AgentTaskSnapshot {
     pub accepted_result: Option<Box<AgentAcceptedResult>>,
     /// Why it reached its terminal status.
     pub terminal_reason: Option<AgentTaskTerminalReason>,
+    /// The nonterminal cancellation request it carries while its wind-down
+    /// propagates ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default)]
+    pub cancellation: Option<Box<AgentTaskCancellation>>,
+    /// How many escrow children the task still holds open: every live
+    /// generation and admitted epoch opens one at the transition that decided
+    /// it, and it closes only when that child's run settles and returns.
+    ///
+    /// This is the finalization gate a requested cancellation waits on
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — and it
+    /// is the reason the count is projected rather than inferred from
+    /// [`Self::assignment`]: a continuous root between epoch assignments holds
+    /// no assignment while its admitted epochs are still executing.
+    /// Snapshots persisted before this field load as zero.
+    #[serde(default)]
+    pub outstanding_escrow: usize,
     /// How many history entries it has produced. The entries themselves are
     /// read through [`AgentTaskHistoryStore::read`].
     pub history_entries: u64,
@@ -3651,6 +3777,28 @@ pub fn assignment_operation_id(
     )
 }
 
+/// Derives the stable operation id of the one run-cancel exchange a task ever
+/// owes one assignment generation.
+///
+/// Pure over `(scope, generation)`: the cancellation marker is absorbing and
+/// a generation is assigned at most one run, so one logical request exists
+/// per generation, ever, and every re-drive after any loss owes the identical
+/// operation ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+pub fn run_cancel_operation_id(
+    scope: &AgentTaskScope,
+    generation: AgentAssignmentGeneration,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::Cancellation,
+        [
+            scope.tenant().as_str(),
+            scope.task().as_str(),
+            "run-cancel",
+            &generation.to_string(),
+        ],
+    )
+}
+
 /// The granted delegation ceilings min-narrowed to the definition's own
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): parent and
 /// definition ceilings enforce at allocation and admission time). `None` on
@@ -3693,6 +3841,12 @@ fn delegation_envelope_for(
             depth: 0,
             deadline: spec.deadline,
             fan_in: spec.fan_in,
+            environments: spec.environments.clone(),
+            // The goal spec's set has no declaredness of its own — empty
+            // means no goal narrowing, so the root's grant statement is the
+            // set when one exists and no statement otherwise.
+            knowledge_spaces: (!spec.knowledge_spaces.is_empty())
+                .then(|| spec.knowledge_spaces.clone()),
         }));
     }
     if let Some(provenance) = task.delegation.as_deref() {
@@ -3720,6 +3874,11 @@ fn delegation_envelope_for(
             // default: the parent's policy governs the parent's group, not
             // the child's.
             fan_in: None,
+            environments: provenance.environments.clone(),
+            // A delegated child's grant statement is always explicit: the
+            // provenance's set, which decodes empty — no communal access —
+            // for a chain recorded before the field existed.
+            knowledge_spaces: Some(provenance.knowledge_spaces.clone()),
         }));
     }
     // The definition is the cap no creation shape escapes: a run with no
@@ -3738,6 +3897,10 @@ fn delegation_envelope_for(
             depth: 0,
             deadline: None,
             fan_in: None,
+            environments: BTreeSet::new(),
+            // A plain or epoch task carries no goal scope and no chain: no
+            // grant statement, and the definition envelope governs.
+            knowledge_spaces: None,
         })
     })
 }
@@ -3981,6 +4144,7 @@ fn create_task(
         rejection_count: 0,
         last_rejection: None,
         terminal_reason: None,
+        cancellation: None,
         created_at: now,
         telemetry: crate::observability::sanitize_agent_telemetry_context(creation.telemetry),
     };
@@ -4121,15 +4285,26 @@ fn declare_dependency(
 /// The default failed-dependency policy cancels the dependent
 /// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)). The command
 /// is the receiving half of the propagation; the sending half — an upstream task
-/// notifying its dependents when it goes terminal — is cancellation propagation,
-/// and it lands with the coordination slices that own the dependents registry.
+/// notifying its dependents when it goes terminal — needs a durable dependents
+/// registry and lands with slice 5.4's human-owned tasks, the first flow that
+/// builds cross-task dependency graphs. Slice 4.6's propagation covers the
+/// delegation and workflow trees, whose parent-child edges the run's cells
+/// already record.
+///
+/// A cancelling dependency takes the *request* path, never a direct
+/// terminalization ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+/// a dependency can resolve while this task's run is mid-flight, and a task
+/// that terminalized here would project terminal `Cancelled` over a started
+/// consequential effect whose outcome is unknown, strand its escrow, and
+/// leave its run to discover the cancellation only if it ever proposes.
+/// Returns whatever the transition owes.
 fn record_dependency_outcome(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
     dependency: &AgentTaskId,
     outcome: AgentTaskDependencyOutcome,
     now: AgentTimestampMillis,
-) -> AgentTaskResult<AgentTaskOutcome> {
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let task = state.task_mut()?;
     if task.status.is_terminal() {
         return Err(AgentTaskError::Terminal {
@@ -4148,7 +4323,7 @@ fn record_dependency_outcome(
         // A dependency resolves once. A replayed outcome is idempotent; a
         // *different* outcome for a resolved dependency is a conflict, not a
         // correction, and it fails closed.
-        Some(existing) if existing == outcome => return Ok(state.outcome()),
+        Some(existing) if existing == outcome => return Ok(Vec::new()),
         Some(_) => {
             return Err(AgentTaskError::DependencyConflict {
                 dependency: dependency.clone(),
@@ -4162,7 +4337,7 @@ fn record_dependency_outcome(
         .map(|edge| (edge.dependency.clone(), edge.outcome));
 
     if let Some((dependency, Some(outcome))) = cancelling {
-        terminate(
+        return request_task_cancellation(
             state,
             operation_id,
             AgentTaskTerminalReason::DependencyNotSatisfied {
@@ -4170,8 +4345,7 @@ fn record_dependency_outcome(
                 outcome,
             },
             now,
-        )?;
-        return Ok(state.outcome());
+        );
     }
 
     let task = state.task_mut()?;
@@ -4199,34 +4373,27 @@ fn record_dependency_outcome(
         )
         .with_detail(detail)
     });
-    Ok(state.outcome())
+    Ok(Vec::new())
 }
 
-/// Moves the task to a terminal status and records why.
-fn terminate(
-    state: &mut AgentTaskState,
-    operation_id: &AgentOperationId,
-    reason: AgentTaskTerminalReason,
+/// Decides the goal a root task holds under the projection its terminal
+/// reason implies, and closes admission with it, when the goal is still
+/// undecided. Returns the history detail of the decision it made.
+///
+/// A terminal root coordinator ends the goal it holds: nothing can drive
+/// the contract further. A completion deliberately does not — completion
+/// is evidence, and only the configured evaluator makes a goal `Satisfied`
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)); the
+/// goal's own budget termination already decided itself. A cancellation
+/// request runs this projection at *request* time
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)), so the
+/// later finalizing [`terminate`] finds the goal terminal and skips it.
+fn project_goal_decision(
+    task: &mut AgentTask,
+    reason: &AgentTaskTerminalReason,
     now: AgentTimestampMillis,
-) -> AgentTaskResult<()> {
-    let task = state.task_mut()?;
-    if task.status.is_terminal() {
-        return Err(AgentTaskError::Terminal {
-            status: task.status,
-        });
-    }
-    task.status = reason.status();
-    task.terminal_reason = Some(reason.clone());
-    // A terminal task fences its run: the assignment is retired, so a late
-    // proposal from it can no longer be validated.
-    task.assignment = None;
-
-    // A terminal root coordinator ends the goal it holds: nothing can drive
-    // the contract further. A completion deliberately does not — completion
-    // is evidence, and only the configured evaluator makes a goal `Satisfied`
-    // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)); the
-    // goal's own budget termination already decided itself.
-    let goal_reason = match &reason {
+) -> AgentTaskResult<Option<String>> {
+    let goal_reason = match reason {
         AgentTaskTerminalReason::ResultAccepted => None,
         AgentTaskTerminalReason::CancellationRequested { .. }
         | AgentTaskTerminalReason::DependencyNotSatisfied { .. } => {
@@ -4250,7 +4417,7 @@ fn terminate(
             code: other.code().to_string(),
         }),
     };
-    let goal_row = match (goal_reason, task.goal_state.as_deref_mut()) {
+    let row = match (goal_reason, task.goal_state.as_deref_mut()) {
         (Some(goal_reason), Some(goal)) if !goal.status().is_terminal() => {
             let detail = format!("{} {}", goal_reason.status().as_label(), goal_reason.code());
             goal.decide(
@@ -4270,6 +4437,190 @@ fn terminate(
         }
         _ => None,
     };
+    Ok(row)
+}
+
+/// Records a durable, nonterminal cancellation request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) and returns
+/// the exchanges it owes now.
+///
+/// In one compare-and-set: the absorbing marker is set with the terminal
+/// reason finalization will record, the goal the task holds is decided and
+/// its admission closed, and the propagation the current state permits is
+/// owed — the run-cancel exchange when a run has durably accepted, or the
+/// immediate finalization when no generation is live. An offered assignment
+/// owes its run-cancel at the acceptance settle instead, so a cancellation
+/// can never definitively refuse ahead of an in-flight assignment.
+///
+/// Absorbing: a request that finds the marker set is answered without a
+/// second transition. A request that finds the task terminal is refused
+/// exactly as the terminal transition it replays would be.
+fn request_task_cancellation(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    reason: AgentTaskTerminalReason,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let task = state.task_mut()?;
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    if task.cancellation.is_some() {
+        return Ok(Vec::new());
+    }
+    task.cancellation = Some(Box::new(AgentTaskCancellation {
+        reason: reason.clone(),
+        requested_at: now,
+    }));
+    // The goal decision and admission close at request time: acceptance of a
+    // cancellation request immediately fences new dispatch for the scope.
+    let goal_row = project_goal_decision(task, &reason, now)?;
+
+    let status = task.status;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::CancellationRequested,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(reason.code())
+    });
+    if let Some(detail) = goal_row {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::GoalDecided,
+            operation_id,
+            detail,
+            now,
+        );
+    }
+
+    let mut owed: Vec<AgentExchangeEnvelope> = owed_run_cancel(state, now)?.into_iter().collect();
+    owed.extend(finalize_task_cancellation(state, operation_id, now)?);
+    Ok(owed)
+}
+
+/// The run-cancel exchange the task owes its accepted assignment, when it
+/// owes one now.
+///
+/// Owed exactly once per generation, and only once the run durably accepted:
+/// an offered assignment's run may not exist yet, and a definitive
+/// `run-cancel-unassigned` refusal against it would end the propagation the
+/// acceptance still owes. The journal's initiation record is the once-guard.
+fn owed_run_cancel(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(cancellation) = task.cancellation.as_deref() else {
+        return Ok(None);
+    };
+    if task.status.is_terminal() {
+        return Ok(None);
+    }
+    let Some(assignment) = task.assignment.as_ref() else {
+        return Ok(None);
+    };
+    if assignment.status != AgentAssignmentStatus::Accepted {
+        return Ok(None);
+    }
+    let operation_id = run_cancel_operation_id(&state.scope, assignment.generation)?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let run_scope = AgentRunScope::new(
+        state.scope.tenant().clone(),
+        assignment.agent.clone(),
+        assignment.run.clone(),
+    )?;
+    let request = AgentRunCancelRequest {
+        task: state.scope.clone(),
+        generation: assignment.generation,
+        reason: cancellation.detail(),
+    };
+    let payload = AgentExchangePayload::encode(AGENT_RUN_CANCEL_PAYLOAD_TYPE, &request)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::RunCancel,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Run(run_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Finalizes a requested cancellation once the task's ledger proves its work
+/// quiescent, and returns the terminal reports the finalization owes.
+///
+/// The gate is escrow closure: every live generation and admitted epoch holds
+/// an open escrow child from the transition that decided it, a refused
+/// generation releases at its settle, and a terminal run's settlement and
+/// return close its child — budget settlement travels only after a known
+/// terminal outcome, so a closed ledger is durable proof no assigned work is
+/// still running or ambiguous
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md): terminal
+/// `Cancelled` only after quiescence, with every started effect's outcome
+/// known or explicitly reconciled — an unresolved run rests in its own
+/// `WaitingForReconciliation`, holding its escrow open and this gate closed).
+fn finalize_task_cancellation(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(cancellation) = task.cancellation.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if task.status.is_terminal() {
+        return Ok(Vec::new());
+    }
+    if task.escrow.outstanding().count() > 0 {
+        return Ok(Vec::new());
+    }
+    let reason = cancellation.reason.clone();
+    terminate(state, operation_id, reason, now)?;
+    owed_child_reports(state, now)
+}
+
+/// Moves the task to a terminal status and records why.
+///
+/// The direct terminalization: it is what the *finalizing* transitions call
+/// once nothing is owed — an accepted result, an exhausted assignment budget,
+/// a closed-ledger cancellation. An ingress that can fire while a run is
+/// mid-flight takes [`request_task_cancellation`] instead, so the task never
+/// projects a terminal status over work whose outcome is unknown
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+fn terminate(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    reason: AgentTaskTerminalReason,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    task.status = reason.status();
+    task.terminal_reason = Some(reason.clone());
+    // A terminal task fences its run: the assignment is retired, so a late
+    // proposal from it can no longer be validated.
+    task.assignment = None;
+    let goal_row = project_goal_decision(task, &reason, now)?;
 
     let status = task.status;
     state.updated_at = now;
@@ -4430,6 +4781,41 @@ pub struct AgentDelegationReport {
     /// unused sub-quota; slice 4.4 never credits.
     #[serde(default)]
     pub descendants_created: u64,
+}
+
+/// The command an [`AgentExchangeKind::DelegationCancel`] exchange carries to
+/// a delegated child task: the parent run's durable cancellation request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The request names the delegation the parent's cell recorded, so the child
+/// authenticates it against its own delegation provenance — a sender that is
+/// not the recorded parent run, or a delegation the child does not carry, is
+/// a forged request refused definitively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDelegationCancelRequest {
+    /// The delegation whose child is asked to cancel.
+    pub delegation: AgentDelegationId,
+    /// The child task the parent's cell created.
+    pub child_task: AgentTaskId,
+    /// The bounded reason recorded on the child's cancellation marker.
+    pub reason: String,
+}
+
+/// The child task's durable receipt replying to an
+/// [`AgentExchangeKind::DelegationCancel`].
+///
+/// Acceptance means the child durably recorded the request — its own
+/// cancellation marker is set, or it was already terminal. The child's
+/// terminal outcome still arrives separately as its
+/// [`AgentExchangeKind::DelegationResult`]; an accepted receipt is never
+/// proof the child's started effects stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDelegationCancelReceipt {
+    /// The child task that recorded the request.
+    pub child_task: AgentTaskId,
+    /// The status the child held after recording it: nonterminal while its
+    /// own wind-down propagates, or the terminal status the request found.
+    pub status: AgentTaskStatus,
 }
 
 /// The delegation-result exchange one terminal delegated child owes its
@@ -6467,6 +6853,19 @@ fn apply_result_proposal(
         );
     }
 
+    // The cancellation fence ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+    // a requested cancellation immediately stops new validation, so a run
+    // racing its proposal against the run-cancel exchange converges on the
+    // wind-down whichever message arrives first. Definitive — the run's
+    // settle rule winds it down exactly as a terminal task's refusal would.
+    if task.cancellation.is_some() {
+        return refuse(
+            state,
+            AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+            "the task's cancellation is propagating; no proposal can be validated".to_string(),
+        );
+    }
+
     let digest = proposal.content.digest();
     let proposal_id = proposal.proposal_id.clone();
     let status_before = task.status;
@@ -6760,6 +7159,121 @@ fn ledger_outcome(granted: Option<AgentBudgetAllocation>) -> AgentExchangeResult
     AgentExchangeResult::accepted(payload)
 }
 
+/// Applies a parent run's [`AgentExchangeKind::DelegationCancel`] request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// receiving half of the parent → child propagation leg, and the recursion
+/// point — the accepted request owes the child's own run-cancel onward in
+/// the same compare-and-set, so the machinery re-enters unchanged at every
+/// depth.
+///
+/// The sender must be the very parent run this task's delegation provenance
+/// records, naming the very delegation that created it; anything else is a
+/// forgery refused definitively. A terminal task, or one whose marker is
+/// already set, answers idempotently: its own durable record is the fence
+/// past the journal's bounded deduplication window.
+fn apply_delegation_cancel(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let request: AgentDelegationCancelRequest = match envelope
+        .payload()
+        .decode(AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE)
+    {
+        Ok(request) => request,
+        // Version skew, not the receiver answering: the parent's settle rule
+        // leaves the exchange outstanding, and it converges after upgrade.
+        Err(error) => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "delegation-cancel-undecodable",
+                error.to_string(),
+            ))
+        }
+    };
+    let Some(task) = state.task.as_ref() else {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-not-delegated",
+            "the addressed task does not exist".to_string(),
+        ));
+    };
+    let Some(provenance) = task.delegation.as_deref() else {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-not-delegated",
+            "the task carries no delegation provenance".to_string(),
+        ));
+    };
+    if provenance.delegation != request.delegation {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-forged",
+            format!(
+                "the task was created by delegation {}, not {}",
+                provenance.delegation, request.delegation
+            ),
+        ));
+    }
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Run(scope) => scope,
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "delegation-cancel-forged",
+                format!("a delegation-cancel cannot originate from {other}"),
+            ))
+        }
+    };
+    if *sender != provenance.parent_run {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-forged",
+            format!(
+                "the task's delegating run is {}, not {}",
+                provenance.parent_run.run(),
+                sender.run()
+            ),
+        ));
+    }
+    let receipt = |state: &AgentTaskState| {
+        let status = state.status().unwrap_or(AgentTaskStatus::Created);
+        let receipt = AgentDelegationCancelReceipt {
+            child_task: state.scope.task().clone(),
+            status,
+        };
+        AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE, &receipt)
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE)
+                }),
+        )
+    };
+    if task.status.is_terminal() || task.cancellation.is_some() {
+        return AgentExchangeTransition::new(receipt(state));
+    }
+    let reason = AgentTaskTerminalReason::CancellationRequested {
+        reason: bounded_detail(request.reason),
+    };
+    match request_task_cancellation(state, envelope.operation_id(), reason, now) {
+        Ok(owed) => {
+            let mut transition = AgentExchangeTransition::new(receipt(state));
+            for envelope in owed {
+                transition = transition.owing(envelope);
+            }
+            transition
+        }
+        // The guards above exclude every refusal `request_task_cancellation`
+        // can make; a failure here is a construction bug answered as a
+        // definitive refusal rather than a silent drop.
+        Err(error) => AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-forged",
+            error.to_string(),
+        )),
+    }
+}
+
 /// Refuses an exchange without making a validation decision.
 fn refuse(state: &AgentTaskState, code: &str, message: String) -> AgentExchangeResult {
     let status = state.status().unwrap_or(AgentTaskStatus::Created);
@@ -6821,7 +7335,21 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 // the reports this child owes upward — the epoch result to
                 // its controller, the delegation result to its parent run —
                 // are now accurate, and owed in this same compare-and-set.
+                // The same closure is the gate a requested cancellation
+                // finalizes behind ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)),
+                // so the finalization commits here too; its own child
+                // reports deduplicate against the consult below.
                 let mut transition = AgentExchangeTransition::new(result);
+                match finalize_task_cancellation(state, envelope.operation_id(), now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "cancellation finalization failed: {error}");
+                    }
+                }
                 match owed_child_reports(state, now) {
                     Ok(owed) => {
                         for envelope in owed {
@@ -6844,6 +7372,9 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             AgentExchangeKind::EpochResult => return apply_epoch_result(state, envelope, now),
             AgentExchangeKind::GoalEvaluation => {
                 return apply_goal_evaluation(state, envelope, now)
+            }
+            AgentExchangeKind::DelegationCancel => {
+                return apply_delegation_cancel(state, envelope, now)
             }
             kind => refuse(
                 state,
@@ -6885,6 +7416,28 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                     ),
                 }
             }
+            AgentExchangeKind::RunCancel if !result.is_accepted() => {
+                // A refused run-cancel settles only under the run's definitive
+                // answers: the sender was not its task, the run never received
+                // the generation, or the generation is not the one it serves.
+                // Every other refusal — an `unsupported-exchange` from an
+                // owner that predates the kind, a payload it could not decode
+                // — leaves the exchange outstanding for re-drive until an
+                // owner that can answer it does (the rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some(
+                        "run-cancel-forged"
+                        | "run-cancel-unassigned"
+                        | "run-cancel-stale-generation",
+                    ) => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::RunCancel,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -6899,7 +7452,33 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         if envelope.kind() == AgentExchangeKind::Assignment {
             settle_assignment(state, envelope, result, now);
         }
-        Vec::new()
+        if !matches!(
+            envelope.kind(),
+            AgentExchangeKind::Assignment | AgentExchangeKind::RunCancel
+        ) {
+            return Vec::new();
+        }
+        // A settled assignment or run-cancel may have moved a requested
+        // cancellation forward: an acceptance owes the run-cancel the request
+        // deferred, a refusal released the generation's escrow, and a receipt
+        // may have found the run already settled — so the propagation and the
+        // finalization it permits are owed from this same compare-and-set.
+        // Settling may not fail; a construction failure is a bug surfaced
+        // loudly in tests and skipped here.
+        let mut owed = Vec::new();
+        match owed_run_cancel(state, now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "run-cancel construction failed: {error}");
+            }
+        }
+        match finalize_task_cancellation(state, envelope.operation_id(), now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "cancellation finalization failed: {error}");
+            }
+        }
+        owed
     }
 }
 
@@ -7247,12 +7826,15 @@ where
                 outcome,
             } => {
                 self.transition(now, readiness, move |state| {
-                    record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
-                    // A failed dependency can terminate a child task with no
-                    // outstanding escrow; it owes its terminal reports — the
-                    // epoch result, the delegation result — in this same
-                    // transition, exactly as a cancellation does.
-                    let owed = owed_child_reports(state, now)?;
+                    // A failed dependency requests the dependent's
+                    // cancellation rather than terminalizing it: with no live
+                    // generation that finalizes here, owing the terminal
+                    // reports upward in this same transition; with an
+                    // accepted run it owes the run-cancel exchange and stays
+                    // nonterminal until its ledger closes.
+                    let mut owed =
+                        record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
+                    owed.extend(owed_child_reports(state, now)?);
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -7262,7 +7844,13 @@ where
                 reason,
             } => {
                 self.transition(now, None, move |state| {
-                    terminate(
+                    // The request is absorbing and nonterminal: a task with no
+                    // live generation finalizes in this same transition —
+                    // owing its terminal reports upward — while a task whose
+                    // run has durably accepted owes the run-cancel exchange
+                    // instead and stays nonterminal until its ledger closes
+                    // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                    let owed = request_task_cancellation(
                         state,
                         &operation_id,
                         AgentTaskTerminalReason::CancellationRequested {
@@ -7270,11 +7858,6 @@ where
                         },
                         now,
                     )?;
-                    // A cancelled child with no outstanding escrow owes its
-                    // terminal reports — the epoch result to its controller,
-                    // the delegation result to its parent run — in this same
-                    // transition.
-                    let owed = owed_child_reports(state, now)?;
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -7697,6 +8280,7 @@ where
     async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
+        self.settle_requested_cancellation(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
         self.park_owed_rewakes(now).await?;
@@ -7779,6 +8363,107 @@ where
         Ok(())
     }
 
+    /// Advances a requested cancellation from the settle pass
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+    /// settle pass is the goal entry point that always commits, so a terminal
+    /// goal decision in the cancel or expiry family lands on the root task
+    /// here even when no command arrives, the run-cancel a crash may have
+    /// raced is re-owed under its derived operation id, and a closed ledger
+    /// finalizes the marker. One chokepoint, so every goal-decision ingress —
+    /// the operator command, the evaluation door, the deadline observation
+    /// above — propagates identically without owning any of it.
+    ///
+    /// The write is skipped entirely while nothing would advance, so a sweep
+    /// over a healthy task burns no revision.
+    async fn settle_requested_cancellation(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) if task.status.is_terminal() => false,
+                Some(task) => match task.cancellation.as_deref() {
+                    None => task.goal_state.as_deref().is_some_and(|goal| {
+                        goal.terminal()
+                            .is_some_and(|decision| decision.reason.requests_root_cancellation())
+                    }),
+                    Some(_) => {
+                        let owes_run_cancel = task.assignment.as_ref().is_some_and(|assignment| {
+                            assignment.status == AgentAssignmentStatus::Accepted
+                                && run_cancel_operation_id(&state.scope, assignment.generation)
+                                    .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                        });
+                        owes_run_cancel || task.escrow.outstanding().count() == 0
+                    }
+                },
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::Command,
+            [
+                self.scope.tenant().as_str(),
+                self.scope.task().as_str(),
+                "goal-cancellation",
+            ],
+        )?;
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                let step =
+                    |state: &mut AgentTaskState| -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+                        let Some(task) = state.task.as_ref() else {
+                            return Ok(Vec::new());
+                        };
+                        if task.status.is_terminal() {
+                            return Ok(Vec::new());
+                        }
+                        if task.cancellation.is_none() {
+                            let Some(code) = task
+                                .goal_state
+                                .as_deref()
+                                .and_then(AgentGoalState::terminal)
+                                .filter(|decision| decision.reason.requests_root_cancellation())
+                                .map(|decision| decision.reason.code())
+                            else {
+                                return Ok(Vec::new());
+                            };
+                            return request_task_cancellation(
+                                state,
+                                &operation_id,
+                                AgentTaskTerminalReason::CancellationRequested {
+                                    reason: format!("goal-{code}"),
+                                },
+                                now,
+                            );
+                        }
+                        let mut owed: Vec<AgentExchangeEnvelope> =
+                            owed_run_cancel(state, now)?.into_iter().collect();
+                        owed.extend(finalize_task_cancellation(state, &operation_id, now)?);
+                        Ok(owed)
+                    };
+                match step(state) {
+                    Ok(owed) => Ok(owed),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
     /// Flushes whatever history the task owes, and fails closed if the outbox
     /// still cannot hold what the next transition may record.
     async fn require_history_headroom(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
@@ -7818,6 +8503,7 @@ where
         // pending-history bound.
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
+        self.settle_requested_cancellation(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
         let rewakes_parked = self.park_owed_rewakes(now).await?;

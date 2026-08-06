@@ -3021,6 +3021,138 @@ Spec: [8.7](spec.md#87-cancellation-failure-and-waiting),
 
 Done when: scenarios 29, 31, and 33 pass.
 
+**Amended as implemented (2026-08-05):**
+
+- **Propagation is edges over the vocabulary M1 already fixed.**
+  `AgentCancellationProgress` needed only its `Propagating` arm — the run
+  derivation reads `awaits_children()`, the new subtree half of the
+  quiescence condition — and the progress model stays a pure derivation of
+  durable record, never a stored enum. Four legs: goal → root task is
+  intra-entity (the settle pass's new `settle_requested_cancellation` step,
+  directly after `observe_goal_deadline`, converts any terminal goal
+  decision in the cancel/expiry families —
+  `AgentGoalTerminalReason::requests_root_cancellation()` — into the root's
+  request, so operator cancel, retirement, and deadline expiry ride one
+  chokepoint); task → run is the tenth exchange `RunCancel` (owed only
+  after durable acceptance — the Offered-window race fix); parent run →
+  child task is the eleventh exchange `DelegationCancel` (in-fabric, the
+  `DelegationResult` precedent; A2A carrier reserved for federation);
+  parent run → child workflow is the `WorkflowCancelCall` effect
+  (generation-free `"{invocation}#cancel-run"`, the start's discipline,
+  gated on `supports_cancellation` with durable
+  `Unsupported`/`Unaffordable` cell dispositions when no effect may exist).
+  The child's `DelegationCancel` arm calls the same request core and owes
+  its own `RunCancel` onward — recursion is the machinery re-entering.
+- **The task defers; the ledger is the finalization gate.** The
+  pre-existing gap — `Cancel` terminalized the task over a run holding an
+  indeterminate effect — closed: the nonterminal `AgentTaskCancellation`
+  marker decides the goal and closes admission at request time, fences
+  assignment (`awaits_assignment`) and proposals (`task-cancel-requested`,
+  definitive), and finalizes through the existing `terminate` only when
+  `escrow.outstanding()` is empty — budget settlement travels only after a
+  known terminal run outcome, so ledger closure is durable proof of
+  quiescence and no new "run terminal report" exchange exists. A task with
+  no live generation finalizes in the requesting transition. Run-side,
+  `settle_run_disposition`'s winding-down branch gained
+  `awaits_children()`: a cancelling parent rests until every delegation and
+  workflow cell holds a terminal outcome, the last child result
+  terminalizes it (settle tails at `accept_delegation_result` and
+  `record_workflow_result`), and a child parked in reconciliation holds the
+  ancestry nonterminal — scenario 31's "never falsely claim their started
+  effects stopped", with the child's view `WaitingForReconciliation` and
+  the parent's `Propagating`.
+- **The chase is one pure condition.** A created, unsettled child is chased
+  when the run winds down under a cancellation *or* when the resolved
+  fan-in group left it unresolved — which makes `FireFanInDeadline`'s
+  timed-out stragglers and an early `Any`/`Quorum` satisfaction's losers
+  the same case with zero plumbing, since `owed_run_exchanges` runs after
+  every transition. Owed cancels never set `terminal_reason`, so a chase
+  cannot wind a satisfied coordinator down; the cell's settled
+  `AgentDelegationCancelOutcome` / `AgentWorkflowCancelDisposition` is the
+  durable once-guard past the journal's bounded ring and the request's
+  observable outcome. Wind-down dispatch fences became kind-based
+  (`exempt_from_wind_down_fence`: compensation + workflow cancel), fixing
+  the claim-path fence's missing `CompensationCall` exemption alongside.
+- **Revocation stays honest.** A revocation-driven goal decision rides the
+  same propagation; per-agent `RevokeTool`/`RevokeCredentialBinding` stays
+  pull-at-next-dispatch (already immediate for every agent's own
+  dispatches, descendants included); agent lifecycle Suspend/Terminate
+  fan-out needs an agent→run registry and stays deferred, as do the
+  dependents-registry sending half (re-pointed at 5.4), per-delegation
+  child-side deadline enforcement, and descendant credit-back.
+- **The environment contract is declaration + protocol + per-attempt
+  doors.** `AgentToolDeclaration.environments` (observe *is* `ReadOnly` —
+  no second mode axis), `AgentEnvironmentConcurrencyProtocol` on the
+  binding (no fail-open variant; required at registration exactly when a
+  mutating tool names an environment; `Environment`-kind descriptors must
+  name one), ordered authority checks (binding ⊆ declaration ⊆ definition
+  envelope, `setup-excludes-environment`, `goal-environment-not-allowed`)
+  with the goal scope reaching the authority through the run's delegation
+  envelope on the context; the adapter-side rules are the trait contract —
+  Rakka cannot enforce the external protocol. Scope projection: envelope
+  `environments` is a narrowing (empty = none), envelope
+  `knowledge_spaces` is a fail-closed grant (`Option`; `None` under
+  lineage refuses — the ancestry-gap posture), the catalog's explicit
+  `AgentDelegationTarget.knowledge_spaces` intersects the parent's grant
+  at the interception door, and both ride the record, the provenance, and
+  the A2A metadata skip-if-empty.
+- **Scenario 33 is a command-initiated effect (user-approved).**
+  `AppendClaim` → `ClaimAppendCall`, the `PromoteMemory` idiom: provenance
+  stamped from durable run identity in the committing transition (agent,
+  goal, task, run, delegation = envelope lineage tail), space validated at
+  the door (`run-claim-space-not-delegated`) and per attempt at the
+  authority; the executor trait lives in `rakka-agent`
+  (`AgentCommunalClaimId` is a mirror newtype — the dependency runs
+  graph → agent) and the graph crate ships
+  `KnowledgeGraphClaimAppendExecutor`, deriving the store operation from
+  the intent's external idempotency key so a generation's attempts converge
+  on one claim and a re-decided generation is a new one. The pre-derived
+  `claim_promotion_*` ids stay untouched for the deferred promotion-gate
+  flow; the model-visible claim tool, communal retrieval and the
+  `SnapshotCommunalClaim` shape, per-claim read-capability enforcement,
+  and claim metrics stay deferred.
+- **Review pass (2026-08-05).** Four liveness holes in the new quiescence
+  machinery closed: the fired-deadline chase (the deadline marks its
+  stragglers `timed_out` *before* resolving, so reading `unresolved_members`
+  chased nobody — the chase set is now `unreported_members`, unresolved **or**
+  timed out); a definitively-refused delegation-cancel now releases its cell
+  from `awaits_children` and re-checks the disposition in that settle, where
+  before a child that could never report held the parent `Cancelling` forever
+  with its escrow open; `commit_workflow_cancels` refuses to commit on a
+  terminal run and stops at the outstanding-effect bound rather than
+  overflowing it into a transition that re-aborts forever; and
+  `fence_unsent_effects` now honours `exempt_from_wind_down_fence`, with an
+  already-winding-down run answering a re-driven run-cancel idempotently, so a
+  re-entered wind-down cannot fence the compensation or workflow-cancel the
+  first one authorized. Two ingresses that still terminalized over a live run
+  — a failed dependency, and a proposal refused by the cancellation fence —
+  now take the request path (`AGENT_TASK_REFUSAL_CANCEL_REQUESTED` is the
+  run-side constant, the stale-generation precedent). `derive_task` reads the
+  snapshot's new `outstanding_escrow` rather than the assignment alone (a
+  cancelled continuous root between epochs was reporting `Quiesced` over
+  running epochs); `AgentClaimAppendRequest::validate` gained its
+  `confidence_bps` range check; and the `RecordWorkflowResult` relay is
+  documented as load-bearing for cancellation — unwired, a workflow-invoking
+  deployment cannot complete one, which is 8.7's own posture, with the command
+  itself being the "explicit reconciliation decision" 8.7 names as the way
+  out. Coverage added for the environment/knowledge authority doors, the
+  graph-backed append executor (new
+  `rakka-agent-knowledge-graph/tests/claim_append_executor.rs`), the widest
+  provenance with both scope sets full, the door price with the cell's cancel
+  outcome, the fired-deadline chase, and the dependency deferral.
+- Proof roster: `tests/cancellation_propagation.rs` (the scenario-31 spine
+  over real child entities with the send-log pinning scenario 29's
+  at-most-once half; receiver fences; settle-pass expiry propagation; the
+  `Any`-resolution chase), `tests/communal_claim_append.rs` (the stamp,
+  the doors, replay convergence, the delegated grant), the
+  `concurrent_specialist_append_provenance` conformance clause across both
+  backends plus the racing two-connection PostgreSQL append proof, the
+  environment-contract registration units, and the honest-semantics
+  updates in `goal_contract.rs`, `task_entity.rs`, and
+  `workflow_tool.rs`. Owed onward: snapshot/projection views (4.7), the
+  crash-point sweeps over the new task-cancellation compare-and-sets, and
+  the deferrals above.
+
 ### Slice 4.7 — M4 acceptance and goal views
 
 Spec: [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4),

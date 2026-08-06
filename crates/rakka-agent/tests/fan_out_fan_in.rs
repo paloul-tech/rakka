@@ -565,12 +565,16 @@ async fn a_wound_down_parent_records_evidence_without_resuming() {
         .expect("the cell exists")
         .clone();
     assert!(cell.result.is_some());
-    // "Resumes nothing" pinned by state, not status alone: the loop phase
-    // did not advance and no new effect was committed.
+    // "Resumes nothing" pinned by state, not status alone: no new effect was
+    // committed and no new turn began. The phase may advance to `Complete` —
+    // these children are fictional, so their delegation-cancels refuse
+    // definitively and release the subtree quiesce condition, letting the
+    // wind-down finish on this evidence instead of parking on children that
+    // can never report ([specification 8.7](../../docs/plans/rakka-agent/spec.md)).
     let (phase_after, _, outstanding_after) = parked_phase(&fixture).await;
-    assert_eq!(
-        phase_after, phase_before,
-        "the late evidence advanced nothing"
+    assert!(
+        phase_after == phase_before || phase_after == AgentLoopPhase::Complete,
+        "the late evidence parked or completed the wind-down, got {phase_after:?}"
     );
     assert_eq!(outstanding_after, outstanding_before);
 }
@@ -1307,6 +1311,8 @@ async fn real_child_tasks_return_results_through_the_exchange_fabric() {
         // The child exists with the provenance its creation validated: the
         // delegation that created it, under this parent run.
         let provenance = rakka_agent::AgentTaskDelegationProvenance {
+            environments: Default::default(),
+            knowledge_spaces: Default::default(),
             delegation: delegation.clone(),
             parent_task: task_scope().task().clone(),
             parent_run: run_scope(),

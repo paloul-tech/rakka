@@ -1021,8 +1021,17 @@ async fn a_result_for_a_wound_down_parent_records_evidence_and_resumes_nothing()
         .expect("the cell exists")
         .clone();
     assert!(cell.result.is_some());
-    let (phase_after, _, outstanding_after) = parked_phase(&fixture).await;
-    assert_eq!(phase_after, phase_before);
+    let (phase_after, status_after, outstanding_after) = parked_phase(&fixture).await;
+    // Recording the last child's evidence completes the wind-down's
+    // quiescence ([specification 8.7](../../docs/plans/rakka-agent/spec.md)):
+    // the run terminalizes under the reason its cancellation recorded. It
+    // still resumes nothing — no new turn, no new effect — which is what
+    // "records evidence and resumes nothing" always meant.
+    assert!(
+        phase_after == phase_before || phase_after == AgentLoopPhase::Complete,
+        "the run rests or completes its wind-down, got {phase_after:?}"
+    );
+    assert_eq!(status_after, Some(AgentRunStatus::Cancelled));
     assert_eq!(outstanding_after, outstanding_before);
 }
 

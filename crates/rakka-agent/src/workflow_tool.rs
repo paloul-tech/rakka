@@ -32,10 +32,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent_workflow::{
-    trigger_start_run_command, AgentCommand, AgentCommandId, AgentCommandMetadata,
-    AgentDurabilityMetadata, AgentEffectId, AgentRunId as WorkflowRunId, AgentTelemetryContext,
-    AgentTenantId, AgentTimestampMillis, AgentTriggerSource, AgentWorkflowId, AgentWorkflowKey,
-    ArtifactRef, WorkflowDefinitionVersion,
+    trigger_cancel_run_command, trigger_start_run_command, AgentCommand, AgentCommandId,
+    AgentCommandMetadata, AgentDurabilityMetadata, AgentEffectId, AgentRunId as WorkflowRunId,
+    AgentTelemetryContext, AgentTenantId, AgentTimestampMillis, AgentTriggerSource,
+    AgentWorkflowId, AgentWorkflowKey, ArtifactRef, WorkflowDefinitionVersion,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -113,6 +113,14 @@ pub const AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE: &str = "workflow-invocation-c
 /// retrying a transient delivery failure is safe and cheap.
 pub const AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
+/// Default attempt ceiling of the workflow cancel effect
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The cancel is idempotent by construction — the derived, generation-free
+/// `CancelRun` identities make every retry converge on one logical request —
+/// so retrying a transient delivery failure is safe and cheap.
+pub const AGENT_WORKFLOW_CANCEL_DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
 /// Derives the identity of the workflow invocation one run's turn commits in
 /// one slot.
 ///
@@ -167,6 +175,18 @@ pub fn child_workflow_run_id(invocation: &AgentWorkflowInvocationId) -> Workflow
 #[must_use]
 pub fn workflow_start_command_id(invocation: &AgentWorkflowInvocationId) -> AgentCommandId {
     AgentCommandId::new(format!("{}#start-run", invocation.as_str()))
+}
+
+/// The derived, generation-free command id of the one `CancelRun` this
+/// invocation ever sends ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Generation-freedom is load-bearing for the same reason as the start's: a
+/// reconciled new effect generation re-derives the identical command id, so
+/// recovery can never deliver a second logical cancellation — the child inbox
+/// answers the replay as a duplicate.
+#[must_use]
+pub fn workflow_cancel_command_id(invocation: &AgentWorkflowInvocationId) -> AgentCommandId {
+    AgentCommandId::new(format!("{}#cancel-run", invocation.as_str()))
 }
 
 /// Derives the stable operation id of the one workflow result a child run
@@ -239,8 +259,12 @@ pub struct AgentWorkflowToolDescriptor {
     /// deployment declares one; the envelope's deadline still bounds it.
     #[serde(default)]
     pub default_deadline_ms: Option<u64>,
-    /// Whether the workflow declares durable cancellation support. Declared
-    /// policy only in this slice: durable propagation is slice 4.6.
+    /// Whether the workflow declares durable cancellation support
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). A
+    /// winding-down parent commits the `CancelRun`-delivering effect only
+    /// under a `true` declaration; under `false` it records a durable
+    /// `Unsupported` disposition and waits for the child's natural terminal
+    /// result.
     #[serde(default)]
     pub supports_cancellation: bool,
     /// Whether the workflow declares compensation support.
@@ -733,6 +757,33 @@ pub struct AgentWorkflowChildResult {
     pub recorded_at: AgentTimestampMillis,
 }
 
+/// The wind-down disposition of one invocation's workflow-cancel request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// durable, observable outcome of the propagation decision, recorded in the
+/// same compare-and-set that made it, and the once-guard that keeps a
+/// re-entered wind-down from committing a second cancel effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentWorkflowCancelDisposition {
+    /// The cancel effect was committed; its delivery settles independently,
+    /// and the child's terminal outcome still returns through the result
+    /// relay.
+    Committed {
+        /// The effect carrying the request.
+        effect: AgentEffectId,
+    },
+    /// The descriptor declares no cancellation support
+    /// (`supports_cancellation` is `false`), or the invocation's tool is no
+    /// longer wired: no effect exists, and the parent waits for the child's
+    /// natural terminal result.
+    Unsupported,
+    /// The wind-down could not afford the request's attempts: no effect
+    /// exists, and the parent waits for the child's natural terminal result
+    /// rather than blocking its own quiescence on budget.
+    Unaffordable,
+}
+
 /// One workflow invocation's durable home on the parent run's loop state.
 ///
 /// The cell commits with the start effect and settles in the same
@@ -754,6 +805,12 @@ pub struct AgentWorkflowInvocationCell {
     /// wins: one logical result per invocation, ever.
     #[serde(default)]
     pub result: Option<AgentWorkflowChildResult>,
+    /// The wind-down disposition of this invocation's cancel request, once a
+    /// wind-down decided one
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default)]
+    pub cancel: Option<AgentWorkflowCancelDisposition>,
 }
 
 impl AgentWorkflowInvocationCell {
@@ -765,6 +822,15 @@ impl AgentWorkflowInvocationCell {
             status: AgentWorkflowInvocationStatus::Pending,
             settled_at: None,
             result: None,
+            cancel: None,
+        }
+    }
+
+    /// Records the wind-down's cancel disposition, first-writer-wins: one
+    /// logical request per invocation, ever.
+    pub fn record_cancel_disposition(&mut self, disposition: AgentWorkflowCancelDisposition) {
+        if self.cancel.is_none() {
+            self.cancel = Some(disposition);
         }
     }
 
@@ -871,6 +937,46 @@ pub fn workflow_start_command(
         message: error.to_string(),
     })?;
     trigger_start_run_command(metadata, AgentTriggerSource::child_workflow(), payload_ref).map_err(
+        |error| AgentWorkflowToolError::Command {
+            message: error.to_string(),
+        },
+    )
+}
+
+/// Builds the durable `CancelRun` command one workflow-cancel effect delivers
+/// to the child's inbox ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The command id is the derived, generation-free
+/// [`workflow_cancel_command_id`], and the deduplication key mirrors it, so
+/// every retry and every reconciled new effect generation converges on one
+/// logical request in the child's own durable inbox. Delivery is the whole
+/// claim: the child's scheduler quiesces under its own cancellation record,
+/// and its terminal outcome returns through the result relay.
+pub fn workflow_cancel_command(
+    record: &AgentWorkflowInvocationRecord,
+    workflow_id: AgentWorkflowId,
+    received_at: AgentTimestampMillis,
+) -> AgentWorkflowToolResult<AgentCommand> {
+    let command_id = workflow_cancel_command_id(&record.invocation);
+    let metadata = AgentCommandMetadata::new(
+        workflow_id,
+        record.child_run.clone(),
+        command_id.clone(),
+        AgentDurabilityMetadata {
+            deduplication_key: rakka_agent_workflow::AgentDeduplicationKey::new(
+                command_id.as_str(),
+            ),
+            causation_id: rakka_agent_workflow::AgentCausationId::new(record.invocation.as_str()),
+            correlation_id: rakka_agent_workflow::AgentCorrelationId::new(record.parent_run.key()),
+            telemetry_context: record.telemetry.clone(),
+        },
+        AgentTenantId::new(record.parent_run.tenant().as_str()),
+        received_at,
+    )
+    .map_err(|error| AgentWorkflowToolError::Command {
+        message: error.to_string(),
+    })?;
+    trigger_cancel_run_command(metadata, AgentTriggerSource::child_workflow(), None).map_err(
         |error| AgentWorkflowToolError::Command {
             message: error.to_string(),
         },
