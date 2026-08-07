@@ -2057,6 +2057,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rakka-example-multi-agent-goal-acceptance"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "a2a-server-lf",
+ "rakka-a2a",
+ "rakka-agent",
+ "rakka-agent-knowledge-graph",
+ "rakka-agent-workflow",
+ "rakka-core",
+ "rakka-persistence",
+ "rakka-sharding",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rakka-example-multi-node-sharding"
 version = "0.1.0"
 dependencies = [

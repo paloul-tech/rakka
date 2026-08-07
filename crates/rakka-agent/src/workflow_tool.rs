@@ -728,7 +728,9 @@ impl Display for AgentWorkflowTerminalStatus {
 ///
 /// References only, never content: the artifact reference and digest
 /// fingerprint the child's result, and the child run id — already on the
-/// record — is the authorized-query handle for anything more.
+/// record — is the authorized-query handle for anything more
+/// ([`crate::query::authorized_agent_goal_view`] assembles the goal-wide
+/// view those handles key into).
 ///
 /// [specification 8.6]: ../../../docs/plans/rakka-agent/spec.md
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

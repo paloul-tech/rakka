@@ -3166,6 +3166,101 @@ Spec: [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4),
 
 Done when: the multi-agent milestone checklist is demonstrated end to end.
 
+**Amended as implemented (2026-08-06):**
+
+- **The goal view is one bounded assembly over durable state, in `query.rs`.**
+  `assemble_agent_goal_view` resolves the root by the recorded
+  open-decision-14 default (goal identity = root task value; any other goal
+  id answers absent, documented), walks breadth-first over the delegation
+  cells' `ChildCreated` edges plus a continuous root's admitted epochs
+  (epoch refs live only while their occurrence is active — a released epoch
+  is history, owned by the task projection), and joins children fail-closed:
+  provenance not naming the traversing delegation, a foreign goal binding, a
+  missing record, or an unreadable schema each become a stable
+  `AgentGoalViewOmission` code rather than a joined forgery or a failed
+  view; only the root record failing fails the call. The view is documented
+  as a causal cut, never a snapshot: per-node durable revisions,
+  `root_revision` as the one fence-able anchor, `records_read` +
+  `observed_at` as the multi-read freshness statement, and a MUST-NOT on
+  authorizing or advancing execution. Node budget
+  `AGENT_GOAL_VIEW_MAX_TASKS = 64`, truncate-with-marker (never refuse),
+  plus `assemble_agent_goal_view_bounded` clamped to `1..=64` — the seam
+  that makes the truncation path testable and cheaper views possible.
+- **Each task resolves its highest-generation run even after completion.**
+  `ResultAccepted` clears the assignment, so the walk re-derives the last
+  run from `assignee` + `assignment_generation` when the assignment is gone
+  — found by the acceptance walk itself: a *completed* goal reconstructed
+  nothing, exactly when reconstruction matters. Earlier generations stay an
+  explicit gap (the node's generation counts surface it); full run history
+  is the 17.18 task projection's job, later work.
+- **Authorization = the owner check the record can answer (user-approved).**
+  `authorized_agent_goal_view` fences on `AgentGoalSpec.owner`; a non-owner
+  gets `Ok(None)` byte-identical to a missing goal (proven against the
+  absent-goal and child-task-id-probe answers), short-circuiting after the
+  root read. The principal-free core remains the composition point for a
+  boundary authorizer; an `A2AOperation`-gated wire surface + typed-client
+  query stay recorded follow-ups.
+- **The 4.3-4.6 snapshot debt is one shared derivation.**
+  `AgentRunCollaborationView` (delegation edges, fan-in with the
+  `unreported_members` chase set, workflow invocations, the evaluation view,
+  retained claim-append effects) is carried by `AgentOperationalSnapshot`
+  (serde-defaulted; pre-collaboration snapshots serialize unchanged — the
+  `skip_serializing_if` keeps old bytes byte-identical) and by the goal
+  view's run nodes, so the run-scoped query and the goal view can never
+  disagree. Redaction follows 17.14: delegated input, credential/capability
+  refs, proposals, results, and the objective summary never ride a view;
+  digests and stable codes do.
+- **Shared-knowledge references are a port with honest degradation
+  (user-approved in scope).** Settled claim receipts are pruned at
+  `clear_turn`, so the view carries three layers: the goal's grant
+  statement, retained `ClaimAppendCall` effect views, and the joined
+  `AgentGoalClaimSource` port — implemented by
+  `KnowledgeGraphGoalClaimSource` beside the append executor (graph → agent
+  dependency direction), serving explicitly named spaces over
+  `ClaimFilter::with_goal`. Absent/failing source ⇒ `claims_available:
+  false` with the durable half intact (scenario 56's shape).
+- **The sharded run factory gained the coordination wiring** —
+  `AgentRunEntityShardingSettings::with_delegation`/`::with_workflow_tools`,
+  plumbed into every hosted run; before this no sharded deployment could
+  serve the delegation or workflow-tool interception at all (the milestone
+  example was the first deployment-shaped consumer). The testkit's
+  `InProcessRunResultDelivery` gained the matching `with_delegation` — the
+  delivered model result is where a fan-out turn is intercepted.
+- **The milestone's done-when is `examples/multi-agent-goal-acceptance`**:
+  an 18-line transcript pinned three ways (README, `EXPECTED_TRANSCRIPT`,
+  `tests/acceptance.rs`) walking every checklist bullet — three sharded
+  agents over real `ClusterSharding`; one fan-out turn committing two
+  delegations + one workflow invocation + a closed three-member group; real
+  children through the in-process `rakka-a2a` service core with a replayed
+  send converging on the deduplication key; a registry-validated compiled
+  refund workflow over a real durable child inbox, replay-adopting the same
+  child with the compiled step executed exactly once; the wait fully
+  passivated; root pod loss (killed result write, redelivered by the
+  child's re-driven settle) and child pod loss (non-idempotent payment
+  invoked once, parked Indeterminate, resolved by a deduplicated
+  reconciliation decision); a provenance-stamped communal claim;
+  `Satisfied` only through the configured evaluator after
+  `task-goal-decision-unattested` refused the direct decision; and the
+  authorized goal view reconstructing the whole tree, with content
+  sentinels absent from every queried surface. Wiring facts the walk
+  enforced: the definition envelope must declare a workflow tool for the
+  invocation to commit (`undeclared-workflow-tool`), a specialist's
+  envelope must grant a knowledge space for its append to dispatch
+  (`widened-knowledge-access`), and sharded asks racing a
+  passivation-in-progress retry exactly as a caller does across a shard
+  handoff.
+- Proof roster: `tests/goal_view.rs` (13 tests: assembly, restart
+  determinism, redaction sweep, existence-safe denial, truncation, partial
+  children, failed-send edges, schema fail-closed/omit split, epoch join
+  and release, evaluation + terminal decision, claim join + degradation),
+  the operational snapshot's collaboration assertion, the graph crate's
+  `tests/goal_claim_source.rs`, and the acceptance example's triple-pinned
+  transcript. Owed onward: the goal view's A2A/typed-client wire surface,
+  crash-point sweeps over the 4.6 task-cancellation compare-and-sets
+  (Phase 6.1), earlier-generation run assembly, and the M5
+  teams/conversations dimensions the `#[non_exhaustive]` views keep
+  additive.
+
 ---
 
 ## Phase 5 — M5 Coordination Capabilities

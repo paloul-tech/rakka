@@ -680,7 +680,9 @@ impl AgentDelegationStatus {
 ///
 /// References only, never content: the digest fingerprints the child's
 /// accepted result and the child task id — already on the cell's
-/// `ChildCreated` status — is the authorized-query handle for anything more.
+/// `ChildCreated` status — is the authorized-query handle for anything more
+/// ([`crate::query::authorized_agent_goal_view`] assembles the goal-wide
+/// view those handles key into).
 ///
 /// [specification 8.4]: ../../../docs/plans/rakka-agent/spec.md
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

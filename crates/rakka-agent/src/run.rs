@@ -7011,6 +7011,29 @@ where
         self
     }
 
+    /// Wires the hosted run to serve delegation
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity intercepts the
+    /// coordination and await verbs exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_delegation(config));
+        self
+    }
+
+    /// Wires the hosted run to serve workflow tools
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity intercepts
+    /// workflow-tool calls exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_workflow_tools(config));
+        self
+    }
+
     fn store(&mut self) -> Result<&mut AgentRunEntityStore<Store, Effects>, AgentRunError> {
         self.entity
             .as_mut()
@@ -7098,6 +7121,8 @@ pub struct AgentRunEntityShardingSettings {
     metrics: Arc<dyn MetricsRecorder>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
     memory: Option<AgentRunMemory>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
 }
 
 impl Debug for AgentRunEntityShardingSettings {
@@ -7127,6 +7152,8 @@ impl AgentRunEntityShardingSettings {
             metrics: Arc::new(NoopMetricsRecorder),
             decisions: None,
             memory: None,
+            delegation: None,
+            workflow_tools: None,
         }
     }
 
@@ -7241,6 +7268,32 @@ impl AgentRunEntityShardingSettings {
         self.memory = Some(memory);
         self
     }
+
+    /// Wires every hosted run to serve delegation
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Absent by default, so an unwired deployment refuses the coordination
+    /// tool. The sharded factory is the production driver of a run, and every
+    /// driver must wire it identically — an entity that advances the loop
+    /// unwired cannot intercept the delegation or await verbs its durable
+    /// state was committed under.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
+        self
+    }
+
+    /// Wires every hosted run to serve workflow tools
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)), under
+    /// the same every-driver rule as [`Self::with_delegation`].
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
+        self
+    }
 }
 
 impl Default for AgentRunEntityShardingSettings {
@@ -7349,6 +7402,12 @@ where
     }
     if let Some(memory) = settings.memory.clone() {
         entity = entity.with_memory(memory);
+    }
+    if let Some(delegation) = settings.delegation.clone() {
+        entity = entity.with_delegation(delegation);
+    }
+    if let Some(workflow_tools) = settings.workflow_tools.clone() {
+        entity = entity.with_workflow_tools(workflow_tools);
     }
     entity
 }

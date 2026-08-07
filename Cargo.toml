@@ -41,6 +41,7 @@ members = [
     "examples/clustered-counter-grpc",
     "examples/clustered-counter-http",
     "examples/coordinated-shutdown",
+    "examples/multi-agent-goal-acceptance",
     "examples/multi-node-sharding",
     "examples/sharded-cart-persistence",
     "examples/streams",

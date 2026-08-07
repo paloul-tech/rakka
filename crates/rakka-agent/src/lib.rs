@@ -238,10 +238,17 @@ pub use otel::{
     ATTR_RAKKA_AGENT_DELEGATION_ID, ATTR_RAKKA_AGENT_GOAL_ID, ATTR_RAKKA_AGENT_TASK_ID,
 };
 pub use query::{
-    agent_operational_snapshot, agent_task_operational_snapshot, assemble_agent_session_view,
-    next_pending_wake_for_task, AgentCancellationProgress, AgentCheckpointView,
-    AgentOperationalSnapshot, AgentPendingEffectView, AgentSessionSegmentSource,
-    AgentSessionTraceSegment, AgentSessionView, AgentTaskOperationalSnapshot,
+    agent_goal_view_omission_code, agent_operational_snapshot, agent_task_operational_snapshot,
+    assemble_agent_goal_view, assemble_agent_goal_view_bounded, assemble_agent_session_view,
+    authorized_agent_goal_view, next_pending_wake_for_task, AgentCancellationProgress,
+    AgentCheckpointView, AgentGoalAssignmentView, AgentGoalBudgetView, AgentGoalClaimAppendView,
+    AgentGoalClaimFuture, AgentGoalClaimRef, AgentGoalClaimSource, AgentGoalClaimSourceError,
+    AgentGoalContractView, AgentGoalDelegationEdgeView, AgentGoalEvaluationView,
+    AgentGoalFanInView, AgentGoalRunNode, AgentGoalTaskNode, AgentGoalView, AgentGoalViewError,
+    AgentGoalViewOmission, AgentGoalViewResult, AgentGoalWorkflowInvocationView,
+    AgentOperationalSnapshot, AgentPendingEffectView, AgentRunCollaborationView,
+    AgentSessionSegmentSource, AgentSessionTraceSegment, AgentSessionView,
+    AgentTaskOperationalSnapshot, AGENT_GOAL_VIEW_MAX_CLAIMS, AGENT_GOAL_VIEW_MAX_TASKS,
 };
 pub use retrieval::{
     assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
