@@ -27,6 +27,7 @@ rig = ["dep:rig-core"]
 otel = []
 
 [dependencies]
+futures-util.workspace = true
 rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
 rakka-core = { path = "../rakka-core", version = "0.1.0" }
 rakka-persistence = { path = "../rakka-persistence", version = "0.1.0" }

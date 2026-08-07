@@ -2572,6 +2572,7 @@ where
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
     workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -2594,6 +2595,7 @@ where
             clock,
             policies: AgentEffectPolicies::default(),
             workflow_tools: None,
+            delegation: None,
         }
     }
 
@@ -2615,6 +2617,16 @@ where
         self.workflow_tools = Some(config);
         self
     }
+
+    /// Wires the entities this delivery builds to serve delegation — the
+    /// delivered model result is where a fan-out turn is intercepted, so an
+    /// unwired delivery would refuse the coordination and await verbs the
+    /// run's durable state was committed under.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
+        self
+    }
 }
 
 impl<Store, Effects> AgentRunResultDelivery for InProcessRunResultDelivery<Store, Effects>
@@ -2633,6 +2645,9 @@ where
                     .with_effect_policies(self.policies.clone());
             if let Some(config) = &self.workflow_tools {
                 entity = entity.with_workflow_tools(config.clone());
+            }
+            if let Some(config) = &self.delegation {
+                entity = entity.with_delegation(config.clone());
             }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity

@@ -23,25 +23,67 @@
 //! them; they still never label a metric. Continuous and multi-agent
 //! projections extend this module in phases 3 and 4.
 
+use std::collections::{BTreeSet, VecDeque};
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
+
+use futures_util::future::{join, join_all};
+
 use rakka_agent_workflow::{
-    AgentEffectId, AgentTelemetryContext, AgentTimestampMillis, HumanCheckpointId,
+    AgentEffectId, AgentRunId as WorkflowRunId, AgentTelemetryContext, AgentTimestampMillis,
+    ArtifactRef, HumanCheckpointId, PrincipalRef, WorkflowDefinitionVersion,
 };
 use rakka_persistence::{DurableStateStore, Revision};
 use serde::{Deserialize, Serialize};
 
+use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption};
 use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind, AgentCheckpointStatus};
 use crate::choreography::AgentExchangeState;
-use crate::definition::AgentEffectSafetyClass;
-use crate::effect::{AgentEffectGeneration, AgentRunEffectKind, AgentRunEffectStatus};
-use crate::identity::{AgentRunScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId};
-use crate::loop_runtime::AgentLoopState;
+use crate::definition::{
+    AgentCapabilityId, AgentEffectSafetyClass, AgentPolicyRef, AgentRevisionNumber,
+    AgentWorkflowToolId,
+};
+use crate::delegation::{
+    AgentDelegationCancelOutcome, AgentDelegationCell, AgentDelegationChildResult,
+    AgentDelegationStatus,
+};
+use crate::effect::{
+    AgentEffectGeneration, AgentRunEffectKind, AgentRunEffectRequest, AgentRunEffectStatus,
+};
+use crate::evaluation::{
+    AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvidenceRef,
+};
+use crate::fan_in::{
+    unreported_members, AgentFanInCell, AgentFanInMemberId, AgentFanInPolicy, AgentFanInResolution,
+};
+use crate::goal::{
+    AgentGoalDelegationBudget, AgentGoalStatus, AgentGoalTerminalDecision, AgentGoalWaitReason,
+};
+use crate::identity::{
+    AgentCommunalClaimId, AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError,
+    AgentOperationId, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, AgentWakeId,
+    AgentWorkflowInvocationId, KnowledgeSpaceId, TenantId,
+};
+use crate::loop_runtime::{AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState};
 use crate::observability::{
     AgentDecisionEvent, AgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
 };
-use crate::run::{AgentRun, AgentRunResult, AgentRunSnapshot, AgentRunState, AgentRunStatus};
+use crate::run::{
+    AgentRun, AgentRunError, AgentRunResult, AgentRunSettlementStatus, AgentRunSnapshot,
+    AgentRunState, AgentRunStatus, AgentRunTerminalReason,
+};
 use crate::schema::AgentSchemaPolicy;
-use crate::task::{AgentTaskResult, AgentTaskSnapshot, AgentTaskState};
+use crate::task::{
+    AgentAssignmentGeneration, AgentAssignmentStatus, AgentContentDigest, AgentTaskError,
+    AgentTaskResult, AgentTaskSnapshot, AgentTaskState, AgentTaskStatus, AgentTaskTerminalReason,
+};
 use crate::wake_timers::{AgentWakeTimerStatus, AgentWakeTimerStoreState};
+use crate::workflow_tool::{
+    AgentWorkflowCancelDisposition, AgentWorkflowChildResult, AgentWorkflowInvocationCell,
+    AgentWorkflowInvocationStatus,
+};
 
 /// How far a requested cancellation has actually got
 /// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md), following
@@ -225,6 +267,337 @@ pub struct AgentCheckpointView {
     pub expires_at: Option<AgentTimestampMillis>,
 }
 
+/// One delegation edge of the delegation graph, as a run's durable cell
+/// records it ([specification 17.18](../../../docs/plans/rakka-agent/spec.md):
+/// the goal projection assembles delegation/fan-in graphs).
+///
+/// Identities, stable codes, ceilings, and reference digests only — the
+/// delegated input rides the durable record and never this view, and the
+/// credential-binding and capability-scope references the resolution carries
+/// are deliberately omitted: an observability surface needs neither
+/// ([specification 17.14](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalDelegationEdgeView {
+    /// The delegation's derived identity.
+    pub delegation: AgentDelegationId,
+    /// The parent task whose run delegated.
+    pub parent_task: AgentTaskId,
+    /// The delegating run.
+    pub parent_run: AgentRunScope,
+    /// Ancestor delegations above this edge, oldest first.
+    pub lineage: Vec<AgentDelegationId>,
+    /// Depth of the child below the root.
+    pub depth: u32,
+    /// The skill the parent requested.
+    pub requested_skill: AgentCapabilityId,
+    /// The specialist agent the catalog resolved.
+    pub target_agent: AgentId,
+    /// Where the delegation stands, including the created child's identities.
+    pub status: AgentDelegationStatus,
+    /// When the status settled, when it has.
+    pub settled_at: Option<AgentTimestampMillis>,
+    /// The child's terminal outcome, once its result returned — references
+    /// and codes by construction, never content.
+    pub result: Option<AgentDelegationChildResult>,
+    /// The settled outcome of the delegation-cancel exchange this child was
+    /// chased with, once one settled
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub cancel: Option<AgentDelegationCancelOutcome>,
+    /// The conserved descendant sub-quota escrowed to the child's subtree.
+    pub granted_descendants: Option<u64>,
+    /// The narrowed delegation ceilings the child runs under.
+    pub budget: Option<AgentGoalDelegationBudget>,
+    /// The child's deadline, when the parent set one.
+    pub deadline: Option<AgentTimestampMillis>,
+    /// The communal knowledge spaces explicitly delegated to the child.
+    pub knowledge_spaces: BTreeSet<KnowledgeSpaceId>,
+}
+
+impl AgentGoalDelegationEdgeView {
+    /// Derives the edge view from one durable delegation cell.
+    #[must_use]
+    pub fn derive(cell: &AgentDelegationCell) -> Self {
+        Self {
+            delegation: cell.record.delegation.clone(),
+            parent_task: cell.record.parent_task.clone(),
+            parent_run: cell.record.parent_run.clone(),
+            lineage: cell.record.lineage.clone(),
+            depth: cell.record.depth,
+            requested_skill: cell.record.requested_skill.clone(),
+            target_agent: cell.record.resolved.agent.clone(),
+            status: cell.status.clone(),
+            settled_at: cell.settled_at,
+            result: cell.result.clone(),
+            cancel: cell.cancel.clone(),
+            granted_descendants: cell.record.granted_descendants,
+            budget: cell.record.budget,
+            deadline: cell.record.deadline,
+            knowledge_spaces: cell.record.knowledge_spaces.clone(),
+        }
+    }
+}
+
+/// A run's one durable fan-out group, as the goal projection reports it
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalFanInView {
+    /// The policy fixed at group open.
+    pub policy: AgentFanInPolicy,
+    /// The members, keys of the run's delegation and workflow-invocation
+    /// cells.
+    pub members: BTreeSet<AgentFanInMemberId>,
+    /// The turn that opened the group.
+    pub opened_turn: u64,
+    /// Whether the await verb has closed membership.
+    pub closed: bool,
+    /// The turn that closed the group, once closed.
+    pub await_turn: Option<u64>,
+    /// The parent-side wait deadline, when one is in force.
+    pub deadline: Option<AgentTimestampMillis>,
+    /// Members the parent's deadline marked timed out.
+    pub timed_out: BTreeSet<AgentFanInMemberId>,
+    /// The deterministic resolution, once computed.
+    pub resolution: Option<AgentFanInResolution>,
+    /// The members whose child never reported a terminal outcome: the chase
+    /// set a cancelled or resolved-and-moved-on parent still owes requests to
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub unreported: Vec<AgentFanInMemberId>,
+}
+
+impl AgentGoalFanInView {
+    /// Derives the group view from the durable cell and the sibling cell maps
+    /// its members key into.
+    #[must_use]
+    pub fn derive(cell: &AgentFanInCell, loop_state: &AgentLoopState) -> Self {
+        Self {
+            policy: cell.policy,
+            members: cell.members.clone(),
+            opened_turn: cell.opened_turn,
+            closed: cell.closed,
+            await_turn: cell.await_turn,
+            deadline: cell.deadline,
+            timed_out: cell.timed_out.clone(),
+            resolution: cell.resolution.clone(),
+            unreported: unreported_members(
+                cell,
+                loop_state.delegations(),
+                loop_state.workflow_invocations(),
+            ),
+        }
+    }
+}
+
+/// One workflow-tool invocation, as a run's durable cell records it
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md): the goal
+/// projection assembles workflow invocations).
+///
+/// Identities, the pinned descriptor coordinates, stable codes, and reference
+/// digests only — the invocation input rides the durable record and never
+/// this view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalWorkflowInvocationView {
+    /// The invocation's derived identity.
+    pub invocation: AgentWorkflowInvocationId,
+    /// The workflow tool the model called.
+    pub workflow_tool: AgentWorkflowToolId,
+    /// The descriptor version the invocation validated under.
+    pub descriptor_version: AgentRevisionNumber,
+    /// The workflow type the invocation starts.
+    pub workflow_type: String,
+    /// The workflow definition version the invocation pins.
+    pub definition_version: WorkflowDefinitionVersion,
+    /// The child workflow run this invocation creates or adopts.
+    pub child_run: WorkflowRunId,
+    /// Where the invocation stands.
+    pub status: AgentWorkflowInvocationStatus,
+    /// When the status settled, when it has.
+    pub settled_at: Option<AgentTimestampMillis>,
+    /// The child's terminal outcome, once its result returned — references
+    /// and codes by construction, never content.
+    pub result: Option<AgentWorkflowChildResult>,
+    /// The wind-down disposition of this invocation's cancel request, once a
+    /// wind-down decided one
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub cancel: Option<AgentWorkflowCancelDisposition>,
+    /// The child's deadline, when one is in force.
+    pub deadline: Option<AgentTimestampMillis>,
+}
+
+impl AgentGoalWorkflowInvocationView {
+    /// Derives the invocation view from one durable workflow-invocation cell.
+    #[must_use]
+    pub fn derive(cell: &AgentWorkflowInvocationCell) -> Self {
+        Self {
+            invocation: cell.record.invocation.clone(),
+            workflow_tool: cell.record.workflow_tool.clone(),
+            descriptor_version: cell.record.descriptor_version,
+            workflow_type: cell.record.workflow_type.clone(),
+            definition_version: cell.record.definition_version.clone(),
+            child_run: cell.record.child_run.clone(),
+            status: cell.status.clone(),
+            settled_at: cell.settled_at,
+            result: cell.result.clone(),
+            cancel: cell.cancel.clone(),
+            deadline: cell.record.deadline,
+        }
+    }
+}
+
+/// One completed goal evaluation and where its report stands, as the goal
+/// projection reports it
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md):
+/// progress/evidence evaluations).
+///
+/// The record's own contract already fits this surface: stable codes,
+/// classed evidence references, and digests — never model text or content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalEvaluationView {
+    /// The evaluation's derived identity.
+    pub evaluation_id: AgentOperationId,
+    /// The evaluator the evaluation ran as.
+    pub evaluator: AgentPolicyRef,
+    /// How the evaluation executed.
+    pub method: AgentGoalEvaluationMethodKind,
+    /// The criteria revision the evaluation assessed.
+    pub criteria_revision: AgentRevisionNumber,
+    /// The verdict.
+    pub outcome: AgentGoalEvaluationOutcome,
+    /// Bounded, stable reason code for the verdict.
+    pub reason_code: String,
+    /// The classed evidence references the verdict rests on.
+    pub evidence: Vec<AgentGoalEvidenceRef>,
+    /// The human resolver, when the method was an authorized review.
+    pub evaluated_by: Option<PrincipalRef>,
+    /// When the evaluation completed.
+    pub evaluated_at: AgentTimestampMillis,
+    /// Whether the exchange reporting it to the coordinating task settled.
+    pub reported: bool,
+    /// The decision door's refusal code, when it refused.
+    pub refusal: Option<String>,
+}
+
+impl AgentGoalEvaluationView {
+    /// Derives the evaluation view from the run's durable evaluation cell.
+    #[must_use]
+    pub fn derive(cell: &AgentGoalEvaluationCell) -> Self {
+        Self {
+            evaluation_id: cell.record.evaluation_id.clone(),
+            evaluator: cell.record.evaluator.clone(),
+            method: cell.record.method,
+            criteria_revision: cell.record.criteria_revision,
+            outcome: cell.record.outcome,
+            reason_code: cell.record.reason_code.clone(),
+            evidence: cell.record.evidence.clone(),
+            evaluated_by: cell.record.evaluated_by.clone(),
+            evaluated_at: cell.record.evaluated_at,
+            reported: cell.reported,
+            refusal: cell.refusal.clone(),
+        }
+    }
+}
+
+/// One communal claim-append effect a run currently retains
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md): shared
+/// knowledge references).
+///
+/// Settled append receipts are pruned from durable run state when their turn
+/// completes, so this view enumerates only what the run still holds — the
+/// communal graph itself is the authoritative enumeration of landed claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalClaimAppendView {
+    /// The effect carrying the append.
+    pub effect_id: AgentEffectId,
+    /// Its current dispatch generation.
+    pub generation: AgentEffectGeneration,
+    /// The communal knowledge space the claim lands in.
+    pub space: KnowledgeSpaceId,
+    /// Where the current generation stands.
+    pub status: AgentRunEffectStatus,
+    /// Dispatch attempts the current generation has made.
+    pub attempts: u32,
+}
+
+/// The multi-agent collaboration state one run's durable record holds: the
+/// delegation, fan-in, workflow-invocation, and goal-evaluation cells of
+/// slices 4.2-4.6, plus the claim-append effects still retained
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Derived once and consumed twice: [`AgentOperationalSnapshot`] carries it
+/// for the run-scoped point query, and the goal view's run nodes carry the
+/// same shape, so the two surfaces can never disagree about what a cell
+/// holds.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentRunCollaborationView {
+    /// The delegation edges this run committed, in identity order.
+    pub delegations: Vec<AgentGoalDelegationEdgeView>,
+    /// The run's one durable fan-out group, when it holds one.
+    pub fan_in: Option<AgentGoalFanInView>,
+    /// The workflow invocations this run committed, in identity order.
+    pub workflow_invocations: Vec<AgentGoalWorkflowInvocationView>,
+    /// The completed goal evaluation the run holds, when one exists.
+    pub evaluation: Option<AgentGoalEvaluationView>,
+    /// The claim-append effects the run still retains.
+    pub claim_appends: Vec<AgentGoalClaimAppendView>,
+}
+
+impl AgentRunCollaborationView {
+    /// Derives the collaboration view from one run's durable loop state.
+    #[must_use]
+    pub fn derive(loop_state: &AgentLoopState) -> Self {
+        Self {
+            delegations: loop_state
+                .delegations()
+                .values()
+                .map(|cell| AgentGoalDelegationEdgeView::derive(cell))
+                .collect(),
+            fan_in: loop_state
+                .fan_in()
+                .map(|cell| AgentGoalFanInView::derive(cell, loop_state)),
+            workflow_invocations: loop_state
+                .workflow_invocations()
+                .values()
+                .map(|cell| AgentGoalWorkflowInvocationView::derive(cell))
+                .collect(),
+            evaluation: loop_state
+                .goal_evaluation()
+                .map(AgentGoalEvaluationView::derive),
+            claim_appends: loop_state
+                .effects()
+                .iter()
+                .filter_map(|effect| match &effect.request {
+                    AgentRunEffectRequest::ClaimAppend { append, .. } => {
+                        Some(AgentGoalClaimAppendView {
+                            effect_id: effect.effect_id.clone(),
+                            generation: effect.generation,
+                            space: append.space.clone(),
+                            status: effect.status,
+                            attempts: effect.attempts,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether the run holds no collaboration state at all, so snapshots of
+    /// pre-collaboration runs serialize exactly as they always have.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.delegations.is_empty()
+            && self.fan_in.is_none()
+            && self.workflow_invocations.is_empty()
+            && self.evaluation.is_none()
+            && self.claim_appends.is_empty()
+    }
+}
+
 /// The authoritative operational point answer for one run
 /// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -275,6 +648,12 @@ pub struct AgentOperationalSnapshot {
     pub decisions_owed: usize,
     /// Decision events the bounded ring dropped before they were flushed.
     pub decision_drops: u64,
+    /// The run's multi-agent collaboration state: delegation, fan-in,
+    /// workflow-invocation, and goal-evaluation cells, plus retained
+    /// claim-append effects. Snapshots persisted before this field load
+    /// empty, and a run holding no collaboration state serializes without it.
+    #[serde(default, skip_serializing_if = "AgentRunCollaborationView::is_empty")]
+    pub collaboration: AgentRunCollaborationView,
 }
 
 impl AgentOperationalSnapshot {
@@ -373,6 +752,9 @@ impl AgentOperationalSnapshot {
             decision_cursor: loop_state.map_or(0, AgentLoopState::decision_sequence),
             decisions_owed: loop_state.map_or(0, |loop_state| loop_state.decision_outbox().len()),
             decision_drops: loop_state.map_or(0, AgentLoopState::decision_drops),
+            collaboration: loop_state
+                .map(AgentRunCollaborationView::derive)
+                .unwrap_or_default(),
         }
     }
 }
@@ -670,4 +1052,1208 @@ fn collect_segment(
         source,
         telemetry: telemetry.clone(),
     });
+}
+
+/// Most task nodes one goal view assembles, runs included one-for-one.
+///
+/// The per-run fan-out and lineage-depth bounds cap the tree's shape but not
+/// its total mass, so the view carries its own node budget; a larger tree
+/// truncates with an explicit [`AgentGoalViewOmission`] per unvisited task
+/// rather than refusing — a view that refuses on a big tree answers nothing
+/// about exactly the goal an operator most needs to see.
+pub const AGENT_GOAL_VIEW_MAX_TASKS: usize = 64;
+
+/// Most joined claim references one goal view carries.
+pub const AGENT_GOAL_VIEW_MAX_CLAIMS: usize = 64;
+
+/// Stable omission codes of the goal view: the reasons
+/// [`AgentGoalViewOmission`] records for a task that did not assemble, and
+/// [`AgentGoalTaskNode::run_omission`] records for a resolved run that did
+/// not join.
+pub mod agent_goal_view_omission_code {
+    /// A created child's task record does not exist in the store.
+    pub const RECORD_MISSING: &str = "record-missing";
+    /// The task's resolved run has no record in the store.
+    pub const RUN_RECORD_MISSING: &str = "run-record-missing";
+    /// The run record exists but the run never durably accepted.
+    pub const RUN_NOT_ACCEPTED: &str = "run-not-accepted";
+    /// The task record's schema version is not readable under the caller's
+    /// policy.
+    pub const SCHEMA_UNSUPPORTED: &str = "schema-unsupported";
+    /// The run record's schema version is not readable under the caller's
+    /// policy.
+    pub const RUN_SCHEMA_UNSUPPORTED: &str = "run-schema-unsupported";
+    /// The child's recorded provenance does not name the edge that reached
+    /// it: the linkage fails closed rather than joining a forged child.
+    pub const UNLINKED_PROVENANCE: &str = "unlinked-provenance";
+    /// The child is bound to a different goal.
+    pub const FOREIGN_GOAL: &str = "foreign-goal";
+    /// The view's node budget was exhausted before this task was visited.
+    pub const NODE_BUDGET_EXHAUSTED: &str = "node-budget-exhausted";
+}
+
+/// One task the goal view knows of but did not assemble, with the stable
+/// reason ([`agent_goal_view_omission_code`]).
+///
+/// Omissions are how the view stays honest without failing whole: a missing
+/// record, an unreadable schema, a forged linkage, or an exhausted node
+/// budget marks its task here, and only the *root* record failing fails the
+/// call. A task appears at most once, and never both here and in
+/// [`AgentGoalView::tasks`] — a run that fails to join marks its assembled
+/// task's [`AgentGoalTaskNode::run_omission`] instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalViewOmission {
+    /// The task that was not assembled.
+    pub task: AgentTaskId,
+    /// Why, as a stable code.
+    pub code: String,
+}
+
+/// The goal contract as the authorized goal view reports it
+/// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The objective *summary* is deliberately redacted — it is user content, and
+/// content never rides an observability surface
+/// ([specification 17.14](../../../docs/plans/rakka-agent/spec.md)); the
+/// artifact reference carries the authorized pointer. The terminal decision
+/// keeps its evaluation reference whole: evaluator, criteria revision,
+/// attestation digest, and classed evidence references are exactly what "the
+/// terminal goal decision" of
+/// [specification 17.18](../../../docs/plans/rakka-agent/spec.md) means.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalContractView {
+    /// The goal-contract status.
+    pub status: AgentGoalStatus,
+    /// The status revision commanded transitions fence on.
+    pub status_revision: AgentRevisionNumber,
+    /// The spec revision in force.
+    pub spec_revision: AgentRevisionNumber,
+    /// The criteria revision a completion evaluation must assess.
+    pub criteria_revision: AgentRevisionNumber,
+    /// Content digest of the criteria, when the application fingerprints
+    /// them.
+    pub criteria_digest: Option<AgentContentDigest>,
+    /// The objective artifact reference; the summary is redacted.
+    pub objective_artifact: Option<ArtifactRef>,
+    /// The configured completion evaluator, when the spec names one.
+    pub evaluator: Option<AgentPolicyRef>,
+    /// Evidence classes a completion evaluation must present.
+    pub required_evidence: BTreeSet<String>,
+    /// Priority relative to the owner's other goals.
+    pub priority: Option<u32>,
+    /// The goal's own deadline.
+    pub deadline: Option<AgentTimestampMillis>,
+    /// The conserved goal allocation.
+    pub allocation: AgentBudgetAllocation,
+    /// The delegation ceilings the goal runs under.
+    pub delegation_ceilings: Option<AgentGoalDelegationBudget>,
+    /// The communal knowledge spaces the goal's grant statement names.
+    pub knowledge_spaces: BTreeSet<KnowledgeSpaceId>,
+    /// Why the goal is waiting, while it is.
+    pub wait: Option<AgentGoalWaitReason>,
+    /// The terminal decision, once one recorded — reason and the evaluation
+    /// reference it rests on.
+    pub terminal: Option<AgentGoalTerminalDecision>,
+    /// When the goal was first activated.
+    pub activated_at: Option<AgentTimestampMillis>,
+    /// When the terminal decision was made.
+    pub decided_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentGoalContractView {
+    /// Derives the contract view from the root task's durable goal record.
+    #[must_use]
+    pub fn derive(state: &crate::goal::AgentGoalState) -> Self {
+        let spec_revision = state.spec();
+        let spec = spec_revision.spec();
+        Self {
+            status: state.status(),
+            status_revision: state.status_revision(),
+            spec_revision: spec_revision.revision(),
+            criteria_revision: spec.criteria.revision,
+            criteria_digest: spec.criteria.digest.clone(),
+            objective_artifact: spec.objective.artifact.clone(),
+            evaluator: spec.evaluator.clone(),
+            required_evidence: spec.required_evidence.clone(),
+            priority: spec.priority,
+            deadline: spec.deadline,
+            allocation: spec.allocation,
+            delegation_ceilings: spec.delegation,
+            knowledge_spaces: spec.knowledge_spaces.clone(),
+            wait: state.wait().cloned(),
+            terminal: state.terminal().cloned(),
+            activated_at: state.activated_at(),
+            decided_at: state.decided_at(),
+        }
+    }
+}
+
+/// One task's current assignment, as the goal view reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalAssignmentView {
+    /// The generation this assignment owns.
+    pub generation: AgentAssignmentGeneration,
+    /// The assigned agent.
+    pub agent: AgentId,
+    /// The run created to serve this generation.
+    pub run: AgentRunId,
+    /// Whether the run has durably accepted.
+    pub status: AgentAssignmentStatus,
+    /// When the decision was recorded.
+    pub assigned_at: AgentTimestampMillis,
+}
+
+/// One task node of the goal view: the root, a delegated specialist child,
+/// or a continuous root's epoch task
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md): root and
+/// specialist tasks).
+///
+/// Every node carries the durable revision it was derived from — the view
+/// spans independently committed records, so freshness is per node, never
+/// global.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalTaskNode {
+    /// The durable state revision this node was derived from.
+    pub revision: Revision,
+    /// The task's scope.
+    pub scope: AgentTaskScope,
+    /// The task that created it, when one did.
+    pub parent: Option<AgentTaskId>,
+    /// The delegation that created it, when one did — the graph's back-edge.
+    pub created_by_delegation: Option<AgentDelegationId>,
+    /// Depth below the root: zero for the root and for epoch tasks.
+    pub depth: u32,
+    /// Whether this is the goal's coordinating root task.
+    pub is_root: bool,
+    /// Whether this task was reached as a continuous root's epoch.
+    pub is_epoch: bool,
+    /// The task's lifecycle status.
+    pub status: AgentTaskStatus,
+    /// How far a requested cancellation of this task has actually got.
+    pub cancellation: AgentCancellationProgress,
+    /// The current assignment, when one stands.
+    pub assignment: Option<AgentGoalAssignmentView>,
+    /// The highest assignment generation the task has decided — the one
+    /// whose run this view resolves, standing assignment or not. A value
+    /// above one signals earlier runs this view does not assemble: their
+    /// scopes are not derivable from the task record, and full run history
+    /// is the task projection's job.
+    pub assignment_generation: AgentAssignmentGeneration,
+    /// How many assignment generations the task has consumed.
+    pub assignments: u32,
+    /// Why the resolved run did not join ([`agent_goal_view_omission_code`]),
+    /// when it did not. Children are discovered through the run's delegation
+    /// cells, so a marker here also means this node's delegated subtree is
+    /// unknown rather than absent — the escrow counters still witness
+    /// anything outstanding below it.
+    pub run_omission: Option<String>,
+    /// Escrow children the task still holds open — the cancellation
+    /// finalization gate ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub outstanding_escrow: usize,
+    /// The total the task's escrow ledger holds.
+    pub escrow_allocation: AgentBudgetAllocation,
+    /// What the task and its settled children have consumed.
+    pub escrow_consumed: AgentBudgetConsumption,
+    /// Whether the task holds an accepted typed result; the content itself
+    /// never rides this view.
+    pub has_accepted_result: bool,
+    /// Why the task reached its terminal status, once it did.
+    pub terminal_reason: Option<AgentTaskTerminalReason>,
+    /// How many result proposals deterministic rules have refused.
+    pub rejection_count: u32,
+    /// The time of the task's last accepted transition.
+    pub updated_at: AgentTimestampMillis,
+}
+
+/// One run node of the goal view
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md): root and
+/// specialist runs). The delegation and workflow edges live on
+/// [`Self::collaboration`], so the graph and its nodes can never disagree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalRunNode {
+    /// The durable state revision this node was derived from.
+    pub revision: Revision,
+    /// The run's scope.
+    pub scope: AgentRunScope,
+    /// The task it serves.
+    pub task: AgentTaskId,
+    /// The assignment generation it owns.
+    pub generation: AgentAssignmentGeneration,
+    /// Its lifecycle status.
+    pub status: AgentRunStatus,
+    /// Where its loop stands.
+    pub phase: AgentLoopPhase,
+    /// The turn it is on.
+    pub turn: u64,
+    /// How far a requested cancellation has actually got.
+    pub cancellation: AgentCancellationProgress,
+    /// Its own durable budget ledger.
+    pub budget: crate::budget::AgentRunBudget,
+    /// How far it has got in handing its escrow back to its task.
+    pub settlement: AgentRunSettlementStatus,
+    /// How many effects it is still waiting on.
+    pub outstanding_effects: usize,
+    /// Whether a result proposal is awaiting the task's decision; the
+    /// proposal itself never rides this view.
+    pub has_pending_proposal: bool,
+    /// Why it reached its terminal status, once it did.
+    pub terminal_reason: Option<AgentRunTerminalReason>,
+    /// Its delegation, fan-in, workflow-invocation, evaluation, and
+    /// claim-append state.
+    pub collaboration: AgentRunCollaborationView,
+}
+
+impl AgentGoalRunNode {
+    /// Derives the run node from one durable run record, once the run has
+    /// accepted.
+    fn derive(run: &AgentRun, scope: AgentRunScope, revision: Revision) -> Self {
+        Self {
+            revision,
+            scope,
+            task: run.task().clone(),
+            generation: run.generation,
+            status: run.status,
+            phase: run.loop_state.phase(),
+            turn: run.loop_state.turn(),
+            cancellation: AgentCancellationProgress::derive(run),
+            budget: *run.loop_state.budget(),
+            settlement: run.settlement,
+            outstanding_effects: run.loop_state.outstanding_effects().count(),
+            has_pending_proposal: run.loop_state.proposal().is_some(),
+            terminal_reason: run.terminal_reason.clone(),
+            collaboration: AgentRunCollaborationView::derive(&run.loop_state),
+        }
+    }
+}
+
+/// The goal's budget position, rolled up from the records the view read
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md): budget
+/// allocation and consumption).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalBudgetView {
+    /// The conserved allocation the goal contract grants.
+    pub allocation: AgentBudgetAllocation,
+    /// The total the root task's escrow ledger holds.
+    pub root_escrow_allocation: AgentBudgetAllocation,
+    /// What the root and its settled children have durably consumed — the
+    /// conserved, folded number.
+    pub root_escrow_consumed: AgentBudgetConsumption,
+    /// Escrow children the root still holds open.
+    pub root_outstanding_children: usize,
+    /// Consumption summed over the *loaded, unsettled* run nodes: advisory
+    /// visibility into spend the ledgers have not folded yet. It is a sum of
+    /// independently committed records, so it is never a conserved figure and
+    /// must never authorize anything.
+    pub live_consumption: AgentBudgetConsumption,
+}
+
+/// A joined reference to one communal claim recorded under the goal
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md): shared
+/// knowledge references). Identities and provenance only, never claim
+/// content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalClaimRef {
+    /// The claim's identity.
+    pub claim: AgentCommunalClaimId,
+    /// The communal knowledge space it lives in.
+    pub space: KnowledgeSpaceId,
+    /// The agent that asserted it.
+    pub agent: AgentId,
+    /// The task the assertion served, when recorded.
+    pub task: Option<AgentTaskId>,
+    /// The run that produced it, when recorded.
+    pub run: Option<AgentRunId>,
+    /// The delegation it was produced under, when recorded.
+    pub delegation: Option<AgentDelegationId>,
+}
+
+impl AgentGoalClaimRef {
+    /// Creates a claim reference carrying its required identities; the
+    /// optional provenance joins through the `with_` builders.
+    #[must_use]
+    pub const fn new(claim: AgentCommunalClaimId, space: KnowledgeSpaceId, agent: AgentId) -> Self {
+        Self {
+            claim,
+            space,
+            agent,
+            task: None,
+            run: None,
+            delegation: None,
+        }
+    }
+
+    /// Sets the task the assertion served.
+    #[must_use]
+    pub fn with_task(mut self, task: AgentTaskId) -> Self {
+        self.task = Some(task);
+        self
+    }
+
+    /// Sets the run that produced the assertion.
+    #[must_use]
+    pub fn with_run(mut self, run: AgentRunId) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    /// Sets the delegation the assertion was produced under.
+    #[must_use]
+    pub fn with_delegation(mut self, delegation: AgentDelegationId) -> Self {
+        self.delegation = Some(delegation);
+        self
+    }
+}
+
+/// Error one goal-claim source failed with.
+///
+/// The assembling view treats any failure as a degraded projection source —
+/// [`AgentGoalView::claims_available`] goes `false` and the durable half of
+/// the view is never degraded (the scenario-56 posture) — so the error is
+/// diagnostic detail, never control flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentGoalClaimSourceError {
+    /// Stable machine-readable code.
+    pub code: String,
+    /// Bounded human-readable detail.
+    pub message: String,
+}
+
+impl AgentGoalClaimSourceError {
+    /// Creates a source error carrying a stable code and bounded detail.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for AgentGoalClaimSourceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "goal claim source failed [{}]: {}",
+            self.code, self.message
+        )
+    }
+}
+
+impl Error for AgentGoalClaimSourceError {}
+
+/// Future type of [`AgentGoalClaimSource`] operations.
+pub type AgentGoalClaimFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<AgentGoalClaimRef>, AgentGoalClaimSourceError>> + Send + 'a>,
+>;
+
+/// A source of joined communal-claim references for one goal.
+///
+/// Settled claim receipts are pruned from durable run state when their turn
+/// completes, so the communal graph is the only complete enumeration of what
+/// a goal's runs recorded — and the graph is a separate store the view joins
+/// through this port, exactly as the session view joins its decision sink.
+/// The implementation decides which spaces it serves; an absent or failing
+/// source degrades the projection half of the view and never the durable
+/// half.
+pub trait AgentGoalClaimSource: Send + Sync {
+    /// Stable backend label for diagnostics.
+    fn backend_name(&self) -> &'static str;
+
+    /// Reads up to `limit` claim references recorded under `goal`, in stable
+    /// claim-id order.
+    fn claims_for_goal<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        goal: &'a AgentGoalId,
+        limit: usize,
+    ) -> AgentGoalClaimFuture<'a>;
+}
+
+/// The authorized goal view: one goal's tasks, runs, delegation graph,
+/// workflow links, evaluations, evidence, budgets, and cancellation state,
+/// assembled from durable state alone
+/// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The view is a *causal cut* over independently committed records, never a
+/// snapshot: every node carries its own durable revision, and
+/// [`Self::root_revision`] is the only anchor a caller may fence against. It
+/// is a bounded read model and must never authorize or advance execution —
+/// durable goal/task/run state remains the one correctness source.
+///
+/// Resolution is convention-bound: with no goal→task index, the root is
+/// reachable exactly because the goal identity defaults to the root task's
+/// value ([`AgentGoalId::for_root_task`], the recorded resolution of open
+/// decision 14). Each task resolves its highest-generation run — through the
+/// standing assignment, or re-derived from the assignee once acceptance
+/// cleared it — while earlier generations' runs are not assembled: their
+/// scopes are not derivable from the task record, the per-node generation
+/// counts make that gap explicit, and full run history belongs to the task
+/// projection. Teams and moderated conversations join in M5; the
+/// non-exhaustive views keep that additive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalView {
+    /// The tenant the view is scoped to.
+    pub tenant: TenantId,
+    /// The goal.
+    pub goal: AgentGoalId,
+    /// When the view was assembled.
+    pub observed_at: AgentTimestampMillis,
+    /// The coordinating root task.
+    pub root_task: AgentTaskId,
+    /// The root record's durable revision: the authoritative anchor.
+    pub root_revision: Revision,
+    /// How many durable records the assembly read.
+    pub records_read: usize,
+    /// Whether the node budget cut the traversal short.
+    pub truncated: bool,
+    /// Every task the view knows of but did not assemble, with its reason.
+    pub omissions: Vec<AgentGoalViewOmission>,
+    /// The goal contract.
+    pub contract: AgentGoalContractView,
+    /// How far a requested cancellation of the whole goal has actually got,
+    /// derived at the root ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    pub cancellation: AgentCancellationProgress,
+    /// The goal's budget position.
+    pub budget: AgentGoalBudgetView,
+    /// The assembled task nodes, root first, in breadth-first order.
+    pub tasks: Vec<AgentGoalTaskNode>,
+    /// The assembled run nodes, in the same traversal order.
+    pub runs: Vec<AgentGoalRunNode>,
+    /// Joined communal-claim references, when a source answered.
+    pub claims: Vec<AgentGoalClaimRef>,
+    /// Whether a claim source answered at all. `false` with empty
+    /// [`Self::claims`] means the join is degraded or unwired, never that no
+    /// claims exist.
+    pub claims_available: bool,
+    /// Whether the claim join was cut at [`AGENT_GOAL_VIEW_MAX_CLAIMS`]: the
+    /// source held more references than the view carries.
+    pub claims_truncated: bool,
+    /// The stable code the claim source failed with when the join degraded —
+    /// [`AgentGoalClaimSourceError::code`], never its free-text detail.
+    /// `None` beside a `false` [`Self::claims_available`] means no source is
+    /// wired at all.
+    pub claims_error_code: Option<String>,
+}
+
+/// Error raised assembling a goal view, attributed to the store that failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AgentGoalViewError {
+    /// Deriving an identity or scope failed.
+    Identity(AgentIdentityError),
+    /// The task store failed to load or validate a record.
+    Task(AgentTaskError),
+    /// The run store failed to load or validate a record.
+    Run(Box<AgentRunError>),
+}
+
+impl AgentGoalViewError {
+    /// The stable machine-readable error code of the underlying failure.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Identity(error) => error.code(),
+            Self::Task(error) => error.code(),
+            Self::Run(error) => error.code(),
+        }
+    }
+}
+
+impl Display for AgentGoalViewError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => write!(f, "goal view identity error: {error}"),
+            Self::Task(error) => write!(f, "goal view task-store error: {error}"),
+            Self::Run(error) => write!(f, "goal view run-store error: {error}"),
+        }
+    }
+}
+
+impl Error for AgentGoalViewError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::Task(error) => Some(error),
+            Self::Run(error) => Some(error),
+        }
+    }
+}
+
+impl From<AgentIdentityError> for AgentGoalViewError {
+    fn from(error: AgentIdentityError) -> Self {
+        Self::Identity(error)
+    }
+}
+
+impl From<AgentTaskError> for AgentGoalViewError {
+    fn from(error: AgentTaskError) -> Self {
+        Self::Task(error)
+    }
+}
+
+impl From<AgentRunError> for AgentGoalViewError {
+    fn from(error: AgentRunError) -> Self {
+        Self::Run(Box::new(error))
+    }
+}
+
+/// Result type for goal-view assembly.
+pub type AgentGoalViewResult<T> = Result<T, AgentGoalViewError>;
+
+/// One frontier entry of the bounded traversal.
+struct GoalViewFrontierEntry {
+    task: AgentTaskId,
+    parent: AgentTaskId,
+    /// The delegation edge that reached the child; `None` for an epoch.
+    via: Option<AgentDelegationId>,
+}
+
+/// Assembles the goal view for one tenant-scoped goal id.
+///
+/// One durable read per record, no entity activation, tenant-scoped by
+/// construction of every derived scope. `Ok(None)` means no goal-rooted task
+/// exists under this id — including a task id that exists but coordinates no
+/// goal, which answers identically so the view never turns a goal id probe
+/// into an existence oracle for tasks.
+///
+/// The traversal is breadth-first from the root task, each wave of
+/// independent records loaded concurrently: each task's current assignment
+/// resolves its run, each run's `ChildCreated` delegation cells resolve its
+/// children, and a continuous root's admitted epochs join from the wake
+/// controller's status view. Children that cannot be joined honestly —
+/// missing records, unreadable schemas, provenance that does not name the
+/// traversing edge, foreign goal bindings — become
+/// [`AgentGoalViewOmission`]s rather than failures; a resolved run that
+/// cannot be joined marks its assembled task's
+/// [`AgentGoalTaskNode::run_omission`] instead; only the root record failing
+/// fails the call. At most [`AGENT_GOAL_VIEW_MAX_TASKS`] task nodes
+/// assemble; the rest truncate with explicit omissions.
+///
+/// `claims` joins shared-knowledge references when a source is wired; an
+/// absent or failing source leaves [`AgentGoalView::claims_available`]
+/// `false` with the durable half of the view intact, a failure's stable code
+/// on [`AgentGoalView::claims_error_code`], and a join cut at
+/// [`AGENT_GOAL_VIEW_MAX_CLAIMS`] sets [`AgentGoalView::claims_truncated`].
+pub async fn assemble_agent_goal_view<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    policy: &AgentSchemaPolicy,
+    claims: Option<&dyn AgentGoalClaimSource>,
+    observed_at: AgentTimestampMillis,
+) -> AgentGoalViewResult<Option<AgentGoalView>>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    assemble_goal_view_gated(
+        tasks,
+        runs,
+        tenant,
+        goal,
+        policy,
+        claims,
+        None,
+        AGENT_GOAL_VIEW_MAX_TASKS,
+        observed_at,
+    )
+    .await
+}
+
+/// [`assemble_agent_goal_view`] under a tighter node budget.
+///
+/// The budget is clamped to `1..=`[`AGENT_GOAL_VIEW_MAX_TASKS`]: a caller
+/// may want a cheaper view of a large goal, never a more expensive one.
+/// Everything unvisited truncates with the explicit
+/// [`agent_goal_view_omission_code::NODE_BUDGET_EXHAUSTED`] omission.
+#[allow(clippy::too_many_arguments)]
+pub async fn assemble_agent_goal_view_bounded<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    policy: &AgentSchemaPolicy,
+    claims: Option<&dyn AgentGoalClaimSource>,
+    max_tasks: usize,
+    observed_at: AgentTimestampMillis,
+) -> AgentGoalViewResult<Option<AgentGoalView>>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    assemble_goal_view_gated(
+        tasks,
+        runs,
+        tenant,
+        goal,
+        policy,
+        claims,
+        None,
+        max_tasks.clamp(1, AGENT_GOAL_VIEW_MAX_TASKS),
+        observed_at,
+    )
+    .await
+}
+
+/// Assembles the goal view for the goal's owner, failing closed on anyone
+/// else.
+///
+/// The owner check is the one authorization the goal record itself can
+/// answer: [`crate::goal::AgentGoalSpec::owner`] is the principal the goal
+/// is accountable to. A non-owner receives `Ok(None)` — byte-identical to a
+/// missing goal, so authorization never leaks existence
+/// ([specification 16](../../../docs/plans/rakka-agent/spec.md)) — and the
+/// denial short-circuits after the root read alone: no fan-out happens on
+/// behalf of an unauthorized caller. The fence is decided before the root
+/// schema gate, from the already-decoded owner field, so even a root record
+/// unreadable under the caller's schema policy answers a non-owner with
+/// `Ok(None)` rather than a distinguishable error. Richer role- or
+/// boundary-based policy belongs to the surface that fronts
+/// [`assemble_agent_goal_view`], exactly as the A2A service authorizes its
+/// operations.
+#[allow(clippy::too_many_arguments)]
+pub async fn authorized_agent_goal_view<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    principal: &PrincipalRef,
+    policy: &AgentSchemaPolicy,
+    claims: Option<&dyn AgentGoalClaimSource>,
+    observed_at: AgentTimestampMillis,
+) -> AgentGoalViewResult<Option<AgentGoalView>>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    assemble_goal_view_gated(
+        tasks,
+        runs,
+        tenant,
+        goal,
+        policy,
+        claims,
+        Some(principal),
+        AGENT_GOAL_VIEW_MAX_TASKS,
+        observed_at,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn assemble_goal_view_gated<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    policy: &AgentSchemaPolicy,
+    claims: Option<&dyn AgentGoalClaimSource>,
+    principal: Option<&PrincipalRef>,
+    max_tasks: usize,
+    observed_at: AgentTimestampMillis,
+) -> AgentGoalViewResult<Option<AgentGoalView>>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    // Resolution is the recorded open-decision-14 default: the goal identity
+    // is the root task's value. A goal instituted under any other id has no
+    // root to reach and answers as absent.
+    let root_task_id = AgentTaskId::new(goal.as_str())?;
+    let root_scope = AgentTaskScope::new(tenant.clone(), root_task_id.clone())?;
+
+    let Some(root_record) = tasks
+        .load(&root_scope.persistence_id())
+        .await
+        .map_err(AgentTaskError::from)?
+    else {
+        return Ok(None);
+    };
+
+    let Some(root_task) = root_record.state.task() else {
+        return Ok(None);
+    };
+    // Qualification: a task that coordinates no goal record, or is bound to a
+    // different goal, answers exactly like an absent goal — a child task id
+    // presented as a goal id must not become an existence oracle.
+    let Some(goal_state) = root_task.goal_state.as_deref() else {
+        return Ok(None);
+    };
+    if root_task.goal.as_ref() != Some(goal) {
+        return Ok(None);
+    }
+    // The owner fence precedes the schema gate and answers from the
+    // already-decoded owner field alone: a schema error is distinguishable
+    // from `Ok(None)` and would hand a non-owner exactly the existence
+    // oracle the deny-is-absent contract forbids.
+    if let Some(principal) = principal {
+        if goal_state.spec().spec().owner != *principal {
+            return Ok(None);
+        }
+    }
+    // The root is the authoritative anchor: unreadable, the whole call fails
+    // closed exactly as the entity's own recovery would.
+    root_record
+        .state
+        .check_schema(policy)
+        .map_err(AgentTaskError::from)?;
+
+    let contract = AgentGoalContractView::derive(goal_state);
+    let root_revision = root_record.revision;
+    let budget = AgentGoalBudgetView {
+        allocation: contract.allocation,
+        root_escrow_allocation: *root_task.escrow.allocation(),
+        root_escrow_consumed: *root_task.escrow.consumed(),
+        root_outstanding_children: root_task.escrow.outstanding().count(),
+        live_consumption: AgentBudgetConsumption::zero(),
+    };
+    let root_state = root_record.state;
+
+    // The claims join depends on nothing the traversal reads, so the two run
+    // concurrently. One reference beyond the cap is requested on purpose: it
+    // is what makes a cut list distinguishable from a complete one.
+    let claims_join = async {
+        match claims {
+            None => (Vec::new(), false, false, None),
+            Some(source) => match source
+                .claims_for_goal(tenant, goal, AGENT_GOAL_VIEW_MAX_CLAIMS + 1)
+                .await
+            {
+                Ok(mut refs) => {
+                    let cut = refs.len() > AGENT_GOAL_VIEW_MAX_CLAIMS;
+                    refs.truncate(AGENT_GOAL_VIEW_MAX_CLAIMS);
+                    (refs, true, cut, None)
+                }
+                // Only the stable code rides the view: the free-text detail
+                // is unbounded backend output, and content never rides an
+                // observability surface.
+                Err(error) => (Vec::new(), false, false, Some(error.code)),
+            },
+        }
+    };
+
+    let traversal = traverse_goal_tree(
+        tasks,
+        runs,
+        tenant,
+        goal,
+        policy,
+        max_tasks,
+        root_state,
+        root_revision,
+        budget,
+    );
+
+    let (traversal, (claim_refs, claims_available, claims_truncated, claims_error_code)) =
+        join(traversal, claims_join).await;
+    let traversal = traversal?;
+
+    Ok(Some(AgentGoalView {
+        tenant: tenant.clone(),
+        goal: goal.clone(),
+        observed_at,
+        root_task: root_task_id,
+        root_revision,
+        records_read: traversal.records_read,
+        truncated: traversal.truncated,
+        omissions: traversal.omissions,
+        contract,
+        cancellation: traversal.cancellation,
+        budget: traversal.budget,
+        tasks: traversal.tasks,
+        runs: traversal.runs,
+        claims: claim_refs,
+        claims_available,
+        claims_truncated,
+        claims_error_code,
+    }))
+}
+
+/// What the bounded breadth-first traversal produced.
+struct GoalViewTraversal {
+    records_read: usize,
+    truncated: bool,
+    omissions: Vec<AgentGoalViewOmission>,
+    cancellation: AgentCancellationProgress,
+    budget: AgentGoalBudgetView,
+    tasks: Vec<AgentGoalTaskNode>,
+    runs: Vec<AgentGoalRunNode>,
+}
+
+/// One assembled node of the current wave, awaiting its run join.
+struct GoalViewWaveNode {
+    /// Index of the node in the assembled task list.
+    node_index: usize,
+    task: AgentTaskId,
+    /// Admitted epoch children, enqueued beside the run's children so the
+    /// frontier keeps the exact order one-at-a-time processing produced.
+    epochs: Vec<AgentTaskId>,
+    run: Option<AgentRunScope>,
+}
+
+/// Records one omission, keeping the list a set: a task the traversal could
+/// not assemble appears once, under the first reason discovered.
+fn push_goal_view_omission(
+    omissions: &mut Vec<AgentGoalViewOmission>,
+    omitted: &mut BTreeSet<AgentTaskId>,
+    task: AgentTaskId,
+    code: &str,
+) {
+    if omitted.insert(task.clone()) {
+        omissions.push(AgentGoalViewOmission {
+            task,
+            code: code.to_string(),
+        });
+    }
+}
+
+/// The bounded breadth-first traversal: waves of entries admitted against
+/// the node budget, each wave's independent store loads issued concurrently.
+///
+/// Admission is optimistic — a wave may hold entries that fail to join and
+/// hand their budget back, and the loop then admits again before truncating —
+/// so the assembled nodes, omissions, and truncation are exactly what
+/// one-at-a-time processing produced while the store round-trips collapse to
+/// two per wave.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn traverse_goal_tree<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    policy: &AgentSchemaPolicy,
+    max_tasks: usize,
+    root_state: AgentTaskState,
+    root_revision: Revision,
+    mut budget: AgentGoalBudgetView,
+) -> AgentGoalViewResult<GoalViewTraversal>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    // The root, read by the caller.
+    let mut records_read = 1_usize;
+    let mut task_nodes: Vec<AgentGoalTaskNode> = Vec::new();
+    let mut run_nodes: Vec<AgentGoalRunNode> = Vec::new();
+    let mut omissions: Vec<AgentGoalViewOmission> = Vec::new();
+    let mut omitted: BTreeSet<AgentTaskId> = BTreeSet::new();
+    let mut truncated = false;
+    let mut visited: BTreeSet<AgentTaskId> = BTreeSet::new();
+    let mut frontier: VecDeque<GoalViewFrontierEntry> = VecDeque::new();
+    let mut root_cancellation = AgentCancellationProgress::NotRequested;
+
+    // The root is processed exactly like every other node, seeded first.
+    let mut wave: Vec<(AgentTaskState, Revision, Option<GoalViewFrontierEntry>)> =
+        vec![(root_state, root_revision, None)];
+
+    loop {
+        let mut wave_nodes: Vec<GoalViewWaveNode> = Vec::new();
+        for (state, revision, entry) in wave.drain(..) {
+            let task_id = state.scope().task().clone();
+            // A duplicate edge admitted into the same wave: an earlier copy
+            // already assembled this task.
+            if visited.contains(&task_id) {
+                continue;
+            }
+            let is_root = entry.is_none();
+            let is_epoch = entry.as_ref().is_some_and(|entry| entry.via.is_none());
+
+            let Some(task) = state.task() else {
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    task_id,
+                    agent_goal_view_omission_code::RECORD_MISSING,
+                );
+                continue;
+            };
+
+            if let Some(entry) = entry.as_ref() {
+                // Linkage fails closed: a child the traversing edge cannot
+                // prove it created is omitted, never joined.
+                if task.goal.as_ref() != Some(goal) {
+                    push_goal_view_omission(
+                        &mut omissions,
+                        &mut omitted,
+                        task_id,
+                        agent_goal_view_omission_code::FOREIGN_GOAL,
+                    );
+                    continue;
+                }
+                match &entry.via {
+                    Some(via) => {
+                        let linked = task.delegation.as_deref().is_some_and(|provenance| {
+                            provenance.delegation == *via && provenance.parent_task == entry.parent
+                        });
+                        if !linked {
+                            push_goal_view_omission(
+                                &mut omissions,
+                                &mut omitted,
+                                task_id,
+                                agent_goal_view_omission_code::UNLINKED_PROVENANCE,
+                            );
+                            continue;
+                        }
+                    }
+                    None => {
+                        if task.wake.is_none() {
+                            push_goal_view_omission(
+                                &mut omissions,
+                                &mut omitted,
+                                task_id,
+                                agent_goal_view_omission_code::UNLINKED_PROVENANCE,
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            visited.insert(task_id.clone());
+            // A task that failed to join through one edge and now joined
+            // through another must not read as both assembled and omitted.
+            if omitted.remove(&task_id) {
+                omissions.retain(|omission| omission.task != task_id);
+            }
+
+            let snapshot = state.snapshot();
+            let cancellation = snapshot
+                .as_ref()
+                .map_or(AgentCancellationProgress::NotRequested, |snapshot| {
+                    AgentCancellationProgress::derive_task(snapshot)
+                });
+            if is_root {
+                root_cancellation = cancellation;
+            }
+
+            task_nodes.push(AgentGoalTaskNode {
+                revision,
+                scope: state.scope().clone(),
+                parent: task.parent.clone(),
+                created_by_delegation: task
+                    .delegation
+                    .as_deref()
+                    .map(|provenance| provenance.delegation.clone()),
+                depth: task
+                    .delegation
+                    .as_deref()
+                    .map_or(0, |provenance| provenance.depth),
+                is_root,
+                is_epoch,
+                status: task.status,
+                cancellation,
+                assignment: task
+                    .assignment
+                    .as_ref()
+                    .map(|assignment| AgentGoalAssignmentView {
+                        generation: assignment.generation,
+                        agent: assignment.agent.clone(),
+                        run: assignment.run.clone(),
+                        status: assignment.status,
+                        assigned_at: assignment.assigned_at,
+                    }),
+                assignment_generation: task.assignment_generation,
+                assignments: task.assignments,
+                run_omission: None,
+                outstanding_escrow: task.escrow.outstanding().count(),
+                escrow_allocation: *task.escrow.allocation(),
+                escrow_consumed: *task.escrow.consumed(),
+                has_accepted_result: task.accepted_result.is_some(),
+                terminal_reason: task.terminal_reason.clone(),
+                rejection_count: task.rejection_count,
+                updated_at: snapshot.as_ref().map_or(task.created_at, |s| s.updated_at),
+            });
+
+            // A continuous root's admitted epochs are reachable children too.
+            let epochs = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.wake.as_ref())
+                .map_or_else(Vec::new, |wake| {
+                    wake.epochs.iter().map(|epoch| epoch.task.clone()).collect()
+                });
+
+            // The current assignment resolves the node's run. A decided task
+            // whose assignment was cleared by result acceptance still names
+            // its serving agent and its highest generation, so the *last*
+            // run's identity re-derives exactly as assignment creation
+            // derived it — a completed goal must still reconstruct its tree.
+            // A standing refusal proves the opposite: deciding a generation
+            // clears `last_refusal`, so one on record means the highest
+            // generation was refused and no accepted run record exists to
+            // re-derive — a between-assignments task, not an anomaly.
+            // Generations before the highest stay an explicit gap.
+            let resolved_run = match task.assignment.as_ref() {
+                Some(assignment) => Some((assignment.agent.clone(), assignment.run.clone())),
+                None if task.last_refusal.is_some() => None,
+                None => match (&task.assignee, task.assignment_generation) {
+                    (Some(assignee), generation)
+                        if generation != AgentAssignmentGeneration::UNASSIGNED =>
+                    {
+                        crate::task::run_id_for_assignment(&task_id, generation)
+                            .ok()
+                            .map(|run| (assignee.clone(), run))
+                    }
+                    _ => None,
+                },
+            };
+            let run = match resolved_run {
+                Some((run_agent, run_id)) => {
+                    Some(AgentRunScope::new(tenant.clone(), run_agent, run_id)?)
+                }
+                None => None,
+            };
+            wave_nodes.push(GoalViewWaveNode {
+                node_index: task_nodes.len() - 1,
+                task: task_id,
+                epochs,
+                run,
+            });
+        }
+
+        // One concurrent round-trip joins the whole wave's runs.
+        let run_ids: Vec<Option<_>> = wave_nodes
+            .iter()
+            .map(|node| node.run.as_ref().map(|scope| scope.persistence_id()))
+            .collect();
+        let run_records = join_all(run_ids.iter().map(|id| async move {
+            match id {
+                None => Ok(None),
+                Some(id) => runs.load(id).await,
+            }
+        }))
+        .await;
+
+        for (node, loaded) in wave_nodes.into_iter().zip(run_records) {
+            for epoch in node.epochs {
+                frontier.push_back(GoalViewFrontierEntry {
+                    task: epoch,
+                    parent: node.task.clone(),
+                    via: None,
+                });
+            }
+            let Some(run_scope) = node.run else {
+                continue;
+            };
+            let run_record = match loaded {
+                Ok(record) => record,
+                Err(error) => return Err(AgentRunError::from(error).into()),
+            };
+            let Some(run_record) = run_record else {
+                task_nodes[node.node_index].run_omission =
+                    Some(agent_goal_view_omission_code::RUN_RECORD_MISSING.to_string());
+                continue;
+            };
+            records_read += 1;
+            if run_record.state.check_schema(policy).is_err() {
+                task_nodes[node.node_index].run_omission =
+                    Some(agent_goal_view_omission_code::RUN_SCHEMA_UNSUPPORTED.to_string());
+                continue;
+            }
+            let Some(run) = run_record.state.run() else {
+                task_nodes[node.node_index].run_omission =
+                    Some(agent_goal_view_omission_code::RUN_NOT_ACCEPTED.to_string());
+                continue;
+            };
+            let run_node = AgentGoalRunNode::derive(run, run_scope, run_record.revision);
+            if run_node.settlement == AgentRunSettlementStatus::Owed {
+                budget.live_consumption = budget
+                    .live_consumption
+                    .saturating_add(run_node.budget.consumption());
+            }
+            for edge in &run_node.collaboration.delegations {
+                if let AgentDelegationStatus::ChildCreated { child_task, .. } = &edge.status {
+                    frontier.push_back(GoalViewFrontierEntry {
+                        task: child_task.clone(),
+                        parent: node.task.clone(),
+                        via: Some(edge.delegation.clone()),
+                    });
+                }
+            }
+            run_nodes.push(run_node);
+        }
+
+        // Admit the next wave against what the node budget still allows.
+        let budget_left = max_tasks.saturating_sub(task_nodes.len());
+        if budget_left == 0 {
+            for remaining in frontier.drain(..) {
+                if visited.contains(&remaining.task) {
+                    continue;
+                }
+                truncated = true;
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    remaining.task,
+                    agent_goal_view_omission_code::NODE_BUDGET_EXHAUSTED,
+                );
+            }
+            break;
+        }
+        let mut admitted: Vec<GoalViewFrontierEntry> = Vec::new();
+        while admitted.len() < budget_left {
+            let Some(entry) = frontier.pop_front() else {
+                break;
+            };
+            if visited.contains(&entry.task) {
+                continue;
+            }
+            admitted.push(entry);
+        }
+        if admitted.is_empty() {
+            break;
+        }
+
+        // One concurrent round-trip loads the whole admitted wave.
+        let mut task_ids = Vec::with_capacity(admitted.len());
+        for entry in &admitted {
+            task_ids
+                .push(AgentTaskScope::new(tenant.clone(), entry.task.clone())?.persistence_id());
+        }
+        let records = join_all(task_ids.iter().map(|id| tasks.load(id))).await;
+        for (entry, record) in admitted.into_iter().zip(records) {
+            let record = match record {
+                Ok(record) => record,
+                Err(error) => return Err(AgentTaskError::from(error).into()),
+            };
+            let Some(record) = record else {
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    entry.task,
+                    agent_goal_view_omission_code::RECORD_MISSING,
+                );
+                continue;
+            };
+            records_read += 1;
+            if record.state.check_schema(policy).is_err() {
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    entry.task,
+                    agent_goal_view_omission_code::SCHEMA_UNSUPPORTED,
+                );
+                continue;
+            }
+            wave.push((record.state, record.revision, Some(entry)));
+        }
+    }
+
+    Ok(GoalViewTraversal {
+        records_read,
+        truncated,
+        omissions,
+        cancellation: root_cancellation,
+        budget,
+        tasks: task_nodes,
+        runs: run_nodes,
+    })
 }

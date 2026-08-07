@@ -4757,7 +4757,8 @@ fn owed_epoch_result(
 /// A child's terminal state is evidence returned to the parent — never a goal
 /// decision, and never the child's content: the digest fingerprints the
 /// accepted result, and the child task id is the authorized-query handle for
-/// anything more.
+/// anything more ([`crate::query::authorized_agent_goal_view`] assembles the
+/// goal-wide view those handles key into).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentDelegationReport {
     /// The delegation whose child reports.
