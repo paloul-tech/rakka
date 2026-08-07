@@ -49,8 +49,9 @@ pub struct AcceptanceReport {
 }
 
 /// The exact transcript one acceptance walk prints, one line per milestone
-/// bullet. `tests/acceptance.rs` asserts the produced lines equal this, and
-/// the README quotes it verbatim — a single source for all three.
+/// bullet. The walk assigns each line from this array once its asserts have
+/// proven the line's facts, and `tests/acceptance.rs` pins the README's
+/// quoted block to it — the transcript has exactly one source.
 pub const EXPECTED_TRANSCRIPT: &[&str] = &[
     "ok  1/18 three agents instantiated; the goal-bearing root created: goal Active with an evaluator, two specialist skills, one versioned workflow tool, one shared knowledge space",
     "ok  2/18 one turn committed the fan-out atomically: 2 delegation records, 1 workflow invocation, a closed 3-member fan-in group",

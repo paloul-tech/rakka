@@ -41,8 +41,9 @@ impl KnowledgeGraphGoalClaimSource {
         }
     }
 
-    /// Adds one knowledge space the source joins claims from, in the order
-    /// spaces were added.
+    /// Adds one knowledge space the source joins claims from. The joined
+    /// references merge in stable claim-id order, so the order spaces are
+    /// added never decides which claims a bounded read carries.
     #[must_use]
     pub fn with_space(mut self, space: KnowledgeSpaceId) -> Self {
         self.spaces.push(space);
@@ -67,16 +68,19 @@ impl AgentGoalClaimSource for KnowledgeGraphGoalClaimSource {
     ) -> AgentGoalClaimFuture<'a> {
         Box::pin(async move {
             let filter = ClaimFilter::matching_all().with_goal(goal.clone());
+            // Every space answers its own prefix: up to `limit` claims in the
+            // store SPI's ascending claim-id order. The first `limit` of the
+            // merged whole are always inside the union of those prefixes, so
+            // the sort below yields the trait's stable claim-id order without
+            // a bounded read ever starving a later-added space.
             let mut refs: Vec<AgentGoalClaimRef> = Vec::new();
             for space in &self.spaces {
-                if refs.len() >= limit {
-                    break;
-                }
                 let scope =
                     KnowledgeSpaceScope::new(tenant.clone(), space.clone()).map_err(|error| {
                         AgentGoalClaimSourceError::new(error.code(), error.to_string())
                     })?;
-                let mut cursor = ClaimCursor::start().with_limit(limit - refs.len());
+                let mut collected = 0_usize;
+                let mut cursor = ClaimCursor::start().with_limit(limit);
                 loop {
                     let page = self
                         .store
@@ -84,7 +88,7 @@ impl AgentGoalClaimSource for KnowledgeGraphGoalClaimSource {
                         .await
                         .map_err(|error| source_error(&error))?;
                     for claim in page.claims {
-                        if refs.len() >= limit {
+                        if collected >= limit {
                             break;
                         }
                         let claim_id = AgentCommunalClaimId::new(claim.claim_id.as_str()).map_err(
@@ -105,15 +109,18 @@ impl AgentGoalClaimSource for KnowledgeGraphGoalClaimSource {
                             reference = reference.with_delegation(delegation);
                         }
                         refs.push(reference);
+                        collected += 1;
                     }
                     match page.next {
-                        Some(next) if refs.len() < limit => {
-                            cursor = next.with_limit(limit - refs.len());
+                        Some(next) if collected < limit => {
+                            cursor = next.with_limit(limit - collected);
                         }
                         _ => break,
                     }
                 }
             }
+            refs.sort_by(|a, b| a.claim.cmp(&b.claim).then_with(|| a.space.cmp(&b.space)));
+            refs.truncate(limit);
             Ok(refs)
         })
     }

@@ -29,6 +29,8 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
+use futures_util::future::{join, join_all};
+
 use rakka_agent_workflow::{
     AgentEffectId, AgentRunId as WorkflowRunId, AgentTelemetryContext, AgentTimestampMillis,
     ArtifactRef, HumanCheckpointId, PrincipalRef, WorkflowDefinitionVersion,
@@ -1064,16 +1066,23 @@ pub const AGENT_GOAL_VIEW_MAX_TASKS: usize = 64;
 /// Most joined claim references one goal view carries.
 pub const AGENT_GOAL_VIEW_MAX_CLAIMS: usize = 64;
 
-/// Stable omission codes of [`AgentGoalViewOmission`].
+/// Stable omission codes of the goal view: the reasons
+/// [`AgentGoalViewOmission`] records for a task that did not assemble, and
+/// [`AgentGoalTaskNode::run_omission`] records for a resolved run that did
+/// not join.
 pub mod agent_goal_view_omission_code {
     /// A created child's task record does not exist in the store.
     pub const RECORD_MISSING: &str = "record-missing";
-    /// The task's assignment names a run whose record does not exist.
+    /// The task's resolved run has no record in the store.
     pub const RUN_RECORD_MISSING: &str = "run-record-missing";
     /// The run record exists but the run never durably accepted.
     pub const RUN_NOT_ACCEPTED: &str = "run-not-accepted";
-    /// The record's schema version is not readable under the caller's policy.
+    /// The task record's schema version is not readable under the caller's
+    /// policy.
     pub const SCHEMA_UNSUPPORTED: &str = "schema-unsupported";
+    /// The run record's schema version is not readable under the caller's
+    /// policy.
+    pub const RUN_SCHEMA_UNSUPPORTED: &str = "run-schema-unsupported";
     /// The child's recorded provenance does not name the edge that reached
     /// it: the linkage fails closed rather than joining a forged child.
     pub const UNLINKED_PROVENANCE: &str = "unlinked-provenance";
@@ -1089,7 +1098,9 @@ pub mod agent_goal_view_omission_code {
 /// Omissions are how the view stays honest without failing whole: a missing
 /// record, an unreadable schema, a forged linkage, or an exhausted node
 /// budget marks its task here, and only the *root* record failing fails the
-/// call.
+/// call. A task appears at most once, and never both here and in
+/// [`AgentGoalView::tasks`] — a run that fails to join marks its assembled
+/// task's [`AgentGoalTaskNode::run_omission`] instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentGoalViewOmission {
@@ -1234,6 +1245,12 @@ pub struct AgentGoalTaskNode {
     pub assignment_generation: AgentAssignmentGeneration,
     /// How many assignment generations the task has consumed.
     pub assignments: u32,
+    /// Why the resolved run did not join ([`agent_goal_view_omission_code`]),
+    /// when it did not. Children are discovered through the run's delegation
+    /// cells, so a marker here also means this node's delegated subtree is
+    /// unknown rather than absent — the escrow counters still witness
+    /// anything outstanding below it.
+    pub run_omission: Option<String>,
     /// Escrow children the task still holds open — the cancellation
     /// finalization gate ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     pub outstanding_escrow: usize,
@@ -1516,6 +1533,14 @@ pub struct AgentGoalView {
     /// [`Self::claims`] means the join is degraded or unwired, never that no
     /// claims exist.
     pub claims_available: bool,
+    /// Whether the claim join was cut at [`AGENT_GOAL_VIEW_MAX_CLAIMS`]: the
+    /// source held more references than the view carries.
+    pub claims_truncated: bool,
+    /// The stable code the claim source failed with when the join degraded —
+    /// [`AgentGoalClaimSourceError::code`], never its free-text detail.
+    /// `None` beside a `false` [`Self::claims_available`] means no source is
+    /// wired at all.
+    pub claims_error_code: Option<String>,
 }
 
 /// Error raised assembling a goal view, attributed to the store that failed.
@@ -1599,19 +1624,24 @@ struct GoalViewFrontierEntry {
 /// goal, which answers identically so the view never turns a goal id probe
 /// into an existence oracle for tasks.
 ///
-/// The traversal is breadth-first from the root task: each task's current
-/// assignment resolves its run, each run's `ChildCreated` delegation cells
-/// resolve its children, and a continuous root's admitted epochs join from
-/// the wake controller's status view. Children that cannot be joined
-/// honestly — missing records, unreadable schemas, provenance that does not
-/// name the traversing edge, foreign goal bindings — become
-/// [`AgentGoalViewOmission`]s rather than failures; only the root record
-/// failing fails the call. At most [`AGENT_GOAL_VIEW_MAX_TASKS`] task nodes
+/// The traversal is breadth-first from the root task, each wave of
+/// independent records loaded concurrently: each task's current assignment
+/// resolves its run, each run's `ChildCreated` delegation cells resolve its
+/// children, and a continuous root's admitted epochs join from the wake
+/// controller's status view. Children that cannot be joined honestly —
+/// missing records, unreadable schemas, provenance that does not name the
+/// traversing edge, foreign goal bindings — become
+/// [`AgentGoalViewOmission`]s rather than failures; a resolved run that
+/// cannot be joined marks its assembled task's
+/// [`AgentGoalTaskNode::run_omission`] instead; only the root record failing
+/// fails the call. At most [`AGENT_GOAL_VIEW_MAX_TASKS`] task nodes
 /// assemble; the rest truncate with explicit omissions.
 ///
 /// `claims` joins shared-knowledge references when a source is wired; an
 /// absent or failing source leaves [`AgentGoalView::claims_available`]
-/// `false` with the durable half of the view intact.
+/// `false` with the durable half of the view intact, a failure's stable code
+/// on [`AgentGoalView::claims_error_code`], and a join cut at
+/// [`AGENT_GOAL_VIEW_MAX_CLAIMS`] sets [`AgentGoalView::claims_truncated`].
 pub async fn assemble_agent_goal_view<Tasks, Runs>(
     tasks: &Tasks,
     runs: &Runs,
@@ -1683,9 +1713,13 @@ where
 /// missing goal, so authorization never leaks existence
 /// ([specification 16](../../../docs/plans/rakka-agent/spec.md)) — and the
 /// denial short-circuits after the root read alone: no fan-out happens on
-/// behalf of an unauthorized caller. Richer role- or boundary-based policy
-/// belongs to the surface that fronts [`assemble_agent_goal_view`], exactly
-/// as the A2A service authorizes its operations.
+/// behalf of an unauthorized caller. The fence is decided before the root
+/// schema gate, from the already-decoded owner field, so even a root record
+/// unreadable under the caller's schema policy answers a non-owner with
+/// `Ok(None)` rather than a distinguishable error. Richer role- or
+/// boundary-based policy belongs to the surface that fronts
+/// [`assemble_agent_goal_view`], exactly as the A2A service authorizes its
+/// operations.
 #[allow(clippy::too_many_arguments)]
 pub async fn authorized_agent_goal_view<Tasks, Runs>(
     tasks: &Tasks,
@@ -1715,7 +1749,7 @@ where
     .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn assemble_goal_view_gated<Tasks, Runs>(
     tasks: &Tasks,
     runs: &Runs,
@@ -1744,13 +1778,6 @@ where
     else {
         return Ok(None);
     };
-    // The root is the authoritative anchor: unreadable, the whole call fails
-    // closed exactly as the entity's own recovery would.
-    root_record
-        .state
-        .check_schema(policy)
-        .map_err(AgentTaskError::from)?;
-    let mut records_read = 1_usize;
 
     let Some(root_task) = root_record.state.task() else {
         return Ok(None);
@@ -1764,270 +1791,71 @@ where
     if root_task.goal.as_ref() != Some(goal) {
         return Ok(None);
     }
+    // The owner fence precedes the schema gate and answers from the
+    // already-decoded owner field alone: a schema error is distinguishable
+    // from `Ok(None)` and would hand a non-owner exactly the existence
+    // oracle the deny-is-absent contract forbids.
     if let Some(principal) = principal {
         if goal_state.spec().spec().owner != *principal {
             return Ok(None);
         }
     }
+    // The root is the authoritative anchor: unreadable, the whole call fails
+    // closed exactly as the entity's own recovery would.
+    root_record
+        .state
+        .check_schema(policy)
+        .map_err(AgentTaskError::from)?;
 
     let contract = AgentGoalContractView::derive(goal_state);
     let root_revision = root_record.revision;
-
-    let mut task_nodes: Vec<AgentGoalTaskNode> = Vec::new();
-    let mut run_nodes: Vec<AgentGoalRunNode> = Vec::new();
-    let mut omissions: Vec<AgentGoalViewOmission> = Vec::new();
-    let mut truncated = false;
-    let mut visited: BTreeSet<AgentTaskId> = BTreeSet::new();
-    let mut frontier: VecDeque<GoalViewFrontierEntry> = VecDeque::new();
-    let mut root_cancellation = AgentCancellationProgress::NotRequested;
-    let mut budget = AgentGoalBudgetView {
+    let budget = AgentGoalBudgetView {
         allocation: contract.allocation,
         root_escrow_allocation: *root_task.escrow.allocation(),
         root_escrow_consumed: *root_task.escrow.consumed(),
         root_outstanding_children: root_task.escrow.outstanding().count(),
         live_consumption: AgentBudgetConsumption::zero(),
     };
+    let root_state = root_record.state;
 
-    // The root is processed exactly like every other node, seeded first.
-    let mut pending: Option<(AgentTaskState, Revision, Option<GoalViewFrontierEntry>)> =
-        Some((root_record.state, root_revision, None));
-
-    loop {
-        let (state, revision, entry) = match pending.take() {
-            Some(root) => root,
-            None => {
-                let Some(entry) = frontier.pop_front() else {
-                    break;
-                };
-                if visited.contains(&entry.task) {
-                    continue;
+    // The claims join depends on nothing the traversal reads, so the two run
+    // concurrently. One reference beyond the cap is requested on purpose: it
+    // is what makes a cut list distinguishable from a complete one.
+    let claims_join = async {
+        match claims {
+            None => (Vec::new(), false, false, None),
+            Some(source) => match source
+                .claims_for_goal(tenant, goal, AGENT_GOAL_VIEW_MAX_CLAIMS + 1)
+                .await
+            {
+                Ok(mut refs) => {
+                    let cut = refs.len() > AGENT_GOAL_VIEW_MAX_CLAIMS;
+                    refs.truncate(AGENT_GOAL_VIEW_MAX_CLAIMS);
+                    (refs, true, cut, None)
                 }
-                if task_nodes.len() >= max_tasks {
-                    truncated = true;
-                    omissions.push(AgentGoalViewOmission {
-                        task: entry.task,
-                        code: agent_goal_view_omission_code::NODE_BUDGET_EXHAUSTED.to_string(),
-                    });
-                    for remaining in frontier.drain(..) {
-                        omissions.push(AgentGoalViewOmission {
-                            task: remaining.task,
-                            code: agent_goal_view_omission_code::NODE_BUDGET_EXHAUSTED.to_string(),
-                        });
-                    }
-                    break;
-                }
-                let scope = AgentTaskScope::new(tenant.clone(), entry.task.clone())?;
-                let record = match tasks.load(&scope.persistence_id()).await {
-                    Ok(record) => record,
-                    Err(error) => return Err(AgentTaskError::from(error).into()),
-                };
-                let Some(record) = record else {
-                    omissions.push(AgentGoalViewOmission {
-                        task: entry.task,
-                        code: agent_goal_view_omission_code::RECORD_MISSING.to_string(),
-                    });
-                    continue;
-                };
-                records_read += 1;
-                if record.state.check_schema(policy).is_err() {
-                    omissions.push(AgentGoalViewOmission {
-                        task: entry.task,
-                        code: agent_goal_view_omission_code::SCHEMA_UNSUPPORTED.to_string(),
-                    });
-                    continue;
-                }
-                (record.state, record.revision, Some(entry))
-            }
-        };
-
-        let task_id = state.scope().task().clone();
-        let is_root = entry.is_none();
-        let is_epoch = entry.as_ref().is_some_and(|entry| entry.via.is_none());
-
-        let Some(task) = state.task() else {
-            omissions.push(AgentGoalViewOmission {
-                task: task_id,
-                code: agent_goal_view_omission_code::RECORD_MISSING.to_string(),
-            });
-            continue;
-        };
-
-        if let Some(entry) = entry.as_ref() {
-            // Linkage fails closed: a child the traversing edge cannot prove
-            // it created is omitted, never joined.
-            if task.goal.as_ref() != Some(goal) {
-                omissions.push(AgentGoalViewOmission {
-                    task: task_id,
-                    code: agent_goal_view_omission_code::FOREIGN_GOAL.to_string(),
-                });
-                continue;
-            }
-            match &entry.via {
-                Some(via) => {
-                    let linked = task.delegation.as_deref().is_some_and(|provenance| {
-                        provenance.delegation == *via && provenance.parent_task == entry.parent
-                    });
-                    if !linked {
-                        omissions.push(AgentGoalViewOmission {
-                            task: task_id,
-                            code: agent_goal_view_omission_code::UNLINKED_PROVENANCE.to_string(),
-                        });
-                        continue;
-                    }
-                }
-                None => {
-                    if task.wake.is_none() {
-                        omissions.push(AgentGoalViewOmission {
-                            task: task_id,
-                            code: agent_goal_view_omission_code::UNLINKED_PROVENANCE.to_string(),
-                        });
-                        continue;
-                    }
-                }
-            }
-        }
-
-        visited.insert(task_id.clone());
-
-        let snapshot = state.snapshot();
-        let cancellation = snapshot
-            .as_ref()
-            .map_or(AgentCancellationProgress::NotRequested, |snapshot| {
-                AgentCancellationProgress::derive_task(snapshot)
-            });
-        if is_root {
-            root_cancellation = cancellation;
-        }
-
-        task_nodes.push(AgentGoalTaskNode {
-            revision,
-            scope: state.scope().clone(),
-            parent: task.parent.clone(),
-            created_by_delegation: task
-                .delegation
-                .as_deref()
-                .map(|provenance| provenance.delegation.clone()),
-            depth: task
-                .delegation
-                .as_deref()
-                .map_or(0, |provenance| provenance.depth),
-            is_root,
-            is_epoch,
-            status: task.status,
-            cancellation,
-            assignment: task
-                .assignment
-                .as_ref()
-                .map(|assignment| AgentGoalAssignmentView {
-                    generation: assignment.generation,
-                    agent: assignment.agent.clone(),
-                    run: assignment.run.clone(),
-                    status: assignment.status,
-                    assigned_at: assignment.assigned_at,
-                }),
-            assignment_generation: task.assignment_generation,
-            assignments: task.assignments,
-            outstanding_escrow: task.escrow.outstanding().count(),
-            escrow_allocation: *task.escrow.allocation(),
-            escrow_consumed: *task.escrow.consumed(),
-            has_accepted_result: task.accepted_result.is_some(),
-            terminal_reason: task.terminal_reason.clone(),
-            rejection_count: task.rejection_count,
-            updated_at: snapshot.as_ref().map_or(task.created_at, |s| s.updated_at),
-        });
-
-        // A continuous root's admitted epochs are reachable children too.
-        if let Some(wake) = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.wake.as_ref())
-        {
-            for epoch in &wake.epochs {
-                frontier.push_back(GoalViewFrontierEntry {
-                    task: epoch.task.clone(),
-                    parent: task_id.clone(),
-                    via: None,
-                });
-            }
-        }
-
-        // The current assignment resolves the node's run. A decided task
-        // whose assignment was cleared by result acceptance still names its
-        // serving agent and its highest generation, so the *last* run's
-        // identity re-derives exactly as assignment creation derived it —
-        // a completed goal must still reconstruct its tree. Generations
-        // before the highest stay an explicit gap.
-        let resolved_run = match task.assignment.as_ref() {
-            Some(assignment) => Some((assignment.agent.clone(), assignment.run.clone())),
-            None => match (&task.assignee, task.assignment_generation) {
-                (Some(assignee), generation)
-                    if generation != crate::task::AgentAssignmentGeneration::UNASSIGNED =>
-                {
-                    crate::task::run_id_for_assignment(&task_id, generation)
-                        .ok()
-                        .map(|run| (assignee.clone(), run))
-                }
-                _ => None,
+                // Only the stable code rides the view: the free-text detail
+                // is unbounded backend output, and content never rides an
+                // observability surface.
+                Err(error) => (Vec::new(), false, false, Some(error.code)),
             },
-        };
-        let Some((run_agent, run_id)) = resolved_run else {
-            continue;
-        };
-        let run_scope = AgentRunScope::new(tenant.clone(), run_agent, run_id)?;
-        let run_record = match runs.load(&run_scope.persistence_id()).await {
-            Ok(record) => record,
-            Err(error) => return Err(AgentRunError::from(error).into()),
-        };
-        let Some(run_record) = run_record else {
-            omissions.push(AgentGoalViewOmission {
-                task: task_id,
-                code: agent_goal_view_omission_code::RUN_RECORD_MISSING.to_string(),
-            });
-            continue;
-        };
-        records_read += 1;
-        if run_record.state.check_schema(policy).is_err() {
-            omissions.push(AgentGoalViewOmission {
-                task: task_id,
-                code: agent_goal_view_omission_code::SCHEMA_UNSUPPORTED.to_string(),
-            });
-            continue;
         }
-        let Some(run) = run_record.state.run() else {
-            omissions.push(AgentGoalViewOmission {
-                task: task_id,
-                code: agent_goal_view_omission_code::RUN_NOT_ACCEPTED.to_string(),
-            });
-            continue;
-        };
-        let node = AgentGoalRunNode::derive(run, run_scope, run_record.revision);
-        if node.settlement == AgentRunSettlementStatus::Owed {
-            add_consumption(&mut budget.live_consumption, node.budget.consumption());
-        }
-        for edge in &node.collaboration.delegations {
-            if let AgentDelegationStatus::ChildCreated { child_task, .. } = &edge.status {
-                frontier.push_back(GoalViewFrontierEntry {
-                    task: child_task.clone(),
-                    parent: task_id.clone(),
-                    via: Some(edge.delegation.clone()),
-                });
-            }
-        }
-        run_nodes.push(node);
-    }
-
-    let (claim_refs, claims_available) = match claims {
-        None => (Vec::new(), false),
-        Some(source) => match source
-            .claims_for_goal(tenant, goal, AGENT_GOAL_VIEW_MAX_CLAIMS)
-            .await
-        {
-            Ok(mut refs) => {
-                refs.truncate(AGENT_GOAL_VIEW_MAX_CLAIMS);
-                (refs, true)
-            }
-            Err(_) => (Vec::new(), false),
-        },
     };
+
+    let traversal = traverse_goal_tree(
+        tasks,
+        runs,
+        tenant,
+        goal,
+        policy,
+        max_tasks,
+        root_state,
+        root_revision,
+        budget,
+    );
+
+    let (traversal, (claim_refs, claims_available, claims_truncated, claims_error_code)) =
+        join(traversal, claims_join).await;
+    let traversal = traversal?;
 
     Ok(Some(AgentGoalView {
         tenant: tenant.clone(),
@@ -2035,32 +1863,397 @@ where
         observed_at,
         root_task: root_task_id,
         root_revision,
+        records_read: traversal.records_read,
+        truncated: traversal.truncated,
+        omissions: traversal.omissions,
+        contract,
+        cancellation: traversal.cancellation,
+        budget: traversal.budget,
+        tasks: traversal.tasks,
+        runs: traversal.runs,
+        claims: claim_refs,
+        claims_available,
+        claims_truncated,
+        claims_error_code,
+    }))
+}
+
+/// What the bounded breadth-first traversal produced.
+struct GoalViewTraversal {
+    records_read: usize,
+    truncated: bool,
+    omissions: Vec<AgentGoalViewOmission>,
+    cancellation: AgentCancellationProgress,
+    budget: AgentGoalBudgetView,
+    tasks: Vec<AgentGoalTaskNode>,
+    runs: Vec<AgentGoalRunNode>,
+}
+
+/// One assembled node of the current wave, awaiting its run join.
+struct GoalViewWaveNode {
+    /// Index of the node in the assembled task list.
+    node_index: usize,
+    task: AgentTaskId,
+    /// Admitted epoch children, enqueued beside the run's children so the
+    /// frontier keeps the exact order one-at-a-time processing produced.
+    epochs: Vec<AgentTaskId>,
+    run: Option<AgentRunScope>,
+}
+
+/// Records one omission, keeping the list a set: a task the traversal could
+/// not assemble appears once, under the first reason discovered.
+fn push_goal_view_omission(
+    omissions: &mut Vec<AgentGoalViewOmission>,
+    omitted: &mut BTreeSet<AgentTaskId>,
+    task: AgentTaskId,
+    code: &str,
+) {
+    if omitted.insert(task.clone()) {
+        omissions.push(AgentGoalViewOmission {
+            task,
+            code: code.to_string(),
+        });
+    }
+}
+
+/// The bounded breadth-first traversal: waves of entries admitted against
+/// the node budget, each wave's independent store loads issued concurrently.
+///
+/// Admission is optimistic — a wave may hold entries that fail to join and
+/// hand their budget back, and the loop then admits again before truncating —
+/// so the assembled nodes, omissions, and truncation are exactly what
+/// one-at-a-time processing produced while the store round-trips collapse to
+/// two per wave.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn traverse_goal_tree<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    policy: &AgentSchemaPolicy,
+    max_tasks: usize,
+    root_state: AgentTaskState,
+    root_revision: Revision,
+    mut budget: AgentGoalBudgetView,
+) -> AgentGoalViewResult<GoalViewTraversal>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    // The root, read by the caller.
+    let mut records_read = 1_usize;
+    let mut task_nodes: Vec<AgentGoalTaskNode> = Vec::new();
+    let mut run_nodes: Vec<AgentGoalRunNode> = Vec::new();
+    let mut omissions: Vec<AgentGoalViewOmission> = Vec::new();
+    let mut omitted: BTreeSet<AgentTaskId> = BTreeSet::new();
+    let mut truncated = false;
+    let mut visited: BTreeSet<AgentTaskId> = BTreeSet::new();
+    let mut frontier: VecDeque<GoalViewFrontierEntry> = VecDeque::new();
+    let mut root_cancellation = AgentCancellationProgress::NotRequested;
+
+    // The root is processed exactly like every other node, seeded first.
+    let mut wave: Vec<(AgentTaskState, Revision, Option<GoalViewFrontierEntry>)> =
+        vec![(root_state, root_revision, None)];
+
+    loop {
+        let mut wave_nodes: Vec<GoalViewWaveNode> = Vec::new();
+        for (state, revision, entry) in wave.drain(..) {
+            let task_id = state.scope().task().clone();
+            // A duplicate edge admitted into the same wave: an earlier copy
+            // already assembled this task.
+            if visited.contains(&task_id) {
+                continue;
+            }
+            let is_root = entry.is_none();
+            let is_epoch = entry.as_ref().is_some_and(|entry| entry.via.is_none());
+
+            let Some(task) = state.task() else {
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    task_id,
+                    agent_goal_view_omission_code::RECORD_MISSING,
+                );
+                continue;
+            };
+
+            if let Some(entry) = entry.as_ref() {
+                // Linkage fails closed: a child the traversing edge cannot
+                // prove it created is omitted, never joined.
+                if task.goal.as_ref() != Some(goal) {
+                    push_goal_view_omission(
+                        &mut omissions,
+                        &mut omitted,
+                        task_id,
+                        agent_goal_view_omission_code::FOREIGN_GOAL,
+                    );
+                    continue;
+                }
+                match &entry.via {
+                    Some(via) => {
+                        let linked = task.delegation.as_deref().is_some_and(|provenance| {
+                            provenance.delegation == *via && provenance.parent_task == entry.parent
+                        });
+                        if !linked {
+                            push_goal_view_omission(
+                                &mut omissions,
+                                &mut omitted,
+                                task_id,
+                                agent_goal_view_omission_code::UNLINKED_PROVENANCE,
+                            );
+                            continue;
+                        }
+                    }
+                    None => {
+                        if task.wake.is_none() {
+                            push_goal_view_omission(
+                                &mut omissions,
+                                &mut omitted,
+                                task_id,
+                                agent_goal_view_omission_code::UNLINKED_PROVENANCE,
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            visited.insert(task_id.clone());
+            // A task that failed to join through one edge and now joined
+            // through another must not read as both assembled and omitted.
+            if omitted.remove(&task_id) {
+                omissions.retain(|omission| omission.task != task_id);
+            }
+
+            let snapshot = state.snapshot();
+            let cancellation = snapshot
+                .as_ref()
+                .map_or(AgentCancellationProgress::NotRequested, |snapshot| {
+                    AgentCancellationProgress::derive_task(snapshot)
+                });
+            if is_root {
+                root_cancellation = cancellation;
+            }
+
+            task_nodes.push(AgentGoalTaskNode {
+                revision,
+                scope: state.scope().clone(),
+                parent: task.parent.clone(),
+                created_by_delegation: task
+                    .delegation
+                    .as_deref()
+                    .map(|provenance| provenance.delegation.clone()),
+                depth: task
+                    .delegation
+                    .as_deref()
+                    .map_or(0, |provenance| provenance.depth),
+                is_root,
+                is_epoch,
+                status: task.status,
+                cancellation,
+                assignment: task
+                    .assignment
+                    .as_ref()
+                    .map(|assignment| AgentGoalAssignmentView {
+                        generation: assignment.generation,
+                        agent: assignment.agent.clone(),
+                        run: assignment.run.clone(),
+                        status: assignment.status,
+                        assigned_at: assignment.assigned_at,
+                    }),
+                assignment_generation: task.assignment_generation,
+                assignments: task.assignments,
+                run_omission: None,
+                outstanding_escrow: task.escrow.outstanding().count(),
+                escrow_allocation: *task.escrow.allocation(),
+                escrow_consumed: *task.escrow.consumed(),
+                has_accepted_result: task.accepted_result.is_some(),
+                terminal_reason: task.terminal_reason.clone(),
+                rejection_count: task.rejection_count,
+                updated_at: snapshot.as_ref().map_or(task.created_at, |s| s.updated_at),
+            });
+
+            // A continuous root's admitted epochs are reachable children too.
+            let epochs = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.wake.as_ref())
+                .map_or_else(Vec::new, |wake| {
+                    wake.epochs.iter().map(|epoch| epoch.task.clone()).collect()
+                });
+
+            // The current assignment resolves the node's run. A decided task
+            // whose assignment was cleared by result acceptance still names
+            // its serving agent and its highest generation, so the *last*
+            // run's identity re-derives exactly as assignment creation
+            // derived it — a completed goal must still reconstruct its tree.
+            // A standing refusal proves the opposite: deciding a generation
+            // clears `last_refusal`, so one on record means the highest
+            // generation was refused and no accepted run record exists to
+            // re-derive — a between-assignments task, not an anomaly.
+            // Generations before the highest stay an explicit gap.
+            let resolved_run = match task.assignment.as_ref() {
+                Some(assignment) => Some((assignment.agent.clone(), assignment.run.clone())),
+                None if task.last_refusal.is_some() => None,
+                None => match (&task.assignee, task.assignment_generation) {
+                    (Some(assignee), generation)
+                        if generation != AgentAssignmentGeneration::UNASSIGNED =>
+                    {
+                        crate::task::run_id_for_assignment(&task_id, generation)
+                            .ok()
+                            .map(|run| (assignee.clone(), run))
+                    }
+                    _ => None,
+                },
+            };
+            let run = match resolved_run {
+                Some((run_agent, run_id)) => {
+                    Some(AgentRunScope::new(tenant.clone(), run_agent, run_id)?)
+                }
+                None => None,
+            };
+            wave_nodes.push(GoalViewWaveNode {
+                node_index: task_nodes.len() - 1,
+                task: task_id,
+                epochs,
+                run,
+            });
+        }
+
+        // One concurrent round-trip joins the whole wave's runs.
+        let run_ids: Vec<Option<_>> = wave_nodes
+            .iter()
+            .map(|node| node.run.as_ref().map(|scope| scope.persistence_id()))
+            .collect();
+        let run_records = join_all(run_ids.iter().map(|id| async move {
+            match id {
+                None => Ok(None),
+                Some(id) => runs.load(id).await,
+            }
+        }))
+        .await;
+
+        for (node, loaded) in wave_nodes.into_iter().zip(run_records) {
+            for epoch in node.epochs {
+                frontier.push_back(GoalViewFrontierEntry {
+                    task: epoch,
+                    parent: node.task.clone(),
+                    via: None,
+                });
+            }
+            let Some(run_scope) = node.run else {
+                continue;
+            };
+            let run_record = match loaded {
+                Ok(record) => record,
+                Err(error) => return Err(AgentRunError::from(error).into()),
+            };
+            let Some(run_record) = run_record else {
+                task_nodes[node.node_index].run_omission =
+                    Some(agent_goal_view_omission_code::RUN_RECORD_MISSING.to_string());
+                continue;
+            };
+            records_read += 1;
+            if run_record.state.check_schema(policy).is_err() {
+                task_nodes[node.node_index].run_omission =
+                    Some(agent_goal_view_omission_code::RUN_SCHEMA_UNSUPPORTED.to_string());
+                continue;
+            }
+            let Some(run) = run_record.state.run() else {
+                task_nodes[node.node_index].run_omission =
+                    Some(agent_goal_view_omission_code::RUN_NOT_ACCEPTED.to_string());
+                continue;
+            };
+            let run_node = AgentGoalRunNode::derive(run, run_scope, run_record.revision);
+            if run_node.settlement == AgentRunSettlementStatus::Owed {
+                budget.live_consumption = budget
+                    .live_consumption
+                    .saturating_add(run_node.budget.consumption());
+            }
+            for edge in &run_node.collaboration.delegations {
+                if let AgentDelegationStatus::ChildCreated { child_task, .. } = &edge.status {
+                    frontier.push_back(GoalViewFrontierEntry {
+                        task: child_task.clone(),
+                        parent: node.task.clone(),
+                        via: Some(edge.delegation.clone()),
+                    });
+                }
+            }
+            run_nodes.push(run_node);
+        }
+
+        // Admit the next wave against what the node budget still allows.
+        let budget_left = max_tasks.saturating_sub(task_nodes.len());
+        if budget_left == 0 {
+            for remaining in frontier.drain(..) {
+                if visited.contains(&remaining.task) {
+                    continue;
+                }
+                truncated = true;
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    remaining.task,
+                    agent_goal_view_omission_code::NODE_BUDGET_EXHAUSTED,
+                );
+            }
+            break;
+        }
+        let mut admitted: Vec<GoalViewFrontierEntry> = Vec::new();
+        while admitted.len() < budget_left {
+            let Some(entry) = frontier.pop_front() else {
+                break;
+            };
+            if visited.contains(&entry.task) {
+                continue;
+            }
+            admitted.push(entry);
+        }
+        if admitted.is_empty() {
+            break;
+        }
+
+        // One concurrent round-trip loads the whole admitted wave.
+        let mut task_ids = Vec::with_capacity(admitted.len());
+        for entry in &admitted {
+            task_ids
+                .push(AgentTaskScope::new(tenant.clone(), entry.task.clone())?.persistence_id());
+        }
+        let records = join_all(task_ids.iter().map(|id| tasks.load(id))).await;
+        for (entry, record) in admitted.into_iter().zip(records) {
+            let record = match record {
+                Ok(record) => record,
+                Err(error) => return Err(AgentTaskError::from(error).into()),
+            };
+            let Some(record) = record else {
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    entry.task,
+                    agent_goal_view_omission_code::RECORD_MISSING,
+                );
+                continue;
+            };
+            records_read += 1;
+            if record.state.check_schema(policy).is_err() {
+                push_goal_view_omission(
+                    &mut omissions,
+                    &mut omitted,
+                    entry.task,
+                    agent_goal_view_omission_code::SCHEMA_UNSUPPORTED,
+                );
+                continue;
+            }
+            wave.push((record.state, record.revision, Some(entry)));
+        }
+    }
+
+    Ok(GoalViewTraversal {
         records_read,
         truncated,
         omissions,
-        contract,
         cancellation: root_cancellation,
         budget,
         tasks: task_nodes,
         runs: run_nodes,
-        claims: claim_refs,
-        claims_available,
-    }))
-}
-
-/// Folds one run's unsettled consumption into the advisory rollup,
-/// saturating per dimension.
-fn add_consumption(total: &mut AgentBudgetConsumption, consumed: &AgentBudgetConsumption) {
-    total.loop_iterations = total
-        .loop_iterations
-        .saturating_add(consumed.loop_iterations);
-    total.model_calls = total.model_calls.saturating_add(consumed.model_calls);
-    total.tool_calls = total.tool_calls.saturating_add(consumed.tool_calls);
-    total.effects = total.effects.saturating_add(consumed.effects);
-    total.effect_attempts = total
-        .effect_attempts
-        .saturating_add(consumed.effect_attempts);
-    total.tokens = total.tokens.saturating_add(consumed.tokens);
-    total.cost_micros = total.cost_micros.saturating_add(consumed.cost_micros);
-    total.descendants = total.descendants.saturating_add(consumed.descendants);
+    })
 }

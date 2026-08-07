@@ -1738,6 +1738,7 @@ dependencies = [
 name = "rakka-agent"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "proptest",
  "rakka-agent-workflow",
  "rakka-cluster",

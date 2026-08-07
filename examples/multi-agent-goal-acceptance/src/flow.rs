@@ -36,7 +36,7 @@ use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, HumanCheckpointId, PrincipalRef,
 };
 
-use crate::report::AcceptanceReport;
+use crate::report::{AcceptanceReport, EXPECTED_TRANSCRIPT};
 use crate::wiring::{
     World, ASK_TIMEOUT, COORDINATOR, SKILL_SUMMARIZATION, SKILL_TRANSLATION, SPACE, SUMMARIZER,
     TENANT, TOOL, TRANSLATOR, WORKFLOW_TOOL,
@@ -568,10 +568,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .expect("the goal record exists");
     assert_eq!(goal_state.status, AgentGoalStatus::Active);
     assert!(goal_state.evaluator.is_some());
-    lines[0] = "ok  1/18 three agents instantiated; the goal-bearing root created: goal Active \
-                with an evaluator, two specialist skills, one versioned workflow tool, one \
-                shared knowledge space"
-        .to_string();
+    lines[0] = EXPECTED_TRANSCRIPT[0].to_string();
 
     // 2/18 + 3/18 + 5/18 — the fan-out turn, driven through the production
     // dispatcher: two real A2A sends, one workflow start, the closed group.
@@ -594,9 +591,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
     assert_eq!(fan_in.members.len(), 3);
     assert!(fan_in.resolution.is_none());
     assert_eq!(loop_state.phase(), AgentLoopPhase::AwaitingChildren);
-    lines[1] = "ok  2/18 one turn committed the fan-out atomically: 2 delegation records, 1 \
-                workflow invocation, a closed 3-member fan-in group"
-        .to_string();
+    lines[1] = EXPECTED_TRANSCRIPT[1].to_string();
 
     // The two created children, with their delegation records.
     let mut children = Vec::new();
@@ -638,9 +633,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
             .expect("the child run scope is valid"),
         ));
     }
-    lines[2] = "ok  3/18 both sends created real children through rakka-a2a: two distinct child \
-                tasks, each with its own generation-1 run and verified provenance"
-        .to_string();
+    lines[2] = EXPECTED_TRANSCRIPT[2].to_string();
 
     // 4/18 — a replayed send converges on the same child.
     let translator_record = children
@@ -668,9 +661,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .map(|(_, task, _)| task.clone())
         .expect("the translation child exists");
     assert_eq!(child_task, translator_child, "no second child");
-    lines[3] = "ok  4/18 a replayed delegation send converged on the same child: the \
-                deduplication key answered, no second child"
-        .to_string();
+    lines[3] = EXPECTED_TRANSCRIPT[3].to_string();
 
     // 5/18 — the workflow start reached the compiled child's durable inbox.
     let invocation = loop_state
@@ -687,9 +678,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
     assert_eq!(invocation.deduplication_key, invocation.invocation.as_str());
     let inbox_entries = world.run_refund_step(&invocation.child_run).await;
     assert_eq!(inbox_entries, 1, "one durable StartRun accepted");
-    lines[4] = "ok  5/18 the workflow start accepted the derived StartRun into the compiled \
-                refund v1 child's durable inbox: invocation id = child run id = deduplication key"
-        .to_string();
+    lines[4] = EXPECTED_TRANSCRIPT[4].to_string();
 
     // 6/18 — everything passivates; the fan-out waits with nothing resident.
     for scope in [
@@ -737,9 +726,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
     let waiting_loop = state.loop_state().expect("the loop is retained");
     assert_eq!(waiting_loop.phase(), AgentLoopPhase::AwaitingChildren);
     assert_eq!(waiting_loop.outstanding_effects().count(), 0);
-    lines[5] = "ok  6/18 the fan-out persisted and the root waits with nothing resident: \
-                AwaitingChildren, 0 outstanding effects, 0 resident entities"
-        .to_string();
+    lines[5] = EXPECTED_TRANSCRIPT[5].to_string();
 
     // 7/18 first half — the passivated root re-materializes on the next ask.
     let describe = ask_retrying(
@@ -840,10 +827,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
     );
     let claim_has_delegation = claim.provenance.delegation.is_some();
     assert!(claim_has_delegation, "the delegation identity is stamped");
-    lines[8] = "ok  9/18 the translator's claim appended into the shared space with attributable \
-                provenance (goal, task, run, delegation stamped); its replay answered the \
-                original claim"
-        .to_string();
+    lines[8] = EXPECTED_TRANSCRIPT[8].to_string();
 
     // 7/18 second half — ROOT pod loss at the result write: the child's
     // courier delivery dies before the root run's record commits, the child
@@ -891,10 +875,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .clone()
         .expect("the redelivered result recorded");
     assert_eq!(recorded.status, AgentTaskStatus::Completed);
-    lines[6] = "ok  7/18 ROOT pod loss: the passivated root re-materialized on the next ask; a \
-                killed result write was redelivered by the child's re-driven settle and \
-                converged on one recorded result"
-        .to_string();
+    lines[6] = EXPECTED_TRANSCRIPT[6].to_string();
 
     // 8/18 — recorded without resolving the three-member group.
     let state = root_run_state(&world).await;
@@ -905,9 +886,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .resolution
         .is_none());
     assert_eq!(waiting_loop.phase(), AgentLoopPhase::AwaitingChildren);
-    lines[7] = "ok  8/18 the translator's terminal task owed its delegation result; recorded on \
-                the root without resolving the 3-member group"
-        .to_string();
+    lines[7] = EXPECTED_TRANSCRIPT[7].to_string();
 
     // 10/18 — CHILD pod loss: the summarizer's worker dies after invoking the
     // non-idempotent tool; recovery parks one Indeterminate.
@@ -975,10 +954,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         1,
         "invoked exactly once"
     );
-    lines[9] = "ok 10/18 CHILD pod loss: the summarizer's worker died after invoking the \
-                non-idempotent tool; recovery parked one Indeterminate outcome — invoked \
-                exactly once, never re-invoked"
-        .to_string();
+    lines[9] = EXPECTED_TRANSCRIPT[9].to_string();
 
     // 11/18 — the deduplicated reconciliation decision resolves it, and the
     // summarizer completes; its result flows to the root through the fabric.
@@ -1074,9 +1050,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
             .is_some(),
         "the summarizer's result recorded on the root"
     );
-    lines[10] = "ok 11/18 the deduplicated reconciliation decision resolved the ambiguity; the \
-                 summarizer completed and its result recorded on the root"
-        .to_string();
+    lines[10] = EXPECTED_TRANSCRIPT[10].to_string();
 
     // 12/18 — the workflow start replayed after both losses adopts the SAME
     // child run; the compiled step executed exactly once.
@@ -1098,9 +1072,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
     assert_eq!(entries_after_replay, 1, "one durable StartRun ever");
     let refund_steps = world.refund_step_executions.load(Ordering::SeqCst) as usize;
     assert_eq!(refund_steps, 1, "the compiled step executed exactly once");
-    lines[11] = "ok 12/18 a workflow start replayed after both losses adopted the SAME child run \
-                 — one durable StartRun ever — and the compiled step executed exactly once"
-        .to_string();
+    lines[11] = EXPECTED_TRANSCRIPT[11].to_string();
 
     // 13/18 — a direct criteria decision has no door under an evaluator.
     let declared = ask_retrying(
@@ -1137,9 +1109,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         panic!("the declaration is refused, got {declared:?}");
     };
     assert_eq!(code, "task-goal-decision-unattested");
-    lines[12] = "ok 13/18 a direct criteria decision was refused task-goal-decision-unattested: \
-                 with an evaluator configured, Satisfied has one door"
-        .to_string();
+    lines[12] = EXPECTED_TRANSCRIPT[12].to_string();
 
     // 14/18 — the configured evaluator judges durable evidence; the exchange
     // records Satisfied.
@@ -1193,10 +1163,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .goal_state
         .expect("the goal record exists");
     assert_eq!(goal_after.status, AgentGoalStatus::Satisfied);
-    lines[13] = "ok 14/18 the EvaluateGoal effect ran the configured evaluator over durable \
-                 evidence; the goal-evaluation exchange recorded Satisfied fenced to the \
-                 assigned root run"
-        .to_string();
+    lines[13] = EXPECTED_TRANSCRIPT[13].to_string();
 
     // 15/18 — the application relays the deduplicated workflow result.
     let relay = |discriminator: &'static str| {
@@ -1251,9 +1218,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .expect("the group resolved");
     assert!(resolution.satisfied);
     assert_eq!(resolution.code, "all-settled");
-    lines[14] = "ok 15/18 the application relayed the deduplicated workflow result; the group \
-                 resolved all-settled and fan-in resumed the model deterministically"
-        .to_string();
+    lines[14] = EXPECTED_TRANSCRIPT[14].to_string();
 
     // 16/18 — the root proposes its own validated result and completes.
     pump(
@@ -1278,9 +1243,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
         .expect("the snapshot derives");
     assert_eq!(final_snapshot.status, AgentTaskStatus::Completed);
     assert_eq!(final_snapshot.outstanding_escrow, 0);
-    lines[15] = "ok 16/18 the root proposed its own validated result: run and task Completed, \
-                 escrow returned across root and children"
-        .to_string();
+    lines[15] = EXPECTED_TRANSCRIPT[15].to_string();
 
     // 17/18 — the authorized goal view reconstructs the whole tree.
     let claim_source = KnowledgeGraphGoalClaimSource::new(world.graph.clone())
@@ -1321,10 +1284,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
     assert!(!evaluation_ref.evidence_items.is_empty());
     assert!(view.claims_available);
     assert_eq!(view.claims.len(), 1);
-    lines[16] = "ok 17/18 the authorized goal view reconstructed the goal, 3 tasks, 3 runs, 2 \
-                 delegations, 1 workflow link, 1 evaluation, and its evidence from durable \
-                 state alone"
-        .to_string();
+    lines[16] = EXPECTED_TRANSCRIPT[16].to_string();
 
     // 18/18 — the sentinel sweep over every queried surface.
     let mut surfaces = Vec::new();
@@ -1352,9 +1312,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
             );
         }
     }
-    lines[17] = "ok 18/18 no private content leaked: planted sentinels appear in no claim, no \
-                 goal view, no snapshot, no metric"
-        .to_string();
+    lines[17] = EXPECTED_TRANSCRIPT[17].to_string();
 
     AcceptanceReport {
         lines,

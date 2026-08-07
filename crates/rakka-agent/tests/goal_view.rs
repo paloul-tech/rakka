@@ -642,6 +642,44 @@ async fn a_non_owner_reads_exactly_what_a_missing_goal_answers() {
     assert_eq!(denied, None);
     assert_eq!(absent, None);
     assert_eq!(probed, None);
+
+    // The fence precedes the schema gate: a root record the caller's policy
+    // cannot read answers a non-owner with the same `Ok(None)` an absent
+    // goal does — a schema error would be a distinguishable answer, and so
+    // an existence oracle — while the owner still sees the honest failure.
+    let rejecting_tasks = AgentSchemaPolicy::n_plus_one().with_compatibility(
+        AgentRecordKind::TaskState,
+        AgentSchemaCompatibility::new(StateSchemaVersion::new(99), StateSchemaVersion::new(99)),
+    );
+    let denied_unreadable = authorized_agent_goal_view(
+        &fixture.tasks,
+        &fixture.runs,
+        &tenant(),
+        &goal(),
+        &intruder,
+        &rejecting_tasks,
+        None,
+        observed,
+    )
+    .await
+    .expect("the denial answers rather than erring");
+    assert_eq!(denied_unreadable, None);
+
+    let owner_unreadable = authorized_agent_goal_view(
+        &fixture.tasks,
+        &fixture.runs,
+        &tenant(),
+        &goal(),
+        &owner(),
+        &rejecting_tasks,
+        None,
+        observed,
+    )
+    .await;
+    assert!(
+        owner_unreadable.is_err(),
+        "the owner sees the schema failure, not a vanished goal"
+    );
 }
 
 /// A tighter node budget truncates with the explicit marker: the root
@@ -772,8 +810,8 @@ async fn a_failed_send_is_an_edge_without_a_node_or_omission() {
 }
 
 /// An unreadable root record fails the whole call closed — the root is the
-/// authoritative anchor — while an unreadable run record is an omission on
-/// its task, leaving the durable half of the view intact.
+/// authoritative anchor — while an unreadable run record marks its task
+/// node's `run_omission`, leaving the durable half of the view intact.
 #[tokio::test]
 async fn schema_failures_fail_closed_at_the_root_and_omit_at_a_run() {
     let fixture = tree_fixture("hello");
@@ -796,8 +834,9 @@ async fn schema_failures_fail_closed_at_the_root_and_omit_at_a_run() {
     .await;
     assert!(result.is_err(), "the root record failing fails closed");
 
-    // Run records unreadable: the run is omitted under its task, the tasks
-    // still assemble.
+    // Run records unreadable: the run marks its assembled task node — under
+    // the run-specific code, never the task-record one — and the task list
+    // stays whole, with no omission naming a task the view did assemble.
     let rejecting_runs = AgentSchemaPolicy::n_plus_one().with_compatibility(
         AgentRecordKind::RunState,
         AgentSchemaCompatibility::new(StateSchemaVersion::new(99), StateSchemaVersion::new(99)),
@@ -816,10 +855,81 @@ async fn schema_failures_fail_closed_at_the_root_and_omit_at_a_run() {
     .expect("the goal resolves");
     assert_eq!(view.tasks.len(), 1, "no run means no discovered children");
     assert!(view.runs.is_empty());
-    assert!(view.omissions.iter().any(|omission| {
-        omission.task == *task_scope().task()
-            && omission.code == agent_goal_view_omission_code::SCHEMA_UNSUPPORTED
-    }));
+    assert_eq!(
+        view.tasks[0].run_omission.as_deref(),
+        Some(agent_goal_view_omission_code::RUN_SCHEMA_UNSUPPORTED)
+    );
+    assert!(
+        view.omissions.is_empty(),
+        "an assembled task never appears in the omissions: {:?}",
+        view.omissions
+    );
+}
+
+/// A standing assignment refusal suppresses run re-derivation: deciding a
+/// generation clears `last_refusal`, so one on record proves the highest
+/// generation never produced an accepted run — the node joins with no run,
+/// no `run_omission`, and no anomaly read into a healthy refusal.
+#[tokio::test]
+async fn a_refused_generation_re_derives_no_run_and_raises_no_anomaly() {
+    use rakka_persistence::DurableStateStore;
+
+    let fixture = tree_fixture("hello");
+    drive_tree(&fixture).await;
+
+    let before = assemble(&fixture).await.expect("the goal resolves");
+    let run_node = &before.runs[0];
+    assert_eq!(run_node.task, *task_scope().task());
+    let run_id = run_node.scope.persistence_id();
+    let run_revision = run_node.revision;
+
+    // Surgery: rewrite the root as a task whose highest generation was
+    // refused — `last_refusal` standing, assignment cleared, generation
+    // consumed — and drop the run record a refusal never produces.
+    let scope = task_scope();
+    let record = fixture
+        .tasks
+        .load(&scope.persistence_id())
+        .await
+        .expect("the record loads")
+        .expect("the root exists");
+    let refusal = rakka_agent::AgentAssignmentRefusal {
+        agent: common::agent_id(),
+        reason: rakka_agent::AgentAssignmentRefusalReason::RunRefusedAssignment,
+        detail: "run-generation-conflict".to_string(),
+        refused_at: AgentTimestampMillis::new(998_000),
+    };
+    let mut value = serde_json::to_value(&record.state).expect("the state serializes");
+    value["task"]["assignment"] = serde_json::Value::Null;
+    value["task"]["last_refusal"] = serde_json::to_value(&refusal).expect("the refusal serializes");
+    let mutated: rakka_agent::AgentTaskState =
+        serde_json::from_value(value).expect("the state deserializes");
+    fixture
+        .tasks
+        .compare_and_set(&scope.persistence_id(), record.revision, mutated)
+        .await
+        .expect("the surgery commits");
+    fixture
+        .runs
+        .delete(&run_id, run_revision)
+        .await
+        .expect("the run record deletes");
+
+    let view = assemble(&fixture).await.expect("the goal resolves");
+    assert_eq!(
+        view.tasks.len(),
+        1,
+        "without a run to read edges from, the subtree is unknown, not omitted"
+    );
+    assert_eq!(
+        view.tasks[0].run_omission, None,
+        "a refusal is not an anomaly"
+    );
+    assert!(
+        view.runs.is_empty(),
+        "no run joins for a refused generation"
+    );
+    assert!(view.omissions.is_empty(), "omissions: {:?}", view.omissions);
 }
 
 /// A requested cancellation is visible end to end: the root task defers
@@ -1098,7 +1208,8 @@ async fn an_evaluation_and_its_evidence_surface_in_the_view() {
 
 /// A wired claim source joins shared-knowledge references; a failing one
 /// degrades the projection half honestly — `claims_available` goes `false`
-/// and the durable half of the view is untouched.
+/// with the failure's stable code on the view, a capped list marks itself
+/// `claims_truncated`, and the durable half of the view is untouched.
 #[tokio::test]
 async fn claims_join_when_a_source_answers_and_degrade_when_it_fails() {
     struct StubSource {
@@ -1157,7 +1268,37 @@ async fn claims_join_when_a_source_answers_and_degrade_when_it_fails() {
     .expect("the assembly succeeds")
     .expect("the goal resolves");
     assert!(view.claims_available);
-    assert_eq!(view.claims, vec![reference]);
+    assert_eq!(view.claims, vec![reference.clone()]);
+    assert!(
+        !view.claims_truncated,
+        "the source held nothing beyond the cap"
+    );
+    assert_eq!(view.claims_error_code, None);
+
+    // A source holding more than the cap: the view carries exactly the cap
+    // and says the list was cut — a capped list must never read as complete.
+    let overflowing = StubSource {
+        fail: false,
+        refs: vec![reference; rakka_agent::AGENT_GOAL_VIEW_MAX_CLAIMS + 1],
+    };
+    let truncated = assemble_agent_goal_view(
+        &fixture.tasks,
+        &fixture.runs,
+        &tenant(),
+        &goal(),
+        &AgentSchemaPolicy::default(),
+        Some(&overflowing),
+        AgentTimestampMillis::new(999_000),
+    )
+    .await
+    .expect("the assembly succeeds")
+    .expect("the goal resolves");
+    assert!(truncated.claims_available);
+    assert!(truncated.claims_truncated);
+    assert_eq!(
+        truncated.claims.len(),
+        rakka_agent::AGENT_GOAL_VIEW_MAX_CLAIMS
+    );
 
     let failing = StubSource {
         fail: true,
@@ -1178,14 +1319,36 @@ async fn claims_join_when_a_source_answers_and_degrade_when_it_fails() {
     assert!(!degraded.claims_available);
     assert!(degraded.claims.is_empty());
     assert_eq!(
+        degraded.claims_error_code.as_deref(),
+        Some("store-unavailable"),
+        "the failure's stable code rides the view"
+    );
+    assert_eq!(
         degraded.tasks.len(),
         view.tasks.len(),
         "the durable half is intact"
     );
+
+    // No source wired at all: degraded the same way, but with no error code —
+    // an unwired join is distinguishable from a failing one.
+    let unwired = assemble_agent_goal_view(
+        &fixture.tasks,
+        &fixture.runs,
+        &tenant(),
+        &goal(),
+        &AgentSchemaPolicy::default(),
+        None,
+        AgentTimestampMillis::new(999_000),
+    )
+    .await
+    .expect("the assembly succeeds")
+    .expect("the goal resolves");
+    assert!(!unwired.claims_available);
+    assert_eq!(unwired.claims_error_code, None);
 }
 
 // A note for the reader: schema-unsupported *task* children cannot be
 // distinguished from an unreadable root under one policy — every task record
-// shares a schema window — so the child half of that omission code is proven
-// through the run-record variant above, and the cross-version half belongs
-// to the compatibility matrix.
+// shares a schema window — so the gate's coverage rides the run-record
+// variant above (under its own `run-schema-unsupported` code), and the
+// cross-version half belongs to the compatibility matrix.

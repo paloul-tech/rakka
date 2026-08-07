@@ -128,6 +128,64 @@ async fn goal_scoped_claims_join_with_their_provenance() {
     );
 }
 
+/// With several spaces wired, the join merges in stable claim-id order and a
+/// bounded read never starves a later-added space: the answer is the first
+/// `limit` of the merged whole, identical however the spaces were ordered.
+#[tokio::test]
+async fn a_bounded_multi_space_join_merges_in_claim_id_order() {
+    let store = Arc::new(InMemoryKnowledgeGraphStore::new());
+    let beta = KnowledgeSpaceId::new("beta-space").expect("the space id is valid");
+    let beta_scope = KnowledgeSpaceScope::new(tenant(), beta.clone()).expect("the scope is valid");
+    let scope = space_scope();
+
+    let mut expected: Vec<(String, KnowledgeSpaceId)> = Vec::new();
+    for index in 0..5 {
+        let claim = append_claim(&store, &scope, &format!("append-{index}"), &goal(), false).await;
+        expected.push((claim.claim_id.as_str().to_string(), space()));
+        let claim = append_claim(
+            &store,
+            &beta_scope,
+            &format!("append-{index}"),
+            &goal(),
+            false,
+        )
+        .await;
+        expected.push((claim.claim_id.as_str().to_string(), beta.clone()));
+    }
+    expected.sort();
+    expected.truncate(5);
+
+    let forward = KnowledgeGraphGoalClaimSource::new(store.clone())
+        .with_space(space())
+        .with_space(beta.clone());
+    let refs = forward
+        .claims_for_goal(&tenant(), &goal(), 5)
+        .await
+        .expect("the source answers");
+    let answered: Vec<(String, KnowledgeSpaceId)> = refs
+        .iter()
+        .map(|reference| {
+            (
+                reference.claim.as_str().to_string(),
+                reference.space.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answered, expected,
+        "the merged first five, in claim-id order"
+    );
+
+    let reversed = KnowledgeGraphGoalClaimSource::new(store)
+        .with_space(beta)
+        .with_space(space());
+    let same = reversed
+        .claims_for_goal(&tenant(), &goal(), 5)
+        .await
+        .expect("the source answers");
+    assert_eq!(same, refs, "the wiring order never decides a bounded read");
+}
+
 /// The bound holds across paging, and a space the source was never given is
 /// simply not joined.
 #[tokio::test]
