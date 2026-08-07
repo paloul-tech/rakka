@@ -1757,6 +1757,7 @@ dependencies = [
 name = "rakka-agent-knowledge-graph"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rakka-agent",
  "rakka-agent-workflow",
  "serde",

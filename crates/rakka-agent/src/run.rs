@@ -2279,6 +2279,19 @@ impl DelegationCeilings {
 
 /// Acts on the turn the model produced: persist its tool effects, or move on to
 /// record it.
+/// The earlier of two optional deadlines — the *child never outlives the
+/// goal* merge every child-planning path shares, so a future nuance to the
+/// rule cannot apply to one child family and not the other.
+fn earliest_deadline(
+    a: Option<AgentTimestampMillis>,
+    b: Option<AgentTimestampMillis>,
+) -> Option<AgentTimestampMillis> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Plans one delegation the model requested through the declared coordination
 /// tool ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -2440,10 +2453,7 @@ fn plan_delegation_call(
         .unwrap_or_default();
     // The child never outlives the goal: the earlier of the model's deadline
     // and the envelope's.
-    let deadline = match (parsed.deadline, envelope_deadline) {
-        (Some(requested), Some(goal_deadline)) => Some(requested.min(goal_deadline)),
-        (requested, goal_deadline) => requested.or(goal_deadline),
-    };
+    let deadline = earliest_deadline(parsed.deadline, envelope_deadline);
     // The wire budget is the parent's own ceilings with the descendants
     // ceiling replaced by the escrowed sub-quota: the cap crosses A2A as
     // validated provenance the child's admission min-narrows against — never
@@ -2587,10 +2597,7 @@ fn plan_workflow_call(
         .default_deadline_ms
         .map(|deadline_ms| AgentTimestampMillis::new(now.as_millis().saturating_add(deadline_ms)));
     let envelope_deadline = envelope.and_then(|env| env.deadline);
-    let deadline = match (descriptor_deadline, envelope_deadline) {
-        (Some(declared), Some(bound)) => Some(declared.min(bound)),
-        (declared, bound) => declared.or(bound),
-    };
+    let deadline = earliest_deadline(descriptor_deadline, envelope_deadline);
     let record = AgentWorkflowInvocationRecord {
         invocation: invocation.clone(),
         goal,

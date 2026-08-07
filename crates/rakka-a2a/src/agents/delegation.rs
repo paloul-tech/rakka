@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task};
+use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState};
 use a2a_server::ServiceParams;
 use rakka_agent::{
     AgentA2aSendExecutor, AgentA2aSendFinding, AgentDelegationRecord, AgentDispatchError,
@@ -136,6 +136,27 @@ where
             metadata: Some(metadata.into_iter().collect()),
             tenant: Some(record.parent_run.tenant().as_str().to_string()),
         })
+    }
+}
+
+/// The stable kebab-case label of one peer task state, for the delegation
+/// cell's durable `peer_status`.
+///
+/// A direct match, deliberately not the peer type's own serialization: that
+/// produces protobuf wire labels (`TASK_STATE_COMPLETED`), and a durable
+/// record that carried them would pin an inconsistent format the crate's
+/// label discipline could never clean up.
+fn peer_status_label(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Unspecified => "unspecified",
+        TaskState::Submitted => "submitted",
+        TaskState::Working => "working",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Canceled => "canceled",
+        TaskState::InputRequired => "input-required",
+        TaskState::Rejected => "rejected",
+        TaskState::AuthRequired => "auth-required",
     }
 }
 
@@ -283,14 +304,10 @@ where
                     code: "invalid-identity",
                     message: error.to_string(),
                 })?;
-            let peer_status = serde_json::to_value(task.status.state)
-                .ok()
-                .and_then(|value| value.as_str().map(ToString::to_string))
-                .unwrap_or_else(|| "unknown".to_string());
             Ok(AgentA2aSendFinding::Sent {
                 child_task,
                 child_run: None,
-                peer_status,
+                peer_status: peer_status_label(&task.status.state).to_string(),
             })
         })
     }

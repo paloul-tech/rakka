@@ -609,6 +609,26 @@ impl AgentContentDigest {
             value: sha256_hex(bytes),
         }
     }
+
+    /// Computes the [`AgentDigestAlgorithm::Sha256`] digest of a segment
+    /// sequence under the injective length-prefixed canonical encoding.
+    ///
+    /// This is the one encoding behind every derived durable identity — wake
+    /// ids, delegation ids, workflow-invocation ids: each segment is written
+    /// as `<decimal byte length>:<bytes>`, so no boundary can be forged by
+    /// segment content. The format is a persisted compatibility surface (the
+    /// golden vectors in `tests/wake_identity.rs` pin it); changing it
+    /// requires a migration.
+    #[must_use]
+    pub fn sha256_of_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut canonical = Vec::new();
+        for segment in segments {
+            canonical.extend_from_slice(segment.len().to_string().as_bytes());
+            canonical.push(b':');
+            canonical.extend_from_slice(segment.as_bytes());
+        }
+        Self::sha256_of_bytes(&canonical)
+    }
 }
 
 impl Display for AgentContentDigest {
@@ -4297,7 +4317,13 @@ fn declare_dependency(
 /// that terminalized here would project terminal `Cancelled` over a started
 /// consequential effect whose outcome is unknown, strand its escrow, and
 /// leave its run to discover the cancellation only if it ever proposes.
-/// Returns whatever the transition owes.
+/// The request trades fail-fast for honesty: a dependent with in-flight work
+/// stays `Cancelling` until its subtree quiesces, and that wait's liveness
+/// rests on the doors every cancellation rests on — effect reconciliation
+/// for a stuck consequential effect, and the hosting application's
+/// workflow-tool result relay. A dependent with a closed ledger still
+/// terminalizes in this same compare-and-set, through the request's own
+/// finalization. Returns whatever the transition owes.
 fn record_dependency_outcome(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,

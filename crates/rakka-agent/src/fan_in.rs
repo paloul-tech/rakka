@@ -494,7 +494,11 @@ pub fn evaluate_fan_in(
             } else {
                 resolution_code::ALL_SETTLED
             };
-            resolve(satisfied, succeeded, code)
+            // The documented invariant: `satisfied_by` is evidence of what
+            // satisfied the policy, so an unsatisfied resolution carries
+            // none — per-member outcomes stay readable from the cells.
+            let satisfied_by = if satisfied { succeeded } else { Vec::new() };
+            resolve(satisfied, satisfied_by, code)
         }
         AgentFanInPolicy::Any => {
             if !succeeded.is_empty() {
@@ -849,7 +853,10 @@ mod tests {
         let resolution = evaluate(&group).expect("all settled");
         assert!(!resolution.satisfied);
         assert_eq!(resolution.code, resolution_code::ALL_SETTLED);
-        assert_eq!(resolution.satisfied_by.len(), 1);
+        assert!(
+            resolution.satisfied_by.is_empty(),
+            "an unsatisfied resolution names no satisfying members"
+        );
     }
 
     #[test]

@@ -302,11 +302,22 @@ impl AgentEffectTargetCatalog {
                 EffectIdempotencyKey,
                 AgentAutonomyArtifactPolicies::new(ArtifactPreferred, ArtifactRequired),
             ))
+            // `ToolCall` and the relaxed input policy admit the agent
+            // domain's outbound A2A sends (slice 4.3): they ride the
+            // executor-routed tool family with target type `a2a-peer` and
+            // carry inline delegation payloads rather than an input
+            // artifact, and the dispatcher classifies them as `A2aPeer` —
+            // a catalog that refused the kind would deny exactly the sends
+            // the classification routes.
             .with_descriptor(AgentAutonomyTargetClassDescriptor::new(
                 AgentAutonomyTargetClass::A2aPeer,
-                [AgentEffectKind::HttpCall, AgentEffectKind::GrpcCall],
+                [
+                    AgentEffectKind::HttpCall,
+                    AgentEffectKind::GrpcCall,
+                    AgentEffectKind::ToolCall,
+                ],
                 A2aMessageId,
-                AgentAutonomyArtifactPolicies::new(ArtifactRequired, ArtifactRequired),
+                AgentAutonomyArtifactPolicies::new(ArtifactPreferred, ArtifactRequired),
             ))
             .with_descriptor(AgentAutonomyTargetClassDescriptor::new(
                 AgentAutonomyTargetClass::HumanCheckpoint,
@@ -335,9 +346,16 @@ impl AgentEffectTargetCatalog {
             // A child-workflow start converges on the outbox deduplication
             // key: it is the derived invocation identity the child run's own
             // inbox deduplicates on, so every replay adopts the one child.
+            // `ToolCall` is accepted because agent-domain workflows-as-tools
+            // (slice 4.5) ride the executor-routed tool family with target
+            // type `workflow-tool`, which the dispatcher classifies as
+            // `ChildWorkflow`.
             .with_descriptor(AgentAutonomyTargetClassDescriptor::new(
                 AgentAutonomyTargetClass::ChildWorkflow,
-                [AgentEffectKind::ChildWorkflowCommand],
+                [
+                    AgentEffectKind::ChildWorkflowCommand,
+                    AgentEffectKind::ToolCall,
+                ],
                 DeduplicationKey,
                 AgentAutonomyArtifactPolicies::new(ArtifactPreferred, ArtifactPreferred),
             ))

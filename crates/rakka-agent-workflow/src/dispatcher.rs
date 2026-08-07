@@ -329,7 +329,18 @@ impl AgentDispatchTargetClass {
             Self::Human => matches!(kind, AgentEffectKind::HumanApprovalRequest),
             Self::Stream => matches!(kind, AgentEffectKind::StreamPublish),
             Self::Artifact => matches!(kind, AgentEffectKind::ArtifactWrite),
-            Self::ChildWorkflow => matches!(kind, AgentEffectKind::ChildWorkflowCommand),
+            Self::ChildWorkflow => {
+                // `ToolCall` joined the accepted kinds with agent-domain
+                // workflows-as-tools (slice 4.5): a workflow start rides the
+                // executor-routed tool family with target type
+                // `workflow-tool`, and refusing the refinement would leave
+                // the class's concurrency limit and autonomy governance
+                // inert for exactly the invocations they were added for.
+                matches!(
+                    kind,
+                    AgentEffectKind::ChildWorkflowCommand | AgentEffectKind::ToolCall
+                )
+            }
             Self::Audit => matches!(kind, AgentEffectKind::AuditEvent),
             Self::Other => true,
         }
@@ -383,6 +394,12 @@ impl AgentDispatchTargetClass {
             "tool" => Self::Tool,
             "process" => Self::Process,
             "a2a-peer" => Self::A2aPeer,
+            // A workflow-tool start is a child-workflow invocation, so the
+            // ChildWorkflow class limit and autonomy policy govern it. The
+            // cancel deliberately stays in the tool family: it is wind-down
+            // work the run already owes, and a class policy that blocks
+            // starting new children must never block stopping started ones.
+            "workflow-tool" => Self::ChildWorkflow,
             "webhook" => Self::Webhook,
             "push" | "a2a-push" => Self::PushNotification,
             "http" => Self::Http,

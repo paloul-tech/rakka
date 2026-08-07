@@ -137,19 +137,13 @@ pub fn delegation_id_for(
     slot: usize,
 ) -> AgentDelegationResult<AgentDelegationId> {
     validate_tenant(scope.tenant())?;
-    let mut canonical = Vec::new();
-    for segment in [
+    let digest = AgentContentDigest::sha256_of_segments([
         scope.tenant().as_str(),
         scope.agent().as_str(),
         scope.run().as_str(),
         &turn.to_string(),
         &slot.to_string(),
-    ] {
-        canonical.extend_from_slice(segment.len().to_string().as_bytes());
-        canonical.push(b':');
-        canonical.extend_from_slice(segment.as_bytes());
-    }
-    let digest = AgentContentDigest::sha256_of_bytes(&canonical);
+    ]);
     Ok(AgentDelegationId::new(format!(
         "{AGENT_DELEGATION_ID_PREFIX}{}",
         digest.value

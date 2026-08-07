@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use futures_util::future::try_join_all;
 use rakka_agent::{
     AgentCommunalClaimId, AgentGoalClaimFuture, AgentGoalClaimRef, AgentGoalClaimSource,
     AgentGoalClaimSourceError, AgentGoalId, KnowledgeSpaceId, TenantId,
@@ -72,53 +73,63 @@ impl AgentGoalClaimSource for KnowledgeGraphGoalClaimSource {
             // store SPI's ascending claim-id order. The first `limit` of the
             // merged whole are always inside the union of those prefixes, so
             // the sort below yields the trait's stable claim-id order without
-            // a bounded read ever starving a later-added space.
-            let mut refs: Vec<AgentGoalClaimRef> = Vec::new();
-            for space in &self.spaces {
-                let scope =
-                    KnowledgeSpaceScope::new(tenant.clone(), space.clone()).map_err(|error| {
-                        AgentGoalClaimSourceError::new(error.code(), error.to_string())
-                    })?;
-                let mut collected = 0_usize;
-                let mut cursor = ClaimCursor::start().with_limit(limit);
-                loop {
-                    let page = self
-                        .store
-                        .query(&scope, &filter, cursor)
-                        .await
-                        .map_err(|error| source_error(&error))?;
-                    for claim in page.claims {
-                        if collected >= limit {
-                            break;
+            // a bounded read ever starving a later-added space. The per-space
+            // reads are independent, so they run concurrently and the join's
+            // latency is the slowest space, not their sum; any space's store
+            // failure still degrades the join whole.
+            let per_space = self.spaces.iter().map(|space| {
+                let filter = &filter;
+                async move {
+                    let scope = KnowledgeSpaceScope::new(tenant.clone(), space.clone()).map_err(
+                        |error| AgentGoalClaimSourceError::new(error.code(), error.to_string()),
+                    )?;
+                    let mut refs: Vec<AgentGoalClaimRef> = Vec::new();
+                    let mut cursor = ClaimCursor::start().with_limit(limit);
+                    loop {
+                        let page = self
+                            .store
+                            .query(&scope, filter, cursor)
+                            .await
+                            .map_err(|error| source_error(&error))?;
+                        for claim in page.claims {
+                            if refs.len() >= limit {
+                                break;
+                            }
+                            let claim_id = AgentCommunalClaimId::new(claim.claim_id.as_str())
+                                .map_err(|error| {
+                                    AgentGoalClaimSourceError::new(error.code(), error.to_string())
+                                })?;
+                            let mut reference = AgentGoalClaimRef::new(
+                                claim_id,
+                                space.clone(),
+                                claim.provenance.agent.clone(),
+                            );
+                            if let Some(task) = claim.provenance.task {
+                                reference = reference.with_task(task);
+                            }
+                            if let Some(run) = claim.provenance.run {
+                                reference = reference.with_run(run);
+                            }
+                            if let Some(delegation) = claim.provenance.delegation {
+                                reference = reference.with_delegation(delegation);
+                            }
+                            refs.push(reference);
                         }
-                        let claim_id = AgentCommunalClaimId::new(claim.claim_id.as_str()).map_err(
-                            |error| AgentGoalClaimSourceError::new(error.code(), error.to_string()),
-                        )?;
-                        let mut reference = AgentGoalClaimRef::new(
-                            claim_id,
-                            space.clone(),
-                            claim.provenance.agent.clone(),
-                        );
-                        if let Some(task) = claim.provenance.task {
-                            reference = reference.with_task(task);
+                        match page.next {
+                            Some(next) if refs.len() < limit => {
+                                cursor = next.with_limit(limit - refs.len());
+                            }
+                            _ => break,
                         }
-                        if let Some(run) = claim.provenance.run {
-                            reference = reference.with_run(run);
-                        }
-                        if let Some(delegation) = claim.provenance.delegation {
-                            reference = reference.with_delegation(delegation);
-                        }
-                        refs.push(reference);
-                        collected += 1;
                     }
-                    match page.next {
-                        Some(next) if collected < limit => {
-                            cursor = next.with_limit(limit - collected);
-                        }
-                        _ => break,
-                    }
+                    Ok::<_, AgentGoalClaimSourceError>(refs)
                 }
-            }
+            });
+            let mut refs: Vec<AgentGoalClaimRef> = try_join_all(per_space)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
             refs.sort_by(|a, b| a.claim.cmp(&b.claim).then_with(|| a.space.cmp(&b.space)));
             refs.truncate(limit);
             Ok(refs)

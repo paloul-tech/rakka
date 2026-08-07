@@ -292,19 +292,13 @@ pub fn wake_id_for_occurrence(
     occurrence: &AgentWakeOccurrence,
 ) -> AgentWakeResult<AgentWakeId> {
     validate_tenant(tenant)?;
-    let mut canonical = Vec::new();
-    for segment in [
+    let digest = AgentContentDigest::sha256_of_segments([
         tenant.as_str(),
         goal.as_str(),
         &schedule_revision.to_string(),
         occurrence.kind_label(),
         &occurrence.identity_value(),
-    ] {
-        canonical.extend_from_slice(segment.len().to_string().as_bytes());
-        canonical.push(b':');
-        canonical.extend_from_slice(segment.as_bytes());
-    }
-    let digest = AgentContentDigest::sha256_of_bytes(&canonical);
+    ]);
     Ok(AgentWakeId::new(format!(
         "{AGENT_WAKE_ID_PREFIX}{}",
         digest.value

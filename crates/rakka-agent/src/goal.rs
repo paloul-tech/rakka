@@ -811,9 +811,14 @@ impl AgentGoalSpec {
                 return Err(AgentGoalError::FanInQuorumInvalid { n, maximum });
             }
         }
+        // The size gate fails closed: a spec that cannot encode would fail
+        // every later persistence of the coordinating task record, so it is
+        // refused here where the error is actionable, never sized as zero.
         let bytes = serde_json::to_vec(self)
             .map(|bytes| bytes.len())
-            .unwrap_or(0);
+            .map_err(|error| AgentGoalError::SpecUnencodable {
+                message: error.to_string(),
+            })?;
         if bytes > AGENT_GOAL_SPEC_MAX_BYTES {
             return Err(AgentGoalError::SpecTooLarge {
                 bytes,
@@ -1604,6 +1609,11 @@ pub enum AgentGoalError {
         /// The bound.
         maximum: usize,
     },
+    /// The spec could not be serialized, so no bound can vouch for it.
+    SpecUnencodable {
+        /// The encoder's message.
+        message: String,
+    },
 }
 
 impl AgentGoalError {
@@ -1630,6 +1640,7 @@ impl AgentGoalError {
             Self::CollectionTooLarge { .. } => "goal-collection-too-large",
             Self::LabelTooLong { .. } => "goal-label-too-long",
             Self::SpecTooLarge { .. } => "goal-spec-too-large",
+            Self::SpecUnencodable { .. } => "goal-spec-unencodable",
         }
     }
 }
@@ -1725,6 +1736,9 @@ impl Display for AgentGoalError {
                 f,
                 "the goal spec serializes to {bytes} bytes, which exceeds the {maximum} byte bound"
             ),
+            Self::SpecUnencodable { message } => {
+                write!(f, "the goal spec could not be serialized: {message}")
+            }
         }
     }
 }

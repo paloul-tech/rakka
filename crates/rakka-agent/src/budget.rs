@@ -1000,25 +1000,30 @@ impl AgentEscrowLedger {
     /// the definition permits. Per conserved dimension the new allocation is
     /// the old plus `additional`, capped at `ceiling`, and never smaller than
     /// what the ledger already held: a widening cannot shrink headroom that
-    /// outstanding children were granted against. Returns the allocation now
-    /// in force; the caller reads [`Self::available`] to learn whether the
-    /// widening relieved a specific exhaustion.
+    /// outstanding children were granted against. A dimension the top-up
+    /// leaves unbounded is left exactly as it was: `None` in a top-up means
+    /// *nothing additional here*, never *lift this cap* — a partial top-up
+    /// must not silently erase the bounds it did not name. Returns the
+    /// allocation now in force; the caller reads [`Self::available`] to learn
+    /// whether the widening relieved a specific exhaustion.
     pub fn widen(
         &mut self,
         additional: &AgentBudgetAllocation,
         ceiling: &AgentBudgetAllocation,
     ) -> AgentBudgetAllocation {
-        let target = self
-            .allocation
-            .saturating_add(additional)
-            .narrowed_to(ceiling);
         let mut widened = self.allocation;
         for dimension in AgentBudgetDimension::CONSERVED {
-            let amount = match (self.allocation.get(dimension), target.get(dimension)) {
-                (None, _) | (_, None) => None,
-                (Some(held), Some(offered)) => Some(held.max(offered)),
+            let (Some(added), Some(held)) =
+                (additional.get(dimension), self.allocation.get(dimension))
+            else {
+                // Nothing added, or the dimension is already unbounded.
+                continue;
             };
-            widened.set(dimension, amount);
+            let mut target = held.saturating_add(added);
+            if let Some(bound) = ceiling.get(dimension) {
+                target = target.min(bound);
+            }
+            widened.set(dimension, Some(held.max(target)));
         }
         self.allocation = widened;
         self.allocation
@@ -1593,19 +1598,44 @@ mod tests {
         let widened = near_max.widen(&tokens(u64::MAX), &AgentBudgetAllocation::unbounded());
         assert_eq!(widened.tokens, Some(u64::MAX));
 
-        // An explicitly unbounded addition under an unbounded ceiling lifts
-        // the bound: unbounded is the type's "everything", here as everywhere.
+        // An unbounded addition adds nothing: `None` in a top-up means *no
+        // additional allocation here*, never *lift this cap*. An allocation
+        // that named no dimension cannot be told apart from one defaulted
+        // into, so treating it as "everything" would let a partial top-up
+        // silently erase every bound it did not name.
         let mut bounded = ledger(10);
         let widened = bounded.widen(
             &AgentBudgetAllocation::unbounded(),
             &AgentBudgetAllocation::unbounded(),
         );
-        assert_eq!(widened.tokens, None);
+        assert_eq!(widened.tokens, Some(10));
 
-        // Under a bounded ceiling the same addition grows exactly to it.
+        // The same under a bounded ceiling: unnamed means unchanged.
         let mut bounded = ledger(10);
         let widened = bounded.widen(&AgentBudgetAllocation::unbounded(), &tokens(25));
-        assert_eq!(widened.tokens, Some(25));
+        assert_eq!(widened.tokens, Some(10));
+    }
+
+    #[test]
+    fn widen_leaves_dimensions_the_top_up_does_not_name_untouched() {
+        // The goal-resume regression: a tokens-only top-up against a ledger
+        // that also bounds cost must not lift the cost cap, whether the
+        // definition ceiling bounds cost or not.
+        let mut ledger = AgentEscrowLedger::new(AgentBudgetGrant::new(
+            AgentBudgetAllocation {
+                tokens: Some(50_000),
+                cost_micros: Some(10_000_000),
+                ..AgentBudgetAllocation::unbounded()
+            },
+            AgentBudgetLimits::unbounded(),
+        ));
+        let widened = ledger.widen(&tokens(50_000), &AgentBudgetAllocation::unbounded());
+        assert_eq!(widened.tokens, Some(100_000));
+        assert_eq!(
+            widened.cost_micros,
+            Some(10_000_000),
+            "a partial top-up must not erase the caps it did not name"
+        );
     }
 
     #[test]
