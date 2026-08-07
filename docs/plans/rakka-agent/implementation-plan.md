@@ -3269,9 +3269,26 @@ Milestone: M5. Acceptance:
 [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5).
 Scenarios owed: 38, 41-43, 45.
 
-Open decisions to resolve: 6 (agent cards/assignment), 18 (first-class
-patterns — resolved default), 19 (setup envelope — enforced since Phase 1),
-21 (replayable coordination events).
+Open decisions to resolve: 6 (agent cards/assignment — slice 4.3's
+`AgentDelegationTarget` catalog already implements the recommended shape
+for delegation; slice 5.1 records the disposition and reuses the catalog
+for handoff target resolution), 18 (first-class patterns — resolved
+default), 19 (setup envelope — enforced since Phase 1), 21 (replayable
+coordination events — resolved by slice 5.5).
+
+**Slice text revised 2026-08-07** against the delivered M1-M4 architecture;
+the scenario mapping and done-whens are unchanged. What prior phases
+already supply: `AgentCoordinationCapabilityKind` as an admission-enforced
+envelope dimension (slices 1.2/4.3), `AgentRunStatus::HandedOff`, the
+coordination-tool interception door, the cell + `A2aSendCall` +
+executor-port + `io.rakka.collaboration` extension idioms (4.3-4.6), the
+`AgentRunCollaborationView`/goal-view lockstep rule (4.7), the per-task
+replay cursor with expired-window resync (1.12), and the `WaitingForInput`
+projection row (1.12). Debts explicitly parked here by earlier slices:
+input delivery to an existing task refuses pending 5.4 (slice 1.12), the
+dependents registry (4.6 → 5.4), the goal-view wire surface (4.7 → 5.5).
+Sequencing: 5.4 depends only on Phase 1 machinery and may run first or in
+parallel; 5.5 must trail 5.1-5.3, whose events it replays.
 
 ### Slice 5.1 — Capability model and handoff
 
@@ -3280,13 +3297,46 @@ Spec: [8.8](spec.md#88-coordination-capability-model),
 (handoff lineage).
 Guidance: [Coordination Capabilities](technical-guidance.md#coordination-capabilities).
 
-- `AgentCoordinationCapability` descriptors as trusted definition/setup data;
-  runtime may expose them to the model as tools, but model output cannot
-  create capability, target, budget, or scope.
-- Handoff: same `AgentTaskId`, source-run fencing, target-run creation,
-  explicit context/artifact projection only, `HandedOff` terminal recorded
-  after durable target acceptance; traverses outbox/inbox + `rakka-a2a` even
-  colocated.
+- Descriptors only — the capability *kind* set, the
+  `CoordinationCapability` envelope dimension, and its admission
+  enforcement shipped in Phases 1/4. This slice adds
+  `AgentCoordinationCapability` descriptors (the four policy payloads) in
+  `coordination.rs` as trusted definition/setup data and wires the existing
+  `AgentRunDelegationConfig` in as the `Delegation` policy's realization.
+  Unchanged rule: the runtime may expose capabilities to the model as
+  tools, but model output cannot create capability, target, budget, or
+  scope.
+- Handoff reuses the delegation idioms wholesale: initiation is a
+  model-visible coordination tool through the 4.3 interception door
+  (refusals are failed tool results the run survives); the handoff id
+  derives from (run scope, turn, slot) via the `delegation_id_for` digest
+  construction and doubles as the A2A message/dedup key; a handoff cell on
+  `AgentLoopState` commits in the same compare-and-set as the `A2aSendCall`
+  effect whose payload is the handoff record; the `io.rakka.collaboration`
+  extension widens with handoff identity
+  ([spec 14.4](spec.md#144-agent-to-agent-effects) reserves it); the target
+  resolves once inside the committing CAS through the
+  `AgentDelegationTarget` catalog (open decision 6's disposition).
+- The new machinery is same-task transfer: ingress drives a new assignment
+  generation on the *same* `AgentTaskId` (`decide_assignment`, not
+  `generated_task_id`); the source run is fenced from completion and effect
+  scheduling; `HandedOff` records only after durable target acceptance;
+  context/artifact projection is explicit-only, with no session-memory
+  namespace reuse and no private-memory exposure; handoff lineage lands in
+  authorized task metadata/history; traversal is outbox/inbox +
+  `rakka-a2a` even colocated.
+- Interactions to settle in-slice: the wind-down fence treatment of a
+  pending handoff send under cancellation (`exempt_from_wind_down_fence` is
+  kind-based); the 4.6 chase condition must cover a
+  handed-off-but-unaccepted target; handoff does not debit `Descendants`
+  (same task) but `delegation_envelope_for` needs an explicit
+  handoff-target arm; the 4.7 goal-view run re-derivation
+  (`run_id_for_assignment` over assignee + generation) must handle a
+  handed-off generation chain — resolve the earlier-generations gap here or
+  keep it explicitly surfaced.
+- View lockstep: the handoff cell joins `AgentRunCollaborationView` and the
+  goal-view task node in this slice (the view structs are
+  `#[non_exhaustive]` for exactly this).
 
 Done when: scenario 38 passes.
 
@@ -3294,10 +3344,25 @@ Done when: scenario 38 passes.
 
 Spec: [8.10](spec.md#810-team-coordination).
 
-- `AgentTeamId`, bounded membership, durable shared task board; atomic
-  claim/release/transfer with revision/lease fencing and stable operation
-  IDs; mediated peer messages over durable commands.
-- Idle teams and members passivate; the board is data.
+- `AgentTeamId` plus a sharded team entity: leader, root goal, bounded
+  member types/instances, capability scopes, creation/expiry policy, and
+  the durable shared task board as entity state; claim/release/transfer are
+  atomic compare-and-sets under revision/lease fencing with stable
+  operation IDs; stale commands fail closed.
+- A board claim composes with the existing assignment machinery — it drives
+  `decide_assignment` on the task entity, whose assignment-generation
+  fencing is already the one-normal-owner guarantee; the board never holds
+  a second copy of ownership.
+- Team↔task exchanges follow the acyclic choreography rule (accept() makes
+  local progress only; the courier drains the journal) as new exchange
+  kinds beyond the current eleven; mediated peer messages are durable
+  commands over `rakka-a2a` carrying team identity in the collaboration
+  extension — never direct actor references.
+- Idle teams and members passivate; the board is data, not a resident
+  coordinator — no single-coordinator topology.
+- [Spec 17.13](spec.md#1713-structured-logs-runtime-events-and-audit) audit
+  and bounded metrics for
+  creation/membership/claim/transfer/message/disband.
 
 Done when: scenario 42 passes (one normal claim owner; stale commands fail
 closed).
@@ -3306,9 +3371,18 @@ closed).
 
 Spec: [8.11](spec.md#811-moderation).
 
-- `AgentConversationId`, participant set, durable turn/round state,
-  transcript artifacts, budgets; only the current participant may submit;
-  duplicates rejected; participants passivate between turns.
+- `AgentConversationId` plus a conversation entity: moderator, authorized
+  participant set, mode, durable turn/round state, transcript artifact or
+  bounded messages, completion rule.
+- Turn ownership reuses the sender-fence and settled-cell idioms (the M3
+  epoch precedent): only the current participant may submit; duplicate or
+  out-of-order turns are rejected via journal deduplication keyed on
+  (conversation, round, turn, participant).
+- Round/iteration/time/token budgets ride the conserved-dimension escrow
+  model — no parallel budget machinery.
+- The moderator may end early under policy; its proposed result still
+  passes typed task-result validation and the 4.2 evaluation door.
+- Participants and moderator passivate between turns.
 
 Done when: scenario 43 passes (turn recovery without duplication across
 passivation/shard movement).
@@ -3318,11 +3392,21 @@ passivation/shard movement).
 Spec: [8.12](spec.md#812-human-owned-tasks),
 [14.3](spec.md#143-taskrun-state-mapping) (`WaitingForInput` row).
 
-- Tasks deliberately unassigned to agents, completed by authenticated
-  humans/services with typed results through the same validation path;
-  dependency unblocking and failure propagation.
+- Ownership policy: a task deliberately unassigned per its definition's
+  human/service ownership policy; the `WaitingForInput` status and its
+  `INPUT_REQUIRED` projection row are already proven (slice 1.12).
+- Unlock the slice 1.12 deferral: `message/send` naming an existing
+  `task_id` currently refuses with a stable reason — replace the refusal
+  with authenticated, deduplicated typed-result delivery through the same
+  validation path, on the `RecordWorkflowResult` idiom (operation id pure
+  over identity, non-committing refusals, first-writer-wins).
+- Build the dependents registry (deferred from 4.6): completion unblocks
+  dependents; failure propagates the declared dependency policy; any
+  ingress firing over a live run takes `request_task_cancellation`, never
+  `terminate`.
 - Keep the boundary with effect-bound checkpoints explicit
-  ([spec 8.12](spec.md#812-human-owned-tasks)).
+  ([spec 8.12](spec.md#812-human-owned-tasks)): exact-effect approval stays
+  `AgentCheckpoint`-bound; a human task never substitutes.
 
 Done when: scenario 41 passes.
 
@@ -3332,9 +3416,19 @@ Spec: [17.13](spec.md#1713-structured-logs-runtime-events-and-audit),
 [14.5](spec.md#145-typed-agent-client).
 Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-testkit).
 
-- Extend the Phase 1 event replay to coordination events (assignment,
-  handoff, claim, turn) with monotonic scoped cursor, bounded retention, and
-  explicit resync; derived struggle signals stay projections.
+- Extend the slice 1.12 replay (per-task event log, task-scoped cursor,
+  expired-window resync in `rakka-a2a`) to coordination events —
+  assignment, handoff, claim, turn — emitted only after the durable
+  transition and deduplication-safe.
+- Generalize to scoped cursors: team and conversation scopes do not fit the
+  `<task-id>:<sequence>` shape; bounded retention and explicit resync per
+  scope. Resolves open decision 21.
+- Derived struggle signals (stalled claims, moderation exhaustion) stay
+  observability projections.
+- Typed-client subscription surface, absorbing the 4.7 recorded follow-up:
+  the goal-view wire surface (an `A2AOperation::GoalViewRead`-shaped
+  operation plus typed-client query over the untouched principal-free
+  assembly core and `authorized_agent_goal_view` wrapper).
 
 Done when: scenario 45 passes.
 
@@ -3342,9 +3436,16 @@ Done when: scenario 45 passes.
 
 Spec: [Coordination Capability Milestone](spec.md#coordination-capability-milestone-m5).
 
-- Deterministic model/tool scripts plus fault injection covering every task,
-  handoff, claim, turn, and effect boundary.
-- Walk the coordination milestone checklist end to end.
+- Deterministic model/tool scripts plus fault injection covering every
+  task, handoff, claim, turn, and effect boundary; walk the coordination
+  milestone checklist end to end.
+- Acceptance example on the `multi-agent-goal-acceptance` pattern: pinned
+  transcript, sharded entities, real in-process A2A, pod loss over the new
+  coordination CAS points.
+- Re-prove "per-run setup cannot widen the envelope" with coordination
+  capabilities as the widened dimension.
+- Scope fence: the 4.4/4.6 crash-sweep debt stays in Phase 6.1
+  (user-confirmed); 5.6 sweeps only the CAS points Phase 5 introduces.
 
 Done when: the checklist is demonstrated and all M5 scenarios pass under
 fault injection.
