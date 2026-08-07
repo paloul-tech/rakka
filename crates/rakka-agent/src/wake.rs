@@ -55,6 +55,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension};
 use crate::definition::{AgentPolicyRef, AgentRevisionNumber, AgentRevisionProvenance};
+use crate::evaluation::{AgentGoalStagnationPolicy, AgentStagnationTrigger};
 use crate::identity::{
     validate_tenant, validated_id, AgentGoalId, AgentIdentityError, AgentOperationId,
     AgentOperationKind, AgentRunId, AgentTaskId, AgentWakeId, TenantId,
@@ -291,19 +292,13 @@ pub fn wake_id_for_occurrence(
     occurrence: &AgentWakeOccurrence,
 ) -> AgentWakeResult<AgentWakeId> {
     validate_tenant(tenant)?;
-    let mut canonical = Vec::new();
-    for segment in [
+    let digest = AgentContentDigest::sha256_of_segments([
         tenant.as_str(),
         goal.as_str(),
         &schedule_revision.to_string(),
         occurrence.kind_label(),
         &occurrence.identity_value(),
-    ] {
-        canonical.extend_from_slice(segment.len().to_string().as_bytes());
-        canonical.push(b':');
-        canonical.extend_from_slice(segment.as_bytes());
-    }
-    let digest = AgentContentDigest::sha256_of_bytes(&canonical);
+    ]);
     Ok(AgentWakeId::new(format!(
         "{AGENT_WAKE_ID_PREFIX}{}",
         digest.value
@@ -1637,6 +1632,12 @@ pub struct AgentGoalLifecycleState {
     backoff_until: Option<AgentTimestampMillis>,
     #[serde(default)]
     rewakes: AgentWakeRewakes,
+    #[serde(default)]
+    last_result_digest: Option<AgentContentDigest>,
+    #[serde(default)]
+    repeated_result_epochs: u32,
+    #[serde(default)]
+    no_progress_epochs: u32,
 }
 
 fn initial_lifecycle_revision() -> AgentRevisionNumber {
@@ -1654,6 +1655,9 @@ impl Default for AgentGoalLifecycleState {
             consecutive_failures: 0,
             backoff_until: None,
             rewakes: AgentWakeRewakes::default(),
+            last_result_digest: None,
+            repeated_result_epochs: 0,
+            no_progress_epochs: 0,
         }
     }
 }
@@ -1712,6 +1716,24 @@ impl AgentGoalLifecycleState {
     #[must_use]
     pub const fn rewakes(&self) -> &AgentWakeRewakes {
         &self.rewakes
+    }
+
+    /// The result fingerprint of the last completed epoch that carried one.
+    #[must_use]
+    pub const fn last_result_digest(&self) -> Option<&AgentContentDigest> {
+        self.last_result_digest.as_ref()
+    }
+
+    /// Consecutive completed epochs sharing the last result fingerprint.
+    #[must_use]
+    pub const fn repeated_result_epochs(&self) -> u32 {
+        self.repeated_result_epochs
+    }
+
+    /// Consecutive completed epochs without a new result fingerprint.
+    #[must_use]
+    pub const fn no_progress_epochs(&self) -> u32 {
+        self.no_progress_epochs
     }
 }
 
@@ -1785,6 +1807,12 @@ pub struct AgentWakeCounters {
     /// Controller-originated retries consumed.
     #[serde(default)]
     pub retried: u64,
+    /// Repeated-result stagnation trips the detector recorded.
+    #[serde(default)]
+    pub stagnation_repeated: u64,
+    /// No-progress stagnation trips the detector recorded.
+    #[serde(default)]
+    pub stagnation_no_progress: u64,
 }
 
 /// How the controller dispositioned one wake delivery
@@ -2265,6 +2293,38 @@ impl AgentWakeControllerState {
         Ok(self.lifecycle.lifecycle_revision)
     }
 
+    /// Suspends the goal under a persisted policy decision — the goal-scope
+    /// budget park of slice 4.1, the same class of durable suspension as the
+    /// failure escalation in [`Self::record_epoch_outcome`]. No principal
+    /// decided it, so it records no provenance, and it takes no fence: it runs
+    /// inside the transition that decided it, against the current record.
+    /// Idempotent on an already-suspended or terminal gate.
+    pub fn suspend_by_policy(&mut self, reason: impl Into<String>) -> AgentRevisionNumber {
+        if self.lifecycle.status != AgentGoalLifecycleStatus::Active {
+            return self.lifecycle.lifecycle_revision;
+        }
+        self.lifecycle.status = AgentGoalLifecycleStatus::Suspended;
+        self.lifecycle.suspended_reason = Some(bounded_reason(reason.into()));
+        self.lifecycle.changed_by = None;
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        self.lifecycle.rewakes = AgentWakeRewakes::default();
+        self.lifecycle.lifecycle_revision
+    }
+
+    /// Retires the goal under a persisted policy decision — the transition a
+    /// terminal goal contract drives so admission closes with it. Absorbing;
+    /// idempotent on an already-terminal gate.
+    pub fn retire_by_policy(&mut self) -> AgentRevisionNumber {
+        if self.lifecycle.status.is_terminal() {
+            return self.lifecycle.lifecycle_revision;
+        }
+        self.lifecycle.status = AgentGoalLifecycleStatus::Retired;
+        self.lifecycle.changed_by = None;
+        self.lifecycle.lifecycle_revision = self.lifecycle.lifecycle_revision.next();
+        self.lifecycle.rewakes = AgentWakeRewakes::default();
+        self.lifecycle.lifecycle_revision
+    }
+
     /// Accounts one epoch's terminal outcome: a completion resets the failure
     /// streak, a failure grows it and engages backoff, a cancellation does
     /// neither. Returns whether the failure escalated into an auto-suspend.
@@ -2311,6 +2371,95 @@ impl AgentWakeControllerState {
                 escalated
             }
         }
+    }
+
+    /// Accounts one epoch's progress evidence and answers which stagnation
+    /// trigger, if any, the policy's thresholds now trip
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Only a `Completed` epoch moves the detector; `Failed` and `Cancelled`
+    /// leave it untouched — the failure streak is
+    /// [`Self::record_epoch_outcome`]'s, and one settlement moves exactly one
+    /// of the two families. Nothing here silently resets: the only reset is a
+    /// completed epoch whose fingerprint is genuinely new, and the one
+    /// non-progress reset is the authorized resume door's
+    /// [`Self::reset_stagnation`].
+    ///
+    /// The deterministic rules, per settled epoch:
+    ///
+    /// | Completed with        | last digest | repeated       | no-progress    |
+    /// |-----------------------|-------------|----------------|----------------|
+    /// | a new digest          | replaced    | `= 1`          | `= 0` (reset)  |
+    /// | the identical digest  | kept        | `+1`           | `+1`           |
+    /// | no digest (defensive) | kept        | kept           | `+1`           |
+    ///
+    /// A trip fires exactly at a set threshold, `RepeatedResult` before
+    /// `NoProgress`. Accounting is unconditional — a streak is a durable fact
+    /// about the epochs whatever the contract does with it — but *counting* the
+    /// trip is not: [`Self::record_stagnation_trip`] is the caller's separate
+    /// step, taken only where the trip is durably acted on, so the metric never
+    /// reports a trip that left no record.
+    pub fn record_epoch_progress(
+        &mut self,
+        policy: &AgentGoalStagnationPolicy,
+        outcome: AgentEpochOutcomeClass,
+        result_digest: Option<&AgentContentDigest>,
+    ) -> Option<AgentStagnationTrigger> {
+        if !matches!(outcome, AgentEpochOutcomeClass::Completed) {
+            return None;
+        }
+        match result_digest {
+            Some(digest) => {
+                if self.lifecycle.last_result_digest.as_ref() == Some(digest) {
+                    self.lifecycle.repeated_result_epochs =
+                        self.lifecycle.repeated_result_epochs.saturating_add(1);
+                    self.lifecycle.no_progress_epochs =
+                        self.lifecycle.no_progress_epochs.saturating_add(1);
+                } else {
+                    self.lifecycle.last_result_digest = Some(digest.clone());
+                    self.lifecycle.repeated_result_epochs = 1;
+                    self.lifecycle.no_progress_epochs = 0;
+                }
+            }
+            None => {
+                self.lifecycle.no_progress_epochs =
+                    self.lifecycle.no_progress_epochs.saturating_add(1);
+            }
+        }
+        policy.tripped(
+            self.lifecycle.repeated_result_epochs,
+            self.lifecycle.no_progress_epochs,
+        )
+    }
+
+    /// Counts one stagnation trip the contract durably acted on.
+    ///
+    /// Called in lockstep with the trip's `GoalStagnationDetected` audit row,
+    /// which is what keeps `rakka.agent.goal.stagnation` honest: a trip the
+    /// goal's status suppressed — it is `Proposed`, or a projection in the same
+    /// settlement already ended it — accounts its streak but is never counted,
+    /// because nothing observed it. An observe-only `Continue` trip *is*
+    /// counted: it records a detection.
+    pub fn record_stagnation_trip(&mut self, trigger: AgentStagnationTrigger) {
+        match trigger {
+            AgentStagnationTrigger::RepeatedResult => {
+                self.counters.stagnation_repeated =
+                    self.counters.stagnation_repeated.saturating_add(1);
+            }
+            AgentStagnationTrigger::NoProgress => {
+                self.counters.stagnation_no_progress =
+                    self.counters.stagnation_no_progress.saturating_add(1);
+            }
+        }
+    }
+
+    /// Clears the stagnation detector under the authorized resume door — the
+    /// one deliberate non-progress reset, commanded with provenance and
+    /// recorded in history, never a silent one.
+    pub fn reset_stagnation(&mut self) {
+        self.lifecycle.last_result_digest = None;
+        self.lifecycle.repeated_result_epochs = 0;
+        self.lifecycle.no_progress_epochs = 0;
     }
 
     /// Whether the goal window could pay for one epoch right now, without

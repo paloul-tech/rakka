@@ -424,11 +424,111 @@ pub enum AgentExchangeKind {
     /// its wake ([specification 8.2](../../../docs/plans/rakka-agent/spec.md)).
     /// Initiated by the epoch task; the reply is the controller's release.
     EpochResult,
+    /// A completed goal evaluation carried to the coordinating root task
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    /// Initiated by the run that committed the evaluation effect; the reply is
+    /// the decision door's acceptance or its refusal, and under a configured
+    /// evaluator this exchange is the only ingress a criteria decision has.
+    GoalEvaluation,
+    /// A delegated child task returning its terminal outcome to the parent
+    /// run that created it, as bounded references only
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md): child
+    /// results return durably deduplicated and participate in deterministic
+    /// fan-in). Initiated by the child task once terminal with its ledger
+    /// closed; the reply is the parent run's acceptance, or a refusal the
+    /// child's settle rule classifies as definitive or re-drivable.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: nothing is
+    ///   owed yet; recovery re-reaches the terminal state whose transition
+    ///   owes the identical envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the cell
+    ///   result and the acceptance committed in one compare-and-set; the
+    ///   re-driven envelope hits the receiver's journal deduplication and
+    ///   returns the original reply.
+    /// - **Reply loss**: identical to the previous window — re-drive,
+    ///   deduplicate, original outcome.
+    /// - **Duplicate delivery inside the deduplication window**: the journal
+    ///   answers the replay; no second transition runs.
+    /// - **Duplicate delivery past the bounded window**: the cell's recorded
+    ///   result is the durable fence — the arm finds it present and accepts
+    ///   idempotently with no state change.
+    /// - **Stale shard owner**: the durable-state compare-and-set refuses
+    ///   the stale write; the new owner converges.
+    /// - **Parent gone, forged, or never assigned**: a settled refusal the
+    ///   child's settle rule accepts as definitive, so the child stops
+    ///   re-driving; a wound-down parent instead records the result as
+    ///   evidence and resumes nothing.
+    DelegationResult,
+    /// A task pushing a durable cancellation request to the run currently
+    /// assigned to it ([specification 8.7](../../../docs/plans/rakka-agent/spec.md):
+    /// propagation is a request with an observable outcome). Initiated by the
+    /// task entity once its nonterminal cancellation marker is set and a run
+    /// has durably accepted the assignment; the reply is the run's receipt
+    /// carrying the status the wind-down reached — `Cancelling` or
+    /// `WaitingForReconciliation` is an accepted receipt, never proof that a
+    /// started effect stopped.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the cancellation
+    ///   marker committed with the goal decision; the settle pass re-derives
+    ///   the identical owed envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the wind-down
+    ///   and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: a winding-down or
+    ///   terminal run is its own fence — the arm answers idempotently with
+    ///   the current durable status and runs no second transition.
+    /// - **Never assigned or forged sender**: a settled refusal the task's
+    ///   settle rule accepts as definitive; the task finalizes through the
+    ///   no-active-run arm instead of re-driving forever.
+    RunCancel,
+    /// A parent run pushing a durable cancellation request to a delegated
+    /// child task it created ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// In-fabric like [`Self::DelegationResult`] — the A2A carrier stays
+    /// reserved for federation. Initiated by the parent run against the child
+    /// task recorded in its delegation cell; the reply is the child's durable
+    /// acceptance of the *request* — the child's terminal outcome still
+    /// arrives separately as [`Self::DelegationResult`], and an accepted
+    /// cancellation is never proof the child's started effects stopped.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the wind-down
+    ///   that marks the cell cancel-owed committed atomically; recovery
+    ///   re-reaches it and owes the identical envelope under the same
+    ///   derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the child's
+    ///   cancellation marker and journal record committed in one
+    ///   compare-and-set; the re-driven envelope is answered from the
+    ///   applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the child's own
+    ///   cancellation marker or terminal status is the durable fence — the
+    ///   arm accepts idempotently with no state change.
+    /// - **Not delegated or forged sender**: a settled refusal the parent's
+    ///   settle rule accepts as definitive; the cell records the refusal and
+    ///   the parent's quiescence no longer waits on that member.
+    DelegationCancel,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -436,6 +536,10 @@ impl AgentExchangeKind {
         Self::BudgetSettlement,
         Self::BudgetReturn,
         Self::EpochResult,
+        Self::GoalEvaluation,
+        Self::DelegationResult,
+        Self::RunCancel,
+        Self::DelegationCancel,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -449,6 +553,10 @@ impl AgentExchangeKind {
             Self::BudgetSettlement => "budget-settlement",
             Self::BudgetReturn => "budget-return",
             Self::EpochResult => "epoch-result",
+            Self::GoalEvaluation => "goal-evaluation",
+            Self::DelegationResult => "delegation-result",
+            Self::RunCancel => "run-cancel",
+            Self::DelegationCancel => "delegation-cancel",
         }
     }
 }

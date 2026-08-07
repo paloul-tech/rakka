@@ -1,19 +1,21 @@
 //! Goal-active work passivates to zero and one durable trigger resumes it.
 //!
-//! Specification: sections 6.11 and 15; scenario 35 of section 18. The M1
-//! reading, pinned here deliberately: the goal types of `goal.rs` are filled
-//! by the later goal slices, so at M1 "an `Active` goal" is a non-terminal
-//! root task carrying an `AgentGoalId`, and "its waiting runs" is the task's
-//! run parked on a durable approval wait. All three entities — agent, task,
-//! run — are real sharded actors here, and all three passivate to a local
-//! entity count of zero while the goal remains logically active: the wait is
-//! the durable checkpoint record (the no-open-span half is scenario 22's
-//! proof in `trace_scenarios.rs`), not a resident actor, task, or timer.
-//! One durable trigger — the checkpoint decision command — reactivates the
-//! correct owner and advances the work exactly once: a duplicate decision is
-//! answered from the record, and an owner killed mid-resume converges on the
-//! same single advance after the trigger is redelivered. Timer-driven wakes
-//! are the phase 3 wake controller's; nothing here invents one.
+//! Specification: sections 6.11, 8.1, and 15; scenario 35 of section 18. The
+//! first two tests keep the M1 reading they were written under — "an `Active`
+//! goal" as a non-terminal root task carrying an `AgentGoalId`, its run
+//! parked on a durable approval wait — because that reading stays true and
+//! the scenario stays owed. Slice 4.1 filled `goal.rs` with the full
+//! contract, so the last test adds the 8.1 half: a root task holding a real
+//! `AgentGoalState` passivates to zero resident entities, the goal record is
+//! read back from durable state alone without waking anything, and one
+//! durable goal command reactivates the correct owner and transitions the
+//! contract exactly once — the "remains durably addressable through
+//! passivation until an authorized terminal transition" clause, proven
+//! against the record the entity itself transitions. All entities are real
+//! sharded actors; the wait is durable state (the no-open-span half is
+//! scenario 22's proof in `trace_scenarios.rs`), not a resident actor, task,
+//! or timer. Timer-driven wakes are the phase 3 wake controller's; nothing
+//! here invents one.
 
 use std::time::Duration;
 
@@ -136,6 +138,7 @@ fn proposing_turn() -> AgentModelTurn {
 struct Sharded {
     system: ActorSystem,
     sharding: ClusterSharding,
+    tasks: CrashingStateStore<rakka_agent::AgentTaskState>,
     runs: CrashingStateStore<AgentRunState>,
     dispatcher: ScriptedDispatcher,
     agent: rakka_agent::AgentEntityRef,
@@ -170,6 +173,7 @@ impl Sharded {
         let ShardedWorld {
             system,
             sharding,
+            tasks,
             runs,
             dispatcher,
             agent_registration,
@@ -181,6 +185,7 @@ impl Sharded {
         Self {
             system,
             sharding,
+            tasks,
             runs,
             dispatcher,
             agent,
@@ -231,6 +236,13 @@ impl Sharded {
     }
 
     async fn create_goal_task(&self) -> AgentTaskEntityReply {
+        self.create_goal_task_with(None).await
+    }
+
+    async fn create_goal_task_with(
+        &self,
+        goal_spec: Option<Box<rakka_agent::AgentGoalSpecDraft>>,
+    ) -> AgentTaskEntityReply {
         self.task
             .ask(
                 |reply_to| AgentTaskEntityMessage::Command {
@@ -247,10 +259,12 @@ impl Sharded {
                             assignee: Some(agent_id()),
                             goal: Some(goal_id()),
                             goal_mode: Default::default(),
+                            goal_spec: goal_spec.clone(),
                             parent: None,
                             dependencies: Vec::new(),
                             escrow: None,
                             wake: None,
+                            delegation: None,
                             telemetry: Default::default(),
                         }),
                     }),
@@ -586,6 +600,145 @@ async fn a_trigger_redelivered_after_an_owner_kill_still_advances_once() {
     assert_eq!(run.status, AgentRunStatus::Completed);
     assert_eq!(run.turn, 2, "the redelivered trigger advanced exactly once");
     assert_eq!(world.dispatcher.tool_calls(), 1, "the gated tool ran once");
+
+    world.system.shutdown();
+}
+
+#[tokio::test]
+async fn the_goal_contract_stays_addressable_while_fully_passivated() {
+    // The slice 4.1 half of the scenario: the root task holds the full
+    // `AgentGoalState`, everything passivates to zero, the goal record is
+    // read from durable state alone, and one durable goal command
+    // reactivates the correct owner and transitions the contract exactly
+    // once (specification 8.1's addressability clause).
+    let world = Sharded::new("GoalContractPassivation", Duration::from_secs(60));
+    world.instantiate_agent().await;
+
+    let created = world
+        .create_goal_task_with(Some(Box::new(common::goal_spec_draft(
+            common::goal_spec(),
+            true,
+        ))))
+        .await;
+    assert!(
+        matches!(created, AgentTaskEntityReply::Applied { .. }),
+        "the goal-bearing task is created, got {created:?}"
+    );
+    world.pump().await;
+    assert_eq!(
+        world.run_status().await,
+        Some(AgentRunStatus::WaitingForApproval),
+        "the run parks on the checkpoint"
+    );
+
+    // Everything passivates while the goal contract is Active.
+    passivate_agent_entity(
+        &world.sharding,
+        world.agent_registration.key(),
+        &agent_scope(),
+    )
+    .expect("agent passivation routes");
+    passivate_agent_task_entity(
+        &world.sharding,
+        world.task_registration.key(),
+        &task_scope(),
+    )
+    .expect("task passivation routes");
+    passivate_agent_run_entity(&world.sharding, world.run_registration.key(), &run_scope())
+        .expect("run passivation routes");
+    world.assert_no_resident_entities("while the goal contract is active");
+
+    // (a) The goal record answers from durable state alone, and reading it
+    // wakes nothing.
+    let state = rakka_agent::load_agent_task_state(
+        &world.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the task state loads")
+    .expect("the task exists");
+    let goal = state
+        .task()
+        .expect("the task is created")
+        .goal_state
+        .as_deref()
+        .expect("the goal record exists")
+        .clone();
+    assert_eq!(goal.status(), rakka_agent::AgentGoalStatus::Active);
+    assert_eq!(goal.spec().revision(), AgentRevisionNumber::INITIAL);
+    world.assert_no_resident_entities("after the durable point read");
+
+    // (b) One durable goal command reactivates the correct owner and makes
+    // the authorized terminal transition exactly once.
+    let decide = |step: &str| {
+        Box::new(AgentTaskEntityCommand::RecordGoalDecision {
+            operation_id: AgentOperationId::new(AgentOperationKind::Command, [TENANT, TASK, step])
+                .expect("the operation id derives"),
+            decision: Box::new(rakka_agent::AgentGoalDecision {
+                reason: rakka_agent::AgentGoalTerminalReason::CriteriaSatisfied,
+                evaluation: Some(Box::new(common::goal_evaluation())),
+                provenance: Some(Box::new(provenance(100))),
+                expected_status_revision: goal.status_revision(),
+            }),
+        })
+    };
+    let reply = world
+        .task
+        .ask(
+            |reply_to| AgentTaskEntityMessage::Command {
+                command: decide("satisfy"),
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("the sharded task replies");
+    let AgentTaskEntityReply::Applied { outcome } = reply else {
+        panic!("expected the decision to apply, got {reply:?}");
+    };
+    assert_eq!(
+        outcome.goal.expect("the goal outcome rides").status,
+        rakka_agent::AgentGoalStatus::Satisfied
+    );
+
+    // The duplicate trigger answers from the record: no second transition.
+    let replay = world
+        .task
+        .ask(
+            |reply_to| AgentTaskEntityMessage::Command {
+                command: decide("satisfy"),
+                reply_to,
+            },
+            ASK_TIMEOUT,
+        )
+        .await
+        .expect("the sharded task replies");
+    assert!(
+        matches!(replay, AgentTaskEntityReply::Duplicate { .. }),
+        "a duplicate decision must not transition again, got {replay:?}"
+    );
+    let after = rakka_agent::load_agent_task_state(
+        &world.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+    )
+    .await
+    .expect("the task state loads")
+    .expect("the task exists");
+    let record = after
+        .task()
+        .expect("the task is created")
+        .goal_state
+        .as_deref()
+        .expect("the goal record exists")
+        .clone();
+    assert_eq!(record.status(), rakka_agent::AgentGoalStatus::Satisfied);
+    assert_eq!(
+        record.status_revision(),
+        goal.status_revision().next(),
+        "the terminal transition happened exactly once"
+    );
 
     world.system.shutdown();
 }

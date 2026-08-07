@@ -365,10 +365,12 @@ impl World {
                     assignee: None,
                     goal: Some(goal_id()),
                     goal_mode: continuous_goal_mode(initial_policy()),
+                    goal_spec: None,
                     parent: None,
                     dependencies: Vec::new(),
                     escrow: None,
                     wake: None,
+                    delegation: None,
                     telemetry: Default::default(),
                 }),
             })

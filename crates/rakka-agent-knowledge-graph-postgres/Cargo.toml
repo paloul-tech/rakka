@@ -30,6 +30,9 @@ serde_json.workspace = true
 tokio-postgres.workspace = true
 
 [dev-dependencies]
+# The provenance identity types the backend-proof tests stamp onto racing
+# specialist claims (already in the tree through the graph crate).
+rakka-agent = { path = "../rakka-agent", version = "0.1.0", default-features = false }
 tokio.workspace = true
 
 [lints]

@@ -29,6 +29,8 @@ rakka-agent-workflow = { path = "../rakka-agent-workflow", version = "0.1.0" }
 # promotion payload and inline claim objects are `serde_json` values.
 serde.workspace = true
 serde_json.workspace = true
+# The goal-claim join queries its configured spaces concurrently.
+futures-util.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

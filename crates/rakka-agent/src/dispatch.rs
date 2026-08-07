@@ -107,7 +107,7 @@ use rakka_agent_workflow::{
     agent_effect_to_outbox_command, AgentDispatchClaim, AgentDispatcherError, AgentDispatcherFleet,
     AgentDispatcherFleetSettings, AgentDispatcherFleetState, AgentDispatcherWorkerId, AgentEffect,
     AgentEphemeralCredential, AgentInboxError, AgentOutboxError, AgentRunId as WorkflowRunId,
-    AgentRunInbox, AgentTimestampMillis,
+    AgentRunInbox, AgentTimestampMillis, PrincipalRef,
 };
 use rakka_persistence::DurableStateStore;
 
@@ -374,6 +374,297 @@ pub trait AgentMemoryPromotionExecutor: Send + Sync {
         promotion: &'a AgentMemoryPromotionRequest,
         now: AgentTimestampMillis,
     ) -> AgentDispatchFuture<'a, AgentMemoryPromotionFinding>;
+}
+
+/// What one bounded goal-evaluation attempt established
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum AgentGoalEvaluationFinding {
+    /// The evaluation reached a verdict. The evidence is the *complete*
+    /// classed set the verdict rests on — the executor starts from the
+    /// request's evidence and may extend it — references and stable codes
+    /// only, never content.
+    ///
+    /// Both verdicts end the goal: `Satisfied` decides it satisfied,
+    /// `NotSatisfied` decides it unsatisfied, and neither is reversible. An
+    /// executor that means *not met yet, keep working* returns
+    /// [`Self::Refused`] instead, which leaves the goal `Active`.
+    Evaluated {
+        /// The verdict. Terminal either way — see the variant's own note.
+        outcome: crate::evaluation::AgentGoalEvaluationOutcome,
+        /// Bounded, stable reason code for the verdict.
+        reason_code: String,
+        /// The complete classed evidence the verdict rests on.
+        evidence: Vec<crate::evaluation::AgentGoalEvidenceRef>,
+        /// The human principal whose authorized decision produced the
+        /// verdict, when one did.
+        evaluated_by: Option<PrincipalRef>,
+    },
+    /// Definitively refused: no retry can change the answer. The generation
+    /// settles `Failed` under the stable code, the goal stays undecided, and
+    /// the caller re-evaluates.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one goal-evaluation effect inside a bounded dispatch attempt
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): judges the
+/// request's criteria revision against durable evidence, as the deterministic
+/// assertion, authoritative query, or evaluator model the request names. The
+/// evaluator-model contract is the request's pinned profile — the authority
+/// resolved it from the request alone, so the agent's turn-bound settings
+/// profile never stands in for it.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the effect's
+/// read-only attempt bound; a [`AgentGoalEvaluationFinding::Refused`] is
+/// definitive. An absent executor fails closed at `invoke`. Human review never
+/// reaches this trait — the effect-bound approval grant is its verdict.
+pub trait AgentGoalEvaluationExecutor: Send + Sync {
+    /// Performs the evaluation and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        evaluation: &'a crate::evaluation::AgentGoalEvaluationRequest,
+        credential: Option<&'a AgentEphemeralCredential>,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentGoalEvaluationFinding>;
+}
+
+/// What one outbound A2A send established
+/// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentA2aSendFinding {
+    /// The peer durably created — or replayed to — the delegation's one
+    /// logical child.
+    Sent {
+        /// The child task the peer reported.
+        child_task: crate::identity::AgentTaskId,
+        /// The child's initial run, when the peer reported one.
+        child_run: Option<crate::identity::AgentRunId>,
+        /// The peer's bounded task-state label.
+        peer_status: String,
+    },
+    /// The peer holds a child this delegation's identity does not own — the
+    /// explicit conflict of
+    /// [specification 6.6](../../../docs/plans/rakka-agent/spec.md). The
+    /// generation settles `Failed` under the code and the cell records the
+    /// conflict; recovery uses a new delegation, never this one.
+    Conflict {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without creating a child: no retry can change
+    /// the answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one outbound A2A send inside a bounded dispatch attempt
+/// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)): carries
+/// the delegation record — verbatim, exactly as it was persisted — to the
+/// peer surface with the versioned collaboration metadata, the record's
+/// message id, and its deduplication key, so a retried attempt converges on
+/// the same logical child.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a [`AgentA2aSendFinding::Conflict`] or
+/// [`AgentA2aSendFinding::Refused`] is definitive. An absent executor fails
+/// closed at `invoke`. The `rakka-a2a` crate provides the in-process
+/// implementation over its agents surface; this crate deliberately has no
+/// A2A dependency, which is one half of why a generic tool cannot reach a
+/// peer.
+pub trait AgentA2aSendExecutor: Send + Sync {
+    /// Performs the send and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        delegation: &'a crate::delegation::AgentDelegationRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aSendFinding>;
+}
+
+/// What one workflow start established
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentWorkflowStartFinding {
+    /// The derived `StartRun` was durably accepted by the child run's inbox:
+    /// the invocation's one logical child now exists.
+    Started,
+    /// The child already existed and the derived `StartRun` deduplicated
+    /// against its inbox or run state: adoption, not an error.
+    Adopted,
+    /// A child run exists that this invocation's identity does not own — a
+    /// deduplication-key match under a foreign command id, or an existing run
+    /// whose workflow type or definition version differs from what the record
+    /// pinned. The dispatch layer normalizes every conflict onto
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE`] —
+    /// this code is detail folded into the failure message, so the executor
+    /// may report any code it likes and the cell still settles `Conflicted`;
+    /// recovery uses a new invocation, never this one.
+    Conflict {
+        /// Machine-readable detail code, preserved in the failure message.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without reaching the child: no retry can change
+    /// the answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one workflow start inside a bounded dispatch attempt
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)): delivers
+/// the derived, generation-free `StartRun` command —
+/// [`crate::workflow_tool::workflow_start_command`] builds it verbatim from
+/// the persisted record — to the child workflow run's own durable inbox.
+///
+/// The hosting application owes this executor: resolving the record's pinned
+/// workflow type and definition version against its workflow registry,
+/// delivering the command to the sharded child `AgentRunInbox` entity,
+/// mapping acceptance to [`AgentWorkflowStartFinding::Started`] and duplicate
+/// acceptance to [`AgentWorkflowStartFinding::Adopted`], driving accepted
+/// `StartRun` entries into its workflow runner, and later relaying the
+/// child's terminal outcome back as the parent's deduplicated
+/// `RecordWorkflowResult` command. A deduplication-key match under a
+/// different command id — or an existing run whose pinned fields disagree —
+/// must return [`AgentWorkflowStartFinding::Conflict`], never adopt.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`. The receipt is derived from the record,
+/// never from the acceptance, so `Started` and `Adopted` produce
+/// byte-identical outcomes apart from the adoption flag.
+pub trait AgentWorkflowStartExecutor: Send + Sync {
+    /// Performs the start and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        invocation: &'a crate::workflow_tool::AgentWorkflowInvocationRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentWorkflowStartFinding>;
+}
+
+/// What one workflow-cancel attempt established
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentWorkflowCancelFinding {
+    /// The derived `CancelRun` was durably accepted — or answered as a
+    /// duplicate — by the child run's inbox: the request exists in the
+    /// child's own durable record. Never proof its started internal effects
+    /// stopped.
+    Requested,
+    /// The child was already terminal when the request arrived; its result
+    /// relay carries — or already carried — the outcome.
+    AlreadyFinished,
+    /// Definitively refused without reaching the child: no retry can change
+    /// the answer. The parent then waits for the child's natural terminal
+    /// result.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one workflow cancel inside a bounded dispatch attempt
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): delivers
+/// the derived, generation-free `CancelRun` command —
+/// [`crate::workflow_tool::workflow_cancel_command`] builds it verbatim from
+/// the persisted record — to the child workflow run's own durable inbox.
+///
+/// The hosting application owes this executor, exactly as it owes the start's:
+/// delivering the command to the sharded child `AgentRunInbox` entity, driving
+/// the accepted `CancelRun` into its workflow runner's cancellation surface,
+/// mapping acceptance and duplicate acceptance to
+/// [`AgentWorkflowCancelFinding::Requested`], and still relaying the child's
+/// terminal outcome — `Cancelled` or otherwise — back as the parent's
+/// deduplicated `RecordWorkflowResult` command. Delivery is the whole claim:
+/// the child's scheduler quiesces under its own durable cancellation record,
+/// and its indeterminate internal effects stay in its own reconciliation.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`.
+pub trait AgentWorkflowCancelExecutor: Send + Sync {
+    /// Performs the cancel delivery and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        invocation: &'a crate::workflow_tool::AgentWorkflowInvocationRecord,
+        reason: &'a str,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentWorkflowCancelFinding>;
+}
+
+/// What one claim-append attempt established
+/// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentClaimAppendFinding {
+    /// The claim durably landed — or the derived operation replayed onto the
+    /// original claim, which is the same logical write.
+    Appended {
+        /// The appended claim's stable id, as the store recorded it.
+        claim: crate::identity::AgentCommunalClaimId,
+    },
+    /// Definitively refused without a durable write: no retry can change the
+    /// answer.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one communal claim append inside a bounded dispatch attempt
+/// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The graph-backed implementation lives beside the knowledge-graph store —
+/// the dependency runs graph → agent, so this crate declares only the trait —
+/// and derives the store's append operation id from the intent's external
+/// idempotency key: stable across every attempt of a generation, so the
+/// store's operation ledger answers a replay with the original claim. The
+/// provenance it writes is the transition-stamped record riding on the
+/// intent, never anything the executor invents.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. An absent
+/// executor fails closed at `invoke`.
+pub trait AgentClaimAppendExecutor: Send + Sync {
+    /// Performs the append and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        append: &'a crate::effect::AgentClaimAppendRequest,
+        provenance: &'a crate::effect::AgentClaimAppendProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentDispatchFuture<'a, AgentClaimAppendFinding>;
 }
 
 /// The runtime-provided promotion executor: the session store in, the private
@@ -953,6 +1244,17 @@ where
             {
                 context = context.with_checkpoint_grant(grant);
             }
+            // The goal-scope envelope binds per attempt
+            // ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+            // its environment narrowing and knowledge grant are read from the
+            // run's own durable state, so a revised assignment reaches the
+            // very next dispatch.
+            if let Some(envelope) = run
+                .loop_state()
+                .and_then(|loop_state| loop_state.delegation_envelope())
+            {
+                context = context.with_delegation_envelope(envelope);
+            }
             let task = run.run().map(AgentRun::task);
             let goal = run.loop_state().and_then(|loop_state| loop_state.goal());
             let decision = match self
@@ -1077,6 +1379,11 @@ where
     reconciler: Option<Arc<dyn AgentEffectReconciler>>,
     compensations: Option<Arc<dyn AgentCompensationExecutor>>,
     memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
+    goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
+    a2a_sends: Option<Arc<dyn AgentA2aSendExecutor>>,
+    workflow_starts: Option<Arc<dyn AgentWorkflowStartExecutor>>,
+    workflow_cancels: Option<Arc<dyn AgentWorkflowCancelExecutor>>,
+    claim_appends: Option<Arc<dyn AgentClaimAppendExecutor>>,
     delivery: Arc<dyn AgentRunResultDelivery>,
     probe: Option<Arc<dyn AgentDispatchProbe>>,
 }
@@ -1132,6 +1439,11 @@ where
             reconciler: None,
             compensations: None,
             memory_promotions: None,
+            goal_evaluations: None,
+            a2a_sends: None,
+            workflow_starts: None,
+            workflow_cancels: None,
+            claim_appends: None,
             delivery,
             probe: None,
         }
@@ -1199,6 +1511,72 @@ where
         memory_promotions: Arc<dyn AgentMemoryPromotionExecutor>,
     ) -> Self {
         self.memory_promotions = Some(memory_promotions);
+        self
+    }
+
+    /// Executes goal-evaluation effects through the given application-owned
+    /// executor ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    /// Without one, an evaluation dispatch fails closed with a stable code —
+    /// except human review, whose effect-bound approval grant is its verdict.
+    #[must_use]
+    pub fn with_goal_evaluation_executor(
+        mut self,
+        goal_evaluations: Arc<dyn AgentGoalEvaluationExecutor>,
+    ) -> Self {
+        self.goal_evaluations = Some(goal_evaluations);
+        self
+    }
+
+    /// Executes outbound A2A sends through the given executor
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)) —
+    /// usually `rakka-a2a`'s in-process delegation-send executor over the
+    /// deployment's agents surface. Without one, a send dispatch fails
+    /// closed with a stable code.
+    #[must_use]
+    pub fn with_a2a_send_executor(mut self, a2a_sends: Arc<dyn AgentA2aSendExecutor>) -> Self {
+        self.a2a_sends = Some(a2a_sends);
+        self
+    }
+
+    /// Executes workflow starts through the given executor
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// application-owned bridge that delivers the derived `StartRun` to the
+    /// child workflow run's inbox. Without one, a workflow start dispatch
+    /// fails closed with a stable code.
+    #[must_use]
+    pub fn with_workflow_start_executor(
+        mut self,
+        workflow_starts: Arc<dyn AgentWorkflowStartExecutor>,
+    ) -> Self {
+        self.workflow_starts = Some(workflow_starts);
+        self
+    }
+
+    /// Executes workflow cancels through the given executor
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// application-owned bridge that delivers the derived `CancelRun` to the
+    /// child workflow run's inbox. Without one, a workflow cancel dispatch
+    /// fails closed with a stable code and the parent waits for the child's
+    /// natural terminal result.
+    #[must_use]
+    pub fn with_workflow_cancel_executor(
+        mut self,
+        workflow_cancels: Arc<dyn AgentWorkflowCancelExecutor>,
+    ) -> Self {
+        self.workflow_cancels = Some(workflow_cancels);
+        self
+    }
+
+    /// Executes communal claim appends through the given executor
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)) — the
+    /// graph-backed bridge the application wires. Without one, a claim
+    /// append dispatch fails closed with a stable code.
+    #[must_use]
+    pub fn with_claim_append_executor(
+        mut self,
+        claim_appends: Arc<dyn AgentClaimAppendExecutor>,
+    ) -> Self {
+        self.claim_appends = Some(claim_appends);
         self
     }
 
@@ -1388,9 +1766,12 @@ where
                 .await;
         }
 
-        if winding_down {
+        if winding_down && !intent.kind().exempt_from_wind_down_fence() {
             // The fence: a ticket that provably never started is cancelled and
-            // its intent settled, never dispatched after the cancellation.
+            // its intent settled, never dispatched after the cancellation. A
+            // compensation or workflow-cancel is exempt — it is exactly the
+            // work the wind-down authorized after the fence, and cancelling
+            // its ticket here would strand the wind-down on it forever.
             self.settle_ticket_cancelled(scope, &claim, "run-cancelled", pass)
                 .await?;
             self.deliver_outcome(
@@ -2232,6 +2613,267 @@ where
                     }
                 }
             }
+            AgentRunEffectRequest::Evaluation { evaluation } => {
+                self.invoke_goal_evaluation(scope, intent, granted, evaluation, credential)
+                    .await
+            }
+            AgentRunEffectRequest::A2aSend { delegation } => {
+                let Some(executor) = self.a2a_sends.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "a2a-send-executor-missing".to_string(),
+                        message: "no A2A send executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor
+                    .execute(scope, intent, delegation, credential)
+                    .await?
+                {
+                    AgentA2aSendFinding::Sent {
+                        child_task,
+                        child_run,
+                        peer_status,
+                    } => Ok(AgentRunEffectOutcome::A2aSend {
+                        receipt: crate::delegation::AgentA2aSendReceipt {
+                            delegation: delegation.delegation.clone(),
+                            child_task,
+                            child_run,
+                            peer_status,
+                        },
+                    }),
+                    AgentA2aSendFinding::Conflict { code, message }
+                    | AgentA2aSendFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                let Some(executor) = self.workflow_starts.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "workflow-start-executor-missing".to_string(),
+                        message: "no workflow start executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor
+                    .execute(scope, intent, invocation, credential)
+                    .await?
+                {
+                    // The receipt derives from the record, never from the
+                    // acceptance: started and adopted outcomes are identical
+                    // apart from the flag, which is what keeps a replayed
+                    // start's outcome convergent.
+                    finding @ (AgentWorkflowStartFinding::Started
+                    | AgentWorkflowStartFinding::Adopted) => {
+                        Ok(AgentRunEffectOutcome::WorkflowStart {
+                            receipt: crate::workflow_tool::AgentWorkflowStartReceipt {
+                                invocation: invocation.invocation.clone(),
+                                child_run: invocation.child_run.clone(),
+                                adopted: matches!(finding, AgentWorkflowStartFinding::Adopted),
+                            },
+                        })
+                    }
+                    // Conflict-ness is normalized onto the canonical code
+                    // here, so the run entity's `Conflicted` settlement never
+                    // depends on an executor picking the right string.
+                    AgentWorkflowStartFinding::Conflict { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed {
+                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            message: format!("{code}: {message}"),
+                        })
+                    }
+                    AgentWorkflowStartFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
+            AgentRunEffectRequest::WorkflowCancel { invocation, reason } => {
+                let Some(executor) = self.workflow_cancels.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation. The parent's wind-down then
+                    // waits for the child's natural terminal result.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "workflow-cancel-executor-missing".to_string(),
+                        message: "no workflow cancel executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor
+                    .execute(scope, intent, invocation, reason, credential)
+                    .await?
+                {
+                    AgentWorkflowCancelFinding::Requested => {
+                        Ok(AgentRunEffectOutcome::WorkflowCancel {
+                            already_finished: false,
+                        })
+                    }
+                    AgentWorkflowCancelFinding::AlreadyFinished => {
+                        Ok(AgentRunEffectOutcome::WorkflowCancel {
+                            already_finished: true,
+                        })
+                    }
+                    AgentWorkflowCancelFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
+            AgentRunEffectRequest::ClaimAppend { append, provenance } => {
+                let Some(executor) = self.claim_appends.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "claim-append-executor-missing".to_string(),
+                        message: "no claim-append executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+                match executor
+                    .execute(scope, intent, append, provenance, now)
+                    .await?
+                {
+                    AgentClaimAppendFinding::Appended { claim } => {
+                        Ok(AgentRunEffectOutcome::ClaimAppend { claim })
+                    }
+                    AgentClaimAppendFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
+        }
+    }
+
+    /// The goal-evaluation arm of [`Self::invoke`]
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Human review never calls an executor: the effect-bound approval grant
+    /// the authority validated *is* the verdict, and the record it produces
+    /// names the resolver and carries the durable human decision as its
+    /// evidence. Every other method runs through the application-owned
+    /// executor, or fails closed definitively when none is configured. A
+    /// verification workflow fails closed until the evaluation cell is
+    /// bridged to the workflow-tool invocation path — defense in depth
+    /// behind the commit-time refusal.
+    async fn invoke_goal_evaluation(
+        &self,
+        scope: &AgentRunScope,
+        intent: &AgentRunEffect,
+        granted: &AgentGrantedDispatch,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        credential: Option<&AgentEphemeralCredential>,
+    ) -> AgentDispatchResult<AgentRunEffectOutcome> {
+        use crate::evaluation::{
+            goal_evaluation_record_id, AgentGoalEvaluationMethod, AgentGoalEvaluationOutcome,
+            AgentGoalEvaluationRecord, AgentGoalEvidenceRef,
+        };
+
+        let now = AgentTimestampMillis::new(self.clock.now().as_millis());
+        let evaluation_id =
+            goal_evaluation_record_id(scope, intent.turn, intent.slot, intent.generation).map_err(
+                |error| AgentDispatchError::Invocation {
+                    code: "evaluation-identity-invalid",
+                    message: error.to_string(),
+                },
+            )?;
+        let build = |outcome: AgentGoalEvaluationOutcome,
+                     reason_code: String,
+                     evidence: Vec<AgentGoalEvidenceRef>,
+                     evaluated_by| {
+            AgentGoalEvaluationRecord::new(
+                evaluation_id.clone(),
+                evaluation.goal.clone(),
+                evaluation.evaluator.clone(),
+                evaluation.method.kind(),
+                evaluation.criteria_revision,
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+                intent.effect_id.clone(),
+                intent.generation,
+                now,
+            )
+        };
+        let finding = match &evaluation.method {
+            AgentGoalEvaluationMethod::HumanReview => {
+                let Some(grant) = granted.checkpoint.as_deref() else {
+                    // The commit marked the effect checkpoint-required, so an
+                    // approved dispatch always carries its grant; an absent
+                    // one is a definitive wiring failure, never a retry.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "evaluation-grant-missing".to_string(),
+                        message: "a human-review evaluation dispatched without its approval \
+                                  grant"
+                            .to_string(),
+                    });
+                };
+                // The commit door reserved this slot, so the append always
+                // fits ([`AgentGoalEvaluationMethod::evidence_reserve`]).
+                let mut evidence = evaluation.evidence.clone();
+                evidence.push(AgentGoalEvidenceRef {
+                    class: crate::evaluation::AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS
+                        .to_string(),
+                    artifact: None,
+                    digest: Some(grant.argument_digest.clone()),
+                });
+                AgentGoalEvaluationFinding::Evaluated {
+                    outcome: AgentGoalEvaluationOutcome::Satisfied,
+                    reason_code: "human-approved".to_string(),
+                    evidence,
+                    evaluated_by: Some(grant.resolver.clone()),
+                }
+            }
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
+                return Ok(AgentRunEffectOutcome::Failed {
+                    code: "evaluation-workflow-deferred".to_string(),
+                    message: "a verification-workflow evaluation cannot execute until the \
+                              evaluation cell is bridged to the workflow-tool invocation path"
+                        .to_string(),
+                });
+            }
+            _ => {
+                let Some(executor) = self.goal_evaluations.as_ref() else {
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "evaluation-executor-missing".to_string(),
+                        message: "no goal-evaluation executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                executor
+                    .execute(scope, intent, evaluation, credential, now)
+                    .await?
+            }
+        };
+        match finding {
+            AgentGoalEvaluationFinding::Evaluated {
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+            } => {
+                let record =
+                    build(outcome, reason_code, evidence, evaluated_by).map_err(|error| {
+                        AgentDispatchError::Invocation {
+                            code: "evaluation-record-invalid",
+                            message: error.to_string(),
+                        }
+                    })?;
+                Ok(AgentRunEffectOutcome::Evaluation {
+                    record: Box::new(record),
+                })
+            }
+            AgentGoalEvaluationFinding::Refused { code, message } => {
+                Ok(AgentRunEffectOutcome::Failed { code, message })
+            }
         }
     }
 
@@ -2365,6 +3007,12 @@ where
         };
 
         for intent in loop_state.ready_effects() {
+            if intent.kind().exempt_from_wind_down_fence() {
+                // The compensation and workflow-cancel the wind-down itself
+                // authorized stay dispatchable; the ordinary flush and claim
+                // paths own them.
+                continue;
+            }
             let ticket_id = intent.dispatch_ticket_id();
             let message_id = OutboxMessageId::new(ticket_id.as_str());
             let mut inbox = self.inbox(scope);

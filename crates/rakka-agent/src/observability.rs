@@ -137,6 +137,8 @@ pub enum AgentDecisionKind {
     RequestAuthorization,
     /// Apply a reconciliation decision to an indeterminate effect.
     Reconcile,
+    /// Commit a goal-evaluation effect.
+    Evaluate,
 }
 
 impl AgentDecisionKind {
@@ -153,6 +155,7 @@ impl AgentDecisionKind {
             Self::RequestApproval => "request-approval",
             Self::RequestAuthorization => "request-authorization",
             Self::Reconcile => "reconcile",
+            Self::Evaluate => "evaluate",
         }
     }
 }
@@ -647,6 +650,45 @@ pub const METRIC_AGENT_EPOCHS: &str = "rakka.agent.epochs";
 /// `renewed` is the one transition that leaves the status unchanged and is
 /// counted from its command.
 pub const METRIC_AGENT_GOAL_LIFECYCLE: &str = "rakka.agent.goal.lifecycle";
+
+/// Counter: goal-contract status transitions
+/// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)), labeled by
+/// the status arrived at.
+///
+/// This is the *contract* status of `AgentGoalStatus` —
+/// proposed/active/waiting/satisfied/unsatisfied/failed/cancelled/expired —
+/// deliberately distinct from [`METRIC_AGENT_GOAL_LIFECYCLE`], which counts
+/// the continuous admission gate. Transitions are counted as the difference of
+/// the goal record's status across the committed transition, so projected and
+/// policy-driven moves count exactly like commanded ones.
+pub const METRIC_AGENT_GOAL_STATUS: &str = "rakka.agent.goal.status";
+
+/// Counter: stagnation-threshold trips the wake controller detected, labeled
+/// by bounded trigger (`repeated-result` / `no-progress`)
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Counted as the difference of the controller's durable stagnation counters
+/// across the committed transition — the admitted-epoch idiom — so a replayed
+/// settlement emits nothing. A `Continue` action produces no status flip, and
+/// this counter is its only metric visibility.
+pub const METRIC_AGENT_GOAL_STAGNATION: &str = "rakka.agent.goal.stagnation";
+
+/// Counter: delegated children's terminal results accepted or refused at the
+/// parent run's door, labeled by bounded `outcome`
+/// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+pub const METRIC_AGENT_DELEGATION_RESULTS: &str = "rakka.agent.delegation.results";
+
+/// Counter: fan-in groups resolved, labeled by the bounded resolution code
+/// (`all-settled` / `any-satisfied` / `quorum-satisfied` / `unsatisfiable` /
+/// `timed-out`) as `outcome`
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+pub const METRIC_AGENT_FAN_IN_RESOLUTIONS: &str = "rakka.agent.fan_in.resolutions";
+
+/// Counter: child workflow runs' terminal results accepted at the parent
+/// run's door, labeled by bounded `outcome`
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). A refused
+/// delivery is a non-committing error and is not counted here.
+pub const METRIC_AGENT_WORKFLOW_RESULTS: &str = "rakka.agent.workflow.results";
 
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///

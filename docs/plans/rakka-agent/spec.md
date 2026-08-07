@@ -2628,12 +2628,39 @@ without one remain open.
     underlying value for the goal/root task/initial run, but keep
     `AgentGoalId`, `AgentTaskId`, and `AgentRunId` as separate types and
     contracts.
+    *Disposition (M4): accepted as the resolved default —
+    `AgentGoalId::for_root_task` derives the goal id from the root
+    `AgentTaskId` value when a creation institutes a goal without an explicit
+    binding; the types, validation, and semantics stay distinct; the root
+    `AgentTaskEntity` coordinates the goal record inside its own
+    compare-and-set, so a dedicated goal entity can later take over without
+    changing the public contract (slice 4.1).*
 15. **Who selects a specialist agent?** Recommended: the model/planner requests
     a skill, while an application-owned authorized catalog resolves the
     concrete `AgentId`, endpoint, compatible contract, and scopes.
+    *Disposition (M4): accepted — model output can only name an
+    `AgentCapabilityId` skill through the one declared coordination tool the
+    loop intercepts (unknown fields fail the parse, so an agent id or
+    endpoint in model output is refused rather than ignored); the
+    application-wired `AgentDelegationCatalog` resolves the concrete agent,
+    logical endpoint, task definition, scopes, and compatibility inside the
+    same compare-and-set that persists the delegation record, replays reuse
+    the recorded resolution verbatim, and the resolved selection travels as
+    `io.rakka.agent.id`/`io.rakka.agent.task-definition` on the send
+    (slice 4.3).*
 16. **How does a compiled workflow appear as a tool?** Recommended: a versioned
     descriptor creates or adopts an independently durable child workflow run;
     never treat the whole workflow as one opaque retryable external effect.
+    *Disposition (M4): accepted — the versioned `AgentWorkflowToolDescriptor`
+    is trusted deployment wiring the loop intercepts by name; the derived
+    invocation id is the child workflow run id and the generation-free
+    `StartRun` deduplication key, so create-or-adopt is an identity property
+    (a replay deduplicates in the child run's own durable inbox and adopts);
+    only the start-or-adopt is an agent-side effect, the child's internal
+    effects keep their own durable boundaries, the parent waits as fan-in
+    membership, and the child's terminal outcome returns as the deduplicated
+    `RecordWorkflowResult` command the hosting application relays
+    (slice 4.5).*
 17. **What maps to A2A `Task.id`?** Recommended: `AgentTaskId`; preserve it
     across handoff while each assignee execution receives a new `AgentRunId`.
     *Disposition (M1): accepted as the equal mapping — A2A `Task.id` is the

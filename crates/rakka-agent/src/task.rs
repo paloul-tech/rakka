@@ -105,9 +105,9 @@ use serde_json::Value;
 use crate::admission::AgentAdmissionRefusal;
 use crate::agent::{load_agent_entity_state, AgentEntityState, AgentLifecycleStatus};
 use crate::budget::{
-    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetExhaustion, AgentBudgetGrant,
-    AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger, AGENT_ESCROW_CHILD_CAPACITY,
-    AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
+    AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension, AgentBudgetExhaustion,
+    AgentBudgetGrant, AgentEscrowChildId, AgentEscrowError, AgentEscrowLedger,
+    AGENT_ESCROW_CHILD_CAPACITY, AGENT_ESCROW_REFUSAL_CHILD_UNKNOWN,
 };
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
@@ -119,15 +119,24 @@ use crate::definition::{
     AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
     AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
 };
-use crate::goal::AgentGoalMode;
+use crate::evaluation::{
+    AgentGoalEvaluationRecord, AgentGoalStagnationAction, AgentGoalStagnationPolicy,
+    AgentStagnationTrigger,
+};
+use crate::goal::{
+    AgentGoalCriteriaSource, AgentGoalDecision, AgentGoalDelegationBudget, AgentGoalError,
+    AgentGoalExhaustionAction, AgentGoalMode, AgentGoalOutcome, AgentGoalSpecDraft,
+    AgentGoalSpecRevision, AgentGoalState, AgentGoalStatus, AgentGoalStatusView,
+    AgentGoalTerminalReason, AgentGoalWaitReason,
+};
 use crate::identity::{
-    validated_id, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
-    AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, AgentWakeId, TenantId,
-    AGENT_IDENTITY_MAX_LENGTH,
+    validated_id, AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId,
+    AgentOperationKind, AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope,
+    AgentWakeId, TenantId, AGENT_IDENTITY_MAX_LENGTH,
 };
 use crate::observability::{
     record_agent_domain_counter, METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE,
-    METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -227,11 +236,12 @@ pub const AGENT_TASK_PENDING_HISTORY_CAPACITY: usize = 64;
 /// The most history entries any one transition can record.
 ///
 /// A creation is the worst case: one row for the task, one for each dependency
-/// it declares, and one for the assignment its own eligibility may decide. The
-/// entity requires this much headroom before it runs a transition, which is what
-/// lets recording an entry be infallible — an owed entry is never dropped, and a
-/// backed-up sink is refused at the entity's door instead.
-pub const AGENT_TASK_MAX_HISTORY_PER_TRANSITION: usize = AGENT_TASK_MAX_DEPENDENCIES + 2;
+/// it declares, one for the goal contract it may institute active, and one for
+/// the assignment its own eligibility may decide. The entity requires this much
+/// headroom before it runs a transition, which is what lets recording an entry
+/// be infallible — an owed entry is never dropped, and a backed-up sink is
+/// refused at the entity's door instead.
+pub const AGENT_TASK_MAX_HISTORY_PER_TRANSITION: usize = AGENT_TASK_MAX_DEPENDENCIES + 3;
 
 /// Largest page one history cursor may request.
 pub const AGENT_TASK_HISTORY_MAX_PAGE_SIZE: usize = 64;
@@ -247,6 +257,34 @@ pub const AGENT_EPOCH_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.EpochResult";
 
 /// Payload type of the controller's reply to an epoch result.
 pub const AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.EpochResultOutcome";
+
+/// Payload type of an [`AgentExchangeKind::DelegationResult`] exchange.
+pub const AGENT_DELEGATION_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.DelegationResult";
+
+/// Payload type of the parent run's reply to a delegation result.
+pub const AGENT_DELEGATION_RESULT_OUTCOME_PAYLOAD_TYPE: &str =
+    "rakka.agent.DelegationResultOutcome";
+
+/// Payload type of an [`AgentExchangeKind::GoalEvaluation`] exchange: the
+/// full [`crate::evaluation::AgentGoalEvaluationRecord`].
+pub const AGENT_GOAL_EVALUATION_PAYLOAD_TYPE: &str = "rakka.agent.GoalEvaluation";
+
+/// Payload type of the coordinating task's reply to a goal evaluation.
+pub const AGENT_GOAL_EVALUATION_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.GoalEvaluationOutcome";
+
+/// Payload type of an [`AgentExchangeKind::RunCancel`] exchange command.
+pub const AGENT_RUN_CANCEL_PAYLOAD_TYPE: &str = "rakka.agent.RunCancel";
+
+/// Payload type of the run's receipt replying to a [`AgentExchangeKind::RunCancel`].
+pub const AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.RunCancelReceipt";
+
+/// Payload type of an [`AgentExchangeKind::DelegationCancel`] exchange command.
+pub const AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE: &str = "rakka.agent.DelegationCancel";
+
+/// Payload type of the child task's receipt replying to a
+/// [`AgentExchangeKind::DelegationCancel`].
+pub const AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE: &str =
+    "rakka.agent.DelegationCancelReceipt";
 
 /// Payload type of an [`AgentRunAssignment`] exchange command.
 pub const AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE: &str = "rakka.agent.RunAssignment";
@@ -268,6 +306,19 @@ pub const AGENT_TASK_DECISION_PAYLOAD_TYPE: &str = "rakka.agent.TaskDecision";
 /// this constant rather than each holding its own copy of the literal. The
 /// string is wire and durable surface — it never changes.
 pub const AGENT_TASK_REFUSAL_STALE_GENERATION: &str = "stale-assignment-generation";
+
+/// Refusal code of a proposal the task would not validate because its
+/// cancellation is propagating
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Like [`AGENT_TASK_REFUSAL_STALE_GENERATION`], it is the one refusal the run
+/// maps to a distinct terminal disposition — here the cancellation wind-down,
+/// not a failure — so both sides name it through this constant rather than
+/// each holding its own copy of the literal. Under the deferred-terminal task
+/// the refusal carries a *nonterminal* status, so the run cannot infer the
+/// cancellation from the status alone; this code is what it reads. The string
+/// is wire and durable surface — it never changes.
+pub const AGENT_TASK_REFUSAL_CANCEL_REQUESTED: &str = "task-cancel-requested";
 
 /// Payload type of the [`AgentTaskOutcome`] an accepted
 /// [`AgentExchangeKind::Creation`] reply carries.
@@ -557,6 +608,26 @@ impl AgentContentDigest {
             algorithm: AgentDigestAlgorithm::Sha256,
             value: sha256_hex(bytes),
         }
+    }
+
+    /// Computes the [`AgentDigestAlgorithm::Sha256`] digest of a segment
+    /// sequence under the injective length-prefixed canonical encoding.
+    ///
+    /// This is the one encoding behind every derived durable identity — wake
+    /// ids, delegation ids, workflow-invocation ids: each segment is written
+    /// as `<decimal byte length>:<bytes>`, so no boundary can be forged by
+    /// segment content. The format is a persisted compatibility surface (the
+    /// golden vectors in `tests/wake_identity.rs` pin it); changing it
+    /// requires a migration.
+    #[must_use]
+    pub fn sha256_of_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut canonical = Vec::new();
+        for segment in segments {
+            canonical.extend_from_slice(segment.len().to_string().as_bytes());
+            canonical.push(b':');
+            canonical.extend_from_slice(segment.as_bytes());
+        }
+        Self::sha256_of_bytes(&canonical)
     }
 }
 
@@ -1273,6 +1344,16 @@ pub struct AgentTaskDefinition {
     /// parent-local allocation decision
     /// [specification 9.7](../../../docs/plans/rakka-agent/spec.md) describes.
     pub run_allocation: Option<AgentBudgetAllocation>,
+    /// The definition's own delegation ceilings, which every delegation
+    /// authority a task of this definition receives is min-narrowed to
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): parent
+    /// *and definition* ceilings enforce at allocation and admission time).
+    ///
+    /// This is the one cap a forged or inflated provenance cannot escape: a
+    /// peer minting a "root child" under this definition still delegates only
+    /// what the definition permits. `None` bounds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<AgentGoalDelegationBudget>,
     /// What happens to this task when a dependency does not complete.
     pub dependency_policy: AgentDependencyFailurePolicy,
     /// Who may complete the task.
@@ -1312,6 +1393,7 @@ impl AgentTaskDefinition {
             limits: AgentTaskLimits::new(),
             budgets: AgentBudgetCeilings::unbounded(),
             run_allocation: None,
+            delegation: None,
             dependency_policy: AgentDependencyFailurePolicy::default(),
             ownership: AgentTaskOwnership::default(),
             // Attended is the safe default: an unattended class is the one that
@@ -1350,6 +1432,13 @@ impl AgentTaskDefinition {
     #[must_use]
     pub const fn with_run_allocation(mut self, allocation: AgentBudgetAllocation) -> Self {
         self.run_allocation = Some(allocation);
+        self
+    }
+
+    /// Sets the definition's own delegation ceilings.
+    #[must_use]
+    pub const fn with_delegation(mut self, delegation: AgentGoalDelegationBudget) -> Self {
+        self.delegation = Some(delegation);
         self
     }
 
@@ -1496,6 +1585,8 @@ impl<'de> Deserialize<'de> for AgentTaskDefinition {
             limits: AgentTaskLimits,
             budgets: AgentBudgetCeilings,
             run_allocation: Option<AgentBudgetAllocation>,
+            #[serde(default)]
+            delegation: Option<AgentGoalDelegationBudget>,
             dependency_policy: AgentDependencyFailurePolicy,
             ownership: AgentTaskOwnership,
             operation_class: AgentOperationClass,
@@ -1515,6 +1606,7 @@ impl<'de> Deserialize<'de> for AgentTaskDefinition {
             limits: wire.limits,
             budgets: wire.budgets,
             run_allocation: wire.run_allocation,
+            delegation: wire.delegation,
             dependency_policy: wire.dependency_policy,
             ownership: wire.ownership,
             operation_class: wire.operation_class,
@@ -1707,6 +1799,22 @@ pub enum AgentTaskTerminalReason {
         /// Bounded, stable reason.
         reason: String,
     },
+    /// The goal this task coordinates exhausted its budget under a
+    /// `Terminate` exhaustion policy
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    GoalBudgetExhausted {
+        /// The ceiling that was reached.
+        exhaustion: AgentBudgetExhaustion,
+    },
+    /// The goal this task coordinates tripped a stagnation threshold under a
+    /// `Terminate` stagnation action
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    GoalStagnant {
+        /// The condition that tripped.
+        trigger: crate::evaluation::AgentStagnationTrigger,
+        /// The streak length at the trip.
+        epochs: u32,
+    },
 }
 
 impl AgentTaskTerminalReason {
@@ -1719,6 +1827,8 @@ impl AgentTaskTerminalReason {
             Self::AssignmentsExhausted { .. } => "assignments-exhausted",
             Self::DependencyNotSatisfied { .. } => "dependency-not-satisfied",
             Self::CancellationRequested { .. } => "cancellation-requested",
+            Self::GoalBudgetExhausted { .. } => "goal-budget-exhausted",
+            Self::GoalStagnant { .. } => "goal-stagnant",
         }
     }
 
@@ -1731,9 +1841,10 @@ impl AgentTaskTerminalReason {
     pub const fn status(&self) -> AgentTaskStatus {
         match self {
             Self::ResultAccepted => AgentTaskStatus::Completed,
-            Self::ResultRejectionsExhausted { .. } | Self::AssignmentsExhausted { .. } => {
-                AgentTaskStatus::Failed
-            }
+            Self::ResultRejectionsExhausted { .. }
+            | Self::AssignmentsExhausted { .. }
+            | Self::GoalBudgetExhausted { .. }
+            | Self::GoalStagnant { .. } => AgentTaskStatus::Failed,
             Self::DependencyNotSatisfied { .. } | Self::CancellationRequested { .. } => {
                 AgentTaskStatus::Cancelled
             }
@@ -1908,6 +2019,36 @@ impl AgentAssignmentStatus {
 impl Display for AgentAssignmentStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_label())
+    }
+}
+
+/// One task's durable, nonterminal cancellation request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Set by a direct cancel command, a parent run's delegation-cancel exchange,
+/// or the settle pass observing a terminal goal decision in the cancel or
+/// expiry family. Absorbing: the first request fixes the reason finalization
+/// terminates under, and every later request answers from it. The marker —
+/// never a terminal status — is what keeps the task nonterminal while its
+/// assigned run and delegated children quiesce, so terminal `Cancelled` is
+/// never projected while a started consequential effect's outcome is unknown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTaskCancellation {
+    /// The terminal reason finalization will record.
+    pub reason: AgentTaskTerminalReason,
+    /// When the request was durably recorded.
+    pub requested_at: AgentTimestampMillis,
+}
+
+impl AgentTaskCancellation {
+    /// The bounded human-readable detail the request carried, for the records
+    /// propagation writes downstream.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match &self.reason {
+            AgentTaskTerminalReason::CancellationRequested { reason } => reason.clone(),
+            other => other.code().to_string(),
+        }
     }
 }
 
@@ -2141,6 +2282,11 @@ pub enum AgentTaskHistoryKind {
     ResultAccepted,
     /// A proposal was refused by a deterministic rule.
     ResultRejected,
+    /// A durable cancellation request was recorded, leaving the task
+    /// nonterminal while its wind-down propagates
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)); the
+    /// detail carries the terminal-reason code finalization will record.
+    CancellationRequested,
     /// The task reached a terminal status.
     Terminated,
     /// A delivered wake occurrence was dispositioned by the controller.
@@ -2163,6 +2309,26 @@ pub enum AgentTaskHistoryKind {
     GoalRetired,
     /// A schedule update took force.
     ScheduleUpdated,
+    /// The goal contract was activated: `Proposed` became `Active`, in the
+    /// creating transition or by command. The `Goal*` kinds above are the
+    /// continuous admission gate's; these four are the goal-contract status
+    /// of [specification 8.1](../../../docs/plans/rakka-agent/spec.md).
+    GoalActivated,
+    /// The goal contract was parked `Waiting` under a persisted policy
+    /// decision; the detail carries the structured reason code.
+    GoalParked,
+    /// The goal contract was reactivated from `Waiting`.
+    GoalReactivated,
+    /// The goal contract reached a terminal decision; the detail carries the
+    /// terminal status and reason code.
+    GoalDecided,
+    /// The stagnation detector tripped a threshold; the detail carries the
+    /// trigger, the streak, and the action taken, and the digest carries the
+    /// repeated result fingerprint for a repetition trip.
+    GoalStagnationDetected,
+    /// The goal's success criteria were revised; the detail carries the
+    /// criteria revision now in force.
+    GoalCriteriaRevised,
 }
 
 impl AgentTaskHistoryKind {
@@ -2180,6 +2346,7 @@ impl AgentTaskHistoryKind {
             Self::ResultProposed => "result-proposed",
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
+            Self::CancellationRequested => "cancellation-requested",
             Self::Terminated => "terminated",
             Self::WakeDispositioned => "wake-dispositioned",
             Self::EpochAdmitted => "epoch-admitted",
@@ -2190,6 +2357,12 @@ impl AgentTaskHistoryKind {
             Self::GoalExpired => "goal-expired",
             Self::GoalRetired => "goal-retired",
             Self::ScheduleUpdated => "schedule-updated",
+            Self::GoalActivated => "goal-activated",
+            Self::GoalParked => "goal-parked",
+            Self::GoalReactivated => "goal-reactivated",
+            Self::GoalDecided => "goal-decided",
+            Self::GoalStagnationDetected => "goal-stagnation-detected",
+            Self::GoalCriteriaRevised => "goal-criteria-revised",
         }
     }
 }
@@ -2524,6 +2697,15 @@ pub struct AgentTaskCreation {
     /// before this field load as finite.
     #[serde(default)]
     pub goal_mode: AgentGoalMode,
+    /// The goal contract this creation institutes, making the created task the
+    /// goal's root coordinator
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)). Absent,
+    /// the task is a child contributor — or, before slice 4.1, a root without
+    /// a goal record — and carries only the `goal` binding. When present
+    /// without an explicit `goal` binding, the goal id defaults to the created
+    /// task's own id. Records persisted before this field load without one.
+    #[serde(default)]
+    pub goal_spec: Option<Box<AgentGoalSpecDraft>>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
     /// Dependencies declared with the creation.
@@ -2543,6 +2725,12 @@ pub struct AgentTaskCreation {
     /// without one.
     #[serde(default)]
     pub wake: Option<AgentWakeId>,
+    /// The delegation provenance the collaboration metadata carried, when a
+    /// parent run's delegation created this task
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)). Records
+    /// persisted before this field load without one.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
     /// Trace context of the ingress that created the task — what the A2A
     /// surface extracted before durable acceptance
     /// ([specification 17.5](../../../docs/plans/rakka-agent/spec.md)).
@@ -2586,6 +2774,15 @@ pub struct AgentRunAssignment {
     pub agent_definition_revision: AgentRevisionNumber,
     /// The agent settings revision the assignment was decided against.
     pub agent_settings_revision: AgentRevisionNumber,
+    /// The delegation authority the run enforces
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)): the
+    /// goal's skill and tool narrowing, its advisory ceilings, and the
+    /// lineage/depth of the task this run serves. Copied from the task's own
+    /// durable state by the assignment decision, because the run never reads
+    /// the goal spec. Commands persisted before this field load without one,
+    /// which means no goal narrowing.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentRunDelegationEnvelope>>,
     /// When the decision was recorded.
     pub assigned_at: AgentTimestampMillis,
 }
@@ -2599,6 +2796,41 @@ pub struct AgentRunAcceptance {
     pub generation: AgentAssignmentGeneration,
     /// When it durably accepted.
     pub accepted_at: AgentTimestampMillis,
+}
+
+/// The command an [`AgentExchangeKind::RunCancel`] exchange carries to the run
+/// entity: wind down the run serving one assignment generation
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The request is owed by the task whose nonterminal cancellation marker is
+/// set, and only for a generation whose run durably accepted — a cancellation
+/// can therefore never outrun an in-flight assignment and refuse definitively
+/// against a run that does not exist yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRunCancelRequest {
+    /// The task requesting the wind-down.
+    pub task: AgentTaskScope,
+    /// The assignment generation the request fences against: a run serving a
+    /// different generation refuses rather than winding down on a stale push.
+    pub generation: AgentAssignmentGeneration,
+    /// The bounded reason recorded on the run's terminal record.
+    pub reason: String,
+}
+
+/// The run's durable receipt replying to an [`AgentExchangeKind::RunCancel`].
+///
+/// The receipt reports the status the wind-down reached — an accepted receipt
+/// is the observable outcome of the propagation request, never proof that a
+/// started effect stopped ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRunCancelReceipt {
+    /// The run that recorded the request.
+    pub run: AgentRunScope,
+    /// The status the run held after recording it: `Cancelling` while work
+    /// quiesces, `WaitingForReconciliation` while an ambiguous effect blocks
+    /// terminalization, or a terminal status when the request found the run
+    /// already settled.
+    pub status: crate::run::AgentRunStatus,
 }
 
 /// A run's report of what it finally consumed, carried by an
@@ -2941,6 +3173,15 @@ pub struct AgentTask {
     /// before this field load as finite.
     #[serde(default)]
     pub goal_mode: AgentGoalMode,
+    /// The goal contract this task coordinates as the goal's root
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md),
+    /// [6.3](../../../docs/plans/rakka-agent/spec.md)): the versioned spec and
+    /// its status lifecycle, held as a component of the root task's own record
+    /// so every goal transition commits in the task's compare-and-set. A child
+    /// task carries only the `goal` binding; records persisted before this
+    /// field load without a goal record.
+    #[serde(default)]
+    pub goal_state: Option<Box<AgentGoalState>>,
     /// The wake controller's durable state, once the task coordinates a
     /// continuous goal. Records persisted before this field load with no
     /// controller activity, and a finite task never carries one.
@@ -2954,6 +3195,12 @@ pub struct AgentTask {
     pub wake: Option<AgentWakeId>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
+    /// The delegation provenance recorded at creation, when a parent run's
+    /// delegation created this task
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)). Records
+    /// persisted before this field load without one.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
     /// The agent the task is meant for, when it is agent-owned.
     pub assignee: Option<AgentId>,
     /// The bounded dependency summary.
@@ -2982,6 +3229,11 @@ pub struct AgentTask {
     pub last_rejection: Option<Box<AgentTaskRejection>>,
     /// Why the task reached its terminal status.
     pub terminal_reason: Option<AgentTaskTerminalReason>,
+    /// The nonterminal cancellation request the task carries while its
+    /// wind-down propagates ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default)]
+    pub cancellation: Option<Box<AgentTaskCancellation>>,
     /// When the creation committed, stamped by the owner that wrote it — never
     /// by the initiator's clock, exactly as
     /// [`crate::choreography::AgentExchangeParticipant::apply`] requires of
@@ -3015,12 +3267,25 @@ impl AgentTask {
     }
 
     /// Whether the task is waiting for an agent assignment decision.
+    ///
+    /// A goal-bearing root only assigns while its goal permits work: a
+    /// `Proposed` goal spends nothing until activated, and a parked goal
+    /// spends nothing until resumed
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
+    /// A requested cancellation fences the next generation the same way
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+    /// acceptance of the request immediately stops new dispatch.
     #[must_use]
     pub fn awaits_assignment(&self) -> bool {
         self.definition.is_agent_owned()
             && self.status.is_assignable()
             && self.assignment.is_none()
+            && self.cancellation.is_none()
             && self.dependencies_satisfied()
+            && self
+                .goal_state
+                .as_ref()
+                .is_none_or(|goal| goal.status().permits_work())
     }
 
     /// Serialized size of the materialized record, in bytes.
@@ -3078,6 +3343,10 @@ pub struct AgentTaskOutcome {
     /// Outcomes persisted before this field load with no wake record.
     #[serde(default)]
     pub wake: Option<AgentWakeOutcome>,
+    /// The goal contract's status, when this task coordinates one. Outcomes
+    /// persisted before this field load without it.
+    #[serde(default)]
+    pub goal: Option<AgentGoalOutcome>,
 }
 
 /// Bounded log of resolved operation ids and the outcome each produced.
@@ -3220,6 +3489,7 @@ impl AgentTaskState {
                 rejection_count: 0,
                 dependencies_satisfied: true,
                 wake: None,
+                goal: None,
             };
         };
         AgentTaskOutcome {
@@ -3236,6 +3506,10 @@ impl AgentTaskState {
             rejection_count: task.rejection_count,
             dependencies_satisfied: task.dependencies_satisfied(),
             wake: None,
+            goal: task.goal_state.as_deref().map(|goal| AgentGoalOutcome {
+                status: goal.status(),
+                status_revision: goal.status_revision(),
+            }),
         }
     }
 
@@ -3250,6 +3524,7 @@ impl AgentTaskState {
             status: task.status,
             goal: task.goal.clone(),
             parent: task.parent.clone(),
+            delegation: task.delegation.clone(),
             assignment: task.assignment.clone(),
             assignment_generation: task.assignment_generation,
             dependencies: task.dependencies.values().cloned().collect(),
@@ -3259,6 +3534,8 @@ impl AgentTaskState {
             last_refusal: task.last_refusal.clone(),
             accepted_result: task.accepted_result.clone(),
             terminal_reason: task.terminal_reason.clone(),
+            cancellation: task.cancellation.clone(),
+            outstanding_escrow: task.escrow.outstanding().count(),
             history_entries: self.next_history_sequence.get().saturating_sub(1),
             updated_at: self.updated_at,
             wake: task.goal_mode.continuous().map(|spec| {
@@ -3302,6 +3579,21 @@ impl AgentTaskState {
                         })
                         .unwrap_or_default(),
                 }
+            }),
+            goal_state: task.goal_state.as_ref().map(|goal| AgentGoalStatusView {
+                status: goal.status(),
+                status_revision: goal.status_revision(),
+                spec_revision: goal.spec().revision(),
+                criteria_revision: goal.spec().spec().criteria.revision,
+                evaluator: goal.spec().spec().evaluator.clone(),
+                wait: goal.wait().cloned(),
+                terminal: goal.terminal().map(|decision| decision.reason.clone()),
+                coordinator: task
+                    .assignment
+                    .as_ref()
+                    .map(|assignment| assignment.run.clone()),
+                activated_at: goal.activated_at(),
+                decided_at: goal.decided_at(),
             }),
         })
     }
@@ -3362,6 +3654,9 @@ impl AgentExchangeState for AgentTaskState {
             if let Some(spec) = task.goal_mode.continuous() {
                 policy.check_record(&spec.wake_policy)?;
             }
+            if let Some(goal) = &task.goal_state {
+                policy.check_record(goal.spec())?;
+            }
         }
         for entry in &self.pending_history {
             policy.check_record(entry)?;
@@ -3393,6 +3688,10 @@ pub struct AgentTaskSnapshot {
     pub goal: Option<AgentGoalId>,
     /// The task that created it.
     pub parent: Option<AgentTaskId>,
+    /// The delegation provenance recorded at creation, when a delegation
+    /// created it. Snapshots persisted before this field load without one.
+    #[serde(default)]
+    pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
     /// Its current assignment.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation it has decided.
@@ -3411,6 +3710,23 @@ pub struct AgentTaskSnapshot {
     pub accepted_result: Option<Box<AgentAcceptedResult>>,
     /// Why it reached its terminal status.
     pub terminal_reason: Option<AgentTaskTerminalReason>,
+    /// The nonterminal cancellation request it carries while its wind-down
+    /// propagates ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default)]
+    pub cancellation: Option<Box<AgentTaskCancellation>>,
+    /// How many escrow children the task still holds open: every live
+    /// generation and admitted epoch opens one at the transition that decided
+    /// it, and it closes only when that child's run settles and returns.
+    ///
+    /// This is the finalization gate a requested cancellation waits on
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — and it
+    /// is the reason the count is projected rather than inferred from
+    /// [`Self::assignment`]: a continuous root between epoch assignments holds
+    /// no assignment while its admitted epochs are still executing.
+    /// Snapshots persisted before this field load as zero.
+    #[serde(default)]
+    pub outstanding_escrow: usize,
     /// How many history entries it has produced. The entries themselves are
     /// read through [`AgentTaskHistoryStore::read`].
     pub history_entries: u64,
@@ -3420,6 +3736,10 @@ pub struct AgentTaskSnapshot {
     /// Snapshots persisted before this field load without it.
     #[serde(default)]
     pub wake: Option<AgentWakeStatusView>,
+    /// The goal contract's status, when this task is the goal's root
+    /// coordinator. Snapshots persisted before this field load without it.
+    #[serde(default)]
+    pub goal_state: Option<AgentGoalStatusView>,
 }
 
 /// Loads one task's durable state without waking its entity.
@@ -3477,6 +3797,134 @@ pub fn assignment_operation_id(
     )
 }
 
+/// Derives the stable operation id of the one run-cancel exchange a task ever
+/// owes one assignment generation.
+///
+/// Pure over `(scope, generation)`: the cancellation marker is absorbing and
+/// a generation is assigned at most one run, so one logical request exists
+/// per generation, ever, and every re-drive after any loss owes the identical
+/// operation ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+pub fn run_cancel_operation_id(
+    scope: &AgentTaskScope,
+    generation: AgentAssignmentGeneration,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::Cancellation,
+        [
+            scope.tenant().as_str(),
+            scope.task().as_str(),
+            "run-cancel",
+            &generation.to_string(),
+        ],
+    )
+}
+
+/// The granted delegation ceilings min-narrowed to the definition's own
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): parent and
+/// definition ceilings enforce at allocation and admission time). `None` on
+/// either side is the unbounded identity.
+fn narrowed_delegation_budget(
+    granted: Option<AgentGoalDelegationBudget>,
+    definition: Option<AgentGoalDelegationBudget>,
+) -> Option<AgentGoalDelegationBudget> {
+    match (granted, definition) {
+        (Some(granted), Some(definition)) => Some(granted.narrowed_to(&definition)),
+        (granted, definition) => granted.or(definition),
+    }
+}
+
+/// The delegation authority one assignment carries to its run.
+///
+/// A goal-bearing root projects its spec's skill and tool narrowing, its
+/// delegation ceilings, and its deadline; a delegated child projects its own
+/// creation provenance — the full ancestor chain including the delegation
+/// that created it, at the depth the parent recorded, with the ancestor-agent
+/// chain extended by the delegating parent's own agent so the run's cycle
+/// check sees the whole chain. Either way the ceilings are min-narrowed to
+/// the task definition's own, which is the cap no provenance can escape. A
+/// task that is neither — an epoch task, or a plain agent-owned task —
+/// carries no goal narrowing and no chain, but still carries its
+/// definition's own ceilings when the definition declares any: without an
+/// envelope the delegation door would enforce nothing for these runs.
+fn delegation_envelope_for(
+    task: &AgentTask,
+) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
+    if let Some(goal_state) = task.goal_state.as_deref() {
+        let spec = goal_state.spec().spec();
+        return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: spec.allowed_skills.clone(),
+            allowed_tools: spec.allowed_tools.clone(),
+            allowed_workflows: spec.allowed_workflows.clone(),
+            budget: narrowed_delegation_budget(spec.delegation, task.definition.delegation),
+            lineage: Vec::new(),
+            ancestors: Vec::new(),
+            depth: 0,
+            deadline: spec.deadline,
+            fan_in: spec.fan_in,
+            environments: spec.environments.clone(),
+            // The goal spec's set has no declaredness of its own — empty
+            // means no goal narrowing, so the root's grant statement is the
+            // set when one exists and no statement otherwise.
+            knowledge_spaces: (!spec.knowledge_spaces.is_empty())
+                .then(|| spec.knowledge_spaces.clone()),
+        }));
+    }
+    if let Some(provenance) = task.delegation.as_deref() {
+        let mut lineage = provenance.lineage.clone();
+        lineage.push(provenance.delegation.clone());
+        // The ancestry stays parallel to the lineage: the delegating parent
+        // committed `provenance.delegation`, so its agent closes the chain.
+        // A provenance whose own ancestry predates the field carries lineage
+        // without agents; the envelope then carries the same gap, and the
+        // run's cycle check refuses to extend it rather than trusting it.
+        let mut ancestors = provenance.ancestors.clone();
+        if !ancestors.is_empty() || provenance.lineage.is_empty() {
+            ancestors.push(provenance.parent_run.agent().clone());
+        }
+        return Some(Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: BTreeSet::new(),
+            allowed_tools: BTreeSet::new(),
+            allowed_workflows: BTreeSet::new(),
+            budget: narrowed_delegation_budget(provenance.budget, task.definition.delegation),
+            lineage,
+            ancestors,
+            depth: provenance.depth,
+            deadline: provenance.deadline,
+            // A delegated child's own fan-out groups open under its wiring's
+            // default: the parent's policy governs the parent's group, not
+            // the child's.
+            fan_in: None,
+            environments: provenance.environments.clone(),
+            // A delegated child's grant statement is always explicit: the
+            // provenance's set, which decodes empty — no communal access —
+            // for a chain recorded before the field existed.
+            knowledge_spaces: Some(provenance.knowledge_spaces.clone()),
+        }));
+    }
+    // The definition is the cap no creation shape escapes: a run with no
+    // envelope at all would enforce no depth, fan-out, or concurrency
+    // ceiling at its delegation door. Root position — no chain, no
+    // narrowing, no deadline — and its fan-out groups open under the
+    // wiring's default.
+    task.definition.delegation.map(|ceilings| {
+        Box::new(crate::delegation::AgentRunDelegationEnvelope {
+            allowed_skills: BTreeSet::new(),
+            allowed_tools: BTreeSet::new(),
+            allowed_workflows: BTreeSet::new(),
+            budget: Some(ceilings),
+            lineage: Vec::new(),
+            ancestors: Vec::new(),
+            depth: 0,
+            deadline: None,
+            fan_in: None,
+            environments: BTreeSet::new(),
+            // A plain or epoch task carries no goal scope and no chain: no
+            // grant statement, and the definition envelope governs.
+            knowledge_spaces: None,
+        })
+    })
+}
+
 /// Creates the task, or fails closed.
 ///
 /// It is the one transition both creation paths reach: the ingress
@@ -3501,6 +3949,41 @@ fn create_task(
     // persisted.
     creation.definition.validate()?;
     creation.input.validate()?;
+    if let Some(provenance) = creation.delegation.as_deref() {
+        provenance
+            .validate()
+            .map_err(|error| AgentTaskError::DelegationProvenanceInvalid {
+                message: error.to_string(),
+            })?;
+        // A delegated child lives in its parent's tenant: the delegating
+        // executor always creates the child under the parent run's tenant,
+        // so a provenance naming a foreign one is a forgery or a
+        // misrouting — refused, never recorded for the enforcement slices
+        // to trust.
+        if provenance.parent_run.tenant() != state.scope.tenant() {
+            return Err(AgentTaskError::DelegationProvenanceInvalid {
+                message: format!(
+                    "the provenance names a parent run in tenant {}, but the task is created in \
+                     tenant {}",
+                    provenance.parent_run.tenant(),
+                    state.scope.tenant()
+                ),
+            });
+        }
+        // A delegated child cannot institute a goal of its own: a goal record
+        // would win the run's delegation envelope and re-root the chain —
+        // empty lineage, empty ancestors, depth zero — so the ceilings and
+        // the cycle set the parent committed would vanish from every door
+        // check. One creation shape carries one authority chain.
+        if creation.goal_spec.is_some() {
+            return Err(AgentTaskError::DelegationProvenanceInvalid {
+                message: "a creation carrying delegation provenance cannot also carry a goal \
+                          spec: a delegated child contributes to its parent's goal and may not \
+                          re-root the delegation chain"
+                    .to_string(),
+            });
+        }
+    }
 
     let mut dependencies = BTreeMap::new();
     for declaration in &creation.dependencies {
@@ -3534,7 +4017,18 @@ fn create_task(
         });
     }
 
-    if creation.goal_mode.is_continuous() && creation.goal.is_none() {
+    // A creation carrying a goal spec institutes the goal on this task, and
+    // the binding defaults to the task's own id — open decision 14's resolved
+    // default ([specification 6.3](../../../docs/plans/rakka-agent/spec.md)).
+    // An explicit binding simply names the goal; the types stay distinct.
+    let goal = creation.goal.or_else(|| {
+        creation
+            .goal_spec
+            .is_some()
+            .then(|| AgentGoalId::for_root_task(state.scope.task()))
+    });
+
+    if creation.goal_mode.is_continuous() && goal.is_none() {
         // A continuous root control task exists to admit epochs for a goal;
         // without the goal binding there is nothing for the wake controller
         // to fence, budget, or retire against.
@@ -3569,13 +4063,53 @@ fn create_task(
     // A creation that rides a parent's transition carries the escrow that
     // parent already debited — the epoch creation the wake controller owes,
     // and later the delegated creations of phase 4. A root creation with no
-    // parent scope to debit is escrowed exactly its ceilings: it is the top
-    // of the hierarchy until the goal scope of phase 4 sits above it
-    // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
-    let escrow = AgentEscrowLedger::new(match creation.escrow {
+    // parent scope to debit is escrowed exactly its ceilings. A goal-bearing
+    // root holds the goal's own allocation instead, narrowed to that base —
+    // the definition-ceiling → goal-allocation → task rung of
+    // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)): the
+    // goal may hold less than the definition permits, never more.
+    let base_grant = match creation.escrow {
         Some(grant) => grant,
         None => AgentBudgetGrant::from_ceilings(&creation.definition.budgets),
-    });
+    };
+    let mut seed = match &creation.goal_spec {
+        Some(draft) => {
+            AgentBudgetGrant::new(draft.spec.allocation, draft.spec.limits).narrowed_to(&base_grant)
+        }
+        None => base_grant,
+    };
+    // The conserved descendants seed: the escrow this task holds in the
+    // descendants dimension is min-narrowed to every delegation ceiling in
+    // scope — the definition's own, the goal spec's at a root, and the
+    // parent-granted provenance budget at a delegated child. The provenance
+    // is a validated cap, never a conserved grant riding A2A: the ledger
+    // builds from the task's own ceilings, and a peer can only shrink it.
+    let descendants_ceiling = [
+        creation
+            .definition
+            .delegation
+            .and_then(|d| d.max_descendants),
+        creation
+            .goal_spec
+            .as_ref()
+            .and_then(|draft| draft.spec.delegation.and_then(|d| d.max_descendants)),
+        creation
+            .delegation
+            .as_deref()
+            .and_then(|p| p.budget.and_then(|b| b.max_descendants)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(u64::from)
+    .min();
+    if let Some(ceiling) = descendants_ceiling {
+        let bounded = seed
+            .allocation
+            .descendants
+            .map_or(ceiling, |held| held.min(ceiling));
+        seed.allocation.descendants = Some(bounded);
+    }
+    let escrow = AgentEscrowLedger::new(seed);
 
     if creation.wake.is_some() && creation.parent.is_none() {
         // An epoch task exists to return its result to the controller that
@@ -3584,19 +4118,41 @@ fn create_task(
         return Err(AgentTaskError::EpochWithoutParent);
     }
 
+    // The goal record is instituted in the creating transition, so the goal
+    // exists from its first commit and there is no window in which the root
+    // coordinates a contract it does not hold. Validation runs inside
+    // `AgentGoalSpecRevision::initial`, so a spec that violates a bound
+    // refuses the whole creation.
+    let goal_state = match creation.goal_spec {
+        Some(draft) => {
+            let revision = AgentGoalSpecRevision::initial(draft.spec, draft.provenance)?;
+            Some(Box::new(AgentGoalState::new(
+                revision,
+                draft.activate_on_creation,
+                now,
+            )))
+        }
+        None => None,
+    };
+    let goal_active = goal_state
+        .as_ref()
+        .is_some_and(|goal| goal.status().permits_work());
+
     let wake_controller = creation
         .goal_mode
         .is_continuous()
         .then(AgentWakeControllerState::new);
-    let task = AgentTask {
+    let mut task = AgentTask {
         definition: creation.definition,
         input: creation.input,
         status,
-        goal: creation.goal,
+        goal,
         goal_mode: creation.goal_mode,
+        goal_state,
         wake_controller,
         wake: creation.wake,
         parent: creation.parent,
+        delegation: creation.delegation,
         assignee: creation.assignee,
         dependencies,
         escrow,
@@ -3608,9 +4164,20 @@ fn create_task(
         rejection_count: 0,
         last_rejection: None,
         terminal_reason: None,
+        cancellation: None,
         created_at: now,
         telemetry: crate::observability::sanitize_agent_telemetry_context(creation.telemetry),
     };
+    // A continuous root instituted with a `Proposed` goal parks admission
+    // until the goal is activated: a proposed goal spends nothing, and the
+    // gate's own coalescing is what holds triggers that arrive meanwhile.
+    if let (Some(goal_record), Some(controller)) =
+        (task.goal_state.as_deref(), task.wake_controller.as_mut())
+    {
+        if goal_record.status() == AgentGoalStatus::Proposed {
+            controller.suspend_by_policy(GOAL_PROPOSED_GATE_REASON);
+        }
+    }
     // Admission reserves growth headroom: a record accepted here must still be
     // able to hold everything its own lifecycle may add.
     task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
@@ -3626,6 +4193,20 @@ fn create_task(
             now,
         )
     });
+    if goal_active {
+        // A goal activated in the creating transition records its activation
+        // exactly as a commanded activation would, so history reads the same
+        // whichever door activated it.
+        state.record_history(|sequence| {
+            AgentTaskHistoryEntry::new(
+                sequence,
+                AgentTaskHistoryKind::GoalActivated,
+                operation_id.clone(),
+                status,
+                now,
+            )
+        });
+    }
     // Each declared edge is its own history row, so scenario 37's "one
     // dependency edge" is observable in history as well as in state.
     let declared: Vec<AgentTaskId> = state
@@ -3724,15 +4305,32 @@ fn declare_dependency(
 /// The default failed-dependency policy cancels the dependent
 /// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)). The command
 /// is the receiving half of the propagation; the sending half — an upstream task
-/// notifying its dependents when it goes terminal — is cancellation propagation,
-/// and it lands with the coordination slices that own the dependents registry.
+/// notifying its dependents when it goes terminal — needs a durable dependents
+/// registry and lands with slice 5.4's human-owned tasks, the first flow that
+/// builds cross-task dependency graphs. Slice 4.6's propagation covers the
+/// delegation and workflow trees, whose parent-child edges the run's cells
+/// already record.
+///
+/// A cancelling dependency takes the *request* path, never a direct
+/// terminalization ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+/// a dependency can resolve while this task's run is mid-flight, and a task
+/// that terminalized here would project terminal `Cancelled` over a started
+/// consequential effect whose outcome is unknown, strand its escrow, and
+/// leave its run to discover the cancellation only if it ever proposes.
+/// The request trades fail-fast for honesty: a dependent with in-flight work
+/// stays `Cancelling` until its subtree quiesces, and that wait's liveness
+/// rests on the doors every cancellation rests on — effect reconciliation
+/// for a stuck consequential effect, and the hosting application's
+/// workflow-tool result relay. A dependent with a closed ledger still
+/// terminalizes in this same compare-and-set, through the request's own
+/// finalization. Returns whatever the transition owes.
 fn record_dependency_outcome(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
     dependency: &AgentTaskId,
     outcome: AgentTaskDependencyOutcome,
     now: AgentTimestampMillis,
-) -> AgentTaskResult<AgentTaskOutcome> {
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let task = state.task_mut()?;
     if task.status.is_terminal() {
         return Err(AgentTaskError::Terminal {
@@ -3751,7 +4349,7 @@ fn record_dependency_outcome(
         // A dependency resolves once. A replayed outcome is idempotent; a
         // *different* outcome for a resolved dependency is a conflict, not a
         // correction, and it fails closed.
-        Some(existing) if existing == outcome => return Ok(state.outcome()),
+        Some(existing) if existing == outcome => return Ok(Vec::new()),
         Some(_) => {
             return Err(AgentTaskError::DependencyConflict {
                 dependency: dependency.clone(),
@@ -3765,7 +4363,7 @@ fn record_dependency_outcome(
         .map(|edge| (edge.dependency.clone(), edge.outcome));
 
     if let Some((dependency, Some(outcome))) = cancelling {
-        terminate(
+        return request_task_cancellation(
             state,
             operation_id,
             AgentTaskTerminalReason::DependencyNotSatisfied {
@@ -3773,8 +4371,7 @@ fn record_dependency_outcome(
                 outcome,
             },
             now,
-        )?;
-        return Ok(state.outcome());
+        );
     }
 
     let task = state.task_mut()?;
@@ -3802,10 +4399,236 @@ fn record_dependency_outcome(
         )
         .with_detail(detail)
     });
-    Ok(state.outcome())
+    Ok(Vec::new())
+}
+
+/// Decides the goal a root task holds under the projection its terminal
+/// reason implies, and closes admission with it, when the goal is still
+/// undecided. Returns the history detail of the decision it made.
+///
+/// A terminal root coordinator ends the goal it holds: nothing can drive
+/// the contract further. A completion deliberately does not — completion
+/// is evidence, and only the configured evaluator makes a goal `Satisfied`
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)); the
+/// goal's own budget termination already decided itself. A cancellation
+/// request runs this projection at *request* time
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)), so the
+/// later finalizing [`terminate`] finds the goal terminal and skips it.
+fn project_goal_decision(
+    task: &mut AgentTask,
+    reason: &AgentTaskTerminalReason,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<String>> {
+    let goal_reason = match reason {
+        AgentTaskTerminalReason::ResultAccepted => None,
+        AgentTaskTerminalReason::CancellationRequested { .. }
+        | AgentTaskTerminalReason::DependencyNotSatisfied { .. } => {
+            Some(AgentGoalTerminalReason::RootTaskCancelled)
+        }
+        AgentTaskTerminalReason::GoalBudgetExhausted { exhaustion } => {
+            Some(AgentGoalTerminalReason::BudgetExhausted {
+                exhaustion: *exhaustion,
+            })
+        }
+        // Symmetry with the budget arm; in practice the stagnation executor
+        // decided the goal before terminating the task, so the non-terminal
+        // guard below skips this projection.
+        AgentTaskTerminalReason::GoalStagnant { trigger, epochs } => {
+            Some(AgentGoalTerminalReason::Stagnant {
+                trigger: *trigger,
+                epochs: *epochs,
+            })
+        }
+        other => Some(AgentGoalTerminalReason::ExecutionFailed {
+            code: other.code().to_string(),
+        }),
+    };
+    let row = match (goal_reason, task.goal_state.as_deref_mut()) {
+        (Some(goal_reason), Some(goal)) if !goal.status().is_terminal() => {
+            let detail = format!("{} {}", goal_reason.status().as_label(), goal_reason.code());
+            goal.decide(
+                AgentGoalDecision {
+                    reason: goal_reason,
+                    evaluation: None,
+                    provenance: None,
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            // Admission closes with the contract.
+            if let Some(controller) = task.wake_controller.as_mut() {
+                controller.retire_by_policy();
+            }
+            Some(detail)
+        }
+        _ => None,
+    };
+    Ok(row)
+}
+
+/// Records a durable, nonterminal cancellation request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)) and returns
+/// the exchanges it owes now.
+///
+/// In one compare-and-set: the absorbing marker is set with the terminal
+/// reason finalization will record, the goal the task holds is decided and
+/// its admission closed, and the propagation the current state permits is
+/// owed — the run-cancel exchange when a run has durably accepted, or the
+/// immediate finalization when no generation is live. An offered assignment
+/// owes its run-cancel at the acceptance settle instead, so a cancellation
+/// can never definitively refuse ahead of an in-flight assignment.
+///
+/// Absorbing: a request that finds the marker set is answered without a
+/// second transition. A request that finds the task terminal is refused
+/// exactly as the terminal transition it replays would be.
+fn request_task_cancellation(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    reason: AgentTaskTerminalReason,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let task = state.task_mut()?;
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    if task.cancellation.is_some() {
+        return Ok(Vec::new());
+    }
+    task.cancellation = Some(Box::new(AgentTaskCancellation {
+        reason: reason.clone(),
+        requested_at: now,
+    }));
+    // The goal decision and admission close at request time: acceptance of a
+    // cancellation request immediately fences new dispatch for the scope.
+    let goal_row = project_goal_decision(task, &reason, now)?;
+
+    let status = task.status;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::CancellationRequested,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(reason.code())
+    });
+    if let Some(detail) = goal_row {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::GoalDecided,
+            operation_id,
+            detail,
+            now,
+        );
+    }
+
+    let mut owed: Vec<AgentExchangeEnvelope> = owed_run_cancel(state, now)?.into_iter().collect();
+    owed.extend(finalize_task_cancellation(state, operation_id, now)?);
+    Ok(owed)
+}
+
+/// The run-cancel exchange the task owes its accepted assignment, when it
+/// owes one now.
+///
+/// Owed exactly once per generation, and only once the run durably accepted:
+/// an offered assignment's run may not exist yet, and a definitive
+/// `run-cancel-unassigned` refusal against it would end the propagation the
+/// acceptance still owes. The journal's initiation record is the once-guard.
+fn owed_run_cancel(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(cancellation) = task.cancellation.as_deref() else {
+        return Ok(None);
+    };
+    if task.status.is_terminal() {
+        return Ok(None);
+    }
+    let Some(assignment) = task.assignment.as_ref() else {
+        return Ok(None);
+    };
+    if assignment.status != AgentAssignmentStatus::Accepted {
+        return Ok(None);
+    }
+    let operation_id = run_cancel_operation_id(&state.scope, assignment.generation)?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let run_scope = AgentRunScope::new(
+        state.scope.tenant().clone(),
+        assignment.agent.clone(),
+        assignment.run.clone(),
+    )?;
+    let request = AgentRunCancelRequest {
+        task: state.scope.clone(),
+        generation: assignment.generation,
+        reason: cancellation.detail(),
+    };
+    let payload = AgentExchangePayload::encode(AGENT_RUN_CANCEL_PAYLOAD_TYPE, &request)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::RunCancel,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Run(run_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Finalizes a requested cancellation once the task's ledger proves its work
+/// quiescent, and returns the terminal reports the finalization owes.
+///
+/// The gate is escrow closure: every live generation and admitted epoch holds
+/// an open escrow child from the transition that decided it, a refused
+/// generation releases at its settle, and a terminal run's settlement and
+/// return close its child — budget settlement travels only after a known
+/// terminal outcome, so a closed ledger is durable proof no assigned work is
+/// still running or ambiguous
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md): terminal
+/// `Cancelled` only after quiescence, with every started effect's outcome
+/// known or explicitly reconciled — an unresolved run rests in its own
+/// `WaitingForReconciliation`, holding its escrow open and this gate closed).
+fn finalize_task_cancellation(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(cancellation) = task.cancellation.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if task.status.is_terminal() {
+        return Ok(Vec::new());
+    }
+    if task.escrow.outstanding().count() > 0 {
+        return Ok(Vec::new());
+    }
+    let reason = cancellation.reason.clone();
+    terminate(state, operation_id, reason, now)?;
+    owed_child_reports(state, now)
 }
 
 /// Moves the task to a terminal status and records why.
+///
+/// The direct terminalization: it is what the *finalizing* transitions call
+/// once nothing is owed — an accepted result, an exhausted assignment budget,
+/// a closed-ledger cancellation. An ingress that can fire while a run is
+/// mid-flight takes [`request_task_cancellation`] instead, so the task never
+/// projects a terminal status over work whose outcome is unknown
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
 fn terminate(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -3823,6 +4646,7 @@ fn terminate(
     // A terminal task fences its run: the assignment is retired, so a late
     // proposal from it can no longer be validated.
     task.assignment = None;
+    let goal_row = project_goal_decision(task, &reason, now)?;
 
     let status = task.status;
     state.updated_at = now;
@@ -3836,6 +4660,15 @@ fn terminate(
         )
         .with_detail(reason.code())
     });
+    if let Some(detail) = goal_row {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::GoalDecided,
+            operation_id,
+            detail,
+            now,
+        );
+    }
     Ok(())
 }
 
@@ -3943,6 +4776,154 @@ fn owed_epoch_result(
     ))
 }
 
+/// The payload an [`AgentExchangeKind::DelegationResult`] exchange carries to
+/// the parent run: one delegated child task's terminal outcome, as bounded
+/// references only ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// A child's terminal state is evidence returned to the parent — never a goal
+/// decision, and never the child's content: the digest fingerprints the
+/// accepted result, and the child task id is the authorized-query handle for
+/// anything more ([`crate::query::authorized_agent_goal_view`] assembles the
+/// goal-wide view those handles key into).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentDelegationReport {
+    /// The delegation whose child reports.
+    pub delegation: AgentDelegationId,
+    /// The reporting child task.
+    pub child_task: AgentTaskId,
+    /// The run that served the child's terminal assignment, when it was ever
+    /// assigned one.
+    #[serde(default)]
+    pub child_run: Option<AgentRunId>,
+    /// The child task's terminal status.
+    pub status: AgentTaskStatus,
+    /// The child's stable terminal-reason code, when it recorded one.
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    /// The accepted result's fingerprint, when the child produced one.
+    #[serde(default)]
+    pub result_digest: Option<AgentContentDigest>,
+    /// Descendant tasks the child's own subtree created, from its settled
+    /// ledger. Recorded on the parent's cell for a later slice to credit
+    /// unused sub-quota; slice 4.4 never credits.
+    #[serde(default)]
+    pub descendants_created: u64,
+}
+
+/// The command an [`AgentExchangeKind::DelegationCancel`] exchange carries to
+/// a delegated child task: the parent run's durable cancellation request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The request names the delegation the parent's cell recorded, so the child
+/// authenticates it against its own delegation provenance — a sender that is
+/// not the recorded parent run, or a delegation the child does not carry, is
+/// a forged request refused definitively.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDelegationCancelRequest {
+    /// The delegation whose child is asked to cancel.
+    pub delegation: AgentDelegationId,
+    /// The child task the parent's cell created.
+    pub child_task: AgentTaskId,
+    /// The bounded reason recorded on the child's cancellation marker.
+    pub reason: String,
+}
+
+/// The child task's durable receipt replying to an
+/// [`AgentExchangeKind::DelegationCancel`].
+///
+/// Acceptance means the child durably recorded the request — its own
+/// cancellation marker is set, or it was already terminal. The child's
+/// terminal outcome still arrives separately as its
+/// [`AgentExchangeKind::DelegationResult`]; an accepted receipt is never
+/// proof the child's started effects stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDelegationCancelReceipt {
+    /// The child task that recorded the request.
+    pub child_task: AgentTaskId,
+    /// The status the child held after recording it: nonterminal while its
+    /// own wind-down propagates, or the terminal status the request found.
+    pub status: AgentTaskStatus,
+}
+
+/// The delegation-result exchange one terminal delegated child owes its
+/// parent run, when it owes one now.
+///
+/// Owed exactly once, after the child's own ledger closed — the run's
+/// settlement and return have both applied, so the consumption-derived
+/// fields are final. The journal's initiation record is the once-guard,
+/// exactly as the epoch result's.
+fn owed_delegation_result(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    if !task.status.is_terminal() {
+        return Ok(None);
+    }
+    let Some(provenance) = task.delegation.as_deref() else {
+        return Ok(None);
+    };
+    if task.escrow.outstanding().count() > 0 {
+        // The child's run has not settled and returned its escrow yet;
+        // reporting now would carry a non-final consumption.
+        return Ok(None);
+    }
+    let operation_id = crate::delegation::delegation_result_operation_id(
+        state.scope.tenant(),
+        &provenance.delegation,
+    )?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let child_run = (task.assignment_generation != AgentAssignmentGeneration::UNASSIGNED)
+        .then(|| run_id_for_assignment(state.scope.task(), task.assignment_generation))
+        .transpose()?;
+    let report = AgentDelegationReport {
+        delegation: provenance.delegation.clone(),
+        child_task: state.scope.task().clone(),
+        child_run,
+        status: task.status,
+        terminal_reason: task
+            .terminal_reason
+            .as_ref()
+            .map(|reason| reason.code().to_string()),
+        result_digest: task
+            .accepted_result
+            .as_ref()
+            .map(|accepted| accepted.digest.clone()),
+        descendants_created: task.escrow.consumed().descendants,
+    };
+    let payload = AgentExchangePayload::encode(AGENT_DELEGATION_RESULT_PAYLOAD_TYPE, &report)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::DelegationResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Run(provenance.parent_run.clone()),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Every child report a terminal task owes right now: the epoch result to a
+/// wake controller, the delegation result to a delegating parent run. One
+/// consult point, so every transition that can close a terminal task's
+/// ledger owes both from the same compare-and-set.
+fn owed_child_reports(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let mut owed = Vec::new();
+    owed.extend(owed_epoch_result(state, now)?);
+    owed.extend(owed_delegation_result(state, now)?);
+    Ok(owed)
+}
+
 /// Applies one epoch's result to the controller that admitted its wake:
 /// settles and returns the epoch's escrow, releases the wake, and owes the
 /// promoted occurrence's epoch creation — all in this one accepted
@@ -4036,6 +5017,19 @@ fn apply_epoch_result(
             // terminal outcome — neither resets nor grows the streak.
             _ => AgentEpochOutcomeClass::Cancelled,
         };
+        // The stagnation facts, read before the controller borrow: the
+        // detector always accounts, but an action fires only against a goal
+        // that is authorized or parked — the exhaustion executor's guards.
+        let (stagnation_policy, stagnation_allowed) = match task.goal_state.as_deref() {
+            Some(goal) => (
+                goal.spec().spec().stagnation_policy.clone(),
+                matches!(
+                    goal.status(),
+                    AgentGoalStatus::Active | AgentGoalStatus::Waiting
+                ),
+            ),
+            None => (AgentGoalStagnationPolicy::default(), false),
+        };
         let controller = task
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
@@ -4044,9 +5038,44 @@ fn apply_epoch_result(
         controller.record_epoch_outcome(&policy, outcome_class, now);
         // The outcome accounting itself may have flipped the lifecycle — an
         // escalated failure streak auto-suspends — so the flip window spans
-        // both the observation and the accounting.
+        // both the observation and the accounting. It deliberately excludes
+        // the stagnation action below: a stagnation park is the contract
+        // door's own wait, and projecting the gate's view of it would hand
+        // the park to the wrong resume door.
         let lifecycle_flip =
             observed_lifecycle_history(lifecycle_before, controller.lifecycle().status());
+        // Account the epoch's progress evidence. Only a completed epoch moves
+        // the detector, so a stagnation trip and a failure flip can never
+        // fire from one settlement.
+        let tripped = controller.record_epoch_progress(
+            &stagnation_policy,
+            outcome_class,
+            result.result_digest.as_ref(),
+        );
+        let stagnation = tripped.filter(|_| stagnation_allowed).map(|trigger| {
+            let epochs = match trigger {
+                AgentStagnationTrigger::RepeatedResult => {
+                    controller.lifecycle().repeated_result_epochs()
+                }
+                AgentStagnationTrigger::NoProgress => controller.lifecycle().no_progress_epochs(),
+            };
+            (trigger, epochs)
+        });
+        // A gate-closing action lands *before* the release, the failure
+        // escalation's precedent: the release's promotion is gated by the
+        // lifecycle in the same breath, so a closed gate releases the active
+        // wake without promoting a coalesced occurrence nobody should admit.
+        if let Some((trigger, _)) = stagnation {
+            match stagnation_policy.action_for(trigger) {
+                AgentGoalStagnationAction::Wait | AgentGoalStagnationAction::Escalate => {
+                    controller.suspend_by_policy(AgentGoalWaitReason::Stagnant { trigger }.code());
+                }
+                AgentGoalStagnationAction::Terminate => {
+                    controller.retire_by_policy();
+                }
+                AgentGoalStagnationAction::Continue | AgentGoalStagnationAction::Replan => {}
+            }
+        }
 
         // Release the wake. A wake that is no longer active was released by
         // an explicit CompleteWakeOccurrence; the settlement above still
@@ -4070,12 +5099,21 @@ fn apply_epoch_result(
         let operation_id = envelope.operation_id();
         if let Some(kind) = lifecycle_flip {
             record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+            project_gate_onto_goal(state, operation_id, None, now)?;
         }
-        record_wake_history(
+        if let Some((trigger, epochs)) = stagnation {
+            let digest = match trigger {
+                AgentStagnationTrigger::RepeatedResult => result.result_digest.clone(),
+                AgentStagnationTrigger::NoProgress => None,
+            };
+            apply_goal_stagnation(state, operation_id, trigger, epochs, digest, now)?;
+        }
+        record_wake_history_with_digest(
             state,
             AgentTaskHistoryKind::EpochSettled,
             operation_id,
             format!("{} {}", outcome_class.as_label(), result.wake),
+            result.result_digest.clone(),
             now,
         );
         if let Some(next) = release
@@ -4108,6 +5146,120 @@ fn apply_epoch_result(
                 transition = transition.owing(envelope);
             }
             transition
+        }
+        Err(error) => AgentExchangeTransition::new(refuse(state, error.code(), error.to_string())),
+    }
+}
+
+/// Applies one completed goal evaluation to the coordinating root task
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): the
+/// exchange ingress of the decision door, and — under a configured evaluator —
+/// the only one that can make a criteria decision.
+///
+/// The sender fence is the attestation: the initiator must be the run the
+/// task's current assignment binds, so a forged or superseded report never
+/// reaches the door. Every contract fence — terminality, status revision read
+/// in this same transition, criteria revision, evaluator identity, required
+/// evidence — runs in the shared decision core; a contract refusal becomes
+/// the exchange's refused reply, which settles the run's evaluation cell and
+/// tells the caller to re-evaluate.
+fn apply_goal_evaluation(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let record: AgentGoalEvaluationRecord = match envelope
+        .payload()
+        .decode(AGENT_GOAL_EVALUATION_PAYLOAD_TYPE)
+    {
+        Ok(record) => record,
+        Err(error) => {
+            return AgentExchangeTransition::new(refuse(state, error.code(), error.to_string()))
+        }
+    };
+
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Run(scope) => scope.run().clone(),
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "task-goal-evaluation-forged",
+                format!("a goal evaluation cannot originate from {other}"),
+            ))
+        }
+    };
+    let (assigned, goal_id, expected) = match state.task.as_ref() {
+        Some(task) => (
+            task.assignment
+                .as_ref()
+                .map(|assignment| assignment.run.clone()),
+            task.goal.clone(),
+            task.goal_state
+                .as_deref()
+                .map(AgentGoalState::status_revision),
+        ),
+        None => (None, None, None),
+    };
+    if assigned.as_ref() != Some(&sender) {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-goal-evaluation-forged",
+            format!("the evaluation was sent by run {sender}, which is not the current assignment"),
+        ));
+    }
+    if goal_id.as_ref() != Some(&record.goal) {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-goal-evaluation-forged",
+            format!(
+                "the evaluation judges goal {}, which this task does not coordinate",
+                record.goal
+            ),
+        ));
+    }
+
+    // The status revision is read inside this same transition — local state,
+    // no window — so the load-bearing fences are the ones the record must
+    // prove: terminality, criteria revision, evaluator, evidence. Replays are
+    // already deduplicated by the journal before this arm runs.
+    let reason = match record.outcome {
+        crate::evaluation::AgentGoalEvaluationOutcome::Satisfied => {
+            AgentGoalTerminalReason::CriteriaSatisfied
+        }
+        crate::evaluation::AgentGoalEvaluationOutcome::NotSatisfied => {
+            AgentGoalTerminalReason::CriteriaNotMet
+        }
+    };
+    // The attestation digest is what binds this decision to this record, so a
+    // reference that cannot be built refuses rather than deciding unbound.
+    let evaluation = match record.to_evaluation_ref() {
+        Ok(evaluation) => evaluation,
+        Err(error) => {
+            return AgentExchangeTransition::new(refuse(state, error.code(), error.to_string()))
+        }
+    };
+    let decision = AgentGoalDecision {
+        reason,
+        evaluation: Some(Box::new(evaluation)),
+        provenance: None,
+        expected_status_revision: expected.unwrap_or(AgentRevisionNumber::INITIAL),
+    };
+    match apply_goal_decision(state, envelope.operation_id(), decision, now) {
+        Ok(()) => {
+            let outcome = state
+                .task
+                .as_ref()
+                .and_then(|task| task.goal_state.as_deref())
+                .map(|goal| AgentGoalOutcome {
+                    status: goal.status(),
+                    status_revision: goal.status_revision(),
+                });
+            let payload =
+                AgentExchangePayload::encode(AGENT_GOAL_EVALUATION_OUTCOME_PAYLOAD_TYPE, &outcome)
+                    .unwrap_or_else(|_| {
+                        AgentExchangePayload::empty(AGENT_GOAL_EVALUATION_OUTCOME_PAYLOAD_TYPE)
+                    });
+            AgentExchangeTransition::new(AgentExchangeResult::accepted(payload))
         }
         Err(error) => AgentExchangeTransition::new(refuse(state, error.code(), error.to_string())),
     }
@@ -4198,10 +5350,15 @@ fn owe_epoch_creation(
         assignee: Some(epoch_spec.assignee.clone()),
         goal: Some(goal),
         goal_mode: AgentGoalMode::Finite,
+        // An epoch task contributes to the goal; it never coordinates it, so
+        // it carries the binding and no goal record of its own.
+        goal_spec: None,
         parent: Some(scope.task().clone()),
         dependencies: Vec::new(),
         escrow: Some(budget),
         wake: Some(wake.clone()),
+        // An epoch is admitted by its own controller, never delegated.
+        delegation: None,
         telemetry: task.telemetry.clone(),
     };
     let payload = AgentExchangePayload::encode(AGENT_TASK_CREATION_PAYLOAD_TYPE, &creation)?;
@@ -4270,6 +5427,34 @@ fn record_wake_history(
     });
 }
 
+/// Records one wake-scoped history row carrying a content fingerprint in the
+/// entry's digest slot — the epoch's result fingerprint on its settlement row,
+/// the repeated fingerprint on a stagnation detection. History is bounded
+/// observability; the controller's durable counters remain the correctness
+/// record.
+fn record_wake_history_with_digest(
+    state: &mut AgentTaskState,
+    kind: AgentTaskHistoryKind,
+    operation_id: &AgentOperationId,
+    detail: String,
+    digest: Option<AgentContentDigest>,
+    now: AgentTimestampMillis,
+) {
+    let status = state
+        .task
+        .as_ref()
+        .expect("a wake transition proved the task exists")
+        .status;
+    state.record_history(|sequence| {
+        let entry = AgentTaskHistoryEntry::new(sequence, kind, operation_id.clone(), status, now)
+            .with_detail(detail.clone());
+        match &digest {
+            Some(digest) => entry.with_digest(digest.clone()),
+            None => entry,
+        }
+    });
+}
+
 fn admit_wake(
     state: &mut AgentTaskState,
     operation_id: &AgentOperationId,
@@ -4328,6 +5513,7 @@ fn admit_wake(
     state.updated_at = now;
     if let Some(kind) = lifecycle_flip {
         record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        project_gate_onto_goal(state, operation_id, None, now)?;
     }
     record_wake_history(
         state,
@@ -4391,6 +5577,7 @@ fn complete_wake_occurrence(
     state.updated_at = now;
     if let Some(kind) = lifecycle_flip {
         record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        project_gate_onto_goal(state, operation_id, None, now)?;
     }
     if let Some(next) = &release.admitted_next {
         record_wake_history(
@@ -4460,6 +5647,7 @@ fn update_continuous_schedule(
     state.updated_at = now;
     if let Some(kind) = lifecycle_flip {
         record_wake_history(state, kind, operation_id, "observed".to_string(), now);
+        project_gate_onto_goal(state, operation_id, None, now)?;
     }
     record_wake_history(
         state,
@@ -4512,6 +5700,7 @@ fn suspend_continuous_goal(
         detail,
         now,
     );
+    project_gate_onto_goal(state, operation_id, None, now)?;
     Ok(AgentWakeOutcome::Lifecycle {
         status,
         lifecycle_revision,
@@ -4529,6 +5718,15 @@ fn resume_continuous_goal(
 ) -> AgentTaskResult<(AgentWakeOutcome, Vec<AgentExchangeEnvelope>)> {
     let scope = state.scope.clone();
     let task = continuous_task_mut(state)?;
+    // Any wait the gate door does not own fences this resume: a budget park
+    // or a stagnation park is the goal door's wait, and resuming the gate
+    // under it would re-admit spending the contract says is parked. The goal
+    // door's own resume — `ResumeGoal` — lifts both records together.
+    if let Some(wait) = task.goal_state.as_deref().and_then(AgentGoalState::wait) {
+        if !matches!(wait, AgentGoalWaitReason::AdmissionSuspended) {
+            return Err(AgentTaskError::GoalWaitOwnedElsewhere { code: wait.code() });
+        }
+    }
     let policy = task
         .goal_mode
         .continuous()
@@ -4541,7 +5739,7 @@ fn resume_continuous_goal(
             .wake_controller
             .get_or_insert_with(AgentWakeControllerState::new);
         controller.observe_lifecycle(&policy, now);
-        let lifecycle_revision = controller.resume(expected, provenance)?;
+        let lifecycle_revision = controller.resume(expected, provenance.clone())?;
         let promoted = controller.promote_admittable(&policy, now);
         controller.ensure_rewakes(&policy, now);
         (
@@ -4572,6 +5770,7 @@ fn resume_continuous_goal(
             now,
         );
     }
+    project_gate_onto_goal(state, operation_id, Some(&provenance), now)?;
     Ok((
         AgentWakeOutcome::Lifecycle {
             status,
@@ -4640,7 +5839,7 @@ fn retire_continuous_goal(
         .wake_controller
         .get_or_insert_with(AgentWakeControllerState::new);
     controller.observe_lifecycle(&policy, now);
-    let lifecycle_revision = controller.retire(expected, provenance)?;
+    let lifecycle_revision = controller.retire(expected, provenance.clone())?;
     controller.ensure_rewakes(&policy, now);
     let status = controller.lifecycle().status();
     state.updated_at = now;
@@ -4651,10 +5850,699 @@ fn retire_continuous_goal(
         String::new(),
         now,
     );
+    project_gate_onto_goal(state, operation_id, Some(&provenance), now)?;
     Ok(AgentWakeOutcome::Lifecycle {
         status,
         lifecycle_revision,
     })
+}
+
+/// The gate-suspension reason a goal instituted `Proposed` parks continuous
+/// admission under, lifted by [`AgentTaskEntityCommand::ActivateGoal`].
+const GOAL_PROPOSED_GATE_REASON: &str = "goal-proposed";
+
+/// Converges the goal contract with the continuous admission gate, one-way —
+/// gate to contract — inside the same transition that moved the gate.
+///
+/// The wake-side [`AgentGoalLifecycleStatus`] is the admission gate; the goal
+/// record carries the contract status of
+/// [specification 8.1](../../../docs/plans/rakka-agent/spec.md). Where the two
+/// overlap, the gate drives: a retirement cancels the goal with the `Retired`
+/// reason, an observed expiry expires it, a suspension parks it, and a resume
+/// reactivates a goal that was waiting on exactly that suspension — and
+/// nothing else, so a goal parked for budget exhaustion is never silently
+/// reactivated by a gate resume that granted nothing.
+///
+/// Every arm must stay infallible by construction: this runs inside exchange
+/// transitions — the epoch-result apply among them — where an error becomes a
+/// durably recorded refusal that is replayed forever. The guards are what
+/// guarantee it today (`Retired`/`Expired` map to reasons every non-terminal
+/// status accepts, the park and reactivate arms are status-guarded, and the
+/// fence uses the current revision); a future arm inherits the obligation.
+fn project_gate_onto_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    provenance: Option<&AgentRevisionProvenance>,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let Some(task) = state.task.as_mut() else {
+        return Ok(());
+    };
+    let Some(gate) = task
+        .wake_controller
+        .as_ref()
+        .map(|controller| controller.lifecycle().status())
+    else {
+        return Ok(());
+    };
+    let Some(goal) = task.goal_state.as_deref_mut() else {
+        return Ok(());
+    };
+    if goal.status().is_terminal() {
+        return Ok(());
+    }
+    let row = match gate {
+        AgentGoalLifecycleStatus::Retired | AgentGoalLifecycleStatus::Expired => {
+            let reason = if gate == AgentGoalLifecycleStatus::Retired {
+                AgentGoalTerminalReason::Retired
+            } else {
+                AgentGoalTerminalReason::ScheduleExpired
+            };
+            let detail = format!("{} {}", reason.status().as_label(), reason.code());
+            goal.decide(
+                AgentGoalDecision {
+                    reason,
+                    evaluation: None,
+                    provenance: provenance.cloned().map(Box::new),
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            Some((AgentTaskHistoryKind::GoalDecided, detail))
+        }
+        AgentGoalLifecycleStatus::Suspended if goal.status() == AgentGoalStatus::Active => {
+            goal.park(AgentGoalWaitReason::AdmissionSuspended, now)?;
+            Some((
+                AgentTaskHistoryKind::GoalParked,
+                AgentGoalWaitReason::AdmissionSuspended.code().to_string(),
+            ))
+        }
+        AgentGoalLifecycleStatus::Active
+            if matches!(goal.wait(), Some(AgentGoalWaitReason::AdmissionSuspended)) =>
+        {
+            let Some(provenance) = provenance else {
+                return Ok(());
+            };
+            goal.reactivate(goal.status_revision(), provenance.clone(), now)?;
+            Some((AgentTaskHistoryKind::GoalReactivated, String::new()))
+        }
+        _ => None,
+    };
+    if let Some((kind, detail)) = row {
+        state.updated_at = now;
+        record_wake_history(state, kind, operation_id, detail, now);
+    }
+    Ok(())
+}
+
+/// The goal-scope exhaustion the root task's own ledger reports right now:
+/// what is spoken for — consumption and still-outstanding child escrow
+/// together — against the goal's allocation.
+fn goal_scope_exhaustion(
+    task: &AgentTask,
+    dimension: AgentBudgetDimension,
+) -> AgentBudgetExhaustion {
+    let limit = task.escrow.allocation().get(dimension).unwrap_or(0);
+    let available = task.escrow.available(dimension).unwrap_or(0);
+    AgentBudgetExhaustion::new(dimension, limit, limit.saturating_sub(available))
+}
+
+/// The conserved dimension whose assignment refusal no settlement can relieve,
+/// when there is one: zero available headroom and no outstanding child escrow
+/// in that dimension whose return could restore any.
+fn permanent_budget_exhaustion(task: &AgentTask) -> Option<AgentBudgetDimension> {
+    if task.escrow.outstanding().count() >= AGENT_ESCROW_CHILD_CAPACITY {
+        return None;
+    }
+    let request = task.definition.run_allocation_request();
+    let affordable = request.narrowed_to(&task.escrow.available_allocation());
+    let dimension = affordable.first_empty_for(&request)?;
+    let outstanding_holds = task
+        .escrow
+        .outstanding()
+        .any(|(_, escrow)| escrow.allocated().get(dimension).unwrap_or(0) > 0);
+    (!outstanding_holds).then_some(dimension)
+}
+
+/// Applies the goal's persisted budget-exhaustion policy
+/// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md): hard
+/// ceilings deterministically park, escalate, or terminate per persisted
+/// policy), inside the transition that observed the exhaustion.
+///
+/// Idempotent: a goal already parked on the same reason, or already terminal,
+/// moves nothing — the consult runs inside command transitions and settle
+/// passes alike, and an unchanged exhaustion is not a new fact.
+fn apply_goal_exhaustion(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    dimension: AgentBudgetDimension,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    let Some(goal) = task.goal_state.as_deref() else {
+        return Ok(());
+    };
+    if goal.status().is_terminal() {
+        return Ok(());
+    }
+    let action = goal.spec().spec().exhaustion.action_for(dimension);
+    let exhaustion = goal_scope_exhaustion(task, dimension);
+    match action {
+        AgentGoalExhaustionAction::Park | AgentGoalExhaustionAction::Escalate => {
+            let reason = match action {
+                AgentGoalExhaustionAction::Park => {
+                    AgentGoalWaitReason::BudgetExhausted { exhaustion }
+                }
+                _ => AgentGoalWaitReason::Escalated { exhaustion },
+            };
+            let escalation = task
+                .goal_state
+                .as_deref()
+                .and_then(|goal| goal.spec().spec().escalation.clone());
+            let goal = task
+                .goal_state
+                .as_deref_mut()
+                .expect("the goal record was read above");
+            // A Proposed goal spends nothing already, so there is nothing to
+            // park; only an authorized goal parks.
+            if !matches!(
+                goal.status(),
+                AgentGoalStatus::Active | AgentGoalStatus::Waiting
+            ) {
+                return Ok(());
+            }
+            let before = goal.status_revision();
+            let code = reason.code();
+            let moved = goal.park(reason, now)? != before;
+            if !moved {
+                return Ok(());
+            }
+            // For a continuous goal the park closes admission in the same
+            // compare-and-set, so triggers coalesce and nothing spends — the
+            // same durable suspension a failure escalation makes.
+            if task.goal_mode.is_continuous() {
+                task.wake_controller
+                    .get_or_insert_with(AgentWakeControllerState::new)
+                    .suspend_by_policy(code);
+            }
+            let detail = match (action, escalation) {
+                (AgentGoalExhaustionAction::Escalate, Some(policy)) => {
+                    format!("{code} {exhaustion} escalation {policy}")
+                }
+                _ => format!("{code} {exhaustion}"),
+            };
+            state.updated_at = now;
+            record_wake_history(
+                state,
+                AgentTaskHistoryKind::GoalParked,
+                operation_id,
+                detail,
+                now,
+            );
+        }
+        AgentGoalExhaustionAction::Terminate => {
+            let goal = task
+                .goal_state
+                .as_deref_mut()
+                .expect("the goal record was read above");
+            let reason = AgentGoalTerminalReason::BudgetExhausted { exhaustion };
+            let detail = format!(
+                "{} {} {exhaustion}",
+                reason.status().as_label(),
+                reason.code()
+            );
+            goal.decide(
+                AgentGoalDecision {
+                    reason,
+                    evaluation: None,
+                    provenance: None,
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            // Admission closes with the contract, and the root task ends with
+            // the goal: durability does not authorize unbounded compute, and a
+            // policy that says terminate means the whole scope stops
+            // ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)).
+            if task.goal_mode.is_continuous() {
+                if let Some(controller) = task.wake_controller.as_mut() {
+                    controller.retire_by_policy();
+                }
+            }
+            state.updated_at = now;
+            record_wake_history(
+                state,
+                AgentTaskHistoryKind::GoalDecided,
+                operation_id,
+                detail,
+                now,
+            );
+            terminate(
+                state,
+                operation_id,
+                AgentTaskTerminalReason::GoalBudgetExhausted { exhaustion },
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies the goal's persisted stagnation policy
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md): bounded
+/// repetition and no-progress epochs continue, wait, escalate, or terminate
+/// under deterministic policy), inside the epoch-settle transition that
+/// observed the trip.
+///
+/// Every arm is infallible against a record this binary wrote — the exhaustion
+/// executor's obligation, inherited because this runs inside an exchange
+/// transition where an error becomes a durably replayed refusal. The
+/// detection row is always recorded; a `Continue` records nothing else. The
+/// gate-side suspension or retirement already landed beside the release; the
+/// idempotent re-application here keeps the executor total on every path.
+fn apply_goal_stagnation(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    trigger: AgentStagnationTrigger,
+    epochs: u32,
+    digest: Option<AgentContentDigest>,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    let Some(goal) = task.goal_state.as_deref() else {
+        return Ok(());
+    };
+    if goal.status().is_terminal() {
+        return Ok(());
+    }
+    // A Proposed goal spends nothing already; only an authorized or parked
+    // goal is acted on. The streak was still accounted durably — it is a fact
+    // about the epochs — but a suppressed trip is deliberately *not* counted,
+    // because it leaves no detection row for the count to correspond to.
+    if !matches!(
+        goal.status(),
+        AgentGoalStatus::Active | AgentGoalStatus::Waiting
+    ) {
+        return Ok(());
+    }
+    let action = goal.spec().spec().stagnation_policy.action_for(trigger);
+    let escalation = goal.spec().spec().escalation.clone();
+    let stagnation_ref = goal.spec().spec().stagnation.clone();
+    let detection = format!("{} {epochs} {}", trigger.code(), action.as_label());
+    // Past every guard, so the durable counter moves exactly with the
+    // detection row recorded below and the metric counts what happened.
+    if let Some(controller) = task.wake_controller.as_mut() {
+        controller.record_stagnation_trip(trigger);
+    }
+
+    let follow_up = match action {
+        // Observe-only; `Replan` is refused at spec validation, so its arm is
+        // defensively identical rather than silently a park.
+        AgentGoalStagnationAction::Continue | AgentGoalStagnationAction::Replan => None,
+        AgentGoalStagnationAction::Wait | AgentGoalStagnationAction::Escalate => {
+            let goal = task
+                .goal_state
+                .as_deref_mut()
+                .expect("the goal record was read above");
+            let before = goal.status_revision();
+            let reason = AgentGoalWaitReason::Stagnant { trigger };
+            let code = reason.code();
+            let moved = goal.park(reason, now)? != before;
+            if moved {
+                if task.goal_mode.is_continuous() {
+                    task.wake_controller
+                        .get_or_insert_with(AgentWakeControllerState::new)
+                        .suspend_by_policy(code);
+                }
+                let detail = match (action, escalation, stagnation_ref) {
+                    (AgentGoalStagnationAction::Escalate, Some(policy), Some(stagnation)) => {
+                        format!("{code} {trigger} {epochs} escalation {policy} policy {stagnation}")
+                    }
+                    (AgentGoalStagnationAction::Escalate, Some(policy), None) => {
+                        format!("{code} {trigger} {epochs} escalation {policy}")
+                    }
+                    _ => format!("{code} {trigger} {epochs}"),
+                };
+                Some((AgentTaskHistoryKind::GoalParked, detail, false))
+            } else {
+                None
+            }
+        }
+        AgentGoalStagnationAction::Terminate => {
+            let goal = task
+                .goal_state
+                .as_deref_mut()
+                .expect("the goal record was read above");
+            let reason = AgentGoalTerminalReason::Stagnant { trigger, epochs };
+            let detail = format!(
+                "{} {} {trigger} {epochs}",
+                reason.status().as_label(),
+                reason.code()
+            );
+            goal.decide(
+                AgentGoalDecision {
+                    reason,
+                    evaluation: None,
+                    provenance: None,
+                    expected_status_revision: goal.status_revision(),
+                },
+                now,
+            )?;
+            // Admission closes with the contract, and the root task ends with
+            // the goal — the exhaustion terminate's posture: durability does
+            // not authorize unbounded compute.
+            if task.goal_mode.is_continuous() {
+                if let Some(controller) = task.wake_controller.as_mut() {
+                    controller.retire_by_policy();
+                }
+            }
+            Some((AgentTaskHistoryKind::GoalDecided, detail, true))
+        }
+    };
+
+    state.updated_at = now;
+    record_wake_history_with_digest(
+        state,
+        AgentTaskHistoryKind::GoalStagnationDetected,
+        operation_id,
+        detection,
+        digest,
+        now,
+    );
+    if let Some((kind, detail, terminates)) = follow_up {
+        record_wake_history(state, kind, operation_id, detail, now);
+        if terminates {
+            terminate(
+                state,
+                operation_id,
+                AgentTaskTerminalReason::GoalStagnant { trigger, epochs },
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Activates a `Proposed` goal under an authorized command, lifting the
+/// proposed-goal admission park when this is a continuous root.
+fn activate_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    // Every goal entry point observes the deadline: a passed one expires the
+    // goal, and the activation below then refuses it as terminal.
+    goal.observe_deadline(now);
+    goal.activate(expected, provenance.clone(), now)?;
+    let mut promoted = None;
+    let mut owed = Vec::new();
+    if task.goal_mode.is_continuous() {
+        let policy = task
+            .goal_mode
+            .continuous()
+            .expect("the mode was just matched")
+            .wake_policy
+            .policy()
+            .clone();
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        // Lift only the park the proposed goal itself made: an operator's own
+        // suspension stays until the operator resumes it.
+        if controller.lifecycle().status() == AgentGoalLifecycleStatus::Suspended
+            && controller.lifecycle().suspended_reason() == Some(GOAL_PROPOSED_GATE_REASON)
+        {
+            let revision = controller.lifecycle().lifecycle_revision();
+            controller.resume(revision, provenance)?;
+            promoted = controller.promote_admittable(&policy, now);
+            controller.ensure_rewakes(&policy, now);
+            if let Some(wake) = &promoted {
+                owed.push(owe_epoch_creation(&scope, task, wake, now)?);
+            }
+        }
+    }
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalActivated,
+        operation_id,
+        String::new(),
+        now,
+    );
+    if let Some(wake) = &promoted {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            wake.to_string(),
+            now,
+        );
+    }
+    // The gate may still be suspended by an operator, in which case the goal
+    // parks right back — the projection converges the two records either way.
+    project_gate_onto_goal(state, operation_id, None, now)?;
+    Ok(owed)
+}
+
+/// The one decision core both ingresses share — the open command and the
+/// goal-evaluation exchange: observe the deadline, decide, close a continuous
+/// gate with the contract, enforce the bound whole, and record the decision
+/// row. Every fence the contract owns — status revision, criteria revision,
+/// evaluator identity, required evidence — runs inside
+/// [`AgentGoalState::decide`], so the two ingresses can never diverge on what
+/// a decision must prove.
+fn apply_goal_decision(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    decision: AgentGoalDecision,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    goal.observe_deadline(now);
+    let outcome = decision.reason.status();
+    let code = decision.reason.code();
+    goal.decide(decision, now)?;
+    if task.goal_mode.is_continuous() {
+        if let Some(controller) = task.wake_controller.as_mut() {
+            controller.retire_by_policy();
+        }
+    }
+    // The decision spends growth headroom admission reserved, so it checks
+    // the full bound: `decide` truncated the reason strings, but the
+    // evaluation reference carries caller-sized artifact fields the record
+    // must still be able to hold.
+    task.check_bounds(0)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalDecided,
+        operation_id,
+        format!("{} {code}", outcome.as_label()),
+        now,
+    );
+    Ok(())
+}
+
+/// Records a terminal goal decision under an authorized command; a terminal
+/// continuous goal closes admission with the contract.
+///
+/// Under a configured evaluator, a criteria decision may not enter here at
+/// all: the goal-evaluation exchange — whose sender fence and digest-bearing
+/// record are the attestation — is the only ingress
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)). Without a
+/// configured evaluator the 4.1 contract stands: any authorized commander may
+/// record a criteria decision, still revision- and evidence-fenced.
+fn record_goal_decision(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    decision: AgentGoalDecision,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    {
+        let task = state.task_mut()?;
+        let goal = task
+            .goal_state
+            .as_deref_mut()
+            .ok_or(AgentTaskError::GoalNotCoordinated)?;
+        // Every goal entry point observes the deadline, and this one observes
+        // it *before* the attestation fence: an expired goal is terminal, and
+        // refusing it `task-goal-decision-unattested` would answer the wrong
+        // question — the decision is not unattested, the goal is over. The
+        // now-terminal goal falls through to `decide`, which refuses it
+        // `goal-terminal`. Durability of the expiry itself stays the settle
+        // pass's job, as it is for every other refused decision.
+        goal.observe_deadline(now);
+        if !goal.status().is_terminal()
+            && decision.reason.requires_evaluation()
+            && goal.spec().spec().evaluator.is_some()
+        {
+            return Err(AgentTaskError::GoalDecisionUnattested);
+        }
+    }
+    apply_goal_decision(state, operation_id, decision, now)
+}
+
+/// Accepts a revised success criteria under an authorized command
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md): if the goal
+/// changes, evaluations against the old revision are invalid — which the
+/// decision door's existing staleness fence enforces, so this command carries
+/// no cancellation machinery at all).
+fn revise_goal_criteria(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected_criteria_revision: AgentRevisionNumber,
+    source: AgentGoalCriteriaSource,
+    digest: Option<AgentContentDigest>,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    // Every goal entry point observes the deadline: a passed one expires the
+    // goal, and the revision below then refuses it as terminal.
+    goal.observe_deadline(now);
+    let revision = goal.revise_criteria(expected_criteria_revision, source, digest, provenance)?;
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalCriteriaRevised,
+        operation_id,
+        revision.to_string(),
+        now,
+    );
+    Ok(())
+}
+
+/// Reactivates a `Waiting` goal under an authorized command — the un-park door
+/// of the goal-scope exhaustion policy. One command widens the ledger under
+/// the definition ceilings, reactivates the contract, and lifts the
+/// goal-driven admission park, in one fenced compare-and-set.
+fn resume_goal(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    expected: AgentRevisionNumber,
+    top_up: Option<AgentBudgetAllocation>,
+    provenance: AgentRevisionProvenance,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let goal = task
+        .goal_state
+        .as_deref_mut()
+        .ok_or(AgentTaskError::GoalNotCoordinated)?;
+    goal.observe_deadline(now);
+    // What the park recorded, before reactivation clears it. An admission
+    // suspension is the gate door's wait: resuming it here would lift a
+    // suspension this command never examined.
+    let wait = goal.wait().cloned();
+    let wait_code = wait.as_ref().map(AgentGoalWaitReason::code);
+    if matches!(wait, Some(AgentGoalWaitReason::AdmissionSuspended)) {
+        return Err(AgentTaskError::GoalWaitOwnedElsewhere {
+            code: AgentGoalWaitReason::AdmissionSuspended.code(),
+        });
+    }
+    let parked = goal
+        .wait()
+        .and_then(AgentGoalWaitReason::exhaustion)
+        .copied();
+    goal.reactivate(expected, provenance.clone(), now)?;
+    if let Some(additional) = &top_up {
+        // The widening is the owner's parent-scope allocation decision; the
+        // definition ceiling still bounds it
+        // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+        let ceiling = AgentBudgetAllocation::from_ceilings(&task.definition.budgets);
+        task.escrow.widen(additional, &ceiling);
+    }
+    if let Some(exhaustion) = parked {
+        // The resume must actually relieve what parked the goal; resuming
+        // into the same exhaustion would only re-park on the next decision.
+        if task.escrow.available(exhaustion.dimension) == Some(0) {
+            return Err(AgentTaskError::GoalResumeUnrelieved {
+                exhaustion: goal_scope_exhaustion(task, exhaustion.dimension),
+            });
+        }
+    }
+    // The structured reason, not its label: the detector reset below is a
+    // durable state change, and a code two reasons could share must not decide
+    // it. `wait_code` stays for the gate's own suspension-reason comparison,
+    // which is string-keyed on the controller side.
+    let stagnant = matches!(wait, Some(AgentGoalWaitReason::Stagnant { .. }));
+    let mut promoted = None;
+    let mut owed = Vec::new();
+    if task.goal_mode.is_continuous() {
+        let policy = task
+            .goal_mode
+            .continuous()
+            .expect("the mode was just matched")
+            .wake_policy
+            .policy()
+            .clone();
+        let controller = task
+            .wake_controller
+            .get_or_insert_with(AgentWakeControllerState::new);
+        // Lift only the park the goal's own policy made — exhaustion or
+        // stagnation alike.
+        let goal_driven = controller.lifecycle().status() == AgentGoalLifecycleStatus::Suspended
+            && controller.lifecycle().suspended_reason() == wait_code;
+        if goal_driven {
+            let revision = controller.lifecycle().lifecycle_revision();
+            controller.resume(revision, provenance)?;
+            promoted = controller.promote_admittable(&policy, now);
+            controller.ensure_rewakes(&policy, now);
+            if let Some(wake) = &promoted {
+                owed.push(owe_epoch_creation(&scope, task, wake, now)?);
+            }
+        }
+        if stagnant {
+            // The one deliberate non-progress reset
+            // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md):
+            // never silently reset): the authorized resume clears the
+            // detector, with provenance on the contract and the reset in
+            // history — otherwise the very next identical epoch would
+            // instantly re-park, and the operator who knows the repetition is
+            // benign would have no relief valve.
+            task.wake_controller
+                .get_or_insert_with(AgentWakeControllerState::new)
+                .reset_stagnation();
+        }
+    }
+    task.check_bounds(AGENT_TASK_STATE_GROWTH_RESERVE_BYTES)?;
+    state.updated_at = now;
+    let mut detail_parts = Vec::new();
+    if top_up.is_some() {
+        detail_parts.push("top-up");
+    }
+    if stagnant {
+        detail_parts.push("stagnation-reset");
+    }
+    record_wake_history(
+        state,
+        AgentTaskHistoryKind::GoalReactivated,
+        operation_id,
+        detail_parts.join(" "),
+        now,
+    );
+    if let Some(wake) = &promoted {
+        record_wake_history(
+            state,
+            AgentTaskHistoryKind::EpochAdmitted,
+            operation_id,
+            wake.to_string(),
+            now,
+        );
+    }
+    // The gate may still be suspended by an operator, in which case the goal
+    // parks right back — the projection converges the two records either way.
+    project_gate_onto_goal(state, operation_id, None, now)?;
+    Ok(owed)
 }
 
 /// Why the task cannot escrow a run right now, when it cannot.
@@ -4773,7 +6661,10 @@ fn refuse_assignment(
 }
 
 /// Decides one assignment against the agent facts the entity read from durable
-/// state, and returns the run-creation exchange the decision owes.
+/// state, and returns the exchanges the decision owes: the run-creation
+/// command of a decided assignment, or — when the decision exhausts the
+/// task's assignments instead — the terminal reports the newly terminal task
+/// owes upward, from this same compare-and-set.
 ///
 /// The transition is idempotent on the task's own state: a task that already has
 /// an assignment is not assignable, so a replay produces no second generation.
@@ -4781,15 +6672,17 @@ fn decide_assignment(
     state: &mut AgentTaskState,
     readiness: &AgentAssignmentReadiness,
     now: AgentTimestampMillis,
-) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
     let task = state.task_mut()?;
     if !task.awaits_assignment() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     if let Some((reason, detail)) = readiness.refusal() {
-        return refuse_assignment(state, readiness, reason, detail, now);
+        return Ok(refuse_assignment(state, readiness, reason, detail, now)?
+            .into_iter()
+            .collect());
     }
 
     if task.assignments >= task.definition.limits.max_assignments {
@@ -4801,7 +6694,12 @@ fn decide_assignment(
             AgentTaskTerminalReason::AssignmentsExhausted { assignments },
             now,
         )?;
-        return Ok(None);
+        // The exhaustion closed this task's ledger — every refused
+        // generation's escrow was released at its settle, so nothing is
+        // outstanding — and a delegated child's parent is parked awaiting
+        // exactly this outcome: the reports the terminal task owes upward
+        // are accurate now, and owed from this same compare-and-set.
+        return owed_child_reports(state, now);
     }
 
     let (agent_definition_revision, agent_settings_revision) =
@@ -4829,7 +6727,15 @@ fn decide_assignment(
     // the headroom, so this takes the same path a suspended agent's refusal
     // takes.
     if let Some((reason, detail)) = task_budget_refusal(task) {
-        return refuse_assignment(state, readiness, reason, detail, now);
+        // A refusal no settlement can relieve — zero headroom and nothing
+        // outstanding to return — is the goal scope's own exhaustion, and the
+        // goal's persisted policy decides what it does about it.
+        let permanent = permanent_budget_exhaustion(task);
+        let refusal = refuse_assignment(state, readiness, reason, detail, now)?;
+        if let Some(dimension) = permanent {
+            apply_goal_exhaustion(state, &operation_id, dimension, now)?;
+        }
+        return Ok(refusal.into_iter().collect());
     }
     let request = task.definition.run_allocation_request();
     let allocation = task
@@ -4858,6 +6764,7 @@ fn decide_assignment(
         budget,
         agent_definition_revision,
         agent_settings_revision,
+        delegation: delegation_envelope_for(task),
         assigned_at: now,
     };
     // The payload is bounded by the substrate. A definition and input that do
@@ -4898,7 +6805,7 @@ fn decide_assignment(
         )
         .with_assignment(&assignment)
     });
-    Ok(Some(envelope))
+    Ok(vec![envelope])
 }
 
 /// Validates one proposed result by deterministic rules alone, and records the
@@ -4970,6 +6877,19 @@ fn apply_result_proposal(
                 "generation {} is not the current generation {}",
                 proposal.generation, assignment.generation
             ),
+        );
+    }
+
+    // The cancellation fence ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+    // a requested cancellation immediately stops new validation, so a run
+    // racing its proposal against the run-cancel exchange converges on the
+    // wind-down whichever message arrives first. Definitive — the run's
+    // settle rule winds it down exactly as a terminal task's refusal would.
+    if task.cancellation.is_some() {
+        return refuse(
+            state,
+            AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+            "the task's cancellation is propagating; no proposal can be validated".to_string(),
         );
     }
 
@@ -5193,7 +7113,7 @@ fn apply_ledger_exchange(
                 .payload()
                 .decode::<AgentBudgetTopUpRequest>(AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE)
             {
-                Ok(request) => apply_top_up(state, &request),
+                Ok(request) => apply_top_up(state, envelope.operation_id(), &request, now),
                 Err(error) => return refuse(state, error.code(), error.to_string()),
             }
         }
@@ -5235,7 +7155,9 @@ fn apply_return(
 
 fn apply_top_up(
     state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
     request: &AgentBudgetTopUpRequest,
+    now: AgentTimestampMillis,
 ) -> AgentTaskResult<Option<AgentBudgetAllocation>> {
     let child = AgentEscrowChildId::for_run(request.run.run())?;
     let task = state.task_mut()?;
@@ -5246,6 +7168,14 @@ fn apply_top_up(
     let granted = task
         .escrow
         .top_up_child(&child, request.sequence, &wanted)?;
+    // The run still receives the honest zero grant and stops with its original
+    // exhaustion; what is new in slice 4.1 is that the *goal* now consults its
+    // exhaustion policy instead of silently idling: the empty grant in the
+    // dimension the run ran out of is the goal scope observing its own ceiling.
+    let dimension = request.exhaustion.dimension;
+    if dimension.is_conserved() && granted.get(dimension) == Some(0) {
+        apply_goal_exhaustion(state, operation_id, dimension, now)?;
+    }
     Ok(Some(granted))
 }
 
@@ -5254,6 +7184,121 @@ fn ledger_outcome(granted: Option<AgentBudgetAllocation>) -> AgentExchangeResult
     let payload = AgentExchangePayload::encode(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, &outcome)
         .unwrap_or_else(|_| AgentExchangePayload::empty(AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE));
     AgentExchangeResult::accepted(payload)
+}
+
+/// Applies a parent run's [`AgentExchangeKind::DelegationCancel`] request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// receiving half of the parent → child propagation leg, and the recursion
+/// point — the accepted request owes the child's own run-cancel onward in
+/// the same compare-and-set, so the machinery re-enters unchanged at every
+/// depth.
+///
+/// The sender must be the very parent run this task's delegation provenance
+/// records, naming the very delegation that created it; anything else is a
+/// forgery refused definitively. A terminal task, or one whose marker is
+/// already set, answers idempotently: its own durable record is the fence
+/// past the journal's bounded deduplication window.
+fn apply_delegation_cancel(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let request: AgentDelegationCancelRequest = match envelope
+        .payload()
+        .decode(AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE)
+    {
+        Ok(request) => request,
+        // Version skew, not the receiver answering: the parent's settle rule
+        // leaves the exchange outstanding, and it converges after upgrade.
+        Err(error) => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "delegation-cancel-undecodable",
+                error.to_string(),
+            ))
+        }
+    };
+    let Some(task) = state.task.as_ref() else {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-not-delegated",
+            "the addressed task does not exist".to_string(),
+        ));
+    };
+    let Some(provenance) = task.delegation.as_deref() else {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-not-delegated",
+            "the task carries no delegation provenance".to_string(),
+        ));
+    };
+    if provenance.delegation != request.delegation {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-forged",
+            format!(
+                "the task was created by delegation {}, not {}",
+                provenance.delegation, request.delegation
+            ),
+        ));
+    }
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Run(scope) => scope,
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "delegation-cancel-forged",
+                format!("a delegation-cancel cannot originate from {other}"),
+            ))
+        }
+    };
+    if *sender != provenance.parent_run {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-forged",
+            format!(
+                "the task's delegating run is {}, not {}",
+                provenance.parent_run.run(),
+                sender.run()
+            ),
+        ));
+    }
+    let receipt = |state: &AgentTaskState| {
+        let status = state.status().unwrap_or(AgentTaskStatus::Created);
+        let receipt = AgentDelegationCancelReceipt {
+            child_task: state.scope.task().clone(),
+            status,
+        };
+        AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE, &receipt)
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE)
+                }),
+        )
+    };
+    if task.status.is_terminal() || task.cancellation.is_some() {
+        return AgentExchangeTransition::new(receipt(state));
+    }
+    let reason = AgentTaskTerminalReason::CancellationRequested {
+        reason: bounded_detail(request.reason),
+    };
+    match request_task_cancellation(state, envelope.operation_id(), reason, now) {
+        Ok(owed) => {
+            let mut transition = AgentExchangeTransition::new(receipt(state));
+            for envelope in owed {
+                transition = transition.owing(envelope);
+            }
+            transition
+        }
+        // The guards above exclude every refusal `request_task_cancellation`
+        // can make; a failure here is a construction bug answered as a
+        // definitive refusal rather than a silent drop.
+        Err(error) => AgentExchangeTransition::new(refuse(
+            state,
+            "delegation-cancel-forged",
+            error.to_string(),
+        )),
+    }
 }
 
 /// Refuses an exchange without making a validation decision.
@@ -5312,14 +7357,32 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             | AgentExchangeKind::BudgetSettlement
             | AgentExchangeKind::BudgetReturn => {
                 let result = apply_ledger_exchange(state, envelope, now);
-                // A ledger exchange may have closed a terminal epoch's own
+                // A ledger exchange may have closed a terminal child's own
                 // ledger: the run's settlement and return both applied, so
-                // the result this epoch owes its controller is now accurate —
-                // and owed in this same compare-and-set.
+                // the reports this child owes upward — the epoch result to
+                // its controller, the delegation result to its parent run —
+                // are now accurate, and owed in this same compare-and-set.
+                // The same closure is the gate a requested cancellation
+                // finalizes behind ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)),
+                // so the finalization commits here too; its own child
+                // reports deduplicate against the consult below.
                 let mut transition = AgentExchangeTransition::new(result);
-                match owed_epoch_result(state, now) {
-                    Ok(Some(owed)) => transition = transition.owing(owed),
-                    Ok(None) => {}
+                match finalize_task_cancellation(state, envelope.operation_id(), now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "cancellation finalization failed: {error}");
+                    }
+                }
+                match owed_child_reports(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
                     Err(error) => {
                         // Owing cannot fail for records this binary wrote; a
                         // failure is a bug. The settlement itself is applied
@@ -5328,12 +7391,18 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                         // the owe is skipped loudly instead. The strict
                         // propagation on the cancellation paths catches
                         // systematic construction bugs in tests.
-                        debug_assert!(false, "epoch-result construction failed: {error}");
+                        debug_assert!(false, "child-report construction failed: {error}");
                     }
                 }
                 return transition;
             }
             AgentExchangeKind::EpochResult => return apply_epoch_result(state, envelope, now),
+            AgentExchangeKind::GoalEvaluation => {
+                return apply_goal_evaluation(state, envelope, now)
+            }
+            AgentExchangeKind::DelegationCancel => {
+                return apply_delegation_cancel(state, envelope, now)
+            }
             kind => refuse(
                 state,
                 "unsupported-exchange",
@@ -5341,6 +7410,63 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             ),
         };
         AgentExchangeTransition::new(result)
+    }
+
+    fn check_settle(
+        &self,
+        envelope: &AgentExchangeEnvelope,
+        result: &AgentExchangeResult,
+    ) -> Result<(), crate::choreography::AgentChoreographyError> {
+        match envelope.kind() {
+            AgentExchangeKind::DelegationResult if !result.is_accepted() => {
+                // A refused delegation result settles only under the parent's
+                // definitive answers: the delegation is unknown, forged, not
+                // owned, or the run never existed — undeliverable however
+                // often it is re-driven. Every other refusal is the
+                // receiver's inability — a `delegation-result-early` receipt
+                // race, an `unsupported-exchange` from an owner that predates
+                // the kind, a payload it could not decode — and the exchange
+                // stays outstanding for re-drive until an owner that can
+                // answer it does.
+                match result.status().rejection_code() {
+                    Some(
+                        "delegation-result-unknown-run"
+                        | "delegation-result-unknown-delegation"
+                        | "delegation-result-forged"
+                        | "delegation-result-not-owned",
+                    ) => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DelegationResult,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::RunCancel if !result.is_accepted() => {
+                // A refused run-cancel settles only under the run's definitive
+                // answers: the sender was not its task, the run never received
+                // the generation, or the generation is not the one it serves.
+                // Every other refusal — an `unsupported-exchange` from an
+                // owner that predates the kind, a payload it could not decode
+                // — leaves the exchange outstanding for re-drive until an
+                // owner that can answer it does (the rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some(
+                        "run-cancel-forged"
+                        | "run-cancel-unassigned"
+                        | "run-cancel-stale-generation",
+                    ) => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::RunCancel,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     fn settle(
@@ -5353,7 +7479,33 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         if envelope.kind() == AgentExchangeKind::Assignment {
             settle_assignment(state, envelope, result, now);
         }
-        Vec::new()
+        if !matches!(
+            envelope.kind(),
+            AgentExchangeKind::Assignment | AgentExchangeKind::RunCancel
+        ) {
+            return Vec::new();
+        }
+        // A settled assignment or run-cancel may have moved a requested
+        // cancellation forward: an acceptance owes the run-cancel the request
+        // deferred, a refusal released the generation's escrow, and a receipt
+        // may have found the run already settled — so the propagation and the
+        // finalization it permits are owed from this same compare-and-set.
+        // Settling may not fail; a construction failure is a bug surfaced
+        // loudly in tests and skipped here.
+        let mut owed = Vec::new();
+        match owed_run_cancel(state, now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "run-cancel construction failed: {error}");
+            }
+        }
+        match finalize_task_cancellation(state, envelope.operation_id(), now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "cancellation finalization failed: {error}");
+            }
+        }
+        owed
     }
 }
 
@@ -5388,8 +7540,9 @@ fn apply_creation_exchange(
 /// Settles the run's answer to an assignment.
 ///
 /// An acceptance moves the task to `InProgress`. A refusal retires the
-/// generation and leaves the task assignable, so the next decision creates a new
-/// run rather than reusing a run that refused.
+/// generation, releases its escrow — the run never accepted, so nothing was
+/// consumed — and leaves the task assignable, so the next decision creates a
+/// new run rather than reusing a run that refused.
 fn settle_assignment(
     state: &mut AgentTaskState,
     envelope: &AgentExchangeEnvelope,
@@ -5448,6 +7601,27 @@ fn settle_assignment(
         detail: bounded_detail(code.clone()),
         refused_at: now,
     });
+    // The refused generation's escrow debit is released in this same settle:
+    // the run never accepted, so it consumed nothing, and a child left
+    // outstanding would both shrink the headroom every later generation is
+    // decided against and hold the ledger gate closed over the terminal
+    // reports an exhausted child owes upward. Idempotent: a re-driven settle
+    // finds the assignment already retired and never reaches here.
+    if let Ok(child) = AgentEscrowChildId::for_run(&assignment.run) {
+        if task
+            .escrow
+            .settle_child(&child, &AgentBudgetConsumption::default())
+            .is_ok()
+        {
+            // Returning a child this transition just settled cannot fail for
+            // records this binary wrote; a failure is a construction bug.
+            let returned = task.escrow.return_child(&child);
+            debug_assert!(
+                returned.is_ok(),
+                "refused-generation escrow return failed: {returned:?}"
+            );
+        }
+    }
     state.updated_at = now;
     state.record_history(|sequence| {
         AgentTaskHistoryEntry::new(
@@ -5679,12 +7853,15 @@ where
                 outcome,
             } => {
                 self.transition(now, readiness, move |state| {
-                    record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
-                    // A failed dependency can terminate an epoch with no
-                    // outstanding escrow; it owes its terminal result to the
-                    // controller in this same transition, exactly as a
-                    // cancellation does.
-                    let owed = owed_epoch_result(state, now)?.into_iter().collect();
+                    // A failed dependency requests the dependent's
+                    // cancellation rather than terminalizing it: with no live
+                    // generation that finalizes here, owing the terminal
+                    // reports upward in this same transition; with an
+                    // accepted run it owes the run-cancel exchange and stays
+                    // nonterminal until its ledger closes.
+                    let mut owed =
+                        record_dependency_outcome(state, &operation_id, &dependency, outcome, now)?;
+                    owed.extend(owed_child_reports(state, now)?);
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -5694,7 +7871,13 @@ where
                 reason,
             } => {
                 self.transition(now, None, move |state| {
-                    terminate(
+                    // The request is absorbing and nonterminal: a task with no
+                    // live generation finalizes in this same transition —
+                    // owing its terminal reports upward — while a task whose
+                    // run has durably accepted owes the run-cancel exchange
+                    // instead and stays nonterminal until its ledger closes
+                    // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                    let owed = request_task_cancellation(
                         state,
                         &operation_id,
                         AgentTaskTerminalReason::CancellationRequested {
@@ -5702,10 +7885,6 @@ where
                         },
                         now,
                     )?;
-                    // A cancelled epoch with no outstanding escrow owes its
-                    // terminal result to the controller in this same
-                    // transition.
-                    let owed = owed_epoch_result(state, now)?.into_iter().collect();
                     Ok((operation_id, None, owed))
                 })
                 .await?
@@ -5814,6 +7993,77 @@ where
                         now,
                     )?;
                     Ok((operation_id, Some(outcome), Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::ActivateGoal {
+                operation_id,
+                expected_status_revision,
+                provenance,
+            } => {
+                // Activation may make the task assignable, so the readiness
+                // read rides along and the assignment commits with it.
+                self.transition(now, readiness, move |state| {
+                    let owed = activate_goal(
+                        state,
+                        &operation_id,
+                        expected_status_revision,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, None, owed))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::RecordGoalDecision {
+                operation_id,
+                decision,
+            } => {
+                self.transition(now, None, move |state| {
+                    record_goal_decision(state, &operation_id, *decision, now)?;
+                    Ok((operation_id, None, Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::ReviseGoalCriteria {
+                operation_id,
+                expected_criteria_revision,
+                source,
+                digest,
+                provenance,
+            } => {
+                self.transition(now, None, move |state| {
+                    revise_goal_criteria(
+                        state,
+                        &operation_id,
+                        expected_criteria_revision,
+                        source,
+                        digest,
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, None, Vec::new()))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::ResumeGoal {
+                operation_id,
+                expected_status_revision,
+                top_up,
+                provenance,
+            } => {
+                // Reactivation may make the task assignable again, so the
+                // readiness read rides along exactly as activation's does.
+                self.transition(now, readiness, move |state| {
+                    let owed = resume_goal(
+                        state,
+                        &operation_id,
+                        expected_status_revision,
+                        top_up.map(|allocation| *allocation),
+                        *provenance,
+                        now,
+                    )?;
+                    Ok((operation_id, None, owed))
                 })
                 .await?
             }
@@ -5954,7 +8204,9 @@ where
             | AgentTaskEntityCommand::SuspendContinuousGoal { .. }
             | AgentTaskEntityCommand::ResumeContinuousGoal { .. }
             | AgentTaskEntityCommand::RenewContinuousGoal { .. }
-            | AgentTaskEntityCommand::RetireContinuousGoal { .. } => return Ok(None),
+            | AgentTaskEntityCommand::RetireContinuousGoal { .. }
+            | AgentTaskEntityCommand::RecordGoalDecision { .. }
+            | AgentTaskEntityCommand::ReviseGoalCriteria { .. } => return Ok(None),
             _ => {
                 let Some(task) = self.state()?.task() else {
                     return Ok(None);
@@ -6019,10 +8271,14 @@ where
         // which re-drives it once the sink is back.
         self.require_history_headroom(now).await?;
         let admitted_before = self.wake_admitted_total();
+        let stagnation_before = self.wake_stagnation_totals();
         let lifecycle_before = self.goal_lifecycle_status();
+        let goal_before = self.goal_contract_status();
         let reply = self.host.accept(envelope, now).await?;
         self.record_admitted_epochs(admitted_before);
+        self.record_stagnation_trips(stagnation_before);
         self.record_lifecycle_transition(lifecycle_before);
+        self.record_goal_status_transition(goal_before);
         self.record_epoch_settlement(envelope, &reply);
         // Accepting a delivered exchange makes *local* progress only: it may
         // decide an assignment freed escrow now permits and flush the history it
@@ -6050,9 +8306,188 @@ where
     /// allowed to trigger; see [`Self::accept`] for why the drive half is not.
     async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
         self.require_history_headroom(now).await?;
+        self.observe_goal_deadline(now).await?;
+        self.settle_requested_cancellation(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
         self.park_owed_rewakes(now).await?;
+        Ok(())
+    }
+
+    /// Expires the goal contract when its own deadline has passed
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)): the
+    /// settle pass is the goal entry point that always commits, so a passed
+    /// deadline lands durably here even when no command arrives — a command's
+    /// own observation would be discarded with the command's refusal.
+    ///
+    /// The write is skipped entirely while nothing would flip, so a sweep over
+    /// a healthy goal burns no revision.
+    async fn observe_goal_deadline(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
+        let would_expire = self
+            .state()?
+            .task()
+            .and_then(|task| task.goal_state.as_deref())
+            .is_some_and(|goal| {
+                !goal.status().is_terminal()
+                    && goal
+                        .spec()
+                        .spec()
+                        .deadline
+                        .is_some_and(|deadline| now.as_millis() >= deadline.as_millis())
+            });
+        if !would_expire {
+            return Ok(());
+        }
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::Command,
+            [
+                self.scope.tenant().as_str(),
+                self.scope.task().as_str(),
+                "goal-deadline",
+            ],
+        )?;
+        let goal_before = self.goal_contract_status();
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                let observe = |state: &mut AgentTaskState| -> AgentTaskResult<()> {
+                    let task = state.task_mut()?;
+                    let Some(goal) = task.goal_state.as_deref_mut() else {
+                        return Ok(());
+                    };
+                    if goal.observe_deadline(now).is_none() {
+                        return Ok(());
+                    }
+                    if let Some(controller) = task.wake_controller.as_mut() {
+                        controller.retire_by_policy();
+                    }
+                    state.updated_at = now;
+                    record_wake_history(
+                        state,
+                        AgentTaskHistoryKind::GoalDecided,
+                        &operation_id,
+                        "expired deadline-expired".to_string(),
+                        now,
+                    );
+                    Ok(())
+                };
+                match observe(state) {
+                    Ok(()) => Ok(Vec::new()),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        self.record_goal_status_transition(goal_before);
+        Ok(())
+    }
+
+    /// Advances a requested cancellation from the settle pass
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+    /// settle pass is the goal entry point that always commits, so a terminal
+    /// goal decision in the cancel or expiry family lands on the root task
+    /// here even when no command arrives, the run-cancel a crash may have
+    /// raced is re-owed under its derived operation id, and a closed ledger
+    /// finalizes the marker. One chokepoint, so every goal-decision ingress —
+    /// the operator command, the evaluation door, the deadline observation
+    /// above — propagates identically without owning any of it.
+    ///
+    /// The write is skipped entirely while nothing would advance, so a sweep
+    /// over a healthy task burns no revision.
+    async fn settle_requested_cancellation(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) if task.status.is_terminal() => false,
+                Some(task) => match task.cancellation.as_deref() {
+                    None => task.goal_state.as_deref().is_some_and(|goal| {
+                        goal.terminal()
+                            .is_some_and(|decision| decision.reason.requests_root_cancellation())
+                    }),
+                    Some(_) => {
+                        let owes_run_cancel = task.assignment.as_ref().is_some_and(|assignment| {
+                            assignment.status == AgentAssignmentStatus::Accepted
+                                && run_cancel_operation_id(&state.scope, assignment.generation)
+                                    .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                        });
+                        owes_run_cancel || task.escrow.outstanding().count() == 0
+                    }
+                },
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::Command,
+            [
+                self.scope.tenant().as_str(),
+                self.scope.task().as_str(),
+                "goal-cancellation",
+            ],
+        )?;
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                let step =
+                    |state: &mut AgentTaskState| -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+                        let Some(task) = state.task.as_ref() else {
+                            return Ok(Vec::new());
+                        };
+                        if task.status.is_terminal() {
+                            return Ok(Vec::new());
+                        }
+                        if task.cancellation.is_none() {
+                            let Some(code) = task
+                                .goal_state
+                                .as_deref()
+                                .and_then(AgentGoalState::terminal)
+                                .filter(|decision| decision.reason.requests_root_cancellation())
+                                .map(|decision| decision.reason.code())
+                            else {
+                                return Ok(Vec::new());
+                            };
+                            return request_task_cancellation(
+                                state,
+                                &operation_id,
+                                AgentTaskTerminalReason::CancellationRequested {
+                                    reason: format!("goal-{code}"),
+                                },
+                                now,
+                            );
+                        }
+                        let mut owed: Vec<AgentExchangeEnvelope> =
+                            owed_run_cancel(state, now)?.into_iter().collect();
+                        owed.extend(finalize_task_cancellation(state, &operation_id, now)?);
+                        Ok(owed)
+                    };
+                match step(state) {
+                    Ok(owed) => Ok(owed),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
         Ok(())
     }
 
@@ -6094,6 +8529,8 @@ where
         // refused (after an attempt to drain it) rather than pushed past the
         // pending-history bound.
         self.require_history_headroom(now).await?;
+        self.observe_goal_deadline(now).await?;
+        self.settle_requested_cancellation(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
         let rewakes_parked = self.park_owed_rewakes(now).await?;
@@ -6233,13 +8670,22 @@ where
 
         let mut assigned = false;
         let mut rejection = None;
+        // A settle-pass refusal may consult the goal's exhaustion policy, so
+        // this commit path counts goal-status flips exactly as the command
+        // path does.
+        let goal_before = self.goal_contract_status();
         let committed = self
             .host
             .initiate(now, |state| {
                 match decide_assignment(state, &readiness, now) {
-                    Ok(envelope) => {
-                        assigned = envelope.is_some();
-                        Ok(envelope.into_iter().collect())
+                    Ok(envelopes) => {
+                        // The decision may instead have exhausted the task's
+                        // assignments and owed its terminal reports; only a
+                        // run-creation command counts as an assignment made.
+                        assigned = envelopes
+                            .iter()
+                            .any(|envelope| envelope.kind() == AgentExchangeKind::Assignment);
+                        Ok(envelopes)
                     }
                     Err(error) => {
                         let carried = AgentChoreographyError::from(error.clone());
@@ -6254,6 +8700,7 @@ where
             return Err(rejection);
         }
         committed?;
+        self.record_goal_status_transition(goal_before);
         Ok(assigned)
     }
 
@@ -6325,6 +8772,7 @@ where
         let mut rejection = None;
         let admitted_before = self.wake_admitted_total();
         let lifecycle_before = self.goal_lifecycle_status();
+        let goal_before = self.goal_contract_status();
         let committed = self
             .host
             .initiate(now, |state| {
@@ -6367,6 +8815,7 @@ where
         committed?;
         self.record_admitted_epochs(admitted_before);
         self.record_lifecycle_transition(lifecycle_before);
+        self.record_goal_status_transition(goal_before);
         Ok(AgentTaskEntityReply::Applied {
             outcome: outcome.expect("an accepted transition produces an outcome"),
         })
@@ -6389,6 +8838,51 @@ where
         }
     }
 
+    /// The controller's durable stagnation-trip totals: repeated-result, then
+    /// no-progress.
+    fn wake_stagnation_totals(&self) -> (u64, u64) {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .and_then(|task| task.wake_controller.as_ref())
+            .map_or((0, 0), |controller| {
+                let counters = controller.counters();
+                (
+                    counters.stagnation_repeated,
+                    counters.stagnation_no_progress,
+                )
+            })
+    }
+
+    /// Emits stagnation-trip counts as the difference of the controller's
+    /// durable counters across the committed transition, so a replayed
+    /// settlement emits nothing — and a `Continue` trip, which flips no
+    /// status, still counts.
+    fn record_stagnation_trips(&self, before: (u64, u64)) {
+        let (repeated_before, no_progress_before) = before;
+        let (repeated, no_progress) = self.wake_stagnation_totals();
+        for (count, trigger) in [
+            (
+                repeated.saturating_sub(repeated_before),
+                AgentStagnationTrigger::RepeatedResult,
+            ),
+            (
+                no_progress.saturating_sub(no_progress_before),
+                AgentStagnationTrigger::NoProgress,
+            ),
+        ] {
+            if count > 0 {
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_GOAL_STAGNATION,
+                    count,
+                    &[("trigger", trigger.code())],
+                )
+                .ok();
+            }
+        }
+    }
+
     /// Emits one lifecycle-transition count when the just-committed
     /// transition changed the goal's lifecycle status — a command or an
     /// observed flip (expiry, retirement by policy, escalation) alike. The
@@ -6396,6 +8890,37 @@ where
     /// the transition emits nothing, because creation is not a transition
     /// out of any prior status. Renewal leaves the status unchanged and is
     /// counted from its command instead.
+    /// The goal contract's status, read from the durable state.
+    ///
+    /// Goal-status metrics are a difference of this status across a committed
+    /// transition, exactly as the admission gate's are: the one source that
+    /// sees a projected or policy-driven move — a budget park, a terminal
+    /// projection, an observed expiry — alongside the commanded ones.
+    fn goal_contract_status(&self) -> Option<AgentGoalStatus> {
+        self.state()
+            .ok()
+            .and_then(|state| state.task())
+            .and_then(|task| task.goal_state.as_deref())
+            .map(AgentGoalState::status)
+    }
+
+    fn record_goal_status_transition(&self, before: Option<AgentGoalStatus>) {
+        let after = self.goal_contract_status();
+        if before == after {
+            return;
+        }
+        let Some(after) = after else {
+            return;
+        };
+        record_agent_domain_counter(
+            self.metrics.as_ref(),
+            METRIC_AGENT_GOAL_STATUS,
+            1,
+            &[("transition", after.as_label())],
+        )
+        .ok();
+    }
+
     fn record_lifecycle_transition(&self, before: Option<AgentGoalLifecycleStatus>) {
         let (Some(before), Some(after)) = (before, self.goal_lifecycle_status()) else {
             return;
@@ -6569,6 +9094,68 @@ pub enum AgentTaskEntityCommand {
         /// Who commanded the transition.
         provenance: Box<AgentRevisionProvenance>,
     },
+    /// Activate a `Proposed` goal contract
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)). Fenced
+    /// on the goal's monotonic status revision.
+    ActivateGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The status revision this command expects to advance.
+        expected_status_revision: AgentRevisionNumber,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
+    /// Record a terminal goal decision — the entry point slice 4.2's
+    /// evaluator, an administrative cancellation, and policy terminations
+    /// drive. A criteria decision must carry the evaluation it rests on; the
+    /// decision's own `expected_status_revision` fences it.
+    RecordGoalDecision {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The decision to record.
+        decision: Box<AgentGoalDecision>,
+    },
+    /// Reactivate a `Waiting` goal, optionally widening its ledger under the
+    /// definition ceilings — the un-park door of the goal-scope
+    /// budget-exhaustion policy
+    /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This door lifts only the admission park the goal's own policy made.
+    /// When the gate is also suspended under a reason this command does not
+    /// own — an operator's suspension, or the first reason of a mixed-reason
+    /// park — the goal reactivates and immediately re-parks as
+    /// `AdmissionSuspended`, and the reply honestly reads `Waiting`: resume
+    /// converges in two commands, this one and the gate's own
+    /// [`Self::ResumeContinuousGoal`].
+    ResumeGoal {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The status revision this command expects to advance.
+        expected_status_revision: AgentRevisionNumber,
+        /// The allocation increase the owner grants, when one does.
+        top_up: Option<Box<AgentBudgetAllocation>>,
+        /// Who commanded the transition.
+        provenance: Box<AgentRevisionProvenance>,
+    },
+    /// Revise the goal's success criteria
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// advances the criteria revision — and with it the spec revision — so
+    /// evaluations against the old revision are refused stale at the decision
+    /// door. Fenced on the criteria revision, not the status revision: the
+    /// status does not move, and a concurrent park or resume must not refuse
+    /// a criteria revision.
+    ReviseGoalCriteria {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The criteria revision this command expects to advance.
+        expected_criteria_revision: AgentRevisionNumber,
+        /// Where the revised criteria live.
+        source: AgentGoalCriteriaSource,
+        /// Content digest of the revised criteria, when fingerprinted.
+        digest: Option<AgentContentDigest>,
+        /// Who commanded the revision.
+        provenance: Box<AgentRevisionProvenance>,
+    },
     /// Read the task's bounded durable projection.
     Describe,
 }
@@ -6588,7 +9175,11 @@ impl AgentTaskEntityCommand {
             | Self::SuspendContinuousGoal { operation_id, .. }
             | Self::ResumeContinuousGoal { operation_id, .. }
             | Self::RenewContinuousGoal { operation_id, .. }
-            | Self::RetireContinuousGoal { operation_id, .. } => Some(operation_id),
+            | Self::RetireContinuousGoal { operation_id, .. }
+            | Self::ActivateGoal { operation_id, .. }
+            | Self::RecordGoalDecision { operation_id, .. }
+            | Self::ResumeGoal { operation_id, .. }
+            | Self::ReviseGoalCriteria { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
     }
@@ -7153,6 +9744,12 @@ pub enum AgentTaskError {
     },
     /// An agent-owned task was created without an assignee.
     MissingAssignee,
+    /// A creation carried delegation provenance that violates its structural
+    /// bounds.
+    DelegationProvenanceInvalid {
+        /// The validation failure detail.
+        message: String,
+    },
     /// A continuous-mode task was created without a goal binding.
     ContinuousWithoutGoal,
     /// An epoch task was created without the parent controller that admitted
@@ -7161,6 +9758,27 @@ pub enum AgentTaskError {
     /// An admission on a continuous goal that never declared its epoch
     /// contract.
     EpochUndefined,
+    /// The goal contract itself refused the transition.
+    Goal(AgentGoalError),
+    /// A goal command was delivered to a task that does not coordinate a goal.
+    GoalNotCoordinated,
+    /// A goal resume that widened nothing in the exhausted dimension.
+    GoalResumeUnrelieved {
+        /// The exhaustion still in force.
+        exhaustion: AgentBudgetExhaustion,
+    },
+    /// A resume arrived at the door that does not own the wait on record: the
+    /// gate's resume for a budget or stagnation park, or the goal's resume
+    /// for an admission suspension.
+    GoalWaitOwnedElsewhere {
+        /// The wait reason's code.
+        code: &'static str,
+    },
+    /// A criteria decision was commanded while the spec configures an
+    /// evaluator: only the goal-evaluation exchange — whose sender fence and
+    /// digest-bearing record are the attestation — may make one
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    GoalDecisionUnattested,
     /// The wake contract itself refused the command.
     Wake(AgentWakeError),
     /// The durable wake-timer store refused a re-wake parking.
@@ -7306,9 +9924,15 @@ impl AgentTaskError {
             Self::AlreadyCreated { .. } => "task-already-created",
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
+            Self::DelegationProvenanceInvalid { .. } => "task-delegation-provenance-invalid",
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::EpochWithoutParent => "task-epoch-without-parent",
             Self::EpochUndefined => "task-epoch-undefined",
+            Self::Goal(error) => error.code(),
+            Self::GoalNotCoordinated => "task-goal-not-coordinated",
+            Self::GoalResumeUnrelieved { .. } => "task-goal-resume-unrelieved",
+            Self::GoalWaitOwnedElsewhere { .. } => "task-goal-wait-owned-elsewhere",
+            Self::GoalDecisionUnattested => "task-goal-decision-unattested",
             Self::Wake(error) => error.code(),
             Self::WakeTimer(error) => error.code(),
             Self::WakeNotContinuous => "task-wake-not-continuous",
@@ -7357,6 +9981,9 @@ impl Display for AgentTaskError {
             Self::MissingAssignee => {
                 write!(f, "an agent-owned task must name the agent it is created for")
             }
+            Self::DelegationProvenanceInvalid { message } => {
+                write!(f, "the creation's delegation provenance is invalid: {message}")
+            }
             Self::ContinuousWithoutGoal => {
                 write!(f, "a continuous-mode task must bind the goal its controller drives")
             }
@@ -7367,6 +9994,24 @@ impl Display for AgentTaskError {
             Self::EpochUndefined => write!(
                 f,
                 "the continuous goal declares no epoch contract, so no epoch can be admitted"
+            ),
+            Self::Goal(error) => Display::fmt(error, f),
+            Self::GoalNotCoordinated => write!(
+                f,
+                "a goal command addresses a task that does not coordinate a goal"
+            ),
+            Self::GoalResumeUnrelieved { exhaustion } => write!(
+                f,
+                "the resume leaves the goal exhausted: {exhaustion}"
+            ),
+            Self::GoalWaitOwnedElsewhere { code } => write!(
+                f,
+                "the wait on record ({code}) is owned by the other resume door"
+            ),
+            Self::GoalDecisionUnattested => write!(
+                f,
+                "the spec configures an evaluator, so a criteria decision may only arrive \
+                 through the goal-evaluation exchange"
             ),
             Self::Wake(error) => Display::fmt(error, f),
             Self::WakeTimer(error) => Display::fmt(error, f),
@@ -7473,6 +10118,12 @@ impl Error for AgentTaskError {
 impl From<AgentWakeError> for AgentTaskError {
     fn from(error: AgentWakeError) -> Self {
         Self::Wake(error)
+    }
+}
+
+impl From<AgentGoalError> for AgentTaskError {
+    fn from(error: AgentGoalError) -> Self {
+        Self::Goal(error)
     }
 }
 
@@ -7612,10 +10263,12 @@ mod epoch_result_tests {
             assignee: None,
             goal: Some(AgentGoalId::new("nightly").expect("the goal id is valid")),
             goal_mode: continuous_mode(),
+            goal_spec: None,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         };
         create_task(&mut state, &create_op, creation, ts(1)).expect("the control task creates");

@@ -25,13 +25,30 @@
 //! ([`AgentExecutionPolicyRouter`]) that lets an application place a tool
 //! executor in the isolation its trust class requires. Rakka persists and
 //! routes the reference; the application owns the worker pool, RBAC, network
-//! policy, credential issuer, and sandbox behind it. The
-//! `AgentEnvironmentRef` contract and concurrency rules for tool adapters
-//! sharing an environment arrive with slice 4.6.
+//! policy, credential issuer, and sandbox behind it.
 //!
-//! Specification: sections 11.7 and 11.8, with the enforcement clauses of 16
-//! and the envelope rules of 7.3. Filled by slice 1.8; the shared-environment
-//! rules by slice 4.6.
+//! # The shared-environment contract
+//!
+//! A tool that observes or mutates a shared environment declares the
+//! [`crate::identity::AgentEnvironmentRef`] set it touches on its
+//! [`crate::definition::AgentToolDeclaration`], and — when its safety class
+//! mutates — the class of external concurrency control its adapter applies
+//! ([`AgentEnvironmentConcurrencyProtocol`], validated at
+//! [`AgentToolRegistry::register`]). "Observe" versus "modify" is the safety
+//! class itself: `ReadOnly` observes; every other class mutates, and there is
+//! deliberately no second mode axis for the two to disagree on. The authority
+//! enforces the references per attempt — binding ⊆ declaration ⊆ definition
+//! envelope, narrowed by the setup and by the run's goal-scope envelope —
+//! while the *protocol* stays the adapter's obligation
+//! ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)): Rakka's
+//! per-run single writer never serializes different agents mutating the same
+//! external resource, so the adapter must apply the declared lease,
+//! compare-and-swap, reservation, transaction, idempotency-key, or
+//! reconciliation protocol of the external system, handing over the intent's
+//! derived external idempotency key unchanged where one exists.
+//!
+//! Specification: sections 11.7 and 11.8, with the enforcement clauses of 16,
+//! the envelope rules of 7.3, and the shared-environment rules of 8.5.
 //!
 //! # Where enforcement runs
 //!
@@ -50,7 +67,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::Arc;
 
 use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::{AgentEntityState, AgentLifecycleStatus};
@@ -309,6 +326,59 @@ impl AgentToolDescriptor {
     }
 }
 
+/// The class of external concurrency control a tool adapter applies when its
+/// tool mutates a shared environment
+/// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Rakka's per-run single writer does not serialize different agents mutating
+/// the same external resource, so the *external system's* protocol is the
+/// only coordination there is — and this declaration is the deployment's
+/// durable statement of which class the adapter uses. Deliberately no
+/// "unprotected" variant exists: a mutating environment tool that declares no
+/// protocol is refused at registration, never silently admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentEnvironmentConcurrencyProtocol {
+    /// The adapter hands the external system the intent's derived idempotency
+    /// key, and the system deduplicates on it.
+    ExternalIdempotencyKey,
+    /// The adapter acquires an application-provided lease before mutating.
+    Lease,
+    /// The adapter mutates through a compare-and-swap on the resource's
+    /// version or state.
+    CompareAndSwap,
+    /// The adapter reserves the resource before mutating it.
+    Reservation,
+    /// The adapter mutates inside the external system's transaction.
+    Transaction,
+    /// The adapter relies on the reconciliation protocol the binding names —
+    /// legal only for a `Reconcileable` declaration, whose protocol reference
+    /// is then the system of record for what happened.
+    Reconciliation,
+}
+
+impl AgentEnvironmentConcurrencyProtocol {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::ExternalIdempotencyKey => "external-idempotency-key",
+            Self::Lease => "lease",
+            Self::CompareAndSwap => "compare-and-swap",
+            Self::Reservation => "reservation",
+            Self::Transaction => "transaction",
+            Self::Reconciliation => "reconciliation",
+        }
+    }
+}
+
+impl Display for AgentEnvironmentConcurrencyProtocol {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
 /// The deployment-authorized authority of one registered tool
 /// ([specification 11.8](../../../docs/plans/rakka-agent/spec.md):
 /// `ToolBinding`).
@@ -326,6 +396,7 @@ pub struct AgentToolBinding {
     declaration: AgentToolDeclaration,
     max_attempts: u32,
     reconciliation_protocol: Option<AgentReconciliationProtocolRef>,
+    environment_concurrency: Option<AgentEnvironmentConcurrencyProtocol>,
     timeout_ms: Option<u64>,
     guardrails: BTreeSet<AgentGuardrailStageId>,
     checkpoint_required: bool,
@@ -342,6 +413,7 @@ impl AgentToolBinding {
             declaration: AgentToolDeclaration::new(AgentEffectSafetyClass::NonIdempotent),
             max_attempts: 1,
             reconciliation_protocol: None,
+            environment_concurrency: None,
             timeout_ms: None,
             guardrails: BTreeSet::new(),
             checkpoint_required: false,
@@ -367,6 +439,7 @@ impl AgentToolBinding {
             declaration,
             max_attempts,
             reconciliation_protocol: None,
+            environment_concurrency: None,
             timeout_ms: None,
             guardrails: BTreeSet::new(),
             checkpoint_required: false,
@@ -383,6 +456,26 @@ impl AgentToolBinding {
     ) -> Self {
         self.reconciliation_protocol = Some(protocol);
         self
+    }
+
+    /// Declares the class of external concurrency control the adapter applies
+    /// against the tool's declared environments
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md));
+    /// required exactly when the declaration names an environment and its
+    /// safety class mutates.
+    #[must_use]
+    pub const fn with_environment_concurrency(
+        mut self,
+        protocol: AgentEnvironmentConcurrencyProtocol,
+    ) -> Self {
+        self.environment_concurrency = Some(protocol);
+        self
+    }
+
+    /// The declared environment-concurrency class, when one is declared.
+    #[must_use]
+    pub const fn environment_concurrency(&self) -> Option<AgentEnvironmentConcurrencyProtocol> {
+        self.environment_concurrency
     }
 
     /// Sets the per-attempt timeout.
@@ -504,6 +597,40 @@ impl AgentToolRegistry {
         binding.descriptor.validate()?;
         binding.effect_spec()?;
         let tool = binding.descriptor.tool.clone();
+        // The environment contract ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+        // a mutating environment tool must state the external coordination
+        // class its adapter uses — there is no fail-open default — while a
+        // protocol on a tool that touches no environment is a wiring mistake
+        // named at registration, not silently carried. An `Environment`-kind
+        // descriptor with no declared ref would escape all environment
+        // gating, so it is refused too; the converse — a `Function` tool
+        // naming an environment — stays legal, because the kind is category
+        // and the ref set is the contract.
+        let mutating_environment = !binding.declaration.environments.is_empty()
+            && binding.declaration.safety != AgentEffectSafetyClass::ReadOnly;
+        if mutating_environment && binding.environment_concurrency.is_none() {
+            return Err(AgentToolError::EnvironmentConcurrencyMissing { tool });
+        }
+        if binding.environment_concurrency.is_some() && binding.declaration.environments.is_empty()
+        {
+            return Err(AgentToolError::EnvironmentConcurrencyUnexpected { tool });
+        }
+        if binding.environment_concurrency
+            == Some(AgentEnvironmentConcurrencyProtocol::Reconciliation)
+            && binding.declaration.safety != AgentEffectSafetyClass::Reconcileable
+        {
+            return Err(AgentToolError::Policy {
+                message: format!(
+                    "the tool {tool} declares reconciliation as its environment concurrency, \
+                     which requires the reconcileable safety class"
+                ),
+            });
+        }
+        if binding.descriptor.kind == AgentToolKind::Environment
+            && binding.declaration.environments.is_empty()
+        {
+            return Err(AgentToolError::EnvironmentRefMissing { tool });
+        }
         // The duplicate check precedes the capacity check so a re-registration
         // at the cap names its real conflict, not a full registry.
         if self.tools.contains_key(&tool) {
@@ -610,6 +737,14 @@ pub struct AgentAuthorityContext<'a> {
     /// `CheckpointRequired` disposition; without a valid grant, either gate
     /// fails closed ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
     pub checkpoint_grant: Option<&'a AgentCheckpointGrant>,
+    /// The run's goal-scope delegation envelope, when the run serves one
+    /// ([specification 8.1](../../../docs/plans/rakka-agent/spec.md): the
+    /// goal says which environment scopes an agent may reach). Its
+    /// environment narrowing binds every attempt — the immediate-safety
+    /// posture — and its knowledge-space grant is the claim-append door's
+    /// authority. Absent for a run with no envelope, which means no
+    /// goal-scope narrowing.
+    pub delegation: Option<&'a crate::delegation::AgentRunDelegationEnvelope>,
 }
 
 impl<'a> AgentAuthorityContext<'a> {
@@ -622,7 +757,19 @@ impl<'a> AgentAuthorityContext<'a> {
             settings: state.settings(),
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         }
+    }
+
+    /// Attaches the run's goal-scope delegation envelope, whose environment
+    /// and knowledge-space narrowing bind every attempt.
+    #[must_use]
+    pub const fn with_delegation_envelope(
+        mut self,
+        envelope: &'a crate::delegation::AgentRunDelegationEnvelope,
+    ) -> Self {
+        self.delegation = Some(envelope);
+        self
     }
 
     /// Attaches the run's setup revision.
@@ -782,6 +929,11 @@ pub struct AgentGrantedDispatch {
     /// Report-only guardrail findings. The dispatch pipeline surfaces these
     /// through its tracing span, which is what makes "recorded" true.
     pub reports: Vec<AgentGuardrailReport>,
+    /// The validated checkpoint grant the attempt dispatches under, when one
+    /// binds the intent. In-memory only — never persisted — it is how the
+    /// human-review evaluation arm reads the resolver whose durable decision
+    /// is the evidence.
+    pub checkpoint: Option<Box<crate::checkpoints::AgentCheckpointGrant>>,
 }
 
 /// A dispatch the authority refused, with a stable reason code.
@@ -991,6 +1143,21 @@ impl AgentToolAuthority {
             AgentRunEffectRequest::MemoryPromotion { .. } => {
                 self.authorize_memory_promotion(context, scope, task, goal, intent, now)
             }
+            AgentRunEffectRequest::Evaluation { evaluation } => self.authorize_goal_evaluation(
+                context, scope, task, goal, intent, evaluation, attempt, now,
+            ),
+            AgentRunEffectRequest::A2aSend { .. } => {
+                self.authorize_a2a_send(context, scope, task, goal, intent, now)
+            }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                self.authorize_workflow_start(context, scope, task, goal, intent, invocation, now)
+            }
+            AgentRunEffectRequest::WorkflowCancel { invocation, .. } => {
+                self.authorize_workflow_cancel(context, scope, task, goal, intent, invocation, now)
+            }
+            AgentRunEffectRequest::ClaimAppend { append, .. } => {
+                self.authorize_claim_append(context, scope, task, goal, intent, append, now)
+            }
         }
     }
 
@@ -1052,6 +1219,39 @@ impl AgentToolAuthority {
                 ),
             ));
         };
+        // A coordination tool is never a generic tool: its calls exist only
+        // as the loop's delegation interception, which converts them into
+        // durable records and outbound A2A effects before dispatch. A generic
+        // `Tool` intent naming one means the run was not wired for the
+        // coordination the registry declares — defense in depth behind the
+        // structural guarantee that model output cannot construct a peer
+        // send ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+        if binding.descriptor().kind == AgentToolKind::AgentCoordination {
+            return Err(AgentAuthorityRefusal::of(
+                "coordination-tool-not-intercepted",
+                format!(
+                    "the coordination tool {} reached generic dispatch; wire the run entity's \
+                     delegation configuration so the loop intercepts it",
+                    call.tool
+                ),
+            ));
+        }
+        // The same discipline for a workflow tool: its calls exist only as
+        // the loop's workflow interception, which converts them into durable
+        // invocation records and start effects before dispatch
+        // ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). A
+        // kind-`Workflow` registration is model-visible toolset projection,
+        // never a generic dispatch path.
+        if binding.descriptor().kind == AgentToolKind::Workflow {
+            return Err(AgentAuthorityRefusal::of(
+                "workflow-tool-requires-interception",
+                format!(
+                    "the workflow tool {} reached generic dispatch; wire the run entity's \
+                     workflow-tool configuration so the loop intercepts it",
+                    call.tool
+                ),
+            ));
+        }
 
         // The definition must declare the tool, and the run's setup — a
         // narrowing — must not have excluded it. Checking both fails closed
@@ -1131,6 +1331,61 @@ impl AgentToolAuthority {
                     call.tool
                 ),
             ));
+        }
+
+        // The environment contract ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)),
+        // first failing layer named: the binding may not touch an environment
+        // the definition's declaration never named for this tool, every
+        // declared reference must sit inside the definition envelope, a
+        // setup must not have narrowed it away, and the goal-scope envelope
+        // — when it narrows at all — binds last, per attempt.
+        if let Some(environment) = binding
+            .declaration
+            .environments
+            .difference(&declared.environments)
+            .next()
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::Environment.as_label(),
+                format!(
+                    "the deployment binds {} to the environment {environment}, which the \
+                     definition never declared for it",
+                    call.tool
+                ),
+            ));
+        }
+        for environment in &declared.environments {
+            if !context
+                .definition
+                .envelope()
+                .environments
+                .contains(environment)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::Environment.as_label(),
+                    format!(
+                        "the environment {environment} is not granted by the definition envelope"
+                    ),
+                ));
+            }
+            if let Some(setup) = context.setup {
+                if !setup.envelope().environments.contains(environment) {
+                    return Err(AgentAuthorityRefusal::of(
+                        "setup-excludes-environment",
+                        format!("the run's setup does not select the environment {environment}"),
+                    ));
+                }
+            }
+            if let Some(delegation) = context.delegation {
+                if !delegation.environments.is_empty()
+                    && !delegation.environments.contains(environment)
+                {
+                    return Err(AgentAuthorityRefusal::of(
+                        "goal-environment-not-allowed",
+                        format!("the goal's environment narrowing does not allow {environment}"),
+                    ));
+                }
+            }
         }
 
         // Layer 3, the intent: model output — or anything else — cannot have
@@ -1339,6 +1594,7 @@ impl AgentToolAuthority {
             sampling: None,
             transforms,
             reports,
+            checkpoint: None,
         })
     }
 
@@ -1371,7 +1627,12 @@ impl AgentToolAuthority {
                 AgentRunEffectRequest::Model { profile, .. } => profile.clone(),
                 AgentRunEffectRequest::Tool { .. }
                 | AgentRunEffectRequest::Compensation { .. }
-                | AgentRunEffectRequest::MemoryPromotion { .. } => None,
+                | AgentRunEffectRequest::MemoryPromotion { .. }
+                | AgentRunEffectRequest::Evaluation { .. }
+                | AgentRunEffectRequest::A2aSend { .. }
+                | AgentRunEffectRequest::WorkflowStart { .. }
+                | AgentRunEffectRequest::WorkflowCancel { .. }
+                | AgentRunEffectRequest::ClaimAppend { .. } => None,
             });
 
         if let Some(profile) = &profile {
@@ -1459,6 +1720,7 @@ impl AgentToolAuthority {
             sampling: Some(settings.sampling),
             transforms: Vec::new(),
             reports,
+            checkpoint: None,
         })
     }
 
@@ -1499,6 +1761,7 @@ impl AgentToolAuthority {
             sampling: None,
             transforms: Vec::new(),
             reports: Vec::new(),
+            checkpoint: None,
         })
     }
 
@@ -1541,6 +1804,365 @@ impl AgentToolAuthority {
             sampling: None,
             transforms: Vec::new(),
             reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one outbound A2A send attempt
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the delegation record is
+    /// its authorization, as with a compensation or promotion: the loop's
+    /// interception already parsed the closed vocabulary, applied the goal's
+    /// skill narrowing, and recorded the catalog's resolution, all inside the
+    /// committing compare-and-set. What remains at dispatch time is the
+    /// immediate-safety layer every attempt passes — lifecycle, guardrail
+    /// policy, credential class, execution policy — under the revisions the
+    /// intent pinned.
+    fn authorize_a2a_send(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one workflow-start attempt
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the invocation record is
+    /// its authorization, as with an A2A send: the loop's interception
+    /// already resolved the descriptor and applied the goal's workflow
+    /// narrowing inside the committing compare-and-set. What remains at
+    /// dispatch time is the immediate-safety layer every attempt passes —
+    /// lifecycle, guardrail policy, credential class, execution policy — plus
+    /// the envelope door re-checked here per attempt, so dropping the
+    /// workflow tool from the definition or setup revokes the very next
+    /// attempt ([specification 7.3](../../../docs/plans/rakka-agent/spec.md)).
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_workflow_start(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        invocation: &crate::workflow_tool::AgentWorkflowInvocationRecord,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .workflow_tools
+            .contains(&invocation.workflow_tool)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::WorkflowTool.as_label(),
+                format!(
+                    "the workflow tool {} is not declared by the definition",
+                    invocation.workflow_tool
+                ),
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup
+                .envelope()
+                .workflow_tools
+                .contains(&invocation.workflow_tool)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::WorkflowTool.as_label(),
+                    format!(
+                        "the run's setup does not select the workflow tool {}",
+                        invocation.workflow_tool
+                    ),
+                ));
+            }
+        }
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            // The grant carries the capability surface the descriptor
+            // declared, copied onto the record at commit — the regular tool
+            // binding's discipline. The definition envelope declares workflow
+            // tools by id only, so the per-tool capability subset check
+            // awaits an envelope-side declaration (recorded follow-up work).
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                invocation.required_capabilities.clone(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one workflow-cancel attempt
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The wind-down that committed the effect is its authorization, the
+    /// compensation posture rather than the start's: a cancel exercises no
+    /// new capability against the world — it asks earlier-authorized work to
+    /// stop — so the envelope door is deliberately absent, and dropping the
+    /// workflow tool from the definition or setup mid-flight cannot strand a
+    /// winding-down parent on a request it may no longer send. The
+    /// immediate-safety layer every attempt passes — lifecycle, guardrail
+    /// policy, credential class, execution policy — still applies.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_workflow_cancel(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        invocation: &crate::workflow_tool::AgentWorkflowInvocationRecord,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                invocation.required_capabilities.clone(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one claim-append attempt
+    /// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the append is its
+    /// authorization, as with a promotion; what is re-checked here, per
+    /// attempt, is the space against current durable authority — the
+    /// definition envelope, the setup narrowing, and the run's delegated
+    /// grant — so dropping a space from any layer revokes the very next
+    /// attempt, the immediate-safety posture.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_claim_append(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        append: &crate::effect::AgentClaimAppendRequest,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        if !context
+            .definition
+            .envelope()
+            .knowledge_spaces
+            .contains(&append.space)
+        {
+            return Err(AgentAuthorityRefusal::of(
+                AgentEnvelopeDimension::KnowledgeSpace.as_label(),
+                format!(
+                    "the knowledge space {} is not granted by the definition envelope",
+                    append.space
+                ),
+            ));
+        }
+        if let Some(setup) = context.setup {
+            if !setup.envelope().knowledge_spaces.contains(&append.space) {
+                return Err(AgentAuthorityRefusal::of(
+                    "setup-excludes-knowledge-space",
+                    format!(
+                        "the run's setup does not select the knowledge space {}",
+                        append.space
+                    ),
+                ));
+            }
+        }
+        if let Some(delegation) = context.delegation {
+            let granted = match delegation.knowledge_spaces.as_ref() {
+                Some(granted) => granted.contains(&append.space),
+                None => delegation.lineage.is_empty(),
+            };
+            if !granted {
+                return Err(AgentAuthorityRefusal::of(
+                    "claim-space-not-delegated",
+                    format!(
+                        "the communal space {} is not delegated to this run",
+                        append.space
+                    ),
+                ));
+            }
+        }
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: None,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint: None,
+        })
+    }
+
+    /// Authorizes one goal-evaluation attempt
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The deduplicated run command that committed the evaluation is its
+    /// authorization, as with a compensation or promotion. What is distinct
+    /// here is the model profile: an evaluator model runs under the profile
+    /// the *request* pins — the "distinct policy" of specification 8.3 —
+    /// validated against the definition and setup envelopes, and the agent's
+    /// current settings profile never enters the resolution, so a worker's
+    /// turn-bound profile cannot silently stand in for the evaluator's. A
+    /// human review dispatches only under the effect-bound approval grant,
+    /// which the granted dispatch carries so the executor arm can record the
+    /// resolver.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_goal_evaluation(
+        &self,
+        context: &AgentAuthorityContext<'_>,
+        scope: &AgentRunScope,
+        task: Option<&AgentTaskId>,
+        goal: Option<&AgentGoalId>,
+        intent: &AgentRunEffect,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        attempt: u32,
+        now: AgentTimestampMillis,
+    ) -> Result<AgentGrantedDispatch, AgentAuthorityRefusal> {
+        let profile = match &evaluation.method {
+            crate::evaluation::AgentGoalEvaluationMethod::EvaluatorModel { profile } => {
+                profile.clone()
+            }
+            _ => None,
+        };
+        if let Some(profile) = &profile {
+            if !context
+                .definition
+                .envelope()
+                .model_profiles
+                .contains(profile)
+            {
+                return Err(AgentAuthorityRefusal::of(
+                    AgentEnvelopeDimension::ModelProfile.as_label(),
+                    format!(
+                        "the evaluator model profile {profile} is not approved by the definition"
+                    ),
+                ));
+            }
+            if let Some(setup) = context.setup {
+                if !setup.envelope().model_profiles.contains(profile) {
+                    return Err(AgentAuthorityRefusal::of(
+                        AgentEnvelopeDimension::ModelProfile.as_label(),
+                        format!(
+                            "the run's setup does not select the evaluator model profile {profile}"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(credential) = &intent.credential_binding {
+            self.check_credential(context, credential)?;
+        }
+        self.check_execution_policy(intent.execution_policy.as_ref())?;
+
+        // The effect-bound checkpoint gate: a human review — or an evaluation
+        // the deployment gates — dispatches only under a digest-bound grant
+        // that binds this exact intent
+        // ([specification 12.3](../../../docs/plans/rakka-agent/spec.md)).
+        let (checkpoint_satisfied, checkpoint_grant_refusal) =
+            self.evaluate_checkpoint_grant(context, scope, intent, attempt, now);
+        if intent.checkpoint_required && !checkpoint_satisfied {
+            return Err(checkpoint_grant_refusal.unwrap_or_else(|| {
+                AgentAuthorityRefusal::of(
+                    "checkpoint-required",
+                    "the goal evaluation requires an effect-bound checkpoint grant, and none \
+                     exists",
+                )
+            }));
+        }
+        let checkpoint = if checkpoint_satisfied {
+            context.checkpoint_grant.cloned().map(Box::new)
+        } else {
+            None
+        };
+
+        Ok(AgentGrantedDispatch {
+            grant: self.grant(
+                context,
+                scope,
+                task,
+                goal,
+                intent,
+                None,
+                BTreeSet::new(),
+                now,
+            ),
+            tool_call: None,
+            model_profile: profile,
+            sampling: None,
+            transforms: Vec::new(),
+            reports: Vec::new(),
+            checkpoint,
         })
     }
 
@@ -1806,6 +2428,24 @@ pub enum AgentToolError {
         /// What made it unenforceable.
         message: String,
     },
+    /// A mutating environment tool declared no external concurrency class
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    EnvironmentConcurrencyMissing {
+        /// The tool whose binding was refused.
+        tool: AgentToolId,
+    },
+    /// An environment-concurrency class was declared for a tool that touches
+    /// no environment.
+    EnvironmentConcurrencyUnexpected {
+        /// The tool whose binding was refused.
+        tool: AgentToolId,
+    },
+    /// An `Environment`-kind descriptor declared no environment reference,
+    /// which would escape all environment gating.
+    EnvironmentRefMissing {
+        /// The tool whose binding was refused.
+        tool: AgentToolId,
+    },
 }
 
 impl AgentToolError {
@@ -1819,6 +2459,9 @@ impl AgentToolError {
             Self::RegistryFull { .. } => "tool-registry-full",
             Self::DuplicateTool { .. } => "tool-already-registered",
             Self::Policy { .. } => "tool-policy-invalid",
+            Self::EnvironmentConcurrencyMissing { .. } => "environment-concurrency-missing",
+            Self::EnvironmentConcurrencyUnexpected { .. } => "environment-concurrency-unexpected",
+            Self::EnvironmentRefMissing { .. } => "environment-ref-missing",
         }
     }
 }
@@ -1859,6 +2502,20 @@ impl Display for AgentToolError {
             Self::Policy { message } => {
                 write!(f, "the tool binding's policy cannot be honored: {message}")
             }
+            Self::EnvironmentConcurrencyMissing { tool } => write!(
+                f,
+                "the tool {tool} mutates a declared environment but names no external \
+                 concurrency class"
+            ),
+            Self::EnvironmentConcurrencyUnexpected { tool } => write!(
+                f,
+                "the tool {tool} declares an environment concurrency class but touches no \
+                 environment"
+            ),
+            Self::EnvironmentRefMissing { tool } => write!(
+                f,
+                "the environment-kind tool {tool} declares no environment reference"
+            ),
         }
     }
 }
@@ -1895,7 +2552,9 @@ mod tests {
     use crate::guardrails::{
         AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailOutcome, AgentGuardrailStage,
     };
-    use crate::identity::{AgentId, AgentOperationId, AgentOperationKind, AgentRunId, TenantId};
+    use crate::identity::{
+        AgentEnvironmentRef, AgentId, AgentOperationId, AgentOperationKind, AgentRunId, TenantId,
+    };
     use crate::memory::AgentContextSnapshotRef;
     use crate::schema::{VersionedAgentRecord, CURRENT_AGENT_SETUP_SCHEMA_VERSION};
     use crate::task::AgentSchemaId;
@@ -2011,6 +2670,75 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_contract_is_validated_at_registration() {
+        let environment = AgentEnvironmentRef::new("workspace-1").expect("the ref is valid");
+
+        // A mutating environment tool without a concurrency class is refused:
+        // there is no fail-open default.
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(environment.clone());
+        let refused = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("sync-workspace"),
+                declaration.clone(),
+                1,
+            ))
+            .expect_err("a mutating environment tool must declare its protocol");
+        assert_eq!(refused.code(), "environment-concurrency-missing");
+
+        // A declared class admits it, and observation needs none.
+        AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("sync-workspace"), declaration, 1)
+                    .with_environment_concurrency(
+                        AgentEnvironmentConcurrencyProtocol::CompareAndSwap,
+                    ),
+            )
+            .expect("the declared protocol admits the tool");
+        AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                descriptor("watch-workspace"),
+                AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly)
+                    .with_environment(environment),
+                1,
+            ))
+            .expect("observation is the read-only class and needs no protocol");
+
+        // A protocol on a tool that touches no environment is a wiring
+        // mistake named at registration.
+        let refused = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(
+                    descriptor("plain-tool"),
+                    AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly),
+                    1,
+                )
+                .with_environment_concurrency(AgentEnvironmentConcurrencyProtocol::Lease),
+            )
+            .expect_err("a protocol needs an environment");
+        assert_eq!(refused.code(), "environment-concurrency-unexpected");
+
+        // An environment-kind descriptor with no declared ref would escape
+        // all environment gating.
+        let environment_kind = AgentToolDescriptor::new(
+            tool_id("env-tool"),
+            AgentToolKind::Environment,
+            "Reads a workspace.",
+            schema("workspace-in"),
+            schema("workspace-out"),
+        )
+        .expect("the descriptor is valid");
+        let refused = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(
+                environment_kind,
+                AgentToolDeclaration::new(AgentEffectSafetyClass::ReadOnly),
+                1,
+            ))
+            .expect_err("an environment-kind tool names its refs");
+        assert_eq!(refused.code(), "environment-ref-missing");
+    }
+
+    #[test]
     fn a_duplicate_registration_is_refused() {
         let registry = AgentToolRegistry::new()
             .register(AgentToolBinding::unclassified(descriptor("charge-card")))
@@ -2057,6 +2785,355 @@ mod tests {
     }
 
     #[test]
+    fn a_coordination_tool_never_dispatches_as_a_generic_tool() {
+        // A deployment that registers the delegation tool but does not wire
+        // the run's delegation configuration lets its calls fall through to
+        // the generic path — where this refusal is the defense in depth
+        // behind the structural guarantee that model output cannot construct
+        // a peer send ([specification 14.4]).
+        let declaration = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent);
+        let coordination = AgentToolDescriptor::new(
+            tool_id("delegate"),
+            AgentToolKind::AgentCoordination,
+            "Delegates a skill to a specialist.",
+            schema("delegate-input"),
+            schema("delegate-output"),
+        )
+        .expect("the descriptor is valid");
+        let registry = AgentToolRegistry::new()
+            .register(AgentToolBinding::new(coordination, declaration.clone(), 1))
+            .expect("the tool registers");
+        let definition = definition_with(BTreeMap::from([(tool_id("delegate"), declaration)]));
+        let settings = settings_for(&definition);
+        let context = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+
+        let authority = AgentToolAuthority::new(registry);
+        let intent = tool_intent(
+            "delegate",
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+        );
+        let refusal = authority
+            .authorize(
+                &context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("a coordination tool on the generic path is refused");
+        assert_eq!(refusal.code, "coordination-tool-not-intercepted");
+    }
+
+    /// The shared-environment doors, per attempt and in order: the binding may
+    /// not touch an environment the definition's own declaration for that tool
+    /// never named, the declaration must sit inside the definition envelope, a
+    /// setup may narrow it away, and the run's goal-scope envelope binds last.
+    #[test]
+    fn the_environment_doors_refuse_in_order_at_every_attempt() {
+        let environment = AgentEnvironmentRef::new("workspace-1").expect("the ref is valid");
+        let other = AgentEnvironmentRef::new("workspace-2").expect("the ref is valid");
+        let declared = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(environment.clone());
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), declared.clone(), 1)
+                    .with_environment_concurrency(AgentEnvironmentConcurrencyProtocol::Lease),
+            )
+            .expect("the tool registers");
+        let authority = AgentToolAuthority::new(registry);
+        let intent = tool_intent(
+            "charge-card",
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+        );
+        let authorize = |context: &AgentAuthorityContext<'_>| {
+            authority.authorize(
+                context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+        };
+
+        // The definition declares the tool but grants no environment at all:
+        // the declared reference is outside the envelope.
+        let definition =
+            definition_with(BTreeMap::from([(tool_id("charge-card"), declared.clone())]));
+        let settings = settings_for(&definition);
+        let refusal = authorize(&AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        })
+        .expect_err("an ungranted environment is refused");
+        assert_eq!(refusal.code, AgentEnvelopeDimension::Environment.as_label());
+
+        // Granting it in the envelope opens the door.
+        let mut granted =
+            definition_with(BTreeMap::from([(tool_id("charge-card"), declared.clone())]));
+        let mut envelope = granted.envelope().clone();
+        envelope.environments.insert(environment.clone());
+        granted = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope.clone(),
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let settings = settings_for(&granted);
+        let base = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &granted,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+        authorize(&base).expect("the granted environment dispatches");
+
+        // A setup that narrows the environment away revokes the very next
+        // attempt, even though the definition still grants it.
+        let mut narrowed = envelope.clone();
+        narrowed.environments.clear();
+        let setup = AgentSetupRevision::new(
+            AgentRevisionNumber::INITIAL,
+            &granted,
+            narrowed,
+            provenance(),
+        )
+        .expect("the narrowing setup is valid");
+        let refusal = authorize(&AgentAuthorityContext {
+            setup: Some(&setup),
+            ..base
+        })
+        .expect_err("a setup may narrow the environment away");
+        assert_eq!(refusal.code, "setup-excludes-environment");
+
+        // The goal scope binds last: a non-empty narrowing that does not name
+        // the environment refuses, and one that names it passes.
+        let goal_scoped = crate::delegation::AgentRunDelegationEnvelope {
+            environments: BTreeSet::from([other]),
+            ..Default::default()
+        };
+        let refusal = authorize(&AgentAuthorityContext {
+            delegation: Some(&goal_scoped),
+            ..base
+        })
+        .expect_err("the goal's environment narrowing binds");
+        assert_eq!(refusal.code, "goal-environment-not-allowed");
+        let allowed = crate::delegation::AgentRunDelegationEnvelope {
+            environments: BTreeSet::from([environment]),
+            ..Default::default()
+        };
+        authorize(&AgentAuthorityContext {
+            delegation: Some(&allowed),
+            ..base
+        })
+        .expect("the goal narrowing that names the environment passes");
+    }
+
+    /// A binding may not reach an environment the definition's declaration for
+    /// that tool never named — the deployment is stricter than the definition
+    /// or equal to it, never wider.
+    #[test]
+    fn a_binding_cannot_widen_the_declarations_environments() {
+        let declared_ref = AgentEnvironmentRef::new("workspace-1").expect("the ref is valid");
+        let extra = AgentEnvironmentRef::new("workspace-2").expect("the ref is valid");
+        let declared = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(declared_ref.clone());
+        let bound = AgentToolDeclaration::new(AgentEffectSafetyClass::Idempotent)
+            .with_environment(declared_ref.clone())
+            .with_environment(extra);
+        let registry = AgentToolRegistry::new()
+            .register(
+                AgentToolBinding::new(descriptor("charge-card"), bound, 1)
+                    .with_environment_concurrency(AgentEnvironmentConcurrencyProtocol::Lease),
+            )
+            .expect("the tool registers");
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.tools = BTreeMap::from([(tool_id("charge-card"), declared)]);
+        envelope.environments.insert(declared_ref);
+        let definition = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope,
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let settings = settings_for(&definition);
+        let refusal = AgentToolAuthority::new(registry)
+            .authorize(
+                &AgentAuthorityContext {
+                    status: AgentLifecycleStatus::Active,
+                    definition: &definition,
+                    settings: &settings,
+                    setup: None,
+                    checkpoint_grant: None,
+                    delegation: None,
+                },
+                &scope(),
+                None,
+                None,
+                &tool_intent(
+                    "charge-card",
+                    &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+                ),
+                1,
+                AgentTimestampMillis::new(2),
+            )
+            .expect_err("the binding may not widen the declaration");
+        assert_eq!(refusal.code, AgentEnvelopeDimension::Environment.as_label());
+    }
+
+    /// The claim-append doors: the definition envelope grants the space, a
+    /// setup may narrow it away, and the run's delegated grant binds last —
+    /// with a chain that carries no grant statement failing closed.
+    #[test]
+    fn the_claim_append_doors_gate_the_knowledge_space() {
+        let space =
+            crate::identity::KnowledgeSpaceId::new("space-alpha").expect("the space id is valid");
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.knowledge_spaces.insert(space.clone());
+        let definition = AgentDefinitionRevision::initial(
+            AgentDefinition::new(
+                AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+                "Resolves tickets.",
+                envelope.clone(),
+            )
+            .expect("the definition is valid"),
+            provenance(),
+        );
+        let settings = settings_for(&definition);
+        let append = crate::effect::AgentClaimAppendRequest {
+            space: space.clone(),
+            subject: "finding".to_string(),
+            predicate: "links".to_string(),
+            object: crate::effect::AgentClaimObjectRequest::Node("evidence".to_string()),
+            confidence_bps: 5_000,
+            classification: crate::memory::MemoryClassification::Unclassified,
+            evidence: Vec::new(),
+            requested_by: PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "researcher".to_string(),
+                display_name: None,
+            },
+        };
+        let provenance_record = crate::effect::AgentClaimAppendProvenance {
+            agent: AgentId::new("support").expect("the agent id is valid"),
+            goal: None,
+            task: crate::identity::AgentTaskId::new("t").expect("the task id is valid"),
+            run: AgentRunId::new("t-gen-1").expect("the run id is valid"),
+            delegation: None,
+        };
+        let intent = AgentRunEffect::new(
+            &scope(),
+            1,
+            0,
+            AgentRunEffectRequest::ClaimAppend {
+                append: Box::new(append),
+                provenance: Box::new(provenance_record),
+            },
+            &AgentEffectSpec::idempotent(1).expect("the spec is valid"),
+            AgentRevisionNumber::INITIAL,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the effect derives");
+        let authority = AgentToolAuthority::new(AgentToolRegistry::new());
+        let authorize = |context: &AgentAuthorityContext<'_>| {
+            authority.authorize(
+                context,
+                &scope(),
+                None,
+                None,
+                &intent,
+                1,
+                AgentTimestampMillis::new(2),
+            )
+        };
+        let base = AgentAuthorityContext {
+            status: AgentLifecycleStatus::Active,
+            definition: &definition,
+            settings: &settings,
+            setup: None,
+            checkpoint_grant: None,
+            delegation: None,
+        };
+        authorize(&base).expect("the granted space appends");
+
+        // A setup that narrows the space away revokes the next attempt.
+        let mut narrowed = envelope.clone();
+        narrowed.knowledge_spaces.clear();
+        let setup = AgentSetupRevision::new(
+            AgentRevisionNumber::INITIAL,
+            &definition,
+            narrowed,
+            provenance(),
+        )
+        .expect("the narrowing setup is valid");
+        let refusal = authorize(&AgentAuthorityContext {
+            setup: Some(&setup),
+            ..base
+        })
+        .expect_err("a setup may narrow the space away");
+        assert_eq!(refusal.code, "setup-excludes-knowledge-space");
+
+        // The delegated grant binds last: a grant that does not name the
+        // space refuses, and a delegated chain with no grant statement at all
+        // fails closed.
+        let ungranted = crate::delegation::AgentRunDelegationEnvelope {
+            knowledge_spaces: Some(BTreeSet::new()),
+            ..Default::default()
+        };
+        let refusal = authorize(&AgentAuthorityContext {
+            delegation: Some(&ungranted),
+            ..base
+        })
+        .expect_err("an ungranted space is refused");
+        assert_eq!(refusal.code, "claim-space-not-delegated");
+
+        let unstated = crate::delegation::AgentRunDelegationEnvelope {
+            lineage: vec![
+                crate::identity::AgentDelegationId::new("delegation-1").expect("the id is valid")
+            ],
+            ..Default::default()
+        };
+        let refusal = authorize(&AgentAuthorityContext {
+            delegation: Some(&unstated),
+            ..base
+        })
+        .expect_err("a delegated chain with no grant statement fails closed");
+        assert_eq!(refusal.code, "claim-space-not-delegated");
+
+        let granted = crate::delegation::AgentRunDelegationEnvelope {
+            knowledge_spaces: Some(BTreeSet::from([space])),
+            ..Default::default()
+        };
+        authorize(&AgentAuthorityContext {
+            delegation: Some(&granted),
+            ..base
+        })
+        .expect("the delegated grant that names the space passes");
+    }
+
+    #[test]
     fn an_intent_cannot_downgrade_the_bindings_safety_class() {
         // The binding declares the tool non-idempotent; an intent claiming a
         // read-only class — however it was produced — is refused. This is the
@@ -2077,6 +3154,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2114,6 +3192,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry).with_grant_ttl_ms(1_000);
@@ -2285,6 +3364,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2343,6 +3423,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2421,6 +3502,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: Some(&grant),
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2475,6 +3557,7 @@ mod tests {
             settings: &revoked,
             setup: None,
             checkpoint_grant: Some(&grant),
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2508,6 +3591,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: Some(&grant),
+            delegation: None,
         };
         authority
             .authorize(
@@ -2582,6 +3666,7 @@ mod tests {
             settings: &settings,
             setup: Some(&setup),
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2625,6 +3710,7 @@ mod tests {
             settings: &revoked,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2657,6 +3743,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2678,6 +3765,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let refusal = authority
             .authorize(
@@ -2716,6 +3804,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
 
         let authority = AgentToolAuthority::new(registry);
@@ -2755,6 +3844,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let authority = AgentToolAuthority::new(registry);
 
@@ -2815,6 +3905,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let intent = tool_intent("charge-card", &AgentEffectSpec::non_idempotent());
 
@@ -2870,6 +3961,7 @@ mod tests {
             settings: &settings,
             setup: None,
             checkpoint_grant: None,
+            delegation: None,
         };
         let chain = AgentGuardrailChain::new(AgentRevisionNumber::INITIAL)
             .with_stage(

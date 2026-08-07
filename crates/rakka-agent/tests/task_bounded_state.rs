@@ -43,6 +43,8 @@ use rakka_agent_workflow::{
 };
 use rakka_persistence::InMemoryDurableStateStore;
 
+mod common;
+
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<RunAcceptanceProbeState>;
@@ -235,16 +237,30 @@ impl Fixture {
     }
 
     async fn create(&self, input: AgentTaskContent) -> Result<(), String> {
+        self.create_shaped(input, Default::default(), None).await
+    }
+
+    async fn create_shaped(
+        &self,
+        input: AgentTaskContent,
+        goal_mode: rakka_agent::AgentGoalMode,
+        goal_spec: Option<Box<rakka_agent::AgentGoalSpecDraft>>,
+    ) -> Result<(), String> {
+        let goal = goal_mode
+            .is_continuous()
+            .then(|| rakka_agent::AgentGoalId::new(TASK).expect("the goal id is valid"));
         let creation = AgentTaskCreation {
             definition: task_definition(),
             input,
             assignee: Some(agent_id()),
-            goal: None,
-            goal_mode: Default::default(),
+            goal,
+            goal_mode,
+            goal_spec,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         };
 
@@ -451,10 +467,12 @@ async fn the_widest_transition_never_loses_a_history_entry() {
         assignee: Some(agent_id()),
         goal: None,
         goal_mode: Default::default(),
+        goal_spec: None,
         parent: None,
         dependencies,
         escrow: None,
         wake: None,
+        delegation: None,
         telemetry: Default::default(),
     };
 
@@ -693,10 +711,12 @@ async fn an_agent_owned_task_id_reserves_room_for_its_derived_run_ids() {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 },
@@ -843,6 +863,7 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         // The dependency keeps the creation from deciding its
                         // own assignment, which is exactly the window where an
@@ -851,6 +872,7 @@ async fn an_admitted_task_reserves_growth_headroom_for_its_own_lifecycle() {
                         dependencies: vec![AgentTaskDependencyDeclaration::new(upstream.clone())],
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 },
@@ -1068,4 +1090,437 @@ async fn bounded_state_and_gapless_history_survive_any_owner_loss() {
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_maximal_goal_bearing_continuous_task_stays_inside_its_bound() {
+    // Slice 4.1's addition to scenario 55: the goal contract is a component
+    // of the root task's bounded record, and its own serialized cap is what
+    // keeps a maximal goal-bearing continuous configuration — definition,
+    // wake policy, controller, escrow, and a spec filled to its collection
+    // bounds — inside the materialized limit with the growth reserve intact.
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let mut spec = common::goal_spec();
+    spec.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH);
+    for index in 0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS {
+        spec.allowed_skills.insert(
+            rakka_agent::AgentCapabilityId::new(format!("skill-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.allowed_tools.insert(
+            rakka_agent::AgentToolId::new(format!("tool-{index:02}")).expect("the id is valid"),
+        );
+        spec.allowed_workflows.insert(
+            rakka_agent::AgentWorkflowToolId::new(format!("flow-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.knowledge_spaces.insert(
+            rakka_agent::KnowledgeSpaceId::new(format!("space-{index:02}"))
+                .expect("the id is valid"),
+        );
+        spec.environments.insert(
+            rakka_agent::AgentEnvironmentRef::new(format!("env-{index:02}"))
+                .expect("the id is valid"),
+        );
+        // Required evidence has its own tighter cap: a spec demanding more
+        // classes than one evaluation may present is statically
+        // unsatisfiable and refused, so the maximal spec fills exactly the
+        // satisfiable bound.
+        if index < rakka_agent::AGENT_GOAL_EVALUATION_MAX_EVIDENCE {
+            spec.required_evidence.insert(format!("class-{index:02}"));
+        }
+    }
+    spec.delegation = Some(rakka_agent::AgentGoalDelegationBudget {
+        max_depth: Some(4),
+        max_fan_out: Some(8),
+        max_descendants: Some(64),
+        max_concurrent: Some(8),
+    });
+    // Slice 4.2's addition: a fully populated stagnation policy — both
+    // thresholds and a per-trigger override — rides the same bounded spec.
+    spec.stagnation =
+        Some(rakka_agent::AgentPolicyRef::new("no-repeats").expect("the policy ref is valid"));
+    spec.stagnation_policy = rakka_agent::AgentGoalStagnationPolicy {
+        repeated_result_epochs: Some(3),
+        no_progress_epochs: Some(5),
+        default: rakka_agent::AgentGoalStagnationAction::Wait,
+        overrides: [(
+            rakka_agent::AgentStagnationTrigger::NoProgress,
+            rakka_agent::AgentGoalStagnationAction::Escalate,
+        )]
+        .into_iter()
+        .collect(),
+    };
+
+    fx.create_shaped(
+        AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        common::continuous_goal_mode(common::wake_policy()),
+        Some(Box::new(common::goal_spec_draft(spec, true))),
+    )
+    .await
+    .expect("the maximal goal-bearing creation admits");
+
+    let entity = fx.entity().await;
+    let state = entity.state().expect("the state is recovered");
+    let task = state.task().expect("the task is created");
+    assert!(task.goal_state.is_some(), "the goal record is held");
+    assert!(
+        task.materialized_size_bytes()
+            <= AGENT_TASK_MATERIALIZED_MAX_BYTES
+                - rakka_agent::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
+        "the admitted record must keep its growth reserve free: {} bytes",
+        task.materialized_size_bytes()
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_goal_spec_is_refused_at_creation() {
+    // The spec's own bounds fail the whole creation closed: an over-long
+    // summary trips its field bound, and a spec padded past the serialized
+    // cap trips the size bound, both before anything is persisted.
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let mut oversized = common::goal_spec();
+    oversized.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH + 1);
+    let error = fx
+        .create_shaped(
+            AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            Default::default(),
+            Some(Box::new(common::goal_spec_draft(oversized, true))),
+        )
+        .await
+        .expect_err("an over-long summary refuses the creation");
+    assert_eq!(error, "goal-summary-too-long");
+
+    let mut padded = common::goal_spec();
+    padded.objective.summary = "s".repeat(rakka_agent::AGENT_GOAL_SUMMARY_MAX_LENGTH);
+    for index in 0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS {
+        padded.allowed_skills.insert(
+            rakka_agent::AgentCapabilityId::new(format!("{index:02}-{}", "s".repeat(120)))
+                .expect("the id is valid"),
+        );
+    }
+    let error = fx
+        .create_shaped(
+            AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            Default::default(),
+            Some(Box::new(common::goal_spec_draft(padded, true))),
+        )
+        .await
+        .expect_err("a spec past its serialized cap refuses the creation");
+    assert_eq!(error, "goal-spec-too-large");
+}
+
+/// A creation carrying the widest delegation provenance the structural
+/// bounds admit — the full lineage chain, delegated scopes, bindings, a
+/// budget, a deadline, and a result contract — still fits the task record
+/// with its growth reserve, and every field survives to the snapshot.
+#[tokio::test]
+async fn the_widest_delegation_provenance_fits_the_task_record() {
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let parent_run = rakka_agent::AgentRunScope::new(
+        tenant(),
+        agent_id(),
+        rakka_agent::AgentRunId::new("parent-run-gen-1").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let lineage: Vec<_> = (0..rakka_agent::AGENT_DELEGATION_MAX_LINEAGE)
+        .map(|slot| {
+            rakka_agent::delegation_id_for(&parent_run, 1, slot).expect("the delegation id derives")
+        })
+        .collect();
+    // The ancestry is parallel to the lineage — one committing agent per
+    // entry — so the widest provenance carries a full chain of realistic
+    // agent identities besides the digests.
+    let ancestors: Vec<_> = (0..rakka_agent::AGENT_DELEGATION_MAX_LINEAGE)
+        .map(|index| {
+            rakka_agent::AgentId::new(format!("specialist-coordinator-{index:02}"))
+                .expect("agent id should be valid")
+        })
+        .collect();
+    // The delegated scopes ride the provenance too, and a goal may declare up
+    // to `AGENT_GOAL_MAX_ALLOWED_REFS` of each: the widest provenance a valid
+    // configuration can produce carries both sets full, at the identity
+    // bound's realistic width, so the record's growth reserve is proven for
+    // the shape production can actually reach.
+    let environments: std::collections::BTreeSet<_> = (0..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS)
+        .map(|index| {
+            rakka_agent::AgentEnvironmentRef::new(format!(
+                "shared-production-workspace-environment-{index:02}"
+            ))
+            .expect("environment ref should be valid")
+        })
+        .collect();
+    let knowledge_spaces: std::collections::BTreeSet<_> = (0
+        ..rakka_agent::AGENT_GOAL_MAX_ALLOWED_REFS)
+        .map(|index| {
+            rakka_agent::KnowledgeSpaceId::new(format!(
+                "communal-knowledge-space-for-specialists-{index:02}"
+            ))
+            .expect("space id should be valid")
+        })
+        .collect();
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments,
+        knowledge_spaces,
+        delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
+            .expect("the delegation id derives"),
+        parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
+        parent_run,
+        lineage,
+        ancestors,
+        // The chain above the delegation plus the delegation itself: depth
+        // is always the lineage length plus one, which validation enforces.
+        depth: rakka_agent::AGENT_DELEGATION_MAX_LINEAGE as u32 + 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("translation")
+            .expect("capability id should be valid"),
+        capability_scopes: (0..8)
+            .map(|index| {
+                rakka_agent::AgentCapabilityId::new(format!("scope-{index}"))
+                    .expect("capability id should be valid")
+            })
+            .collect(),
+        credential_bindings: (0..8)
+            .map(|index| {
+                rakka_agent::AgentCredentialBindingRef::new(format!("binding-{index}"))
+                    .expect("binding ref should be valid")
+            })
+            .collect(),
+        result_schema: Some(schema("delegated-result")),
+        budget: Some(rakka_agent::AgentGoalDelegationBudget {
+            max_depth: Some(4),
+            max_fan_out: Some(4),
+            max_descendants: Some(64),
+            max_concurrent: Some(8),
+        }),
+        deadline: Some(AgentTimestampMillis::new(9_999_999)),
+    };
+    provenance.validate().expect("the provenance is bounded");
+
+    let creation = AgentTaskCreation {
+        definition: task_definition(),
+        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        assignee: Some(agent_id()),
+        goal: None,
+        goal_mode: Default::default(),
+        goal_spec: None,
+        parent: Some(AgentTaskId::new("goal-root").expect("task id should be valid")),
+        dependencies: Vec::new(),
+        escrow: None,
+        wake: None,
+        delegation: Some(Box::new(provenance.clone())),
+        telemetry: Default::default(),
+    };
+
+    let mut entity = fx.entity().await;
+    let now = fx.now();
+    entity
+        .apply(
+            AgentTaskEntityCommand::Create {
+                operation_id: AgentOperationId::new(
+                    AgentOperationKind::TaskCreation,
+                    [TENANT, TASK, "1"],
+                )
+                .expect("operation id should be derivable"),
+                creation: Box::new(creation),
+            },
+            &fx.task_router,
+            now,
+        )
+        .await
+        .expect("the widest delegated creation should fit the record");
+
+    let state = fx.durable_state().await;
+    let recorded = state
+        .task()
+        .expect("the task exists")
+        .delegation
+        .as_deref()
+        .expect("the provenance is recorded")
+        .clone();
+    assert_eq!(recorded, provenance);
+
+    // One ancestor past the structural bound refuses the whole creation.
+    let mut too_deep = provenance;
+    too_deep.lineage.push(
+        rakka_agent::delegation_id_for(
+            &rakka_agent::AgentRunScope::new(
+                tenant(),
+                agent_id(),
+                rakka_agent::AgentRunId::new("parent-run-gen-2").expect("run id should be valid"),
+            )
+            .expect("run scope should be valid"),
+            3,
+            0,
+        )
+        .expect("the delegation id derives"),
+    );
+    assert_eq!(
+        too_deep
+            .validate()
+            .expect_err("the lineage is too deep")
+            .code(),
+        "delegation-lineage-too-deep"
+    );
+}
+
+/// A provenance that is lineage-valid but oversized — peer-supplied scope
+/// collections past the serialized byte bound — refuses the whole creation:
+/// the receiving surface holds network-supplied provenance to the same byte
+/// discipline the parent-side record obeys, so a hostile peer cannot inflate
+/// a child task's durable state.
+#[tokio::test]
+async fn an_oversized_delegation_provenance_refuses_the_creation() {
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let parent_run = rakka_agent::AgentRunScope::new(
+        tenant(),
+        agent_id(),
+        rakka_agent::AgentRunId::new("parent-run-gen-1").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        delegation: rakka_agent::delegation_id_for(&parent_run, 2, 0)
+            .expect("the delegation id derives"),
+        parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
+        parent_run,
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("translation")
+            .expect("capability id should be valid"),
+        capability_scopes: (0..256)
+            .map(|index| {
+                rakka_agent::AgentCapabilityId::new(format!("scope-{index:03}-{}", "x".repeat(32)))
+                    .expect("capability id should be valid")
+            })
+            .collect(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    };
+    assert_eq!(
+        provenance
+            .validate()
+            .expect_err("the provenance is oversized")
+            .code(),
+        "delegation-provenance-too-large"
+    );
+
+    let creation = AgentTaskCreation {
+        definition: task_definition(),
+        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        assignee: Some(agent_id()),
+        goal: None,
+        goal_mode: Default::default(),
+        goal_spec: None,
+        parent: Some(AgentTaskId::new("goal-root").expect("task id should be valid")),
+        dependencies: Vec::new(),
+        escrow: None,
+        wake: None,
+        delegation: Some(Box::new(provenance)),
+        telemetry: Default::default(),
+    };
+    let mut entity = fx.entity().await;
+    let error = entity
+        .apply(
+            AgentTaskEntityCommand::Create {
+                operation_id: AgentOperationId::new(
+                    AgentOperationKind::TaskCreation,
+                    [TENANT, TASK, "1"],
+                )
+                .expect("operation id should be derivable"),
+                creation: Box::new(creation),
+            },
+            &fx.task_router,
+            fx.now(),
+        )
+        .await
+        .expect_err("the oversized provenance refuses the creation");
+    assert_eq!(error.code(), "task-delegation-provenance-invalid");
+}
+
+/// A provenance whose parent run lives in a foreign tenant refuses the whole
+/// creation: a delegated child lives in its parent's tenant, so a claim
+/// otherwise is a forgery or a misrouting — never recorded for the
+/// enforcement slices to trust.
+#[tokio::test]
+async fn a_cross_tenant_parent_run_refuses_the_creation() {
+    let fx = Fixture::new();
+    fx.instantiate_agent().await;
+
+    let foreign_parent = rakka_agent::AgentRunScope::new(
+        TenantId::new("evil"),
+        agent_id(),
+        rakka_agent::AgentRunId::new("parent-run-gen-1").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let provenance = rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        delegation: rakka_agent::delegation_id_for(&foreign_parent, 2, 0)
+            .expect("the delegation id derives"),
+        parent_task: AgentTaskId::new("goal-root").expect("task id should be valid"),
+        parent_run: foreign_parent,
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("translation")
+            .expect("capability id should be valid"),
+        capability_scopes: BTreeSet::new(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    };
+    provenance
+        .validate()
+        .expect("the provenance itself is structurally valid");
+
+    let creation = AgentTaskCreation {
+        definition: task_definition(),
+        input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+            .expect("the input is inline-bounded"),
+        assignee: Some(agent_id()),
+        goal: None,
+        goal_mode: Default::default(),
+        goal_spec: None,
+        parent: Some(AgentTaskId::new("goal-root").expect("task id should be valid")),
+        dependencies: Vec::new(),
+        escrow: None,
+        wake: None,
+        delegation: Some(Box::new(provenance)),
+        telemetry: Default::default(),
+    };
+    let mut entity = fx.entity().await;
+    let error = entity
+        .apply(
+            AgentTaskEntityCommand::Create {
+                operation_id: AgentOperationId::new(
+                    AgentOperationKind::TaskCreation,
+                    [TENANT, TASK, "1"],
+                )
+                .expect("operation id should be derivable"),
+                creation: Box::new(creation),
+            },
+            &fx.task_router,
+            fx.now(),
+        )
+        .await
+        .expect_err("the cross-tenant parent run refuses the creation");
+    assert_eq!(error.code(), "task-delegation-provenance-invalid");
 }

@@ -57,14 +57,17 @@
 //! access set is carried, queryable data; its enforcement point is the
 //! communal retrieval and policy layer), and no cross-tenant federation.
 
+pub mod append_executor;
 pub mod claim;
 pub mod conformance;
 pub mod error;
+pub mod goal_claim_source;
 pub mod promotion;
 pub mod scope;
 pub mod store;
 pub mod transition;
 
+pub use append_executor::KnowledgeGraphClaimAppendExecutor;
 pub use claim::{
     Claim, ClaimAccess, ClaimId, ClaimNodeId, ClaimObject, ClaimOperationId, ClaimPredicate,
     ClaimProvenance, ClaimRecord, ClaimTrustStatus, CLAIM_MAX_ACL_CAPABILITIES,
@@ -72,6 +75,7 @@ pub use claim::{
     CURRENT_CLAIM_SCHEMA_VERSION,
 };
 pub use error::{check_schema_window, ClaimError, ClaimFuture, ClaimRecordKind, ClaimResult};
+pub use goal_claim_source::KnowledgeGraphGoalClaimSource;
 pub use promotion::{
     claim_promotion_binding, claim_promotion_effect_id, validate_promotion, ClaimPromotionEvidence,
     ClaimPromotionPolicy,

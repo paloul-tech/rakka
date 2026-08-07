@@ -70,8 +70,8 @@ use crate::definition::{AgentCredentialBindingRef, AgentModelProfileId, AgentRev
 use crate::dispatch::{
     AgentDispatchError, AgentDispatchFuture, AgentDispatchProbe, AgentDispatchToolExecutor,
     AgentDispatchWindow, AgentEffectCredentialResolver, AgentEffectReconciler,
-    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
-    AgentRunResultDelivery,
+    AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding, AgentMemoryPromotionExecutor,
+    AgentMemoryPromotionFinding, AgentReconciliationFinding, AgentRunResultDelivery,
 };
 use crate::effect::{
     AgentEffectPolicies, AgentMemoryPromotionRequest, AgentReconciliationProtocolRef,
@@ -374,9 +374,14 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
-            // An epoch result is a durable transition but not a balance
+            // An epoch result, a goal evaluation, a delegation result, or a
+            // cancellation request is a durable transition but not a balance
             // movement: the probe records the application without crediting.
-            AgentExchangeKind::EpochResult => apply_ledger(state, envelope, 0),
+            AgentExchangeKind::EpochResult
+            | AgentExchangeKind::GoalEvaluation
+            | AgentExchangeKind::DelegationResult
+            | AgentExchangeKind::RunCancel
+            | AgentExchangeKind::DelegationCancel => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -768,6 +773,31 @@ impl AgentExchangeParticipant for RunAcceptanceProbe {
         envelope: &AgentExchangeEnvelope,
         now: AgentTimestampMillis,
     ) -> AgentExchangeTransition {
+        if envelope.kind() == AgentExchangeKind::RunCancel {
+            // The probe models a run with nothing outstanding: the request
+            // is durably recorded and the wind-down is instantly terminal.
+            let receipt = crate::task::AgentRunCancelReceipt {
+                run: match &state.address {
+                    AgentEntityAddress::Run(scope) => scope.clone(),
+                    other => AgentRunScope::new(
+                        other.tenant().clone(),
+                        crate::AgentId::new("probe").expect("the literal is a valid agent id"),
+                        crate::AgentRunId::new("probe").expect("the literal is a valid run id"),
+                    )
+                    .expect("the probe scope is well formed"),
+                },
+                status: crate::run::AgentRunStatus::Cancelled,
+            };
+            return AgentExchangeTransition::new(AgentExchangeResult::accepted(
+                AgentExchangePayload::encode(
+                    crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE,
+                    &receipt,
+                )
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE)
+                }),
+            ));
+        }
         if envelope.kind() != AgentExchangeKind::Assignment {
             return AgentExchangeTransition::new(AgentExchangeResult::rejected(
                 "unsupported-exchange",
@@ -1191,6 +1221,8 @@ where
     memory: Arc<Mutex<Option<AgentRunMemory>>>,
     decisions: Arc<Mutex<Option<Arc<dyn AgentDecisionEventSink>>>>,
     metrics: Arc<Mutex<Option<Arc<dyn MetricsRecorder>>>>,
+    delegation: Arc<Mutex<Option<crate::delegation::AgentRunDelegationConfig>>>,
+    workflow_tools: Arc<Mutex<Option<crate::workflow_tool::AgentRunWorkflowConfig>>>,
     faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
     acceptances: Arc<AtomicUsize>,
 }
@@ -1210,6 +1242,8 @@ where
             memory: self.memory.clone(),
             decisions: self.decisions.clone(),
             metrics: self.metrics.clone(),
+            delegation: self.delegation.clone(),
+            workflow_tools: self.workflow_tools.clone(),
             faults: self.faults.clone(),
             acceptances: self.acceptances.clone(),
         }
@@ -1238,6 +1272,8 @@ where
             memory: Arc::new(Mutex::new(None)),
             decisions: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(None)),
+            delegation: Arc::new(Mutex::new(None)),
+            workflow_tools: Arc::new(Mutex::new(None)),
             faults: Arc::new(Mutex::new(VecDeque::new())),
             acceptances: Arc::new(AtomicUsize::new(0)),
         }
@@ -1277,6 +1313,26 @@ where
             .metrics
             .lock()
             .expect("the metrics slot should not be poisoned") = Some(metrics);
+    }
+
+    /// Wires every run entity this transport builds to serve delegation,
+    /// under the same shared-slot rule as [`Self::install_memory`]: every
+    /// driver of a run must share one wiring, because an entity that
+    /// advances the loop unwired refuses the coordination tool.
+    pub fn install_delegation(&self, config: crate::delegation::AgentRunDelegationConfig) {
+        *self
+            .delegation
+            .lock()
+            .expect("the delegation slot should not be poisoned") = Some(config);
+    }
+
+    /// Wires every run entity this transport builds to serve workflow tools,
+    /// under the same shared-slot rule as [`Self::install_memory`].
+    pub fn install_workflow_tools(&self, config: crate::workflow_tool::AgentRunWorkflowConfig) {
+        *self
+            .workflow_tools
+            .lock()
+            .expect("the workflow-tool slot should not be poisoned") = Some(config);
     }
 
     /// Uses explicit effect specs for the effects hosted runs commit.
@@ -1369,6 +1425,22 @@ where
                 .clone();
             if let Some(metrics) = metrics {
                 entity = entity.with_metrics(metrics);
+            }
+            let delegation = self
+                .delegation
+                .lock()
+                .expect("the delegation slot should not be poisoned")
+                .clone();
+            if let Some(delegation) = delegation {
+                entity = entity.with_delegation(delegation);
+            }
+            let workflow_tools = self
+                .workflow_tools
+                .lock()
+                .expect("the workflow-tool slot should not be poisoned")
+                .clone();
+            if let Some(workflow_tools) = workflow_tools {
+                entity = entity.with_workflow_tools(workflow_tools);
             }
 
             self.acceptances.fetch_add(1, Ordering::SeqCst);
@@ -1580,6 +1652,11 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     failures: Arc<Mutex<BTreeMap<String, (String, String)>>>,
     compensations: Arc<Mutex<BTreeMap<String, AgentTaskContent>>>,
     promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
+    evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
+    a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
+    workflow_starts: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>>>>,
+    workflow_cancels: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>>>>,
+    claim_appends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentClaimAppendExecutor>>>>,
     model_calls: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
 }
@@ -1670,6 +1747,11 @@ where
             failures: Arc::new(Mutex::new(BTreeMap::new())),
             compensations: Arc::new(Mutex::new(BTreeMap::new())),
             promotions: Arc::new(Mutex::new(None)),
+            evaluations: Arc::new(Mutex::new(None)),
+            a2a_sends: Arc::new(Mutex::new(None)),
+            workflow_starts: Arc::new(Mutex::new(None)),
+            workflow_cancels: Arc::new(Mutex::new(None)),
+            claim_appends: Arc::new(Mutex::new(None)),
             model_calls: Arc::new(AtomicUsize::new(0)),
             tool_calls: Arc::new(AtomicUsize::new(0)),
         }
@@ -1729,6 +1811,87 @@ where
         self
     }
 
+    /// Executes goal-evaluation effects through the given executor. An
+    /// unwired evaluation fails with the real pipeline's
+    /// `evaluation-executor-missing` code; a human review never consults the
+    /// executor — its effect-bound approval grant is its verdict, exactly as
+    /// in the real pipeline.
+    #[must_use]
+    pub fn with_goal_evaluation_executor(
+        self,
+        executor: Arc<dyn AgentGoalEvaluationExecutor>,
+    ) -> Self {
+        *self
+            .evaluations
+            .lock()
+            .expect("the evaluation executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes outbound A2A send effects through the given executor. An
+    /// unwired send fails with the real pipeline's
+    /// `a2a-send-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_a2a_send_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentA2aSendExecutor>,
+    ) -> Self {
+        *self
+            .a2a_sends
+            .lock()
+            .expect("the A2A send executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes workflow start effects through the given executor. An
+    /// unwired start fails with the real pipeline's
+    /// `workflow-start-executor-missing` code, exactly as the real
+    /// dispatcher fails closed.
+    #[must_use]
+    pub fn with_workflow_start_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>,
+    ) -> Self {
+        *self
+            .workflow_starts
+            .lock()
+            .expect("the workflow start executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes workflow cancel effects through the given executor. An
+    /// unwired cancel fails with the real pipeline's
+    /// `workflow-cancel-executor-missing` code, exactly as the real
+    /// dispatcher fails closed.
+    #[must_use]
+    pub fn with_workflow_cancel_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>,
+    ) -> Self {
+        *self
+            .workflow_cancels
+            .lock()
+            .expect("the workflow cancel executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes communal claim appends through the given executor. An
+    /// unwired append fails with the real pipeline's
+    /// `claim-append-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_claim_append_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentClaimAppendExecutor>,
+    ) -> Self {
+        *self
+            .claim_appends
+            .lock()
+            .expect("the claim-append executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
     /// How many model calls the dispatcher has answered, re-invocations included.
     #[must_use]
     pub fn model_calls(&self) -> usize {
@@ -1771,6 +1934,23 @@ where
                 // needs the scope only `drive` holds.
                 AgentRunEffectRequest::MemoryPromotion { promotion } => {
                     self.promotion_outcome(&scope, &effect, promotion, now)
+                        .await
+                }
+                // An append executor writes under the run scope only `drive`
+                // holds.
+                AgentRunEffectRequest::ClaimAppend { append, provenance } => {
+                    self.claim_append_outcome(&scope, &effect, append, provenance, now)
+                        .await
+                }
+                // An evaluation needs the scope, and — for a human review —
+                // the grant the run's own checkpoint issued, exactly as the
+                // real authority reads it from the loop state.
+                AgentRunEffectRequest::Evaluation { evaluation } => {
+                    let grant = entity
+                        .state()?
+                        .loop_state()
+                        .and_then(|loop_state| loop_state.grant_for(&effect).cloned());
+                    self.evaluation_outcome(&scope, &effect, evaluation, grant.as_ref(), now)
                         .await
                 }
                 _ => self.answer(&effect).await,
@@ -1866,7 +2046,249 @@ where
                         .to_string(),
                 }
             }
+            AgentRunEffectRequest::Evaluation { .. } => {
+                // An evaluation needs the run scope — and, for a human
+                // review, the grant — that only `drive` or
+                // [`Self::evaluation_outcome`] carry. Deliberately not
+                // memoized, so a later scoped answer can still resolve it.
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                AgentRunEffectOutcome::Failed {
+                    code: "goal-evaluation-unscoped".to_string(),
+                    message: "a goal evaluation is answered through drive or \
+                              evaluation_outcome, which carry the run scope"
+                        .to_string(),
+                }
+            }
+            AgentRunEffectRequest::A2aSend { delegation } => {
+                // The record carries its own parent scope, so the send needs
+                // nothing `answer` does not hold. Memoized like a tool call:
+                // a re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived deduplication
+                // key promises.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .a2a_sends
+                    .lock()
+                    .expect("the A2A send executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "a2a-send-executor-missing".to_string(),
+                        message: "no A2A send executor is wired into this dispatcher".to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&delegation.parent_run, effect, delegation, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentA2aSendFinding::Sent {
+                            child_task,
+                            child_run,
+                            peer_status,
+                        }) => AgentRunEffectOutcome::A2aSend {
+                            receipt: crate::delegation::AgentA2aSendReceipt {
+                                delegation: delegation.delegation.clone(),
+                                child_task,
+                                child_run,
+                                peer_status,
+                            },
+                        },
+                        Ok(crate::dispatch::AgentA2aSendFinding::Conflict { code, message })
+                        | Ok(crate::dispatch::AgentA2aSendFinding::Refused { code, message }) => {
+                            AgentRunEffectOutcome::Failed { code, message }
+                        }
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::Failed {
+                            code: "a2a-send-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::WorkflowStart { invocation } => {
+                // The record carries its own parent scope, so the start needs
+                // nothing `answer` does not hold. Memoized like a send: a
+                // re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived generation-free
+                // `StartRun` identities promise.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .workflow_starts
+                    .lock()
+                    .expect("the workflow start executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "workflow-start-executor-missing".to_string(),
+                        message: "no workflow start executor is wired into this dispatcher"
+                            .to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&invocation.parent_run, effect, invocation, None)
+                        .await
+                    {
+                        Ok(
+                            finding @ (crate::dispatch::AgentWorkflowStartFinding::Started
+                            | crate::dispatch::AgentWorkflowStartFinding::Adopted),
+                        ) => AgentRunEffectOutcome::WorkflowStart {
+                            receipt: crate::workflow_tool::AgentWorkflowStartReceipt {
+                                invocation: invocation.invocation.clone(),
+                                child_run: invocation.child_run.clone(),
+                                adopted: matches!(
+                                    finding,
+                                    crate::dispatch::AgentWorkflowStartFinding::Adopted
+                                ),
+                            },
+                        },
+                        // The real dispatcher's conflict normalization,
+                        // verbatim: the cell's `Conflicted` settlement is
+                        // structural, never an executor string convention.
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Conflict {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::Failed {
+                            code: crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE
+                                .to_string(),
+                            message: format!("{code}: {message}"),
+                        },
+                        Ok(crate::dispatch::AgentWorkflowStartFinding::Refused {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::Failed { code, message },
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::Failed {
+                            code: "workflow-start-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::WorkflowCancel { invocation, reason } => {
+                // The record carries its own parent scope, so the cancel
+                // needs nothing `answer` does not hold. Memoized like a
+                // start: a re-invocation of the same generation returns the
+                // same outcome, which is exactly what the derived
+                // generation-free `CancelRun` identities promise.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .workflow_cancels
+                    .lock()
+                    .expect("the workflow cancel executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "workflow-cancel-executor-missing".to_string(),
+                        message: "no workflow cancel executor is wired into this dispatcher"
+                            .to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&invocation.parent_run, effect, invocation, reason, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::Requested) => {
+                            AgentRunEffectOutcome::WorkflowCancel {
+                                already_finished: false,
+                            }
+                        }
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::AlreadyFinished) => {
+                            AgentRunEffectOutcome::WorkflowCancel {
+                                already_finished: true,
+                            }
+                        }
+                        Ok(crate::dispatch::AgentWorkflowCancelFinding::Refused {
+                            code,
+                            message,
+                        }) => AgentRunEffectOutcome::Failed { code, message },
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as a failed effect, the
+                        // model-adapter precedent above.
+                        Err(error) => AgentRunEffectOutcome::Failed {
+                            code: "workflow-cancel-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::ClaimAppend { .. } => {
+                // An append executor runs under the run scope only `drive`
+                // holds. Answer it through [`Self::drive`] or
+                // [`Self::claim_append_outcome`]. Deliberately not memoized,
+                // so a later scoped answer can still resolve the effect.
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                AgentRunEffectOutcome::Failed {
+                    code: "claim-append-unscoped".to_string(),
+                    message: "a claim append is answered through drive or claim_append_outcome, \
+                              which carry the run scope"
+                        .to_string(),
+                }
+            }
         }
+    }
+
+    /// What this dispatcher returns for one claim-append effect, running the
+    /// wired executor under the run's scope. Memoized on the effect id and
+    /// generation exactly like every other answer.
+    pub async fn claim_append_outcome(
+        &self,
+        scope: &AgentRunScope,
+        effect: &AgentRunEffect,
+        append: &crate::effect::AgentClaimAppendRequest,
+        provenance: &crate::effect::AgentClaimAppendProvenance,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEffectOutcome {
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.cached(effect) {
+            return outcome;
+        }
+        let executor = self
+            .claim_appends
+            .lock()
+            .expect("the claim-append executor slot should not be poisoned")
+            .clone();
+        let outcome = match executor {
+            None => AgentRunEffectOutcome::Failed {
+                code: "claim-append-executor-missing".to_string(),
+                message: "no claim-append executor is wired into this dispatcher".to_string(),
+            },
+            Some(executor) => match executor
+                .execute(scope, effect, append, provenance, now)
+                .await
+            {
+                Ok(crate::dispatch::AgentClaimAppendFinding::Appended { claim }) => {
+                    AgentRunEffectOutcome::ClaimAppend { claim }
+                }
+                Ok(crate::dispatch::AgentClaimAppendFinding::Refused { code, message }) => {
+                    AgentRunEffectOutcome::Failed { code, message }
+                }
+                // The in-process driver has no attempt machinery: a
+                // retryable failure surfaces as a failed effect, the
+                // model-adapter precedent above.
+                Err(error) => AgentRunEffectOutcome::Failed {
+                    code: "claim-append-attempt-failed".to_string(),
+                    message: error.to_string(),
+                },
+            },
+        };
+        self.memoize(effect, outcome)
     }
 
     /// What this dispatcher returns for one memory-promotion effect, running
@@ -1908,6 +2330,161 @@ where
                     message: error.to_string(),
                 },
             },
+        };
+        self.memoize(effect, outcome)
+    }
+
+    /// What this dispatcher returns for one goal-evaluation effect, mirroring
+    /// the real pipeline's evaluation arm: a human review's verdict is the
+    /// effect-bound approval grant, a verification workflow fails closed as
+    /// deferred, and everything else runs the wired executor or fails with the
+    /// real `evaluation-executor-missing` code. Memoized on the effect id and
+    /// generation exactly like every other answer.
+    pub async fn evaluation_outcome(
+        &self,
+        scope: &AgentRunScope,
+        effect: &AgentRunEffect,
+        evaluation: &crate::evaluation::AgentGoalEvaluationRequest,
+        grant: Option<&crate::checkpoints::AgentCheckpointGrant>,
+        now: AgentTimestampMillis,
+    ) -> AgentRunEffectOutcome {
+        use crate::evaluation::{
+            goal_evaluation_record_id, AgentGoalEvaluationMethod, AgentGoalEvaluationOutcome,
+            AgentGoalEvaluationRecord, AgentGoalEvidenceRef,
+        };
+
+        self.tool_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(outcome) = self.cached(effect) {
+            return outcome;
+        }
+        let evaluation_id =
+            match goal_evaluation_record_id(scope, effect.turn, effect.slot, effect.generation) {
+                Ok(evaluation_id) => evaluation_id,
+                Err(error) => {
+                    return self.memoize(
+                        effect,
+                        AgentRunEffectOutcome::Failed {
+                            code: "evaluation-identity-invalid".to_string(),
+                            message: error.to_string(),
+                        },
+                    );
+                }
+            };
+        let build = |outcome: AgentGoalEvaluationOutcome,
+                     reason_code: String,
+                     evidence: Vec<AgentGoalEvidenceRef>,
+                     evaluated_by| {
+            AgentGoalEvaluationRecord::new(
+                evaluation_id.clone(),
+                evaluation.goal.clone(),
+                evaluation.evaluator.clone(),
+                evaluation.method.kind(),
+                evaluation.criteria_revision,
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+                effect.effect_id.clone(),
+                effect.generation,
+                now,
+            )
+        };
+        let finding = match &evaluation.method {
+            AgentGoalEvaluationMethod::HumanReview => match grant {
+                None => {
+                    return self.memoize(
+                        effect,
+                        AgentRunEffectOutcome::Failed {
+                            code: "evaluation-grant-missing".to_string(),
+                            message: "a human-review evaluation dispatched without its approval \
+                                      grant"
+                                .to_string(),
+                        },
+                    );
+                }
+                Some(grant) => {
+                    let mut evidence = evaluation.evidence.clone();
+                    evidence.push(AgentGoalEvidenceRef {
+                        class: crate::evaluation::AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS
+                            .to_string(),
+                        artifact: None,
+                        digest: Some(grant.argument_digest.clone()),
+                    });
+                    AgentGoalEvaluationFinding::Evaluated {
+                        outcome: AgentGoalEvaluationOutcome::Satisfied,
+                        reason_code: "human-approved".to_string(),
+                        evidence,
+                        evaluated_by: Some(grant.resolver.clone()),
+                    }
+                }
+            },
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. } => {
+                return self.memoize(
+                    effect,
+                    AgentRunEffectOutcome::Failed {
+                        code: "evaluation-workflow-deferred".to_string(),
+                        message: "a verification-workflow evaluation cannot execute until the \
+                                  evaluation cell is bridged to the workflow-tool invocation path"
+                            .to_string(),
+                    },
+                );
+            }
+            _ => {
+                let executor = self
+                    .evaluations
+                    .lock()
+                    .expect("the evaluation executor slot should not be poisoned")
+                    .clone();
+                match executor {
+                    None => {
+                        return self.memoize(
+                            effect,
+                            AgentRunEffectOutcome::Failed {
+                                code: "evaluation-executor-missing".to_string(),
+                                message: "no goal-evaluation executor is wired into this \
+                                          dispatcher"
+                                    .to_string(),
+                            },
+                        );
+                    }
+                    Some(executor) => {
+                        match executor.execute(scope, effect, evaluation, None, now).await {
+                            Ok(finding) => finding,
+                            // The in-process driver has no attempt machinery:
+                            // a retryable failure surfaces as a failed effect,
+                            // the promotion precedent above.
+                            Err(error) => {
+                                return self.memoize(
+                                    effect,
+                                    AgentRunEffectOutcome::Failed {
+                                        code: "evaluation-attempt-failed".to_string(),
+                                        message: error.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let outcome = match finding {
+            AgentGoalEvaluationFinding::Evaluated {
+                outcome,
+                reason_code,
+                evidence,
+                evaluated_by,
+            } => match build(outcome, reason_code, evidence, evaluated_by) {
+                Ok(record) => AgentRunEffectOutcome::Evaluation {
+                    record: Box::new(record),
+                },
+                Err(error) => AgentRunEffectOutcome::Failed {
+                    code: "evaluation-record-invalid".to_string(),
+                    message: error.to_string(),
+                },
+            },
+            AgentGoalEvaluationFinding::Refused { code, message } => {
+                AgentRunEffectOutcome::Failed { code, message }
+            }
         };
         self.memoize(effect, outcome)
     }
@@ -1994,6 +2571,8 @@ where
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
     policies: AgentEffectPolicies,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
 }
 
 impl<Store, Effects> InProcessRunResultDelivery<Store, Effects>
@@ -2015,6 +2594,8 @@ where
             router,
             clock,
             policies: AgentEffectPolicies::default(),
+            workflow_tools: None,
+            delegation: None,
         }
     }
 
@@ -2022,6 +2603,28 @@ where
     #[must_use]
     pub fn with_effect_policies(mut self, policies: AgentEffectPolicies) -> Self {
         self.policies = policies;
+        self
+    }
+
+    /// Wires the entities this delivery builds to serve workflow tools —
+    /// the delivered model result is what the loop evaluates, so the
+    /// interception must be wired on this path too.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
+        self
+    }
+
+    /// Wires the entities this delivery builds to serve delegation — the
+    /// delivered model result is where a fan-out turn is intercepted, so an
+    /// unwired delivery would refuse the coordination and await verbs the
+    /// run's durable state was committed under.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
         self
     }
 }
@@ -2040,6 +2643,12 @@ where
             let mut entity =
                 AgentRunEntityStore::new(scope.clone(), self.store.clone(), self.effects.clone())
                     .with_effect_policies(self.policies.clone());
+            if let Some(config) = &self.workflow_tools {
+                entity = entity.with_workflow_tools(config.clone());
+            }
+            if let Some(config) = &self.delegation {
+                entity = entity.with_delegation(config.clone());
+            }
             let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
             entity
                 .apply(command, &self.router, now)

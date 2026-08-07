@@ -64,6 +64,7 @@ pub mod delegation;
 pub mod dispatch;
 pub mod effect;
 pub mod evaluation;
+pub mod fan_in;
 pub mod goal;
 pub mod guardrails;
 pub mod identity;
@@ -139,27 +140,41 @@ pub use client::{
     RakkaAgentClient,
 };
 pub use dispatch::{
-    workflow_run_id, AgentCompensationExecutor, AgentDispatchAuthority, AgentDispatchDecision,
-    AgentDispatchError, AgentDispatchFuture, AgentDispatchPass, AgentDispatchProbe,
-    AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
+    workflow_run_id, AgentA2aSendExecutor, AgentA2aSendFinding, AgentClaimAppendExecutor,
+    AgentClaimAppendFinding, AgentCompensationExecutor, AgentDispatchAuthority,
+    AgentDispatchDecision, AgentDispatchError, AgentDispatchFuture, AgentDispatchPass,
+    AgentDispatchProbe, AgentDispatchResult, AgentDispatchToolExecutor, AgentDispatchWindow,
     AgentEffectCredentialResolver, AgentEffectReconciler, AgentEntityAuthority,
-    AgentMemoryPromotionExecutor, AgentMemoryPromotionFinding, AgentReconciliationFinding,
-    AgentRunEffectDispatcher, AgentRunResultDelivery, AgentRunSetupResolver,
+    AgentGoalEvaluationExecutor, AgentGoalEvaluationFinding, AgentMemoryPromotionExecutor,
+    AgentMemoryPromotionFinding, AgentReconciliationFinding, AgentRunEffectDispatcher,
+    AgentRunResultDelivery, AgentRunSetupResolver, AgentWorkflowCancelExecutor,
+    AgentWorkflowCancelFinding, AgentWorkflowStartExecutor, AgentWorkflowStartFinding,
     SessionMemoryPromotionExecutor, WorkflowAgentRunEffectSink,
 };
 pub use effect::{
-    compensation_call_id, effect_id_for, external_idempotency_key_for, AgentEffectError,
-    AgentEffectFuture, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
-    AgentEffectResult, AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
+    compensation_call_id, effect_id_for, external_idempotency_key_for, AgentClaimAppendProvenance,
+    AgentClaimAppendRequest, AgentClaimObjectRequest, AgentEffectError, AgentEffectFuture,
+    AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution, AgentEffectResult,
+    AgentEffectSafety, AgentEffectSpec, AgentExternalIdempotencyKey,
     AgentMemoryConsolidationTarget, AgentMemoryPromotionRequest, AgentReconciliationProtocolRef,
     AgentRunEffect, AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest,
     AgentRunEffectSink, AgentRunEffectStatus, AgentToolResult, InMemoryAgentRunEffectSink,
-    AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH, AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS,
-    AGENT_MEMORY_PROMOTION_MAX_ENTRIES, AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES,
-    ATTR_AGENT_EFFECT_ARGUMENT_DIGEST, ATTR_AGENT_EFFECT_EXECUTION_POLICY,
-    ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID, ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL,
-    ATTR_AGENT_EFFECT_SAFETY_CLASS, ATTR_AGENT_EFFECT_SETTINGS_REVISION,
-    ATTR_AGENT_TELEMETRY_LINK_KIND, LINK_KIND_SUPERSEDED_GENERATION,
+    AGENT_CLAIM_APPEND_DEFAULT_MAX_ATTEMPTS, AGENT_CLAIM_APPEND_MAX_EVIDENCE,
+    AGENT_CLAIM_APPEND_OBJECT_MAX_BYTES, AGENT_EXTERNAL_IDEMPOTENCY_KEY_MAX_LENGTH,
+    AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    AGENT_RUN_MAX_PENDING_EFFECTS, AGENT_TOOL_RESULT_MAX_BYTES, ATTR_AGENT_EFFECT_ARGUMENT_DIGEST,
+    ATTR_AGENT_EFFECT_EXECUTION_POLICY, ATTR_AGENT_EFFECT_GENERATION, ATTR_AGENT_EFFECT_ID,
+    ATTR_AGENT_EFFECT_RECONCILIATION_PROTOCOL, ATTR_AGENT_EFFECT_SAFETY_CLASS,
+    ATTR_AGENT_EFFECT_SETTINGS_REVISION, ATTR_AGENT_TELEMETRY_LINK_KIND,
+    LINK_KIND_SUPERSEDED_GENERATION,
+};
+pub use evaluation::{
+    goal_evaluation_record_id, AgentGoalEvaluationError, AgentGoalEvaluationMethod,
+    AgentGoalEvaluationMethodKind, AgentGoalEvaluationOutcome, AgentGoalEvaluationRecord,
+    AgentGoalEvaluationRequest, AgentGoalEvaluationResult, AgentGoalEvidenceRef,
+    AgentGoalStagnationAction, AgentGoalStagnationPolicy, AgentStagnationTrigger,
+    AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS, AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS,
+    AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
 };
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
@@ -169,8 +184,9 @@ pub use guardrails::{
     AGENT_GUARDRAIL_REASON_MAX_LENGTH,
 };
 pub use loop_runtime::{
-    AgentLoopPhase, AgentLoopState, AgentMemoryPromotionRecord, AgentPendingTopUp,
-    AgentRunProposal, AGENT_RUN_MAX_MEMORY_PROMOTIONS, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState, AgentMemoryPromotionRecord,
+    AgentPendingTopUp, AgentRunProposal, AGENT_RUN_MAX_MEMORY_PROMOTIONS,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
 pub use memory::{
     assemble_session_context, check_memory_schema, check_private_memory_schema,
@@ -203,10 +219,13 @@ pub use observability::{
     AgentObservabilityError, AgentObservabilityFuture, AgentObservabilityResult,
     InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
     AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
-    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_WORKFLOW_RESULTS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
@@ -219,10 +238,17 @@ pub use otel::{
     ATTR_RAKKA_AGENT_DELEGATION_ID, ATTR_RAKKA_AGENT_GOAL_ID, ATTR_RAKKA_AGENT_TASK_ID,
 };
 pub use query::{
-    agent_operational_snapshot, agent_task_operational_snapshot, assemble_agent_session_view,
-    next_pending_wake_for_task, AgentCancellationProgress, AgentCheckpointView,
-    AgentOperationalSnapshot, AgentPendingEffectView, AgentSessionSegmentSource,
-    AgentSessionTraceSegment, AgentSessionView, AgentTaskOperationalSnapshot,
+    agent_goal_view_omission_code, agent_operational_snapshot, agent_task_operational_snapshot,
+    assemble_agent_goal_view, assemble_agent_goal_view_bounded, assemble_agent_session_view,
+    authorized_agent_goal_view, next_pending_wake_for_task, AgentCancellationProgress,
+    AgentCheckpointView, AgentGoalAssignmentView, AgentGoalBudgetView, AgentGoalClaimAppendView,
+    AgentGoalClaimFuture, AgentGoalClaimRef, AgentGoalClaimSource, AgentGoalClaimSourceError,
+    AgentGoalContractView, AgentGoalDelegationEdgeView, AgentGoalEvaluationView,
+    AgentGoalFanInView, AgentGoalRunNode, AgentGoalTaskNode, AgentGoalView, AgentGoalViewError,
+    AgentGoalViewOmission, AgentGoalViewResult, AgentGoalWorkflowInvocationView,
+    AgentOperationalSnapshot, AgentPendingEffectView, AgentRunCollaborationView,
+    AgentSessionSegmentSource, AgentSessionTraceSegment, AgentSessionView,
+    AgentTaskOperationalSnapshot, AGENT_GOAL_VIEW_MAX_CLAIMS, AGENT_GOAL_VIEW_MAX_TASKS,
 };
 pub use retrieval::{
     assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
@@ -234,22 +260,31 @@ pub use retrieval::{
 };
 pub use run::{
     agent_run_entity_id, agent_run_entity_persistence_id, agent_run_entity_ref,
-    agent_run_entity_type_key, init_agent_run_entity_remote_sharding,
-    init_agent_run_entity_sharding, ledger_operation_id, load_agent_run_state,
-    passivate_agent_run_entity, promotion_operation_id, proposal_operation_id,
-    registered_agent_run_entity_ref, system_run_clock, AgentRun, AgentRunClock, AgentRunEntity,
-    AgentRunEntityCommand, AgentRunEntityMessage, AgentRunEntityRef, AgentRunEntityRegistration,
-    AgentRunEntityReply, AgentRunEntityShardingSettings, AgentRunEntityStore,
-    AgentRunEntityTypeKey, AgentRunError, AgentRunOperationLog, AgentRunOutcome,
-    AgentRunParticipant, AgentRunProgress, AgentRunResult, AgentRunSettlementStatus,
-    AgentRunSnapshot, AgentRunState, AgentRunStatus, AgentRunTerminalReason,
-    AGENT_RUN_DETAIL_MAX_LENGTH, AGENT_RUN_MATERIALIZED_MAX_BYTES,
+    agent_run_entity_type_key, claim_append_operation_id, evaluation_operation_id,
+    init_agent_run_entity_remote_sharding, init_agent_run_entity_sharding, ledger_operation_id,
+    load_agent_run_state, passivate_agent_run_entity, promotion_operation_id,
+    proposal_operation_id, registered_agent_run_entity_ref, system_run_clock, AgentRun,
+    AgentRunClock, AgentRunEntity, AgentRunEntityCommand, AgentRunEntityMessage, AgentRunEntityRef,
+    AgentRunEntityRegistration, AgentRunEntityReply, AgentRunEntityShardingSettings,
+    AgentRunEntityStore, AgentRunEntityTypeKey, AgentRunError, AgentRunOperationLog,
+    AgentRunOutcome, AgentRunParticipant, AgentRunProgress, AgentRunResult,
+    AgentRunSettlementStatus, AgentRunSnapshot, AgentRunState, AgentRunStatus,
+    AgentRunTerminalReason, AGENT_RUN_DETAIL_MAX_LENGTH, AGENT_RUN_MATERIALIZED_MAX_BYTES,
     AGENT_RUN_MAX_LOOP_STEPS_PER_PASS, AGENT_RUN_MAX_SETTLE_ROUNDS,
     AGENT_RUN_OPERATION_LOG_CAPACITY, AGENT_RUN_STATE_GROWTH_RESERVE_BYTES,
     DEFAULT_AGENT_RUN_ENTITY_TYPE,
 };
 
-pub use goal::{AgentContinuousGoalSpec, AgentEpochSpec, AgentGoalMode};
+pub use goal::{
+    AgentContinuousGoalSpec, AgentEpochSpec, AgentGoalCriteria, AgentGoalCriteriaSource,
+    AgentGoalDecision, AgentGoalDelegationBudget, AgentGoalError, AgentGoalEvaluationRef,
+    AgentGoalExhaustionAction, AgentGoalExhaustionPolicy, AgentGoalMode, AgentGoalObjective,
+    AgentGoalOutcome, AgentGoalResult, AgentGoalSpec, AgentGoalSpecDraft, AgentGoalSpecRevision,
+    AgentGoalState, AgentGoalStatus, AgentGoalStatusView, AgentGoalTerminalDecision,
+    AgentGoalTerminalReason, AgentGoalWaitReason, AGENT_GOAL_EVIDENCE_CLASS_MAX_LENGTH,
+    AGENT_GOAL_MAX_ALLOWED_REFS, AGENT_GOAL_REASON_MAX_LENGTH, AGENT_GOAL_SPEC_MAX_BYTES,
+    AGENT_GOAL_SUMMARY_MAX_LENGTH,
+};
 pub use wake::{
     epoch_admission_operation_id, epoch_result_operation_id, epoch_task_id_for_wake,
     wake_admission_operation_id, wake_id_for_occurrence, AgentActiveWake, AgentBudgetWindow,
@@ -288,13 +323,30 @@ pub use definition::{
     SettingsRevision, SettingsTimingClass, AGENT_DESCRIPTION_MAX_LENGTH,
     AGENT_SETTINGS_MAX_CHANGES,
 };
+pub use delegation::{
+    delegation_cancel_operation_id, delegation_id_for, delegation_result_operation_id,
+    AgentA2aSendReceipt, AgentDelegationCancelOutcome, AgentDelegationCatalog, AgentDelegationCell,
+    AgentDelegationChildResult, AgentDelegationError, AgentDelegationRecord,
+    AgentDelegationResolutionError, AgentDelegationResult, AgentDelegationStatus,
+    AgentDelegationTarget, AgentDelegationToolCall, AgentRunDelegationConfig,
+    AgentRunDelegationEnvelope, AgentTaskDelegationProvenance, StaticAgentDelegationCatalog,
+    AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS, AGENT_A2A_SEND_STATUS_MAX_BYTES,
+    AGENT_DELEGATION_ENDPOINT_MAX_BYTES, AGENT_DELEGATION_ID_PREFIX, AGENT_DELEGATION_MAX_LINEAGE,
+    AGENT_DELEGATION_PROVENANCE_MAX_BYTES, AGENT_DELEGATION_RECORD_MAX_BYTES,
+    AGENT_RUN_MAX_DELEGATIONS,
+};
+pub use fan_in::{
+    evaluate_fan_in, AgentFanInCell, AgentFanInMemberId, AgentFanInPolicy, AgentFanInResolution,
+    AgentFanInToolCall, AGENT_RUN_MAX_FAN_IN_MEMBERS,
+};
 pub use identity::{
-    validate_identity_segment, validate_tenant, AgentDelegationId, AgentEnvironmentRef,
-    AgentGoalId, AgentId, AgentIdentityError, AgentIdentityResult, AgentMemoryNamespace,
-    AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId, AgentRunScope, AgentScope,
-    AgentTaskId, AgentTaskScope, AgentWakeId, KnowledgeSpaceId, TenantId,
-    AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_NAMESPACE_PREFIX,
-    AGENT_PERSISTENCE_SEPARATOR, AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
+    validate_identity_segment, validate_tenant, AgentCommunalClaimId, AgentDelegationId,
+    AgentEnvironmentRef, AgentGoalId, AgentId, AgentIdentityError, AgentIdentityResult,
+    AgentMemoryNamespace, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
+    AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope, AgentWakeId, AgentWorkflowInvocationId,
+    KnowledgeSpaceId, TenantId, AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH,
+    AGENT_MEMORY_NAMESPACE_PREFIX, AGENT_PERSISTENCE_SEPARATOR,
+    AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
     AGENT_TASK_ENTITY_PERSISTENCE_PREFIX,
 };
 pub use schema::{
@@ -303,7 +355,8 @@ pub use schema::{
     CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION, CURRENT_AGENT_DECISION_EVENT_SCHEMA_VERSION,
     CURRENT_AGENT_DEFINITION_SCHEMA_VERSION, CURRENT_AGENT_ENTITY_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_EXCHANGE_ENVELOPE_SCHEMA_VERSION, CURRENT_AGENT_EXCHANGE_JOURNAL_SCHEMA_VERSION,
-    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
+    CURRENT_AGENT_EXCHANGE_REPLY_SCHEMA_VERSION, CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION,
+    CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION, CURRENT_AGENT_LOOP_STATE_SCHEMA_VERSION,
     CURRENT_AGENT_MODEL_TURN_SCHEMA_VERSION, CURRENT_AGENT_RUN_EFFECT_SCHEMA_VERSION,
     CURRENT_AGENT_RUN_STATE_SCHEMA_VERSION, CURRENT_AGENT_SETTINGS_SCHEMA_VERSION,
     CURRENT_AGENT_SETUP_SCHEMA_VERSION, CURRENT_AGENT_TASK_DEFINITION_SCHEMA_VERSION,
@@ -314,13 +367,15 @@ pub use task::{
     agent_task_entity_id, agent_task_entity_persistence_id, agent_task_entity_ref,
     agent_task_entity_type_key, assignment_operation_id, init_agent_task_entity_remote_sharding,
     init_agent_task_entity_sharding, load_agent_task_state, passivate_agent_task_entity,
-    registered_agent_task_entity_ref, run_id_for_assignment, system_task_clock,
-    AgentAcceptedResult, AgentAssignmentGeneration, AgentAssignmentReadiness,
+    registered_agent_task_entity_ref, run_cancel_operation_id, run_id_for_assignment,
+    system_task_clock, AgentAcceptedResult, AgentAssignmentGeneration, AgentAssignmentReadiness,
     AgentAssignmentRefusal, AgentAssignmentRefusalReason, AgentAssignmentStatus,
     AgentBudgetLedgerOutcome, AgentBudgetReturn, AgentBudgetSettlement, AgentBudgetTopUpRequest,
-    AgentContentDigest, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentEpochResult,
-    AgentRunAcceptance, AgentRunAssignment, AgentSchemaId, AgentSchemaRef, AgentTask,
-    AgentTaskClock, AgentTaskContent, AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition,
+    AgentContentDigest, AgentDelegationCancelReceipt, AgentDelegationCancelRequest,
+    AgentDelegationReport, AgentDependencyFailurePolicy, AgentDigestAlgorithm, AgentEpochResult,
+    AgentRunAcceptance, AgentRunAssignment, AgentRunCancelReceipt, AgentRunCancelRequest,
+    AgentSchemaId, AgentSchemaRef, AgentTask, AgentTaskCancellation, AgentTaskClock,
+    AgentTaskContent, AgentTaskCreation, AgentTaskDecision, AgentTaskDefinition,
     AgentTaskDependency, AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome,
     AgentTaskEntity, AgentTaskEntityCommand, AgentTaskEntityMessage, AgentTaskEntityRef,
     AgentTaskEntityRegistration, AgentTaskEntityReply, AgentTaskEntityShardingSettings,
@@ -333,8 +388,12 @@ pub use task::{
     AgentTaskState, AgentTaskStatus, AgentTaskTerminalReason, InMemoryAgentTaskHistoryStore,
     TypedTask, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
     AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE, AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
+    AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE, AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE,
+    AGENT_DELEGATION_RESULT_OUTCOME_PAYLOAD_TYPE, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
     AGENT_EPOCH_RESULT_OUTCOME_PAYLOAD_TYPE, AGENT_EPOCH_RESULT_PAYLOAD_TYPE,
+    AGENT_GOAL_EVALUATION_OUTCOME_PAYLOAD_TYPE, AGENT_GOAL_EVALUATION_PAYLOAD_TYPE,
     AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
+    AGENT_RUN_CANCEL_PAYLOAD_TYPE, AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE,
     AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH, AGENT_TASK_CREATION_OUTCOME_PAYLOAD_TYPE,
     AGENT_TASK_CREATION_PAYLOAD_TYPE, AGENT_TASK_DECISION_PAYLOAD_TYPE,
     AGENT_TASK_DESCRIPTION_MAX_LENGTH, AGENT_TASK_DETAIL_MAX_LENGTH,
@@ -349,10 +408,23 @@ pub use task::{
     DEFAULT_AGENT_TASK_ENTITY_TYPE,
 };
 pub use tools::{
-    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant, AgentExecutionPolicyRouter,
-    AgentGrantDescriptor, AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding,
-    AgentToolDescriptor, AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
+    AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,
+    AgentEnvironmentConcurrencyProtocol, AgentExecutionPolicyRouter, AgentGrantDescriptor,
+    AgentGrantedDispatch, AgentToolAuthority, AgentToolBinding, AgentToolDescriptor,
+    AgentToolError, AgentToolKind, AgentToolRegistry, AgentToolResultBehavior,
     AGENT_DISPATCH_GRANT_DEFAULT_TTL_MS, AGENT_EVALUATED_GUARDRAIL_BOUNDARIES,
     AGENT_TOOL_DESCRIPTION_MAX_LENGTH, AGENT_TOOL_PARAMETERS_MAX_BYTES,
     AGENT_TOOL_REGISTRY_MAX_TOOLS,
+};
+pub use workflow_tool::{
+    child_workflow_run_id, workflow_cancel_command, workflow_cancel_command_id,
+    workflow_invocation_id_for, workflow_result_operation_id, workflow_start_command,
+    workflow_start_command_id, AgentRunWorkflowConfig, AgentWorkflowCancelDisposition,
+    AgentWorkflowChildResult, AgentWorkflowInvocationCell, AgentWorkflowInvocationRecord,
+    AgentWorkflowInvocationStatus, AgentWorkflowStartReceipt, AgentWorkflowTerminalStatus,
+    AgentWorkflowToolDescriptor, AgentWorkflowToolError, AgentWorkflowToolResult,
+    AGENT_RUN_MAX_WORKFLOW_INVOCATIONS, AGENT_RUN_MAX_WORKFLOW_TOOLS,
+    AGENT_WORKFLOW_CANCEL_DEFAULT_MAX_ATTEMPTS, AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE,
+    AGENT_WORKFLOW_INVOCATION_ID_PREFIX, AGENT_WORKFLOW_INVOCATION_RECORD_MAX_BYTES,
+    AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS, AGENT_WORKFLOW_TOOL_DESCRIPTOR_MAX_BYTES,
 };

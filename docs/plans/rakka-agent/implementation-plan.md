@@ -2411,8 +2411,9 @@ Milestone: M4. Acceptance:
 [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4).
 Scenarios owed: 27-34, 39.
 
-Open decisions to resolve: 14 (distinct goal identity — resolved default),
-15 (catalog resolves specialists), 16 (workflow tools).
+Open decisions to resolve: 14 (distinct goal identity — resolved default,
+disposition recorded by slice 4.1), 15 (catalog resolves specialists),
+16 (workflow tools).
 
 ### Slice 4.1 — Goal contract and lifecycle
 
@@ -2429,6 +2430,105 @@ Guidance: [Define the Goal Before Starting the Loop](technical-guidance.md#defin
 Done when: goal lifecycle transitions are covered by unit tests and the goal
 remains addressable while fully passivated.
 
+**Amended as implemented (2026-07-28):**
+
+- **The contract status is orthogonal to the M3 admission gate, and the gate
+  projects one-way onto it.** `AgentGoalStatus` (the spec 8.1 eight-state
+  contract lifecycle) lives on a new goal record; the wake-side
+  `AgentGoalLifecycleStatus` stays exactly the continuous admission gate it
+  was. Where the two overlap, the gate drives the contract in the same
+  compare-and-set (`project_gate_onto_goal`): an observed or commanded
+  expiry → `Expired`, a retirement → `Cancelled` with the structured
+  `Retired` reason (spec 8.1 has no `Retired` status, and spec 9.7 says a
+  structured reason, not a new status — the `AgentTaskTerminalReason`
+  precedent), a suspension parks the goal `Waiting(AdmissionSuspended)`, and
+  a gate resume reactivates only a goal waiting on exactly that suspension.
+  Contract-side transitions drive the gate the other way — a goal-terminal
+  decision retires it, a budget park suspends it — through new
+  provenance-free `suspend_by_policy`/`retire_by_policy` methods, the same
+  class of durable transition as M3's failure-escalation auto-suspend.
+- **The terminal status is derived from the reason, never stored beside it.**
+  `AgentGoalDecision` carries an `AgentGoalTerminalReason` whose `status()`
+  determines the outcome, so an inconsistent outcome/reason pair is
+  unrepresentable. `CriteriaSatisfied` and `CriteriaNotMet` are
+  unconstructible without an `AgentGoalEvaluationRef` that assessed the
+  criteria revision in force — the slice 4.2 hook is the shape of the entry
+  point from day one, and `Satisfied`-by-declaration is refused at the
+  entity surface (spec 8.3). From `Proposed` only `Cancelled` and `Expired`
+  are reachable: no work happened, so no execution failure and no evaluation
+  can exist.
+- **The spec is a bounded component of the root task's record, and identity
+  is composed, not duplicated.** `AgentGoalSpecRevision` (own record kind,
+  fail-closed on load like the wake policy) rides `AgentTask.goal_state`,
+  so every goal transition commits in the root task's one compare-and-set —
+  spec 6.3's coordination without a new entity. The spec serializes under a
+  4 KiB cap with per-collection bounds, which is what keeps a maximal
+  goal-bearing continuous task inside the 32 KiB materialized bound with the
+  growth reserve intact (proven in `task_bounded_state.rs`). Tenant, goal
+  id, root task id, mode, and coordinator run are the task record's own
+  fields, composed around the spec. `allowed_workflows` landed after all —
+  `AgentWorkflowToolId` has been a stable envelope identity since Phase 1,
+  so the planned deferral had nothing to wait for; only stagnation's numeric
+  thresholds wait for 4.2 to define the detector they bound.
+- **Creation institutes the goal, and a `Proposed` goal spends nothing.**
+  `AgentTaskCreation.goal_spec` institutes the goal in the creating
+  transition; the binding defaults to `AgentGoalId::for_root_task` (open
+  decision 14's disposition). The goal's allocation seeds the root escrow
+  narrowed to the definition ceilings — the definition-ceiling → goal →
+  task rung of spec 9.7 with no new machinery. `activate_on_creation`
+  defaults to true (creating the task is the authorization to work);
+  opting out starts the goal `Proposed`, which gates `awaits_assignment`
+  and parks the continuous gate under the `goal-proposed` reason until
+  `ActivateGoal` lifts exactly that park.
+- **Exhaustion policy: park by default, at two trigger points.**
+  `AgentGoalExhaustionPolicy` (default `Park`, per-dimension overrides)
+  is consulted when the root grants a zero top-up in the exhausted conserved
+  dimension, and when an assignment refusal is *permanent* — zero headroom
+  and no outstanding child escrow whose return could restore any. `Park`
+  moves the goal `Waiting` and suspends continuous admission in the same
+  compare-and-set; `Escalate` is the same park with the escalation recorded
+  against the spec's escalation reference (goal-scope HITL is a later
+  slice, and nothing pretends otherwise); `Terminate` fails the goal, the
+  root task (`goal-budget-exhausted`), and the gate together. The M3
+  window-ceiling deferral is deliberately exempt: a window wait relieves
+  itself at the persisted window turn. The run-side contract is untouched —
+  the run still receives the honest zero grant and stops with its original
+  exhaustion.
+- **One `ResumeGoal` door un-parks, and each door owns its wait.**
+  `ResumeGoal` widens the root ledger under the definition ceilings
+  (`AgentEscrowLedger::widen` — grow, cap at the ceiling, never shrink),
+  reactivates the contract, and lifts the goal-driven admission park, in one
+  fenced compare-and-set; a resume that leaves the exhausted dimension
+  without headroom is refused (`task-goal-resume-unrelieved`) rather than
+  re-parking on the next decision. Ownership is fenced both ways
+  (`task-goal-wait-owned-elsewhere`): the gate's resume refuses a budget
+  park, and the goal's resume refuses an admission suspension — without the
+  fence, a gate resume would re-admit spending the contract says is parked.
+- **The settle pass is the goal entry point that always commits.** A goal's
+  own deadline expiry is observed by `settle_side_effects`/
+  `make_local_progress` (skipping the write while nothing would flip),
+  because a command-side observation is discarded with the command's
+  refusal — activate-on-expired refuses `goal-terminal`, and the durable
+  expiry must not depend on a command that succeeds.
+- **A terminal root ends the goal it coordinates — except completion.**
+  Every task-terminal path projects onto a held goal record (cancellation →
+  `RootTaskCancelled`, failures → `ExecutionFailed`), because a terminal
+  coordinator can drive nothing further. `ResultAccepted` deliberately does
+  not: completion is evidence, and only the configured evaluator makes a
+  goal `Satisfied` (spec 8.3) — slice 4.2 wires who may call the decision
+  door. Symmetrically, a failed-and-released run does *not* release its
+  accepted assignment; reassignment/handoff semantics belong to later
+  slices, and `ResumeGoal` honestly reactivates only the contract.
+- **Bookkeeping.** Four new task-history kinds (`GoalActivated`,
+  `GoalParked`, `GoalReactivated`, `GoalDecided`) beside M3's wake-scoped
+  `Goal*` kinds; `AGENT_TASK_MAX_HISTORY_PER_TRANSITION` grew to
+  `max_dependencies + 3` for the creation that also activates a goal; the
+  `rakka.agent.goal.status` counter counts contract transitions by status
+  difference across the committed transition, distinct from the gate's
+  `rakka.agent.goal.lifecycle`; `AgentTaskOutcome`/`AgentTaskSnapshot`
+  carry the goal outcome and view, so replays and `Describe` answer the
+  goal without waking anything.
+
 ### Slice 4.2 — Progress, evidence, and evaluation
 
 Spec: [8.3](spec.md#83-progress-evidence-and-completion).
@@ -2443,6 +2543,99 @@ Guidance: [Verify Progress and Completion](technical-guidance.md#verify-progress
 
 Done when: scenario 30 passes (goal `Satisfied` only after evaluation of the
 current criteria revision against durable evidence).
+
+**Amended as implemented (2026-07-28):**
+
+- **Evaluation is a run-side durable effect, and the exchange is the
+  attestation.** `EvaluateGoal` commits a read-only `Evaluation` effect
+  (`GoalEvaluationCall`, default two attempts) in a deduplicated bounded
+  transition; the application-owned `AgentGoalEvaluationExecutor` judges it;
+  the completed `AgentGoalEvaluationRecord` (own fail-closed
+  `AgentRecordKind::GoalEvaluation`) parks in the run's one durable
+  evaluation cell and crosses to the root task as the eighth
+  `AgentExchangeKind::GoalEvaluation`, owed from durable state under a
+  derived operation id so any crash re-owes the identical exchange. Under a
+  configured `spec.evaluator` the open `RecordGoalDecision` command refuses
+  criteria decisions (`task-goal-decision-unattested`); the exchange —
+  sender-fenced to the currently assigned run
+  (`task-goal-evaluation-forged`) — is the only ingress, and both ingresses
+  share one decision core so their fences can never diverge. A door refusal
+  becomes the exchange's refused reply and settles the cell with the door's
+  code: the caller re-evaluates, never a crash loop.
+- **All five evaluator methods are typed; four execute.** Deterministic
+  assertion, authoritative query, and the evaluator model run through the
+  executor; human review is an `Approval` checkpoint bound to the evaluation
+  effect itself — the digest-bound grant is the verdict, the record carries
+  the resolver and the durable decision as its evidence, a denial is a
+  *failed evaluation* (the goal stays `Active`), and expiry never
+  auto-approves. A verification workflow is refused closed at commit
+  (`run-goal-evaluation-workflow-deferred`) until 4.5 lands
+  workflows-as-tools — the ChildWorkflow autonomy-classifier gap makes
+  anything else unsound now. The evaluator model's "distinct policy" is the
+  request's pinned profile: `authorize_goal_evaluation` resolves it from the
+  request alone against the definition and setup envelopes, so the agent's
+  turn-bound settings profile never clobbers it. A failed evaluation is the
+  second exception (beside memory promotion) to the run's effect-failure
+  wind-down: the coordinator must outlive it so the goal stays decidable.
+- **The decision door grew its remaining fences.** Beside 4.1's revision
+  fence: evaluator identity (`goal-evaluator-mismatch`; `evaluator: None`
+  keeps the 4.1 allow-any-commander contract), required-evidence coverage
+  over the new classed `evidence_items` (`goal-evidence-missing`), and
+  evidence bounds (`AGENT_GOAL_EVALUATION_MAX_EVIDENCE = 16`; a spec
+  requiring more classes than one evaluation may present is refused as
+  statically unsatisfiable). `AgentGoalEvaluationRef` grew additively:
+  evaluation id, method, evidence items, and the SHA-256 attestation digest
+  of the full record — the cryptographic one, never the FNV fingerprint.
+  The new criteria-only `ReviseGoalCriteria` command (fenced on the criteria
+  revision itself, exercising the previously dead
+  `AgentGoalSpecRevision::updated`) makes the staleness fence real; an
+  in-flight evaluation is invalidated purely by that existing fence.
+- **Stagnation detects at the epoch settlement, and only there.** The
+  detector needs no settle-pass observation: no stagnation fact becomes true
+  by time passing, so `record_epoch_progress` accounts each settlement beside
+  the failure streak — completed epochs only, `result_digest` as the
+  repetition fingerprint (previously dropped at settle), streaks and trip
+  counters additive on `AgentGoalLifecycleState`/`AgentWakeCounters`, trips
+  exactly at a set threshold, `RepeatedResult` before `NoProgress`. The
+  thresholds live in `AgentGoalStagnationPolicy` on the spec (disabled by
+  default — the `escalate_after_failures` posture; user-approved), `Replan`
+  is typed but refused at validation until a slice can execute it honestly
+  (user-approved), and the actions execute in `apply_goal_stagnation`, a
+  parallel of the exhaustion executor under the same infallibility
+  obligation: `Continue` records only; `Wait`/`Escalate` park
+  `Waiting(Stagnant)` and close the gate *before* the release so a coalesced
+  occurrence is never promoted; `Terminate` fails goal
+  (`Stagnant` → `Failed`, never `Unsatisfied`), task (`goal-stagnant`), and
+  gate together. `ResumeGoal` owns the wait and performs the one deliberate
+  non-progress reset; widening the gate-resume fence to refuse *any* wait it
+  does not own fixed a real 4.1 gap — a stagnation park (exhaustion-free)
+  would have slipped the old `exhaustion().is_some()` fence and split the
+  two records permanently. Worst-case history stays inside the
+  `max_dependencies + 3` headroom: a terminate settlement records
+  detection + decision + termination + settlement, and stagnation rows are
+  mutually exclusive with failure-escalation rows (one outcome class per
+  settlement).
+- **Deliberately out of scope, documented:** finite-goal stagnation (no
+  epoch signal; the finite root's repeated units are already bounded by
+  rejection/assignment ceilings — delegation slices extend the detector),
+  within-run repetition (the loop's iteration budget bounds it), stale
+  environmental assumptions (needs 4.6's environment surface), goal-scope
+  HITL beyond the evaluation checkpoint, and a post-completion evaluation
+  path: a finite goal's coordinator evaluates before proposing its result —
+  after `ResultAccepted` clears the assignment, the sender fence refuses,
+  and an unevaluated completed root's goal remains decidable by
+  cancellation/expiry until later slices own reassignment.
+- **Bookkeeping.** New audit kinds `GoalStagnationDetected` (repeated
+  fingerprint in the digest slot) and `GoalCriteriaRevised`; `EpochSettled`
+  rows carry the epoch's result fingerprint (history stays observability —
+  the durable counters are the correctness record); the
+  `rakka.agent.goal.stagnation{trigger}` counter counts trips by
+  durable-counter difference (an observe-only `Continue` trip is visible;
+  replays count nothing); `AgentGoalStatusView` gained the configured
+  `evaluator`; the goal-evaluation target class routes as substrate
+  `ToolCall` with target type `"goal-evaluation"` and classifies `Other` in
+  the autonomy catalog — the memory-promotion posture, failing closed under
+  strict autonomy policies.
 
 ### Slice 4.3 — Durable delegation and A2A collaboration metadata
 
@@ -2464,6 +2657,121 @@ Guidance: [Durable Delegation Graph](technical-guidance.md#durable-delegation-gr
 
 Done when: scenarios 28 and 39 pass.
 
+**Amended as implemented (2026-07-31):**
+
+- **Initiation is a model-visible coordination tool; child results defer to
+  4.4.** The loop's `evaluate_model_output` intercepts calls to the one
+  declared coordination tool (wired via
+  `AgentRunEntityStore::with_delegation(AgentRunDelegationConfig)`; the
+  config refuses construction without the `Delegation` capability) and
+  commits the `AgentDelegationRecord` plus its
+  `AgentRunEffectKind::A2aSendCall` effect in one compare-and-set — the
+  record lives in the run's bounded cell map
+  (`AGENT_RUN_MAX_DELEGATIONS = 16`), not on the task, which makes scenario
+  39's "parent task identity and ownership unchanged" a construction
+  property. This slice ends when the child task/run is durably created and
+  the send outcome settles the cell (`ChildCreated`/`Conflicted`/`Failed`);
+  no child→parent result return, no fan-in, no parent wait-for-children, and
+  the continuation-send ingress stays refused. No new exchange kind: the
+  send is an effect through the outbox and `rakka-a2a`, and
+  `AgentOperationKind::{Delegation, A2aSend}` remain reserved — convergence
+  rests on the derived deduplication key through the single task-creation
+  ingress, so a delegated and a plain creation cannot diverge.
+- **Every identity is a pure derivation.** `delegation_id_for(scope, turn,
+  slot)` (the wake-id digest construction) doubles as the A2A message id and
+  the deduplication key; the receiving surface derives the child
+  `AgentTaskId` from the key, so `rakka-a2a`'s id derivation stays out of
+  `rakka-agent` and the child ids fill in from the send receipt. The send's
+  policy defaults idempotent, three attempts, no reconciliation protocol —
+  an ambiguous loss retries safely under the same key. Explicit conflict is
+  a settled cell status: the peer's `task-already-created` maps to
+  `delegation-child-conflict`, and a child answering under another
+  delegation (detected by the projection's `io.rakka.collaboration` echo) to
+  `delegation-child-mismatch`; catalog drift cannot mint a second child
+  because resolution happens once, inside the committing compare-and-set,
+  and replays reuse the recorded `AgentDelegationTarget` verbatim.
+- **Refusals let the run survive (user-approved divergence from the
+  dispatch-authority wind-down).** Parse, cap, skill-narrowing, catalog, and
+  bounds refusals become failed tool results under stable codes; the model
+  corrects course inside the existing iteration/budget ceilings, and
+  stagnation detection catches futile retries. `delegation-not-configured`
+  turned out unreachable and was dropped: an unwired run cannot recognize
+  the tool, so its calls take the generic path where the authority's
+  defense-in-depth refusal `coordination-tool-not-intercepted` (real
+  enforced code, not just structure) answers. `allowed_tools` enforcement
+  joined the slice as approved: goal-scope narrowing rides the new
+  `AgentRunAssignment.delegation` envelope (`AgentRunDelegationEnvelope`,
+  copied from the goal spec at the root or from the child's own
+  `AgentTaskDelegationProvenance`, which also gives every run its
+  lineage/depth so 4.4 enforces ceilings without schema change); an empty
+  set means no narrowing — declaredness is not recorded, so empty-set
+  fail-closed was not implementable honestly.
+- **The extension is one metadata object, not a data part.**
+  `urn:rakka:a2a-extension:collaboration:v1` +
+  `io.rakka.collaboration` carrying `AgentCollaborationMetadata` (the
+  management-extension versioning pattern: version in the URI, schema number
+  in the envelope, fail-closed on every half-formed engagement including the
+  reserved key without the declaration); the message's parts stay the
+  child's input. Ingress converts the envelope to the child's recorded
+  provenance and parent/goal bindings; `escrow` stays `None` — the
+  envelope's budget is advisory provenance because a conserved grant cannot
+  ride A2A (4.4 enforces). `A2AAgentDelegationSendExecutor` implements the
+  `AgentA2aSendExecutor` port in-process over the same service core an
+  external caller uses; `AgentDispatchTargetClass::A2aPeer` accepts the
+  executor-routed tool family so a declared `a2a-peer` target classifies
+  truthfully. Open decision 15's disposition is recorded in spec 21.3.
+- Proof roster: `tests/delegation_record.rs`, `tests/delegation_dispatch.rs`,
+  the `tools.rs` authority pin, the `task_bounded_state.rs` provenance
+  bounds, the substrate's `A2aPeer` classification pin, and `rakka-a2a`'s
+  `tests/collaboration_surface.rs` (scenario 39 end to end and scenario 28's
+  A2A half, the fail-closed matrix, plain-client compatibility, credential
+  hygiene); the whole M3, 4.1, and 4.2 suites pass unchanged.
+
+**Amended after review (2026-08-01):** three review findings closed before
+4.4 builds on this state.
+
+- **Every fence settles the cell.** The in-place fence
+  (`fence_unsent_effects`, reached by cancellation and the failed-effect
+  wind-down) and the winding-down `ConfirmedNotExecuted` reconciliation now
+  settle a fenced send's cell `Failed { run-winding-down }` exactly as the
+  dispatch-layer fence always did — no `Pending` cell can survive under a
+  cancelled effect for 4.4's fan-in to misread as an in-flight child.
+- **Ingress provenance is byte-bounded.**
+  `AgentTaskDelegationProvenance::validate()` enforces
+  `AGENT_DELEGATION_PROVENANCE_MAX_BYTES` (8 KiB, the receiving side of the
+  parent's record bound) besides the lineage cap, so a peer's scope and
+  binding collections cannot inflate the child's durable record; the
+  creation refuses whole under `task-delegation-provenance-invalid`.
+- **`task-already-created` is disambiguated, not presumed a conflict.** The
+  child's deduplication window is bounded
+  (`AGENT_TASK_OPERATION_LOG_CAPACITY`), so an aged-out replay of a
+  delegation's own send earns the same refusal a genuine conflict does. The
+  executor now fetches the held task and compares its collaboration echo
+  first: an echoing child converges as a replay, and only a foreign child is
+  `delegation-child-conflict` — this supersedes the unconditional mapping
+  described in the 2026-07-31 note above.
+- **Delegation admission is priced against the materialized bound.** A
+  committed delegation is held twice in the run's durable record (cell and
+  effect payload), so the interception refuses
+  `delegation-headroom-exceeded` when twice the record's serialized bytes
+  plus a fixed commit overhead would cross the run's remaining
+  `AGENT_RUN_MATERIALIZED_MAX_BYTES` headroom — a failed tool result the
+  model corrects course from, never a committed turn the bound check wedges
+  afterwards on every re-drive.
+- **Refusal text is bounded at the recording door.** A catalog's
+  `Unavailable` refusal carries application text of unchecked length; the
+  refusal tool result passes both code and message through the run's
+  bounded-detail truncation, so an oversized message cannot fail the inline
+  content bound and poison the transition.
+- **Forged parent bindings refuse at the creation door.** The provenance's
+  declared depth must agree with its presented lineage (depth is always the
+  ancestor count plus one; `delegation-depth-incoherent` otherwise — the
+  record enforces the same coherence), and the parent run must live in the
+  child's own tenant. 4.4's ceiling and cycle enforcement reads these fields
+  as validated inputs, never as peer assertions. The envelope's `allowed_*`
+  rustdoc now states the enforced empty-means-no-narrowing semantics, and
+  `create_task`'s doc comment is back on `create_task`.
+
 ### Slice 4.4 — Fan-out/fan-in, lineage, and coordinator limits
 
 Spec: [8.4](spec.md#84-specialization-and-durable-delegation),
@@ -2476,6 +2784,121 @@ Spec: [8.4](spec.md#84-specialization-and-durable-delegation),
   lineage-based cycle rejection.
 
 Done when: scenarios 27 and 34 pass, including coordinator loss and resume.
+
+**Amended as implemented (2026-08-02):**
+
+- **The cells are the membership; the group is one cell beside them.**
+  `AgentFanInCell` on the loop state opens in the same CAS as the first
+  committed delegation — the policy (`AgentFanInPolicy::{All, Any, Quorum}`,
+  non-exhaustive for the deferred policy-evaluator variant) comes from the
+  goal spec's new `fan_in` field or the wiring's `default_fan_in`, never
+  model output, so "fixed in durable state before results are accepted" is a
+  construction property with no early-result window. The model's second
+  declared coordination verb (`with_fan_in_tool`; closed vocabulary carrying
+  only an optional deadline) closes membership; the run rests in the new
+  `AwaitingChildren` phase under status `Running` (the documented honest
+  non-residency status — no new `AgentRunStatus`), holding no effect and no
+  residency; a resolved group is absorbing and the next delegation replaces
+  it, so sequential rounds are one cell, not a history. `evaluate_fan_in` is
+  a pure function of durable cells + policy + parent-side `timed_out` marks;
+  the bounded resolution table (no child content, no repeated child ids, the
+  reason codes truncated — the growth-reserve test caught the unbounded
+  shape) answers the awaiting call, and the model still proposes: fan-in
+  never completes the parent task. `FireFanInDeadline` marks stragglers
+  timed out and resolves; chasing them is 4.6.
+- **Result return = ninth exchange, user-approved divergence from spec
+  8.4's letter.** `AgentExchangeKind::DelegationResult`, child task → parent
+  run over the courier (the epoch-result template verbatim): owed exactly
+  once from the transition that closes the terminal child's ledger, pure
+  operation id `delegation_result_operation_id(tenant, delegation)`,
+  `AgentDelegationReport` references only. Parent-side fences: sender must
+  be the very child the cell created; `Pending` cell → `delegation-result-
+  early` (re-drivable); settled-non-created → `-not-owned`; unknown →
+  `-unknown-delegation`/`-unknown-run`; the cell's `result` field is the
+  first-writer-wins durable fence past the journal window; a terminal or
+  winding-down parent records evidence and resumes nothing. The child-side
+  settle rule advances only on the four definitive codes. The 9.8
+  failure-window table lives on the kind's rustdoc. The remote A2A carrier
+  (a collaboration result envelope + the `ContinueTask` lift) is reserved
+  for federation, when a remote forward executor exists at all.
+- **Limits split by conservation.** Descendants is the 8th conserved
+  `AgentBudgetDimension`: seeded at `create_task` from min(goal spec,
+  definition's new `AgentTaskDefinition.delegation` ceilings — the forged-
+  root-child defense, approved in-slice — spec allocation), escrowed
+  task→run via the existing `open_child`, spent 1 + `granted_descendants`
+  per live cell at the door (settled-failed sends release; pending counts),
+  folded into consumption once at `terminate` so the existing ledger
+  exchanges conserve it across generations. The new `WORK` set keeps
+  `first_empty_for` from refusing assignments over `descendants: Some(0)`
+  (verified hazard). Depth/fan-out/concurrency stay door checks off the
+  envelope + cells, priced per planned call; `max_concurrent` re-documented
+  as per-run unsettled direct children. The even-split sub-quota crosses
+  A2A as the child's narrowed `max_descendants` (a validated cap the child's
+  seed min-narrows below its own ceilings — never a conserved grant);
+  credit-back of unused sub-quota is deliberately off, `descendants_created`
+  recorded on the cell for a later slice.
+- **Cycle rejection reads a validated ancestor-agent chain.** Lineage
+  entries are delegation digests, so the parallel `ancestors: Vec<AgentId>`
+  (record/provenance/envelope/collaboration metadata; skip-if-empty keeps
+  root sends v1-wire-compatible, deeper chains fail closed cross-version;
+  coherence `len == lineage.len()` enforced at every door,
+  `delegation-ancestry-incoherent`) is what makes direct and indirect
+  rejection implementable: resolved target ∈ ancestors ∪ {own agent} →
+  `delegation-cycle-detected`. An unaccounted chain (pre-4.4 parent) works
+  but cannot sub-delegate (`delegation-ancestry-unknown`). The bounded-
+  iterative escape hatch stays deferred, refusal-only.
+- **A failed send became a fan-in disposition.** With every delegation now a
+  group member, a definitive send failure settles the cell, reaches the
+  model as the call's failed tool result, and the coordinator survives —
+  superseding 4.3's unconditional wind-down (which still governs sends
+  outside any fan-out group). Membership alone is the test, never a
+  still-unresolved group: an `Any` satisfied by its first child while a
+  sibling's send was still in flight must not be wound down by that
+  straggler's later failure. `delegation_dispatch.rs`'s conflict test pins
+  the survival, and `fan_out_fan_in.rs`'s post-resolution straggler pins the
+  resolved-group half.
+- Proof roster: `tests/fan_out_fan_in.rs` (scenario 27's loop and fabric
+  halves, with real child task entities and re-driven settles),
+  `tests/delegation_limits.rs` (scenario 34's six classes, each fail-closed
+  and re-derived across the fixture's per-command restarts), the pre-4.4
+  decode pin, the two-part growth-reserve/door-price empirical test,
+  `fan_in.rs`'s policy/order-invariance units, and
+  `collaboration_surface.rs`'s ancestors round-trip and forged-ancestry
+  refusals. Owed onward: snapshot/projection views (4.7), cancellation
+  propagation and straggler chase (4.6), workflow members reusing the
+  member-disposition interface (4.5), descendant credit-back, and the
+  federated A2A result carrier.
+- **Review fixes (2026-08-03).** Four findings closed after review: (1) an
+  `AssignmentsExhausted` terminal now owes the child's terminal reports from
+  the terminating transition, and a run-refused generation releases its
+  escrow at its settle — without both, an `All` parent with no deadline
+  parked forever over a definitively failed child; (2) the planner refuses a
+  delegation planned after the same turn's await (`delegation-after-await`)
+  — the orphan member would have revived the superseded wind-down;
+  (3) `delegation_envelope_for` grew a third, definition-only arm so epoch
+  and plain tasks enforce `AgentTaskDefinition::delegation` at the door;
+  (4) `create_task` refuses a creation carrying both a goal spec and
+  delegation provenance, closing the lineage re-rooting door. Pinned by
+  `an_assignments_exhausted_delegated_child_owes_its_delegation_result`,
+  `a_delegation_planned_after_the_await_is_refused_and_the_run_survives`,
+  `a_plain_tasks_definition_ceilings_enforce_at_the_door`, and
+  `a_delegated_creation_carrying_a_goal_spec_is_refused`.
+- **Minor-findings pass (2026-08-04).** A model-supplied await deadline must
+  lie in the future (`fan-in-invalid-arguments` otherwise; the envelope
+  bound stays trusted); a direct `settle_side_effects` sweep counts its
+  fan-in resolution (public wrapper + unsampled inner pass); the
+  `FireFanInDeadline` rustdoc states the hosting application owes the
+  scheduler — record that obligation wherever ops docs grow; the goal
+  door's quorum bound delegates to `AgentFanInPolicy::validate`;
+  `satisfied_by` documented as timing-dependent evidence. Coverage added:
+  quorum through the run entity, deadline-vs-late-result absorption, uneven
+  sub-quota split per slot, conflicting-duplicate first-writer fence, exact
+  forged-report codes, wound-down pinned by phase+effects, duplicate
+  deadline counts once, pre-4.4 run-state decode, ancestors-key-omitted
+  wire decode. Still owed from the review: a descendants-conservation test
+  across an actual replacement generation (the terminal fold is pinned;
+  driving a real second generation through a failed run is not), and
+  crash-point sweeps over the new fan-in compare-and-sets.
 
 ### Slice 4.5 — Workflows as tools
 
@@ -2494,6 +2917,95 @@ Guidance: [Workflows as Tools](technical-guidance.md#workflows-as-tools).
 Done when: scenario 32 passes (replayed invocation adopts one child run, no
 duplicated internal effects).
 
+**Amended as implemented (2026-08-04):**
+
+- **Create-or-adopt is an identity property, not a protocol.** The
+  interception commits — in one CAS, the 4.3/4.4 discipline — the
+  `AgentWorkflowInvocationRecord`, its cell, its fan-in membership, and the
+  new `WorkflowStartCall` effect. The derived
+  `workflow_invocation_id_for(scope, turn, slot)` (delegation-digest
+  construction, disjoint `workflow-invocation-` prefix) *is* the child
+  workflow run id and the `StartRun` deduplication key, and the command id
+  (`{invocation}#start-run`) is **generation-free**: a reconciled new effect
+  generation re-derives the identical `StartRun`, so recovery can never mint
+  a second child run — the scenario-32 keystone. The descriptor's shape
+  (version, digest, workflow type and definition version) is copied at
+  commit; a replay never re-resolves, and a mid-flight descriptor upgrade is
+  a `Conflict`, never an adopt (dedup-key match under a foreign command id
+  likewise). The effect is the start, never the workflow; it completes at
+  the durable start receipt, and the wait is fan-in membership.
+- **The model surface is the config map, not the registry.** Each configured
+  `AgentWorkflowToolDescriptor` (in `AgentRunWorkflowConfig`, wired via
+  `with_workflow_tools`) appears as its own named tool; the planner
+  intercepts by map lookup after the coordination arm and before the goal
+  tool narrowing. A kind-`Workflow` registry entry that reaches generic
+  dispatch refuses `workflow-tool-requires-interception` — defense in depth.
+  The dead placeholders now enforce: `workflow_tools` on the envelope
+  per attempt (`undeclared-workflow-tool`), `allowed_workflows` at the door
+  (`goal-workflow-not-allowed`) via the delegation envelope.
+- **Workflow members reuse the member-disposition interface** (the 4.4 owed
+  item): `AgentFanInMemberId` widens members/timed-out/satisfied-by as raw
+  prefixed id strings — a delegation-only 4.4 group round-trips
+  byte-identically, and a pre-4.5 node reading a mixed group parks
+  deny-when-unknown: the load-bearing cross-version fence, since a turn's
+  effects clear when it records (while retained, the `workflow-start`
+  request variant additionally fails a pre-4.5 binary loudly as
+  unknown-variant). No schema bump. One group, one
+  CAS join, `AwaitingChildren` reused, `workflow-after-await` mirrors 4.4's
+  refusal, combined membership bounded at both doors, failed/conflicted/
+  unwired starts are surviving fan-in dispositions, wind-down fences settle
+  unsent starts' cells. Deliberate: workflow invocations never debit
+  `Descendants` (no agent-task creation path; `descendants_created`
+  recorded for a later credit fold) and never count against
+  `max_concurrent` (delegation-envelope ceiling; the membership bound is
+  the cap until a descriptor-level ceiling exists).
+- **The result path is an entity command, not a tenth exchange.** A workflow
+  run is not a choreography participant, so
+  `AgentRunEntityCommand::RecordWorkflowResult` (pure
+  `workflow_result_operation_id(tenant, invocation)`; the hosting
+  application owes the relay, the `FireFanInDeadline` obligation idiom)
+  carries the terminal status, bounded reason, and result reference/digest.
+  Refusals are non-committing errors (`workflow-result-unknown-run`/
+  `-unknown-invocation`/`-forged`/`-not-owned`; non-terminal statuses are
+  unrepresentable), duplicates answer from the journal and the cell's
+  first-writer-wins result behind it, a wound-down parent records evidence
+  and resumes nothing — and there is deliberately **no early window**,
+  diverging from `delegation-result-early`: the child's identity is derived
+  at commit, so an early result authenticates against the record and
+  records first-writer-wins while the receipt settles the effect
+  independently.
+- **The classifier gap is closed minimally.**
+  `AgentAutonomyTargetClass::ChildWorkflow` is first-class
+  (`from_dispatch_class`, `from_label`, phase-5 catalog under
+  `DeduplicationKey` idempotency, policy allowance, concurrency seed);
+  dispatcher registration and the compiled-plan node stay out of scope, and
+  an unregistered class still fails closed. `VerificationWorkflow` stays
+  refused (`run-goal-evaluation-workflow-deferred`), re-worded to name the
+  remaining work: bridging the evaluation cell to this invocation path.
+- Proof roster: `tests/workflow_tool.rs` — the derived-identity commit, the
+  scenario-32 crash sweep (one invocation/child-run/`StartRun` identity
+  across every owner-loss window's executor sightings), the end-to-end
+  adopt over a **real** child `AgentRunInbox` (replayed invocations
+  deduplicate in the child's own durable inbox before and after its one
+  internal step executes exactly once; the relayed result resumes the
+  parent to completion), duplicate/conflicting/forged/not-owned results,
+  the no-early-window proof, the wound-down parent, the after-await and
+  goal-narrowing refusals, the mixed group, and the pre-4.5 decode +
+  wire-tag pins; `fan_in.rs` member round-trip/prefix/mixed-group units;
+  `workflow_tool.rs` (src) identity and bounds units; the classifier pins
+  in `rakka-agent-workflow`. Owed onward: cancellation propagation to child
+  workflows (4.6), the evaluation-cell bridge for `VerificationWorkflow`,
+  descriptor-level concurrency ceilings, descendant credit for
+  `descendants_created`, a combined-membership 17-member integration sweep
+  (the bound is door-enforced and unit-covered; a full 17-effect turn
+  exceeds the per-turn effect bound), snapshot/projection views (4.7), and
+  an envelope-side per-workflow-tool capability declaration — the review
+  pass made `required_capabilities` flow (copied onto the record at commit,
+  carried on the dispatch grant per attempt), but the definition envelope
+  declares workflow tools by id only, so the regular tool declaration's
+  capability *subset* check has no definition-side set to check against
+  yet.
+
 ### Slice 4.6 — Cancellation propagation and shared environment
 
 Spec: [8.7](spec.md#87-cancellation-failure-and-waiting),
@@ -2509,6 +3021,138 @@ Spec: [8.7](spec.md#87-cancellation-failure-and-waiting),
 
 Done when: scenarios 29, 31, and 33 pass.
 
+**Amended as implemented (2026-08-05):**
+
+- **Propagation is edges over the vocabulary M1 already fixed.**
+  `AgentCancellationProgress` needed only its `Propagating` arm — the run
+  derivation reads `awaits_children()`, the new subtree half of the
+  quiescence condition — and the progress model stays a pure derivation of
+  durable record, never a stored enum. Four legs: goal → root task is
+  intra-entity (the settle pass's new `settle_requested_cancellation` step,
+  directly after `observe_goal_deadline`, converts any terminal goal
+  decision in the cancel/expiry families —
+  `AgentGoalTerminalReason::requests_root_cancellation()` — into the root's
+  request, so operator cancel, retirement, and deadline expiry ride one
+  chokepoint); task → run is the tenth exchange `RunCancel` (owed only
+  after durable acceptance — the Offered-window race fix); parent run →
+  child task is the eleventh exchange `DelegationCancel` (in-fabric, the
+  `DelegationResult` precedent; A2A carrier reserved for federation);
+  parent run → child workflow is the `WorkflowCancelCall` effect
+  (generation-free `"{invocation}#cancel-run"`, the start's discipline,
+  gated on `supports_cancellation` with durable
+  `Unsupported`/`Unaffordable` cell dispositions when no effect may exist).
+  The child's `DelegationCancel` arm calls the same request core and owes
+  its own `RunCancel` onward — recursion is the machinery re-entering.
+- **The task defers; the ledger is the finalization gate.** The
+  pre-existing gap — `Cancel` terminalized the task over a run holding an
+  indeterminate effect — closed: the nonterminal `AgentTaskCancellation`
+  marker decides the goal and closes admission at request time, fences
+  assignment (`awaits_assignment`) and proposals (`task-cancel-requested`,
+  definitive), and finalizes through the existing `terminate` only when
+  `escrow.outstanding()` is empty — budget settlement travels only after a
+  known terminal run outcome, so ledger closure is durable proof of
+  quiescence and no new "run terminal report" exchange exists. A task with
+  no live generation finalizes in the requesting transition. Run-side,
+  `settle_run_disposition`'s winding-down branch gained
+  `awaits_children()`: a cancelling parent rests until every delegation and
+  workflow cell holds a terminal outcome, the last child result
+  terminalizes it (settle tails at `accept_delegation_result` and
+  `record_workflow_result`), and a child parked in reconciliation holds the
+  ancestry nonterminal — scenario 31's "never falsely claim their started
+  effects stopped", with the child's view `WaitingForReconciliation` and
+  the parent's `Propagating`.
+- **The chase is one pure condition.** A created, unsettled child is chased
+  when the run winds down under a cancellation *or* when the resolved
+  fan-in group left it unresolved — which makes `FireFanInDeadline`'s
+  timed-out stragglers and an early `Any`/`Quorum` satisfaction's losers
+  the same case with zero plumbing, since `owed_run_exchanges` runs after
+  every transition. Owed cancels never set `terminal_reason`, so a chase
+  cannot wind a satisfied coordinator down; the cell's settled
+  `AgentDelegationCancelOutcome` / `AgentWorkflowCancelDisposition` is the
+  durable once-guard past the journal's bounded ring and the request's
+  observable outcome. Wind-down dispatch fences became kind-based
+  (`exempt_from_wind_down_fence`: compensation + workflow cancel), fixing
+  the claim-path fence's missing `CompensationCall` exemption alongside.
+- **Revocation stays honest.** A revocation-driven goal decision rides the
+  same propagation; per-agent `RevokeTool`/`RevokeCredentialBinding` stays
+  pull-at-next-dispatch (already immediate for every agent's own
+  dispatches, descendants included); agent lifecycle Suspend/Terminate
+  fan-out needs an agent→run registry and stays deferred, as do the
+  dependents-registry sending half (re-pointed at 5.4), per-delegation
+  child-side deadline enforcement, and descendant credit-back.
+- **The environment contract is declaration + protocol + per-attempt
+  doors.** `AgentToolDeclaration.environments` (observe *is* `ReadOnly` —
+  no second mode axis), `AgentEnvironmentConcurrencyProtocol` on the
+  binding (no fail-open variant; required at registration exactly when a
+  mutating tool names an environment; `Environment`-kind descriptors must
+  name one), ordered authority checks (binding ⊆ declaration ⊆ definition
+  envelope, `setup-excludes-environment`, `goal-environment-not-allowed`)
+  with the goal scope reaching the authority through the run's delegation
+  envelope on the context; the adapter-side rules are the trait contract —
+  Rakka cannot enforce the external protocol. Scope projection: envelope
+  `environments` is a narrowing (empty = none), envelope
+  `knowledge_spaces` is a fail-closed grant (`Option`; `None` under
+  lineage refuses — the ancestry-gap posture), the catalog's explicit
+  `AgentDelegationTarget.knowledge_spaces` intersects the parent's grant
+  at the interception door, and both ride the record, the provenance, and
+  the A2A metadata skip-if-empty.
+- **Scenario 33 is a command-initiated effect (user-approved).**
+  `AppendClaim` → `ClaimAppendCall`, the `PromoteMemory` idiom: provenance
+  stamped from durable run identity in the committing transition (agent,
+  goal, task, run, delegation = envelope lineage tail), space validated at
+  the door (`run-claim-space-not-delegated`) and per attempt at the
+  authority; the executor trait lives in `rakka-agent`
+  (`AgentCommunalClaimId` is a mirror newtype — the dependency runs
+  graph → agent) and the graph crate ships
+  `KnowledgeGraphClaimAppendExecutor`, deriving the store operation from
+  the intent's external idempotency key so a generation's attempts converge
+  on one claim and a re-decided generation is a new one. The pre-derived
+  `claim_promotion_*` ids stay untouched for the deferred promotion-gate
+  flow; the model-visible claim tool, communal retrieval and the
+  `SnapshotCommunalClaim` shape, per-claim read-capability enforcement,
+  and claim metrics stay deferred.
+- **Review pass (2026-08-05).** Four liveness holes in the new quiescence
+  machinery closed: the fired-deadline chase (the deadline marks its
+  stragglers `timed_out` *before* resolving, so reading `unresolved_members`
+  chased nobody — the chase set is now `unreported_members`, unresolved **or**
+  timed out); a definitively-refused delegation-cancel now releases its cell
+  from `awaits_children` and re-checks the disposition in that settle, where
+  before a child that could never report held the parent `Cancelling` forever
+  with its escrow open; `commit_workflow_cancels` refuses to commit on a
+  terminal run and stops at the outstanding-effect bound rather than
+  overflowing it into a transition that re-aborts forever; and
+  `fence_unsent_effects` now honours `exempt_from_wind_down_fence`, with an
+  already-winding-down run answering a re-driven run-cancel idempotently, so a
+  re-entered wind-down cannot fence the compensation or workflow-cancel the
+  first one authorized. Two ingresses that still terminalized over a live run
+  — a failed dependency, and a proposal refused by the cancellation fence —
+  now take the request path (`AGENT_TASK_REFUSAL_CANCEL_REQUESTED` is the
+  run-side constant, the stale-generation precedent). `derive_task` reads the
+  snapshot's new `outstanding_escrow` rather than the assignment alone (a
+  cancelled continuous root between epochs was reporting `Quiesced` over
+  running epochs); `AgentClaimAppendRequest::validate` gained its
+  `confidence_bps` range check; and the `RecordWorkflowResult` relay is
+  documented as load-bearing for cancellation — unwired, a workflow-invoking
+  deployment cannot complete one, which is 8.7's own posture, with the command
+  itself being the "explicit reconciliation decision" 8.7 names as the way
+  out. Coverage added for the environment/knowledge authority doors, the
+  graph-backed append executor (new
+  `rakka-agent-knowledge-graph/tests/claim_append_executor.rs`), the widest
+  provenance with both scope sets full, the door price with the cell's cancel
+  outcome, the fired-deadline chase, and the dependency deferral.
+- Proof roster: `tests/cancellation_propagation.rs` (the scenario-31 spine
+  over real child entities with the send-log pinning scenario 29's
+  at-most-once half; receiver fences; settle-pass expiry propagation; the
+  `Any`-resolution chase), `tests/communal_claim_append.rs` (the stamp,
+  the doors, replay convergence, the delegated grant), the
+  `concurrent_specialist_append_provenance` conformance clause across both
+  backends plus the racing two-connection PostgreSQL append proof, the
+  environment-contract registration units, and the honest-semantics
+  updates in `goal_contract.rs`, `task_entity.rs`, and
+  `workflow_tool.rs`. Owed onward: snapshot/projection views (4.7), the
+  crash-point sweeps over the new task-cancellation compare-and-sets, and
+  the deferrals above.
+
 ### Slice 4.7 — M4 acceptance and goal views
 
 Spec: [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4),
@@ -2521,6 +3165,101 @@ Spec: [Multi-Agent Goal Milestone](spec.md#multi-agent-goal-milestone-m4),
   the evaluator.
 
 Done when: the multi-agent milestone checklist is demonstrated end to end.
+
+**Amended as implemented (2026-08-06):**
+
+- **The goal view is one bounded assembly over durable state, in `query.rs`.**
+  `assemble_agent_goal_view` resolves the root by the recorded
+  open-decision-14 default (goal identity = root task value; any other goal
+  id answers absent, documented), walks breadth-first over the delegation
+  cells' `ChildCreated` edges plus a continuous root's admitted epochs
+  (epoch refs live only while their occurrence is active — a released epoch
+  is history, owned by the task projection), and joins children fail-closed:
+  provenance not naming the traversing delegation, a foreign goal binding, a
+  missing record, or an unreadable schema each become a stable
+  `AgentGoalViewOmission` code rather than a joined forgery or a failed
+  view; only the root record failing fails the call. The view is documented
+  as a causal cut, never a snapshot: per-node durable revisions,
+  `root_revision` as the one fence-able anchor, `records_read` +
+  `observed_at` as the multi-read freshness statement, and a MUST-NOT on
+  authorizing or advancing execution. Node budget
+  `AGENT_GOAL_VIEW_MAX_TASKS = 64`, truncate-with-marker (never refuse),
+  plus `assemble_agent_goal_view_bounded` clamped to `1..=64` — the seam
+  that makes the truncation path testable and cheaper views possible.
+- **Each task resolves its highest-generation run even after completion.**
+  `ResultAccepted` clears the assignment, so the walk re-derives the last
+  run from `assignee` + `assignment_generation` when the assignment is gone
+  — found by the acceptance walk itself: a *completed* goal reconstructed
+  nothing, exactly when reconstruction matters. Earlier generations stay an
+  explicit gap (the node's generation counts surface it); full run history
+  is the 17.18 task projection's job, later work.
+- **Authorization = the owner check the record can answer (user-approved).**
+  `authorized_agent_goal_view` fences on `AgentGoalSpec.owner`; a non-owner
+  gets `Ok(None)` byte-identical to a missing goal (proven against the
+  absent-goal and child-task-id-probe answers), short-circuiting after the
+  root read. The principal-free core remains the composition point for a
+  boundary authorizer; an `A2AOperation`-gated wire surface + typed-client
+  query stay recorded follow-ups.
+- **The 4.3-4.6 snapshot debt is one shared derivation.**
+  `AgentRunCollaborationView` (delegation edges, fan-in with the
+  `unreported_members` chase set, workflow invocations, the evaluation view,
+  retained claim-append effects) is carried by `AgentOperationalSnapshot`
+  (serde-defaulted; pre-collaboration snapshots serialize unchanged — the
+  `skip_serializing_if` keeps old bytes byte-identical) and by the goal
+  view's run nodes, so the run-scoped query and the goal view can never
+  disagree. Redaction follows 17.14: delegated input, credential/capability
+  refs, proposals, results, and the objective summary never ride a view;
+  digests and stable codes do.
+- **Shared-knowledge references are a port with honest degradation
+  (user-approved in scope).** Settled claim receipts are pruned at
+  `clear_turn`, so the view carries three layers: the goal's grant
+  statement, retained `ClaimAppendCall` effect views, and the joined
+  `AgentGoalClaimSource` port — implemented by
+  `KnowledgeGraphGoalClaimSource` beside the append executor (graph → agent
+  dependency direction), serving explicitly named spaces over
+  `ClaimFilter::with_goal`. Absent/failing source ⇒ `claims_available:
+  false` with the durable half intact (scenario 56's shape).
+- **The sharded run factory gained the coordination wiring** —
+  `AgentRunEntityShardingSettings::with_delegation`/`::with_workflow_tools`,
+  plumbed into every hosted run; before this no sharded deployment could
+  serve the delegation or workflow-tool interception at all (the milestone
+  example was the first deployment-shaped consumer). The testkit's
+  `InProcessRunResultDelivery` gained the matching `with_delegation` — the
+  delivered model result is where a fan-out turn is intercepted.
+- **The milestone's done-when is `examples/multi-agent-goal-acceptance`**:
+  an 18-line transcript pinned three ways (README, `EXPECTED_TRANSCRIPT`,
+  `tests/acceptance.rs`) walking every checklist bullet — three sharded
+  agents over real `ClusterSharding`; one fan-out turn committing two
+  delegations + one workflow invocation + a closed three-member group; real
+  children through the in-process `rakka-a2a` service core with a replayed
+  send converging on the deduplication key; a registry-validated compiled
+  refund workflow over a real durable child inbox, replay-adopting the same
+  child with the compiled step executed exactly once; the wait fully
+  passivated; root pod loss (killed result write, redelivered by the
+  child's re-driven settle) and child pod loss (non-idempotent payment
+  invoked once, parked Indeterminate, resolved by a deduplicated
+  reconciliation decision); a provenance-stamped communal claim;
+  `Satisfied` only through the configured evaluator after
+  `task-goal-decision-unattested` refused the direct decision; and the
+  authorized goal view reconstructing the whole tree, with content
+  sentinels absent from every queried surface. Wiring facts the walk
+  enforced: the definition envelope must declare a workflow tool for the
+  invocation to commit (`undeclared-workflow-tool`), a specialist's
+  envelope must grant a knowledge space for its append to dispatch
+  (`widened-knowledge-access`), and sharded asks racing a
+  passivation-in-progress retry exactly as a caller does across a shard
+  handoff.
+- Proof roster: `tests/goal_view.rs` (13 tests: assembly, restart
+  determinism, redaction sweep, existence-safe denial, truncation, partial
+  children, failed-send edges, schema fail-closed/omit split, epoch join
+  and release, evaluation + terminal decision, claim join + degradation),
+  the operational snapshot's collaboration assertion, the graph crate's
+  `tests/goal_claim_source.rs`, and the acceptance example's triple-pinned
+  transcript. Owed onward: the goal view's A2A/typed-client wire surface,
+  crash-point sweeps over the 4.6 task-cancellation compare-and-sets
+  (Phase 6.1), earlier-generation run assembly, and the M5
+  teams/conversations dimensions the `#[non_exhaustive]` views keep
+  additive.
 
 ---
 

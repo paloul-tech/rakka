@@ -124,10 +124,12 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         assignee: Some(agent_id()),
         goal: None,
         goal_mode: Default::default(),
+        goal_spec: None,
         parent: None,
         dependencies,
         escrow: None,
         wake: None,
+        delegation: None,
         telemetry: Default::default(),
     }
 }
@@ -767,6 +769,104 @@ async fn a_run_that_refuses_its_assignment_retires_the_generation_and_leaves_the
     );
 }
 
+/// A delegated child that exhausts its assignments owes its delegation result
+/// from the terminating transition: each refused generation's escrow was
+/// released at its settle, so the terminal ledger is closed and the report is
+/// accurate — and under an owner that cannot answer the kind it stays
+/// outstanding for re-drive rather than vanishing.
+#[tokio::test]
+async fn an_assignments_exhausted_delegated_child_owes_its_delegation_result() {
+    let fx = Fixture::new(RunAcceptanceProbe::refusing());
+    fx.instantiate_agent().await;
+
+    let parent_run = AgentRunScope::new(
+        tenant(),
+        agent_id(),
+        AgentRunId::new("delegating-run").expect("run id should be valid"),
+    )
+    .expect("run scope should be valid");
+    let delegation =
+        rakka_agent::delegation_id_for(&parent_run, 1, 0).expect("the delegation id derives");
+    let mut delegated = creation(Vec::new());
+    delegated.delegation = Some(Box::new(rakka_agent::AgentTaskDelegationProvenance {
+        environments: Default::default(),
+        knowledge_spaces: Default::default(),
+        delegation,
+        parent_task: AgentTaskId::new("parent-task").expect("task id should be valid"),
+        parent_run,
+        lineage: Vec::new(),
+        ancestors: Vec::new(),
+        depth: 1,
+        requested_skill: rakka_agent::AgentCapabilityId::new("summarize")
+            .expect("capability id should be valid"),
+        capability_scopes: Default::default(),
+        credential_bindings: Vec::new(),
+        result_schema: None,
+        budget: None,
+        deadline: None,
+    }));
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(delegated),
+        })
+        .await,
+    );
+
+    // The creation decided generation one; two sweeps decide the second and
+    // third refused generations, and the next decision exhausts the limit.
+    fx.settle().await;
+    fx.settle().await;
+    let deliveries_before = fx.run_transport.deliveries();
+    let exhausting = fx.try_settle().await;
+
+    let exhausted = fx.snapshot().await;
+    assert_eq!(exhausted.status, AgentTaskStatus::Failed);
+    assert_eq!(
+        exhausted
+            .terminal_reason
+            .as_ref()
+            .map(rakka_agent::AgentTaskTerminalReason::code),
+        Some("assignments-exhausted")
+    );
+
+    // Every refused generation's escrow was released at its settle: the
+    // terminal ledger holds nothing outstanding, which is exactly the gate
+    // the owed report reads its final consumption through.
+    let state = load_agent_task_state(&fx.tasks, &task_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads")
+        .expect("the task exists");
+    assert_eq!(
+        state
+            .task()
+            .expect("the task was created")
+            .escrow
+            .outstanding()
+            .count(),
+        0,
+        "a refused generation must not leak its escrow"
+    );
+
+    // The terminating sweep owed and delivered the delegation result; the
+    // probe predates the kind, so its refusal is unsettleable and the sweep
+    // surfaces it while the exchange stays outstanding.
+    assert!(
+        exhausting.is_err(),
+        "the owed report's refusal is the receiver's inability, surfaced loudly"
+    );
+    assert_eq!(
+        fx.run_transport.deliveries(),
+        deliveries_before + 1,
+        "exactly the delegation result crossed after exhaustion"
+    );
+
+    // A later sweep re-drives the same exchange: still owed, still answered
+    // with the owner's inability, never dropped.
+    assert!(fx.try_settle().await.is_err());
+    assert_eq!(fx.run_transport.deliveries(), deliveries_before + 2);
+}
+
 #[tokio::test]
 async fn a_dependency_declared_during_an_outstanding_assignment_blocks_the_refused_task() {
     let fx = Fixture::new(RunAcceptanceProbe::refusing());
@@ -833,6 +933,56 @@ async fn a_failed_dependency_cancels_its_dependents_by_default() {
     assert!(
         cancelled.assignment.is_none(),
         "a terminal task fences its run"
+    );
+}
+
+/// A dependency that fails while a run is live requests the cancellation
+/// rather than terminalizing over it.
+///
+/// The dependent is `InProgress` with an accepted run, which may hold a
+/// started effect whose outcome is unknown: terminalizing here would project
+/// terminal `Cancelled` over it, strand the escrow, and leave the run to
+/// discover the cancellation only if it ever proposed
+/// ([specification 8.7](../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn a_failed_dependency_defers_while_its_dependents_run_is_live() {
+    let fx = Fixture::new(RunAcceptanceProbe::accepting());
+    fx.instantiate_agent().await;
+    applied(fx.apply(create_command(Vec::new())).await);
+    let assigned = fx.snapshot().await;
+    assert_eq!(assigned.status, AgentTaskStatus::InProgress);
+    assert!(assigned.assignment.is_some(), "the run accepted");
+
+    applied(
+        fx.apply(AgentTaskEntityCommand::DeclareDependency {
+            operation_id: operation(AgentOperationKind::Command, "late-dependency"),
+            declaration: Box::new(dependency("upstream")),
+        })
+        .await,
+    );
+    applied(
+        fx.apply(AgentTaskEntityCommand::RecordDependencyOutcome {
+            operation_id: operation(AgentOperationKind::Command, "resolve"),
+            dependency: AgentTaskId::new("upstream").expect("task id should be valid"),
+            outcome: AgentTaskDependencyOutcome::Failed,
+        })
+        .await,
+    );
+
+    let deferred = fx.snapshot().await;
+    assert!(
+        !deferred.status.is_terminal(),
+        "the dependent defers to its live run, got {:?}",
+        deferred.status
+    );
+    let marker = deferred
+        .cancellation
+        .as_ref()
+        .expect("the cancellation request is durable");
+    assert_eq!(marker.reason.code(), "dependency-not-satisfied");
+    assert!(
+        deferred.outstanding_escrow > 0,
+        "the finalization gate is still closed"
     );
 }
 
@@ -914,7 +1064,22 @@ async fn a_human_owned_task_is_never_assigned_to_an_agent() {
 async fn a_cancelled_task_accepts_no_further_transition() {
     let fx = Fixture::new(RunAcceptanceProbe::accepting());
     fx.instantiate_agent().await;
-    applied(fx.apply(create_command(Vec::new())).await);
+    // Human-owned, so no run ever accepts and the cancel finalizes in its
+    // own transition — the no-active-run arm of specification 8.7. The
+    // deferred half, where an accepted run must wind down first, lives in
+    // `goal_contract.rs` and `cancellation_propagation.rs`.
+    let mut human = creation(Vec::new());
+    human.definition = human
+        .definition
+        .with_ownership(rakka_agent::AgentTaskOwnership::Human);
+    human.assignee = None;
+    applied(
+        fx.apply(AgentTaskEntityCommand::Create {
+            operation_id: operation(AgentOperationKind::TaskCreation, "1"),
+            creation: Box::new(human),
+        })
+        .await,
+    );
 
     applied(
         fx.apply(AgentTaskEntityCommand::Cancel {

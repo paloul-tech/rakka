@@ -64,8 +64,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rakka_agent_workflow::{
-    AgentCausationId, AgentCorrelationId, AgentEffectId, AgentTimestampMillis, HumanCheckpointId,
-    PrincipalRef, StateSchemaVersion,
+    AgentCausationId, AgentCorrelationId, AgentEffectId, AgentTelemetryContext,
+    AgentTimestampMillis, ArtifactRef, HumanCheckpointId, PrincipalRef, StateSchemaVersion,
 };
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
@@ -95,14 +95,15 @@ use crate::choreography::{
 };
 use crate::definition::AgentRevisionNumber;
 use crate::effect::{
-    AgentEffectError, AgentEffectGeneration, AgentEffectPolicies, AgentEffectResolution,
-    AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect, AgentRunEffectKind,
-    AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink, AgentRunEffectStatus,
-    AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
+    effect_id_for, AgentEffectError, AgentEffectGeneration, AgentEffectPolicies,
+    AgentEffectResolution, AgentEffectSpec, AgentMemoryPromotionRequest, AgentRunEffect,
+    AgentRunEffectKind, AgentRunEffectOutcome, AgentRunEffectRequest, AgentRunEffectSink,
+    AgentRunEffectStatus, AgentToolResult, AGENT_MEMORY_PROMOTION_MAX_ENTRIES,
 };
 use crate::identity::{
-    AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunBinding, AgentRunId,
-    AgentRunScope, AgentTaskId, AgentTaskScope, TenantId,
+    AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentOperationKind,
+    AgentRunBinding, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope,
+    AgentWorkflowInvocationId, TenantId,
 };
 use crate::loop_runtime::{AgentLoopPhase, AgentLoopState, AgentPendingTopUp, AgentRunProposal};
 use crate::memory::{
@@ -112,10 +113,10 @@ use crate::model::AgentModelError;
 use crate::observability::{
     record_agent_domain_counter, record_agent_domain_gauge, AgentDecisionDraft,
     AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
+    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WORKFLOW_RESULTS,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -126,8 +127,8 @@ use crate::task::{
     AgentRunAssignment, AgentTaskContent, AgentTaskDecision, AgentTaskDefinition, AgentTaskError,
     AgentTaskResultProposal, AgentTaskStatus, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE,
     AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE, AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE,
-    AGENT_TASK_DECISION_PAYLOAD_TYPE, AGENT_TASK_REFUSAL_STALE_GENERATION,
-    AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
+    AGENT_TASK_DECISION_PAYLOAD_TYPE, AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+    AGENT_TASK_REFUSAL_STALE_GENERATION, AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
 };
 
 /// Default sharded entity type of the run entity.
@@ -162,8 +163,17 @@ pub const AGENT_RUN_MATERIALIZED_MAX_BYTES: usize = 176 * 1024;
 /// bounded tool result per effect
 /// ([`crate::effect::AGENT_TOOL_RESULT_MAX_BYTES`]); the result proposal; the
 /// accepted result ([`crate::task::AGENT_TASK_INLINE_CONTENT_MAX_BYTES`] plus
-/// its envelope); and the bounded feedback and terminal details
-/// ([`AGENT_RUN_DETAIL_MAX_LENGTH`]).
+/// its envelope); the bounded feedback and terminal details
+/// ([`AGENT_RUN_DETAIL_MAX_LENGTH`]); each delegation cell's later-recorded
+/// child terminal result
+/// ([`crate::delegation::AgentDelegationChildResult`], bounded identities and
+/// codes); the fan-in group cell with its full membership, timeout marks, and
+/// resolution ([`crate::fan_in::AgentFanInCell`]); and the resolution's
+/// bounded result table recorded as the awaiting call's tool result. The
+/// per-delegation share of that growth is priced at the interception door
+/// (the crate-private `AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES`), and the
+/// reserve covers it again so a result arriving after acceptance can always
+/// be recorded.
 ///
 /// Acceptance therefore enforces the materialized bound *minus* this reserve,
 /// so a run the entity admits can never later be unable to record the very turn
@@ -196,6 +206,27 @@ pub const AGENT_RUN_MAX_SETTLE_ROUNDS: usize = 4;
 /// cancellation reason, a failure detail, or the sanitized feedback a rejected
 /// proposal returned.
 pub const AGENT_RUN_DETAIL_MAX_LENGTH: usize = 512;
+
+/// What one committed delegation adds to the run's durable record beyond
+/// twice its serialized record bytes: the effect envelope around the payload,
+/// the cell's status fields, the send receipt later recorded as the call's
+/// bounded tool result, the child's terminal result later recorded on the
+/// cell, the settled outcome of the delegation-cancel a wind-down or
+/// straggler chase may record on it, the fan-in group's membership entry, and
+/// the delegation's share of the resolution table recorded as the awaiting
+/// call's tool result. `the_growth_reserve_covers_the_maximal_working_set`
+/// measures that whole lifecycle empirically against this price.
+const AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
+
+/// What one committed workflow invocation adds to the run's durable record
+/// beyond twice its serialized record bytes: the effect envelope around the
+/// payload, the cell's status fields, the start receipt later recorded as the
+/// call's bounded tool result, the child's terminal result later recorded on
+/// the cell, the cancel disposition a wind-down or straggler chase may record
+/// on it — at most one derived effect id — the fan-in group's membership
+/// entry, and the invocation's share of the resolution table recorded as the
+/// awaiting call's tool result.
+const AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES: usize = 4 * 1024;
 
 const DEFAULT_AGENT_RUN_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
@@ -606,6 +637,7 @@ impl AgentRun {
             AgentLoopPhase::DecidingContinuation => self.loop_state.proposal().is_none(),
             AgentLoopPhase::AwaitingModel
             | AgentLoopPhase::AwaitingTools
+            | AgentLoopPhase::AwaitingChildren
             | AgentLoopPhase::Suspended
             | AgentLoopPhase::Complete => false,
         }
@@ -970,6 +1002,74 @@ pub fn promotion_operation_id(
     )
 }
 
+/// Derives the stable operation id of one claim-append command
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md): graph
+/// claim appends carry stable operation ids).
+///
+/// Pure over the scope and the caller's discriminator, so a replayed command
+/// deduplicates in the run's operation log, and the store-side append
+/// operation — derived from the committed effect's external idempotency key —
+/// converges independently.
+pub fn claim_append_operation_id(
+    scope: &AgentRunScope,
+    discriminator: impl AsRef<str>,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ClaimAppend,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            discriminator.as_ref(),
+        ],
+    )
+}
+
+/// Derives the stable operation id of one goal-evaluation command
+/// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The caller supplies a discriminator it can reconstruct after a crash — a
+/// policy epoch, a criteria revision — so a retried command deduplicates
+/// against the evaluation it already committed instead of evaluating twice.
+pub fn evaluation_operation_id(
+    scope: &AgentRunScope,
+    discriminator: impl AsRef<str>,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::GoalEvaluation,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            "evaluate",
+            discriminator.as_ref(),
+        ],
+    )
+}
+
+/// Derives the operation id of the exchange that reports one completed
+/// evaluation: pure per the effect generation that produced the record, so a
+/// re-driven transition re-owes the identical exchange.
+fn goal_evaluation_exchange_operation_id(
+    scope: &AgentRunScope,
+    turn: u64,
+    slot: usize,
+    generation: AgentEffectGeneration,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::GoalEvaluation,
+        [
+            scope.tenant().as_str(),
+            scope.agent().as_str(),
+            scope.run().as_str(),
+            "exchange",
+            &format!("t{turn}"),
+            &format!("s{slot}"),
+            &format!("g{generation}"),
+        ],
+    )
+}
+
 fn bounded_detail(detail: impl Into<String>) -> String {
     let mut detail = detail.into();
     if detail.len() > AGENT_RUN_DETAIL_MAX_LENGTH {
@@ -994,6 +1094,16 @@ fn terminate(
     let run = state.run_mut()?;
     if run.status.is_terminal() {
         return Ok(());
+    }
+    // The conserved descendants spend materializes as consumption exactly
+    // once, here: every live child and its granted sub-quota folds into what
+    // the owed settlement carries up, so the task's ledger — and any
+    // replacement generation it escrows — never forgets what this
+    // generation's children may still create. The terminal guard above is
+    // what makes the fold once-only under re-drive.
+    let descendants = run.loop_state.delegation_descendants_consumed();
+    if descendants > 0 {
+        run.loop_state.budget_mut().charge_descendants(descendants);
     }
     run.status = reason.status();
     run.loop_state.set_phase(AgentLoopPhase::Complete);
@@ -1113,7 +1223,7 @@ fn accept_assignment(
     // spend the task's whole budget again
     // ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
     let budget = AgentRunBudget::allocate(assignment.budget, now);
-    let loop_state = AgentLoopState::started(
+    let mut loop_state = AgentLoopState::started(
         assignment.task.task().clone(),
         assignment.goal.clone(),
         assignment.agent_definition_revision,
@@ -1121,6 +1231,12 @@ fn accept_assignment(
         assignment.definition.version,
         budget,
     );
+    if let Some(envelope) = assignment.delegation {
+        // The delegation authority the task copied from its own durable
+        // state; the run enforces goal-scope narrowing from here, never by
+        // reading the goal spec.
+        loop_state.set_delegation_envelope(*envelope);
+    }
 
     let run = AgentRun {
         binding,
@@ -1166,6 +1282,492 @@ fn refuse(code: &str, message: impl Into<String>) -> AgentExchangeResult {
         message,
         AgentExchangePayload::empty(AGENT_RUN_ACCEPTANCE_PAYLOAD_TYPE),
     )
+}
+
+/// Evaluates the run's fan-in group against its durable cells, persisting the
+/// resolution and recording the awaiting call's bounded result table when the
+/// policy resolves. Returns whether it resolved here.
+///
+/// Pure inputs, absorbing output: a group that already resolved evaluates to
+/// nothing, so a duplicate delivery can never re-resolve or re-record.
+fn try_resolve_fan_in(run: &mut AgentRun, now: AgentTimestampMillis) -> bool {
+    let Some(cell) = run.loop_state.fan_in() else {
+        return false;
+    };
+    let Some(resolution) = crate::fan_in::evaluate_fan_in(
+        cell,
+        run.loop_state.delegations(),
+        run.loop_state.workflow_invocations(),
+        now,
+    ) else {
+        return false;
+    };
+    let await_call = cell.await_call.clone();
+    run.loop_state.resolve_fan_in(resolution);
+    if let Some(call_id) = await_call {
+        let table = crate::fan_in::fan_in_result_table(
+            run.loop_state
+                .fan_in()
+                .expect("the group just resolved and is retained"),
+            run.loop_state.delegations(),
+            run.loop_state.workflow_invocations(),
+        );
+        match AgentTaskContent::inline(table) {
+            Ok(content) => run.loop_state.record_tool_result(AgentToolResult {
+                call_id,
+                content,
+                recorded_at: now,
+            }),
+            Err(error) => {
+                // Bounded by construction: at most sixteen rows of identities
+                // and stable codes, well inside the inline bound. A failure
+                // here is a construction bug, and the resolution itself is
+                // already durable — the turn completes with the await call
+                // unanswered rather than wedging the accept.
+                debug_assert!(false, "the fan-in result table exceeded its bound: {error}");
+            }
+        }
+    }
+    true
+}
+
+/// The parent run's half of the delegation-result exchange: record the
+/// child's terminal outcome on its cell, run the deterministic fan-in step,
+/// and — when the policy resolves a parked wait — complete the awaiting turn
+/// ([specification 8.4 and 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every fence below is the run's own durable state, so a replay past the
+/// journal's bounded window converges on the recorded result rather than
+/// applying twice, and a stale claim refuses on the domain's terms.
+fn accept_delegation_result(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    use crate::delegation::{AgentDelegationChildResult, AgentDelegationStatus};
+
+    let report: crate::task::AgentDelegationReport = match envelope
+        .payload()
+        .decode(crate::task::AGENT_DELEGATION_RESULT_PAYLOAD_TYPE)
+    {
+        Ok(report) => report,
+        // Version skew, not the receiver answering: the child's settle rule
+        // leaves the exchange outstanding, and it converges after upgrade.
+        Err(error) => return refuse("delegation-result-undecodable", error.to_string()),
+    };
+    if !report.status.is_terminal() {
+        return refuse(
+            "delegation-result-forged",
+            format!(
+                "a delegation result must carry a terminal status, not {}",
+                report.status
+            ),
+        );
+    }
+    // The sender must be the very child task the report claims, in this
+    // run's own tenant: anything else is a forgery, whatever it claims.
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Task(scope) => scope,
+        other => {
+            return refuse(
+                "delegation-result-forged",
+                format!("a delegation result cannot originate from {other}"),
+            )
+        }
+    };
+    if sender.tenant() != state.scope.tenant() || *sender.task() != report.child_task {
+        return refuse(
+            "delegation-result-forged",
+            format!(
+                "the delegation result claims child {}, but was sent by {}",
+                report.child_task,
+                sender.task()
+            ),
+        );
+    }
+    let Some(run) = state.run.as_mut() else {
+        // A run that never accepted an assignment never delegated: the
+        // report is undeliverable definitively, and the child settles on it.
+        return refuse(
+            "delegation-result-unknown-run",
+            "the addressed run was never assigned, so it owns no delegations",
+        );
+    };
+    let Some(cell) = run.loop_state.delegation(&report.delegation) else {
+        // Cells live for the run's lifetime — the map is never pruned — so an
+        // unknown delegation is a forgery or a misroute, not aging.
+        return refuse(
+            "delegation-result-unknown-delegation",
+            format!("the run holds no delegation {}", report.delegation),
+        );
+    };
+    match &cell.status {
+        AgentDelegationStatus::Pending => {
+            // The child exists and finished before this parent's send receipt
+            // settled the cell — a real race. Not the receiver answering:
+            // the child re-drives and converges once the receipt lands.
+            return refuse(
+                "delegation-result-early",
+                "the delegation's send receipt has not settled yet; the result converges on \
+                 re-drive",
+            );
+        }
+        AgentDelegationStatus::Conflicted { .. } | AgentDelegationStatus::Failed { .. } => {
+            // A settled non-created cell owns no child: whatever task sent
+            // this was not created by this delegation.
+            return refuse(
+                "delegation-result-not-owned",
+                "the delegation settled without a child this run owns",
+            );
+        }
+        AgentDelegationStatus::ChildCreated { child_task, .. } => {
+            if *child_task != report.child_task {
+                return refuse(
+                    "delegation-result-forged",
+                    format!(
+                        "the delegation created child {child_task}, not {}",
+                        report.child_task
+                    ),
+                );
+            }
+        }
+    }
+    if !cell.child_settled() {
+        let result = AgentDelegationChildResult {
+            status: report.status,
+            terminal_reason: report.terminal_reason.map(bounded_detail),
+            result_digest: report.result_digest.clone(),
+            child_run: report.child_run.clone(),
+            descendants_created: report.descendants_created,
+            recorded_at: now,
+        };
+        if let Some(cell) = run.loop_state.delegation_mut(&report.delegation) {
+            cell.record_child_result(result);
+        }
+        // The deterministic fan-in step, in this same compare-and-set. A
+        // resolution completes a parked wait only on a run that is still
+        // going somewhere: a terminal or winding-down parent records the
+        // evidence and resumes nothing.
+        let resolved = try_resolve_fan_in(run, now);
+        if resolved
+            && run.loop_state.phase() == AgentLoopPhase::AwaitingChildren
+            && !run.status.is_terminal()
+            && run.status != AgentRunStatus::Cancelling
+            && run.terminal_reason.is_none()
+        {
+            run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+            run.status = AgentRunStatus::Running;
+        }
+        state.updated_at = now;
+    }
+    // The recorded result may be the last outcome a winding-down parent
+    // awaited: quiescence is re-checked in this same compare-and-set, so the
+    // final child report terminalizes a cancelling parent
+    // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+    if let Err(error) = settle_run_disposition(state, now) {
+        debug_assert!(false, "disposition settle failed: {error}");
+    }
+    // A result already recorded — a duplicate past the journal's bounded
+    // window — accepts idempotently with no further transition: the cell is
+    // the durable fence.
+    AgentExchangeResult::accepted(AgentExchangePayload::empty(
+        crate::task::AGENT_DELEGATION_RESULT_OUTCOME_PAYLOAD_TYPE,
+    ))
+}
+
+/// Applies the task's [`AgentExchangeKind::RunCancel`] request
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// receiving half of the task → run propagation leg.
+///
+/// The wind-down and the journal record commit in one compare-and-set, and
+/// the receipt reports the status the wind-down reached — never proof a
+/// started effect stopped. A terminal run answers idempotently with its
+/// terminal status: its own durable record is the fence past the journal's
+/// bounded deduplication window.
+fn accept_run_cancel(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let request: crate::task::AgentRunCancelRequest = match envelope
+        .payload()
+        .decode(crate::task::AGENT_RUN_CANCEL_PAYLOAD_TYPE)
+    {
+        Ok(request) => request,
+        // Version skew, not the receiver answering: the task's settle rule
+        // leaves the exchange outstanding, and it converges after upgrade.
+        Err(error) => return refuse("run-cancel-undecodable", error.to_string()),
+    };
+    // The sender must be the very task this run serves, in its own tenant:
+    // anything else is a forgery, whatever it claims.
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Task(scope) => scope,
+        other => {
+            return refuse(
+                "run-cancel-forged",
+                format!("a run-cancel cannot originate from {other}"),
+            )
+        }
+    };
+    if sender.tenant() != state.scope.tenant() || *sender != request.task {
+        return refuse(
+            "run-cancel-forged",
+            format!(
+                "the run-cancel claims task {}, but was sent by {}",
+                request.task.task(),
+                sender.task()
+            ),
+        );
+    }
+    let Some(run) = state.run.as_ref() else {
+        // Definitive: the task owes a run-cancel only after the run durably
+        // accepted, so an unassigned entity here is a misroute the task
+        // finalizes past rather than re-driving forever.
+        return refuse(
+            "run-cancel-unassigned",
+            "the addressed run was never assigned",
+        );
+    };
+    if *sender.task() != *run.task() {
+        return refuse(
+            "run-cancel-forged",
+            format!("the run serves task {}, not {}", run.task(), sender.task()),
+        );
+    }
+    if request.generation != run.generation {
+        return refuse(
+            "run-cancel-stale-generation",
+            format!(
+                "the run serves generation {}, not {}",
+                run.generation, request.generation
+            ),
+        );
+    }
+    // Already winding down — a duplicate request past the journal's bounded
+    // deduplication window, or a cancellation this run reached on its own —
+    // answers idempotently from the durable record. Re-running the wind-down
+    // would re-fence, and the fence would settle work the first wind-down
+    // authorized after itself (a scheduled compensation, a chased
+    // workflow-cancel) under a cell disposition that already claims it.
+    let winding_down = run.status.is_terminal()
+        || run.terminal_reason.is_some()
+        || run.status == AgentRunStatus::Cancelling;
+    if !winding_down {
+        if let Err(error) = cancel(state, request.reason, now) {
+            // `cancel` fails only on a terminal run, which the guard above
+            // excludes; surfacing the impossible loudly beats masking it.
+            return refuse("run-cancel-failed", error.to_string());
+        }
+    }
+    let run = state.run.as_ref().expect("the run exists on this path");
+    let receipt = crate::task::AgentRunCancelReceipt {
+        run: state.scope.clone(),
+        status: run.status,
+    };
+    AgentExchangeResult::accepted(
+        AgentExchangePayload::encode(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE, &receipt)
+            .unwrap_or_else(|_| {
+                AgentExchangePayload::empty(crate::task::AGENT_RUN_CANCEL_RECEIPT_PAYLOAD_TYPE)
+            }),
+    )
+}
+
+/// The bounded reason a chased child's cancellation marker records.
+fn chase_reason(run: &AgentRun) -> String {
+    match &run.terminal_reason {
+        Some(AgentRunTerminalReason::CancellationRequested { reason }) => reason.clone(),
+        Some(other) => other.code().to_string(),
+        None => "fan-in-straggler".to_string(),
+    }
+}
+
+/// The chase context of one run ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+/// whether every created child sits in a cancelled scope, and the members a
+/// resolved fan-in group left behind without a terminal report — the
+/// stragglers a deadline marked timed out, or an early `Any`/`Quorum`
+/// satisfaction moved past.
+///
+/// The straggler set is [`crate::fan_in::unreported_members`], not
+/// `unresolved_members`: a fired deadline marks its stragglers timed out
+/// *before* resolving the group, so the unresolved set is empty by the time
+/// the chase reads it and the deadline branch would chase nobody.
+fn chase_context(run: &AgentRun) -> (bool, Vec<crate::fan_in::AgentFanInMemberId>) {
+    let winding_down_cancelled = matches!(
+        run.terminal_reason,
+        Some(AgentRunTerminalReason::CancellationRequested { .. })
+    ) || matches!(
+        run.status,
+        AgentRunStatus::Cancelling | AgentRunStatus::Cancelled
+    );
+    let stragglers = run
+        .loop_state
+        .fan_in()
+        .filter(|cell| cell.resolution.is_some())
+        .map(|cell| {
+            crate::fan_in::unreported_members(
+                cell,
+                run.loop_state.delegations(),
+                run.loop_state.workflow_invocations(),
+            )
+        })
+        .unwrap_or_default();
+    (winding_down_cancelled, stragglers)
+}
+
+/// The started, unsettled workflow invocations the wind-down or straggler
+/// chase owes a cancel decision for right now
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). The cell's
+/// recorded disposition is the durable once-guard.
+fn chased_workflow_invocations(run: &AgentRun) -> Vec<AgentWorkflowInvocationId> {
+    use crate::workflow_tool::AgentWorkflowInvocationStatus;
+
+    let (winding_down_cancelled, straggler_members) = chase_context(run);
+    let stragglers: std::collections::BTreeSet<AgentWorkflowInvocationId> = straggler_members
+        .into_iter()
+        .filter_map(|member| match member {
+            crate::fan_in::AgentFanInMemberId::WorkflowInvocation(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    if !winding_down_cancelled && stragglers.is_empty() {
+        return Vec::new();
+    }
+    run.loop_state
+        .workflow_invocations()
+        .iter()
+        .filter(|(id, cell)| {
+            matches!(cell.status, AgentWorkflowInvocationStatus::Started { .. })
+                && !cell.child_settled()
+                && cell.cancel.is_none()
+                && (winding_down_cancelled || stragglers.contains(*id))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Every delegation-cancel exchange this run owes right now
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
+/// parent → child propagation leg, and the straggler chase, as one pure
+/// condition over durable state.
+///
+/// A created, unsettled child is chased when the run is winding down under a
+/// cancellation — every child is then in the cancelled scope — or when the
+/// fan-in group has resolved without it: a deadline marked it timed out, or
+/// an early `Any`/`Quorum` satisfaction left it behind, and either way the
+/// group no longer waits for work the parent no longer wants. The cell's
+/// settled cancel outcome is the durable once-guard past the journal's
+/// bounded window; owed cancels never touch the run's own terminal reason,
+/// so a chase can never wind the parent down.
+fn owed_child_cancel_exchanges(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    use crate::delegation::AgentDelegationStatus;
+
+    let Some(run) = state.run.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let (winding_down_cancelled, straggler_members) = chase_context(run);
+    let stragglers: std::collections::BTreeSet<crate::identity::AgentDelegationId> =
+        straggler_members
+            .into_iter()
+            .filter_map(|member| match member {
+                crate::fan_in::AgentFanInMemberId::Delegation(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+    if !winding_down_cancelled && stragglers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut owed = Vec::new();
+    for (id, cell) in run.loop_state.delegations() {
+        let AgentDelegationStatus::ChildCreated { child_task, .. } = &cell.status else {
+            continue;
+        };
+        if cell.child_settled() || cell.cancel.is_some() {
+            continue;
+        }
+        if !(winding_down_cancelled || stragglers.contains(id)) {
+            continue;
+        }
+        let operation_id =
+            crate::delegation::delegation_cancel_operation_id(state.scope.tenant(), id)?;
+        if state.journal.has_initiated(&operation_id) {
+            continue;
+        }
+        let request = crate::task::AgentDelegationCancelRequest {
+            delegation: id.clone(),
+            child_task: child_task.clone(),
+            reason: if winding_down_cancelled {
+                chase_reason(run)
+            } else {
+                "fan-in-straggler".to_string()
+            },
+        };
+        let payload = AgentExchangePayload::encode(
+            crate::task::AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE,
+            &request,
+        )?;
+        let child_scope = AgentTaskScope::new(state.scope.tenant().clone(), child_task.clone())?;
+        owed.push(AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::DelegationCancel,
+            AgentEntityAddress::Run(state.scope.clone()),
+            AgentEntityAddress::Task(child_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?);
+    }
+    Ok(owed)
+}
+
+/// Records the child's answer to a delegation-cancel exchange on its cell:
+/// the durable once-guard, and the request's observable outcome.
+fn settle_delegation_cancel(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    result: &AgentExchangeResult,
+    now: AgentTimestampMillis,
+) {
+    use crate::delegation::AgentDelegationCancelOutcome;
+
+    let request: crate::task::AgentDelegationCancelRequest = match envelope
+        .payload()
+        .decode(crate::task::AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            // This entity encoded the payload it is now settling; a decode
+            // failure is a construction bug surfaced loudly in tests.
+            debug_assert!(false, "delegation-cancel payload undecodable: {error}");
+            return;
+        }
+    };
+    let Some(run) = state.run.as_mut() else {
+        return;
+    };
+    let outcome = if result.is_accepted() {
+        AgentDelegationCancelOutcome::Accepted { settled_at: now }
+    } else {
+        AgentDelegationCancelOutcome::Refused {
+            code: bounded_detail(result.status().rejection_code().unwrap_or("refused")),
+            settled_at: now,
+        }
+    };
+    if let Some(cell) = run.loop_state.delegation_mut(&request.delegation) {
+        cell.record_cancel_outcome(outcome);
+        state.updated_at = now;
+    }
+    // A definitive refusal releases the cell from the subtree quiesce
+    // condition — the child can never report — so it may have been the last
+    // outcome a winding-down parent was waiting on. Re-checking here is what
+    // makes the release terminalize the parent rather than leaving it
+    // `Cancelling` until some unrelated transition happens to run.
+    if let Err(error) = settle_run_disposition(state, now) {
+        debug_assert!(false, "disposition settle failed: {error}");
+    }
 }
 
 /// Derives the stable id of one ledger exchange a run owes its task.
@@ -1301,6 +1903,94 @@ fn owed_ledger_exchange(
     Ok(vec![envelope])
 }
 
+/// The goal-evaluation exchange the run owes its task, if it owes one
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed from the durable cell alone — a completed record whose exchange has
+/// not settled — so a run lost at any point after the outcome committed
+/// re-owes the identical envelope and the journal deduplicates it. A terminal
+/// run still owes it: the record must reach the coordinating task however the
+/// run itself ended, and the decision door fences whatever no longer applies.
+fn owed_goal_evaluation_exchange(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let Some(run) = state.run.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(cell) = run.loop_state.goal_evaluation() else {
+        return Ok(Vec::new());
+    };
+    if cell.reported {
+        return Ok(Vec::new());
+    }
+    let task = AgentTaskScope::new(scope.tenant().clone(), run.task().clone())?;
+    let payload = AgentExchangePayload::encode(
+        crate::task::AGENT_GOAL_EVALUATION_PAYLOAD_TYPE,
+        cell.record.as_ref(),
+    )?;
+    let operation_id = cell.exchange_operation_id.clone();
+    let envelope = AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::GoalEvaluation,
+        AgentEntityAddress::Run(scope.clone()),
+        AgentEntityAddress::Task(task),
+        payload,
+        AgentCorrelationId::new(operation_id.as_str()),
+        now,
+    )?;
+    Ok(vec![envelope])
+}
+
+/// Every exchange the run owes right now: the ledger steps, plus the
+/// goal-evaluation report.
+fn owed_run_exchanges(
+    state: &AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
+    let mut owed = owed_ledger_exchange(state, now)?;
+    owed.extend(owed_goal_evaluation_exchange(state, now)?);
+    owed.extend(owed_child_cancel_exchanges(state, now)?);
+    Ok(owed)
+}
+
+/// Records the decision door's answer to the reported evaluation: accepted, or
+/// refused under the door's own code. Either way the cell settles — a refused
+/// evaluation is never re-driven; the caller re-evaluates at the current
+/// criteria revision.
+fn settle_goal_evaluation_exchange(
+    state: &mut AgentRunState,
+    envelope: &AgentExchangeEnvelope,
+    result: &AgentExchangeResult,
+    now: AgentTimestampMillis,
+) {
+    let Some(run) = state.run.as_mut() else {
+        return;
+    };
+    // Settle the cell this reply actually answers. The journal deduplicates
+    // replies before a participant sees them, so a mismatch is unreachable
+    // today — but the cell is durable state holding at most one report, and a
+    // reply for an evaluation a successor has already replaced must never mark
+    // that successor reported and strand its own crossing.
+    if run
+        .loop_state
+        .goal_evaluation()
+        .is_none_or(|cell| &cell.exchange_operation_id != envelope.operation_id())
+    {
+        return;
+    }
+    let refusal = if result.is_accepted() {
+        None
+    } else {
+        Some(bounded_detail(
+            result.status().rejection_code().unwrap_or("refused"),
+        ))
+    };
+    run.loop_state.settle_goal_evaluation(refusal);
+    state.updated_at = now;
+}
+
 /// Applies the parent's decision on a top-up request
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -1401,6 +2091,8 @@ fn advance_once(
     policies: &AgentEffectPolicies,
     session_memory: bool,
     decision_events: bool,
+    delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
+    workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<Vec<AgentExchangeEnvelope>> {
     let scope = state.scope.clone();
@@ -1421,10 +2113,16 @@ fn advance_once(
             now,
         )
         .map(|()| Vec::new()),
-        AgentLoopPhase::EvaluatingModelOutput => {
-            evaluate_model_output(state, &scope, policies, decision_events, now)
-                .map(|()| Vec::new())
-        }
+        AgentLoopPhase::EvaluatingModelOutput => evaluate_model_output(
+            state,
+            &scope,
+            policies,
+            decision_events,
+            delegation,
+            workflow,
+            now,
+        )
+        .map(|()| Vec::new()),
         AgentLoopPhase::RecordingTurn => {
             record_turn(state, &scope, session_memory, now).map(|()| Vec::new())
         }
@@ -1434,6 +2132,7 @@ fn advance_once(
         // `can_advance` already excluded these.
         AgentLoopPhase::AwaitingModel
         | AgentLoopPhase::AwaitingTools
+        | AgentLoopPhase::AwaitingChildren
         | AgentLoopPhase::Suspended
         | AgentLoopPhase::Complete => Ok(Vec::new()),
     }?;
@@ -1443,7 +2142,7 @@ fn advance_once(
     // effect or wait it decided ([specification 9.7]). The settlement rides the
     // run's own journal and is delivered by the courier, never from inside this
     // transition.
-    owed.extend(owed_ledger_exchange(state, now)?);
+    owed.extend(owed_run_exchanges(state, now)?);
     Ok(owed)
 }
 
@@ -1540,13 +2239,402 @@ fn prepare_context(
     Ok(())
 }
 
+/// The coordinator-limit inputs one delegation is planned against, snapshotted
+/// from durable state once per turn and advanced by the planning loop as each
+/// call in the turn commits — so a multi-call turn prices every call against
+/// what the calls before it already took
+/// ([specification 8.4 and 9.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every count derives from the durable cell map and the run's own ledger, so
+/// the ceilings survive coordinator loss by construction: a recovered owner
+/// re-derives the same numbers from the same durable state.
+#[derive(Debug, Clone, Copy)]
+struct DelegationCeilings {
+    /// Delegation cells the run retains — the structural cap input.
+    held: usize,
+    /// Direct children spent against the fan-out ceiling.
+    fan_out_spent: u64,
+    /// Concurrently unsettled direct children.
+    active_children: u64,
+    /// The run's escrowed descendants allocation; `None` is unbounded.
+    descendants_limit: Option<u64>,
+    /// Descendants spent or held by live children; `None` when a pre-slice
+    /// cell makes the spend unaccountable — refused under a bounded limit.
+    descendants_spent: Option<u64>,
+}
+
+impl DelegationCeilings {
+    /// Advances the snapshot past one planned delegation.
+    fn commit(&mut self, granted_descendants: Option<u64>) {
+        self.held += 1;
+        self.fan_out_spent = self.fan_out_spent.saturating_add(1);
+        self.active_children = self.active_children.saturating_add(1);
+        self.descendants_spent = self.descendants_spent.map(|spent| {
+            spent
+                .saturating_add(1)
+                .saturating_add(granted_descendants.unwrap_or(0))
+        });
+    }
+}
+
 /// Acts on the turn the model produced: persist its tool effects, or move on to
 /// record it.
+/// The earlier of two optional deadlines — the *child never outlives the
+/// goal* merge every child-planning path shares, so a future nuance to the
+/// rule cannot apply to one child family and not the other.
+fn earliest_deadline(
+    a: Option<AgentTimestampMillis>,
+    b: Option<AgentTimestampMillis>,
+) -> Option<AgentTimestampMillis> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Plans one delegation the model requested through the declared coordination
+/// tool ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Everything that can refuse, refuses here — parse, cell cap, goal skill
+/// narrowing, the depth/fan-out/concurrency/descendants ceilings, catalog
+/// resolution, cycle rejection, input bounds, record bounds — before the
+/// turn commits anything, and the refusal is `(code, message)` for the failed
+/// tool result the model sees. On success the returned record carries the one
+/// catalog resolution this delegation ever performs: replays reuse it
+/// verbatim and never re-resolve.
+#[allow(clippy::too_many_arguments)]
+fn plan_delegation_call(
+    scope: &AgentRunScope,
+    config: &crate::delegation::AgentRunDelegationConfig,
+    envelope: Option<&crate::delegation::AgentRunDelegationEnvelope>,
+    call: &crate::model::AgentToolCallRequest,
+    ceilings: &DelegationCeilings,
+    turn: u64,
+    slot: usize,
+    goal: Option<AgentGoalId>,
+    task: AgentTaskId,
+    definition_revision: AgentRevisionNumber,
+    settings_revision: AgentRevisionNumber,
+    telemetry: AgentTelemetryContext,
+    now: AgentTimestampMillis,
+) -> Result<Box<crate::delegation::AgentDelegationRecord>, (String, String)> {
+    use crate::delegation::{
+        delegation_id_for, AgentDelegationError, AgentDelegationRecord, AgentDelegationToolCall,
+        AGENT_RUN_MAX_DELEGATIONS,
+    };
+
+    let refuse = |error: &dyn std::fmt::Display, code: &str| (code.to_string(), error.to_string());
+    let refuse_typed = |error: AgentDelegationError| (error.code().to_string(), error.to_string());
+    let parsed = AgentDelegationToolCall::parse(&call.arguments)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    if ceilings.held >= AGENT_RUN_MAX_DELEGATIONS {
+        return Err((
+            "delegation-limit-exceeded".to_string(),
+            format!(
+                "the run already retains its maximum of {AGENT_RUN_MAX_DELEGATIONS} delegations"
+            ),
+        ));
+    }
+    if let Some(env) = envelope {
+        if !env.allowed_skills.is_empty() && !env.allowed_skills.contains(&parsed.skill) {
+            return Err((
+                "delegation-skill-not-allowed".to_string(),
+                format!(
+                    "the goal does not allow delegating the skill {}",
+                    parsed.skill
+                ),
+            ));
+        }
+    }
+
+    // The envelope ceilings, checked cheapest first and all before the
+    // catalog resolution they do not need. Every count is envelope-local or
+    // cell-derived: no cross-entity read at the door, exactly as
+    // [specification 9.7](../../../docs/plans/rakka-agent/spec.md) requires.
+    let budget = envelope.and_then(|env| env.budget);
+    let child_depth = envelope.map_or(0, |env| env.depth).saturating_add(1);
+    if let Some(maximum) = budget.and_then(|b| b.max_depth) {
+        if child_depth > maximum {
+            return Err(refuse_typed(AgentDelegationError::DepthExceeded {
+                depth: child_depth,
+                maximum,
+            }));
+        }
+    }
+    if let Some(env) = envelope {
+        // A chain without its ancestor agents cannot be cycle-checked, so it
+        // may not be extended: deny-when-unknown, scoped to sub-delegation —
+        // the run's own work is untouched.
+        if !env.lineage.is_empty() && env.ancestors.len() != env.lineage.len() {
+            return Err(refuse_typed(AgentDelegationError::AncestryUnknown {
+                lineage: env.lineage.len(),
+            }));
+        }
+    }
+    if let Some(maximum) = budget.and_then(|b| b.max_fan_out) {
+        let committed = ceilings.fan_out_spent.saturating_add(1);
+        if committed > u64::from(maximum) {
+            return Err(refuse_typed(AgentDelegationError::FanOutExceeded {
+                committed,
+                maximum,
+            }));
+        }
+    }
+    if let Some(maximum) = budget.and_then(|b| b.max_concurrent) {
+        let active = ceilings.active_children.saturating_add(1);
+        if active > u64::from(maximum) {
+            return Err(refuse_typed(AgentDelegationError::ConcurrencyExceeded {
+                active,
+                maximum,
+            }));
+        }
+    }
+
+    // The conserved descendants debit: this child costs one plus the
+    // sub-quota escrowed to its own subtree, and the sub-quota is a
+    // deterministic even split of the remainder over the fan-out slots the
+    // run can still use — replays reuse the recorded grant verbatim, so the
+    // split is stable under re-drive.
+    let granted_descendants = match ceilings.descendants_limit {
+        None => None,
+        Some(limit) => {
+            let Some(spent) = ceilings.descendants_spent else {
+                return Err(refuse_typed(AgentDelegationError::DescendantsExhausted {
+                    limit,
+                    spent: None,
+                }));
+            };
+            let remaining = limit.saturating_sub(spent);
+            if remaining < 1 {
+                return Err(refuse_typed(AgentDelegationError::DescendantsExhausted {
+                    limit,
+                    spent: Some(spent),
+                }));
+            }
+            let slots = match budget.and_then(|b| b.max_fan_out) {
+                Some(maximum) => u64::from(maximum).saturating_sub(ceilings.fan_out_spent),
+                None => (AGENT_RUN_MAX_DELEGATIONS as u64).saturating_sub(ceilings.held as u64),
+            }
+            .max(1);
+            Some((remaining - 1) / slots)
+        }
+    };
+
+    let target = config
+        .catalog
+        .resolve(scope.tenant(), &parsed.skill)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    target
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+
+    // Cycle rejection, necessarily after resolution: the resolved target may
+    // not be this run's own agent nor any validated ancestor
+    // ([specification 8.4](../../../docs/plans/rakka-agent/spec.md): repeated
+    // delegation lineage). Agent-identity granularity; the bounded-iterative
+    // escape hatch is deferred with this refusal-only default.
+    let ancestors = envelope
+        .map(|env| env.ancestors.clone())
+        .unwrap_or_default();
+    if target.agent == *scope.agent() || ancestors.contains(&target.agent) {
+        return Err(refuse_typed(AgentDelegationError::CycleDetected {
+            agent: target.agent.clone(),
+        }));
+    }
+
+    let input = AgentTaskContent::inline(parsed.input.clone())
+        .map_err(|error| refuse(&error, "delegation-invalid-arguments"))?;
+    let delegation_id = delegation_id_for(scope, turn, slot)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    let effect = effect_id_for(scope, turn, slot)
+        .map_err(|error| refuse(&error, "delegation-identity-invalid"))?;
+    let (lineage, depth, envelope_deadline) = envelope
+        .map(|env| (env.lineage.clone(), env.depth, env.deadline))
+        .unwrap_or_default();
+    // The child never outlives the goal: the earlier of the model's deadline
+    // and the envelope's.
+    let deadline = earliest_deadline(parsed.deadline, envelope_deadline);
+    // The wire budget is the parent's own ceilings with the descendants
+    // ceiling replaced by the escrowed sub-quota: the cap crosses A2A as
+    // validated provenance the child's admission min-narrows against — never
+    // a conserved grant.
+    let child_budget = match (budget, granted_descendants) {
+        (None, None) => None,
+        (budget, granted) => {
+            let mut child = budget.unwrap_or_default();
+            if let Some(granted) = granted {
+                child.max_descendants = Some(u32::try_from(granted).unwrap_or(u32::MAX));
+            }
+            Some(child)
+        }
+    };
+    // The scopes the child inherits ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)):
+    // the goal's environment narrowing rides verbatim, and the knowledge
+    // grant is the catalog's explicit statement intersected with the
+    // parent's own effective grant — a catalog can never widen what the
+    // parent holds, and a parent with no grant statement of its own passes
+    // the catalog's through only at the root, where the definition envelope
+    // still bounds every append.
+    let environments = envelope
+        .map(|env| env.environments.clone())
+        .unwrap_or_default();
+    let knowledge_spaces = match envelope.and_then(|env| env.knowledge_spaces.as_ref()) {
+        Some(granted) => target
+            .knowledge_spaces
+            .intersection(granted)
+            .cloned()
+            .collect(),
+        None if envelope.is_some_and(|env| !env.lineage.is_empty()) => {
+            // A chain whose own grant statement predates the field cannot
+            // prove what it may re-delegate: deny-when-unknown, the
+            // ancestry-gap posture.
+            std::collections::BTreeSet::new()
+        }
+        None => target.knowledge_spaces.clone(),
+    };
+    let record = AgentDelegationRecord {
+        environments,
+        knowledge_spaces,
+        delegation: delegation_id.clone(),
+        goal,
+        parent_task: task,
+        parent_run: scope.clone(),
+        lineage,
+        ancestors,
+        depth: depth.saturating_add(1),
+        requested_skill: parsed.skill,
+        result_schema: target.result_schema.clone(),
+        resolved: target,
+        a2a_message_id: delegation_id.as_str().to_string(),
+        deduplication_key: delegation_id.as_str().to_string(),
+        turn,
+        slot,
+        effect,
+        call_id: call.call_id.clone(),
+        input,
+        budget: child_budget,
+        granted_descendants,
+        deadline,
+        definition_revision,
+        settings_revision,
+        telemetry,
+        created_at: now,
+    };
+    record
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    Ok(Box::new(record))
+}
+
+/// Plans one workflow-tool call into its durable invocation record, or the
+/// refusal the model corrects course from
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every check is envelope-local or cell-derived, like the delegation door:
+/// the combined membership bound, the goal's workflow narrowing, and the
+/// bounded input — then the pure identity derivations and the descriptor's
+/// shape copied at commit, so a replay never re-resolves and a descriptor
+/// upgrade mid-flight is a visible conflict rather than a silently different
+/// child.
+#[allow(clippy::too_many_arguments)]
+fn plan_workflow_call(
+    scope: &AgentRunScope,
+    descriptor: &crate::workflow_tool::AgentWorkflowToolDescriptor,
+    envelope: Option<&crate::delegation::AgentRunDelegationEnvelope>,
+    call: &crate::model::AgentToolCallRequest,
+    combined_members: usize,
+    turn: u64,
+    slot: usize,
+    goal: Option<AgentGoalId>,
+    task: AgentTaskId,
+    definition_revision: AgentRevisionNumber,
+    settings_revision: AgentRevisionNumber,
+    telemetry: AgentTelemetryContext,
+    now: AgentTimestampMillis,
+) -> Result<Box<crate::workflow_tool::AgentWorkflowInvocationRecord>, (String, String)> {
+    use crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS;
+    use crate::workflow_tool::{
+        child_workflow_run_id, workflow_invocation_id_for, AgentWorkflowInvocationRecord,
+        AgentWorkflowToolError,
+    };
+
+    // Refusal codes and messages come from the one error type that defines
+    // them, so the stable code surface cannot drift from a restated literal.
+    if combined_members >= AGENT_RUN_MAX_FAN_IN_MEMBERS {
+        let error = AgentWorkflowToolError::LimitExceeded {
+            maximum: AGENT_RUN_MAX_FAN_IN_MEMBERS,
+        };
+        return Err((error.code().to_string(), error.to_string()));
+    }
+    if let Some(env) = envelope {
+        if !env.allowed_workflows.is_empty()
+            && !env.allowed_workflows.contains(&descriptor.workflow_tool)
+        {
+            let error = AgentWorkflowToolError::NotAllowed {
+                tool: descriptor.workflow_tool.clone(),
+            };
+            return Err((error.code().to_string(), error.to_string()));
+        }
+    }
+    let input = AgentTaskContent::inline(call.arguments.clone()).map_err(|error| {
+        (
+            "workflow-invocation-invalid-arguments".to_string(),
+            error.to_string(),
+        )
+    })?;
+    let invocation = workflow_invocation_id_for(scope, turn, slot)
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    let effect = effect_id_for(scope, turn, slot).map_err(|error| {
+        (
+            "workflow-invocation-identity-invalid".to_string(),
+            error.to_string(),
+        )
+    })?;
+    // The child never outlives the goal: the earlier of the descriptor's
+    // default deadline and the envelope's. Both are trusted state — the model
+    // supplies no deadline through a workflow call.
+    let descriptor_deadline = descriptor
+        .default_deadline_ms
+        .map(|deadline_ms| AgentTimestampMillis::new(now.as_millis().saturating_add(deadline_ms)));
+    let envelope_deadline = envelope.and_then(|env| env.deadline);
+    let deadline = earliest_deadline(descriptor_deadline, envelope_deadline);
+    let record = AgentWorkflowInvocationRecord {
+        invocation: invocation.clone(),
+        goal,
+        parent_task: task,
+        parent_run: scope.clone(),
+        workflow_tool: descriptor.workflow_tool.clone(),
+        descriptor_version: descriptor.version,
+        descriptor_digest: descriptor.schema_digest(),
+        workflow_type: descriptor.workflow_type.clone(),
+        definition_version: descriptor.definition_version.clone(),
+        required_capabilities: descriptor.required_capabilities.clone(),
+        child_run: child_workflow_run_id(&invocation),
+        deduplication_key: invocation.as_str().to_string(),
+        turn,
+        slot,
+        effect,
+        call_id: call.call_id.clone(),
+        input,
+        deadline,
+        definition_revision,
+        settings_revision,
+        telemetry,
+        created_at: now,
+    };
+    record
+        .validate()
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    Ok(Box::new(record))
+}
+
 fn evaluate_model_output(
     state: &mut AgentRunState,
     scope: &AgentRunScope,
     policies: &AgentEffectPolicies,
     decision_events: bool,
+    delegation: Option<&crate::delegation::AgentRunDelegationConfig>,
+    workflow: Option<&crate::workflow_tool::AgentRunWorkflowConfig>,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
     let (turn, calls) = {
@@ -1573,55 +2661,464 @@ fn evaluate_model_output(
 
     let selected: Vec<_> = calls.iter().map(|call| call.tool.clone()).collect();
 
+    // What one planned call becomes: an effect the turn commits, a fan-in
+    // close the commit loop applies after the delegations before it, or a
+    // refusal recorded as a failed tool result — the run survives a refusal
+    // and the model corrects course, bounded by the iteration and budget
+    // ceilings the run already enforces.
+    enum PlannedCall {
+        Effect(AgentRunEffectRequest, AgentEffectSpec),
+        AwaitFanIn {
+            call_id: crate::model::AgentToolCallId,
+            deadline: Option<AgentTimestampMillis>,
+        },
+        Refused {
+            call_id: crate::model::AgentToolCallId,
+            code: String,
+            message: String,
+        },
+    }
+
     // Each tool's spec — safety class, attempt bound, protocol — comes from its
     // registration, defaulting to a single non-idempotent attempt for a tool the
     // deployment has not classified: the model asked for the call, but it cannot
     // choose how failure and ambiguity are handled ([specification 11.2]).
-    let requests: Vec<(AgentRunEffectRequest, AgentEffectSpec)> = calls
-        .into_iter()
-        .map(|call| {
-            let request = AgentRunEffectRequest::Tool {
-                call: Box::new(call),
-            };
-            let spec = policies.spec_for(&request).clone();
-            (request, spec)
-        })
-        .collect();
+    //
+    // Two doors are decided per call before anything commits. A call naming
+    // the declared coordination tool is intercepted into a delegation: parsed
+    // under the closed vocabulary, narrowed by the goal's allowed skills,
+    // resolved through the application-owned catalog, and committed as the
+    // delegation record plus its send effect — in this one compare-and-set,
+    // which is what "persisted before send" means
+    // ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)). A
+    // generic call is narrowed by the goal's allowed tools
+    // ([specification 8.1](../../../docs/plans/rakka-agent/spec.md)); the
+    // delegation tool itself is governed by the skill set, never the tool
+    // set. Slots are planned in call order over the calls that commit
+    // effects, exactly as the commit loop below re-derives them.
+    let (slot_base, mut ceilings, envelope, run_goal, run_task, definition_revision, telemetry) = {
+        let run = state.run_mut()?;
+        (
+            run.loop_state.next_effect_slot(),
+            DelegationCeilings {
+                held: run.loop_state.delegation_count(),
+                fan_out_spent: run.loop_state.delegation_fan_out_spent(),
+                active_children: run.loop_state.delegation_active_children(),
+                descendants_limit: run.loop_state.budget().allocation().descendants,
+                descendants_spent: run.loop_state.delegation_descendants_spent(),
+            },
+            run.loop_state.delegation_envelope().cloned(),
+            run.loop_state.goal().cloned(),
+            run.loop_state.task().clone(),
+            run.loop_state.agent_definition_revision(),
+            run.loop_state.telemetry().clone(),
+        )
+    };
+    // Fan-in membership spans both cell maps, so the combined count is what
+    // the workflow door bounds; it advances with every invocation planned
+    // this turn, exactly as the delegation ceilings advance with each commit.
+    let mut combined_members = ceilings
+        .held
+        .saturating_add(state.run_mut()?.loop_state.workflow_invocation_count());
+    let settings_revision = state.run_mut()?.loop_state.agent_settings_revision();
+    // A committed delegation is held twice in the run's durable record — the
+    // cell and the effect payload — so its admission is priced against the
+    // materialized bound before anything commits. Refusing here keeps an
+    // unaffordable delegation a failed tool result the model corrects course
+    // from; letting it commit would wedge the run afterwards, when the bound
+    // check fails a transition whose model turn is already durably pending
+    // and every re-drive fails the same way.
+    let mut delegation_headroom = if delegation.is_some() || workflow.is_some() {
+        let run = state.run_mut()?;
+        AGENT_RUN_MATERIALIZED_MAX_BYTES.saturating_sub(run.materialized_size_bytes())
+    } else {
+        // No coordination or workflow tool is wired, so no call below prices
+        // against it. Delegations and workflow invocations share this one
+        // accumulator: two doors over one record must not each spend the
+        // same remaining bytes.
+        0
+    };
+    let mut planned: Vec<PlannedCall> = Vec::with_capacity(calls.len());
+    let mut next_slot = slot_base;
+    let mut await_planned = false;
+    for call in calls {
+        if let Some(config) = delegation {
+            // The declared await verb closes the fan-in group: parsed under
+            // its closed vocabulary here, applied by the commit loop below in
+            // call order — after the delegations planned before it have
+            // joined the group, so a delegate-and-await turn closes over the
+            // membership the model just committed.
+            if config
+                .fan_in_tool
+                .as_ref()
+                .is_some_and(|tool| call.tool == *tool)
+            {
+                match crate::fan_in::AgentFanInToolCall::parse(&call.arguments) {
+                    Ok(parsed) => {
+                        // The deadline is the one model-supplied value that
+                        // reaches durable timer state, so it fails closed like
+                        // every other model input: a deadline not in the
+                        // future would let the first `FireFanInDeadline` mark
+                        // every child timed out before any could report. The
+                        // envelope bound is trusted state and stays exempt.
+                        if parsed.deadline.is_some_and(|deadline| deadline <= now) {
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: "fan-in-invalid-arguments".to_string(),
+                                message: "the await deadline must lie in the future".to_string(),
+                            });
+                            continue;
+                        }
+                        let deadline = match (
+                            parsed.deadline,
+                            envelope.as_ref().and_then(|env| env.deadline),
+                        ) {
+                            (Some(requested), Some(bound)) => Some(requested.min(bound)),
+                            (requested, bound) => requested.or(bound),
+                        };
+                        planned.push(PlannedCall::AwaitFanIn {
+                            call_id: call.call_id,
+                            deadline,
+                        });
+                        await_planned = true;
+                    }
+                    Err(error) => planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "fan-in-invalid-arguments".to_string(),
+                        message: error.to_string(),
+                    }),
+                }
+                continue;
+            }
+            if call.tool == config.tool {
+                if await_planned {
+                    // The await planned earlier in this turn closes the run's
+                    // one fan-out group, and the commit loop applies calls in
+                    // this same order: a delegation committed after the close
+                    // could join nothing — the cell stays closed and
+                    // unresolved until the wait ends — leaving a member no
+                    // await can ever cover, whose definitive send failure
+                    // would wind the coordinator down over a child the group
+                    // never held. Refused instead; the model delegates before
+                    // awaiting, or in the turn the resolution resumes.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-after-await".to_string(),
+                        message: "this turn already closed its fan-out group; plan delegations \
+                                  before the await, or in the turn after the fan-in resolves"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                if combined_members >= crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS {
+                    // Fan-in membership spans the delegation and workflow
+                    // cell maps under one bound: sixteen rows of identities
+                    // is what the result table's growth reserve was measured
+                    // against, whichever kind fills them.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-limit-exceeded".to_string(),
+                        message: format!(
+                            "the run already retains its maximum of {} combined fan-out members",
+                            crate::fan_in::AGENT_RUN_MAX_FAN_IN_MEMBERS
+                        ),
+                    });
+                    continue;
+                }
+                match plan_delegation_call(
+                    scope,
+                    config,
+                    envelope.as_ref(),
+                    &call,
+                    &ceilings,
+                    turn,
+                    next_slot,
+                    run_goal.clone(),
+                    run_task.clone(),
+                    definition_revision,
+                    settings_revision,
+                    telemetry.clone(),
+                    now,
+                ) {
+                    Ok(record) => {
+                        let record_bytes = serde_json::to_vec(record.as_ref())
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        let cost = record_bytes
+                            .saturating_mul(2)
+                            .saturating_add(AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES);
+                        if cost > delegation_headroom {
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: "delegation-headroom-exceeded".to_string(),
+                                message: format!(
+                                    "committing this delegation would add {cost} bytes to the \
+                                     run's durable record, which exceeds its \
+                                     {delegation_headroom} bytes of remaining headroom"
+                                ),
+                            });
+                        } else {
+                            delegation_headroom -= cost;
+                            ceilings.commit(record.granted_descendants);
+                            combined_members = combined_members.saturating_add(1);
+                            let request = AgentRunEffectRequest::A2aSend { delegation: record };
+                            let spec = policies.spec_for(&request).clone();
+                            next_slot += 1;
+                            planned.push(PlannedCall::Effect(request, spec));
+                        }
+                    }
+                    Err((code, message)) => planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code,
+                        message,
+                    }),
+                }
+                continue;
+            }
+        }
+        // A call naming a configured workflow tool is intercepted into a
+        // durable invocation: the descriptor's shape is copied at commit, the
+        // derived identities make create-or-adopt an identity property, and
+        // the invocation joins the run's one fan-out group exactly as a
+        // delegation does ([specification 8.6]). Narrowed by the goal's
+        // allowed workflows, never its allowed tools.
+        if let Some(config) = workflow {
+            let descriptor = crate::definition::AgentWorkflowToolId::new(call.tool.as_str())
+                .ok()
+                .and_then(|id| config.descriptor(&id));
+            if let Some(descriptor) = descriptor {
+                if await_planned {
+                    // The delegation-after-await rationale, verbatim: a
+                    // member committed after the close could join nothing,
+                    // and its definitive start failure would wind the
+                    // coordinator down over a child the group never held.
+                    // The model-facing message stays instructive; the code
+                    // comes from the error type that defines it.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: crate::workflow_tool::AgentWorkflowToolError::AfterAwait
+                            .code()
+                            .to_string(),
+                        message: "this turn already closed its fan-out group; invoke workflows \
+                                  before the await, or in the turn after the fan-in resolves"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                match plan_workflow_call(
+                    scope,
+                    descriptor,
+                    envelope.as_ref(),
+                    &call,
+                    combined_members,
+                    turn,
+                    next_slot,
+                    run_goal.clone(),
+                    run_task.clone(),
+                    definition_revision,
+                    settings_revision,
+                    telemetry.clone(),
+                    now,
+                ) {
+                    Ok(record) => {
+                        let record_bytes = serde_json::to_vec(record.as_ref())
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(usize::MAX);
+                        let cost = record_bytes
+                            .saturating_mul(2)
+                            .saturating_add(AGENT_WORKFLOW_INVOCATION_COMMIT_OVERHEAD_BYTES);
+                        if cost > delegation_headroom {
+                            let error =
+                                crate::workflow_tool::AgentWorkflowToolError::HeadroomExceeded {
+                                    needed: cost,
+                                    available: delegation_headroom,
+                                };
+                            planned.push(PlannedCall::Refused {
+                                call_id: call.call_id,
+                                code: error.code().to_string(),
+                                message: error.to_string(),
+                            });
+                        } else {
+                            delegation_headroom -= cost;
+                            combined_members = combined_members.saturating_add(1);
+                            let request =
+                                AgentRunEffectRequest::WorkflowStart { invocation: record };
+                            // The descriptor's gates and bindings overlay the
+                            // start's cloned spec at commit, so the existing
+                            // gated-checkpoint machinery and the credential
+                            // resolution boundary cover consequential
+                            // workflows unchanged.
+                            let mut spec = policies.spec_for(&request).clone();
+                            spec.checkpoint_required |= descriptor.checkpoint_required;
+                            spec.authorization_required |= descriptor.authorization_required;
+                            if spec.credential_binding.is_none() {
+                                spec.credential_binding = descriptor.credential_binding.clone();
+                            }
+                            next_slot += 1;
+                            planned.push(PlannedCall::Effect(request, spec));
+                        }
+                    }
+                    Err((code, message)) => planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code,
+                        message,
+                    }),
+                }
+                continue;
+            }
+        }
+        if let Some(env) = envelope.as_ref() {
+            if !env.allowed_tools.is_empty() && !env.allowed_tools.contains(&call.tool) {
+                planned.push(PlannedCall::Refused {
+                    call_id: call.call_id.clone(),
+                    code: "goal-tool-not-allowed".to_string(),
+                    message: format!("the goal does not allow the tool {}", call.tool),
+                });
+                continue;
+            }
+        }
+        let request = AgentRunEffectRequest::Tool {
+            call: Box::new(call),
+        };
+        let spec = policies.spec_for(&request).clone();
+        next_slot += 1;
+        planned.push(PlannedCall::Effect(request, spec));
+    }
 
     // The whole fan-out is reserved before any effect is recorded, all-or-nothing:
     // one tool call and one effect per tool, plus the sum of their attempt bounds,
     // checked against the concurrency ceiling. A turn either fits its budget or
     // commits none of it, so the record never holds a partial fan-out; a run that
     // cannot afford it parks with nothing charged and re-attempts this exact
-    // fan-out once its parent tops it up ([specification 9.7]).
+    // fan-out once its parent tops it up ([specification 9.7]). Refused calls
+    // commit no effect and reserve nothing.
     {
-        let count = u64::try_from(requests.len()).unwrap_or(u64::MAX);
-        let total_attempts = requests
+        let effects = planned
             .iter()
-            .map(|(_, spec)| u64::from(spec.max_attempts))
+            .filter(|call| matches!(call, PlannedCall::Effect(..)))
+            .count();
+        let count = u64::try_from(effects).unwrap_or(u64::MAX);
+        let total_attempts = planned
+            .iter()
+            .filter_map(|call| match call {
+                PlannedCall::Effect(_, spec) => Some(u64::from(spec.max_attempts)),
+                PlannedCall::AwaitFanIn { .. } | PlannedCall::Refused { .. } => None,
+            })
             .fold(0, u64::saturating_add);
-        let run = state.run_mut()?;
-        let outstanding = run.loop_state.outstanding_effects().count();
-        if let Err(exhaustion) =
-            run.loop_state
-                .budget_mut()
-                .reserve_tool_turn(count, total_attempts, outstanding, now)
-        {
-            return park_or_terminate(state, exhaustion, now);
+        if count > 0 {
+            let run = state.run_mut()?;
+            let outstanding = run.loop_state.outstanding_effects().count();
+            if let Err(exhaustion) = run.loop_state.budget_mut().reserve_tool_turn(
+                count,
+                total_attempts,
+                outstanding,
+                now,
+            ) {
+                return park_or_terminate(state, exhaustion, now);
+            }
         }
     }
 
-    for (request, spec) in requests {
-        let (slot, settings_revision) = {
-            let run = state.run_mut()?;
-            (
-                run.loop_state.next_effect_slot(),
-                run.loop_state.agent_settings_revision(),
-            )
-        };
-        let effect =
-            AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
-        state.run_mut()?.loop_state.record_effect(effect)?;
+    // The policy a group opens under: the goal's envelope, else the wiring's
+    // default — trusted state either way, fixed in the same compare-and-set
+    // as the first member ([specification 8.7]).
+    let fan_in_policy = envelope
+        .as_ref()
+        .and_then(|env| env.fan_in)
+        .or_else(|| delegation.map(|config| config.default_fan_in))
+        .unwrap_or_default();
+    for planned_call in planned {
+        match planned_call {
+            PlannedCall::Effect(request, spec) => {
+                let (slot, settings_revision) = {
+                    let run = state.run_mut()?;
+                    (
+                        run.loop_state.next_effect_slot(),
+                        run.loop_state.agent_settings_revision(),
+                    )
+                };
+                if let AgentRunEffectRequest::A2aSend { delegation } = &request {
+                    // The delegation record and its cell commit with the send
+                    // effect in this one compare-and-set — persisted strictly
+                    // before the settle pass can hand anything to the sink —
+                    // and the cell joins the run's fan-out group, opening it
+                    // with the trusted policy when none is open.
+                    let member =
+                        crate::fan_in::AgentFanInMemberId::from(delegation.delegation.clone());
+                    let run = state.run_mut()?;
+                    run.loop_state.record_delegation(
+                        crate::delegation::AgentDelegationCell::pending(delegation.clone()),
+                    );
+                    run.loop_state.join_fan_in(fan_in_policy, member, turn, now);
+                }
+                if let AgentRunEffectRequest::WorkflowStart { invocation } = &request {
+                    // The invocation record and its cell commit with the
+                    // start effect in this same discipline, and the cell
+                    // joins the run's one fan-out group: workflow members
+                    // reuse the member-disposition interface, so mixed
+                    // delegation-and-workflow groups fall out of the same
+                    // policy evaluation.
+                    let member =
+                        crate::fan_in::AgentFanInMemberId::from(invocation.invocation.clone());
+                    let run = state.run_mut()?;
+                    run.loop_state.record_workflow_invocation(
+                        crate::workflow_tool::AgentWorkflowInvocationCell::pending(
+                            invocation.clone(),
+                        ),
+                    );
+                    run.loop_state.join_fan_in(fan_in_policy, member, turn, now);
+                }
+                let effect =
+                    AgentRunEffect::new(scope, turn, slot, request, &spec, settings_revision, now)?;
+                state.run_mut()?.loop_state.record_effect(effect)?;
+            }
+            PlannedCall::AwaitFanIn { call_id, deadline } => {
+                let run = state.run_mut()?;
+                if run.loop_state.close_fan_in(call_id.clone(), deadline, turn) {
+                    // Closed. The wait — or the immediate resolution when
+                    // every member has already settled — is decided after the
+                    // whole turn commits, below.
+                    continue;
+                }
+                // Nothing to await: no group, no members, or a group already
+                // closed under another call. A failed tool result the model
+                // corrects course from, exactly as a delegation refusal.
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "error": "fan-in-no-children",
+                    "message": "no open fan-out group with members awaits this call",
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+            }
+            PlannedCall::Refused {
+                call_id,
+                code,
+                message,
+            } => {
+                // The code and message pass through `bounded_detail` because
+                // a catalog's `Unavailable` refusal carries application text
+                // of unchecked length: unbounded, it could fail the inline
+                // bound and turn a refusal the run survives into a
+                // deterministic transition failure the run cannot escape.
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "error": bounded_detail(code),
+                    "message": bounded_detail(message),
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                state
+                    .run_mut()?
+                    .loop_state
+                    .record_tool_result(AgentToolResult {
+                        call_id,
+                        content,
+                        recorded_at: now,
+                    });
+            }
+        }
     }
 
     // The model's decision, recorded in the same compare-and-set that commits
@@ -1674,8 +3171,13 @@ fn evaluate_model_output(
     }
 
     let run = state.run_mut()?;
-    run.loop_state.set_phase(AgentLoopPhase::AwaitingTools);
-    run.status = checkpoint_wait_status(&run.loop_state);
+    // A group closed over members that have all settled already resolves in
+    // this same compare-and-set: the await call receives its table and the
+    // turn completes without parking at all.
+    try_resolve_fan_in(run, now);
+    let (phase, status) = turn_rest(&run.loop_state);
+    run.loop_state.set_phase(phase);
+    run.status = status;
     run.check_bounds(0)?;
     state.updated_at = now;
     Ok(())
@@ -1688,6 +3190,28 @@ fn checkpoint_wait_status(loop_state: &AgentLoopState) -> AgentRunStatus {
         Some(AgentCheckpointKind::SecurityAuthorization) => AgentRunStatus::WaitingForAuthorization,
         Some(_) => AgentRunStatus::WaitingForApproval,
         None => AgentRunStatus::WaitingForEffect,
+    }
+}
+
+/// Where a turn rests once its planned work is committed or resolved: the
+/// effect wait, the fan-in wait, or completion — the one decision every
+/// turn-completing site shares.
+///
+/// An awaiting fan-in rests `Running`, not a wait status: the run is waiting
+/// for peer entities' durable decisions, which the choreography re-drives,
+/// and `Running` is the honest non-residency status for that
+/// ([specification 9.3](../../../docs/plans/rakka-agent/spec.md)) — the
+/// entity passivates here like anywhere else.
+fn turn_rest(loop_state: &AgentLoopState) -> (AgentLoopPhase, AgentRunStatus) {
+    if loop_state.awaits_effect() {
+        (
+            AgentLoopPhase::AwaitingTools,
+            checkpoint_wait_status(loop_state),
+        )
+    } else if loop_state.awaits_fan_in() {
+        (AgentLoopPhase::AwaitingChildren, AgentRunStatus::Running)
+    } else {
+        (AgentLoopPhase::RecordingTurn, AgentRunStatus::Running)
     }
 }
 
@@ -1933,6 +3457,7 @@ fn apply_effect_outcome(
     outcome: &AgentRunEffectOutcome,
     now: AgentTimestampMillis,
 ) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
     // Whether the run is already winding down: recording the outcome of work
     // already in flight is not further dispatch, but it must not resume a run
     // that is quiescing ([specification 8.7]).
@@ -1974,9 +3499,11 @@ fn apply_effect_outcome(
             };
             run.loop_state.record_tool_result(result);
             if !winding_down && !run.loop_state.awaits_effect() {
-                // The last tool of the turn came back, so the turn is complete.
-                run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
-                run.status = AgentRunStatus::Running;
+                // The last tool of the turn came back, so the turn rests:
+                // complete, or awaiting a closed fan-in group's children.
+                let (phase, status) = turn_rest(&run.loop_state);
+                run.loop_state.set_phase(phase);
+                run.status = status;
             }
         }
         AgentRunEffectOutcome::MemoryPromotion { promoted } => {
@@ -1987,6 +3514,138 @@ fn apply_effect_outcome(
             effect.status = AgentRunEffectStatus::Succeeded;
             run.loop_state
                 .record_memory_promotion(effect_id.clone(), promoted.clone(), now);
+        }
+        AgentRunEffectOutcome::Evaluation { record } => {
+            // An evaluation is not part of the turn either: the completed
+            // record parks in its cell until the settle pass owes its
+            // exchange to the coordinating task. No phase, no status, no
+            // resumption — the goal moves only when the task's decision door
+            // accepts the record. The exchange operation id derives from the
+            // producing generation here, in the same compare-and-set, so a
+            // re-driven resolution re-owes the identical exchange.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let (turn, slot, generation) = (effect.turn, effect.slot, effect.generation);
+            let exchange_operation_id =
+                goal_evaluation_exchange_operation_id(&scope, turn, slot, generation)?;
+            run.loop_state
+                .record_goal_evaluation((**record).clone(), exchange_operation_id, now);
+        }
+        AgentRunEffectOutcome::A2aSend { receipt } => {
+            // The send returned its one logical child. The effect succeeds
+            // and the delegation cell settles in this same compare-and-set,
+            // so the record, the effect, and the status can never disagree.
+            // The model sees a bounded confirmation as the tool result of the
+            // call that requested the delegation; the child's *result* is the
+            // fan-in wait's business, and the turn rests there only when a
+            // closed group awaits it.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let run = state.run_mut()?;
+            let Some(cell) = run.loop_state.delegation_mut(&receipt.delegation) else {
+                return Err(AgentRunError::UnknownDelegation {
+                    delegation: receipt.delegation.clone(),
+                });
+            };
+            cell.settle_child_created(receipt.child_task.clone(), receipt.child_run.clone(), now);
+            let call_id = cell.record.call_id.clone();
+            let content = AgentTaskContent::inline(serde_json::json!({
+                "delegation": receipt.delegation.as_str(),
+                "child_task": receipt.child_task.as_str(),
+                "status": receipt.peer_status,
+            }))
+            .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+            run.loop_state.record_tool_result(AgentToolResult {
+                call_id,
+                content,
+                recorded_at: now,
+            });
+            if !winding_down && !run.loop_state.awaits_effect() {
+                // The last effect of the turn came back, so the turn rests:
+                // complete, or awaiting a closed fan-in group's children.
+                let (phase, status) = turn_rest(&run.loop_state);
+                run.loop_state.set_phase(phase);
+                run.status = status;
+            }
+        }
+        AgentRunEffectOutcome::WorkflowStart { receipt } => {
+            // The start durably reached — or adopted — its one logical child
+            // run. The effect succeeds and the invocation cell settles in
+            // this same compare-and-set. The model sees a bounded receipt as
+            // the tool result of the call that invoked the workflow; the
+            // child's *result* is the fan-in wait's business.
+            effect.status = AgentRunEffectStatus::Succeeded;
+            let run = state.run_mut()?;
+            let Some(cell) = run.loop_state.workflow_invocation(&receipt.invocation) else {
+                return Err(AgentRunError::UnknownWorkflowInvocation {
+                    invocation: receipt.invocation.clone(),
+                });
+            };
+            let call_id = cell.record.call_id.clone();
+            // The one child this invocation may ever bind is derived on the
+            // record: a receipt naming any other run is a broken executor,
+            // and the cell settles failed rather than grafting a foreign
+            // child onto the invocation. Every invocation is a group member,
+            // so the failure is a fan-in disposition and the coordinator
+            // survives it.
+            if receipt.child_run != cell.record.child_run {
+                if let Some(cell) = run.loop_state.workflow_invocation_mut(&receipt.invocation) {
+                    cell.settle_failed("workflow-start-run-mismatch", now);
+                }
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "error": "workflow-start-run-mismatch",
+                    "message": "the start receipt named a child run the invocation does not own",
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+            } else {
+                if let Some(cell) = run.loop_state.workflow_invocation_mut(&receipt.invocation) {
+                    cell.settle_started(receipt.adopted, now);
+                }
+                let content = AgentTaskContent::inline(serde_json::json!({
+                    "invocation": receipt.invocation.as_str(),
+                    "child_run": receipt.child_run.as_str(),
+                    "adopted": receipt.adopted,
+                }))
+                .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                run.loop_state.record_tool_result(AgentToolResult {
+                    call_id,
+                    content,
+                    recorded_at: now,
+                });
+            }
+            // There is no early window for a workflow result, so the child's
+            // outcome may already be on the cell when this receipt settles it
+            // `Started` — and a member whose disposition just became decidable
+            // may resolve a closed group in this same compare-and-set. The
+            // delegation arm needs no such step: an early delegation result
+            // is refused, so its dispositions only change through paths that
+            // already run the fan-in step.
+            try_resolve_fan_in(run, now);
+            if !winding_down && !run.loop_state.awaits_effect() {
+                // The last effect of the turn came back, so the turn rests:
+                // complete, or awaiting a closed fan-in group's children.
+                let (phase, status) = turn_rest(&run.loop_state);
+                run.loop_state.set_phase(phase);
+                run.status = status;
+            }
+        }
+        AgentRunEffectOutcome::ClaimAppend { .. } => {
+            // The claim landed; the receipt's id is on the settled outcome
+            // record. Nothing else moves: an append is not part of the turn,
+            // and whatever wait the run held, it still holds.
+            effect.status = AgentRunEffectStatus::Succeeded;
+        }
+        AgentRunEffectOutcome::WorkflowCancel { .. } => {
+            // The request durably reached the child's inbox, or found it
+            // already finished. Nothing else moves: the disposition recorded
+            // at commit is the durable decision, the child's terminal
+            // outcome still returns through the result relay, and the
+            // winding-down run keeps quiescing until it does
+            // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+            effect.status = AgentRunEffectStatus::Succeeded;
         }
         AgentRunEffectOutcome::Failed { code, .. }
         | AgentRunEffectOutcome::Exhausted { code, .. } => {
@@ -2000,15 +3659,153 @@ fn apply_effect_outcome(
             effect.last_error_code = Some(bounded_detail(code.clone()));
             let failed_kind = effect.kind();
             let code = code.clone();
-            // A failed memory promotion is the one exception to the wind-down:
+            // A failed memory promotion is one exception to the wind-down:
             // memory is never the correctness source
             // ([specification 13.1](../../../docs/plans/rakka-agent/spec.md)),
             // so a memory-store outage must not kill a live run. The failure
             // stays on the effect record, and the initiator may re-issue the
-            // promotion under a new operation id.
-            if failed_kind != AgentRunEffectKind::MemoryPromotionCall {
+            // promotion under a new operation id. A failed goal evaluation is
+            // the other: the coordinator run must outlive a refused or
+            // unwired evaluation so the goal stays decidable — the failure
+            // stays on the effect record and the caller re-evaluates
+            // ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+            // A definitively failed send settles its delegation cell in this
+            // same compare-and-set — as an explicit conflict when the peer
+            // reported one, else as a failure.
+            let mut group_member_send = false;
+            if failed_kind == AgentRunEffectKind::A2aSendCall {
                 let run = state.run_mut()?;
-                run.loop_state.fence_unsent_effects();
+                let held =
+                    run.loop_state.delegations().iter().find_map(|(id, cell)| {
+                        (cell.record.effect == *effect_id).then(|| id.clone())
+                    });
+                if let Some(delegation_id) = held {
+                    let conflict = matches!(
+                        code.as_str(),
+                        "delegation-child-conflict" | "delegation-child-mismatch"
+                    );
+                    let call_id = run
+                        .loop_state
+                        .delegation(&delegation_id)
+                        .map(|cell| cell.record.call_id.clone());
+                    if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                        if conflict {
+                            cell.settle_conflicted(code.clone(), now);
+                        } else {
+                            cell.settle_failed(code.clone(), now);
+                        }
+                    }
+                    // A send whose delegation belongs to the run's fan-out
+                    // group is a *child that failed to exist* — an explicit
+                    // fan-in disposition, not a coordinator failure
+                    // ([specification 8.7]: failed children are handled
+                    // explicitly by policy). The failure reaches the model as
+                    // the call's failed tool result, the policy branches on
+                    // it, and the coordinator survives to work with the
+                    // children it has. Membership alone is the test, never a
+                    // still-unresolved group: a policy that resolved early —
+                    // an `Any` satisfied by the first child while its
+                    // siblings' sends were still in flight — has already
+                    // decided what it waited for, and its own stragglers must
+                    // not then wind it down. A send outside any group keeps
+                    // the pre-fan-in wind-down below.
+                    let member = crate::fan_in::AgentFanInMemberId::from(delegation_id.clone());
+                    group_member_send = !winding_down
+                        && run
+                            .loop_state
+                            .fan_in()
+                            .is_some_and(|group| group.members.contains(&member));
+                    if group_member_send {
+                        if let Some(call_id) = call_id {
+                            let content = AgentTaskContent::inline(serde_json::json!({
+                                "error": bounded_detail(code.clone()),
+                                "message": "the delegation send failed definitively; no child \
+                                            was created",
+                            }))
+                            .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                            run.loop_state.record_tool_result(AgentToolResult {
+                                call_id,
+                                content,
+                                recorded_at: now,
+                            });
+                        }
+                        // The settled failure may resolve a closed group —
+                        // an `Any` with nothing left to succeed, a quorum no
+                        // longer reachable — in this same compare-and-set.
+                        try_resolve_fan_in(run, now);
+                        if !run.loop_state.awaits_effect() {
+                            let (phase, status) = turn_rest(&run.loop_state);
+                            run.loop_state.set_phase(phase);
+                            run.status = status;
+                        }
+                    }
+                }
+            }
+            // A definitively failed workflow start is the same shape: a
+            // *child that failed to exist* — the invocation cell settles as
+            // an explicit conflict when the executor reported one, else as a
+            // failure, and a group member becomes a fan-in disposition the
+            // coordinator survives.
+            if failed_kind == AgentRunEffectKind::WorkflowStartCall {
+                let run = state.run_mut()?;
+                let held = run
+                    .loop_state
+                    .workflow_invocations()
+                    .iter()
+                    .find_map(|(id, cell)| (cell.record.effect == *effect_id).then(|| id.clone()));
+                if let Some(invocation_id) = held {
+                    // The canonical code the dispatch layer normalizes every
+                    // conflict finding onto — structural, not an executor
+                    // string convention.
+                    let conflict = code.as_str()
+                        == crate::workflow_tool::AGENT_WORKFLOW_INVOCATION_CONFLICT_CODE;
+                    let call_id = run
+                        .loop_state
+                        .workflow_invocation(&invocation_id)
+                        .map(|cell| cell.record.call_id.clone());
+                    if let Some(cell) = run.loop_state.workflow_invocation_mut(&invocation_id) {
+                        if conflict {
+                            cell.settle_conflicted(code.clone(), now);
+                        } else {
+                            cell.settle_failed(code.clone(), now);
+                        }
+                    }
+                    let member = crate::fan_in::AgentFanInMemberId::from(invocation_id.clone());
+                    let group_member_start = !winding_down
+                        && run
+                            .loop_state
+                            .fan_in()
+                            .is_some_and(|group| group.members.contains(&member));
+                    if group_member_start {
+                        if let Some(call_id) = call_id {
+                            let content = AgentTaskContent::inline(serde_json::json!({
+                                "error": bounded_detail(code.clone()),
+                                "message": "the workflow start failed definitively; no child \
+                                            run was reached",
+                            }))
+                            .map_err(|error| AgentRunError::Task(Box::new(error)))?;
+                            run.loop_state.record_tool_result(AgentToolResult {
+                                call_id,
+                                content,
+                                recorded_at: now,
+                            });
+                        }
+                        try_resolve_fan_in(run, now);
+                        if !run.loop_state.awaits_effect() {
+                            let (phase, status) = turn_rest(&run.loop_state);
+                            run.loop_state.set_phase(phase);
+                            run.status = status;
+                        }
+                    }
+                    group_member_send = group_member_send || group_member_start;
+                }
+            }
+            if failed_kind != AgentRunEffectKind::MemoryPromotionCall
+                && failed_kind != AgentRunEffectKind::GoalEvaluationCall
+                && !group_member_send
+            {
+                let run = state.run_mut()?;
+                run.loop_state.fence_unsent_effects(now);
                 if run.terminal_reason.is_none() {
                     run.terminal_reason = Some(AgentRunTerminalReason::EffectFailed {
                         effect_id: effect_id.clone(),
@@ -2030,8 +3827,39 @@ fn apply_effect_outcome(
         }
         AgentRunEffectOutcome::Cancelled { .. } => {
             // The dispatch layer fenced and settled the generation without
-            // invocation. Recording that never resumes the run.
+            // invocation. Recording that never resumes the run. A fenced
+            // delegation send settles its cell as failed: the winding-down
+            // parent never spawned the child, and recovery after the wind-down
+            // uses a new delegation, never this one.
+            let cancelled_kind = effect.kind();
             effect.status = AgentRunEffectStatus::Cancelled;
+            if cancelled_kind == AgentRunEffectKind::A2aSendCall {
+                let run = state.run_mut()?;
+                let held =
+                    run.loop_state.delegations().iter().find_map(|(id, cell)| {
+                        (cell.record.effect == *effect_id).then(|| id.clone())
+                    });
+                if let Some(delegation_id) = held {
+                    if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                        cell.settle_failed("run-winding-down", now);
+                    }
+                }
+            }
+            // A fenced workflow start settles its cell the same way: the
+            // winding-down parent never reached the child run.
+            if cancelled_kind == AgentRunEffectKind::WorkflowStartCall {
+                let run = state.run_mut()?;
+                let held = run
+                    .loop_state
+                    .workflow_invocations()
+                    .iter()
+                    .find_map(|(id, cell)| (cell.record.effect == *effect_id).then(|| id.clone()));
+                if let Some(invocation_id) = held {
+                    if let Some(cell) = run.loop_state.workflow_invocation_mut(&invocation_id) {
+                        cell.settle_failed("run-winding-down", now);
+                    }
+                }
+            }
         }
     }
 
@@ -2095,7 +3923,13 @@ fn settle_run_disposition(
 
     let winding_down = run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling;
     if winding_down {
-        if run.loop_state.awaits_settlement() {
+        // The quiesce condition spans the subtree ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+        // a created child whose terminal outcome has not returned is a
+        // started consequential effect, so the parent stays `Cancelling`
+        // until every delegation and workflow cell holds one — the last
+        // child result, arriving through its own exchange, re-runs this
+        // settle and terminalizes the parent.
+        if run.loop_state.awaits_settlement() || run.loop_state.awaits_children() {
             run.status = AgentRunStatus::Cancelling;
             state.updated_at = now;
             return Ok(());
@@ -2224,8 +4058,24 @@ fn apply_indeterminate_resolution(
         AgentEffectResolution::ConfirmedNotExecuted => {
             if winding_down {
                 // Proven never executed, and the run wants nothing further:
-                // the fence holds and the generation settles as cancelled.
+                // the fence holds and the generation settles as cancelled. A
+                // reconciled delegation send settles its cell in the same
+                // compare-and-set — proven never executed means the child was
+                // never created, and recovery after the wind-down uses a new
+                // delegation, never this one.
                 effect.status = AgentRunEffectStatus::Cancelled;
+                let cancelled_kind = effect.kind();
+                if cancelled_kind == AgentRunEffectKind::A2aSendCall {
+                    let run = state.run_mut()?;
+                    let held = run.loop_state.delegations().iter().find_map(|(id, cell)| {
+                        (cell.record.effect == *effect_id).then(|| id.clone())
+                    });
+                    if let Some(delegation_id) = held {
+                        if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                            cell.settle_failed("run-winding-down", now);
+                        }
+                    }
+                }
                 state.updated_at = now;
             } else {
                 // A new invocation is authorized, and it is a new generation:
@@ -2304,7 +4154,7 @@ fn cancel(
         return Err(AgentRunError::Terminal { status: run.status });
     }
 
-    run.loop_state.fence_unsent_effects();
+    run.loop_state.fence_unsent_effects(now);
     run.loop_state.cancel_open_checkpoints(now);
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::CancellationRequested {
@@ -2614,7 +4464,7 @@ fn schedule_compensation(
     // Wind down first, then commit the compensation: the fence cancels only
     // what was pending before it, and the effect recorded after it is exactly
     // the one piece of new work the decision authorizes.
-    run.loop_state.fence_unsent_effects();
+    run.loop_state.fence_unsent_effects(now);
     if run.terminal_reason.is_none() {
         run.terminal_reason = Some(AgentRunTerminalReason::EffectCompensated {
             effect_id: effect_id.clone(),
@@ -2711,6 +4561,191 @@ fn promote_memory(
     Ok(())
 }
 
+/// Commits one communal claim-append effect from a deduplicated command
+/// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The transition is bounded and performs no I/O: it validates the statement,
+/// checks the space against the run's delegated grant — `Some(set)` must name
+/// it; `None` under a delegated chain fails closed, the deny-when-unknown
+/// posture; `None` at a root defers to the definition envelope the authority
+/// re-checks per attempt — stamps the provenance from durable state alone,
+/// reserves the append's attempt budget, and records the effect. The
+/// dispatcher-side executor performs the store append inside its bounded
+/// attempt.
+fn append_claim(
+    state: &mut AgentRunState,
+    append: crate::effect::AgentClaimAppendRequest,
+    policies: &AgentEffectPolicies,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let scope = state.scope.clone();
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Err(AgentRunError::Terminal { status: run.status });
+    }
+    if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
+        // An append is new work, which the wind-down fence forbids.
+        return Err(AgentRunError::ClaimAppendFenced { status: run.status });
+    }
+    append
+        .validate()
+        .map_err(|error| AgentRunError::ClaimAppendInvalid {
+            message: error.to_string(),
+        })?;
+    let envelope = run.loop_state.delegation_envelope();
+    let granted = match envelope.and_then(|envelope| envelope.knowledge_spaces.as_ref()) {
+        Some(granted) => granted.contains(&append.space),
+        None => envelope.is_none_or(|envelope| envelope.lineage.is_empty()),
+    };
+    if !granted {
+        return Err(AgentRunError::ClaimSpaceNotDelegated {
+            space: append.space.clone(),
+        });
+    }
+    // The provenance is stamped here and only here, from durable identity:
+    // the command payload carries none, so a hostile initiator cannot assert
+    // work in another scope's name.
+    let provenance = crate::effect::AgentClaimAppendProvenance {
+        agent: scope.agent().clone(),
+        goal: run.loop_state.goal().cloned(),
+        task: run.task().clone(),
+        run: scope.run().clone(),
+        delegation: envelope.and_then(|envelope| envelope.lineage.last().cloned()),
+    };
+    let request = AgentRunEffectRequest::ClaimAppend {
+        append: Box::new(append),
+        provenance: Box::new(provenance),
+    };
+    let spec = policies.spec_for(&request).clone();
+    if let Err(exhaustion) = run
+        .loop_state
+        .budget_mut()
+        .reserve_attempts(spec.max_attempts)
+    {
+        return Err(AgentRunError::ClaimAppendUnaffordable { exhaustion });
+    }
+
+    let turn = run.loop_state.turn();
+    let slot = run.loop_state.next_effect_slot();
+    let settings_revision = run.loop_state.agent_settings_revision();
+    let effect = AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+    run.loop_state.record_effect(effect)?;
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Commits one goal-evaluation effect from a deduplicated command
+/// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The transition is bounded and performs no I/O: it fences, reserves the
+/// evaluation's attempt budget, and records the read-only effect — the
+/// promotion idiom. The run's status and phase do not move; a human review
+/// additionally opens the approval checkpoint whose grant is its verdict, in
+/// this same compare-and-set, so the effect stays `Pending` until an
+/// authorized decision exists.
+///
+/// The fences, in order: a terminal or winding-down run evaluates nothing
+/// (`run-goal-evaluation-fenced` — an evaluation is new work); the request's
+/// evidence must fit its bound *with the dispatcher's own appends reserved*
+/// (`run-goal-evaluation-invalid`), so a human review that would overflow the
+/// record is refused here rather than after a human already approved it; the
+/// run must be bound to exactly the goal under evaluation
+/// (`run-goal-evaluation-unbound`);
+/// a verification workflow is typed but refused until a slice bridges the
+/// evaluation cell to the workflow-tool invocation path
+/// (`run-goal-evaluation-workflow-deferred`); and one evaluation is open at a
+/// time (`run-goal-evaluation-outstanding`) — the goal's decision door is
+/// serial, so a second in-flight evaluation could only race the first.
+fn evaluate_goal(
+    state: &mut AgentRunState,
+    evaluation: crate::evaluation::AgentGoalEvaluationRequest,
+    policies: &AgentEffectPolicies,
+    decision_events: bool,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    use crate::evaluation::AgentGoalEvaluationMethod;
+
+    let scope = state.scope.clone();
+    let checkpoint_owed = {
+        let run = state.run_mut()?;
+        if run.status.is_terminal() {
+            return Err(AgentRunError::Terminal { status: run.status });
+        }
+        if run.terminal_reason.is_some() || run.status == AgentRunStatus::Cancelling {
+            return Err(AgentRunError::GoalEvaluationFenced { status: run.status });
+        }
+        evaluation
+            .validate()
+            .map_err(|error| AgentRunError::GoalEvaluationInvalid {
+                message: error.to_string(),
+            })?;
+        if run.loop_state.goal() != Some(&evaluation.goal) {
+            return Err(AgentRunError::GoalEvaluationUnbound {
+                goal: evaluation.goal.clone(),
+            });
+        }
+        if matches!(
+            evaluation.method,
+            AgentGoalEvaluationMethod::VerificationWorkflow { .. }
+        ) {
+            return Err(AgentRunError::GoalEvaluationWorkflowDeferred);
+        }
+        if run.loop_state.has_open_goal_evaluation() {
+            return Err(AgentRunError::GoalEvaluationOutstanding);
+        }
+
+        let human_review = matches!(evaluation.method, AgentGoalEvaluationMethod::HumanReview);
+        let request = AgentRunEffectRequest::Evaluation {
+            evaluation: Box::new(evaluation),
+        };
+        let mut spec = policies.spec_for(&request).clone();
+        if human_review {
+            // The authorized decision is the verdict, so the effect must not
+            // dispatch until one exists — whatever the deployment's spec says.
+            spec.checkpoint_required = true;
+        }
+        if let Err(exhaustion) = run
+            .loop_state
+            .budget_mut()
+            .reserve_attempts(spec.max_attempts)
+        {
+            return Err(AgentRunError::GoalEvaluationUnaffordable { exhaustion });
+        }
+
+        let turn = run.loop_state.turn();
+        let slot = run.loop_state.next_effect_slot();
+        let settings_revision = run.loop_state.agent_settings_revision();
+        let effect =
+            AgentRunEffect::new(&scope, turn, slot, request, &spec, settings_revision, now)?;
+        let effect_id = effect.effect_id.clone();
+        let checkpoint_owed = effect.checkpoint_required;
+        run.loop_state.record_effect(effect)?;
+        if decision_events {
+            run.loop_state.record_decision(
+                &scope,
+                AgentDecisionDraft::new(
+                    AgentDecisionKind::Evaluate,
+                    AgentDecisionSource::DeterministicPolicy,
+                    "goal-evaluation",
+                ),
+                now,
+            );
+        }
+        checkpoint_owed.then_some(effect_id)
+    };
+    if let Some(effect_id) = checkpoint_owed {
+        open_effect_checkpoint(
+            state,
+            policies,
+            &effect_id,
+            AgentCheckpointKind::Approval,
+            now,
+        )?;
+    }
+    state.updated_at = now;
+    Ok(())
+}
+
 /// Fires the durable SLA and expiration timers on every open checkpoint
 /// ([specification 12.6](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -2767,6 +4802,159 @@ fn fire_checkpoint_timers(
     }
 
     settle_run_disposition(state, now)
+}
+
+/// Fires the parked fan-in wait's deadline: marks the still-unresolved
+/// members timed out and resolves the group deterministically
+/// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Idempotent and clock-fenced: a deadline not yet due, a group already
+/// resolved, an open group, or no group at all transitions nothing, so early,
+/// late, and duplicate deliveries all converge. A terminal or winding-down
+/// run records the resolution as evidence and resumes nothing.
+fn fire_fan_in_deadline(
+    state: &mut AgentRunState,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    let run = state.run_mut()?;
+    if run.status.is_terminal() {
+        return Ok(());
+    }
+    let Some(group) = run.loop_state.fan_in() else {
+        return Ok(());
+    };
+    if !group.awaiting() {
+        return Ok(());
+    }
+    let Some(deadline) = group.deadline else {
+        return Ok(());
+    };
+    if now.as_millis() < deadline.as_millis() {
+        return Ok(());
+    }
+    let stragglers = crate::fan_in::unresolved_members(
+        group,
+        run.loop_state.delegations(),
+        run.loop_state.workflow_invocations(),
+    );
+    if let Some(group) = run.loop_state.fan_in_mut() {
+        group.timed_out.extend(stragglers);
+    }
+    let resolved = try_resolve_fan_in(run, now);
+    if resolved
+        && run.loop_state.phase() == AgentLoopPhase::AwaitingChildren
+        && run.status != AgentRunStatus::Cancelling
+        && run.terminal_reason.is_none()
+    {
+        run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+        run.status = AgentRunStatus::Running;
+    }
+    state.updated_at = now;
+    Ok(())
+}
+
+/// Records one child workflow run's terminal outcome on the invocation cell
+/// that owns it, runs the deterministic fan-in step, and — when the policy
+/// resolves a parked wait — completes the awaiting turn
+/// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md): workflow
+/// completion returns a deduplicated result/evidence reference).
+///
+/// Every fence below is the run's own durable state, refused as a
+/// non-committing error so a refused delivery is never journaled and a
+/// corrected re-send applies. There is deliberately no early window: the
+/// child's identity is derived on the record at commit, so a result arriving
+/// before the start receipt authenticates against the record and records
+/// first-writer-wins — the receipt later settles the effect independently.
+/// A duplicate inside the journal's bounded window answers from the
+/// operation log; past it, the cell's recorded result is the durable fence
+/// and the delivery accepts idempotently with no second transition. A
+/// superseded effect generation needs no extra fence: the invocation id is
+/// generation-free, and the cell's status decides.
+#[allow(clippy::too_many_arguments)]
+fn record_workflow_result(
+    state: &mut AgentRunState,
+    invocation: &AgentWorkflowInvocationId,
+    child_run: &rakka_agent_workflow::AgentRunId,
+    status: crate::workflow_tool::AgentWorkflowTerminalStatus,
+    terminal_reason: Option<String>,
+    result_ref: Option<ArtifactRef>,
+    result_digest: Option<crate::task::AgentContentDigest>,
+    now: AgentTimestampMillis,
+) -> AgentRunResult<()> {
+    use crate::workflow_tool::{AgentWorkflowChildResult, AgentWorkflowInvocationStatus};
+
+    let Some(run) = state.run.as_mut() else {
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-unknown-run",
+            message: "the addressed run was never assigned, so it owns no workflow invocations"
+                .to_string(),
+        });
+    };
+    let Some(cell) = run.loop_state.workflow_invocation(invocation) else {
+        // Cells live for the run's lifetime — the map is never pruned — so an
+        // unknown invocation is a forgery or a misroute, not aging.
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-unknown-invocation",
+            message: format!("the run holds no workflow invocation {invocation}"),
+        });
+    };
+    if *child_run != cell.record.child_run {
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-forged",
+            message: format!(
+                "the invocation's child run is {}, not {child_run}",
+                cell.record.child_run
+            ),
+        });
+    }
+    if matches!(
+        cell.status,
+        AgentWorkflowInvocationStatus::Conflicted { .. }
+            | AgentWorkflowInvocationStatus::Failed { .. }
+    ) {
+        // A settled non-started cell owns no child: whatever run produced
+        // this result was not started by this invocation.
+        return Err(AgentRunError::WorkflowResultRefused {
+            code: "workflow-result-not-owned",
+            message: "the invocation settled without a child run this run owns".to_string(),
+        });
+    }
+    if !cell.child_settled() {
+        let result = AgentWorkflowChildResult {
+            status,
+            terminal_reason: terminal_reason.map(bounded_detail),
+            result_ref,
+            result_digest,
+            descendants_created: 0,
+            recorded_at: now,
+        };
+        if let Some(cell) = run.loop_state.workflow_invocation_mut(invocation) {
+            cell.record_child_result(result);
+        }
+        // The deterministic fan-in step, in this same compare-and-set. A
+        // resolution completes a parked wait only on a run that is still
+        // going somewhere: a terminal or winding-down parent records the
+        // evidence and resumes nothing.
+        let resolved = try_resolve_fan_in(run, now);
+        if resolved
+            && run.loop_state.phase() == AgentLoopPhase::AwaitingChildren
+            && !run.status.is_terminal()
+            && run.status != AgentRunStatus::Cancelling
+            && run.terminal_reason.is_none()
+        {
+            run.loop_state.set_phase(AgentLoopPhase::RecordingTurn);
+            run.status = AgentRunStatus::Running;
+        }
+        state.updated_at = now;
+        // The recorded result may be the last outcome a winding-down parent
+        // awaited: quiescence is re-checked in this same compare-and-set
+        // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+        settle_run_disposition(state, now)?;
+    }
+    // A result already recorded — a conflicting duplicate past the journal's
+    // bounded window — accepts idempotently with no further transition: the
+    // cell is the durable fence, first writer wins.
+    Ok(())
 }
 
 /// Applies the task's decision on a result proposal.
@@ -2858,6 +5046,19 @@ fn settle_proposal(
             // evaluate the proposal, because the run is fenced by a newer
             // generation or the task has moved on. There is nothing for the run
             // to correct, so it stops with the task's own reason on record.
+            if code == AGENT_TASK_REFUSAL_CANCEL_REQUESTED {
+                // The task's cancellation is propagating and this run is the
+                // scope being cancelled: the refusal is the wind-down
+                // reaching the run through the proposal it happened to hold,
+                // so it takes the wind-down path rather than terminalizing
+                // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                // Terminalizing here would project `Failed` (the task's
+                // status is deliberately still nonterminal), skip the
+                // subtree quiesce gate, and leave this run's own children
+                // unchased. `cancel` keeps whatever reason a run-cancel
+                // already recorded, so the two orderings converge.
+                return cancel(state, code, now);
+            }
             terminate(
                 state,
                 if code == AGENT_TASK_REFUSAL_STALE_GENERATION {
@@ -2910,6 +5111,43 @@ impl AgentExchangeParticipant for AgentRunParticipant {
     ) -> AgentExchangeTransition {
         let result = match envelope.kind() {
             AgentExchangeKind::Assignment => accept_assignment(state, envelope, now),
+            AgentExchangeKind::DelegationResult => {
+                let result = accept_delegation_result(state, envelope, now);
+                // The result may have completed a cancelling parent's
+                // quiescence, terminalizing it: whatever the terminalization
+                // owes — the ledger settlement, a remaining child chase —
+                // commits in this same compare-and-set.
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_run_exchanges(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "owed-exchange construction failed: {error}");
+                    }
+                }
+                return transition;
+            }
+            AgentExchangeKind::RunCancel => {
+                let result = accept_run_cancel(state, envelope, now);
+                // The wind-down owes its children's chase in the same
+                // compare-and-set that accepted the request
+                // ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                let mut transition = AgentExchangeTransition::new(result);
+                match owed_run_exchanges(state, now) {
+                    Ok(owed) => {
+                        for envelope in owed {
+                            transition = transition.owing(envelope);
+                        }
+                    }
+                    Err(error) => {
+                        debug_assert!(false, "owed-exchange construction failed: {error}");
+                    }
+                }
+                return transition;
+            }
             kind => refuse(
                 "unsupported-exchange",
                 format!("a run entity does not receive a {kind} exchange"),
@@ -2920,7 +5158,10 @@ impl AgentExchangeParticipant for AgentRunParticipant {
         // segment's context in place ([specification 17.5]). Recorded in the
         // same compare-and-set as the acceptance, so every effect the ensuing
         // transitions commit carries the causal chain the ingress started.
-        if envelope.has_telemetry() {
+        // Scoped to the assignment: a child's delegation result carries the
+        // *child's* context, which links into the parent's spans rather than
+        // replacing its causal chain ([specification 17.4]).
+        if envelope.kind() == AgentExchangeKind::Assignment && envelope.has_telemetry() {
             if let Some(run) = state.run.as_mut() {
                 run.loop_state
                     .record_telemetry(envelope.telemetry().clone());
@@ -2979,6 +5220,22 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                     }),
                 }
             }
+            AgentExchangeKind::DelegationCancel if !result.is_accepted() => {
+                // A refused delegation-cancel settles only under the child's
+                // definitive answers: the sender was not its recorded parent,
+                // or it carries no such delegation. Every other refusal — an
+                // `unsupported-exchange` from an owner that predates the
+                // kind, a payload it could not decode — leaves the exchange
+                // outstanding for re-drive until an owner that can answer it
+                // does (the rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some("delegation-cancel-forged" | "delegation-cancel-not-delegated") => Ok(()),
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::DelegationCancel,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -3013,9 +5270,22 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                 // the original exhaustion.
                 apply_top_up_grant(state, result, now);
             }
+            AgentExchangeKind::GoalEvaluation => {
+                // The decision door answered — accepted, or refused under its
+                // own code. Either way the report settles; a refusal is the
+                // caller's signal to re-evaluate, never a crash loop.
+                settle_goal_evaluation_exchange(state, envelope, result, now);
+            }
+            AgentExchangeKind::DelegationCancel => {
+                // The child answered — accepted, or refused definitively.
+                // Either way the outcome records on the cell: the durable
+                // once-guard, and the observable outcome the propagation
+                // request owes ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+                settle_delegation_cancel(state, envelope, result, now);
+            }
             _ => {}
         }
-        owed_ledger_exchange(state, now).unwrap_or_default()
+        owed_run_exchanges(state, now).unwrap_or_default()
     }
 }
 
@@ -3044,6 +5314,8 @@ where
     policies: AgentEffectPolicies,
     memory: Option<AgentRunMemory>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
     metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
@@ -3089,6 +5361,8 @@ where
             policies: AgentEffectPolicies::default(),
             memory: None,
             decisions: None,
+            delegation: None,
+            workflow_tools: None,
             metrics: Arc::new(NoopMetricsRecorder),
             recovered: false,
         }
@@ -3161,6 +5435,43 @@ where
         self
     }
 
+    /// Wires the run to serve delegation
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run intercepts calls to the configured coordination tool and
+    /// converts each into a durable delegation record plus its outbound A2A
+    /// send effect, committed in one compare-and-set. An unwired run cannot
+    /// recognize the tool, so its calls take the generic path — where the
+    /// dispatch authority refuses a registered coordination-kind tool with
+    /// `coordination-tool-not-intercepted`, the defense in depth behind the
+    /// structural guarantee. The configuration itself refuses construction
+    /// without the delegation capability, so a deployment cannot wire the
+    /// tool while forgetting the authority that permits it.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
+        self
+    }
+
+    /// Wires the run to serve workflow tools
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A wired run intercepts calls naming a configured workflow tool and
+    /// converts each into a durable invocation record plus its start effect,
+    /// committed in one compare-and-set. An unwired run cannot recognize the
+    /// tool, so its calls take the generic path — where the dispatch
+    /// authority refuses a registered kind-`Workflow` tool with
+    /// `workflow-tool-requires-interception`, the defense in depth behind
+    /// the structural guarantee.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
+        self
+    }
+
     /// The scope this facade addresses.
     #[must_use]
     pub const fn scope(&self) -> &AgentRunScope {
@@ -3221,7 +5532,27 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunEntityReply> {
         self.ensure_recovered(now).await?;
+        // Counted across the whole operation, not at one resolving site: a
+        // command resolves a group from three different places — the deadline
+        // timer, a member send that failed definitively, and an await that
+        // closed over members which had all already settled — and the
+        // transition functions that reach them hold no metrics handle. The
+        // reply is carried through unchanged, including an error: the
+        // transition commits before the settle pass, so a resolution can be
+        // durable even when the call fails.
+        let resolution_before = self.fan_in_resolution();
+        let reply = self.apply_command(command, router, now).await;
+        self.record_fan_in_resolution(resolution_before);
+        reply
+    }
 
+    /// [`Self::apply`] without its metric bookkeeping.
+    async fn apply_command(
+        &mut self,
+        command: AgentRunEntityCommand,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<AgentRunEntityReply> {
         if let Some(operation_id) = command.operation_id() {
             if let Some(outcome) = self
                 .state()?
@@ -3233,8 +5564,9 @@ where
                 // settlement failure, so the replay must re-drive the settle
                 // pass the committed transition still owes — answering from
                 // the log alone would leave the run stalled on work it durably
-                // recorded but never dispatched.
-                self.settle_side_effects(router, now).await?;
+                // recorded but never dispatched. The inner pass: `apply`'s
+                // own sampling scope wraps this call.
+                self.settle_side_effects_inner(router, now).await?;
                 return Ok(AgentRunEntityReply::Duplicate { outcome });
             }
         }
@@ -3343,6 +5675,49 @@ where
                 })
                 .await?
             }
+            AgentRunEntityCommand::FireFanInDeadline { operation_id } => {
+                self.transition(now, move |state| {
+                    fire_fan_in_deadline(state, now)?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
+            AgentRunEntityCommand::RecordWorkflowResult {
+                operation_id,
+                invocation,
+                child_run,
+                status,
+                terminal_reason,
+                result_ref,
+                result_digest,
+            } => {
+                let reply = self
+                    .transition(now, move |state| {
+                        record_workflow_result(
+                            state,
+                            &invocation,
+                            &child_run,
+                            status,
+                            terminal_reason,
+                            result_ref.map(|reference| *reference),
+                            result_digest,
+                            now,
+                        )?;
+                        Ok(operation_id)
+                    })
+                    .await?;
+                // Counted after the recording transition committed; a
+                // replayed result answers from the operation log above and
+                // never reaches this arm.
+                record_agent_domain_counter(
+                    self.metrics.as_ref(),
+                    METRIC_AGENT_WORKFLOW_RESULTS,
+                    1,
+                    &[("outcome", "accepted")],
+                )
+                .ok();
+                reply
+            }
             AgentRunEntityCommand::Cancel {
                 operation_id,
                 reason,
@@ -3365,9 +5740,33 @@ where
                 })
                 .await?
             }
+            AgentRunEntityCommand::AppendClaim {
+                operation_id,
+                append,
+            } => {
+                let policies = self.policies.clone();
+                self.transition(now, move |state| {
+                    append_claim(state, *append, &policies, now)?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
+            AgentRunEntityCommand::EvaluateGoal {
+                operation_id,
+                evaluation,
+            } => {
+                let policies = self.policies.clone();
+                let decision_events = self.decisions.is_some();
+                self.transition(now, move |state| {
+                    evaluate_goal(state, *evaluation, &policies, decision_events, now)?;
+                    Ok(operation_id)
+                })
+                .await?
+            }
         };
 
-        self.settle_side_effects(router, now).await?;
+        // The inner pass: `apply`'s own sampling scope wraps this call.
+        self.settle_side_effects_inner(router, now).await?;
         Ok(reply)
     }
 
@@ -3379,7 +5778,22 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentExchangeReply> {
         self.ensure_recovered(now).await?;
+        let resolution_before = self.fan_in_resolution();
         let reply = self.host.accept(envelope, now).await?;
+        if envelope.kind() == AgentExchangeKind::DelegationResult {
+            let outcome = if reply.result().is_accepted() {
+                "accepted"
+            } else {
+                "rejected"
+            };
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_DELEGATION_RESULTS,
+                1,
+                &[("outcome", outcome)],
+            )
+            .ok();
+        }
         // Accepting a delivered exchange makes *local* progress only: it cranks
         // the loop and hands new effects to the sink. It does **not** deliver the
         // cross-entity exchanges that crank may have committed to the run's
@@ -3396,8 +5810,55 @@ where
         // reply lets the initiator settle first, exactly as a durable outbox
         // drains on a later turn rather than inside the transition that filled
         // it.
-        self.make_local_progress(now).await?;
+        // The delivered result may have resolved the group here, or the crank
+        // below may resolve it from a member send that failed on the way out.
+        let progress = self.make_local_progress(now).await;
+        self.record_fan_in_resolution(resolution_before);
+        progress?;
         Ok(reply)
+    }
+
+    /// The identity of the fan-in resolution the run currently holds: the
+    /// group that produced it, and its bounded code.
+    ///
+    /// The group is part of the identity, not just the code. A resolution is
+    /// absorbing and the next committed delegation replaces the whole group,
+    /// so two rounds of fan-out that resolve the same way are two
+    /// resolutions, while re-reading one resolved group is not.
+    fn fan_in_resolution(&self) -> Option<(u64, AgentTimestampMillis, String)> {
+        let group = self.state().ok()?.run.as_ref()?.loop_state.fan_in()?;
+        let resolution = group.resolution.as_ref()?;
+        Some((group.opened_turn, group.opened_at, resolution.code.clone()))
+    }
+
+    /// Counts a fan-in resolution this operation persisted, exactly once.
+    ///
+    /// Every path that can resolve a group — an awaited child's result, the
+    /// deadline timer, a member send that failed definitively, and an await
+    /// that closed over members which had all already settled — runs through
+    /// [`Self::apply`], [`Self::accept`], or a direct
+    /// [`Self::settle_side_effects`] sweep, so comparing the resolution
+    /// identity across the whole operation reaches all five bounded codes
+    /// while the transitions themselves stay free of a metrics handle. An
+    /// unchanged identity is a re-read or a replay and counts nothing. A
+    /// replacement cannot swallow a count: replacing a group requires a
+    /// model-committed delegation, a model turn is answered in its own
+    /// operation, and that operation's starting sample already saw the
+    /// resolved group.
+    fn record_fan_in_resolution(&self, before: Option<(u64, AgentTimestampMillis, String)>) {
+        let after = self.fan_in_resolution();
+        if after == before {
+            return;
+        }
+        if let Some((.., code)) = after {
+            record_agent_domain_counter(
+                self.metrics.as_ref(),
+                METRIC_AGENT_FAN_IN_RESOLUTIONS,
+                1,
+                &[("outcome", code.as_str())],
+            )
+            .ok();
+        }
     }
 
     /// Cranks the loop and dispatches effects, without delivering any owed
@@ -3446,17 +5907,38 @@ where
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunProgress> {
         self.ensure_recovered(now).await?;
+        // A sweep can resolve the group too — an await that closed over
+        // members which had all already settled advances here, and a member
+        // send that fails definitively settles here — so a direct sweep
+        // counts its resolution exactly as `apply` and `accept` do. The
+        // inner pass carries no sampling of its own, because `apply` calls
+        // it inside its whole-operation scope.
+        let resolution_before = self.fan_in_resolution();
+        let progress = self.settle_side_effects_inner(router, now).await;
+        self.record_fan_in_resolution(resolution_before);
+        progress
+    }
 
+    /// [`Self::settle_side_effects`] without its metric bookkeeping.
+    async fn settle_side_effects_inner(
+        &mut self,
+        router: &AgentExchangeRouter,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<AgentRunProgress> {
         let mut progress = AgentRunProgress::default();
         for _round in 0..AGENT_RUN_MAX_SETTLE_ROUNDS {
             let advanced = self.advance_loop(now).await?;
+            // The wind-down's owed workflow-cancel decisions commit before
+            // the flush, so a committed cancel effect reaches the outbox in
+            // this same round ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
+            let cancels = self.commit_workflow_cancels(now).await?;
             let flushed = self.flush_session_memory(now).await?;
             let snapshotted = self.persist_context_snapshots(now).await?;
             let dispatched = self.dispatch_effects(now).await?;
             let decisions = self.flush_decision_events(now).await?;
             let report = drive_pending_exchanges(&mut self.host, router, now).await?;
 
-            progress.transitions += advanced;
+            progress.transitions += advanced + cancels;
             progress.effects_dispatched += dispatched;
             progress.session_entries_flushed += flushed;
             progress.snapshots_persisted += snapshotted;
@@ -3465,6 +5947,7 @@ where
             progress.failed += report.failed;
 
             if advanced == 0
+                && cancels == 0
                 && dispatched == 0
                 && flushed == 0
                 && snapshotted == 0
@@ -3724,6 +6207,8 @@ where
             let policies = self.policies.clone();
             let session_memory = self.memory.is_some();
             let decision_events = self.decisions.is_some();
+            let delegation = self.delegation.clone();
+            let workflow = self.workflow_tools.clone();
             let phase = self
                 .state()?
                 .loop_state()
@@ -3731,7 +6216,15 @@ where
             let committed = self
                 .host
                 .initiate(now, |state| {
-                    match advance_once(state, &policies, session_memory, decision_events, now) {
+                    match advance_once(
+                        state,
+                        &policies,
+                        session_memory,
+                        decision_events,
+                        delegation.as_ref(),
+                        workflow.as_ref(),
+                        now,
+                    ) {
                         Ok(owed) => Ok(owed),
                         Err(error) => {
                             let carried = AgentChoreographyError::from(error.clone());
@@ -3756,6 +6249,180 @@ where
             .ok();
         }
         Ok(transitions)
+    }
+
+    /// Commits the workflow-cancel decisions a wind-down or straggler chase
+    /// owes ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)):
+    /// for each started, unsettled invocation in a cancelled scope, either
+    /// the `WorkflowCancelCall` effect — gated on the descriptor's declared
+    /// `supports_cancellation`, priced like the compensation it parallels —
+    /// or a durable `Unsupported`/`Unaffordable` disposition: the request's
+    /// observable outcome when no effect may exist, leaving the parent to
+    /// wait for the child's natural terminal result.
+    ///
+    /// Re-derivable: the cell's disposition is the durable once-guard, so a
+    /// pass lost between the wind-down and this commit re-derives the same
+    /// decision, and a re-entered pass commits nothing.
+    ///
+    /// Two bounds are deliberate. A **terminal** run commits nothing: it
+    /// dispatches nothing, so an effect recorded here could never leave, and
+    /// its cell would claim a request that was never made. For a cancelled
+    /// scope that costs nothing — `awaits_children` holds the wind-down open
+    /// until every child settles, so the chase always gets its chance before
+    /// terminal. For a *normally completing* parent the straggler chase is
+    /// therefore best-effort by construction: fan-in never blocks the
+    /// parent's own completion (slice 4.4), so a parent that completes in the
+    /// same window leaves its straggler running, exactly as it did before the
+    /// chase existed. And the batch stops at the per-run outstanding-effect
+    /// bound rather than overflowing it, because an overflow would abort the
+    /// whole transition and re-abort identically on every later pass.
+    async fn commit_workflow_cancels(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentRunResult<usize> {
+        let owed: Vec<AgentWorkflowInvocationId> = {
+            let state = self.state()?;
+            match state.run() {
+                Some(run) => chased_workflow_invocations(run),
+                None => return Ok(0),
+            }
+        };
+        if owed.is_empty() {
+            return Ok(0);
+        }
+        let scope = self.scope.clone();
+        let policies = self.policies.clone();
+        let config = self.workflow_tools.clone();
+        let mut committed = 0usize;
+        let mut rejection = None;
+        let outcome = self
+            .host
+            .initiate(now, |state| {
+                let mut step = |state: &mut AgentRunState| -> AgentRunResult<()> {
+                    use crate::workflow_tool::{
+                        AgentWorkflowCancelDisposition, AgentWorkflowInvocationStatus,
+                    };
+
+                    let Some(run) = state.run.as_mut() else {
+                        return Ok(());
+                    };
+                    if run.status.is_terminal() {
+                        // A terminal run dispatches nothing, so committing a
+                        // cancel effect here would persist a request that can
+                        // never leave — and its cell disposition would claim
+                        // one was made. The chase is best-effort *before* the
+                        // parent terminalizes; a cancelled scope always gets
+                        // its chance, because `awaits_children` holds the
+                        // wind-down open until every child settles.
+                        return Ok(());
+                    }
+                    let reason = chase_reason(run);
+                    for invocation_id in &owed {
+                        let Some(cell) = run.loop_state.workflow_invocation(invocation_id) else {
+                            continue;
+                        };
+                        if cell.cancel.is_some()
+                            || cell.child_settled()
+                            || !matches!(cell.status, AgentWorkflowInvocationStatus::Started { .. })
+                        {
+                            continue;
+                        }
+                        let record = cell.record.clone();
+                        let supported = config
+                            .as_ref()
+                            .and_then(|config| config.descriptor(&record.workflow_tool))
+                            .is_some_and(|descriptor| descriptor.supports_cancellation);
+                        if !supported {
+                            if let Some(cell) =
+                                run.loop_state.workflow_invocation_mut(invocation_id)
+                            {
+                                cell.record_cancel_disposition(
+                                    AgentWorkflowCancelDisposition::Unsupported,
+                                );
+                            }
+                            committed += 1;
+                            continue;
+                        }
+                        if run.loop_state.outstanding_effects().count()
+                            >= crate::effect::AGENT_RUN_MAX_PENDING_EFFECTS
+                        {
+                            // The per-run outstanding-effect bound is this
+                            // batch's ceiling: a run may hold more chaseable
+                            // invocations than dispatch slots, and committing
+                            // past the bound would abort the whole
+                            // transition — which, re-derived from unchanged
+                            // durable state, would abort identically forever.
+                            // The remaining cells stay undecided and a later
+                            // pass commits them once the dispatched cancels
+                            // settle and free their slots. Progress is
+                            // guaranteed: a cancel is exempt from the
+                            // wind-down flush fence, so it dispatches and
+                            // settles even while the run winds down.
+                            break;
+                        }
+                        let request = AgentRunEffectRequest::WorkflowCancel {
+                            invocation: record,
+                            reason: reason.clone(),
+                        };
+                        let spec = policies.spec_for(&request).clone();
+                        if run
+                            .loop_state
+                            .budget_mut()
+                            .reserve_attempts(spec.max_attempts)
+                            .is_err()
+                        {
+                            // Never block the wind-down on budget: no effect
+                            // exists, and the parent waits for the child's
+                            // natural result instead.
+                            if let Some(cell) =
+                                run.loop_state.workflow_invocation_mut(invocation_id)
+                            {
+                                cell.record_cancel_disposition(
+                                    AgentWorkflowCancelDisposition::Unaffordable,
+                                );
+                            }
+                            committed += 1;
+                            continue;
+                        }
+                        let turn = run.loop_state.turn();
+                        let slot = run.loop_state.next_effect_slot();
+                        let settings_revision = run.loop_state.agent_settings_revision();
+                        let effect = AgentRunEffect::new(
+                            &scope,
+                            turn,
+                            slot,
+                            request,
+                            &spec,
+                            settings_revision,
+                            now,
+                        )?;
+                        let effect_id = effect.effect_id.clone();
+                        run.loop_state.record_effect(effect)?;
+                        if let Some(cell) = run.loop_state.workflow_invocation_mut(invocation_id) {
+                            cell.record_cancel_disposition(
+                                AgentWorkflowCancelDisposition::Committed { effect: effect_id },
+                            );
+                        }
+                        committed += 1;
+                    }
+                    state.updated_at = now;
+                    Ok(())
+                };
+                match step(state) {
+                    Ok(()) => Ok(Vec::new()),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        outcome?;
+        Ok(committed)
     }
 
     /// Makes the loop's committed effects dispatchable, then hands every
@@ -3809,8 +6476,7 @@ where
                     .into_iter()
                     .filter(|effect| {
                         loop_state.is_dispatchable(effect)
-                            && (!winding_down
-                                || effect.kind() == AgentRunEffectKind::CompensationCall)
+                            && (!winding_down || effect.kind().exempt_from_wind_down_fence())
                     })
                     .map(|effect| effect.effect_id)
                     .collect()
@@ -3841,7 +6507,7 @@ where
             .map(AgentLoopState::ready_effects)
             .unwrap_or_default();
         for effect in &ready {
-            if winding_down && effect.kind() != AgentRunEffectKind::CompensationCall {
+            if winding_down && !effect.kind().exempt_from_wind_down_fence() {
                 continue;
             }
             let record = effect.to_workflow_effect(&self.scope);
@@ -3879,7 +6545,7 @@ where
                             .record(operation_id, result.clone());
                         state.updated_at = now;
                         outcome = Some(result);
-                        owed_ledger_exchange(state, now)
+                        owed_run_exchanges(state, now)
                     };
 
                 match apply(state) {
@@ -4001,6 +6667,90 @@ pub enum AgentRunEntityCommand {
         /// The stable operation id this command deduplicates on.
         operation_id: AgentOperationId,
     },
+    /// Fire the parked fan-in wait's deadline
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md):
+    /// timed-out children are handled explicitly by policy). **The hosting
+    /// application owes the scheduler**: exactly as with
+    /// [`Self::FireCheckpointTimers`], nothing in this crate delivers the
+    /// command — the deadline is readable from the parked group
+    /// (`loop_state.fan_in()`), and an `All`-policy wait whose child is
+    /// lost parks until this fires. It marks the still-unresolved members
+    /// timed out — a parent-side disposition, never a forged child result —
+    /// and resolves the group deterministically. A deadline not yet due, a
+    /// group already resolved, or no group at all is a no-op, so the command
+    /// is safe to deliver early, late, or twice. The resolution itself then
+    /// chases the stragglers: a resolved group's unresolved members owe
+    /// their delegation-cancel exchanges and workflow-cancel effects from
+    /// this same transition's settle.
+    FireFanInDeadline {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+    },
+    /// One child workflow run's terminal outcome, recorded on the invocation
+    /// cell that owns it
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    /// **The hosting application owes the relay**: exactly as with
+    /// [`Self::FireFanInDeadline`], nothing in this crate delivers the
+    /// command — the application observes the child's durable terminal state
+    /// (its own outbox addressed at this entity, or an observer it re-drives
+    /// from durable state; runtime events may trigger the relay but are never
+    /// its correctness source) and constructs the command with
+    /// [`Self::record_workflow_result`], whose operation id is pure over
+    /// `(tenant, invocation)` so every re-drive owes the identical operation.
+    ///
+    /// Failure-window table: a delivery lost before the transition commits
+    /// re-sends and applies; a duplicate inside the journal's bounded window
+    /// answers from the operation log; a conflicting duplicate past it
+    /// re-runs the transition and the cell's first-writer-wins result keeps
+    /// the original; a refusal is a non-committing error, so a corrected
+    /// re-send applies rather than replaying the refusal. Refusal codes:
+    /// `workflow-result-unknown-run`, `workflow-result-unknown-invocation`,
+    /// `workflow-result-forged` (a child run the invocation does not own; a
+    /// non-terminal status is unrepresentable by construction), and
+    /// `workflow-result-not-owned` (a cell settled without reaching a
+    /// child). A terminal or winding-down parent records the result as
+    /// evidence and resumes nothing.
+    ///
+    /// **The relay is load-bearing for cancellation.** A started invocation's
+    /// cell is released only by the result this command records, and a
+    /// winding-down parent stays nonterminal until every child cell holds one
+    /// ([`crate::loop_runtime::AgentLoopState::awaits_children`],
+    /// [specification 8.7](../../../docs/plans/rakka-agent/spec.md)) — so a
+    /// deployment that invokes workflow tools without wiring this relay
+    /// cannot complete a cancellation at all. That is the specification's own
+    /// posture rather than a gap to route around: the parent does not know
+    /// whether the child stopped, and projecting terminal `Cancelled` anyway
+    /// would be the false claim 8.7 forbids. Delivering this command is
+    /// equally the "explicit reconciliation decision" 8.7 names as the other
+    /// way out, so a child whose outcome was established out of band can
+    /// always be resolved.
+    RecordWorkflowResult {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`crate::workflow_tool::workflow_result_operation_id`], or
+        /// construct the whole command with
+        /// [`Self::record_workflow_result`].
+        operation_id: AgentOperationId,
+        /// The invocation whose child reports.
+        invocation: AgentWorkflowInvocationId,
+        /// The child workflow run that reached the terminal status: must be
+        /// the invocation's derived child run, or the command is refused as
+        /// forged.
+        child_run: rakka_agent_workflow::AgentRunId,
+        /// The child's terminal status.
+        status: crate::workflow_tool::AgentWorkflowTerminalStatus,
+        /// The child's stable terminal-reason code, when it recorded one.
+        /// Truncated to [`AGENT_RUN_DETAIL_MAX_LENGTH`] bytes at recording —
+        /// the run's uniform detail bound — never refused over its wording.
+        #[serde(default)]
+        terminal_reason: Option<String>,
+        /// The child's result artifact reference, when one exists. Boxed to
+        /// keep the command enum's variants close in size.
+        #[serde(default)]
+        result_ref: Option<Box<ArtifactRef>>,
+        /// Content digest of the child's result, when one exists.
+        #[serde(default)]
+        result_digest: Option<crate::task::AgentContentDigest>,
+    },
     /// Request cancellation of the run.
     Cancel {
         /// The stable operation id this command deduplicates on.
@@ -4021,6 +6771,34 @@ pub enum AgentRunEntityCommand {
         /// What to promote and where.
         promotion: Box<AgentMemoryPromotionRequest>,
     },
+    /// Append one provenance-bearing claim into a communal knowledge space
+    /// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)):
+    /// commits one idempotent durable `ClaimAppend` effect in a bounded
+    /// transition, with the provenance stamped from durable run identity.
+    /// Application- or policy-initiated; a model-visible claim tool is a
+    /// later slice.
+    AppendClaim {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`claim_append_operation_id`].
+        operation_id: AgentOperationId,
+        /// The statement to append and the space it lands in.
+        append: Box<crate::effect::AgentClaimAppendRequest>,
+    },
+    /// Evaluate the bound goal's current success-criteria revision against
+    /// durable evidence
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)): commits
+    /// one read-only durable `Evaluation` effect in a bounded transition. Its
+    /// completed record crosses to the coordinating task as the
+    /// goal-evaluation exchange — under a configured evaluator, the only
+    /// ingress a criteria decision has. Application- or policy-initiated;
+    /// model-visible evaluation tools are a later slice.
+    EvaluateGoal {
+        /// The stable operation id this command deduplicates on. Derive it
+        /// with [`evaluation_operation_id`].
+        operation_id: AgentOperationId,
+        /// What to evaluate, as which evaluator, by which method.
+        evaluation: Box<crate::evaluation::AgentGoalEvaluationRequest>,
+    },
     /// Read the run's bounded durable projection.
     Describe,
 }
@@ -4034,10 +6812,39 @@ impl AgentRunEntityCommand {
             | Self::ResolveIndeterminateEffect { operation_id, .. }
             | Self::ResolveCheckpoint { operation_id, .. }
             | Self::FireCheckpointTimers { operation_id }
+            | Self::FireFanInDeadline { operation_id }
+            | Self::RecordWorkflowResult { operation_id, .. }
             | Self::Cancel { operation_id, .. }
-            | Self::PromoteMemory { operation_id, .. } => Some(operation_id),
+            | Self::PromoteMemory { operation_id, .. }
+            | Self::AppendClaim { operation_id, .. }
+            | Self::EvaluateGoal { operation_id, .. } => Some(operation_id),
             Self::Describe => None,
         }
+    }
+
+    /// Builds one child workflow run's result command with its derived
+    /// operation id, so the relay cannot mis-derive the identity every
+    /// re-drive must share.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_workflow_result(
+        tenant: &TenantId,
+        invocation: AgentWorkflowInvocationId,
+        child_run: rakka_agent_workflow::AgentRunId,
+        status: crate::workflow_tool::AgentWorkflowTerminalStatus,
+        terminal_reason: Option<String>,
+        result_ref: Option<ArtifactRef>,
+        result_digest: Option<crate::task::AgentContentDigest>,
+    ) -> Result<Self, AgentIdentityError> {
+        let operation_id = crate::workflow_tool::workflow_result_operation_id(tenant, &invocation)?;
+        Ok(Self::RecordWorkflowResult {
+            operation_id,
+            invocation,
+            child_run,
+            status,
+            terminal_reason,
+            result_ref: result_ref.map(Box::new),
+            result_digest,
+        })
     }
 }
 
@@ -4211,6 +7018,29 @@ where
         self
     }
 
+    /// Wires the hosted run to serve delegation
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity intercepts the
+    /// coordination and await verbs exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_delegation(config));
+        self
+    }
+
+    /// Wires the hosted run to serve workflow tools
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)),
+    /// delegating to the wrapped store so a sharded entity intercepts
+    /// workflow-tool calls exactly as a directly-driven one does.
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.entity = self.entity.map(|entity| entity.with_workflow_tools(config));
+        self
+    }
+
     fn store(&mut self) -> Result<&mut AgentRunEntityStore<Store, Effects>, AgentRunError> {
         self.entity
             .as_mut()
@@ -4298,6 +7128,8 @@ pub struct AgentRunEntityShardingSettings {
     metrics: Arc<dyn MetricsRecorder>,
     decisions: Option<Arc<dyn AgentDecisionEventSink>>,
     memory: Option<AgentRunMemory>,
+    delegation: Option<crate::delegation::AgentRunDelegationConfig>,
+    workflow_tools: Option<crate::workflow_tool::AgentRunWorkflowConfig>,
 }
 
 impl Debug for AgentRunEntityShardingSettings {
@@ -4327,6 +7159,8 @@ impl AgentRunEntityShardingSettings {
             metrics: Arc::new(NoopMetricsRecorder),
             decisions: None,
             memory: None,
+            delegation: None,
+            workflow_tools: None,
         }
     }
 
@@ -4441,6 +7275,32 @@ impl AgentRunEntityShardingSettings {
         self.memory = Some(memory);
         self
     }
+
+    /// Wires every hosted run to serve delegation
+    /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Absent by default, so an unwired deployment refuses the coordination
+    /// tool. The sharded factory is the production driver of a run, and every
+    /// driver must wire it identically — an entity that advances the loop
+    /// unwired cannot intercept the delegation or await verbs its durable
+    /// state was committed under.
+    #[must_use]
+    pub fn with_delegation(mut self, config: crate::delegation::AgentRunDelegationConfig) -> Self {
+        self.delegation = Some(config);
+        self
+    }
+
+    /// Wires every hosted run to serve workflow tools
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)), under
+    /// the same every-driver rule as [`Self::with_delegation`].
+    #[must_use]
+    pub fn with_workflow_tools(
+        mut self,
+        config: crate::workflow_tool::AgentRunWorkflowConfig,
+    ) -> Self {
+        self.workflow_tools = Some(config);
+        self
+    }
 }
 
 impl Default for AgentRunEntityShardingSettings {
@@ -4550,6 +7410,12 @@ where
     if let Some(memory) = settings.memory.clone() {
         entity = entity.with_memory(memory);
     }
+    if let Some(delegation) = settings.delegation.clone() {
+        entity = entity.with_delegation(delegation);
+    }
+    if let Some(workflow_tools) = settings.workflow_tools.clone() {
+        entity = entity.with_workflow_tools(workflow_tools);
+    }
     entity
 }
 
@@ -4657,6 +7523,27 @@ pub enum AgentRunError {
         /// The effect the result named.
         effect_id: AgentEffectId,
     },
+    /// A send receipt named a delegation the run does not hold.
+    UnknownDelegation {
+        /// The delegation the receipt named.
+        delegation: crate::identity::AgentDelegationId,
+    },
+    /// A start receipt named a workflow invocation the run does not hold.
+    UnknownWorkflowInvocation {
+        /// The invocation the receipt named.
+        invocation: AgentWorkflowInvocationId,
+    },
+    /// A workflow result could not be applied to the invocation it named.
+    ///
+    /// Refused as a non-committing error so a corrected re-send applies; the
+    /// code is one of the stable `workflow-result-*` refusals documented on
+    /// [`AgentRunEntityCommand::RecordWorkflowResult`].
+    WorkflowResultRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
     /// A checkpoint decision could not be applied.
     Checkpoint(Box<AgentCheckpointError>),
     /// A decision arrived for a checkpoint the run does not hold, or has already
@@ -4740,6 +7627,61 @@ pub enum AgentRunError {
         /// The ceiling the reservation would cross.
         exhaustion: AgentBudgetExhaustion,
     },
+    /// An evaluation was requested of a run that is winding down; an
+    /// evaluation is new work, which the wind-down fence forbids.
+    GoalEvaluationFenced {
+        /// The status the run held.
+        status: AgentRunStatus,
+    },
+    /// An evaluation named a goal this run is not bound to — or the run is
+    /// bound to no goal at all.
+    GoalEvaluationUnbound {
+        /// The goal the request named.
+        goal: crate::identity::AgentGoalId,
+    },
+    /// An evaluation request violated a bounded invariant.
+    GoalEvaluationInvalid {
+        /// What the validation refused.
+        message: String,
+    },
+    /// An evaluation is already open — committed and unresolved, or completed
+    /// and not yet reported. One at a time.
+    GoalEvaluationOutstanding,
+    /// A verification-workflow evaluation is typed but cannot execute until
+    /// a slice bridges the evaluation cell to the workflow-tool invocation
+    /// path that slice 4.5 landed.
+    GoalEvaluationWorkflowDeferred,
+    /// An evaluation could not reserve its attempt bound from the run's
+    /// budget.
+    GoalEvaluationUnaffordable {
+        /// The ceiling the reservation would cross.
+        exhaustion: AgentBudgetExhaustion,
+    },
+    /// A claim append was requested of a run that is winding down; an append
+    /// is new work, which the wind-down fence forbids.
+    ClaimAppendFenced {
+        /// The status the run held.
+        status: AgentRunStatus,
+    },
+    /// A claim-append request violated a bounded invariant.
+    ClaimAppendInvalid {
+        /// What the validation refused.
+        message: String,
+    },
+    /// A claim append named a communal space outside the run's delegated
+    /// grant ([specification 8.5](../../../docs/plans/rakka-agent/spec.md):
+    /// children inherit only explicitly delegated access), or the run's
+    /// chain carries no grant statement at all — deny-when-unknown.
+    ClaimSpaceNotDelegated {
+        /// The space the request named.
+        space: crate::identity::KnowledgeSpaceId,
+    },
+    /// A claim append could not reserve its attempt bound from the run's
+    /// budget.
+    ClaimAppendUnaffordable {
+        /// The ceiling the reservation would cross.
+        exhaustion: AgentBudgetExhaustion,
+    },
 }
 
 impl AgentRunError {
@@ -4757,6 +7699,9 @@ impl AgentRunError {
             Self::NotAccepted { .. } => "run-not-accepted",
             Self::Terminal { .. } => "run-terminal",
             Self::UnknownEffect { .. } => "run-unknown-effect",
+            Self::UnknownDelegation { .. } => "run-unknown-delegation",
+            Self::UnknownWorkflowInvocation { .. } => "run-unknown-workflow-invocation",
+            Self::WorkflowResultRefused { code, .. } => code,
             Self::Checkpoint(error) => error.code(),
             Self::UnknownCheckpoint { .. } => "run-unknown-checkpoint",
             Self::StaleEffectResult { .. } => "run-stale-effect-result",
@@ -4770,6 +7715,16 @@ impl AgentRunError {
             Self::MemorySelectionOutOfRange { .. } => "run-memory-selection-out-of-range",
             Self::MemoryConsolidationInvalid => "run-memory-consolidation-invalid",
             Self::MemoryPromotionUnaffordable { .. } => "run-memory-promotion-unaffordable",
+            Self::GoalEvaluationFenced { .. } => "run-goal-evaluation-fenced",
+            Self::GoalEvaluationUnbound { .. } => "run-goal-evaluation-unbound",
+            Self::GoalEvaluationInvalid { .. } => "run-goal-evaluation-invalid",
+            Self::GoalEvaluationOutstanding => "run-goal-evaluation-outstanding",
+            Self::GoalEvaluationWorkflowDeferred => "run-goal-evaluation-workflow-deferred",
+            Self::GoalEvaluationUnaffordable { .. } => "run-goal-evaluation-unaffordable",
+            Self::ClaimAppendFenced { .. } => "run-claim-append-fenced",
+            Self::ClaimAppendInvalid { .. } => "run-claim-append-invalid",
+            Self::ClaimSpaceNotDelegated { .. } => "run-claim-space-not-delegated",
+            Self::ClaimAppendUnaffordable { .. } => "run-claim-append-unaffordable",
         }
     }
 }
@@ -4795,6 +7750,18 @@ impl Display for AgentRunError {
                 f,
                 "a result arrived for effect {effect_id}, which this run does not hold"
             ),
+            Self::UnknownDelegation { delegation } => write!(
+                f,
+                "a send receipt named delegation {delegation}, which this run does not hold"
+            ),
+            Self::UnknownWorkflowInvocation { invocation } => write!(
+                f,
+                "a start receipt named workflow invocation {invocation}, which this run does \
+                 not hold"
+            ),
+            Self::WorkflowResultRefused { code, message } => {
+                write!(f, "the workflow result was refused ({code}): {message}")
+            }
             Self::Checkpoint(error) => Display::fmt(error, f),
             Self::UnknownCheckpoint { checkpoint_id } => write!(
                 f,
@@ -4847,6 +7814,45 @@ impl Display for AgentRunError {
             Self::MemoryPromotionUnaffordable { exhaustion } => write!(
                 f,
                 "the promotion cannot reserve its attempt bound ({exhaustion})"
+            ),
+            Self::GoalEvaluationFenced { status } => write!(
+                f,
+                "the run is {status} and winding down; an evaluation is new work the fence forbids"
+            ),
+            Self::GoalEvaluationUnbound { goal } => write!(
+                f,
+                "the evaluation names goal {goal}, which this run is not bound to"
+            ),
+            Self::GoalEvaluationInvalid { message } => {
+                write!(f, "the evaluation request is invalid: {message}")
+            }
+            Self::GoalEvaluationOutstanding => write!(
+                f,
+                "an evaluation is already open; the goal is evaluated one evaluation at a time"
+            ),
+            Self::GoalEvaluationWorkflowDeferred => write!(
+                f,
+                "a verification-workflow evaluation cannot execute until the evaluation cell is \
+                 bridged to the workflow-tool invocation path"
+            ),
+            Self::GoalEvaluationUnaffordable { exhaustion } => write!(
+                f,
+                "the evaluation cannot reserve its attempt bound ({exhaustion})"
+            ),
+            Self::ClaimAppendFenced { status } => write!(
+                f,
+                "the run is {status}; a claim append is new work the wind-down fence forbids"
+            ),
+            Self::ClaimAppendInvalid { message } => {
+                write!(f, "the claim append is invalid: {message}")
+            }
+            Self::ClaimSpaceNotDelegated { space } => write!(
+                f,
+                "the communal space {space} is not delegated to this run"
+            ),
+            Self::ClaimAppendUnaffordable { exhaustion } => write!(
+                f,
+                "the claim append cannot reserve its attempt bound ({exhaustion})"
             ),
         }
     }
@@ -5141,6 +8147,137 @@ mod tests {
             "the maximal working set grows the record by {growth} bytes, which exceeds the \
              {AGENT_RUN_STATE_GROWTH_RESERVE_BYTES} byte reserve: a run admitted at the bound \
              could be refused its own turn"
+        );
+
+        // The delegation lifecycle is priced at the interception door, not on
+        // the reserve: each committed delegation reserved twice its record
+        // bytes plus [`AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES`] of headroom,
+        // and everything the delegation later grows the record by — the cell,
+        // the child's terminal result, the group's membership, timeout mark,
+        // and resolution share, and the resolution table recorded as the
+        // awaiting call's tool result — must fit inside that price. This half
+        // holds the overhead constant to that claim, at the same maximal
+        // identifiers.
+        let before_delegations = run.materialized_size_bytes();
+        let mut door_price = 0_usize;
+        let mut members = Vec::new();
+        for slot in 0..crate::delegation::AGENT_RUN_MAX_DELEGATIONS {
+            let delegation = crate::delegation::delegation_id_for(&scope, turn, slot)
+                .expect("the delegation id derives");
+            members.push(delegation.clone());
+            let record = crate::delegation::AgentDelegationRecord {
+                environments: Default::default(),
+                knowledge_spaces: Default::default(),
+                delegation: delegation.clone(),
+                goal: None,
+                parent_task: AgentTaskId::new(&long).expect("the task id is valid"),
+                parent_run: scope.clone(),
+                lineage: Vec::new(),
+                ancestors: Vec::new(),
+                depth: 1,
+                requested_skill: crate::definition::AgentCapabilityId::new("skill")
+                    .expect("the capability id is valid"),
+                resolved: crate::delegation::AgentDelegationTarget::new(
+                    AgentId::new("specialist").expect("the agent id is valid"),
+                    AgentTaskDefinitionId::new("specialist-definition")
+                        .expect("the definition id is valid"),
+                ),
+                a2a_message_id: delegation.as_str().to_string(),
+                deduplication_key: delegation.as_str().to_string(),
+                turn,
+                slot,
+                effect: effect_id_for(&scope, turn, slot).expect("the effect id derives"),
+                call_id: AgentToolCallId::new(format!("delegate-{slot}"))
+                    .expect("the call id is valid"),
+                input: AgentTaskContent::inline(serde_json::json!({"input": "x"}))
+                    .expect("the input is inline-bounded"),
+                result_schema: None,
+                budget: None,
+                granted_descendants: Some(u64::MAX),
+                deadline: Some(now),
+                definition_revision: AgentRevisionNumber::INITIAL,
+                settings_revision: AgentRevisionNumber::INITIAL,
+                telemetry: Default::default(),
+                created_at: now,
+            };
+            let record_bytes = serde_json::to_vec(&record)
+                .expect("the record encodes")
+                .len();
+            door_price = door_price
+                .saturating_add(record_bytes.saturating_mul(2))
+                .saturating_add(AGENT_DELEGATION_COMMIT_OVERHEAD_BYTES);
+            let mut cell = crate::delegation::AgentDelegationCell::pending(Box::new(record));
+            cell.settle_child_created(
+                AgentTaskId::new(&long).expect("the task id is valid"),
+                Some(AgentRunId::new(&long).expect("the run id is valid")),
+                now,
+            );
+            cell.record_child_result(crate::delegation::AgentDelegationChildResult {
+                status: crate::task::AgentTaskStatus::Failed,
+                terminal_reason: Some("t".repeat(AGENT_RUN_DETAIL_MAX_LENGTH)),
+                result_digest: Some(
+                    AgentTaskContent::inline(serde_json::json!("digest"))
+                        .expect("the content is inline-bounded")
+                        .digest(),
+                ),
+                child_run: Some(AgentRunId::new(&long).expect("the run id is valid")),
+                descendants_created: u64::MAX,
+                recorded_at: now,
+            });
+            // The wind-down's own growth: every chased cell records the
+            // settled outcome of its delegation-cancel, and a refusal carries
+            // a bounded code besides the timestamp — post-commit growth the
+            // door price must cover just like the result above.
+            cell.record_cancel_outcome(crate::delegation::AgentDelegationCancelOutcome::Refused {
+                code: "c".repeat(AGENT_RUN_DETAIL_MAX_LENGTH),
+                settled_at: now,
+            });
+            run.loop_state.record_delegation(cell);
+            run.loop_state.join_fan_in(
+                crate::fan_in::AgentFanInPolicy::Quorum { n: 16 },
+                crate::fan_in::AgentFanInMemberId::from(delegation),
+                turn,
+                now,
+            );
+        }
+        let members: Vec<crate::fan_in::AgentFanInMemberId> = members
+            .into_iter()
+            .map(crate::fan_in::AgentFanInMemberId::from)
+            .collect();
+        run.loop_state.close_fan_in(
+            AgentToolCallId::new("await-children").expect("the call id is valid"),
+            Some(now),
+            turn,
+        );
+        if let Some(group) = run.loop_state.fan_in_mut() {
+            group.timed_out.extend(members.iter().cloned());
+        }
+        run.loop_state
+            .resolve_fan_in(crate::fan_in::AgentFanInResolution {
+                satisfied: false,
+                satisfied_by: members,
+                code: crate::fan_in::resolution_code::TIMED_OUT.to_string(),
+                resolved_at: now,
+            });
+        let table = crate::fan_in::fan_in_result_table(
+            run.loop_state.fan_in().expect("the group is retained"),
+            run.loop_state.delegations(),
+            run.loop_state.workflow_invocations(),
+        );
+        run.loop_state.record_tool_result(AgentToolResult {
+            call_id: AgentToolCallId::new("await-children").expect("the call id is valid"),
+            content: AgentTaskContent::inline(table).expect("the table is inline-bounded"),
+            recorded_at: now,
+        });
+
+        let delegation_growth = run
+            .materialized_size_bytes()
+            .saturating_sub(before_delegations);
+        assert!(
+            delegation_growth <= door_price,
+            "the full delegation lifecycle grows the record by {delegation_growth} bytes, which \
+             exceeds the {door_price} bytes the interception door priced for it: a delegation \
+             the door admits could wedge the run it was committed on"
         );
     }
 

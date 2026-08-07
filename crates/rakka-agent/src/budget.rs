@@ -27,15 +27,28 @@
 //!
 //! - **Conserved** dimensions ([`AgentBudgetDimension::CONSERVED`]) are
 //!   quantities that are spent: iterations, model calls, tool calls, effects,
-//!   effect attempts, tokens, and cost. Only these can be escrowed, because
-//!   only these can be debited from a parent, held by a child, and returned
-//!   unused. They live in [`AgentBudgetAllocation`].
+//!   effect attempts, tokens, cost, and delegated descendants. Only these can
+//!   be escrowed, because only these can be debited from a parent, held by a
+//!   child, and returned unused. They live in [`AgentBudgetAllocation`].
 //! - **Non-conserved** limits — a wall-clock deadline and a concurrent-effect
 //!   ceiling — are not quantities at all. Two children running under one
 //!   deadline do not each consume half of it, and a concurrency ceiling is a
 //!   level rather than a total. Escrowing them would be a category error, so
 //!   they are inherited and narrowed rather than debited, and live in
 //!   [`AgentBudgetLimits`].
+//!
+//! [`AgentBudgetDimension::Descendants`] is conserved but not *work*: a run
+//! spends it only by delegating, never by taking a turn, so it is absent from
+//! [`AgentBudgetDimension::WORK`] and an empty descendants grant refuses
+//! nothing but delegation. Its exhaustion is refused at the delegation door as
+//! a failed tool result the model corrects course from — it never parks the
+//! run (a coordinator that cannot delegate further can still finish with the
+//! children it has) and never terminates it. What makes the dimension a ledger
+//! dimension rather than a door-local count is cross-generation conservation:
+//! delegated children are durable tasks that outlive the run that created
+//! them, so a failed generation's spent descendants must settle up to the task
+//! exactly like any other conserved spend, leaving its replacement generation
+//! escrowed only the remainder.
 //!
 //! [`AgentBudgetGrant`] is the pair: exactly what a creation command carries.
 //!
@@ -178,6 +191,14 @@ pub enum AgentBudgetDimension {
     WallClock,
     /// Concurrently dispatched effects.
     ConcurrentEffects,
+    /// Delegated descendant tasks across the whole subtree below a scope
+    /// ([specification 8.4 and 9.7](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Each committed delegation spends one for the child itself plus the
+    /// sub-quota escrowed to the child's own subtree. See the module
+    /// documentation: conserved but not work, and its exhaustion refuses the
+    /// delegation rather than parking the run.
+    Descendants,
 }
 
 impl AgentBudgetDimension {
@@ -186,7 +207,26 @@ impl AgentBudgetDimension {
     /// See the module documentation: a dimension is in this set exactly when
     /// debiting it from a parent, holding it in a child, and returning the
     /// unused remainder is meaningful arithmetic.
-    pub const CONSERVED: [Self; 7] = [
+    pub const CONSERVED: [Self; 8] = [
+        Self::LoopIterations,
+        Self::ModelCalls,
+        Self::ToolCalls,
+        Self::Effects,
+        Self::EffectAttempts,
+        Self::Tokens,
+        Self::Cost,
+        Self::Descendants,
+    ];
+
+    /// The conserved dimensions a run cannot take a single turn without.
+    ///
+    /// [`Self::Descendants`] is deliberately absent: a run spends it only by
+    /// delegating, so holding none of it refuses delegation, not work. This is
+    /// the set an assignment-viability check
+    /// ([`AgentBudgetAllocation::first_empty_for`]) must consult — refusing an
+    /// assignment because a goal disabled delegation would turn a narrowing
+    /// into an outage.
+    pub const WORK: [Self; 7] = [
         Self::LoopIterations,
         Self::ModelCalls,
         Self::ToolCalls,
@@ -215,6 +255,7 @@ impl AgentBudgetDimension {
             Self::Cost => "cost",
             Self::WallClock => "wall-clock",
             Self::ConcurrentEffects => "concurrent-effects",
+            Self::Descendants => "descendants",
         }
     }
 }
@@ -291,6 +332,13 @@ pub struct AgentBudgetAllocation {
     pub tokens: Option<u64>,
     /// Provider cost granted, in micro-units of currency.
     pub cost_micros: Option<u64>,
+    /// Delegated descendant tasks granted across the whole subtree.
+    ///
+    /// Defaulted on decode so a record persisted before the dimension existed
+    /// reads as unbounded — the pre-slice semantics, under which nothing read
+    /// the field to refuse.
+    #[serde(default)]
+    pub descendants: Option<u64>,
 }
 
 impl AgentBudgetAllocation {
@@ -305,6 +353,7 @@ impl AgentBudgetAllocation {
             effect_attempts: None,
             tokens: None,
             cost_micros: None,
+            descendants: None,
         }
     }
 
@@ -319,6 +368,7 @@ impl AgentBudgetAllocation {
             effect_attempts: Some(0),
             tokens: Some(0),
             cost_micros: Some(0),
+            descendants: Some(0),
         }
     }
 
@@ -338,6 +388,7 @@ impl AgentBudgetAllocation {
             effect_attempts: ceilings.max_effect_attempts.map(u64::from),
             tokens: ceilings.max_tokens,
             cost_micros: ceilings.max_cost_micros,
+            descendants: None,
         }
     }
 
@@ -355,6 +406,7 @@ impl AgentBudgetAllocation {
             AgentBudgetDimension::EffectAttempts => self.effect_attempts,
             AgentBudgetDimension::Tokens => self.tokens,
             AgentBudgetDimension::Cost => self.cost_micros,
+            AgentBudgetDimension::Descendants => self.descendants,
             AgentBudgetDimension::WallClock | AgentBudgetDimension::ConcurrentEffects => None,
         }
     }
@@ -371,6 +423,7 @@ impl AgentBudgetAllocation {
             AgentBudgetDimension::EffectAttempts => self.effect_attempts = amount,
             AgentBudgetDimension::Tokens => self.tokens = amount,
             AgentBudgetDimension::Cost => self.cost_micros = amount,
+            AgentBudgetDimension::Descendants => self.descendants = amount,
             AgentBudgetDimension::WallClock | AgentBudgetDimension::ConcurrentEffects => {}
         }
     }
@@ -401,19 +454,20 @@ impl AgentBudgetAllocation {
             .all(|dimension| self.get(*dimension).is_none())
     }
 
-    /// The first dimension in which this grant holds nothing while `request`
-    /// asked for something.
+    /// The first *work* dimension in which this grant holds nothing while
+    /// `request` asked for something.
     ///
     /// This is what separates a partial grant, which a child can work with,
-    /// from an empty one, which leaves it unable to take a single turn.
+    /// from an empty one, which leaves it unable to take a single turn. It
+    /// consults [`AgentBudgetDimension::WORK`], not the full conserved set: an
+    /// empty descendants grant only disables delegation, and a run that cannot
+    /// delegate can still take every turn it was created to take.
     #[must_use]
     pub fn first_empty_for(&self, request: &Self) -> Option<AgentBudgetDimension> {
-        AgentBudgetDimension::CONSERVED
-            .into_iter()
-            .find(|dimension| {
-                let wanted = request.get(*dimension).unwrap_or(u64::MAX);
-                wanted > 0 && self.get(*dimension) == Some(0)
-            })
+        AgentBudgetDimension::WORK.into_iter().find(|dimension| {
+            let wanted = request.get(*dimension).unwrap_or(u64::MAX);
+            wanted > 0 && self.get(*dimension) == Some(0)
+        })
     }
 
     /// This grant with `other` added, dimension by dimension.
@@ -465,6 +519,31 @@ impl AgentBudgetLimits {
             max_concurrent_effects: ceilings.max_concurrent_effects,
         }
     }
+
+    /// These limits narrowed to `ceiling`: the smaller of the two per field.
+    ///
+    /// Unbounded is the identity, exactly as
+    /// [`AgentBudgetAllocation::narrowed_to`] treats the conserved dimensions.
+    #[must_use]
+    pub fn narrowed_to(&self, ceiling: &Self) -> Self {
+        fn tighter<T: Ord + Copy>(held: Option<T>, bound: Option<T>) -> Option<T> {
+            match (held, bound) {
+                (None, bound) => bound,
+                (held, None) => held,
+                (Some(held), Some(bound)) => Some(held.min(bound)),
+            }
+        }
+        Self {
+            max_wall_clock_millis: tighter(
+                self.max_wall_clock_millis,
+                ceiling.max_wall_clock_millis,
+            ),
+            max_concurrent_effects: tighter(
+                self.max_concurrent_effects,
+                ceiling.max_concurrent_effects,
+            ),
+        }
+    }
 }
 
 /// What a creation command carries: a conserved grant plus the limits the child
@@ -501,6 +580,16 @@ impl AgentBudgetGrant {
             AgentBudgetLimits::from_ceilings(ceilings),
         )
     }
+
+    /// This grant narrowed to `ceiling`, allocation and limits alike: a child
+    /// grant can never widen what its parent or definition permits.
+    #[must_use]
+    pub fn narrowed_to(&self, ceiling: &Self) -> Self {
+        Self::new(
+            self.allocation.narrowed_to(&ceiling.allocation),
+            self.limits.narrowed_to(&ceiling.limits),
+        )
+    }
 }
 
 /// What a scope actually spent, per conserved dimension
@@ -524,6 +613,13 @@ pub struct AgentBudgetConsumption {
     pub tokens: u64,
     /// Provider cost consumed, in micro-units of currency.
     pub cost_micros: u64,
+    /// Delegated descendant tasks spent: one per committed delegation plus the
+    /// sub-quota escrowed to that child's subtree.
+    ///
+    /// Defaulted on decode: a record persisted before the dimension existed
+    /// had spent none.
+    #[serde(default)]
+    pub descendants: u64,
 }
 
 impl AgentBudgetConsumption {
@@ -538,6 +634,7 @@ impl AgentBudgetConsumption {
             effect_attempts: 0,
             tokens: 0,
             cost_micros: 0,
+            descendants: 0,
         }
     }
 
@@ -554,6 +651,7 @@ impl AgentBudgetConsumption {
             AgentBudgetDimension::EffectAttempts => self.effect_attempts,
             AgentBudgetDimension::Tokens => self.tokens,
             AgentBudgetDimension::Cost => self.cost_micros,
+            AgentBudgetDimension::Descendants => self.descendants,
             AgentBudgetDimension::WallClock | AgentBudgetDimension::ConcurrentEffects => 0,
         }
     }
@@ -577,6 +675,9 @@ impl AgentBudgetConsumption {
             AgentBudgetDimension::Tokens => self.tokens = self.tokens.saturating_add(amount),
             AgentBudgetDimension::Cost => {
                 self.cost_micros = self.cost_micros.saturating_add(amount)
+            }
+            AgentBudgetDimension::Descendants => {
+                self.descendants = self.descendants.saturating_add(amount);
             }
             AgentBudgetDimension::WallClock | AgentBudgetDimension::ConcurrentEffects => {}
         }
@@ -888,6 +989,44 @@ impl AgentEscrowLedger {
         }
         self.outstanding.remove(child);
         Ok(released)
+    }
+
+    /// Widens this scope's own allocation, narrowed to `ceiling`.
+    ///
+    /// This is the goal-scope top-up of
+    /// [specification 9.7](../../../docs/plans/rakka-agent/spec.md): the
+    /// owner's parent-scope decision to allocate more, which the definition
+    /// ceiling still bounds — a child allocation may grow, but never past what
+    /// the definition permits. Per conserved dimension the new allocation is
+    /// the old plus `additional`, capped at `ceiling`, and never smaller than
+    /// what the ledger already held: a widening cannot shrink headroom that
+    /// outstanding children were granted against. A dimension the top-up
+    /// leaves unbounded is left exactly as it was: `None` in a top-up means
+    /// *nothing additional here*, never *lift this cap* — a partial top-up
+    /// must not silently erase the bounds it did not name. Returns the
+    /// allocation now in force; the caller reads [`Self::available`] to learn
+    /// whether the widening relieved a specific exhaustion.
+    pub fn widen(
+        &mut self,
+        additional: &AgentBudgetAllocation,
+        ceiling: &AgentBudgetAllocation,
+    ) -> AgentBudgetAllocation {
+        let mut widened = self.allocation;
+        for dimension in AgentBudgetDimension::CONSERVED {
+            let (Some(added), Some(held)) =
+                (additional.get(dimension), self.allocation.get(dimension))
+            else {
+                // Nothing added, or the dimension is already unbounded.
+                continue;
+            };
+            let mut target = held.saturating_add(added);
+            if let Some(bound) = ceiling.get(dimension) {
+                target = target.min(bound);
+            }
+            widened.set(dimension, Some(held.max(target)));
+        }
+        self.allocation = widened;
+        self.allocation
     }
 }
 
@@ -1293,6 +1432,18 @@ impl AgentRunBudget {
         self.top_ups = self.top_ups.max(sequence);
     }
 
+    /// Records the run's conserved descendants spend, folded exactly once at
+    /// its terminal transition from the durable delegation cells.
+    ///
+    /// The delegation door prices against the cells directly — a `Failed` or
+    /// `Conflicted` send releases its debit, which recorded consumption never
+    /// could — so the spend materializes as consumption only here, where the
+    /// owed settlement carries it up and a replacement generation is escrowed
+    /// only the remainder.
+    pub fn charge_descendants(&mut self, count: u64) {
+        self.consumed.add(AgentBudgetDimension::Descendants, count);
+    }
+
     /// The allocation this run holds and will not use.
     ///
     /// This is what its return carries upward once its settlement is
@@ -1414,6 +1565,77 @@ mod tests {
             tokens(amount),
             AgentBudgetLimits::unbounded(),
         ))
+    }
+
+    #[test]
+    fn widen_grows_under_the_ceiling_and_never_shrinks() {
+        let mut ledger = ledger(10);
+        // A widening under a roomy ceiling adds what was asked.
+        let widened = ledger.widen(&tokens(5), &tokens(100));
+        assert_eq!(widened.tokens, Some(15));
+        assert_eq!(ledger.available(AgentBudgetDimension::Tokens), Some(15));
+
+        // The ceiling caps the growth.
+        let widened = ledger.widen(&tokens(1_000), &tokens(20));
+        assert_eq!(widened.tokens, Some(20));
+
+        // A ceiling below the current allocation shrinks nothing: children
+        // were granted against the headroom already held.
+        let widened = ledger.widen(&tokens(1), &tokens(5));
+        assert_eq!(widened.tokens, Some(20));
+    }
+
+    #[test]
+    fn widen_saturates_and_respects_unbounded() {
+        // An unbounded parent stays unbounded whatever is added.
+        let mut unbounded = AgentEscrowLedger::new(AgentBudgetGrant::unbounded());
+        let widened = unbounded.widen(&tokens(5), &tokens(10));
+        assert_eq!(widened.tokens, None);
+
+        // A saturating add near the top of the range cannot overflow, and the
+        // unbounded ceiling leaves the sum unclamped.
+        let mut near_max = ledger(u64::MAX - 1);
+        let widened = near_max.widen(&tokens(u64::MAX), &AgentBudgetAllocation::unbounded());
+        assert_eq!(widened.tokens, Some(u64::MAX));
+
+        // An unbounded addition adds nothing: `None` in a top-up means *no
+        // additional allocation here*, never *lift this cap*. An allocation
+        // that named no dimension cannot be told apart from one defaulted
+        // into, so treating it as "everything" would let a partial top-up
+        // silently erase every bound it did not name.
+        let mut bounded = ledger(10);
+        let widened = bounded.widen(
+            &AgentBudgetAllocation::unbounded(),
+            &AgentBudgetAllocation::unbounded(),
+        );
+        assert_eq!(widened.tokens, Some(10));
+
+        // The same under a bounded ceiling: unnamed means unchanged.
+        let mut bounded = ledger(10);
+        let widened = bounded.widen(&AgentBudgetAllocation::unbounded(), &tokens(25));
+        assert_eq!(widened.tokens, Some(10));
+    }
+
+    #[test]
+    fn widen_leaves_dimensions_the_top_up_does_not_name_untouched() {
+        // The goal-resume regression: a tokens-only top-up against a ledger
+        // that also bounds cost must not lift the cost cap, whether the
+        // definition ceiling bounds cost or not.
+        let mut ledger = AgentEscrowLedger::new(AgentBudgetGrant::new(
+            AgentBudgetAllocation {
+                tokens: Some(50_000),
+                cost_micros: Some(10_000_000),
+                ..AgentBudgetAllocation::unbounded()
+            },
+            AgentBudgetLimits::unbounded(),
+        ));
+        let widened = ledger.widen(&tokens(50_000), &AgentBudgetAllocation::unbounded());
+        assert_eq!(widened.tokens, Some(100_000));
+        assert_eq!(
+            widened.cost_micros,
+            Some(10_000_000),
+            "a partial top-up must not erase the caps it did not name"
+        );
     }
 
     #[test]

@@ -1738,6 +1738,7 @@ dependencies = [
 name = "rakka-agent"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "proptest",
  "rakka-agent-workflow",
  "rakka-cluster",
@@ -1756,6 +1757,7 @@ dependencies = [
 name = "rakka-agent-knowledge-graph"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rakka-agent",
  "rakka-agent-workflow",
  "serde",
@@ -1767,6 +1769,7 @@ dependencies = [
 name = "rakka-agent-knowledge-graph-postgres"
 version = "0.1.0"
 dependencies = [
+ "rakka-agent",
  "rakka-agent-knowledge-graph",
  "rakka-agent-workflow",
  "serde",
@@ -2053,6 +2056,23 @@ dependencies = [
  "rakka",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rakka-example-multi-agent-goal-acceptance"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "a2a-server-lf",
+ "rakka-a2a",
+ "rakka-agent",
+ "rakka-agent-knowledge-graph",
+ "rakka-agent-workflow",
+ "rakka-core",
+ "rakka-persistence",
+ "rakka-sharding",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

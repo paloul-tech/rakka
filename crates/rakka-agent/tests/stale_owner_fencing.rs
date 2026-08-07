@@ -184,10 +184,12 @@ async fn a_stale_task_owner_write_is_rejected_and_answered_from_the_authoritativ
             assignee: Some(agent_id()),
             goal: None,
             goal_mode: Default::default(),
+            goal_spec: None,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
             telemetry: Default::default(),
         }),
     };

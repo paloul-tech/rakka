@@ -80,6 +80,10 @@ pub struct NormalizedAgentCommand {
     /// `traceparent` is dropped whole rather than entering durable state, and
     /// an untraced ingress starts a root.
     pub telemetry: AgentTelemetryContext,
+    /// The validated collaboration envelope, when the send engaged the
+    /// versioned collaboration extension (specification 14.4). `None` for an
+    /// ordinary send.
+    pub collaboration: Option<super::collaboration::AgentCollaborationMetadata>,
 }
 
 impl NormalizedAgentCommand {
@@ -159,6 +163,9 @@ pub fn normalize_agent_send(
         task_definition: metadata_string(metadata, META_TASK_DEFINITION)
             .map_err(RakkaAgentA2AError::Mapping)?,
         telemetry: extract_ingress_telemetry(metadata),
+        // The single chokepoint where the collaboration extension either
+        // parses whole or fails the send closed (specification 14.4).
+        collaboration: super::collaboration::parse_collaboration_metadata(message, metadata)?,
     })
 }
 
@@ -208,6 +215,7 @@ pub fn normalize_agent_cancel(
         agent: None,
         task_definition: None,
         telemetry: extract_ingress_telemetry(metadata),
+        collaboration: None,
     })
 }
 
@@ -290,22 +298,41 @@ pub fn agent_task_create_command(
     target: &A2AAgentTarget,
     input: Value,
 ) -> RakkaAgentA2AResult<AgentTaskEntityCommand> {
+    // A collaboration send binds the child to its delegation graph: the
+    // validated envelope becomes the child's recorded provenance, its parent
+    // binding, and its goal binding (specification 14.4). The escrow stays
+    // `None` either way — a conserved budget grant cannot ride A2A, so the
+    // envelope's budget is advisory provenance and the child's ledger builds
+    // from its own definition ceilings.
+    let (goal, parent, delegation) = match normalized.collaboration.as_ref() {
+        Some(envelope) => {
+            let provenance = envelope.to_provenance()?;
+            (
+                envelope.goal_id()?,
+                Some(provenance.parent_task.clone()),
+                Some(Box::new(provenance)),
+            )
+        }
+        None => (None, None, None),
+    };
     Ok(AgentTaskEntityCommand::Create {
         operation_id: normalized.operation_id.clone(),
         creation: Box::new(AgentTaskCreation {
             definition: target.definition.clone(),
             input: AgentTaskContent::inline(input)?,
             assignee: Some(target.agent.clone()),
-            goal: None,
+            goal,
             // An A2A message creates a finite unit of work; a continuous root
             // control task is instituted by the goal surface, never by
             // ingress — and never an epoch, whose creation only the admitting
             // controller owes.
             goal_mode: AgentGoalMode::Finite,
-            parent: None,
+            goal_spec: None,
+            parent,
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation,
             telemetry: normalized.telemetry.clone(),
         }),
     })

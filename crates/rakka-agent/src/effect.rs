@@ -72,10 +72,14 @@ use crate::definition::{
     AgentCredentialBindingRef, AgentEffectSafetyClass, AgentExecutionPolicyRef,
     AgentModelProfileId, AgentRevisionNumber, AgentToolId,
 };
-use crate::identity::{AgentIdentityError, AgentOperationId, AgentOperationKind, AgentRunScope};
+use crate::identity::{
+    AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError, AgentOperationId,
+    AgentOperationKind, AgentRunId, AgentRunScope, AgentTaskId, KnowledgeSpaceId,
+    AGENT_IDENTITY_MAX_LENGTH,
+};
 use crate::memory::{
     AgentContextSnapshotRef, AgentPrivateMemoryId, AgentPrivateMemoryKind, AgentPromotedMemoryRef,
-    MemorySequence, AGENT_SESSION_WINDOW_MAX_ENTRIES,
+    MemoryClassification, MemorySequence, AGENT_SESSION_WINDOW_MAX_ENTRIES,
 };
 use crate::model::{AgentModelTurn, AgentToolCallId, AgentToolCallRequest};
 use crate::schema::{
@@ -619,6 +623,11 @@ pub struct AgentEffectPolicies {
     default_tool: AgentEffectSpec,
     compensation: AgentEffectSpec,
     memory_promotion: AgentEffectSpec,
+    goal_evaluation: AgentEffectSpec,
+    a2a_send: AgentEffectSpec,
+    workflow_start: AgentEffectSpec,
+    workflow_cancel: AgentEffectSpec,
+    claim_append: AgentEffectSpec,
     checkpoint_sla: crate::checkpoints::AgentCheckpointSla,
 }
 
@@ -637,6 +646,83 @@ impl AgentEffectPolicies {
             memory_promotion: AgentEffectSpec {
                 safety_class: AgentEffectSafetyClass::Idempotent,
                 max_attempts: AGENT_MEMORY_PROMOTION_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // An evaluation judges evidence and never mutates the world:
+            // read-only is what makes a crash-retry safe and keeps an
+            // ambiguous loss off the reconciliation path.
+            goal_evaluation: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::ReadOnly,
+                max_attempts: crate::evaluation::AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // The send's deduplication key is a pure derivation of the
+            // delegation identity, so every retry converges on the same
+            // logical child: idempotent by construction, and an ambiguous
+            // loss retries safely under the same key instead of parking for
+            // reconciliation.
+            a2a_send: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: crate::delegation::AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // The start's command id and deduplication key are pure,
+            // generation-free derivations of the invocation identity, so
+            // every retry converges on the same child run: idempotent by
+            // construction — the workflow *behind* the start keeps its own
+            // declared safety, which the descriptor overlays at commit.
+            workflow_start: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: crate::workflow_tool::AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // The cancel's command id and deduplication key are pure,
+            // generation-free derivations of the invocation identity, so
+            // every retry converges on one logical request: idempotent by
+            // construction, and the request authorizes nothing — an
+            // ambiguous loss retries safely instead of parking a wind-down
+            // for reconciliation.
+            workflow_cancel: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: crate::workflow_tool::AGENT_WORKFLOW_CANCEL_DEFAULT_MAX_ATTEMPTS,
+                reconciliation_protocol: None,
+                credential_binding: None,
+                timeout_ms: None,
+                execution_policy: None,
+                guardrail_revision: None,
+                checkpoint_required: false,
+                authorization_required: false,
+            },
+            // The append's operation id derives from the intent's external
+            // idempotency key, and the store's ledger answers every replay
+            // with the original claim: idempotent by construction.
+            claim_append: AgentEffectSpec {
+                safety_class: AgentEffectSafetyClass::Idempotent,
+                max_attempts: AGENT_CLAIM_APPEND_DEFAULT_MAX_ATTEMPTS,
                 reconciliation_protocol: None,
                 credential_binding: None,
                 timeout_ms: None,
@@ -707,6 +793,60 @@ impl AgentEffectPolicies {
         Ok(self)
     }
 
+    /// Sets the spec goal evaluations dispatch under
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::evaluation::AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS`]
+    /// read-only attempts.
+    pub fn with_goal_evaluation_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.goal_evaluation = spec;
+        Ok(self)
+    }
+
+    /// Sets the spec outbound A2A sends dispatch under
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::delegation::AGENT_A2A_SEND_DEFAULT_MAX_ATTEMPTS`] idempotent
+    /// attempts.
+    pub fn with_a2a_send_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.a2a_send = spec;
+        Ok(self)
+    }
+
+    /// Sets the spec workflow starts dispatch under
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_START_DEFAULT_MAX_ATTEMPTS`]
+    /// idempotent attempts.
+    pub fn with_workflow_start_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.workflow_start = spec;
+        Ok(self)
+    }
+
+    /// Sets the spec workflow cancels dispatch under
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is
+    /// [`crate::workflow_tool::AGENT_WORKFLOW_CANCEL_DEFAULT_MAX_ATTEMPTS`]
+    /// idempotent attempts.
+    pub fn with_workflow_cancel_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.workflow_cancel = spec;
+        Ok(self)
+    }
+
+    /// Sets the spec communal claim appends dispatch under
+    /// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)). The
+    /// default is [`AGENT_CLAIM_APPEND_DEFAULT_MAX_ATTEMPTS`] idempotent
+    /// attempts.
+    pub fn with_claim_append_spec(mut self, spec: AgentEffectSpec) -> AgentEffectResult<Self> {
+        spec.validate()?;
+        self.claim_append = spec;
+        Ok(self)
+    }
+
     /// Pins every spec — model, registered tools, and the unclassified
     /// default — to the guardrail chain revision the deployment evaluates at
     /// dispatch, so each committed intent records the policy its transforms
@@ -718,6 +858,11 @@ impl AgentEffectPolicies {
         self.model.guardrail_revision = Some(revision);
         self.default_tool.guardrail_revision = Some(revision);
         self.memory_promotion.guardrail_revision = Some(revision);
+        self.goal_evaluation.guardrail_revision = Some(revision);
+        self.a2a_send.guardrail_revision = Some(revision);
+        self.workflow_start.guardrail_revision = Some(revision);
+        self.workflow_cancel.guardrail_revision = Some(revision);
+        self.claim_append.guardrail_revision = Some(revision);
         for spec in self.tools.values_mut() {
             spec.guardrail_revision = Some(revision);
         }
@@ -734,6 +879,11 @@ impl AgentEffectPolicies {
             }
             AgentRunEffectRequest::Compensation { .. } => &self.compensation,
             AgentRunEffectRequest::MemoryPromotion { .. } => &self.memory_promotion,
+            AgentRunEffectRequest::Evaluation { .. } => &self.goal_evaluation,
+            AgentRunEffectRequest::A2aSend { .. } => &self.a2a_send,
+            AgentRunEffectRequest::WorkflowStart { .. } => &self.workflow_start,
+            AgentRunEffectRequest::WorkflowCancel { .. } => &self.workflow_cancel,
+            AgentRunEffectRequest::ClaimAppend { .. } => &self.claim_append,
         }
     }
 }
@@ -776,6 +926,28 @@ pub enum AgentRunEffectKind {
     /// A promotion of session-memory entries into the agent's private
     /// long-term store ([specification 13.3](../../../docs/plans/rakka-agent/spec.md)).
     MemoryPromotionCall,
+    /// An evaluation of the goal's success criteria against durable evidence
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    GoalEvaluationCall,
+    /// An outbound agent-to-agent send carrying one durable delegation
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    A2aSendCall,
+    /// The start-or-adopt command of one durable workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)). The
+    /// effect is the start, never the workflow: the child run's internal
+    /// effects keep their own durable boundaries.
+    WorkflowStartCall,
+    /// The cancel command of one durable workflow-tool invocation
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). The
+    /// effect is the request, never the stop: delivering it to the child's
+    /// durable inbox is all it ever claims, and the child's terminal outcome
+    /// still returns through its own result relay.
+    WorkflowCancelCall,
+    /// An append of one provenance-bearing claim into a communal knowledge
+    /// space ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)):
+    /// idempotent by construction — the store's append ledger converges every
+    /// replay of the derived operation on the original claim.
+    ClaimAppendCall,
 }
 
 impl AgentRunEffectKind {
@@ -787,6 +959,11 @@ impl AgentRunEffectKind {
             Self::ToolCall => "tool-call",
             Self::CompensationCall => "compensation-call",
             Self::MemoryPromotionCall => "memory-promotion-call",
+            Self::GoalEvaluationCall => "goal-evaluation-call",
+            Self::A2aSendCall => "a2a-send-call",
+            Self::WorkflowStartCall => "workflow-start-call",
+            Self::WorkflowCancelCall => "workflow-cancel-call",
+            Self::ClaimAppendCall => "claim-append-call",
         }
     }
 
@@ -795,14 +972,36 @@ impl AgentRunEffectKind {
     pub const fn workflow_kind(self) -> AgentEffectKind {
         match self {
             Self::ModelCall => AgentEffectKind::ModelCall,
-            // A compensation or memory promotion dispatches through the same
+            // A compensation, memory promotion, goal evaluation, A2A send,
+            // workflow start, or workflow cancel dispatches through the same
             // adapter surface as a tool call: the outbox ticket's target type
-            // (`compensation`, `memory-promotion`) is what routes it to its
-            // executor.
-            Self::ToolCall | Self::CompensationCall | Self::MemoryPromotionCall => {
-                AgentEffectKind::ToolCall
-            }
+            // (`compensation`, `memory-promotion`, `goal-evaluation`,
+            // `a2a-peer`, `workflow-tool`, `workflow-cancel`) is what routes
+            // it to its executor.
+            Self::ToolCall
+            | Self::CompensationCall
+            | Self::MemoryPromotionCall
+            | Self::GoalEvaluationCall
+            | Self::A2aSendCall
+            | Self::WorkflowStartCall
+            | Self::WorkflowCancelCall
+            | Self::ClaimAppendCall => AgentEffectKind::ToolCall,
         }
+    }
+
+    /// Whether an effect of this kind may still be handed to the outbox and
+    /// dispatched while its run winds down.
+    ///
+    /// The wind-down fence forbids new dispatch
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)), with
+    /// exactly two exemptions, each a piece of work the wind-down itself
+    /// authorizes: the compensation an operator's `Compensate` decision
+    /// schedules after the fence
+    /// ([specification 12.5](../../../docs/plans/rakka-agent/spec.md)), and
+    /// the workflow-cancel the wind-down owes its started child workflows.
+    #[must_use]
+    pub const fn exempt_from_wind_down_fence(self) -> bool {
+        matches!(self, Self::CompensationCall | Self::WorkflowCancelCall)
     }
 }
 
@@ -980,6 +1179,149 @@ impl AgentMemoryPromotionRequest {
     }
 }
 
+/// Most evidence artifacts one claim append may carry — the graph record's
+/// own cap, enforced here so a refused request never reaches the store.
+pub const AGENT_CLAIM_APPEND_MAX_EVIDENCE: usize = 16;
+
+/// Longest inline claim-object value, in bytes — the graph record's own
+/// bound, enforced here so a refused request never reaches the store.
+pub const AGENT_CLAIM_APPEND_OBJECT_MAX_BYTES: usize = 4096;
+
+/// The default attempt bound of a claim-append effect.
+pub const AGENT_CLAIM_APPEND_DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// Highest confidence one claim append may assert, in basis points — the
+/// graph record's own range, enforced here so a refused request never reaches
+/// the store.
+pub const AGENT_CLAIM_APPEND_MAX_CONFIDENCE_BPS: u16 = 10_000;
+
+/// The object half of a requested communal claim
+/// ([specification 13.4](../../../docs/plans/rakka-agent/spec.md)), mirroring
+/// the graph's own statement shape: an edge to another node, or a bounded
+/// literal value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentClaimObjectRequest {
+    /// An edge to another node, by its raw node id.
+    Node(String),
+    /// A bounded literal or artifact-referenced value.
+    Value(AgentTaskContent),
+}
+
+/// What one communal claim append asserts and where
+/// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The statement is caller input; the provenance never is — it rides beside
+/// this request as [`AgentClaimAppendProvenance`], stamped from durable run
+/// identity by the committing transition, so no initiator can assert work in
+/// another scope's name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentClaimAppendRequest {
+    /// The communal knowledge space the claim lands in, validated against
+    /// the run's delegated grant and the definition envelope at the door.
+    pub space: KnowledgeSpaceId,
+    /// The subject node's raw id.
+    pub subject: String,
+    /// The predicate's raw label.
+    pub predicate: String,
+    /// The object half of the statement.
+    pub object: AgentClaimObjectRequest,
+    /// The asserted confidence, in basis points.
+    pub confidence_bps: u16,
+    /// The claim's classification.
+    pub classification: MemoryClassification,
+    /// Evidence artifact references, at most
+    /// [`AGENT_CLAIM_APPEND_MAX_EVIDENCE`].
+    #[serde(default)]
+    pub evidence: Vec<rakka_agent_workflow::ArtifactRef>,
+    /// Who asked for the append. Provenance and audit, never authority.
+    pub requested_by: PrincipalRef,
+}
+
+impl AgentClaimAppendRequest {
+    /// Rejects a request that exceeds its structural bounds.
+    pub fn validate(&self) -> AgentEffectResult<()> {
+        let bounded_segment = |label: &str, value: &str| {
+            if value.is_empty() || value.len() > AGENT_IDENTITY_MAX_LENGTH {
+                return Err(AgentEffectError::InvalidPolicy {
+                    message: format!(
+                        "the claim {label} is {} bytes; it must be non-empty and at most {}",
+                        value.len(),
+                        AGENT_IDENTITY_MAX_LENGTH
+                    ),
+                });
+            }
+            Ok(())
+        };
+        bounded_segment("subject", &self.subject)?;
+        bounded_segment("predicate", &self.predicate)?;
+        match &self.object {
+            AgentClaimObjectRequest::Node(node) => bounded_segment("object node", node)?,
+            AgentClaimObjectRequest::Value(content) => {
+                content.validate()?;
+                let bytes = content.size_bytes();
+                if bytes > AGENT_CLAIM_APPEND_OBJECT_MAX_BYTES {
+                    return Err(AgentEffectError::InvalidPolicy {
+                        message: format!(
+                            "the claim object value is {bytes} bytes, which exceeds the \
+                             {AGENT_CLAIM_APPEND_OBJECT_MAX_BYTES} byte bound"
+                        ),
+                    });
+                }
+            }
+        }
+        if self.evidence.len() > AGENT_CLAIM_APPEND_MAX_EVIDENCE {
+            return Err(AgentEffectError::InvalidPolicy {
+                message: format!(
+                    "the claim names {} evidence artifacts, which exceeds the {} bound",
+                    self.evidence.len(),
+                    AGENT_CLAIM_APPEND_MAX_EVIDENCE
+                ),
+            });
+        }
+        // Basis points, so the store refuses anything past ten thousand. The
+        // check belongs here for the same reason the bounds above do: a
+        // request refused at the door costs the caller an error, while one
+        // refused at dispatch has already reserved the run's attempts and
+        // spent an effect slot on a claim that can never land.
+        if self.confidence_bps > AGENT_CLAIM_APPEND_MAX_CONFIDENCE_BPS {
+            return Err(AgentEffectError::InvalidPolicy {
+                message: format!(
+                    "the claim asserts {} basis points of confidence, which exceeds the {} bound",
+                    self.confidence_bps, AGENT_CLAIM_APPEND_MAX_CONFIDENCE_BPS
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The provenance one claim append carries
+/// ([specification 8.5](../../../docs/plans/rakka-agent/spec.md): a
+/// collaboration claim includes goal, task, source agent/run, and delegation
+/// identity).
+///
+/// Stamped only by the run transition, from durable state — never command
+/// input — which is what makes forged provenance unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AgentClaimAppendProvenance {
+    /// The agent asserting the claim.
+    pub agent: AgentId,
+    /// The goal the assertion serves, when the run serves one.
+    #[serde(default)]
+    pub goal: Option<AgentGoalId>,
+    /// The task the assertion serves.
+    pub task: AgentTaskId,
+    /// The run that produced the assertion.
+    pub run: AgentRunId,
+    /// The delegation this run works under, when it works under one.
+    #[serde(default)]
+    pub delegation: Option<AgentDelegationId>,
+}
+
 /// The existing memory one consolidation updates, at the exact revision the
 /// initiator read ([specification 13.3](../../../docs/plans/rakka-agent/spec.md);
 /// open decision 1's compare-and-set rule).
@@ -1042,6 +1384,70 @@ pub enum AgentRunEffectRequest {
         /// What to promote and where.
         promotion: Box<AgentMemoryPromotionRequest>,
     },
+    /// Evaluate the goal's current success-criteria revision against durable
+    /// evidence ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)):
+    /// a read-only durable effect, committed by a deduplicated run command and
+    /// executed by the dispatcher's evaluation executor. Its completed record
+    /// is what a criteria decision rests on.
+    Evaluation {
+        /// What to evaluate, as which evaluator, by which method.
+        evaluation: Box<crate::evaluation::AgentGoalEvaluationRequest>,
+    },
+    /// Send one durable delegation to a specialist agent over `rakka-a2a`
+    /// ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)): an
+    /// idempotent durable effect whose payload *is* the delegation record
+    /// persisted alongside it — what was persisted is exactly what is sent,
+    /// and a replay re-sends it verbatim.
+    ///
+    /// This variant is constructible only by the loop's delegation
+    /// interception; model output can never produce it, which is one half of
+    /// why a generic tool cannot reach a peer.
+    A2aSend {
+        /// The delegation record the send carries.
+        delegation: Box<crate::delegation::AgentDelegationRecord>,
+    },
+    /// Start — or adopt — the one durable child workflow run of a
+    /// workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)): an
+    /// idempotent durable effect whose payload *is* the invocation record
+    /// persisted alongside it, and whose derived, generation-free `StartRun`
+    /// identities make every replay converge on the same child run.
+    ///
+    /// This variant is constructible only by the loop's workflow-tool
+    /// interception; model output can never produce it.
+    WorkflowStart {
+        /// The invocation record the start carries.
+        invocation: Box<crate::workflow_tool::AgentWorkflowInvocationRecord>,
+    },
+    /// Deliver the durable cancellation request of one workflow-tool
+    /// invocation to its child workflow run
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): an
+    /// idempotent durable effect whose derived, generation-free `CancelRun`
+    /// identities make every replay converge on one logical request. The
+    /// effect is the request, never the stop — the child's terminal outcome
+    /// still returns through its own result relay, and delivery is never
+    /// proof its started internal effects stopped.
+    ///
+    /// This variant is constructible only by the run's wind-down commit;
+    /// model output can never produce it.
+    WorkflowCancel {
+        /// The invocation record whose child is asked to cancel.
+        invocation: Box<crate::workflow_tool::AgentWorkflowInvocationRecord>,
+        /// The bounded reason carried to the child.
+        reason: String,
+    },
+    /// Append one provenance-bearing claim into a communal knowledge space
+    /// ([specification 8.5 and 13.4](../../../docs/plans/rakka-agent/spec.md)):
+    /// an idempotent durable effect, committed by a deduplicated run command
+    /// and executed by the dispatcher's claim-append executor. The statement
+    /// is the command's; the provenance is stamped from durable run identity
+    /// by the committing transition and can never be forged by an initiator.
+    ClaimAppend {
+        /// The statement to append and the space it lands in.
+        append: Box<AgentClaimAppendRequest>,
+        /// The transition-stamped provenance the claim records.
+        provenance: Box<AgentClaimAppendProvenance>,
+    },
 }
 
 impl AgentRunEffectRequest {
@@ -1053,6 +1459,11 @@ impl AgentRunEffectRequest {
             Self::Tool { .. } => AgentRunEffectKind::ToolCall,
             Self::Compensation { .. } => AgentRunEffectKind::CompensationCall,
             Self::MemoryPromotion { .. } => AgentRunEffectKind::MemoryPromotionCall,
+            Self::Evaluation { .. } => AgentRunEffectKind::GoalEvaluationCall,
+            Self::A2aSend { .. } => AgentRunEffectKind::A2aSendCall,
+            Self::WorkflowStart { .. } => AgentRunEffectKind::WorkflowStartCall,
+            Self::WorkflowCancel { .. } => AgentRunEffectKind::WorkflowCancelCall,
+            Self::ClaimAppend { .. } => AgentRunEffectKind::ClaimAppendCall,
         }
     }
 
@@ -1060,7 +1471,14 @@ impl AgentRunEffectRequest {
     #[must_use]
     pub fn tool_call(&self) -> Option<&AgentToolCallRequest> {
         match self {
-            Self::Model { .. } | Self::Compensation { .. } | Self::MemoryPromotion { .. } => None,
+            Self::Model { .. }
+            | Self::Compensation { .. }
+            | Self::MemoryPromotion { .. }
+            | Self::Evaluation { .. }
+            | Self::A2aSend { .. }
+            | Self::WorkflowStart { .. }
+            | Self::WorkflowCancel { .. }
+            | Self::ClaimAppend { .. } => None,
             Self::Tool { call } => Some(call),
         }
     }
@@ -1123,6 +1541,57 @@ impl AgentRunEffectRequest {
             Self::MemoryPromotion { promotion } => AgentEffectTarget {
                 target_type: "memory-promotion".to_string(),
                 name: promotion.kind.as_label().to_string(),
+                address: None,
+                attributes: BTreeMap::new(),
+            },
+            Self::Evaluation { evaluation } => AgentEffectTarget {
+                target_type: "goal-evaluation".to_string(),
+                name: evaluation.evaluator.to_string(),
+                address: None,
+                attributes: BTreeMap::new(),
+            },
+            Self::A2aSend { delegation } => AgentEffectTarget {
+                target_type: "a2a-peer".to_string(),
+                name: delegation.resolved.agent.to_string(),
+                address: delegation.resolved.endpoint.clone(),
+                attributes: BTreeMap::from([
+                    ("skill".to_string(), delegation.requested_skill.to_string()),
+                    ("delegation".to_string(), delegation.delegation.to_string()),
+                ]),
+            },
+            Self::WorkflowStart { invocation } => AgentEffectTarget {
+                target_type: "workflow-tool".to_string(),
+                name: invocation.workflow_tool.to_string(),
+                address: None,
+                attributes: BTreeMap::from([
+                    (
+                        "workflow-type".to_string(),
+                        invocation.workflow_type.clone(),
+                    ),
+                    (
+                        "definition-version".to_string(),
+                        invocation.definition_version.as_str().to_string(),
+                    ),
+                    ("invocation".to_string(), invocation.invocation.to_string()),
+                    ("child-run".to_string(), invocation.child_run.to_string()),
+                ]),
+            },
+            Self::WorkflowCancel { invocation, .. } => AgentEffectTarget {
+                target_type: "workflow-cancel".to_string(),
+                name: invocation.workflow_tool.to_string(),
+                address: None,
+                attributes: BTreeMap::from([
+                    (
+                        "workflow-type".to_string(),
+                        invocation.workflow_type.clone(),
+                    ),
+                    ("invocation".to_string(), invocation.invocation.to_string()),
+                    ("child-run".to_string(), invocation.child_run.to_string()),
+                ]),
+            },
+            Self::ClaimAppend { append, .. } => AgentEffectTarget {
+                target_type: "claim-append".to_string(),
+                name: append.space.to_string(),
                 address: None,
                 attributes: BTreeMap::new(),
             },
@@ -1604,6 +2073,40 @@ pub enum AgentRunEffectOutcome {
         /// The bounded receipt: identities and revisions only, never content.
         promoted: Vec<AgentPromotedMemoryRef>,
     },
+    /// A goal evaluation completed with a verdict
+    /// ([specification 8.3](../../../docs/plans/rakka-agent/spec.md)).
+    Evaluation {
+        /// The durable record: outcome, evidence references, and the criteria
+        /// revision it assessed.
+        record: Box<crate::evaluation::AgentGoalEvaluationRecord>,
+    },
+    /// An outbound A2A send durably created — or replayed to — its one
+    /// logical child ([specification 14.4](../../../docs/plans/rakka-agent/spec.md)).
+    A2aSend {
+        /// The bounded receipt: identities and a status label only.
+        receipt: crate::delegation::AgentA2aSendReceipt,
+    },
+    /// A workflow start durably created — or adopted — its one logical child
+    /// run ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    WorkflowStart {
+        /// The bounded receipt: identities and the adoption flag only.
+        receipt: crate::workflow_tool::AgentWorkflowStartReceipt,
+    },
+    /// A workflow-cancel request durably reached its child's inbox, or found
+    /// the child already finished
+    /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)). Never
+    /// proof the child's started internal effects stopped — its terminal
+    /// outcome still returns through the result relay.
+    WorkflowCancel {
+        /// Whether the child had already finished when the request arrived.
+        already_finished: bool,
+    },
+    /// A claim append durably landed — or replayed onto — its one logical
+    /// claim ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    ClaimAppend {
+        /// The appended claim's stable id, as the store recorded it.
+        claim: crate::identity::AgentCommunalClaimId,
+    },
     /// The generation failed definitively.
     Failed {
         /// Stable machine-readable code.
@@ -1640,7 +2143,14 @@ impl AgentRunEffectOutcome {
     pub const fn is_completed(&self) -> bool {
         matches!(
             self,
-            Self::Model { .. } | Self::Tool { .. } | Self::MemoryPromotion { .. }
+            Self::Model { .. }
+                | Self::Tool { .. }
+                | Self::MemoryPromotion { .. }
+                | Self::Evaluation { .. }
+                | Self::A2aSend { .. }
+                | Self::WorkflowStart { .. }
+                | Self::WorkflowCancel { .. }
+                | Self::ClaimAppend { .. }
         )
     }
 
@@ -1648,9 +2158,14 @@ impl AgentRunEffectOutcome {
     #[must_use]
     pub const fn resolved_status(&self) -> AgentRunEffectStatus {
         match self {
-            Self::Model { .. } | Self::Tool { .. } | Self::MemoryPromotion { .. } => {
-                AgentRunEffectStatus::Succeeded
-            }
+            Self::Model { .. }
+            | Self::Tool { .. }
+            | Self::MemoryPromotion { .. }
+            | Self::Evaluation { .. }
+            | Self::A2aSend { .. }
+            | Self::WorkflowStart { .. }
+            | Self::WorkflowCancel { .. }
+            | Self::ClaimAppend { .. } => AgentRunEffectStatus::Succeeded,
             Self::Failed { .. } => AgentRunEffectStatus::Failed,
             Self::Exhausted { .. } => AgentRunEffectStatus::Exhausted,
             Self::Indeterminate { .. } => AgentRunEffectStatus::Indeterminate,
@@ -1680,6 +2195,9 @@ impl AgentRunEffectOutcome {
     pub fn check_schema(&self, policy: &AgentSchemaPolicy) -> Result<(), AgentSchemaError> {
         if let Self::Model { turn } = self {
             policy.check_record(turn.as_ref())?;
+        }
+        if let Self::Evaluation { record } = self {
+            policy.check_record(record.as_ref())?;
         }
         Ok(())
     }
@@ -1713,6 +2231,26 @@ impl AgentRunEffectOutcome {
                         ),
                     });
                 }
+                Ok(())
+            }
+            Self::Evaluation { record } => {
+                record
+                    .validate()
+                    .map_err(|error| AgentEffectError::InvalidPolicy {
+                        message: error.to_string(),
+                    })
+            }
+            Self::A2aSend { receipt } => {
+                receipt
+                    .validate()
+                    .map_err(|error| AgentEffectError::InvalidPolicy {
+                        message: error.to_string(),
+                    })
+            }
+            // The start receipt is identities and a flag, the cancel outcome
+            // one flag, and the append receipt one identity: bounded by
+            // construction.
+            Self::WorkflowStart { .. } | Self::WorkflowCancel { .. } | Self::ClaimAppend { .. } => {
                 Ok(())
             }
             Self::Failed { .. }
@@ -2027,6 +2565,72 @@ impl From<AgentTaskError> for AgentEffectError {
 
 #[cfg(test)]
 mod tests {
+    /// Every structural bound a claim append can violate is refused at the
+    /// door, so a request that reaches dispatch is one the store can accept.
+    /// A bound checked only store-side would have already reserved the run's
+    /// attempts and spent an effect slot before failing.
+    #[test]
+    fn a_claim_append_request_refuses_every_bound_at_the_door() {
+        let base = || AgentClaimAppendRequest {
+            space: crate::identity::KnowledgeSpaceId::new("space").expect("the space id is valid"),
+            subject: "finding".to_string(),
+            predicate: "links".to_string(),
+            object: AgentClaimObjectRequest::Node("evidence".to_string()),
+            confidence_bps: 5_000,
+            classification: MemoryClassification::Unclassified,
+            evidence: Vec::new(),
+            requested_by: PrincipalRef {
+                principal_type: "service".to_string(),
+                principal_id: "researcher".to_string(),
+                display_name: None,
+            },
+        };
+        base().validate().expect("the base request is bounded");
+
+        let mut empty_subject = base();
+        empty_subject.subject = String::new();
+        empty_subject
+            .validate()
+            .expect_err("an empty subject is refused");
+
+        let mut long_predicate = base();
+        long_predicate.predicate = "p".repeat(AGENT_IDENTITY_MAX_LENGTH + 1);
+        long_predicate
+            .validate()
+            .expect_err("an oversized predicate is refused");
+
+        let mut over_evidence = base();
+        over_evidence.evidence = (0..=AGENT_CLAIM_APPEND_MAX_EVIDENCE)
+            .map(|index| rakka_agent_workflow::ArtifactRef {
+                artifact_id: format!("artifact-{index}"),
+                kind: rakka_agent_workflow::ArtifactKind::File,
+                uri: format!("s3://evidence/artifact-{index}"),
+                checksum: None,
+                content_type: None,
+                byte_len: None,
+                retention_class: None,
+                encryption: None,
+                redaction: rakka_agent_workflow::RedactionStatus::Unredacted,
+                created_at: AgentTimestampMillis::new(1),
+                metadata: rakka_agent_workflow::AgentAttributes::default(),
+            })
+            .collect();
+        over_evidence
+            .validate()
+            .expect_err("evidence past the bound is refused");
+
+        // Confidence is basis points: the store refuses anything past ten
+        // thousand, and `u16` admits six times that.
+        let mut over_confidence = base();
+        over_confidence.confidence_bps = AGENT_CLAIM_APPEND_MAX_CONFIDENCE_BPS + 1;
+        over_confidence
+            .validate()
+            .expect_err("confidence past ten thousand basis points is refused");
+        let mut at_bound = base();
+        at_bound.confidence_bps = AGENT_CLAIM_APPEND_MAX_CONFIDENCE_BPS;
+        at_bound.validate().expect("the bound itself is admissible");
+    }
+
     use super::*;
     use crate::identity::{AgentId, AgentRunId, TenantId};
     use crate::memory::AgentContextSnapshotRef;

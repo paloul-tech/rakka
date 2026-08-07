@@ -107,6 +107,325 @@ pub fn goal_id() -> AgentGoalId {
     AgentGoalId::new(GOAL).expect("goal id should be valid")
 }
 
+/// A minimal valid goal contract for the fixture goal: policy-sourced
+/// criteria at the initial revision, unbounded budgets, and the default
+/// (park) exhaustion policy.
+pub fn goal_spec() -> rakka_agent::AgentGoalSpec {
+    rakka_agent::AgentGoalSpec {
+        owner: PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "goal-owner".to_string(),
+            display_name: None,
+        },
+        objective: rakka_agent::AgentGoalObjective {
+            artifact: None,
+            summary: "resolve the fixture ticket to the owner's satisfaction".to_string(),
+        },
+        criteria: rakka_agent::AgentGoalCriteria {
+            source: rakka_agent::AgentGoalCriteriaSource::Policy(
+                AgentPolicyRef::new("ticket-resolved").expect("the policy ref is valid"),
+            ),
+            revision: AgentRevisionNumber::INITIAL,
+            digest: None,
+        },
+        priority: None,
+        deadline: None,
+        cancellation: None,
+        allocation: AgentBudgetAllocation::unbounded(),
+        limits: rakka_agent::AgentBudgetLimits::unbounded(),
+        delegation: None,
+        fan_in: None,
+        exhaustion: rakka_agent::AgentGoalExhaustionPolicy::default(),
+        allowed_skills: Default::default(),
+        allowed_tools: Default::default(),
+        allowed_workflows: Default::default(),
+        knowledge_spaces: Default::default(),
+        environments: Default::default(),
+        evaluator: None,
+        required_evidence: Default::default(),
+        escalation: None,
+        terminal_decision: None,
+        stagnation: None,
+        stagnation_policy: Default::default(),
+        settings_revision: None,
+        policy_revision: None,
+    }
+}
+
+/// The fixture goal contract with a configured completion evaluator and one
+/// required evidence class: under it, a criteria decision may only arrive
+/// through the goal-evaluation exchange.
+pub fn goal_spec_with_evaluator() -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.evaluator =
+        Some(AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"));
+    spec.required_evidence = ["artifact".to_string()].into_iter().collect();
+    spec
+}
+
+/// The fixture goal contract with a stagnation policy: repeated-result trips
+/// at `repeated` consecutive identical completions under `action`.
+pub fn goal_spec_with_stagnation(
+    repeated: u32,
+    action: rakka_agent::AgentGoalStagnationAction,
+) -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.stagnation = Some(AgentPolicyRef::new("no-repeats").expect("the policy ref is valid"));
+    spec.stagnation_policy = rakka_agent::AgentGoalStagnationPolicy {
+        repeated_result_epochs: Some(repeated),
+        no_progress_epochs: None,
+        default: action,
+        overrides: Default::default(),
+    };
+    spec
+}
+
+/// The creation draft instituting the fixture goal.
+pub fn goal_spec_draft(
+    spec: rakka_agent::AgentGoalSpec,
+    activate: bool,
+) -> rakka_agent::AgentGoalSpecDraft {
+    rakka_agent::AgentGoalSpecDraft {
+        spec,
+        provenance: provenance(1),
+        activate_on_creation: activate,
+    }
+}
+
+/// The evaluation reference a criteria decision on the fixture goal rests on,
+/// assessed at the initial criteria revision.
+pub fn goal_evaluation() -> rakka_agent::AgentGoalEvaluationRef {
+    rakka_agent::AgentGoalEvaluationRef {
+        evaluator: AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"),
+        criteria_revision: AgentRevisionNumber::INITIAL,
+        evidence: None,
+        digest: None,
+        evaluation_id: None,
+        method: None,
+        evidence_items: Vec::new(),
+    }
+}
+
+/// The evaluation request the fixture's coordinator commits: a deterministic
+/// assertion as the configured evaluator, presenting one classed evidence
+/// artifact at `criteria_revision`.
+pub fn goal_evaluation_request(
+    criteria_revision: AgentRevisionNumber,
+) -> rakka_agent::AgentGoalEvaluationRequest {
+    rakka_agent::AgentGoalEvaluationRequest {
+        // The goal-bearing root task derives its goal identity from its own
+        // value (open decision 14's resolved default), and the run is bound
+        // to that derived id.
+        goal: AgentGoalId::for_root_task(task_scope().task()),
+        evaluator: AgentPolicyRef::new("ticket-evaluator").expect("the policy ref is valid"),
+        criteria_revision,
+        method: rakka_agent::AgentGoalEvaluationMethod::DeterministicAssertion {
+            assertion: AgentPolicyRef::new("ticket-resolved").expect("the policy ref is valid"),
+        },
+        evidence: vec![rakka_agent::AgentGoalEvidenceRef {
+            class: "artifact".to_string(),
+            artifact: None,
+            digest: None,
+        }],
+        requested_by: PrincipalRef {
+            principal_type: "service".to_string(),
+            principal_id: "goal-orchestrator".to_string(),
+            display_name: None,
+        },
+    }
+}
+
+/// The creation command of a goal-bearing agent-owned root task: the goal id
+/// is deliberately omitted, so creation derives it from the root task's own
+/// value (open decision 14's resolved default).
+pub fn goal_task_creation_command(
+    definition: AgentTaskDefinition,
+    draft: rakka_agent::AgentGoalSpecDraft,
+) -> AgentTaskEntityCommand {
+    AgentTaskEntityCommand::Create {
+        operation_id: AgentOperationId::new(AgentOperationKind::TaskCreation, [TENANT, TASK, "1"])
+            .expect("operation id should be derivable"),
+        creation: Box::new(AgentTaskCreation {
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: Some(agent_id()),
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: Some(Box::new(draft)),
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        }),
+    }
+}
+
+/// The coordination tool the delegation fixture declares.
+pub const DELEGATION_TOOL: &str = "delegate";
+
+/// The skill the fixture goal may delegate.
+pub const SKILL: &str = "translation";
+
+/// The specialist agent the fixture catalog resolves the skill to.
+pub const SPECIALIST: &str = "translator";
+
+/// The specialist's typed task definition.
+pub const SPECIALIST_DEFINITION: &str = "translate-document";
+
+pub fn delegation_tool_id() -> rakka_agent::AgentToolId {
+    rakka_agent::AgentToolId::new(DELEGATION_TOOL).expect("tool id should be valid")
+}
+
+pub fn skill_id() -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(SKILL).expect("capability id should be valid")
+}
+
+/// The target the fixture catalog resolves [`skill_id`] to.
+pub fn delegation_target() -> rakka_agent::AgentDelegationTarget {
+    rakka_agent::AgentDelegationTarget::new(
+        AgentId::new(SPECIALIST).expect("agent id should be valid"),
+        AgentTaskDefinitionId::new(SPECIALIST_DEFINITION).expect("definition id should be valid"),
+    )
+}
+
+/// The delegation wiring the fixture run entity serves: the declared
+/// coordination tool, a static catalog serving [`skill_id`], and the
+/// delegation capability.
+pub fn delegation_config() -> rakka_agent::AgentRunDelegationConfig {
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(skill_id(), delegation_target()),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+}
+
+/// The await verb the fan-in fixture declares.
+pub const FAN_IN_TOOL: &str = "await_children";
+
+/// The second skill the fan-out fixture may delegate, resolved to a second
+/// specialist so scenario 27's "multiple specialist agents" is two distinct
+/// targets, not one twice.
+pub const SKILL_2: &str = "summarization";
+
+/// The second specialist agent.
+pub const SPECIALIST_2: &str = "summarizer";
+
+pub fn fan_in_tool_id() -> rakka_agent::AgentToolId {
+    rakka_agent::AgentToolId::new(FAN_IN_TOOL).expect("tool id should be valid")
+}
+
+pub fn skill_2_id() -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(SKILL_2).expect("capability id should be valid")
+}
+
+/// The delegation wiring with the await verb declared and both specialist
+/// skills resolvable.
+pub fn delegation_config_with_fan_in() -> rakka_agent::AgentRunDelegationConfig {
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(skill_id(), delegation_target())
+                .with_target(
+                    skill_2_id(),
+                    rakka_agent::AgentDelegationTarget::new(
+                        AgentId::new(SPECIALIST_2).expect("agent id should be valid"),
+                        AgentTaskDefinitionId::new("summarize-document")
+                            .expect("definition id should be valid"),
+                    ),
+                ),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+    .with_fan_in_tool(fan_in_tool_id())
+}
+
+/// The fixture goal contract narrowed to delegating [`skill_id`] only.
+pub fn goal_spec_with_delegation() -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.allowed_skills = std::collections::BTreeSet::from([skill_id()]);
+    spec
+}
+
+/// The fixture goal contract allowing both specialist skills, with an
+/// explicit fan-in policy and delegation ceilings for the fan-out tests.
+pub fn goal_spec_with_fan_out(
+    fan_in: Option<rakka_agent::AgentFanInPolicy>,
+    delegation: Option<rakka_agent::AgentGoalDelegationBudget>,
+) -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.allowed_skills = std::collections::BTreeSet::from([skill_id(), skill_2_id()]);
+    spec.fan_in = fan_in;
+    spec.delegation = delegation;
+    spec
+}
+
+/// The workflow tool the workflow fixture declares.
+pub const WORKFLOW_TOOL: &str = "refund-flow";
+
+/// The workflow type the descriptor pins.
+pub const WORKFLOW_TYPE: &str = "refund";
+
+/// The workflow definition version the descriptor pins.
+pub const WORKFLOW_VERSION: &str = "v1";
+
+pub fn workflow_tool_id() -> rakka_agent::AgentWorkflowToolId {
+    rakka_agent::AgentWorkflowToolId::new(WORKFLOW_TOOL).expect("workflow tool id should be valid")
+}
+
+/// The capability the workflow fixture's descriptor declares.
+pub const WORKFLOW_CAPABILITY: &str = "issue-refunds";
+
+/// The versioned descriptor under which the fixture's compiled workflow
+/// appears in the agent's toolset. Declares one required capability, so
+/// tests can observe the descriptor's capability surface copied onto the
+/// invocation record at commit.
+pub fn workflow_tool_descriptor() -> rakka_agent::AgentWorkflowToolDescriptor {
+    rakka_agent::AgentWorkflowToolDescriptor::new(
+        workflow_tool_id(),
+        WORKFLOW_TYPE,
+        rakka_agent_workflow::WorkflowDefinitionVersion::new(WORKFLOW_VERSION),
+        "Runs the compiled refund workflow.",
+        schema("refund-input"),
+        schema("refund-output"),
+    )
+    .expect("the workflow-tool descriptor should be valid")
+    .with_capability(
+        rakka_agent::AgentCapabilityId::new(WORKFLOW_CAPABILITY)
+            .expect("the capability id should be valid"),
+    )
+    .expect("the descriptor should accept the capability")
+}
+
+/// The workflow-tool wiring the fixture run entity serves.
+pub fn workflow_config() -> rakka_agent::AgentRunWorkflowConfig {
+    rakka_agent::AgentRunWorkflowConfig::new()
+        .with_descriptor(workflow_tool_descriptor())
+        .expect("the workflow configuration should accept the descriptor")
+}
+
+/// The fixture goal contract narrowed to the declared workflow tool, over the
+/// fan-out spec so mixed delegation-and-workflow turns stay authorized.
+pub fn goal_spec_with_workflow(
+    fan_in: Option<rakka_agent::AgentFanInPolicy>,
+) -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec_with_fan_out(fan_in, None);
+    spec.allowed_workflows = std::collections::BTreeSet::from([workflow_tool_id()]);
+    spec
+}
+
 /// The default continuous wake policy: durable-timer trigger, a bounded
 /// per-epoch budget, and a one-minute epoch deadline — the resolved defaults
 /// everywhere else.
@@ -160,10 +479,39 @@ pub fn continuous_control_creation_command(goal_mode: AgentGoalMode) -> AgentTas
             assignee: None,
             goal: Some(goal_id()),
             goal_mode,
+            goal_spec: None,
             parent: None,
             dependencies: Vec::new(),
             escrow: None,
             wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        }),
+    }
+}
+
+/// The creation command of a human-owned continuous root control task that
+/// also institutes the full goal contract.
+pub fn continuous_goal_control_creation_command(
+    goal_mode: AgentGoalMode,
+    draft: rakka_agent::AgentGoalSpecDraft,
+) -> AgentTaskEntityCommand {
+    AgentTaskEntityCommand::Create {
+        operation_id: AgentOperationId::new(AgentOperationKind::TaskCreation, [TENANT, TASK, "1"])
+            .expect("operation id should be derivable"),
+        creation: Box::new(AgentTaskCreation {
+            definition: task_definition().with_ownership(rakka_agent::AgentTaskOwnership::Human),
+            input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            goal: Some(goal_id()),
+            goal_mode,
+            goal_spec: Some(Box::new(draft)),
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
             telemetry: Default::default(),
         }),
     }
@@ -337,6 +685,12 @@ pub struct Fixture<
     /// The metrics recorder the run entity is wired with, when a test enables
     /// it. Absent by default, so the run records no metrics.
     pub metrics: Option<Arc<dyn rakka_core::MetricsRecorder>>,
+    /// The delegation wiring the run entity serves, when a test enables it.
+    /// Absent by default, so the run refuses the coordination tool.
+    pub delegation: Option<rakka_agent::AgentRunDelegationConfig>,
+    /// The workflow-tool wiring the run entity serves, when a test enables
+    /// it. Absent by default, so workflow-tool calls take the generic path.
+    pub workflow_tools: Option<rakka_agent::AgentRunWorkflowConfig>,
 }
 
 impl<A: AgentModelAdapter> Fixture<A> {
@@ -416,6 +770,8 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             memory: None,
             decisions: None,
             metrics: None,
+            delegation: None,
+            workflow_tools: None,
         }
     }
 
@@ -429,6 +785,25 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     pub fn with_memory(mut self, memory: AgentRunMemory) -> Self {
         self.run_transport.install_memory(memory.clone());
         self.memory = Some(memory);
+        self
+    }
+
+    /// Wires the run entity to serve delegation, under the same every-driver
+    /// rule as [`Self::with_memory`]: an entity that advances the loop
+    /// unwired refuses the coordination tool.
+    #[must_use]
+    pub fn with_delegation(mut self, config: rakka_agent::AgentRunDelegationConfig) -> Self {
+        self.run_transport.install_delegation(config.clone());
+        self.delegation = Some(config);
+        self
+    }
+
+    /// Wires the run entity to serve workflow tools, under the same
+    /// every-driver rule as [`Self::with_memory`].
+    #[must_use]
+    pub fn with_workflow_tools(mut self, config: rakka_agent::AgentRunWorkflowConfig) -> Self {
+        self.run_transport.install_workflow_tools(config.clone());
+        self.workflow_tools = Some(config);
         self
     }
 
@@ -541,11 +916,13 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         assignee: Some(agent_id()),
                         goal: None,
                         goal_mode: Default::default(),
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,
                         wake: None,
                         telemetry,
+                        delegation: None,
                     }),
                 },
                 &self.router,
@@ -604,10 +981,12 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
                         assignee: Some(agent_id()),
                         goal: Some(goal_id()),
                         goal_mode,
+                        goal_spec: None,
                         parent: None,
                         dependencies: Vec::new(),
                         escrow: None,
                         wake: None,
+                        delegation: None,
                         telemetry: Default::default(),
                     }),
                 },
@@ -680,7 +1059,35 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
         }
+        if let Some(delegation) = &self.delegation {
+            entity = entity.with_delegation(delegation.clone());
+        }
+        if let Some(workflow_tools) = &self.workflow_tools {
+            entity = entity.with_workflow_tools(workflow_tools.clone());
+        }
         entity
+    }
+
+    /// Applies one command to a task entity at an explicit scope — the
+    /// delegated child tasks the fan-out tests create and cancel.
+    pub async fn apply_task_command_at(
+        &self,
+        scope: &AgentTaskScope,
+        command: AgentTaskEntityCommand,
+    ) -> Result<rakka_agent::AgentTaskEntityReply, rakka_agent::AgentTaskError> {
+        let mut task = AgentTaskEntityStore::new(
+            scope.clone(),
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        task = task.with_wake_timers(self.rewake_parker.clone());
+        if let Some(metrics) = &self.metrics {
+            task = task.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        task.recover(now).await?;
+        task.apply(command, &self.router, self.now()).await
     }
 
     /// Settles one task entity at an explicit scope, the way a recovery sweep
@@ -767,6 +1174,12 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         }
         if let Some(metrics) = &self.metrics {
             entity = entity.with_metrics(metrics.clone());
+        }
+        if let Some(delegation) = &self.delegation {
+            entity = entity.with_delegation(delegation.clone());
+        }
+        if let Some(workflow_tools) = &self.workflow_tools {
+            entity = entity.with_workflow_tools(workflow_tools.clone());
         }
         entity
     }

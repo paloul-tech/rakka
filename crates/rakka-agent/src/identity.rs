@@ -186,6 +186,22 @@ validated_id! {
     pub AgentGoalId, "agent_goal_id"
 }
 
+impl AgentGoalId {
+    /// Derives the goal identity from the root task that coordinates it
+    /// ([specification 6.3](../../../docs/plans/rakka-agent/spec.md), open
+    /// decision 14's resolved default).
+    ///
+    /// Infallible by construction: both identities validate under the same
+    /// [`validate_identity_segment`] rules, and the task id already passed
+    /// them. The value coincides; the types and semantics stay distinct, so
+    /// goal coordination can later move to a dedicated entity without changing
+    /// the public contract.
+    #[must_use]
+    pub fn for_root_task(task: &AgentTaskId) -> Self {
+        Self(task.as_str().to_owned())
+    }
+}
+
 validated_id! {
     /// Identity of one durable, typed unit of work and its eventual public
     /// result ([specification 6.4](../../../docs/plans/rakka-agent/spec.md)).
@@ -223,6 +239,18 @@ validated_id! {
 }
 
 validated_id! {
+    /// Identity of one durable workflow-tool invocation
+    /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived by [`crate::workflow_tool::workflow_invocation_id_for`] as a
+    /// pure function of the parent run's `(turn, slot)` coordinate. It doubles
+    /// verbatim as the child workflow run id and the `StartRun` deduplication
+    /// key, so replaying one invocation creates or adopts the same durable
+    /// child run rather than a second one.
+    pub AgentWorkflowInvocationId, "agent_workflow_invocation_id"
+}
+
+validated_id! {
     /// Identity of one durable logical wake occurrence that may admit a
     /// continuous-goal epoch
     /// ([specification 6.9](../../../docs/plans/rakka-agent/spec.md)).
@@ -251,6 +279,16 @@ validated_id! {
     /// default space is tenant- or organization-scoped; cross-tenant sharing
     /// requires an explicit federation design.
     pub KnowledgeSpaceId, "knowledge_space_id"
+}
+
+validated_id! {
+    /// Identity of one appended communal claim, as the graph store recorded
+    /// it ([specification 13.4](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// A mirror newtype: the graph crate owns the derived `ClaimId` and
+    /// depends on this crate, so the append receipt carries the id in this
+    /// crate's own validated form rather than importing the graph's.
+    pub AgentCommunalClaimId, "agent_communal_claim_id"
 }
 
 /// Durable scope of one agent entity: `(TenantId, AgentId)`
@@ -687,10 +725,19 @@ pub enum AgentOperationKind {
     EpochAdmission,
     /// A completed epoch returning its result to the controller.
     EpochResult,
+    /// One goal evaluation: the committed effect, its record, and the
+    /// exchange that carries the record to the coordinating task.
+    GoalEvaluation,
     /// Append of one communal knowledge-graph claim.
     ClaimAppend,
     /// Durable delegation of work to a specialist agent.
     Delegation,
+    /// A delegated child task returning its terminal outcome to the parent
+    /// run that created it.
+    DelegationResult,
+    /// A child workflow run returning its terminal outcome to the parent run
+    /// that invoked it.
+    WorkflowResult,
     /// Durable handoff of a task to another agent.
     Handoff,
     /// A team member's claim on a shared task-board item.
@@ -736,8 +783,11 @@ impl AgentOperationKind {
             Self::WakeAdmission => "wake-admission",
             Self::EpochAdmission => "epoch-admission",
             Self::EpochResult => "epoch-result",
+            Self::GoalEvaluation => "goal-evaluation",
             Self::ClaimAppend => "claim-append",
             Self::Delegation => "delegation",
+            Self::DelegationResult => "delegation-result",
+            Self::WorkflowResult => "workflow-result",
             Self::Handoff => "handoff",
             Self::TeamClaim => "team-claim",
             Self::ConversationTurn => "conversation-turn",

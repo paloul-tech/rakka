@@ -165,6 +165,27 @@ pub const CURRENT_AGENT_CHECKPOINT_SCHEMA_VERSION: StateSchemaVersion = StateSch
 /// binary cannot read.
 pub const CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
 
+/// Current schema version of a persisted
+/// [`crate::goal::AgentGoalSpecRevision`].
+///
+/// A goal-spec revision outlives every decision made under it — a terminal
+/// decision names the criteria revision it evaluated, and an operator reads
+/// that contract back long after the goal ended — so it carries its own
+/// version rather than the coordinating task state's, and fails closed on one
+/// this binary cannot read.
+pub const CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION: StateSchemaVersion = StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::evaluation::AgentGoalEvaluationRecord`].
+///
+/// An evaluation record outlives the transition that produced it — it crosses
+/// the goal-evaluation exchange, and the terminal decision derived from it is
+/// read back long after the run that held it ended — so it carries its own
+/// version rather than the run state's, and fails closed on one this binary
+/// cannot read.
+pub const CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of the persisted
 /// [`crate::wake_timers::AgentWakeTimerStoreState`].
 ///
@@ -234,11 +255,15 @@ pub enum AgentRecordKind {
     WakePolicyRevision,
     /// The shared scanner's durable index of parked wake occurrences.
     WakeTimerState,
+    /// One accepted revision of a goal's spec.
+    GoalSpec,
+    /// One completed goal evaluation.
+    GoalEvaluation,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -262,6 +287,8 @@ impl AgentRecordKind {
         Self::PrivateMemory,
         Self::WakePolicyRevision,
         Self::WakeTimerState,
+        Self::GoalSpec,
+        Self::GoalEvaluation,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -291,6 +318,8 @@ impl AgentRecordKind {
             Self::PrivateMemory => "agent-private-memory",
             Self::WakePolicyRevision => "agent-wake-policy-revision",
             Self::WakeTimerState => "agent-wake-timer-state",
+            Self::GoalSpec => "agent-goal-spec",
+            Self::GoalEvaluation => "agent-goal-evaluation",
         }
     }
 
@@ -321,6 +350,8 @@ impl AgentRecordKind {
             Self::PrivateMemory => CURRENT_AGENT_PRIVATE_MEMORY_SCHEMA_VERSION,
             Self::WakePolicyRevision => CURRENT_AGENT_WAKE_POLICY_SCHEMA_VERSION,
             Self::WakeTimerState => CURRENT_AGENT_WAKE_TIMER_SCHEMA_VERSION,
+            Self::GoalSpec => CURRENT_AGENT_GOAL_SPEC_SCHEMA_VERSION,
+            Self::GoalEvaluation => CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION,
         }
     }
 
@@ -349,6 +380,8 @@ impl AgentRecordKind {
             Self::PrivateMemory => 20,
             Self::WakePolicyRevision => 21,
             Self::WakeTimerState => 22,
+            Self::GoalSpec => 23,
+            Self::GoalEvaluation => 24,
         }
     }
 }
