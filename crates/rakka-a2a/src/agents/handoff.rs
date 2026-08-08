@@ -14,15 +14,16 @@
 //! its handoff cluster under [`super::collaboration::META_COLLABORATION`]
 //! with the v1 extension URI declared.
 //!
-//! On an ambiguous failure the executor probes the task's durable state
-//! before giving up (the user-approved posture): a projection whose
-//! collaboration echo names this handoff proves the transfer was durably
-//! recorded — the finding is `Recorded`, converged exactly as an in-window
-//! replay would have been — while an echo naming a different transfer is the
-//! explicit conflict. Only a probe that cannot answer either way leaves the
-//! attempt as a retryable error; when the attempt budget spends out, the
-//! source run parks indeterminate rather than resuming beside a
-//! possibly-live transfer.
+//! On an ambiguous failure the executor probes the task's authoritative
+//! durable state before giving up (the user-approved posture): a task whose
+//! materialized handoff provenance names this handoff proves the transfer
+//! was durably recorded — the finding is `Recorded`, converged exactly as an
+//! in-window replay would have been — while an *unresolved* transfer under a
+//! different identity is the explicit conflict; a settled previous hop is
+//! history and proves this transfer was never recorded. Only a probe that
+//! cannot answer either way leaves the attempt as a retryable error; when
+//! the attempt budget spends out, the source run parks indeterminate rather
+//! than resuming beside a possibly-live transfer.
 
 use std::sync::Arc;
 
@@ -44,6 +45,7 @@ use super::collaboration::{
 };
 use super::error::RakkaAgentA2AError;
 use super::ingress::{META_AGENT_ID, META_TASK_DEFINITION};
+use super::projection::{agent_task_state, AgentTaskCondition};
 use super::service::RakkaAgentA2AService;
 
 /// In-process [`AgentA2aHandoffSendExecutor`] over the agents-surface
@@ -143,40 +145,51 @@ where
         }
     }
 
-    /// Probes the task's durable state for this handoff's echo.
+    /// Probes the task's authoritative durable state for this handoff.
     ///
-    /// `Ok(Some(finding))` is a definitive answer either way; `Ok(None)`
-    /// means the probe reached the task but the echo names no handoff yet —
-    /// the transfer was provably never recorded; `Err` means the probe
-    /// itself could not answer.
+    /// Reads the durable task snapshot directly — never the public
+    /// projection, which is an observability read model that may lag the
+    /// commit, and never `tasks/get`, whose deployment authorization gates
+    /// external callers while this probe is the deployment's own recovery
+    /// step. `Ok(Some(finding))` is a definitive answer either way;
+    /// `Ok(None)` means the task's durable state records no transfer under
+    /// this handoff's identity — a task carrying no handoff, or only a
+    /// *settled previous hop*, proves this transfer was never recorded;
+    /// `Err` means the probe itself could not answer.
     async fn probe(
         &self,
         record: &AgentHandoffRecord,
     ) -> Result<Option<AgentA2aHandoffFinding>, RakkaAgentA2AError> {
-        let held = self
+        let Some((snapshot, run)) = self
             .service
-            .get_task(
-                &ServiceParams::new(),
-                Some(record.source_run.tenant().as_str()),
-                record.task.as_str(),
-                None,
-            )
-            .await?;
-        match handoff_echo_id(&held) {
-            Some(echoed) if echoed == record.handoff.as_str() => {
+            .authoritative_task_view(record.source_run.tenant().as_str(), record.task.as_str())
+            .await?
+        else {
+            // No durable task at all: nothing can have recorded the transfer.
+            return Ok(None);
+        };
+        let peer_status = peer_status_label(&agent_task_state(AgentTaskCondition {
+            task: snapshot.status,
+            run,
+        }));
+        match snapshot.handoff.as_deref() {
+            Some(held) if held.handoff == record.handoff => {
                 Ok(Some(AgentA2aHandoffFinding::Recorded {
-                    target_generation: None,
-                    peer_status: peer_status_label(&held.status.state).to_string(),
+                    target_generation: held.target_generation,
+                    peer_status: peer_status.to_string(),
                 }))
             }
-            Some(_) => Ok(Some(AgentA2aHandoffFinding::Conflict {
+            Some(held) if !held.is_settled() => Ok(Some(AgentA2aHandoffFinding::Conflict {
                 code: "handoff-conflict".to_string(),
                 message: format!(
-                    "the task {} echoes a transfer this handoff's identity does not own",
-                    held.id
+                    "the task {} carries the unresolved transfer {}, which this handoff's \
+                     identity does not own",
+                    record.task, held.handoff
                 ),
             })),
-            None => Ok(None),
+            // No transfer, or a previous hop that already settled: history,
+            // not a conflict — this handoff was provably never recorded.
+            _ => Ok(None),
         }
     }
 }

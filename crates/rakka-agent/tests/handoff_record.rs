@@ -685,6 +685,121 @@ async fn a_replayed_handoff_send_converges_on_one_transfer() {
     );
 }
 
+/// A re-dispatched handoff send replaying past the journal's bounded
+/// deduplication window — modeled by a fresh operation id — converges on the
+/// recorded transfer even after the target completed the task: the
+/// materialized provenance is the deduplication echo, checked before the
+/// terminal guard. A `task-terminal` refusal here would tell the source no
+/// transfer was ever recorded and resume it beside the target's completed
+/// work.
+#[tokio::test]
+async fn a_past_window_replay_on_a_terminal_task_echoes_the_recorded_transfer() {
+    let fixture = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn(handoff_turn(handoff_arguments()))
+            .with_turn(proposing_turn()),
+    ))
+    .with_delegation(handoff_config());
+    let executor = ApplyingHandoffExecutor::over(&fixture);
+    let _ = fixture
+        .dispatcher
+        .clone()
+        .with_a2a_handoff_executor(executor.clone());
+    create_goal_task(&fixture).await;
+    fixture.instantiate_agent_at(handoff_target_scope()).await;
+    fixture.pump().await.expect("the loop should converge");
+    for _ in 0..4 {
+        fixture
+            .settle_task_at(&common::task_scope())
+            .await
+            .expect("the task should settle");
+    }
+
+    // Drive the target run to its own completion, terminalizing the task.
+    for _ in 0..16 {
+        fixture
+            .settle_task_at(&common::task_scope())
+            .await
+            .expect("the task should settle");
+        let now = fixture.now();
+        let mut target = fixture.run_at(&handoff_target_run_scope());
+        target.recover(now).await.expect("the target run recovers");
+        target
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await
+            .expect("the target run settles");
+        let answered = fixture
+            .dispatcher
+            .drive(&mut target, &fixture.router, fixture.now())
+            .await
+            .expect("the dispatcher drives the target");
+        let terminal = target
+            .state()
+            .ok()
+            .and_then(|state| state.status())
+            .is_some_and(AgentRunStatus::is_terminal);
+        if terminal && answered == 0 {
+            break;
+        }
+    }
+    fixture
+        .settle_task_at(&common::task_scope())
+        .await
+        .expect("the task should settle");
+    let task = fixture.task_snapshot().await;
+    assert_eq!(task.status, AgentTaskStatus::Completed);
+
+    // The re-dispatched send: same request, a fresh operation id — exactly
+    // what an aged-out journal window leaves the entity to answer from its
+    // materialized provenance.
+    let record = executor
+        .seen
+        .lock()
+        .expect("the record log should not be poisoned")
+        .first()
+        .cloned()
+        .expect("the executor saw the record");
+    let operation_id = AgentOperationId::new(
+        AgentOperationKind::Handoff,
+        [
+            record.source_run.tenant().as_str(),
+            record.task.as_str(),
+            "past-window-redispatch",
+        ],
+    )
+    .expect("the operation id derives");
+    let mut store = AgentTaskEntityStore::new(
+        AgentTaskScope::new(record.source_run.tenant().clone(), record.task.clone())
+            .expect("the task scope is valid"),
+        fixture.tasks.clone(),
+        fixture.agents.clone(),
+        fixture.history.clone(),
+    )
+    .with_wake_timers(fixture.rewake_parker.clone());
+    store
+        .recover(fixture.now())
+        .await
+        .expect("the task recovers");
+    let reply = store
+        .apply(
+            AgentTaskEntityCommand::RecordHandoff {
+                operation_id,
+                request: Box::new(ApplyingHandoffExecutor::request_for(&record)),
+            },
+            &fixture.router,
+            fixture.now(),
+        )
+        .await
+        .expect("the echo accepts instead of refusing task-terminal");
+    assert!(
+        matches!(reply, AgentTaskEntityReply::Applied { .. }),
+        "the recorded transfer echoes, got {reply:?}"
+    );
+    let task = fixture.task_snapshot().await;
+    assert_eq!(task.handoffs, 1, "one transfer, however late the replay");
+    assert_eq!(task.status, AgentTaskStatus::Completed);
+}
+
 /// A target that cannot accept restores the source: the handoff offer gets
 /// exactly one generation attempt, its refusal reverts the assignment to the
 /// stashed source, and the source resumes with the failed tool result — the

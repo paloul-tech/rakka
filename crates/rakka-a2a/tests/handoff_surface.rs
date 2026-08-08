@@ -23,7 +23,10 @@ use rakka_a2a::agents::{
     RakkaAgentA2AService, AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION,
     META_AGENT_ID, META_COLLABORATION, META_TASK_DEFINITION,
 };
-use rakka_a2a::auth::AllowAllAuthorizer;
+use rakka_a2a::auth::{
+    A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, A2AOperation,
+    AllowAllAuthorizer,
+};
 use rakka_a2a::mapping::{A2AHeaderTenantResolver, META_DEDUPLICATION_KEY};
 use rakka_a2a::projection::InMemoryA2ATaskProjectionStore;
 use rakka_agent::testkit::{
@@ -148,6 +151,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(adapter: DeterministicModelAdapter) -> Self {
+        Self::with_authorizer(adapter, Arc::new(AllowAllAuthorizer))
+    }
+
+    fn with_authorizer(
+        adapter: DeterministicModelAdapter,
+        authorizer: Arc<dyn A2AAuthorizer>,
+    ) -> Self {
         let tasks = TaskStore::new();
         let agents = AgentStore::new();
         let runs = RunStore::new();
@@ -187,7 +197,7 @@ impl Fixture {
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),
                 Arc::new(A2AHeaderTenantResolver),
-                Arc::new(AllowAllAuthorizer),
+                authorizer,
             )
             .with_clock(Arc::new(TestClock(clock.clone())))
             .with_default_tenant(TENANT),
@@ -469,6 +479,17 @@ async fn a_handoff_transfers_the_same_task_across_the_a2a_surface() {
     fixture.instantiate(&target()).await;
     fixture.create_task().await;
 
+    // Bootstrap the public projection before the transfer — the shape of
+    // every A2A-created task, whose projection exists from creation. The
+    // executor's post-send identity check must find the fresh handoff echo
+    // on this *existing* projection: only the metadata half of the
+    // projection sync keeps it truthful after bootstrap.
+    fixture
+        .service
+        .get_task(&params(), Some(TENANT), TASK, None)
+        .await
+        .expect("the projection bootstraps");
+
     // The source's world: the model turn commits the transfer, the executor
     // carries it through the service, and the courier resolves the source.
     fixture.pump(&source(), 1).await;
@@ -591,6 +612,74 @@ async fn wire_level_handoff_sends_converge_and_fail_closed() {
         "a forged source fails closed, got {forged:?}"
     );
 
+    // A cluster that does not deduplicate under its own handoff id is
+    // refused before anything durable: the id doubles verbatim as the
+    // deduplication key, and any other binding could alias one transfer
+    // onto another's recorded operation.
+    let mut mismatched = handoff_message(&handoff, 1);
+    if let Some(metadata) = mismatched.metadata.as_mut() {
+        metadata.insert(
+            META_DEDUPLICATION_KEY.to_string(),
+            Value::String("other-key".to_string()),
+        );
+    }
+    let refused = fixture
+        .service
+        .send_message(&params(), &send_request(mismatched))
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(RakkaAgentA2AError::Refused { code, .. }) if code == "handoff-identity-mismatch"
+        ),
+        "a foreign deduplication key fails closed, got {refused:?}"
+    );
+
+    // A cluster naming a target this surface does not serve is refused by
+    // the same catalog gate the creation path passes — before the
+    // state-mutating command could spend one of the task's bounded handoffs.
+    let mut foreign = handoff_message("handoff-foreign", 1);
+    if let Some(metadata) = foreign.metadata.as_mut() {
+        if let Some(Value::Object(cluster)) = metadata.get_mut(META_COLLABORATION) {
+            cluster.insert(
+                "target-agent".to_string(),
+                Value::String("internal-ops".to_string()),
+            );
+        }
+    }
+    let refused = fixture
+        .service
+        .send_message(&params(), &send_request(foreign))
+        .await;
+    assert!(
+        matches!(&refused, Err(RakkaAgentA2AError::UnknownAgent { .. })),
+        "an unserved target fails closed, got {refused:?}"
+    );
+
+    // A cluster whose context projection exceeds the sender-side structural
+    // bounds is re-validated at the transition and refused: the wire's claim
+    // never bloats the task's bounded materialized state.
+    let mut oversized = handoff_message("handoff-oversized", 1);
+    if let Some(metadata) = oversized.metadata.as_mut() {
+        if let Some(Value::Object(cluster)) = metadata.get_mut(META_COLLABORATION) {
+            cluster.insert(
+                "context".to_string(),
+                json!((0..100).map(|i| format!("ref-{i}")).collect::<Vec<_>>()),
+            );
+        }
+    }
+    let refused = fixture
+        .service
+        .send_message(&params(), &send_request(oversized))
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(RakkaAgentA2AError::Task(error)) if error.code() == "handoff-context-invalid"
+        ),
+        "an oversized context projection fails closed, got {refused:?}"
+    );
+
     // The genuine transfer records once; a replay converges on it.
     let first = fixture
         .service
@@ -653,4 +742,82 @@ async fn wire_level_handoff_sends_converge_and_fail_closed() {
         matches!(&refused, Err(RakkaAgentA2AError::Unsupported { .. })),
         "a task-less handoff fails closed, got {refused:?}"
     );
+}
+
+/// The transfer is its own operation class at the authorization boundary: a
+/// deployment authorizer that permits ordinary sends can still deny
+/// `RecordHandoff`, and the check carries the cluster's claimed source and
+/// target so the authorizer can bind the caller to the source run it claims
+/// to speak for.
+#[tokio::test]
+async fn a_handoff_authorizes_as_its_own_operation_class() {
+    struct DenyTransfers;
+
+    #[async_trait::async_trait]
+    impl A2AAuthorizer for DenyTransfers {
+        async fn authorize(
+            &self,
+            request: &A2AAuthorizationRequest<'_>,
+        ) -> A2AAuthorizationDecision {
+            match request.operation {
+                A2AOperation::RecordHandoff => {
+                    let claim = request.handoff.expect("the transfer claim rides the check");
+                    assert_eq!(claim.source_agent, SOURCE);
+                    assert_eq!(claim.target_agent, TARGET);
+                    assert_eq!(claim.source_generation, 1);
+                    A2AAuthorizationDecision::Deny
+                }
+                _ => A2AAuthorizationDecision::Allow,
+            }
+        }
+    }
+
+    let fixture =
+        Fixture::with_authorizer(DeterministicModelAdapter::new(), Arc::new(DenyTransfers));
+    fixture.instantiate(&source()).await;
+    fixture.instantiate(&target()).await;
+    fixture.create_task().await;
+    for _ in 0..4 {
+        let now = fixture.now();
+        let mut task = AgentTaskEntityStore::new(
+            fixture.task_scope(),
+            fixture.tasks.clone(),
+            fixture.agents.clone(),
+            fixture.history.clone(),
+        );
+        task.recover(now).await.expect("the task recovers");
+        let _ = task
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await;
+    }
+
+    let handoff = handoff_id_for(&fixture.run_scope(&source(), 1), 7, 0)
+        .expect("the handoff id derives")
+        .into_string();
+    let denied = fixture
+        .service
+        .send_message(&params(), &send_request(handoff_message(&handoff, 1)))
+        .await;
+    assert!(
+        matches!(&denied, Err(RakkaAgentA2AError::Unauthorized)),
+        "a denied transfer fails closed, got {denied:?}"
+    );
+
+    // Nothing durable happened: the task still carries no transfer and its
+    // handoff budget is unspent.
+    let mut task = AgentTaskEntityStore::new(
+        fixture.task_scope(),
+        fixture.tasks.clone(),
+        fixture.agents.clone(),
+        fixture.history.clone(),
+    );
+    task.recover(fixture.now())
+        .await
+        .expect("the task recovers");
+    let snapshot = task
+        .snapshot()
+        .expect("the snapshot reads")
+        .expect("the task exists");
+    assert!(snapshot.handoff.is_none());
+    assert_eq!(snapshot.handoffs, 0);
 }

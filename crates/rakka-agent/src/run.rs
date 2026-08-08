@@ -3076,6 +3076,22 @@ fn evaluate_model_output(
                 .as_ref()
                 .is_some_and(|tool| call.tool == *tool)
             {
+                if !config
+                    .coordination
+                    .contains(&crate::definition::AgentCoordinationCapabilityKind::Delegation)
+                {
+                    // The config is wirable for handoff alone; its delegation
+                    // vocabulary — the fan-in close included — stays inert
+                    // without the capability that authorizes it.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-capability-missing".to_string(),
+                        message: "the definition does not declare the delegation coordination \
+                                  capability"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 match crate::fan_in::AgentFanInToolCall::parse(&call.arguments) {
                     Ok(parsed) => {
                         // The deadline is the one model-supplied value that
@@ -3114,6 +3130,22 @@ fn evaluate_model_output(
                 continue;
             }
             if call.tool == config.tool {
+                if !config
+                    .coordination
+                    .contains(&crate::definition::AgentCoordinationCapabilityKind::Delegation)
+                {
+                    // Same inert-door refusal as the fan-in arm: a
+                    // handoff-only configuration names a delegation tool it
+                    // may never serve.
+                    planned.push(PlannedCall::Refused {
+                        call_id: call.call_id,
+                        code: "delegation-capability-missing".to_string(),
+                        message: "the definition does not declare the delegation coordination \
+                                  capability"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 if await_planned {
                     // The await planned earlier in this turn closes the run's
                     // one fan-out group, and the commit loop applies calls in
@@ -4627,7 +4659,12 @@ fn apply_indeterminate_resolution(
                 // reconciled delegation send settles its cell in the same
                 // compare-and-set — proven never executed means the child was
                 // never created, and recovery after the wind-down uses a new
-                // delegation, never this one.
+                // delegation, never this one. A reconciled handoff or
+                // workflow start settles its cell the same way — the
+                // transfer was never recorded, the child run never reached —
+                // because a cell left `Pending` here has no exchange left
+                // that could ever settle it, and `awaits_children` would
+                // hold the wind-down open forever.
                 effect.status = AgentRunEffectStatus::Cancelled;
                 let cancelled_kind = effect.kind();
                 if cancelled_kind == AgentRunEffectKind::A2aSendCall {
@@ -4637,6 +4674,30 @@ fn apply_indeterminate_resolution(
                     });
                     if let Some(delegation_id) = held {
                         if let Some(cell) = run.loop_state.delegation_mut(&delegation_id) {
+                            cell.settle_failed("run-winding-down", now);
+                        }
+                    }
+                    let handoff_held = run
+                        .loop_state
+                        .handoff()
+                        .is_some_and(|cell| cell.record.effect == *effect_id);
+                    if handoff_held {
+                        if let Some(cell) = run.loop_state.handoff_mut() {
+                            cell.settle_failed("run-winding-down", now);
+                        }
+                    }
+                }
+                if cancelled_kind == AgentRunEffectKind::WorkflowStartCall {
+                    let run = state.run_mut()?;
+                    let held =
+                        run.loop_state
+                            .workflow_invocations()
+                            .iter()
+                            .find_map(|(id, cell)| {
+                                (cell.record.effect == *effect_id).then(|| id.clone())
+                            });
+                    if let Some(invocation_id) = held {
+                        if let Some(cell) = run.loop_state.workflow_invocation_mut(&invocation_id) {
                             cell.settle_failed("run-winding-down", now);
                         }
                     }

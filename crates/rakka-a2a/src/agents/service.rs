@@ -22,7 +22,8 @@ use rakka_agent::{
     load_agent_run_state, AgentEntityCommand, AgentEntityReply, AgentEntityState, AgentEntityStore,
     AgentId, AgentOperationId, AgentOperationKind, AgentRunScope, AgentRunState, AgentRunStatus,
     AgentSchemaPolicy, AgentScope, AgentTaskEntityCommand, AgentTaskEntityReply,
-    AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskScope, AgentTaskSnapshot, AgentTaskState,
+    AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskId, AgentTaskScope, AgentTaskSnapshot,
+    AgentTaskState, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_persistence::DurableStateStore;
@@ -39,7 +40,7 @@ use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
     agent_task_cancel_command, agent_task_create_command, agent_task_handoff_command,
     agent_task_input, normalize_agent_cancel, normalize_agent_send, resolve_agent_target,
-    NormalizedAgentCommand,
+    resolve_handoff_target, NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -214,6 +215,7 @@ where
             tenant: Some(tenant.as_str()),
             task_id: None,
             principal: principal.as_ref(),
+            handoff: None,
         };
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
@@ -371,8 +373,6 @@ where
             &request.message,
             &metadata,
         )?;
-        self.authorize(A2AOperation::SendMessage, &normalized)
-            .await?;
         if matches!(
             normalized.intent,
             crate::mapping::A2ATaskIntent::ContinueTask
@@ -383,10 +383,32 @@ where
             // the target its generation in the same compare-and-set. Plain
             // input delivery stays parked for its own slice, cleanly
             // distinguished by the collaboration metadata.
-            if matches!(
-                normalized.collaboration.as_ref(),
-                Some(super::collaboration::AgentCollaborationEnvelope::Handoff(_))
-            ) {
+            if let Some(super::collaboration::AgentCollaborationEnvelope::Handoff(cluster)) =
+                normalized.collaboration.as_ref()
+            {
+                // The transfer is its own operation class at the
+                // authorization boundary: the deployment authorizer sees
+                // `RecordHandoff` with the cluster's claimed source and
+                // target bound into the request — never an undifferentiated
+                // send — so it can bind the authenticated caller to the
+                // source run the cluster claims to speak for.
+                self.authorize_claimed(
+                    A2AOperation::RecordHandoff,
+                    &normalized,
+                    Some(crate::auth::A2AHandoffClaim {
+                        handoff: &cluster.handoff,
+                        source_agent: &cluster.source_agent,
+                        source_run: &cluster.source_run,
+                        source_generation: cluster.source_generation,
+                        target_agent: &cluster.target_agent,
+                    }),
+                )
+                .await?;
+                // The same catalog gate the creation path passes: the wire's
+                // target must be an agent this surface serves, checked before
+                // the state-mutating command can commit — or spend one of the
+                // task's bounded handoffs on an unserved target.
+                resolve_handoff_target(self.catalog.as_ref(), cluster)?;
                 let command = agent_task_handoff_command(&normalized)?;
                 let snapshot = self.apply_task_command(&normalized, command, now).await?;
                 let run = self.current_run_status(&normalized, &snapshot).await?;
@@ -402,11 +424,15 @@ where
                 .await?;
                 return self.public_task(&normalized, None).await;
             }
+            self.authorize(A2AOperation::SendMessage, &normalized)
+                .await?;
             return Err(RakkaAgentA2AError::Unsupported {
                 operation: "send-message",
                 reason: "input delivery to an existing agent task is not served yet",
             });
         }
+        self.authorize(A2AOperation::SendMessage, &normalized)
+            .await?;
         let input = agent_task_input(&request.message)?;
         let target = resolve_agent_target(self.catalog.as_ref(), &normalized)?;
         let command = agent_task_create_command(&normalized, &target, input)?;
@@ -581,6 +607,48 @@ where
             })
     }
 
+    /// The authoritative durable view the in-process handoff executor probes
+    /// after an ambiguous send: the task snapshot plus the current run's
+    /// status, read from durable state — never the public projection, which
+    /// is an observability read model that may lag the very commit the probe
+    /// must find.
+    ///
+    /// In-process wiring only: the executor holding this service *is* the
+    /// deployment, and its send already passed the deployment authorizer.
+    /// External callers read through `tasks/get` and its authorization.
+    pub(crate) async fn authoritative_task_view(
+        &self,
+        tenant: &str,
+        task_id: &str,
+    ) -> RakkaAgentA2AResult<Option<(AgentTaskSnapshot, Option<AgentRunStatus>)>> {
+        let now = self.clock.now();
+        let tenant = TenantId::new(tenant);
+        let task = AgentTaskId::new(task_id)?;
+        let scope = AgentTaskScope::new(tenant.clone(), task)?;
+        let mut store = AgentTaskEntityStore::new(
+            scope,
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        );
+        store.recover(now).await?;
+        let Some(snapshot) = store.snapshot()? else {
+            return Ok(None);
+        };
+        let run = match snapshot.assignment.as_ref() {
+            None => None,
+            Some(assignment) => {
+                let scope =
+                    AgentRunScope::new(tenant, assignment.agent.clone(), assignment.run.clone())?;
+                load_agent_run_state(&self.runs, &scope, &AgentSchemaPolicy::default())
+                    .await?
+                    .as_ref()
+                    .and_then(rakka_agent::AgentRunState::status)
+            }
+        };
+        Ok(Some((snapshot, run)))
+    }
+
     /// Reads the authoritative task snapshot without mutating anything.
     async fn task_snapshot(
         &self,
@@ -638,11 +706,23 @@ where
         operation: A2AOperation,
         normalized: &NormalizedAgentCommand,
     ) -> RakkaAgentA2AResult<()> {
+        self.authorize_claimed(operation, normalized, None).await
+    }
+
+    /// Runs the deployment authorizer for one operation, binding the claimed
+    /// transfer into the request on a record-handoff check.
+    async fn authorize_claimed(
+        &self,
+        operation: A2AOperation,
+        normalized: &NormalizedAgentCommand,
+        handoff: Option<crate::auth::A2AHandoffClaim<'_>>,
+    ) -> RakkaAgentA2AResult<()> {
         let request = A2AAuthorizationRequest {
             operation,
             tenant: Some(normalized.tenant.as_str()),
             task_id: Some(normalized.task.as_str()),
             principal: normalized.principal.as_ref(),
+            handoff,
         };
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),

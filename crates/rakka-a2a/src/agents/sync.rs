@@ -31,16 +31,14 @@ pub const AGENT_STATUS_SOURCE: &str = "rakka-agent-task";
 /// Metadata key carrying the typed task-definition id on agent projections.
 pub const META_AGENT_TASK_DEFINITION_ID: &str = "io.rakka.agent.task-definition";
 
-/// Assembles the public projection record for one authoritative snapshot.
+/// Assembles the bounded public metadata for one authoritative snapshot —
+/// the map every projection assembled from that snapshot carries.
 #[must_use]
-pub(crate) fn agent_projection_from_snapshot(
+fn agent_metadata_from_snapshot(
     snapshot: &AgentTaskSnapshot,
     run: Option<AgentRunStatus>,
-    tenant: &str,
-    context_id: &str,
-    history: Vec<Message>,
     projection_revision: u64,
-) -> A2ATaskProjection {
+) -> HashMap<String, Value> {
     let condition = AgentTaskCondition {
         task: snapshot.status,
         run,
@@ -85,6 +83,23 @@ pub(crate) fn agent_projection_from_snapshot(
         META_STATUS_SOURCE.to_string(),
         Value::String(AGENT_STATUS_SOURCE.to_string()),
     );
+    metadata
+}
+
+/// Assembles the public projection record for one authoritative snapshot.
+#[must_use]
+pub(crate) fn agent_projection_from_snapshot(
+    snapshot: &AgentTaskSnapshot,
+    run: Option<AgentRunStatus>,
+    tenant: &str,
+    context_id: &str,
+    history: Vec<Message>,
+    projection_revision: u64,
+) -> A2ATaskProjection {
+    let condition = AgentTaskCondition {
+        task: snapshot.status,
+        run,
+    };
     A2ATaskProjection {
         task_id: snapshot.scope.task().as_str().to_string(),
         context_id: context_id.to_string(),
@@ -94,7 +109,7 @@ pub(crate) fn agent_projection_from_snapshot(
         status_timestamp: snapshot.updated_at,
         history,
         artifacts: Vec::new(),
-        metadata,
+        metadata: agent_metadata_from_snapshot(snapshot, run, projection_revision),
         projection_revision,
     }
 }
@@ -119,39 +134,44 @@ pub(crate) async fn project_agent_send(
     let task_id = snapshot.scope.task().as_str();
     let mut events = Vec::new();
     match store.projection(Some(tenant), task_id).await {
-        Ok(projection) => {
+        Ok(mut projection) => {
             let already_projected = projection
                 .history
                 .iter()
                 .any(|recorded| recorded.message_id == message.message_id);
+            let mut current = true;
             if !already_projected {
-                events.push(
-                    store
-                        .append_event_payload(
-                            tenant,
-                            task_id,
-                            context_id,
-                            now,
-                            A2ATaskEventPayload::MessageUpdate {
-                                message: message.clone(),
-                            },
-                        )
-                        .await?,
-                );
-            }
-            if let Some(event) = sync_agent_status(
-                store,
-                snapshot,
-                run,
-                tenant,
-                context_id,
-                now,
-                Some(projection.status),
-            )
-            .await?
-            {
+                let event = store
+                    .append_event_payload(
+                        tenant,
+                        task_id,
+                        context_id,
+                        now,
+                        A2ATaskEventPayload::MessageUpdate {
+                            message: message.clone(),
+                        },
+                    )
+                    .await?;
+                // Keep the local copy in step with what the store now holds,
+                // so the status/metadata sync below compares — and, on a
+                // refresh, re-snapshots — the history including this message.
+                // A concurrent writer can outrun the copy; the sync then
+                // reloads instead of trusting it.
+                current = projection.apply_event(&event).is_ok();
                 events.push(event);
             }
+            events.extend(
+                sync_agent_status(
+                    store,
+                    snapshot,
+                    run,
+                    tenant,
+                    context_id,
+                    now,
+                    current.then_some(&projection),
+                )
+                .await?,
+            );
         }
         Err(TaskProjectionError::TaskNotFound { .. }) => {
             let projection = agent_projection_from_snapshot(
@@ -179,9 +199,15 @@ pub(crate) async fn project_agent_send(
     Ok(events)
 }
 
-/// Brings the projection in line with the authoritative snapshot, creating
-/// it when missing and appending a status event only on a real, allowed
-/// public transition.
+/// Brings the projection in line with the authoritative snapshot: creates it
+/// when missing, appends a status event on a real, allowed public
+/// transition, and re-snapshots the projection when its bounded metadata —
+/// assignment agent, condition labels, the collaboration echo — no longer
+/// matches what the snapshot assembles. The metadata half is what keeps a
+/// pre-existing projection's handoff echo truthful: without it the echo is
+/// written once at bootstrap and a later transfer never surfaces, which the
+/// sending executor's identity check would misread as an unrecorded
+/// transfer.
 pub(crate) async fn sync_agent_status(
     store: &dyn A2ATaskProjectionStore,
     snapshot: &AgentTaskSnapshot,
@@ -189,17 +215,21 @@ pub(crate) async fn sync_agent_status(
     tenant: &str,
     context_id: &str,
     now: AgentTimestampMillis,
-    current_status: Option<a2a::TaskState>,
-) -> RakkaAgentA2AResult<Option<A2ATaskEvent>> {
+    current: Option<&A2ATaskProjection>,
+) -> RakkaAgentA2AResult<Vec<A2ATaskEvent>> {
     let task_id = snapshot.scope.task().as_str();
     let state = agent_task_state(AgentTaskCondition {
         task: snapshot.status,
         run,
     });
-    let current = match current_status {
-        Some(status) => status,
+    let loaded;
+    let current = match current {
+        Some(projection) => projection,
         None => match store.projection(Some(tenant), task_id).await {
-            Ok(projection) => projection.status,
+            Ok(projection) => {
+                loaded = projection;
+                &loaded
+            }
             Err(TaskProjectionError::TaskNotFound { .. }) => {
                 let projection = agent_projection_from_snapshot(
                     snapshot,
@@ -218,23 +248,57 @@ pub(crate) async fn sync_agent_status(
                         A2ATaskEventPayload::Snapshot(projection),
                     )
                     .await
-                    .map(Some)
+                    .map(|event| vec![event])
                     .map_err(Into::into);
             }
             Err(error) => return Err(error.into()),
         },
     };
-    if current == state || !status_transition_allowed(&current, &state) {
-        return Ok(None);
-    }
-    let payload = if state.is_terminal() {
-        A2ATaskEventPayload::Terminal { state }
+    let mut events = Vec::new();
+    let status = if current.status != state && status_transition_allowed(&current.status, &state) {
+        let payload = if state.is_terminal() {
+            A2ATaskEventPayload::Terminal {
+                state: state.clone(),
+            }
+        } else {
+            A2ATaskEventPayload::StatusUpdate {
+                state: state.clone(),
+            }
+        };
+        events.push(
+            store
+                .append_event_payload(tenant, task_id, context_id, now, payload)
+                .await?,
+        );
+        state
     } else {
-        A2ATaskEventPayload::StatusUpdate { state }
+        // Either nothing moved or the transition is disallowed; the
+        // projection's public status stands, and a metadata refresh below
+        // must not regress it through snapshot adoption.
+        current.status.clone()
     };
-    store
-        .append_event_payload(tenant, task_id, context_id, now, payload)
-        .await
-        .map(Some)
-        .map_err(Into::into)
+    if agent_metadata_from_snapshot(snapshot, run, current.projection_revision) != current.metadata
+    {
+        let mut refreshed = agent_projection_from_snapshot(
+            snapshot,
+            run,
+            tenant,
+            context_id,
+            current.history.clone(),
+            current.projection_revision,
+        );
+        refreshed.status = status;
+        events.push(
+            store
+                .append_event_payload(
+                    tenant,
+                    task_id,
+                    context_id,
+                    now,
+                    A2ATaskEventPayload::Snapshot(refreshed),
+                )
+                .await?,
+        );
+    }
+    Ok(events)
 }

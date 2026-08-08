@@ -320,7 +320,11 @@ impl AgentHandoffToolCall {
 }
 
 /// Rejects a context projection that exceeds its structural bounds.
-fn check_context_refs(context: &[String]) -> AgentCoordinationResult<()> {
+///
+/// Crate-visible because the bound is enforced twice: by the sender's record
+/// validation, and by the receiving task transition re-validating the wire's
+/// claim.
+pub(crate) fn check_context_refs(context: &[String]) -> AgentCoordinationResult<()> {
     if context.len() > AGENT_HANDOFF_MAX_CONTEXT_REFS {
         return Err(AgentCoordinationError::ContextRefsTooMany {
             count: context.len(),

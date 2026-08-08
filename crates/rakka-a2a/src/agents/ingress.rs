@@ -148,11 +148,27 @@ pub fn normalize_agent_send(
     // under its own reserved kind.
     let collaboration = super::collaboration::parse_collaboration_envelope(message, metadata)?;
     let operation_kind = match collaboration.as_ref() {
-        Some(super::collaboration::AgentCollaborationEnvelope::Handoff(_)) => {
+        Some(super::collaboration::AgentCollaborationEnvelope::Handoff(cluster)) => {
             if !matches!(intent, A2ATaskIntent::ContinueTask) {
                 return Err(RakkaAgentA2AError::Unsupported {
                     operation: "agent-collaboration",
                     reason: "a handoff send must name the task it transfers via message.task_id",
+                });
+            }
+            // The cluster's handoff id doubles verbatim as the send's
+            // deduplication identity — that binding is what makes one
+            // transfer one durable operation. A send that deduplicates under
+            // any other key could alias a different transfer onto a recorded
+            // one (answering success for a transfer never recorded) or split
+            // one transfer across operation ids, so the mismatch fails
+            // closed before anything durable happens.
+            if discriminator != cluster.handoff {
+                return Err(RakkaAgentA2AError::Refused {
+                    code: "handoff-identity-mismatch".to_string(),
+                    message: format!(
+                        "a handoff send must deduplicate under its handoff id {}, not {}",
+                        cluster.handoff, discriminator
+                    ),
                 });
             }
             AgentOperationKind::Handoff
@@ -415,6 +431,30 @@ pub fn resolve_agent_target(
         .ok_or_else(|| RakkaAgentA2AError::UnknownAgent {
             agent: normalized.agent.clone(),
             task_definition: normalized.task_definition.clone(),
+        })
+}
+
+/// Resolves the catalog target a handoff cluster names, failing closed when
+/// this surface does not serve it — the same gate
+/// [`resolve_agent_target`] places on a creation send, keyed off the
+/// cluster's own target claim rather than the request's selection metadata.
+///
+/// # Errors
+///
+/// Returns [`RakkaAgentA2AError::UnknownAgent`] when the named target is not
+/// a hosted agent of this surface.
+pub fn resolve_handoff_target(
+    catalog: &dyn A2AAgentCatalog,
+    cluster: &super::collaboration::AgentHandoffCollaborationMetadata,
+) -> RakkaAgentA2AResult<A2AAgentTarget> {
+    catalog
+        .resolve(&A2AAgentSelector {
+            agent: Some(&cluster.target_agent),
+            task_definition: Some(&cluster.target_task_definition),
+        })
+        .ok_or_else(|| RakkaAgentA2AError::UnknownAgent {
+            agent: Some(cluster.target_agent.clone()),
+            task_definition: Some(cluster.target_task_definition.clone()),
         })
 }
 

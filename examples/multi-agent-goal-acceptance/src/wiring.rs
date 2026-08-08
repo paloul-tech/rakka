@@ -170,6 +170,7 @@ pub fn delegation_config() -> AgentRunDelegationConfig {
     )
     .expect("the delegation configuration declares the capability")
     .with_fan_in_tool(AgentToolId::new(AWAIT_TOOL).expect("the tool id is valid"))
+    .expect("the fan-in tool id does not collide")
 }
 
 /// The versioned descriptor under which the compiled refund workflow appears

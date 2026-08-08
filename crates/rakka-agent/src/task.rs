@@ -5008,18 +5008,24 @@ fn record_handoff(
     now: AgentTimestampMillis,
 ) -> AgentTaskResult<()> {
     let task = state.task_mut()?;
+    if let Some(existing) = task.handoff.as_deref() {
+        if existing.handoff == request.handoff {
+            // First-writer-wins echo: the transfer is already recorded, and
+            // the reply carries the recorded outcome rather than minting a
+            // second one. Checked before every guard — including the
+            // terminal one — because this is the deduplication echo past the
+            // journal's bounded window: a re-dispatched send replaying after
+            // the target completed the task must converge on the recorded
+            // transfer, not be refused as if none was recorded.
+            return Ok(());
+        }
+    }
     if task.status.is_terminal() {
         return Err(AgentTaskError::Terminal {
             status: task.status,
         });
     }
     if let Some(existing) = task.handoff.as_deref() {
-        if existing.handoff == request.handoff {
-            // First-writer-wins echo: the transfer is already recorded, and
-            // the reply carries the recorded outcome rather than minting a
-            // second one.
-            return Ok(());
-        }
         if !existing.is_settled() {
             return Err(AgentTaskError::HandoffRefused {
                 code: "handoff-conflict",
@@ -5029,6 +5035,30 @@ fn record_handoff(
                 ),
             });
         }
+    }
+    // The structural re-validation the request's contract promises ("every
+    // field is a claim the transition re-validates"): the wire's context
+    // projection re-passes the sender-side reference bounds, and the whole
+    // claim re-passes the record's serialized ceiling, so an oversized
+    // cluster can never consume the task's bounded materialized headroom and
+    // wedge later transitions that need it.
+    if let Err(error) = crate::coordination::check_context_refs(&request.context) {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-context-invalid",
+            message: error.to_string(),
+        });
+    }
+    let request_bytes = serde_json::to_vec(request)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if request_bytes > crate::coordination::AGENT_HANDOFF_RECORD_MAX_BYTES {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-request-too-large",
+            message: format!(
+                "the handoff cluster serializes to {request_bytes} bytes; at most {} are accepted",
+                crate::coordination::AGENT_HANDOFF_RECORD_MAX_BYTES
+            ),
+        });
     }
     if task.cancellation.is_some() {
         return Err(AgentTaskError::HandoffRefused {
@@ -5271,7 +5301,27 @@ fn owed_handoff_result(
 
 /// Marks the handoff-result exchange settled on the provenance: the durable
 /// once-guard past the journal's bounded deduplication window.
-fn settle_handoff_result_exchange(state: &mut AgentTaskState, now: AgentTimestampMillis) {
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the *currently materialized* handoff derives: a settled provenance
+/// can be replaced by a successor hop, and a late settlement of the previous
+/// hop's exchange must not quiesce the successor's owed result — that would
+/// strand its fenced source run forever.
+fn settle_handoff_result_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state
+        .task()
+        .and_then(|task| task.handoff.as_deref())
+        .and_then(|handoff| {
+            crate::coordination::handoff_result_operation_id(state.scope.tenant(), &handoff.handoff)
+                .ok()
+        });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
     let mut settled = false;
     if let Ok(task) = state.task_mut() {
         if let Some(handoff) = task.handoff.as_deref_mut() {
@@ -8151,7 +8201,7 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             // `check_settle` classified definitive. Either way the marker
             // settles on the provenance: the durable once-guard that
             // quiesces the owed derivation past the journal's bounded window.
-            settle_handoff_result_exchange(state, now);
+            settle_handoff_result_exchange(state, envelope, now);
         }
         if !matches!(
             envelope.kind(),

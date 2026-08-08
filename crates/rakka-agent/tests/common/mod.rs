@@ -424,6 +424,7 @@ pub fn delegation_config_with_fan_in() -> rakka_agent::AgentRunDelegationConfig 
     )
     .expect("the delegation configuration declares the capability")
     .with_fan_in_tool(fan_in_tool_id())
+    .expect("the fan-in tool id does not collide")
 }
 
 /// The fixture goal contract narrowed to delegating [`skill_id`] only.
