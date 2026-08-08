@@ -81,6 +81,7 @@ pub mod rig;
 pub mod run;
 pub mod schema;
 pub mod task;
+pub mod team;
 pub mod testkit;
 pub mod tools;
 pub mod wake;
@@ -225,8 +226,8 @@ pub use observability::{
     METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
     METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
     METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
-    METRIC_AGENT_WORKFLOW_RESULTS,
+    METRIC_AGENT_TEAM_OPERATIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_WAKE_DISPOSITIONS, METRIC_AGENT_WORKFLOW_RESULTS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
@@ -314,12 +315,17 @@ pub use wake_timers::{
 };
 
 pub use coordination::{
-    handoff_id_for, handoff_result_operation_id, AgentA2aHandoffReceipt,
+    handoff_id_for, handoff_result_operation_id, team_claim_id_for, team_claim_operation_id,
+    team_claim_release_operation_id, team_claim_result_operation_id, AgentA2aHandoffReceipt,
     AgentCoordinationCapability, AgentCoordinationError, AgentCoordinationResult,
     AgentDelegationPolicy, AgentHandoffCell, AgentHandoffPolicy, AgentHandoffRecord,
-    AgentHandoffStatus, AgentHandoffToolCall, AgentModerationPolicy, AgentTeamPolicy,
+    AgentHandoffStatus, AgentHandoffToolCall, AgentModerationPolicy, AgentTeamClaimAction,
+    AgentTeamClaimCommand, AgentTeamClaimOutcome, AgentTeamClaimResultNotice, AgentTeamPolicy,
     AGENT_HANDOFF_CONTEXT_REF_MAX_BYTES, AGENT_HANDOFF_ID_PREFIX, AGENT_HANDOFF_MAX_CONTEXT_REFS,
-    AGENT_HANDOFF_REASON_MAX_BYTES, AGENT_HANDOFF_RECORD_MAX_BYTES,
+    AGENT_HANDOFF_REASON_MAX_BYTES, AGENT_HANDOFF_RECORD_MAX_BYTES, AGENT_TEAM_CLAIM_ID_PREFIX,
+    AGENT_TEAM_CLAIM_PAYLOAD_TYPE, AGENT_TEAM_CLAIM_RESULT_PAYLOAD_TYPE,
+    AGENT_TEAM_MAX_BOARD_ENTRIES, AGENT_TEAM_MAX_MEMBERS, AGENT_TEAM_MAX_MESSAGES,
+    AGENT_TEAM_MESSAGE_MAX_BYTES,
 };
 pub use definition::{
     effective_settings_for_turn, AgentAuthorityEnvelope, AgentBudgetCeilings, AgentCapabilityId,
@@ -354,10 +360,11 @@ pub use identity::{
     AgentEnvironmentRef, AgentGoalId, AgentHandoffId, AgentId, AgentIdentityError,
     AgentIdentityResult, AgentMemoryNamespace, AgentOperationId, AgentOperationKind,
     AgentRunBinding, AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope,
-    AgentWakeId, AgentWorkflowInvocationId, KnowledgeSpaceId, TenantId,
-    AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_NAMESPACE_PREFIX,
-    AGENT_PERSISTENCE_SEPARATOR, AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
-    AGENT_TASK_ENTITY_PERSISTENCE_PREFIX,
+    AgentTeamClaimId, AgentTeamId, AgentTeamScope, AgentWakeId, AgentWorkflowInvocationId,
+    KnowledgeSpaceId, TenantId, AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH,
+    AGENT_MEMORY_NAMESPACE_PREFIX, AGENT_PERSISTENCE_SEPARATOR,
+    AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
+    AGENT_TASK_ENTITY_PERSISTENCE_PREFIX, AGENT_TEAM_ENTITY_PERSISTENCE_PREFIX,
 };
 pub use schema::{
     previous_schema_version, AgentRecordKind, AgentSchemaCompatibility, AgentSchemaError,
@@ -396,8 +403,9 @@ pub use task::{
     AgentTaskOutcome, AgentTaskOwnership, AgentTaskParticipant, AgentTaskProgress,
     AgentTaskRejection, AgentTaskRejectionCause, AgentTaskResult, AgentTaskResultCheck,
     AgentTaskResultProposal, AgentTaskResultRule, AgentTaskRuleId, AgentTaskSnapshot,
-    AgentTaskState, AgentTaskStatus, AgentTaskTerminalReason, InMemoryAgentTaskHistoryStore,
-    TypedTask, AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
+    AgentTaskState, AgentTaskStatus, AgentTaskTeamClaim, AgentTaskTeamClaimStatus,
+    AgentTaskTerminalReason, AgentTeamClaimApplyOutcome, InMemoryAgentTaskHistoryStore, TypedTask,
+    AGENT_BUDGET_LEDGER_OUTCOME_PAYLOAD_TYPE, AGENT_BUDGET_RETURN_PAYLOAD_TYPE,
     AGENT_BUDGET_SETTLEMENT_PAYLOAD_TYPE, AGENT_BUDGET_TOP_UP_PAYLOAD_TYPE,
     AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE, AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE,
     AGENT_DELEGATION_RESULT_OUTCOME_PAYLOAD_TYPE, AGENT_DELEGATION_RESULT_PAYLOAD_TYPE,
@@ -417,7 +425,26 @@ pub use task::{
     AGENT_TASK_PENDING_HISTORY_CAPACITY, AGENT_TASK_RESULT_PROPOSAL_PAYLOAD_TYPE,
     AGENT_TASK_RULE_ONE_OF_MAX_VALUES, AGENT_TASK_RULE_POINTER_MAX_LENGTH,
     AGENT_TASK_RULE_VALUE_MAX_LENGTH, AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
-    DEFAULT_AGENT_TASK_ENTITY_TYPE,
+    AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE, DEFAULT_AGENT_TASK_ENTITY_TYPE,
+};
+pub use team::{
+    agent_team_entity_id, agent_team_entity_persistence_id, agent_team_entity_ref,
+    agent_team_entity_type_key, init_agent_team_entity_remote_sharding,
+    init_agent_team_entity_sharding, passivate_agent_team_entity, registered_agent_team_entity_ref,
+    system_team_clock, AgentTeam, AgentTeamBoardClaim, AgentTeamBoardEntry,
+    AgentTeamBoardEntryStatus, AgentTeamClock, AgentTeamCreation, AgentTeamEntity,
+    AgentTeamEntityCommand, AgentTeamEntityMessage, AgentTeamEntityRef,
+    AgentTeamEntityRegistration, AgentTeamEntityReply, AgentTeamEntityShardingSettings,
+    AgentTeamEntityStore, AgentTeamEntityTypeKey, AgentTeamError, AgentTeamHistoryCursor,
+    AgentTeamHistoryEntry, AgentTeamHistoryFuture, AgentTeamHistoryKind, AgentTeamHistoryPage,
+    AgentTeamHistorySequence, AgentTeamHistoryStore, AgentTeamMember, AgentTeamMessage,
+    AgentTeamOperationLog, AgentTeamOutcome, AgentTeamParticipant, AgentTeamProgress,
+    AgentTeamResult, AgentTeamSnapshot, AgentTeamState, AgentTeamStatus,
+    InMemoryAgentTeamHistoryStore, AGENT_TEAM_DETAIL_MAX_LENGTH,
+    AGENT_TEAM_HISTORY_DEFAULT_PAGE_SIZE, AGENT_TEAM_HISTORY_MAX_PAGE_SIZE,
+    AGENT_TEAM_MATERIALIZED_MAX_BYTES, AGENT_TEAM_MAX_HISTORY_PER_TRANSITION,
+    AGENT_TEAM_OPERATION_LOG_CAPACITY, AGENT_TEAM_PENDING_HISTORY_CAPACITY,
+    AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES, DEFAULT_AGENT_TEAM_ENTITY_TYPE,
 };
 pub use tools::{
     AgentAuthorityContext, AgentAuthorityRefusal, AgentDispatchGrant,

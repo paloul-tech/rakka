@@ -273,6 +273,7 @@ async fn a_permanent_assignment_refusal_parks_a_continuous_goal_and_suspends_adm
             input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: Some(agent_id()),
+            team: None,
             goal: Some(goal_id()),
             goal_mode: continuous_goal_mode(wake_policy()),
             goal_spec: Some(Box::new(goal_spec_draft(spec, true))),

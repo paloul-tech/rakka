@@ -693,6 +693,7 @@ pub async fn run_acceptance() -> AcceptanceReport {
                         input: AgentTaskContent::inline(serde_json::json!({ "quarter": "Q3" }))
                             .expect("the input is inline-bounded"),
                         assignee: Some(auditor_id()),
+                        team: None,
                         goal: None,
                         goal_mode: Default::default(),
                         goal_spec: None,

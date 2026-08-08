@@ -3434,6 +3434,92 @@ Spec: [8.10](spec.md#810-team-coordination).
 Done when: scenario 42 passes (one normal claim owner; stale commands fail
 closed).
 
+**Amended as implemented (2026-08-08).** Landed as specified, with the
+in-slice decisions resolved as follows (scope decisions user-approved):
+
+- **Claim ingress is A2A/entity commands only** (user-approved): no
+  model-visible team tool this slice — no interception-door arm, no team
+  effect kind, no executor port. `AgentTeamPolicy` filled out with the
+  bounded ceilings, `claim_lease_ms`, `expires_after_ms`, and a
+  shaped-but-dormant `tool: Option<AgentToolId>` hook so the door lands
+  later without re-plumbing; every field serde-defaulted so the 5.1
+  revision-only shell still decodes. **Mediated peer messages are a
+  durable board ring** (user-approved): bounded, recipient-read through
+  the team query surface, drop-oldest with a durable `messages_dropped`
+  counter, no push delivery. **Membership is mutable** (user-approved):
+  join/leave fence on the lifecycle revision with provenance; the leader
+  is immovable, a member holding an unresolved claim cannot leave.
+- **The claim choreography is two new exchange kinds** (`ALL` is 14):
+  `TeamClaim` (team → task) owed in the same compare-and-set as the board
+  mutation, whose pure task-side arbitration records the bounded
+  `AgentTask::team_claim` provenance (echo-before-every-guard, the
+  `record_handoff` precedent) against a new durable claim-epoch fence
+  (`team_claim_fence`) that closes courier reordering — the reply means
+  "claim recorded", never "assignment made"; and `TeamClaimResult`
+  (task → team), the `HandoffResult` mirror (pure derivation, settle-pass
+  re-drive, `result_settled` once-guard) settling the board entry Active
+  with an observational generation/run echo or reopening it under the
+  refusal code. Board tasks are ordinary creations with the new
+  `AgentTaskCreation::team` provenance and a deferred assignee (the
+  `MissingAssignee` guard relaxes only under a team); the claim sets the
+  assignee and the existing `decide_assignment` mints the one generation —
+  the assignment fence stays the one-owner guarantee, proven by a direct
+  fence test (`team-claim-already-owned` over an accepted assignment).
+- **Single-attempt posture, the handoff precedent**: readiness refusal,
+  `team-claim-assignments-exhausted` (the claim resolves rather than the
+  task terminating — the board's members decide what an unassignable
+  entry means, bounded by the definition's new `max_team_claims`,
+  default 4), `team-claim-budget-unaffordable`, a run refusal, and a
+  pre-mint cancellation all resolve through one helper
+  (`resolve_team_claim_refusal`) that clears the assignee back to the
+  board-pending posture. A superseding claim (transfer, expired-lease
+  steal) refuses over an in-flight offer
+  (`team-claim-assignment-inflight`) so exactly one generation is ever in
+  flight; the lease bounds the claim-pending window only, and an
+  activated claim is never stealable. Release is holder-or-leader,
+  pre-acceptance only, epoch-qualified in its operation id so a retried
+  release is a new durable operation; post-acceptance transfer defers to
+  the handoff machinery. Terminal/foreign tasks close entries lazily
+  through claim refusals (`Done` + code) — the task→team terminal
+  notification exchange stays owed to 5.5.
+- **Wire**: the team cluster is the third shape under
+  `io.rakka.collaboration`, discriminated by its `team` field checked
+  before `handoff` (`deny_unknown_fields` fails a two-discriminator
+  payload whole); verbs are claim/release/transfer/post-task/message/
+  join/leave — create and disband are entity-command-only trusted
+  wiring. A team send must not name `message.task_id`
+  (`team-send-names-task`); ids derive under `TeamClaim` plus the new
+  `TeamMessage`/`TeamOperation` operation kinds; membership changes
+  require an authenticated principal. The command authorizes under its
+  own `A2AOperation::TeamCommand` with the typed `A2ATeamClaim` bound in,
+  answers with an immediate message (never a task), returns stale fences
+  as structured refusals, and the projection echoes the governing claim
+  beside the delegation/handoff echoes via the metadata-synced path. The
+  service gained team store generics; no persistence/postgres work
+  (stores are state-generic), though the `AgentTeamHistoryStore`
+  PostgreSQL backend is owed.
+- **Audit + metrics**: a parallel `AgentTeamHistoryStore` (idempotent
+  slot-keyed appends, identities and codes only), three new task-history
+  kinds (`team-claim-recorded/accepted/refused`), and
+  `rakka.agent.team.operations` {operation, outcome} counted once per
+  durable decision at the entity boundary ("operation" joined the closed
+  metric-key set) — asserted in tests, closing the unasserted-counter gap
+  5.1 left. Otel team span rows owed, the 5.1 precedent.
+- Proof roster: `tests/team_board.rs` (7), `tests/team_claim_assignment.rs`
+  (11, scenario 42's core incl. the two-shard stale-owner race and the
+  three-layer replay convergence), `tests/team_claim_recovery.rs` (3,
+  self-covering crash sweeps over every team- and task-store write of the
+  claim round trip), `tests/team_passivation.rs` (2, real sharded
+  entities: zero-resident board with the claim activating across
+  passivation), the team-operations metric assertion, and rakka-a2a's
+  `tests/team_surface.rs` (4, scenario 42's wire half + fail-closed
+  matrix + per-operation authorization). Owed onward: 5.5's replayable
+  team events, task→team terminal/handoff notifications, board rewake
+  parking, goal/collaboration-view team dimensions, the team otel rows,
+  the Postgres team-history backend, the model-visible team tool door
+  (+ its reserved `AgentDecisionKind` label), and A2A-carried
+  create/disband if ever needed.
+
 ### Slice 5.3 — Moderation
 
 Spec: [8.11](spec.md#811-moderation).

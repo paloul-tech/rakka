@@ -297,6 +297,7 @@ async fn create_child(
                     input: AgentTaskContent::inline(json!({ "text": "delegated" }))
                         .expect("the input is inline-bounded"),
                     assignee: None,
+                    team: None,
                     goal: bind_goal.then(goal),
                     goal_mode: Default::default(),
                     goal_spec: None,
@@ -994,6 +995,7 @@ async fn a_continuous_roots_epochs_join_the_view() {
                 input: AgentTaskContent::inline(json!({ "goal": 1 }))
                     .expect("the input is inline-bounded"),
                 assignee: None,
+                team: None,
                 goal: None,
                 goal_mode: common::continuous_goal_mode(wake_policy()),
                 goal_spec: Some(Box::new(goal_spec_draft(common::goal_spec(), true))),

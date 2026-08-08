@@ -375,15 +375,17 @@ impl AgentExchangeParticipant for ChoreographyProbe {
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
             // An epoch result, a goal evaluation, a delegation result, a
-            // cancellation request, or a handoff resolution is a durable
-            // transition but not a balance movement: the probe records the
-            // application without crediting.
+            // cancellation request, a handoff resolution, or a team-board
+            // exchange is a durable transition but not a balance movement:
+            // the probe records the application without crediting.
             AgentExchangeKind::EpochResult
             | AgentExchangeKind::GoalEvaluation
             | AgentExchangeKind::DelegationResult
             | AgentExchangeKind::RunCancel
             | AgentExchangeKind::DelegationCancel
-            | AgentExchangeKind::HandoffResult => apply_ledger(state, envelope, 0),
+            | AgentExchangeKind::HandoffResult
+            | AgentExchangeKind::TeamClaim
+            | AgentExchangeKind::TeamClaimResult => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -1019,6 +1021,156 @@ where
 }
 
 fn task_delivery_error(error: AgentTaskError) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
+/// Delivers exchanges to a real [`crate::team::AgentTeamEntityStore`] over a shared
+/// durable store, exactly as [`InProcessTaskEntityTransport`] does for
+/// tasks: every delivery re-materializes the entity from durable state
+/// alone, so it exercises the passivate-anytime contract, and the same
+/// [`ExchangeFault`] queue injects the failure windows.
+pub struct InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    store: Store,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, History> Clone for InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, History> InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    /// Creates a transport that delivers to team entities in one durable
+    /// store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a team entity's durable accept path,
+    /// including the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, History> AgentExchangeTransport for InProcessTeamEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::team::AgentTeamState>,
+    History: crate::team::AgentTeamHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the team entity",
+                ));
+            }
+
+            let AgentEntityAddress::Team(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves team entities only",
+                ));
+            };
+
+            let mut entity = crate::team::AgentTeamEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(team_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(team_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the team accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn team_delivery_error(error: crate::team::AgentTeamError) -> AgentExchangeDeliveryError {
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
 }
 
@@ -3393,7 +3545,8 @@ impl DeferredExchangeRouter {
         AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Agent, transport.clone())
             .with_route(AgentEntityClass::Task, transport.clone())
-            .with_route(AgentEntityClass::Run, transport)
+            .with_route(AgentEntityClass::Run, transport.clone())
+            .with_route(AgentEntityClass::Team, transport)
     }
 }
 

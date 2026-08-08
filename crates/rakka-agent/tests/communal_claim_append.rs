@@ -262,6 +262,7 @@ async fn a_delegated_specialist_appends_under_its_grant_with_its_delegation_stam
             input: AgentTaskContent::inline(json!({ "text": "hello" }))
                 .expect("the input is inline-bounded"),
             assignee: Some(common::agent_id()),
+            team: None,
             goal: None,
             goal_mode: Default::default(),
             goal_spec: None,

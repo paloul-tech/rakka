@@ -42,27 +42,34 @@ use super::ingress::{META_AGENT_ID, META_TASK_DEFINITION};
 use super::service::RakkaAgentA2AService;
 
 /// In-process [`AgentA2aSendExecutor`] over the agents-surface service core.
-pub struct A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs>
+pub struct A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
 {
-    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>,
+    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
     principal: Option<PrincipalRef>,
 }
 
-impl<Tasks, Agents, History, Runs> A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory>
+    A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
 {
     /// Wraps a service.
     #[must_use]
-    pub const fn new(service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>) -> Self {
+    pub const fn new(
+        service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
+    ) -> Self {
         Self {
             service,
             principal: None,
@@ -216,13 +223,15 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
     }
 }
 
-impl<Tasks, Agents, History, Runs> AgentA2aSendExecutor
-    for A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory> AgentA2aSendExecutor
+    for A2AAgentDelegationSendExecutor<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
 {
     fn execute<'a>(
         &'a self,

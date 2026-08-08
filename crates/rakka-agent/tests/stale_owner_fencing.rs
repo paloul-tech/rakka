@@ -182,6 +182,7 @@ async fn a_stale_task_owner_write_is_rejected_and_answered_from_the_authoritativ
             input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: Some(agent_id()),
+            team: None,
             goal: None,
             goal_mode: Default::default(),
             goal_spec: None,

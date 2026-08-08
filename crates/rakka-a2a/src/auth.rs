@@ -19,6 +19,16 @@ pub enum A2AOperation {
     /// authorizer bind the authenticated caller to the source run the
     /// cluster claims.
     RecordHandoff,
+    /// A `message:send` carrying the collaboration extension's team cluster:
+    /// a state-mutating board or membership command over a team entity
+    /// (claim, release, transfer, post-task, message, join, leave).
+    ///
+    /// One operation class with the per-command granularity riding
+    /// [`A2AAuthorizationRequest::team`]: the claim carries the cluster's
+    /// operation label and the member/task/target it names, so a deployment
+    /// authorizer can gate each verb and bind the authenticated caller to
+    /// the member the cluster claims to speak for.
+    TeamCommand,
     /// `tasks/get`.
     GetTask,
     /// `tasks/list`.
@@ -46,6 +56,7 @@ impl A2AOperation {
         match self {
             Self::SendMessage => "send-message",
             Self::RecordHandoff => "record-handoff",
+            Self::TeamCommand => "team-command",
             Self::GetTask => "get-task",
             Self::ListTasks => "list-tasks",
             Self::CancelTask => "cancel-task",
@@ -80,6 +91,28 @@ pub struct A2AHandoffClaim<'a> {
     pub target_agent: &'a str,
 }
 
+/// The team claim riding one [`A2AOperation::TeamCommand`] check.
+///
+/// Every field is the wire cluster's *claim*, surfaced before anything
+/// durable happens so the deployment authorizer can gate each board verb
+/// and bind the authenticated caller to the member the cluster names — the
+/// team entity's transition then re-validates the same claims against
+/// durable state, which gates consistency but never identity.
+#[derive(Debug, Clone, Copy)]
+pub struct A2ATeamClaim<'a> {
+    /// The team the command addresses.
+    pub team: &'a str,
+    /// The cluster's operation label (`claim`, `release`, `transfer`,
+    /// `post-task`, `message`, `join`, `leave`).
+    pub operation: &'a str,
+    /// The member the caller claims to act as, when the operation names one.
+    pub member: Option<&'a str>,
+    /// The board task the operation touches, when it names one.
+    pub task: Option<&'a str>,
+    /// The member a transfer targets or a message addresses, when named.
+    pub target_member: Option<&'a str>,
+}
+
 /// One authorization check.
 #[derive(Debug, Clone)]
 pub struct A2AAuthorizationRequest<'a> {
@@ -93,6 +126,8 @@ pub struct A2AAuthorizationRequest<'a> {
     pub principal: Option<&'a PrincipalRef>,
     /// The claimed transfer, on [`A2AOperation::RecordHandoff`] checks.
     pub handoff: Option<A2AHandoffClaim<'a>>,
+    /// The claimed team command, on [`A2AOperation::TeamCommand`] checks.
+    pub team: Option<A2ATeamClaim<'a>>,
 }
 
 /// Authorization decision.

@@ -1350,6 +1350,7 @@ async fn real_child_tasks_return_results_through_the_exchange_fabric() {
                         input: AgentTaskContent::inline(json!({ "text": "hello" }))
                             .expect("the input is inline-bounded"),
                         assignee: None,
+                        team: None,
                         goal: None,
                         goal_mode: Default::default(),
                         goal_spec: None,

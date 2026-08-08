@@ -23,7 +23,8 @@ use rakka_agent::{
     AgentId, AgentOperationId, AgentOperationKind, AgentRunScope, AgentRunState, AgentRunStatus,
     AgentSchemaPolicy, AgentScope, AgentTaskEntityCommand, AgentTaskEntityReply,
     AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskId, AgentTaskScope, AgentTaskSnapshot,
-    AgentTaskState, TenantId,
+    AgentTaskState, AgentTeamEntityReply, AgentTeamEntityStore, AgentTeamHistoryStore,
+    AgentTeamState, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_persistence::DurableStateStore;
@@ -39,8 +40,8 @@ use super::catalog::A2AAgentCatalog;
 use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
     agent_task_cancel_command, agent_task_create_command, agent_task_handoff_command,
-    agent_task_input, normalize_agent_cancel, normalize_agent_send, resolve_agent_target,
-    resolve_handoff_target, NormalizedAgentCommand,
+    agent_task_input, agent_team_command, normalize_agent_cancel, normalize_agent_send,
+    resolve_agent_target, resolve_handoff_target, NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -73,17 +74,21 @@ impl A2AAgentClock for SystemA2AAgentClock {
 /// Generic over the durable stores exactly like the entity facades it
 /// drives; every store is cheap-clone by the [`DurableStateStore`] contract,
 /// so each request materializes its own entity facade over shared state.
-pub struct RakkaAgentA2AService<Tasks, Agents, History, Runs>
+pub struct RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<AgentTeamState>,
+    TeamHistory: AgentTeamHistoryStore + Clone,
 {
     tasks: Tasks,
     agents: Agents,
     history: History,
     runs: Runs,
+    teams: Teams,
+    team_history: TeamHistory,
     router: AgentExchangeRouter,
     catalog: Arc<dyn A2AAgentCatalog>,
     projections: Arc<dyn A2ATaskProjectionStore>,
@@ -93,12 +98,15 @@ where
     default_tenant: Option<String>,
 }
 
-impl<Tasks, Agents, History, Runs> RakkaAgentA2AService<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory>
+    RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<AgentTeamState>,
+    TeamHistory: AgentTeamHistoryStore + Clone,
 {
     /// Creates a service over the given durable stores and policy seams.
     #[expect(
@@ -110,6 +118,8 @@ where
         agents: Agents,
         history: History,
         runs: Runs,
+        teams: Teams,
+        team_history: TeamHistory,
         router: AgentExchangeRouter,
         catalog: Arc<dyn A2AAgentCatalog>,
         projections: Arc<dyn A2ATaskProjectionStore>,
@@ -121,6 +131,8 @@ where
             agents,
             history,
             runs,
+            teams,
+            team_history,
             router,
             catalog,
             projections,
@@ -160,14 +172,133 @@ where
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<a2a::SendMessageResponse> {
         if is_management_message(&request.message) {
-            self.manage_agent(params, request)
+            return self
+                .manage_agent(params, request)
                 .await
-                .map(a2a::SendMessageResponse::Message)
-        } else {
-            self.send_message(params, request)
-                .await
-                .map(a2a::SendMessageResponse::Task)
+                .map(a2a::SendMessageResponse::Message);
         }
+        // A team command answers with an immediate message, exactly as a
+        // management command does — it drives a board decision, never a
+        // task creation (specification 8.10). The collaboration engagement
+        // either parses whole or fails the send closed.
+        let metadata =
+            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
+                .map_err(RakkaAgentA2AError::Mapping)?;
+        if matches!(
+            super::collaboration::parse_collaboration_envelope(&request.message, &metadata)?,
+            Some(super::collaboration::AgentCollaborationEnvelope::Team(_))
+        ) {
+            return self
+                .team_command(params, request)
+                .await
+                .map(a2a::SendMessageResponse::Message);
+        }
+        self.send_message(params, request)
+            .await
+            .map(a2a::SendMessageResponse::Task)
+    }
+
+    /// Serves one team board or membership command carried by the
+    /// collaboration extension's team cluster
+    /// ([specification 8.10](../../../../docs/plans/rakka-agent/spec.md)):
+    /// authorizes it under its own operation class with the claimed team
+    /// command bound in, durably applies it through the team entity's
+    /// deduplicated inbox, drives the settle passes that deliver what the
+    /// decision owed, and answers with an immediate response message.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on normalization, a missing required cluster field, an
+    /// unauthenticated membership change, or authorization denial. A domain
+    /// refusal — a stale epoch, a non-member, a busy entry — is not an
+    /// error: it answers as a structured refusal message so the caller can
+    /// rebase on the current board.
+    pub async fn team_command(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> RakkaAgentA2AResult<Message> {
+        let now = self.clock.now();
+        let metadata =
+            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
+                .map_err(RakkaAgentA2AError::Mapping)?;
+        let normalized = normalize_agent_send(
+            self.tenant_resolver.as_ref(),
+            self.default_tenant.as_deref(),
+            params,
+            request.tenant.as_deref(),
+            &request.message,
+            &metadata,
+        )?;
+        let Some(super::collaboration::AgentCollaborationEnvelope::Team(cluster)) =
+            normalized.collaboration.as_ref()
+        else {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the send carries no team envelope",
+            });
+        };
+        // The command is its own operation class at the authorization
+        // boundary: the deployment authorizer sees `TeamCommand` with the
+        // cluster's claimed verb, member, task, and target bound into the
+        // request — never an undifferentiated send.
+        let authorization = A2AAuthorizationRequest {
+            operation: A2AOperation::TeamCommand,
+            tenant: Some(normalized.tenant.as_str()),
+            task_id: cluster.task.as_deref(),
+            principal: normalized.principal.as_ref(),
+            handoff: None,
+            team: Some(crate::auth::A2ATeamClaim {
+                team: &cluster.team,
+                operation: cluster.operation.as_label(),
+                member: cluster.member.as_deref(),
+                task: cluster.task.as_deref(),
+                target_member: cluster.target_member.as_deref(),
+            }),
+        };
+        match self.authorizer.authorize(&authorization).await {
+            A2AAuthorizationDecision::Allow => {}
+            A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
+        }
+
+        let board_task = cluster.task.clone();
+        let (scope, command) = agent_team_command(&normalized, now)?;
+        let mut store =
+            AgentTeamEntityStore::new(scope.clone(), self.teams.clone(), self.team_history.clone());
+        let reply = match store.apply(command, &self.router, now).await {
+            Ok(reply) => reply,
+            // A domain refusal is a decision the caller rebases on, not a
+            // transport failure; infrastructure faults stay errors.
+            Err(error) if error.is_domain_refusal() => AgentTeamEntityReply::Rejected {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            },
+            Err(error) => return Err(error.into()),
+        };
+        // The courier duty the entity actors otherwise perform: the team's
+        // settle pass delivers the board decision to the task, whose accept
+        // decides the assignment; the task's settle pass then delivers the
+        // assignment onward and, once the claim resolves, the claim result
+        // home; the final team settle absorbs an already-arrived result.
+        // Outstanding exchanges beyond these bounded passes re-drive on
+        // later operations and settle sweeps — convergence never depends on
+        // this call completing them all.
+        let _ = store.settle_side_effects(&self.router, now).await;
+        if let Some(task) = board_task {
+            if let Ok(task) = AgentTaskId::new(task) {
+                if let Ok(task_scope) = AgentTaskScope::new(normalized.tenant.clone(), task) {
+                    let mut tasks = AgentTaskEntityStore::new(
+                        task_scope,
+                        self.tasks.clone(),
+                        self.agents.clone(),
+                        self.history.clone(),
+                    );
+                    let _ = tasks.settle_side_effects(&self.router, now).await;
+                }
+            }
+        }
+        let _ = store.settle_side_effects(&self.router, now).await;
+        Ok(team_response_message(&request.message.message_id, &reply))
     }
 
     /// Serves one agent-management command: parses the versioned envelope
@@ -216,6 +347,7 @@ where
             task_id: None,
             principal: principal.as_ref(),
             handoff: None,
+            team: None,
         };
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
@@ -723,6 +855,7 @@ where
             task_id: Some(normalized.task.as_str()),
             principal: normalized.principal.as_ref(),
             handoff,
+            team: None,
         };
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),
@@ -737,5 +870,30 @@ where
 pub fn accepted_message(message: &Message, task_id: &str) -> Message {
     let mut message = message.clone();
     message.task_id = Some(task_id.to_string());
+    message
+}
+
+/// Builds the immediate response message one team command answers with —
+/// the management-response precedent: a team command never creates a task,
+/// so its outcome rides a message, not a task projection.
+#[must_use]
+pub fn team_response_message(
+    request_message_id: &str,
+    reply: &rakka_agent::AgentTeamEntityReply,
+) -> Message {
+    let payload = serde_json::to_value(reply).unwrap_or(serde_json::Value::Null);
+    let mut message = Message::new(
+        a2a::Role::Agent,
+        vec![a2a::Part {
+            content: a2a::PartContent::Data(payload),
+            filename: None,
+            media_type: Some("application/json".to_string()),
+            metadata: None,
+        }],
+    );
+    message.extensions = Some(vec![
+        super::collaboration::AGENT_COLLABORATION_EXTENSION_URI.to_string(),
+    ]);
+    message.message_id = format!("{request_message_id}::team-response");
     message
 }

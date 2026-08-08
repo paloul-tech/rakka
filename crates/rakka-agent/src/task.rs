@@ -1247,10 +1247,22 @@ pub struct AgentTaskLimits {
     /// this field load with the default bound.
     #[serde(default = "default_max_handoffs")]
     pub max_handoffs: u32,
+    /// How many team board claims the task may record over its lifetime
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)): the
+    /// deterministic bound on claim/refuse cycles, the handoff bound's
+    /// precedent. Definitions persisted before this field load with the
+    /// default bound.
+    #[serde(default = "default_max_team_claims")]
+    pub max_team_claims: u32,
 }
 
 /// The default handoff bound of [`AgentTaskLimits`].
 const fn default_max_handoffs() -> u32 {
+    4
+}
+
+/// The default team-claim bound of [`AgentTaskLimits`].
+const fn default_max_team_claims() -> u32 {
     4
 }
 
@@ -1264,6 +1276,7 @@ impl AgentTaskLimits {
             max_assignments: 3,
             max_dependencies: AGENT_TASK_MAX_DEPENDENCIES,
             max_handoffs: default_max_handoffs(),
+            max_team_claims: default_max_team_claims(),
         }
     }
 
@@ -2240,6 +2253,84 @@ pub struct AgentTaskHandoffRequest {
     pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
 }
 
+/// The task's *latest* team board claim: the bounded materialized provenance
+/// of one board-driven assignment
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only the latest claim is materialized — the chain is history, exactly as
+/// superseded assignments and handoffs are — and this record is load-bearing
+/// the same three ways [`AgentTaskHandoff`] is: it is the deduplication echo
+/// past the journal's bounded window, the address the owed claim-result
+/// derivation reads, and the durable claim fence's provenance. The board
+/// never holds ownership: the assignment-generation fence stays the
+/// one-normal-owner guarantee, and this record only mirrors the claim that
+/// drove it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskTeamClaim {
+    /// The claim identity the team's board decision derived.
+    pub claim: crate::identity::AgentTeamClaimId,
+    /// The team whose board drove it.
+    pub team: crate::identity::AgentTeamScope,
+    /// The claiming member.
+    pub member: AgentId,
+    /// The board entry's claim epoch at the decision — the value the task's
+    /// claim fence records.
+    pub epoch: u64,
+    /// The assignment generation minted toward the claimant, once the
+    /// decision ran.
+    #[serde(default)]
+    pub target_generation: Option<AgentAssignmentGeneration>,
+    /// Where the claim stands.
+    pub status: AgentTaskTeamClaimStatus,
+    /// Whether the claim-result exchange to the team has settled: the
+    /// durable once-guard past the journal's bounded deduplication window.
+    #[serde(default)]
+    pub result_settled: bool,
+    /// When the claim was recorded.
+    pub recorded_at: AgentTimestampMillis,
+    /// When the claim settled, when it has.
+    #[serde(default)]
+    pub settled_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentTaskTeamClaim {
+    /// Whether the claim has resolved, accepted or refused.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        !matches!(self.status, AgentTaskTeamClaimStatus::Initiated)
+    }
+}
+
+/// Where one recorded team claim stands on the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentTaskTeamClaimStatus {
+    /// Recorded: the claimant is the assignee and its generation is offered
+    /// or about to be.
+    Initiated,
+    /// The claimant's assignment was durably accepted.
+    Accepted,
+    /// The claim resolved without an accepted assignment; the assignee was
+    /// cleared back to the board-pending posture.
+    Refused {
+        /// Stable machine-readable refusal code.
+        code: String,
+    },
+}
+
+impl AgentTaskTeamClaimStatus {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Initiated => "initiated",
+            Self::Accepted => "accepted",
+            Self::Refused { .. } => "refused",
+        }
+    }
+}
+
 /// Why an assignment decision refused an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2452,6 +2543,18 @@ pub enum AgentTaskHistoryKind {
     /// The handoff resolved without an accepted target; the source
     /// assignment was restored. The detail carries the refusal code.
     HandoffRefused,
+    /// A team board claim was recorded: the claimant became the assignee and
+    /// a generation is about to be offered
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)). The
+    /// detail carries the claim id and member.
+    TeamClaimRecorded,
+    /// The claim's assignment was durably accepted: the claimant owns the
+    /// task under the assignment fence.
+    TeamClaimAccepted,
+    /// The claim resolved without an accepted assignment; the detail carries
+    /// the refusal code and the assignee cleared back to the board-pending
+    /// posture.
+    TeamClaimRefused,
     /// A run proposed a typed result.
     ResultProposed,
     /// A proposal passed every deterministic rule.
@@ -2522,6 +2625,9 @@ impl AgentTaskHistoryKind {
             Self::HandoffInitiated => "handoff-initiated",
             Self::HandoffAccepted => "handoff-accepted",
             Self::HandoffRefused => "handoff-refused",
+            Self::TeamClaimRecorded => "team-claim-recorded",
+            Self::TeamClaimAccepted => "team-claim-accepted",
+            Self::TeamClaimRefused => "team-claim-refused",
             Self::ResultProposed => "result-proposed",
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
@@ -2866,6 +2972,13 @@ pub struct AgentTaskCreation {
     pub input: AgentTaskContent,
     /// The agent the task should be assigned to, when it is agent-owned.
     pub assignee: Option<AgentId>,
+    /// The team whose shared board will govern the assignment
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)). An
+    /// agent-owned creation carrying a team may omit the assignee: the task
+    /// waits on the board until a claim names one. Records persisted before
+    /// this field load without one.
+    #[serde(default)]
+    pub team: Option<crate::identity::AgentTeamId>,
     /// The collaborative goal it contributes to.
     pub goal: Option<AgentGoalId>,
     /// Whether the task coordinates a finite or continuous goal
@@ -3449,6 +3562,26 @@ pub struct AgentTask {
     /// How many handoffs the task has recorded over its lifetime.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub handoffs: u32,
+    /// The team whose shared board governs this task's assignment, when one
+    /// does ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    /// Creation-time provenance: a task created for a board waits unassigned
+    /// until a claim names its assignee. Records persisted before this field
+    /// load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::identity::AgentTeamId>,
+    /// The latest board claim, when a team drove one; the chain is history.
+    /// Records persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_claim: Option<Box<AgentTaskTeamClaim>>,
+    /// How many board claims the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub team_claims: u32,
+    /// The claim-epoch fence: a team-claim exchange whose epoch is not above
+    /// this refuses, so a courier-reordered stale board decision can never
+    /// revive a superseded claim. Records persisted before this field load
+    /// with the fence at zero.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub team_claim_fence: u64,
     /// The most recent assignment refusal.
     pub last_refusal: Option<AgentAssignmentRefusal>,
     /// The accepted typed result.
@@ -3557,6 +3690,14 @@ impl AgentTask {
 /// the field existed.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// The `skip_serializing_if` predicate of the task's claim fence: a task no
+/// board ever touched serializes byte-identically to one persisted before
+/// the field existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -3765,6 +3906,9 @@ impl AgentTaskState {
             delegation: task.delegation.clone(),
             handoff: task.handoff.clone(),
             handoffs: task.handoffs,
+            team: task.team.clone(),
+            team_claim: task.team_claim.clone(),
+            team_claims: task.team_claims,
             assignment: task.assignment.clone(),
             assignment_generation: task.assignment_generation,
             dependencies: task.dependencies.values().cloned().collect(),
@@ -3940,6 +4084,18 @@ pub struct AgentTaskSnapshot {
     /// How many handoffs the task has recorded over its lifetime.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub handoffs: u32,
+    /// The team whose shared board governs the assignment, when one does
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<crate::identity::AgentTeamId>,
+    /// The latest board claim, when a team drove one. Snapshots persisted
+    /// before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_claim: Option<Box<AgentTaskTeamClaim>>,
+    /// How many board claims the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub team_claims: u32,
     /// Its current assignment.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation it has decided.
@@ -4325,7 +4481,10 @@ fn create_task(
     }
 
     let agent_owned = creation.definition.is_agent_owned();
-    if agent_owned && creation.assignee.is_none() {
+    // A board-governed creation may defer its assignee: the task waits
+    // unassigned — no generation ever mints without an assignee — until a
+    // team claim names one ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    if agent_owned && creation.assignee.is_none() && creation.team.is_none() {
         return Err(AgentTaskError::MissingAssignee);
     }
     if agent_owned && state.scope.task().as_str().len() > AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH {
@@ -4450,6 +4609,10 @@ fn create_task(
         assignments: 0,
         handoff: None,
         handoffs: 0,
+        team: creation.team,
+        team_claim: None,
+        team_claims: 0,
+        team_claim_fence: 0,
         last_refusal: None,
         accepted_result: None,
         rejection_count: 0,
@@ -4835,6 +4998,23 @@ fn request_task_cancellation(
         owed.extend(resolve_handoff_refusal(
             state,
             AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+            now,
+        )?);
+    }
+    // A pending board claim whose generation was never minted resolves
+    // refused in the same compare-and-set as the marker, exactly as the
+    // handoff does: the owed claim result reopens the board entry under the
+    // cancellation code. A minted, still-offered generation is left to its
+    // Assignment settle.
+    let unminted_claim = state.task.as_ref().is_some_and(|task| {
+        task.team_claim
+            .as_deref()
+            .is_some_and(|claim| !claim.is_settled() && claim.target_generation.is_none())
+    });
+    if unminted_claim {
+        owed.extend(resolve_team_claim_refusal(
+            state,
+            "team-claim-task-cancelling",
             now,
         )?);
     }
@@ -5327,6 +5507,476 @@ fn settle_handoff_result_exchange(
         if let Some(handoff) = task.handoff.as_deref_mut() {
             if handoff.is_settled() && !handoff.result_settled {
                 handoff.result_settled = true;
+                settled = true;
+            }
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
+}
+
+fn task_team_claim_pending(task: &AgentTask) -> bool {
+    task.team_claim
+        .as_deref()
+        .is_some_and(|claim| !claim.is_settled())
+}
+
+/// The bounded outcome echo one applied team-claim exchange returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTeamClaimApplyOutcome {
+    /// The task's status once the transition committed.
+    pub status: AgentTaskStatus,
+    /// The claim the arbitration recorded or echoed.
+    pub claim: crate::identity::AgentTeamClaimId,
+    /// The task's claim fence after the transition.
+    pub epoch: u64,
+}
+
+/// Payload type of the team-claim outcome echo.
+pub const AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.TeamClaimOutcome";
+
+/// Applies one delivered team-claim exchange: the task-side arbitration of a
+/// board decision ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The reply means "claim recorded", never "assignment made" — the receiving
+/// entity's local-progress pass decides the assignment right after this, and
+/// the outcome returns by the claim-result exchange.
+fn apply_team_claim(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let command: crate::coordination::AgentTeamClaimCommand = match envelope
+        .payload()
+        .decode(crate::coordination::AGENT_TEAM_CLAIM_PAYLOAD_TYPE)
+    {
+        Ok(command) => command,
+        Err(error) => return refuse(state, error.code(), error.to_string()),
+    };
+    // The initiator must be the team the command names: a board decision
+    // about team T sent by anything but T's entity is forged.
+    match envelope.initiator() {
+        AgentEntityAddress::Team(scope) if scope == &command.team => {}
+        _ => {
+            return refuse(
+                state,
+                "team-claim-forged",
+                "a team claim must be initiated by the team it names".to_string(),
+            )
+        }
+    }
+    let applied = match &command.action {
+        crate::coordination::AgentTeamClaimAction::Claim { member } => {
+            record_team_claim(state, envelope.operation_id(), &command, member, now)
+        }
+        crate::coordination::AgentTeamClaimAction::Release => {
+            release_team_claim(state, envelope.operation_id(), &command, now)
+        }
+    };
+    match applied {
+        Ok(outcome) => AgentExchangeResult::accepted(
+            AgentExchangePayload::encode(AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE, &outcome)
+                .unwrap_or_else(|_| {
+                    AgentExchangePayload::empty(AGENT_TEAM_CLAIM_OUTCOME_PAYLOAD_TYPE)
+                }),
+        ),
+        Err(error) => refuse(state, error.code(), error.to_string()),
+    }
+}
+
+/// Records one board claim: validates the decision against durable state and
+/// points the task's assignee at the claimant
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Atomically validate-then-mutate: a refusal leaves the task exactly as it
+/// found it, which is what lets the board treat a definitive refusal as
+/// proof no claim was recorded. A replay matching the recorded claim id
+/// accepts idempotently — the materialized claim is the deduplication echo
+/// past the journal's bounded window, checked before every guard including
+/// the terminal one. The epoch fence closes courier reordering: a stale
+/// board decision refuses however well formed it is.
+fn record_team_claim(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    command: &crate::coordination::AgentTeamClaimCommand,
+    member: &AgentId,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentTeamClaimApplyOutcome> {
+    let task = state
+        .task
+        .as_mut()
+        .ok_or(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-unknown",
+            message: "no task exists under this scope".to_string(),
+        })?;
+    if let Some(existing) = task.team_claim.as_deref() {
+        if existing.claim == command.claim {
+            return Ok(AgentTeamClaimApplyOutcome {
+                status: task.status,
+                claim: existing.claim.clone(),
+                epoch: task.team_claim_fence,
+            });
+        }
+    }
+    if task.team.as_ref() != Some(command.team.team()) {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-wrong-team",
+            message: "the task is not governed by this team's board".to_string(),
+        });
+    }
+    if command.epoch <= task.team_claim_fence {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-stale-epoch",
+            message: format!(
+                "the decision's epoch {} is not above the recorded fence {}",
+                command.epoch, task.team_claim_fence
+            ),
+        });
+    }
+    if task.status.is_terminal() {
+        let detail = task.terminal_reason.as_ref().map_or_else(
+            || task.status.to_string(),
+            |reason| reason.code().to_string(),
+        );
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-terminal",
+            message: format!("the task is terminal: {detail}"),
+        });
+    }
+    if task.cancellation.is_some() {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-cancelling",
+            message: "the task's cancellation is propagating; no claim can be recorded".to_string(),
+        });
+    }
+    if task_handoff_pending(task) {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-handoff-pending",
+            message: "the task carries an unresolved handoff".to_string(),
+        });
+    }
+    if let Some(assignment) = task.assignment.as_ref() {
+        if assignment.status == AgentAssignmentStatus::Accepted {
+            return Err(AgentTaskError::TeamClaimRefused {
+                code: "team-claim-already-owned",
+                message: format!(
+                    "generation {} is accepted by {}",
+                    assignment.generation, assignment.agent
+                ),
+            });
+        }
+        // An offered generation belongs to the decision the board is
+        // superseding; refusing keeps exactly one generation in flight
+        // ever, and the board reopens for a retry after the offer resolves.
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-assignment-inflight",
+            message: format!(
+                "generation {} is offered and undecided",
+                assignment.generation
+            ),
+        });
+    }
+    if task.team_claims >= task.definition.limits.max_team_claims {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-limit-exceeded",
+            message: format!(
+                "the task already recorded its maximum of {} board claims",
+                task.definition.limits.max_team_claims
+            ),
+        });
+    }
+
+    // A superseding claim replaces a pending predecessor whose generation
+    // never minted — a transfer's prior claimant, or an expired-lease steal.
+    // The board recorded the supersession in the same compare-and-set that
+    // committed this decision, so the predecessor has no board slot left to
+    // report into and its materialized record is simply replaced; the chain
+    // is history.
+    task.team_claim = Some(Box::new(AgentTaskTeamClaim {
+        claim: command.claim.clone(),
+        team: command.team.clone(),
+        member: member.clone(),
+        epoch: command.epoch,
+        target_generation: None,
+        status: AgentTaskTeamClaimStatus::Initiated,
+        result_settled: false,
+        recorded_at: now,
+        settled_at: None,
+    }));
+    task.team_claims += 1;
+    task.team_claim_fence = command.epoch;
+    task.assignee = Some(member.clone());
+    task.last_refusal = None;
+    let status = task.status;
+    task.check_bounds(0)?;
+    state.updated_at = now;
+    let claim_id = command.claim.clone();
+    let member = member.clone();
+    let operation = operation_id.clone();
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::TeamClaimRecorded,
+            operation,
+            status,
+            now,
+        )
+        .with_detail(format!("{claim_id} -> {member}"))
+    });
+    Ok(AgentTeamClaimApplyOutcome {
+        status,
+        claim: command.claim.clone(),
+        epoch: command.epoch,
+    })
+}
+
+/// Releases one pending board claim before its assignment accepted.
+///
+/// Valid only pre-mint: an offered generation refuses in-flight (the entry
+/// restores and the release may be retried once the offer resolves), and an
+/// accepted assignment refuses owned — ownership leaves the board only
+/// through task-side outcomes. The release's outcome rides the reply home;
+/// no claim-result exchange is owed for it.
+fn release_team_claim(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    command: &crate::coordination::AgentTeamClaimCommand,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<AgentTeamClaimApplyOutcome> {
+    let task = state
+        .task
+        .as_mut()
+        .ok_or(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-task-unknown",
+            message: "no task exists under this scope".to_string(),
+        })?;
+    let Some(existing) = task
+        .team_claim
+        .as_deref()
+        .filter(|claim| claim.claim == command.claim)
+    else {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-release-unknown",
+            message: "the task holds no such claim to release".to_string(),
+        });
+    };
+    if existing.is_settled() {
+        // The release replayed past the journal window; the recorded
+        // resolution stands.
+        return Ok(AgentTeamClaimApplyOutcome {
+            status: task.status,
+            claim: existing.claim.clone(),
+            epoch: task.team_claim_fence,
+        });
+    }
+    if command.epoch <= task.team_claim_fence {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-stale-epoch",
+            message: format!(
+                "the release's epoch {} is not above the recorded fence {}",
+                command.epoch, task.team_claim_fence
+            ),
+        });
+    }
+    if let Some(assignment) = task.assignment.as_ref() {
+        if assignment.status == AgentAssignmentStatus::Accepted {
+            return Err(AgentTaskError::TeamClaimRefused {
+                code: "team-claim-already-owned",
+                message: format!(
+                    "generation {} is accepted by {}",
+                    assignment.generation, assignment.agent
+                ),
+            });
+        }
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-release-assignment-inflight",
+            message: format!(
+                "generation {} is offered and undecided",
+                assignment.generation
+            ),
+        });
+    }
+
+    let claim = task
+        .team_claim
+        .as_deref_mut()
+        .expect("the claim was matched above");
+    claim.status = AgentTaskTeamClaimStatus::Refused {
+        code: "team-claim-released".to_string(),
+    };
+    claim.settled_at = Some(now);
+    claim.result_settled = true;
+    let claim_id = claim.claim.clone();
+    let member = claim.member.clone();
+    task.team_claim_fence = command.epoch;
+    task.assignee = None;
+    let status = task.status;
+    state.updated_at = now;
+    let operation = operation_id.clone();
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::TeamClaimRefused,
+            operation,
+            status,
+            now,
+        )
+        .with_detail(format!("{claim_id} released by {member}"))
+    });
+    Ok(AgentTeamClaimApplyOutcome {
+        status,
+        claim: command.claim.clone(),
+        epoch: command.epoch,
+    })
+}
+
+/// Resolves the pending team claim as refused: clears the assignee back to
+/// the board-pending posture and settles the claim under a stable code.
+///
+/// The claim gets exactly one assignment-generation attempt — the handoff
+/// single-attempt precedent: every definitive refusal of that attempt (the
+/// run's own refusal, a readiness or affordability refusal, an exhausted
+/// assignment budget, a cancellation arriving before the generation minted)
+/// resolves through this one helper, and the owed claim-result exchange
+/// carries the code back to the board, which reopens the entry. Escrow is
+/// deliberately untouched: the caller that released a refused generation
+/// already released it, and no other caller minted one.
+fn resolve_team_claim_refusal(
+    state: &mut AgentTaskState,
+    code: &str,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let Some(claim) = task
+        .team_claim
+        .as_deref_mut()
+        .filter(|claim| !claim.is_settled())
+    else {
+        return Ok(Vec::new());
+    };
+    let detail = bounded_detail(code);
+    claim.status = AgentTaskTeamClaimStatus::Refused {
+        code: detail.clone(),
+    };
+    claim.settled_at = Some(now);
+    let claim_id = claim.claim.clone();
+    let member = claim.member.clone();
+    let operation_id =
+        crate::coordination::team_claim_result_operation_id(scope.tenant(), &claim_id)?;
+    task.assignee = None;
+    let status = task.status;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::TeamClaimRefused,
+            operation_id,
+            status,
+            now,
+        )
+        .with_detail(format!("{claim_id} {member}: {detail}"))
+    });
+    Ok(owed_team_claim_result(state, now)?.into_iter().collect())
+}
+
+/// The claim-result exchange the task owes its claim's team, when it owes
+/// one now ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per claim — the resolution is absorbing, first writer
+/// wins — and re-derived by every settle pass until the exchange settles:
+/// the journal's initiation record is the once-guard inside its bounded
+/// window, and the claim's `result_settled` marker is the durable
+/// once-guard past it.
+fn owed_team_claim_result(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(claim) = task.team_claim.as_deref() else {
+        return Ok(None);
+    };
+    if !claim.is_settled() || claim.result_settled {
+        return Ok(None);
+    }
+    let operation_id =
+        crate::coordination::team_claim_result_operation_id(state.scope.tenant(), &claim.claim)?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let outcome = match &claim.status {
+        AgentTaskTeamClaimStatus::Initiated => return Ok(None),
+        AgentTaskTeamClaimStatus::Accepted => {
+            let Some(generation) = claim.target_generation else {
+                // An accepted claim always recorded its minted generation;
+                // absent one there is nothing coherent to report.
+                return Ok(None);
+            };
+            crate::coordination::AgentTeamClaimOutcome::Activated {
+                generation,
+                run: run_id_for_assignment(state.scope.task(), generation)?,
+                member: claim.member.clone(),
+            }
+        }
+        AgentTaskTeamClaimStatus::Refused { code } => {
+            crate::coordination::AgentTeamClaimOutcome::Refused { code: code.clone() }
+        }
+    };
+    let notice = crate::coordination::AgentTeamClaimResultNotice {
+        task: state.scope.clone(),
+        claim: claim.claim.clone(),
+        epoch: claim.epoch,
+        outcome,
+    };
+    let payload = AgentExchangePayload::encode(
+        crate::coordination::AGENT_TEAM_CLAIM_RESULT_PAYLOAD_TYPE,
+        &notice,
+    )?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::TeamClaimResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Team(claim.team.clone()),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Marks the claim-result exchange settled on the claim provenance: the
+/// durable once-guard past the journal's bounded deduplication window.
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the *currently materialized* claim derives, exactly as the handoff
+/// marker does: a settled claim can be replaced by a successor, and a late
+/// settlement of the predecessor's exchange must not quiesce the
+/// successor's owed result.
+fn settle_team_claim_result_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state
+        .task()
+        .and_then(|task| task.team_claim.as_deref())
+        .and_then(|claim| {
+            crate::coordination::team_claim_result_operation_id(state.scope.tenant(), &claim.claim)
+                .ok()
+        });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if let Some(claim) = task.team_claim.as_deref_mut() {
+            if claim.is_settled() && !claim.result_settled {
+                claim.result_settled = true;
                 settled = true;
             }
         }
@@ -6012,6 +6662,8 @@ fn owe_epoch_creation(
         definition: epoch_spec.definition.clone(),
         input,
         assignee: Some(epoch_spec.assignee.clone()),
+        // An epoch is admitted by its own controller, never board-claimed.
+        team: None,
         goal: Some(goal),
         goal_mode: AgentGoalMode::Finite,
         // An epoch task contributes to the goal; it never coordinates it, so
@@ -7350,9 +8002,18 @@ fn decide_assignment(
     // terminalizing it over a source run that is fenced-alive awaiting the
     // resolution.
     let handoff_pending = task_handoff_pending(task);
+    // The claim single-attempt rule mirrors the handoff's: the claimant gets
+    // exactly one assignment-generation attempt, and every definitive
+    // refusal of it resolves the claim — reopening the board entry through
+    // the owed claim result — rather than parking the task in a refusal
+    // loop.
+    let team_claim_pending = task_team_claim_pending(task);
     if let Some((reason, detail)) = readiness.refusal() {
         if handoff_pending {
             return resolve_handoff_refusal(state, reason.code(), now);
+        }
+        if team_claim_pending {
+            return resolve_team_claim_refusal(state, reason.code(), now);
         }
         return Ok(refuse_assignment(state, readiness, reason, detail, now)?
             .into_iter()
@@ -7362,6 +8023,12 @@ fn decide_assignment(
     if task.assignments >= task.definition.limits.max_assignments {
         if handoff_pending {
             return resolve_handoff_refusal(state, "handoff-assignments-exhausted", now);
+        }
+        if team_claim_pending {
+            // The claim resolves rather than the task terminating: the
+            // board's members decide what an unassignable entry means, and
+            // the claim ceiling bounds how often they may ask.
+            return resolve_team_claim_refusal(state, "team-claim-assignments-exhausted", now);
         }
         let assignments = task.assignments;
         let operation_id = assignment_operation_id(&scope, task.assignment_generation)?;
@@ -7413,6 +8080,12 @@ fn decide_assignment(
             // a fenced-alive source (the user-approved posture; a reserved
             // handoff allowance is a recorded policy hook, not this slice).
             return resolve_handoff_refusal(state, "handoff-budget-unaffordable", now);
+        }
+        if team_claim_pending {
+            // Fail closed exactly as the handoff does: the claim resolves
+            // refused and the board reopens, rather than the task parking a
+            // claim over headroom that may never return.
+            return resolve_team_claim_refusal(state, "team-claim-budget-unaffordable", now);
         }
         // A refusal no settlement can relieve — zero headroom and nothing
         // outstanding to return — is the goal scope's own exhaustion, and the
@@ -7486,6 +8159,17 @@ fn decide_assignment(
             && handoff.target_generation.is_none()
         {
             handoff.target_generation = Some(generation);
+        }
+    }
+    // A pending board claim records the generation it minted the same way:
+    // the claim's target generation is what the acceptance flip and the
+    // claim-result notice key on.
+    if let Some(claim) = task.team_claim.as_deref_mut() {
+        if !claim.is_settled()
+            && claim.member == assignment.agent
+            && claim.target_generation.is_none()
+        {
+            claim.target_generation = Some(generation);
         }
     }
     // The assignment spends growth headroom admission reserved, so it checks
@@ -8101,6 +8785,7 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             AgentExchangeKind::DelegationCancel => {
                 return apply_delegation_cancel(state, envelope, now)
             }
+            AgentExchangeKind::TeamClaim => apply_team_claim(state, envelope, now),
             kind => refuse(
                 state,
                 "unsupported-exchange",
@@ -8182,6 +8867,23 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                     ),
                 }
             }
+            AgentExchangeKind::TeamClaimResult if !result.is_accepted() => {
+                // A refused claim result settles only under the team's
+                // definitive answers: no team exists, the board holds no
+                // such entry, or the notice was forged — undeliverable
+                // however often it is re-driven. Every other refusal leaves
+                // the exchange outstanding for re-drive (the rolling-upgrade
+                // rule).
+                match result.status().rejection_code() {
+                    Some("team-not-found" | "team-claim-unknown" | "team-claim-forged") => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::TeamClaimResult,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -8203,11 +8905,18 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             // quiesces the owed derivation past the journal's bounded window.
             settle_handoff_result_exchange(state, envelope, now);
         }
+        if envelope.kind() == AgentExchangeKind::TeamClaimResult {
+            // The team answered — the board settlement applied, or refused
+            // under a definitive code. The marker settles on the claim
+            // provenance exactly as the handoff marker does.
+            settle_team_claim_result_exchange(state, envelope, now);
+        }
         if !matches!(
             envelope.kind(),
             AgentExchangeKind::Assignment
                 | AgentExchangeKind::RunCancel
                 | AgentExchangeKind::HandoffResult
+                | AgentExchangeKind::TeamClaimResult
         ) {
             return Vec::new();
         }
@@ -8231,6 +8940,12 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             Ok(envelopes) => owed.extend(envelopes),
             Err(error) => {
                 debug_assert!(false, "handoff-result construction failed: {error}");
+            }
+        }
+        match owed_team_claim_result(state, now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "team-claim-result construction failed: {error}");
             }
         }
         match finalize_task_cancellation(state, envelope.operation_id(), now) {
@@ -8312,6 +9027,19 @@ fn settle_assignment(
                 handoff_accepted = Some(handoff.handoff.clone());
             }
         }
+        // The claim acceptance flip ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)):
+        // when the accepted generation is the one a pending board claim
+        // minted, the claimant owns the task under the assignment fence —
+        // the claim settles `Accepted` in this same compare-and-set, and the
+        // settle pass owes the board its claim result.
+        let mut claim_accepted = None;
+        if let Some(claim) = task.team_claim.as_deref_mut() {
+            if !claim.is_settled() && claim.target_generation == Some(assignment.generation) {
+                claim.status = AgentTaskTeamClaimStatus::Accepted;
+                claim.settled_at = Some(now);
+                claim_accepted = Some(claim.claim.clone());
+            }
+        }
         state.updated_at = now;
         state.record_history(|sequence| {
             AgentTaskHistoryEntry::new(
@@ -8334,6 +9062,19 @@ fn settle_assignment(
                 )
                 .with_assignment(&assignment)
                 .with_detail(handoff_id.to_string())
+            });
+        }
+        if let Some(claim_id) = claim_accepted {
+            state.record_history(|sequence| {
+                AgentTaskHistoryEntry::new(
+                    sequence,
+                    AgentTaskHistoryKind::TeamClaimAccepted,
+                    operation_id.clone(),
+                    AgentTaskStatus::InProgress,
+                    now,
+                )
+                .with_assignment(&assignment)
+                .with_detail(claim_id.to_string())
             });
         }
         return;
@@ -8410,6 +9151,23 @@ fn settle_assignment(
         debug_assert!(
             resolved.is_ok(),
             "handoff refusal resolution failed: {resolved:?}"
+        );
+    }
+    // The claim single-attempt rule, the handoff precedent: a refused claim
+    // generation resolves the claim — clearing the assignee back to the
+    // board-pending posture — rather than re-offering toward a member whose
+    // run just refused. The owed claim-result exchange is collected by the
+    // participant's settle pass, which runs right after this.
+    let refused_claim_generation = state.task.as_ref().is_some_and(|task| {
+        task.team_claim.as_deref().is_some_and(|claim| {
+            !claim.is_settled() && claim.target_generation == Some(assignment.generation)
+        })
+    });
+    if refused_claim_generation {
+        let resolved = resolve_team_claim_refusal(state, &code, now);
+        debug_assert!(
+            resolved.is_ok(),
+            "team-claim refusal resolution failed: {resolved:?}"
         );
     }
 }
@@ -9121,6 +9879,7 @@ where
         self.observe_goal_deadline(now).await?;
         self.settle_requested_cancellation(now).await?;
         self.settle_handoff_resolution(now).await?;
+        self.settle_team_claim_resolution(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
         self.park_owed_rewakes(now).await?;
@@ -9163,6 +9922,56 @@ where
         let committed = self
             .host
             .initiate(now, |state| match owed_handoff_result(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
+    /// Re-owes the claim-result exchange a settled board claim still owes
+    /// its team ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The `settle_handoff_resolution` twin: the transition that settled the
+    /// claim owed the exchange in its own compare-and-set, but a crash
+    /// between that commit and the initiation must not strand the board's
+    /// pending entry forever. The derivation is pure over durable state, the
+    /// journal's initiation record guards the bounded window, and the
+    /// claim's `result_settled` marker quiesces it past that window.
+    async fn settle_team_claim_resolution(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => task.team_claim.as_deref().is_some_and(|claim| {
+                    claim.is_settled()
+                        && !claim.result_settled
+                        && crate::coordination::team_claim_result_operation_id(
+                            state.scope.tenant(),
+                            &claim.claim,
+                        )
+                        .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                }),
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_team_claim_result(state, now) {
                 Ok(owed) => Ok(owed.into_iter().collect()),
                 Err(error) => {
                     let carried = AgentChoreographyError::from(error.clone());
@@ -9396,6 +10205,7 @@ where
         self.observe_goal_deadline(now).await?;
         self.settle_requested_cancellation(now).await?;
         self.settle_handoff_resolution(now).await?;
+        self.settle_team_claim_resolution(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
         let rewakes_parked = self.park_owed_rewakes(now).await?;
@@ -10634,6 +11444,14 @@ pub enum AgentTaskError {
         /// Bounded human-readable detail.
         message: String,
     },
+    /// A team board claim was refused by the task's arbitration
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    TeamClaimRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
     /// A creation carried delegation provenance that violates its structural
     /// bounds.
     DelegationProvenanceInvalid {
@@ -10815,6 +11633,7 @@ impl AgentTaskError {
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
             Self::HandoffRefused { code, .. } => code,
+            Self::TeamClaimRefused { code, .. } => code,
             Self::DelegationProvenanceInvalid { .. } => "task-delegation-provenance-invalid",
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::EpochWithoutParent => "task-epoch-without-parent",
@@ -10874,6 +11693,9 @@ impl Display for AgentTaskError {
             }
             Self::HandoffRefused { code, message } => {
                 write!(f, "the handoff was refused ({code}): {message}")
+            }
+            Self::TeamClaimRefused { code, message } => {
+                write!(f, "the team claim was refused ({code}): {message}")
             }
             Self::DelegationProvenanceInvalid { message } => {
                 write!(f, "the creation's delegation provenance is invalid: {message}")
@@ -11155,6 +11977,7 @@ mod epoch_result_tests {
             input: AgentTaskContent::inline(serde_json::json!({ "goal": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: None,
+            team: None,
             goal: Some(AgentGoalId::new("nightly").expect("the goal id is valid")),
             goal_mode: continuous_mode(),
             goal_spec: None,
