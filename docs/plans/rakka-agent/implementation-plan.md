@@ -3340,6 +3340,73 @@ Guidance: [Coordination Capabilities](technical-guidance.md#coordination-capabil
 
 Done when: scenario 38 passes.
 
+**Amended as implemented (2026-08-07).** Landed as specified, with the
+in-slice interactions resolved as follows (decision points user-approved):
+
+- **Descriptors** are construction-validated wiring, never serialized
+  definition data: `AgentCoordinationCapability` and the four policies live
+  in `coordination.rs`; `AgentRunDelegationConfig::descriptor()` derives the
+  Delegation payload, and the handoff policy rides the same config
+  (`with_handoff`, gated on the `Handoff` kind exactly as `new()` gates on
+  `Delegation`) — so the existing `with_delegation` plumbing (entity, store,
+  sharding settings, testkit) needed no second config path.
+- **The task-side resolution machine is the load-bearing piece** the risk
+  review demanded: the bounded `AgentTask::handoff` provenance (latest hop
+  only, chain in history per 9.6) stashes the source assignment whole and
+  carries a status + `result_settled` once-guard. It is the deduplication
+  echo past the journal window, the source address for every owed
+  derivation, and the goal view's source-run join. The twelfth exchange,
+  `HandoffResult` (task → source run), is owed by a pure derivation the
+  settle pass re-derives; its settle terminates the source
+  `HandedOff` (the status finally became reachable via the new
+  `AgentRunTerminalReason::HandedOff`) or restores the stashed source on a
+  refusal — the **single-attempt** posture: readiness, exhaustion
+  (`handoff-assignments-exhausted`), and the fail-closed escrow refusal
+  (`handoff-budget-unaffordable`; the source's open escrow child makes an
+  exact-fit budget unable to afford the target's generation — the recorded
+  policy hook for reserved handoff headroom stays unimplemented) all
+  resolve through one helper.
+- **Wind-down fence**: the handoff send stays non-exempt
+  (`exempt_from_wind_down_fence` unchanged); `fence_unsent_effects` gained
+  the handoff-cell arm (`Failed{run-winding-down}`). The 4.6 chase needed
+  no run-side arm: cancellation routes to exactly one owner through the
+  task — an accepted target generation takes the `RunCancel` while the
+  source terminalizes `HandedOff`; a refusal restores the source into its
+  own wind-down; an unminted pending transfer resolves refused inside the
+  cancellation-marker transition. An unresolved transfer holds
+  `settle_run_disposition` open via `awaits_children`.
+- **Interception exclusivity** goes beyond the planned refusals: the
+  transfer must be the turn's only work (`handoff-with-planned-calls`) and
+  refuses beside outstanding children, an unresolved group, or a live or
+  ambiguous effect — closing the 8.9 replay-ambiguity window structurally.
+  The delegation cycle check is deliberately not copied (A→B→A is bounded
+  by the definition's new `max_handoffs`, default 4), and the planner never
+  touches the descendants ceilings. There is deliberately no door-side
+  escrow pre-check: the task's ledger is not readable at the run's door,
+  so affordability resolves through the task's own refusal.
+- **Goal-view gap (user-approved: latest hop only)**: the re-derivation
+  resolves a mid-transfer task to the provenance's recorded source pair;
+  generations before the latest handoff stay the explicitly surfaced gap.
+- **Ambiguous send (user-approved: probe, then definitive)**: the
+  `A2AAgentHandoffSendExecutor` probes the task's durable handoff echo on
+  an ambiguous failure; an unanswerable probe leaves the attempt retryable,
+  and exhaustion parks the source indeterminate (the run-side `Exhausted`
+  arm maps a handoff send to `Indeterminate`) rather than resuming it
+  beside a possibly-live transfer.
+- **Wire**: the collaboration extension's handoff cluster is a second
+  shape under the one metadata key, discriminated by its `handoff` field —
+  the delegation envelope is untouched, old receivers fail closed on a
+  populated cluster (14.4), plain clients stay untouched — and ingress
+  derives the operation id under the reserved `AgentOperationKind::Handoff`.
+- Proof roster: `tests/handoff_record.rs` (6), `tests/handoff_cancellation.rs`
+  (3, including the crash-point sweep over the committed-but-unsent fence
+  window), the goal view's handoff join + lockstep, and rakka-a2a's
+  `tests/handoff_surface.rs` (scenario 38 end to end over the real service
+  core + the wire fail-closed matrix). Owed onward: `AgentDecisionKind`'s
+  reserved `handoff` label (interception still rides `CallTools`, the
+  delegation precedent), the `rakka.agent.handoff` span rows (otel), the
+  reserved-headroom policy hook, and 5.5's replayable handoff events.
+
 ### Slice 5.2 — Team coordination
 
 Spec: [8.10](spec.md#810-team-coordination).

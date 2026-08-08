@@ -37,8 +37,9 @@ use crate::projection::A2ATaskProjectionStore;
 use super::catalog::A2AAgentCatalog;
 use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
-    agent_task_cancel_command, agent_task_create_command, agent_task_input, normalize_agent_cancel,
-    normalize_agent_send, resolve_agent_target, NormalizedAgentCommand,
+    agent_task_cancel_command, agent_task_create_command, agent_task_handoff_command,
+    agent_task_input, normalize_agent_cancel, normalize_agent_send, resolve_agent_target,
+    NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -376,6 +377,31 @@ where
             normalized.intent,
             crate::mapping::A2ATaskIntent::ContinueTask
         ) {
+            // A continuation carrying the handoff cluster is the same-task
+            // transfer of specification 8.9: the deduplicated handoff command
+            // records the transfer, and the inline assignment decision offers
+            // the target its generation in the same compare-and-set. Plain
+            // input delivery stays parked for its own slice, cleanly
+            // distinguished by the collaboration metadata.
+            if matches!(
+                normalized.collaboration.as_ref(),
+                Some(super::collaboration::AgentCollaborationEnvelope::Handoff(_))
+            ) {
+                let command = agent_task_handoff_command(&normalized)?;
+                let snapshot = self.apply_task_command(&normalized, command, now).await?;
+                let run = self.current_run_status(&normalized, &snapshot).await?;
+                project_agent_send(
+                    self.projections.as_ref(),
+                    &snapshot,
+                    run,
+                    normalized.tenant.as_str(),
+                    &normalized.context_id,
+                    &request.message,
+                    now,
+                )
+                .await?;
+                return self.public_task(&normalized, None).await;
+            }
             return Err(RakkaAgentA2AError::Unsupported {
                 operation: "send-message",
                 reason: "input delivery to an existing agent task is not served yet",

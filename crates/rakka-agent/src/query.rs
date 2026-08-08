@@ -62,9 +62,9 @@ use crate::goal::{
     AgentGoalDelegationBudget, AgentGoalStatus, AgentGoalTerminalDecision, AgentGoalWaitReason,
 };
 use crate::identity::{
-    AgentCommunalClaimId, AgentDelegationId, AgentGoalId, AgentId, AgentIdentityError,
-    AgentOperationId, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, AgentWakeId,
-    AgentWorkflowInvocationId, KnowledgeSpaceId, TenantId,
+    AgentCommunalClaimId, AgentDelegationId, AgentGoalId, AgentHandoffId, AgentId,
+    AgentIdentityError, AgentOperationId, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope,
+    AgentWakeId, AgentWorkflowInvocationId, KnowledgeSpaceId, TenantId,
 };
 use crate::loop_runtime::{AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState};
 use crate::observability::{
@@ -522,9 +522,64 @@ pub struct AgentGoalClaimAppendView {
     pub attempts: u32,
 }
 
+/// One handoff, as a source run's durable cell records it
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Identities, stable codes, labels, and counts only — the reason and the
+/// context references ride the durable record, never this view, exactly as
+/// the delegation edge omits its input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalHandoffView {
+    /// The handoff's derived identity.
+    pub handoff: AgentHandoffId,
+    /// The agent the transfer targets.
+    pub target: AgentId,
+    /// The skill the source's model requested.
+    pub requested_skill: AgentCapabilityId,
+    /// Where the handoff stands, as its stable label.
+    pub status: String,
+    /// The refusal or failure code, when the handoff settled under one.
+    pub reason_code: Option<String>,
+    /// How many context references the transfer projected — the count, never
+    /// the references.
+    pub context_refs: usize,
+    /// The assignment generation the task minted toward the target, once the
+    /// receipt reported one.
+    pub target_generation: Option<AgentAssignmentGeneration>,
+    /// When the status settled, when it has.
+    pub settled_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentGoalHandoffView {
+    /// Derives the handoff view from one durable handoff cell.
+    #[must_use]
+    pub fn derive(cell: &crate::coordination::AgentHandoffCell) -> Self {
+        use crate::coordination::AgentHandoffStatus;
+        let (reason_code, target_generation) = match &cell.status {
+            AgentHandoffStatus::Pending => (None, None),
+            AgentHandoffStatus::Sent { target_generation } => (None, *target_generation),
+            AgentHandoffStatus::Accepted { generation, .. } => (None, Some(*generation)),
+            AgentHandoffStatus::Refused { code } | AgentHandoffStatus::Failed { code } => {
+                (Some(code.clone()), None)
+            }
+        };
+        Self {
+            handoff: cell.record.handoff.clone(),
+            target: cell.record.resolved.agent.clone(),
+            requested_skill: cell.record.requested_skill.clone(),
+            status: cell.status.as_label().to_string(),
+            reason_code,
+            context_refs: cell.record.context.len(),
+            target_generation,
+            settled_at: cell.settled_at,
+        }
+    }
+}
+
 /// The multi-agent collaboration state one run's durable record holds: the
-/// delegation, fan-in, workflow-invocation, and goal-evaluation cells of
-/// slices 4.2-4.6, plus the claim-append effects still retained
+/// delegation, fan-in, workflow-invocation, goal-evaluation, and handoff
+/// cells of slices 4.2-5.1, plus the claim-append effects still retained
 /// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// Derived once and consumed twice: [`AgentOperationalSnapshot`] carries it
@@ -544,6 +599,11 @@ pub struct AgentRunCollaborationView {
     pub evaluation: Option<AgentGoalEvaluationView>,
     /// The claim-append effects the run still retains.
     pub claim_appends: Vec<AgentGoalClaimAppendView>,
+    /// The run's one handoff, when it holds one
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). Views
+    /// persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<AgentGoalHandoffView>,
 }
 
 impl AgentRunCollaborationView {
@@ -583,6 +643,7 @@ impl AgentRunCollaborationView {
                     _ => None,
                 })
                 .collect(),
+            handoff: loop_state.handoff().map(AgentGoalHandoffView::derive),
         }
     }
 
@@ -595,6 +656,7 @@ impl AgentRunCollaborationView {
             && self.workflow_invocations.is_empty()
             && self.evaluation.is_none()
             && self.claim_appends.is_empty()
+            && self.handoff.is_none()
     }
 }
 
@@ -1237,11 +1299,20 @@ pub struct AgentGoalTaskNode {
     pub cancellation: AgentCancellationProgress,
     /// The current assignment, when one stands.
     pub assignment: Option<AgentGoalAssignmentView>,
+    /// The latest handoff recorded on this task, when one was
+    /// ([specification 14.2](../../../docs/plans/rakka-agent/spec.md):
+    /// source and target lineage in authorized metadata). It carries the
+    /// source pair the task record itself no longer names, which is what
+    /// keeps a handed-off generation out of the earlier-generations gap.
+    /// Nodes assembled before the field existed load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<AgentGoalTaskHandoffView>,
     /// The highest assignment generation the task has decided — the one
     /// whose run this view resolves, standing assignment or not. A value
     /// above one signals earlier runs this view does not assemble: their
-    /// scopes are not derivable from the task record, and full run history
-    /// is the task projection's job.
+    /// scopes are not derivable from the task record — beyond the latest
+    /// handoff, whose source pair [`Self::handoff`] carries — and full run
+    /// history is the task projection's job.
     pub assignment_generation: AgentAssignmentGeneration,
     /// How many assignment generations the task has consumed.
     pub assignments: u32,
@@ -1267,6 +1338,34 @@ pub struct AgentGoalTaskNode {
     pub rejection_count: u32,
     /// The time of the task's last accepted transition.
     pub updated_at: AgentTimestampMillis,
+}
+
+/// The latest handoff of one task node, as its materialized provenance
+/// records it ([specification 8.9 and 14.2](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Identities, the stable status label, and timestamps only — the reason and
+/// context references never ride the view. Only the latest hop is
+/// materialized; the chain is the task history's job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentGoalTaskHandoffView {
+    /// The handoff's derived identity.
+    pub handoff: AgentHandoffId,
+    /// The agent whose run initiated the transfer.
+    pub source_agent: AgentId,
+    /// The assignment generation the source served.
+    pub source_generation: AgentAssignmentGeneration,
+    /// The source run — the pair the task record itself no longer names
+    /// after the transfer.
+    pub source_run: AgentRunId,
+    /// The agent the transfer targets.
+    pub target: AgentId,
+    /// The assignment generation minted toward the target, once one was.
+    pub target_generation: Option<AgentAssignmentGeneration>,
+    /// Where the transfer stands, as its stable label.
+    pub status: String,
+    /// When the transfer was recorded.
+    pub recorded_at: AgentTimestampMillis,
 }
 
 /// One run node of the goal view
@@ -1491,12 +1590,13 @@ pub trait AgentGoalClaimSource: Send + Sync {
 /// reachable exactly because the goal identity defaults to the root task's
 /// value ([`AgentGoalId::for_root_task`], the recorded resolution of open
 /// decision 14). Each task resolves its highest-generation run — through the
-/// standing assignment, or re-derived from the assignee once acceptance
-/// cleared it — while earlier generations' runs are not assembled: their
+/// standing assignment, re-derived from the assignee once acceptance
+/// cleared it, or resolved through a pending handoff's recorded source —
+/// while generations before the latest handoff are not assembled: their
 /// scopes are not derivable from the task record, the per-node generation
-/// counts make that gap explicit, and full run history belongs to the task
-/// projection. Teams and moderated conversations join in M5; the
-/// non-exhaustive views keep that additive.
+/// counts and handoff provenance make that gap explicit, and full run
+/// history belongs to the task projection. Teams and moderated
+/// conversations join in M5; the non-exhaustive views keep that additive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentGoalView {
@@ -2061,6 +2161,19 @@ where
                         status: assignment.status,
                         assigned_at: assignment.assigned_at,
                     }),
+                handoff: task
+                    .handoff
+                    .as_deref()
+                    .map(|handoff| AgentGoalTaskHandoffView {
+                        handoff: handoff.handoff.clone(),
+                        source_agent: handoff.source_assignment.agent.clone(),
+                        source_generation: handoff.source_assignment.generation,
+                        source_run: handoff.source_assignment.run.clone(),
+                        target: handoff.target.clone(),
+                        target_generation: handoff.target_generation,
+                        status: handoff.status.as_label().to_string(),
+                        recorded_at: handoff.recorded_at,
+                    }),
                 assignment_generation: task.assignment_generation,
                 assignments: task.assignments,
                 run_omission: None,
@@ -2090,9 +2203,27 @@ where
             // clears `last_refusal`, so one on record means the highest
             // generation was refused and no accepted run record exists to
             // re-derive — a between-assignments task, not an anomaly.
-            // Generations before the highest stay an explicit gap.
+            // Generations before the highest stay an explicit gap — beyond
+            // the latest handoff, whose materialized provenance carries the
+            // source pair the task record itself no longer names.
+            let pending_handoff_source = task
+                .handoff
+                .as_deref()
+                .filter(|handoff| !handoff.is_settled())
+                .map(|handoff| {
+                    (
+                        handoff.source_assignment.agent.clone(),
+                        handoff.source_assignment.run.clone(),
+                    )
+                });
             let resolved_run = match task.assignment.as_ref() {
                 Some(assignment) => Some((assignment.agent.clone(), assignment.run.clone())),
+                // Mid-handoff the assignment is cleared while the *source*
+                // run still owns the work: pairing the target assignee with
+                // the source's highest generation would fabricate a scope
+                // that never existed, so the pending transfer resolves the
+                // recorded source instead ([specification 8.9]).
+                None if pending_handoff_source.is_some() => pending_handoff_source,
                 None if task.last_refusal.is_some() => None,
                 None => match (&task.assignee, task.assignment_generation) {
                     (Some(assignee), generation)

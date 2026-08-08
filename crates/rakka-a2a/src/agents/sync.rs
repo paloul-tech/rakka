@@ -56,12 +56,25 @@ pub(crate) fn agent_projection_from_snapshot(
             Value::String(assignment.agent.as_str().to_string()),
         );
     }
+    // The bounded collaboration echo: enough for observability and the
+    // delegating or handing-off sender's identity check, never the whole
+    // envelope. The two clusters merge under the one key — a delegated task
+    // that was later handed off echoes both.
+    let mut collaboration = serde_json::Map::new();
     if let Some(provenance) = snapshot.delegation.as_deref() {
-        // The bounded collaboration echo: enough for observability and the
-        // delegating sender's identity check, never the whole envelope.
+        if let Value::Object(echo) = super::collaboration::collaboration_echo(provenance) {
+            collaboration.extend(echo);
+        }
+    }
+    if let Some(handoff) = snapshot.handoff.as_deref() {
+        if let Value::Object(echo) = super::collaboration::handoff_echo(handoff) {
+            collaboration.extend(echo);
+        }
+    }
+    if !collaboration.is_empty() {
         metadata.insert(
             super::collaboration::META_COLLABORATION.to_string(),
-            super::collaboration::collaboration_echo(provenance),
+            Value::Object(collaboration),
         );
     }
     metadata.insert(

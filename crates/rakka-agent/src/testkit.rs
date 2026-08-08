@@ -374,14 +374,16 @@ impl AgentExchangeParticipant for ChoreographyProbe {
                 apply_ledger(state, envelope, 1)
             }
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
-            // An epoch result, a goal evaluation, a delegation result, or a
-            // cancellation request is a durable transition but not a balance
-            // movement: the probe records the application without crediting.
+            // An epoch result, a goal evaluation, a delegation result, a
+            // cancellation request, or a handoff resolution is a durable
+            // transition but not a balance movement: the probe records the
+            // application without crediting.
             AgentExchangeKind::EpochResult
             | AgentExchangeKind::GoalEvaluation
             | AgentExchangeKind::DelegationResult
             | AgentExchangeKind::RunCancel
-            | AgentExchangeKind::DelegationCancel => apply_ledger(state, envelope, 0),
+            | AgentExchangeKind::DelegationCancel
+            | AgentExchangeKind::HandoffResult => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or
@@ -1654,6 +1656,7 @@ pub struct ScriptedDispatcher<A = DeterministicModelAdapter> {
     promotions: Arc<Mutex<Option<Arc<dyn AgentMemoryPromotionExecutor>>>>,
     evaluations: Arc<Mutex<Option<Arc<dyn AgentGoalEvaluationExecutor>>>>,
     a2a_sends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aSendExecutor>>>>,
+    a2a_handoffs: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentA2aHandoffSendExecutor>>>>,
     workflow_starts: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowStartExecutor>>>>,
     workflow_cancels: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentWorkflowCancelExecutor>>>>,
     claim_appends: Arc<Mutex<Option<Arc<dyn crate::dispatch::AgentClaimAppendExecutor>>>>,
@@ -1749,6 +1752,7 @@ where
             promotions: Arc::new(Mutex::new(None)),
             evaluations: Arc::new(Mutex::new(None)),
             a2a_sends: Arc::new(Mutex::new(None)),
+            a2a_handoffs: Arc::new(Mutex::new(None)),
             workflow_starts: Arc::new(Mutex::new(None)),
             workflow_cancels: Arc::new(Mutex::new(None)),
             claim_appends: Arc::new(Mutex::new(None)),
@@ -1841,6 +1845,22 @@ where
             .a2a_sends
             .lock()
             .expect("the A2A send executor slot should not be poisoned") = Some(executor);
+        self
+    }
+
+    /// Executes outbound handoff send effects through the given executor. An
+    /// unwired handoff fails with the real pipeline's
+    /// `a2a-handoff-executor-missing` code, exactly as the real dispatcher
+    /// fails closed.
+    #[must_use]
+    pub fn with_a2a_handoff_executor(
+        self,
+        executor: Arc<dyn crate::dispatch::AgentA2aHandoffSendExecutor>,
+    ) -> Self {
+        *self
+            .a2a_handoffs
+            .lock()
+            .expect("the A2A handoff executor slot should not be poisoned") = Some(executor);
         self
     }
 
@@ -2106,6 +2126,58 @@ where
                         // model-adapter precedent above.
                         Err(error) => AgentRunEffectOutcome::Failed {
                             code: "a2a-send-attempt-failed".to_string(),
+                            message: error.to_string(),
+                        },
+                    },
+                };
+                self.memoize(effect, outcome)
+            }
+            AgentRunEffectRequest::A2aHandoff { handoff } => {
+                // The record carries its own source scope, so the send needs
+                // nothing `answer` does not hold. Memoized like a tool call:
+                // a re-invocation of the same generation returns the same
+                // receipt, which is exactly what the derived deduplication
+                // key promises.
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(outcome) = self.cached(effect) {
+                    return outcome;
+                }
+                let executor = self
+                    .a2a_handoffs
+                    .lock()
+                    .expect("the A2A handoff executor slot should not be poisoned")
+                    .clone();
+                let outcome = match executor {
+                    None => AgentRunEffectOutcome::Failed {
+                        code: "a2a-handoff-executor-missing".to_string(),
+                        message: "no A2A handoff executor is wired into this dispatcher"
+                            .to_string(),
+                    },
+                    Some(executor) => match executor
+                        .execute(&handoff.source_run, effect, handoff, None)
+                        .await
+                    {
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Recorded {
+                            target_generation,
+                            peer_status,
+                        }) => AgentRunEffectOutcome::A2aHandoff {
+                            receipt: crate::coordination::AgentA2aHandoffReceipt {
+                                handoff: handoff.handoff.clone(),
+                                target_generation,
+                                peer_status,
+                            },
+                        },
+                        Ok(crate::dispatch::AgentA2aHandoffFinding::Conflict { code, message })
+                        | Ok(crate::dispatch::AgentA2aHandoffFinding::Refused { code, message }) => {
+                            AgentRunEffectOutcome::Failed { code, message }
+                        }
+                        // The in-process driver has no attempt machinery: a
+                        // retryable failure surfaces as an *exhausted* effect
+                        // — the real pipeline's spent retry budget — so the
+                        // run parks indeterminate rather than resuming beside
+                        // a possibly-recorded transfer.
+                        Err(error) => AgentRunEffectOutcome::Exhausted {
+                            code: "a2a-handoff-attempt-failed".to_string(),
                             message: error.to_string(),
                         },
                     },

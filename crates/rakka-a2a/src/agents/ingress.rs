@@ -80,10 +80,10 @@ pub struct NormalizedAgentCommand {
     /// `traceparent` is dropped whole rather than entering durable state, and
     /// an untraced ingress starts a root.
     pub telemetry: AgentTelemetryContext,
-    /// The validated collaboration envelope, when the send engaged the
-    /// versioned collaboration extension (specification 14.4). `None` for an
-    /// ordinary send.
-    pub collaboration: Option<super::collaboration::AgentCollaborationMetadata>,
+    /// The validated collaboration engagement — delegation envelope or
+    /// handoff cluster — when the send engaged the versioned collaboration
+    /// extension (specification 14.4). `None` for an ordinary send.
+    pub collaboration: Option<super::collaboration::AgentCollaborationEnvelope>,
 }
 
 impl NormalizedAgentCommand {
@@ -141,8 +141,26 @@ pub fn normalize_agent_send(
         .unwrap_or_else(|| task.as_str())
         .to_string();
 
+    // The single chokepoint where the collaboration extension either parses
+    // whole or fails the send closed (specification 14.4). Parsed before the
+    // operation id derives, because a handoff is a distinct operation class:
+    // it continues an existing task, never creates one, and deduplicates
+    // under its own reserved kind.
+    let collaboration = super::collaboration::parse_collaboration_envelope(message, metadata)?;
+    let operation_kind = match collaboration.as_ref() {
+        Some(super::collaboration::AgentCollaborationEnvelope::Handoff(_)) => {
+            if !matches!(intent, A2ATaskIntent::ContinueTask) {
+                return Err(RakkaAgentA2AError::Unsupported {
+                    operation: "agent-collaboration",
+                    reason: "a handoff send must name the task it transfers via message.task_id",
+                });
+            }
+            AgentOperationKind::Handoff
+        }
+        _ => AgentOperationKind::TaskCreation,
+    };
     let operation_id = AgentOperationId::new(
-        AgentOperationKind::TaskCreation,
+        operation_kind,
         [tenant.as_str(), task.as_str(), discriminator.as_str()],
     )?;
 
@@ -163,9 +181,7 @@ pub fn normalize_agent_send(
         task_definition: metadata_string(metadata, META_TASK_DEFINITION)
             .map_err(RakkaAgentA2AError::Mapping)?,
         telemetry: extract_ingress_telemetry(metadata),
-        // The single chokepoint where the collaboration extension either
-        // parses whole or fails the send closed (specification 14.4).
-        collaboration: super::collaboration::parse_collaboration_metadata(message, metadata)?,
+        collaboration,
     })
 }
 
@@ -305,13 +321,22 @@ pub fn agent_task_create_command(
     // envelope's budget is advisory provenance and the child's ledger builds
     // from its own definition ceilings.
     let (goal, parent, delegation) = match normalized.collaboration.as_ref() {
-        Some(envelope) => {
+        Some(super::collaboration::AgentCollaborationEnvelope::Delegation(envelope)) => {
             let provenance = envelope.to_provenance()?;
             (
                 envelope.goal_id()?,
                 Some(provenance.parent_task.clone()),
                 Some(Box::new(provenance)),
             )
+        }
+        // A handoff never creates a task: the same `AgentTaskId` is the whole
+        // point. Reaching a creation with the handoff cluster is a routing
+        // bug fail-closed, not a silent plain task.
+        Some(super::collaboration::AgentCollaborationEnvelope::Handoff(_)) => {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "a handoff envelope cannot create a task",
+            });
         }
         None => (None, None, None),
     };
@@ -335,6 +360,31 @@ pub fn agent_task_create_command(
             delegation,
             telemetry: normalized.telemetry.clone(),
         }),
+    })
+}
+
+/// Builds the deduplicated handoff command for one normalized send carrying
+/// the handoff cluster ([specification 8.9](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// # Errors
+///
+/// Fails closed when the normalized send carries no handoff cluster, or when
+/// a cluster identity cannot key a durable scope. Every field is a claim the
+/// task's transition re-validates against durable state.
+pub fn agent_task_handoff_command(
+    normalized: &NormalizedAgentCommand,
+) -> RakkaAgentA2AResult<AgentTaskEntityCommand> {
+    let Some(super::collaboration::AgentCollaborationEnvelope::Handoff(envelope)) =
+        normalized.collaboration.as_ref()
+    else {
+        return Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "the send carries no handoff envelope",
+        });
+    };
+    Ok(AgentTaskEntityCommand::RecordHandoff {
+        operation_id: normalized.operation_id.clone(),
+        request: Box::new(envelope.to_request()?),
     })
 }
 

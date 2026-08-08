@@ -1087,6 +1087,11 @@ pub struct AgentRunDelegationConfig {
     pub catalog: Arc<dyn AgentDelegationCatalog>,
     /// The coordination capabilities the agent definition declares.
     pub coordination: BTreeSet<AgentCoordinationCapabilityKind>,
+    /// The handoff policy the loop intercepts under, when the deployment
+    /// wires one ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    /// Handoff resolves targets through the same catalog as delegation
+    /// (open decision 6's disposition). Unwired, the run never hands off.
+    pub handoff: Option<crate::coordination::AgentHandoffPolicy>,
 }
 
 impl AgentRunDelegationConfig {
@@ -1106,6 +1111,7 @@ impl AgentRunDelegationConfig {
             default_fan_in: crate::fan_in::AgentFanInPolicy::default(),
             catalog,
             coordination,
+            handoff: None,
         })
     }
 
@@ -1114,6 +1120,44 @@ impl AgentRunDelegationConfig {
     pub fn with_fan_in_tool(mut self, tool: AgentToolId) -> Self {
         self.fan_in_tool = Some(tool);
         self
+    }
+
+    /// Declares the handoff policy the loop intercepts under, refusing a
+    /// coordination set without
+    /// [`AgentCoordinationCapabilityKind::Handoff`] — the same
+    /// construction-time obligation [`Self::new`] places on delegation
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    pub fn with_handoff(
+        mut self,
+        policy: crate::coordination::AgentHandoffPolicy,
+    ) -> AgentDelegationResult<Self> {
+        if !self
+            .coordination
+            .contains(&AgentCoordinationCapabilityKind::Handoff)
+        {
+            return Err(AgentDelegationError::HandoffCapabilityMissing);
+        }
+        self.handoff = Some(policy);
+        Ok(self)
+    }
+
+    /// Derives the delegation capability descriptor this wiring realizes
+    /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The descriptor mirrors the declared surface — tool ids and the given
+    /// policy revision — while the catalog stays runtime wiring: trusted
+    /// config is never duplicated into descriptor data.
+    #[must_use]
+    pub fn descriptor(
+        &self,
+        revision: AgentRevisionNumber,
+    ) -> crate::coordination::AgentCoordinationCapability {
+        let mut policy =
+            crate::coordination::AgentDelegationPolicy::new(self.tool.clone(), revision);
+        if let Some(fan_in_tool) = &self.fan_in_tool {
+            policy = policy.with_fan_in_tool(fan_in_tool.clone());
+        }
+        crate::coordination::AgentCoordinationCapability::Delegation(policy)
     }
 
     /// Sets the fan-in policy used when the goal's envelope declares none,
@@ -1144,6 +1188,9 @@ pub enum AgentDelegationError {
     /// The configuration's coordination set does not declare the delegation
     /// capability.
     CapabilityMissing,
+    /// The configuration's coordination set does not declare the handoff
+    /// capability.
+    HandoffCapabilityMissing,
     /// The requested skill is outside the goal's allowed set.
     SkillNotAllowed {
         /// The skill the model requested.
@@ -1267,6 +1314,7 @@ impl AgentDelegationError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::CapabilityMissing => "delegation-capability-missing",
+            Self::HandoffCapabilityMissing => "handoff-capability-missing",
             Self::SkillNotAllowed { .. } => "delegation-skill-not-allowed",
             Self::InvalidArguments { .. } => "delegation-invalid-arguments",
             Self::LimitExceeded { .. } => "delegation-limit-exceeded",
@@ -1294,6 +1342,10 @@ impl Display for AgentDelegationError {
         match self {
             Self::CapabilityMissing => f.write_str(
                 "the delegation configuration's coordination set does not declare the delegation \
+                 capability",
+            ),
+            Self::HandoffCapabilityMissing => f.write_str(
+                "the delegation configuration's coordination set does not declare the handoff \
                  capability",
             ),
             Self::SkillNotAllowed { skill } => {

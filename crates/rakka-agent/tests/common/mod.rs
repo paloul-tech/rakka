@@ -308,6 +308,80 @@ pub fn delegation_config() -> rakka_agent::AgentRunDelegationConfig {
     .expect("the delegation configuration declares the capability")
 }
 
+/// The coordination tool the handoff fixture declares.
+pub const HANDOFF_TOOL: &str = "transfer";
+
+/// The skill the fixture goal may hand off to.
+pub const HANDOFF_SKILL: &str = "billing";
+
+/// The agent the fixture catalog resolves the handoff skill to.
+pub const HANDOFF_TARGET: &str = "billing-agent";
+
+pub fn handoff_tool_id() -> rakka_agent::AgentToolId {
+    rakka_agent::AgentToolId::new(HANDOFF_TOOL).expect("tool id should be valid")
+}
+
+pub fn handoff_skill_id() -> rakka_agent::AgentCapabilityId {
+    rakka_agent::AgentCapabilityId::new(HANDOFF_SKILL).expect("capability id should be valid")
+}
+
+pub fn handoff_target_id() -> AgentId {
+    AgentId::new(HANDOFF_TARGET).expect("agent id should be valid")
+}
+
+pub fn handoff_target_scope() -> AgentScope {
+    AgentScope::new(tenant(), handoff_target_id()).expect("agent scope should be valid")
+}
+
+/// The target the fixture catalog resolves [`handoff_skill_id`] to: another
+/// agent serving the *same* task definition — specification 8.9's contract
+/// validation requires it.
+pub fn handoff_target() -> rakka_agent::AgentDelegationTarget {
+    rakka_agent::AgentDelegationTarget::new(handoff_target_id(), task_definition_id())
+}
+
+/// The run scope of the handoff target's generation-two run: the same task,
+/// one generation later, under the target agent.
+pub fn handoff_target_run_scope() -> AgentRunScope {
+    let run = rakka_agent::run_id_for_assignment(
+        task_scope().task(),
+        rakka_agent::AgentAssignmentGeneration::new(2),
+    )
+    .expect("the run id should be derivable");
+    AgentRunScope::new(tenant(), handoff_target_id(), run).expect("run scope should be valid")
+}
+
+/// The delegation-and-handoff wiring the fixture run entity serves: the
+/// declared coordination tools, a static catalog serving both skills, and
+/// both capabilities.
+pub fn handoff_config() -> rakka_agent::AgentRunDelegationConfig {
+    rakka_agent::AgentRunDelegationConfig::new(
+        delegation_tool_id(),
+        Arc::new(
+            rakka_agent::StaticAgentDelegationCatalog::new()
+                .with_target(skill_id(), delegation_target())
+                .with_target(handoff_skill_id(), handoff_target()),
+        ),
+        std::collections::BTreeSet::from([
+            rakka_agent::AgentCoordinationCapabilityKind::Delegation,
+            rakka_agent::AgentCoordinationCapabilityKind::Handoff,
+        ]),
+    )
+    .expect("the delegation configuration declares the capability")
+    .with_handoff(rakka_agent::AgentHandoffPolicy::new(
+        handoff_tool_id(),
+        AgentRevisionNumber::INITIAL,
+    ))
+    .expect("the handoff configuration declares the capability")
+}
+
+/// The fixture goal contract allowing the handoff skill.
+pub fn goal_spec_with_handoff() -> rakka_agent::AgentGoalSpec {
+    let mut spec = goal_spec();
+    spec.allowed_skills = std::collections::BTreeSet::from([skill_id(), handoff_skill_id()]);
+    spec
+}
+
 /// The await verb the fan-in fixture declares.
 pub const FAN_IN_TOOL: &str = "await_children";
 
@@ -841,6 +915,25 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     /// Instantiates the agent under an explicit authority envelope, for tests
     /// whose dispatches must pass the slice 1.8 authority gate.
     pub async fn instantiate_agent_with_envelope(&self, envelope: AgentAuthorityEnvelope) {
+        self.instantiate_agent_with_envelope_at(agent_scope(), envelope)
+            .await;
+    }
+
+    /// Instantiates an agent at an explicit scope — the handoff target the
+    /// transfer tests offer the task to.
+    pub async fn instantiate_agent_at(&self, scope: AgentScope) {
+        let mut envelope = AgentAuthorityEnvelope::empty();
+        envelope.task_definitions.insert(task_definition_id());
+        self.instantiate_agent_with_envelope_at(scope, envelope)
+            .await;
+    }
+
+    /// Instantiates an agent at an explicit scope under an explicit envelope.
+    pub async fn instantiate_agent_with_envelope_at(
+        &self,
+        scope: AgentScope,
+        envelope: AgentAuthorityEnvelope,
+    ) {
         let definition = AgentDefinition::new(
             AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
             "Resolves customer support tickets end to end.",
@@ -848,13 +941,13 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         )
         .expect("the agent definition should be valid");
 
-        let mut agent = AgentEntityStore::new(agent_scope(), self.agents.clone());
+        let mut agent = AgentEntityStore::new(scope.clone(), self.agents.clone());
         agent.recover().await.expect("the agent should recover");
         agent
             .apply(AgentEntityCommand::Instantiate {
                 operation_id: AgentOperationId::for_agent(
                     AgentOperationKind::DefinitionUpdate,
-                    &agent_scope(),
+                    &scope,
                     "1",
                 )
                 .expect("operation id should be derivable"),
