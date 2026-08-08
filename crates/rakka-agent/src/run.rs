@@ -1601,8 +1601,14 @@ fn accept_run_cancel(
 /// one compare-and-set, which is what makes `HandedOff` strictly after
 /// durable target acceptance. A refusal settles the cell, releases the
 /// fence, and resumes the turn with the failed tool result the model
-/// corrects course from. A settled cell answers idempotently: it is the
-/// durable fence past the journal's bounded deduplication window.
+/// corrects course from. A settled cell answers idempotently — it is the
+/// durable fence past the journal's bounded deduplication window — with one
+/// exception: an accepted resolution contradicting a cell that settled
+/// under a *local* failure corrects the record instead of being absorbed,
+/// because the task's durable acceptance is where responsibility actually
+/// went. On a live run the correction applies as a first resolution would;
+/// on an already-terminal run only the cell is corrected — the terminal
+/// status is history and stands.
 fn accept_handoff_result(
     state: &mut AgentRunState,
     envelope: &AgentExchangeEnvelope,
@@ -1668,11 +1674,59 @@ fn accept_handoff_result(
         );
     }
     if cell.status.is_settled() {
-        // A duplicate past the journal's bounded window: the settled cell is
-        // the durable fence, and no second transition runs.
-        return AgentExchangeResult::accepted(AgentExchangePayload::empty(
-            crate::task::AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE,
-        ));
+        // A settled cell absorbs duplicates past the journal's bounded
+        // window — with one exception. An `Accepted` resolution arriving at
+        // a cell that settled under a *local* failure — a fenced wind-down,
+        // a reconciliation decision an ambiguously failed write later
+        // contradicted — is not a duplicate: the task's durable record says
+        // responsibility transferred, and the run's local belief must not
+        // absorb it. The contradiction falls through so the acceptance
+        // corrects the record; everything else answers idempotently.
+        let contradicted = matches!(
+            &notice.resolution,
+            crate::task::AgentHandoffResolutionNotice::Accepted { .. }
+        ) && !matches!(
+            cell.status,
+            crate::coordination::AgentHandoffStatus::Accepted { .. }
+        );
+        if !contradicted {
+            return AgentExchangeResult::accepted(AgentExchangePayload::empty(
+                crate::task::AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE,
+            ));
+        }
+        if run.status.is_terminal() {
+            // The run already terminalized under the wind-down that settled
+            // this cell; its terminal status and reason are history and
+            // stand. The cell alone is corrected, so the collaboration and
+            // goal views carry the durable truth: responsibility moved to
+            // the target.
+            let correct = |state: &mut AgentRunState| -> AgentRunResult<()> {
+                let crate::task::AgentHandoffResolutionNotice::Accepted {
+                    target_run,
+                    generation,
+                } = &notice.resolution
+                else {
+                    return Ok(());
+                };
+                let run = state.run_mut()?;
+                if let Some(cell) = run.loop_state.handoff_mut() {
+                    cell.correct_accepted(target_run.clone(), *generation, now);
+                }
+                Ok(())
+            };
+            if let Err(error) = correct(state) {
+                return refuse("handoff-result-failed", error.to_string());
+            }
+            state.updated_at = now;
+            return AgentExchangeResult::accepted(AgentExchangePayload::empty(
+                crate::task::AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE,
+            ));
+        }
+        // A live run falls through: the acceptance applies exactly as a
+        // first resolution would, correcting the cell and terminalizing
+        // `HandedOff` — the earlier failed tool result stands (results
+        // deduplicate by call), and the run stops spending budget on a task
+        // it no longer owns.
     }
     let call_id = cell.record.call_id.clone();
     let target = cell.record.resolved.agent.clone();
@@ -1685,7 +1739,11 @@ fn accept_handoff_result(
             } => {
                 let run = state.run_mut()?;
                 if let Some(cell) = run.loop_state.handoff_mut() {
-                    cell.settle_accepted(target_run.clone(), *generation, now);
+                    // `correct_accepted`, not `settle_accepted`: on the
+                    // ordinary unsettled path the two act identically, and
+                    // on the contradicted path above only the correction may
+                    // rewrite the locally settled failure.
+                    cell.correct_accepted(target_run.clone(), *generation, now);
                 }
                 let content = AgentTaskContent::inline(serde_json::json!({
                     "handoff": notice.handoff.as_str(),
@@ -1698,14 +1756,11 @@ fn accept_handoff_result(
                     content,
                     recorded_at: now,
                 });
-                // Responsibility durably moved, so `HandedOff` wins over a
-                // concurrent cancellation wind-down: recording `Cancelled`
-                // here would claim the task's work stopped with this run,
-                // which the task's own durable record contradicts. No other
-                // wind-down reason can be standing — the door refused a
-                // handoff beside outstanding or ambiguous effects, and the
-                // send's own failure settles the cell before any reason is
-                // recorded.
+                // Responsibility durably moved, so `HandedOff` wins over any
+                // standing wind-down reason: recording `Cancelled` — or a
+                // resumed-run failure — here would claim the task's work
+                // stopped with this run, which the task's own durable record
+                // contradicts.
                 run.terminal_reason = Some(AgentRunTerminalReason::HandedOff {
                     handoff: notice.handoff.clone(),
                     target,
@@ -9044,6 +9099,201 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&unwired.metrics, &metrics),
             "an unwired deployment measures through the no-op default"
+        );
+    }
+
+    /// An accepted resolution contradicting a locally settled failure
+    /// corrects the record instead of being absorbed: the task's durable
+    /// acceptance is where responsibility actually went. On a live run the
+    /// source terminalizes `HandedOff`; on an already-terminal run the cell
+    /// alone is corrected and the terminal state stands; a genuine duplicate
+    /// — the cell already accepted — still absorbs idempotently.
+    #[test]
+    fn a_contradicted_accepted_resolution_corrects_the_settled_cell() {
+        use crate::coordination::{AgentHandoffCell, AgentHandoffRecord, AgentHandoffStatus};
+
+        let now = AgentTimestampMillis::new(10);
+        let scope = AgentRunScope::new(
+            TenantId::new("acme"),
+            AgentId::new("support-agent").expect("the agent id is valid"),
+            AgentRunId::new("ticket-1-gen-1").expect("the run id is valid"),
+        )
+        .expect("the scope is valid");
+        let task = AgentTaskId::new("ticket-1").expect("the task id is valid");
+        let task_scope = AgentTaskScope::new(scope.tenant().clone(), task.clone())
+            .expect("the task scope is valid");
+        let schema = AgentSchemaRef::new(
+            AgentSchemaId::new("result").expect("the schema id is valid"),
+            AgentRevisionNumber::INITIAL,
+        );
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"),
+            "The correction fixture.",
+            schema.clone(),
+            schema,
+        )
+        .expect("the definition is valid");
+        let handoff_id =
+            crate::coordination::handoff_id_for(&scope, 1, 0).expect("the handoff id derives");
+        let record = AgentHandoffRecord {
+            handoff: handoff_id.clone(),
+            goal: None,
+            task: task.clone(),
+            source_run: scope.clone(),
+            source_generation: AgentAssignmentGeneration::new(1),
+            requested_skill: crate::AgentCapabilityId::new("billing")
+                .expect("the skill id is valid"),
+            resolved: crate::delegation::AgentDelegationTarget::new(
+                AgentId::new("billing-agent").expect("the agent id is valid"),
+                AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"),
+            ),
+            reason: "needs billing authority".to_string(),
+            policy_revision: AgentRevisionNumber::INITIAL,
+            definition_revision: AgentRevisionNumber::INITIAL,
+            settings_revision: AgentRevisionNumber::INITIAL,
+            context: Vec::new(),
+            a2a_message_id: handoff_id.as_str().to_string(),
+            deduplication_key: handoff_id.as_str().to_string(),
+            turn: 1,
+            slot: 0,
+            effect: AgentEffectId::new("effect-1"),
+            call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+            telemetry: Default::default(),
+            created_at: now,
+        };
+        let build_state = |status: AgentRunStatus,
+                           terminal_reason: Option<AgentRunTerminalReason>,
+                           cell_status: AgentHandoffStatus| {
+            let budget = AgentRunBudget::allocate(
+                crate::budget::AgentBudgetGrant::from_ceilings(&definition.budgets),
+                now,
+            );
+            let mut loop_state = AgentLoopState::started(
+                task.clone(),
+                None,
+                AgentRevisionNumber::INITIAL,
+                AgentRevisionNumber::INITIAL,
+                definition.version,
+                budget,
+            );
+            let mut cell = AgentHandoffCell::pending(Box::new(record.clone()));
+            cell.status = cell_status;
+            cell.settled_at = Some(now);
+            loop_state.record_handoff(cell);
+            let mut state = AgentRunState::unassigned(scope.clone(), now);
+            state.run = Some(AgentRun {
+                binding: AgentRunBinding::new(scope.clone(), task.clone()),
+                generation: AgentAssignmentGeneration::new(1),
+                definition: definition.clone(),
+                input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                    .expect("the input is inline-bounded"),
+                status,
+                loop_state,
+                terminal_reason,
+                settlement: AgentRunSettlementStatus::Owed,
+                accepted_at: now,
+            });
+            state
+        };
+        let operation_id =
+            crate::coordination::handoff_result_operation_id(scope.tenant(), &handoff_id)
+                .expect("the operation id derives");
+        let target_run = AgentRunId::new("ticket-1-gen-2").expect("the run id is valid");
+        let notice = crate::task::AgentHandoffResultNotice {
+            task: task_scope.clone(),
+            handoff: handoff_id.clone(),
+            resolution: crate::task::AgentHandoffResolutionNotice::Accepted {
+                target_run: target_run.clone(),
+                generation: AgentAssignmentGeneration::new(2),
+            },
+        };
+        let envelope = AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::HandoffResult,
+            AgentEntityAddress::Task(task_scope),
+            AgentEntityAddress::Run(scope.clone()),
+            AgentExchangePayload::encode(crate::task::AGENT_HANDOFF_RESULT_PAYLOAD_TYPE, &notice)
+                .expect("the payload encodes"),
+            rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )
+        .expect("the envelope builds");
+
+        // A live run whose cell settled under a local failure: the
+        // acceptance applies as a first resolution would, and the source
+        // terminalizes `HandedOff` instead of spending budget on a task it
+        // no longer owns.
+        let mut live = build_state(
+            AgentRunStatus::Running,
+            None,
+            AgentHandoffStatus::Failed {
+                code: "run-winding-down".to_string(),
+            },
+        );
+        let result = accept_handoff_result(&mut live, &envelope, now);
+        assert!(result.is_accepted(), "the correction settles the exchange");
+        let run = live.run().expect("the run survives");
+        assert!(
+            matches!(
+                run.loop_state.handoff().expect("the cell survives").status,
+                AgentHandoffStatus::Accepted { .. }
+            ),
+            "the cell is corrected to the durable acceptance"
+        );
+        assert!(
+            matches!(
+                run.terminal_reason,
+                Some(AgentRunTerminalReason::HandedOff { .. })
+            ),
+            "responsibility durably moved, so the source hands off"
+        );
+        assert_eq!(run.status, AgentRunStatus::HandedOff);
+
+        // An already-terminal run: the terminal state is history and stands,
+        // but the cell is corrected so the views carry the durable truth.
+        let mut terminal = build_state(
+            AgentRunStatus::Cancelled,
+            Some(AgentRunTerminalReason::CancellationRequested {
+                reason: "cancelled".to_string(),
+            }),
+            AgentHandoffStatus::Failed {
+                code: "run-winding-down".to_string(),
+            },
+        );
+        let result = accept_handoff_result(&mut terminal, &envelope, now);
+        assert!(result.is_accepted(), "the correction settles the exchange");
+        let run = terminal.run().expect("the run survives");
+        assert!(
+            matches!(
+                run.loop_state.handoff().expect("the cell survives").status,
+                AgentHandoffStatus::Accepted { .. }
+            ),
+            "the cell is corrected to the durable acceptance"
+        );
+        assert_eq!(run.status, AgentRunStatus::Cancelled, "history stands");
+        assert!(matches!(
+            run.terminal_reason,
+            Some(AgentRunTerminalReason::CancellationRequested { .. })
+        ));
+
+        // A genuine duplicate absorbs idempotently: an accepted cell keeps
+        // its resolution untouched.
+        let mut duplicate = build_state(
+            AgentRunStatus::HandedOff,
+            Some(AgentRunTerminalReason::HandedOff {
+                handoff: handoff_id.clone(),
+                target: AgentId::new("billing-agent").expect("the agent id is valid"),
+            }),
+            AgentHandoffStatus::Accepted {
+                target_run,
+                generation: AgentAssignmentGeneration::new(2),
+            },
+        );
+        let result = accept_handoff_result(&mut duplicate, &envelope, now);
+        assert!(result.is_accepted(), "the duplicate answers idempotently");
+        assert_eq!(
+            duplicate.run().expect("the run survives").status,
+            AgentRunStatus::HandedOff
         );
     }
 }

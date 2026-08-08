@@ -577,6 +577,31 @@ impl AgentHandoffCell {
         self.settled_at = Some(now);
     }
 
+    /// Corrects the cell to the target's durably accepted assignment — the
+    /// one transition allowed to rewrite a settled resolution.
+    ///
+    /// First-writer-wins holds for every ordinary settle, but a locally
+    /// settled *failure* — a fenced wind-down, a reconciliation decision an
+    /// ambiguously failed write later contradicted — is this run's belief,
+    /// while the task's accepted resolution is the durable record of where
+    /// responsibility went, and the record wins. An already-accepted cell
+    /// keeps its resolution: the correction is idempotent.
+    pub fn correct_accepted(
+        &mut self,
+        target_run: AgentRunId,
+        generation: AgentAssignmentGeneration,
+        now: AgentTimestampMillis,
+    ) {
+        if matches!(self.status, AgentHandoffStatus::Accepted { .. }) {
+            return;
+        }
+        self.status = AgentHandoffStatus::Accepted {
+            target_run,
+            generation,
+        };
+        self.settled_at = Some(now);
+    }
+
     /// Settles the cell with a definitive refusal, first-writer-wins.
     pub fn settle_refused(&mut self, code: impl Into<String>, now: AgentTimestampMillis) {
         if self.status.is_settled() {

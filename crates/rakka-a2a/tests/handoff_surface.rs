@@ -30,24 +30,26 @@ use rakka_a2a::auth::{
 use rakka_a2a::mapping::{A2AHeaderTenantResolver, META_DEDUPLICATION_KEY};
 use rakka_a2a::projection::InMemoryA2ATaskProjectionStore;
 use rakka_agent::testkit::{
-    run_entity, CrashingStateStore, DeferredExchangeRouter, DeterministicModelAdapter,
+    run_entity, CrashPoint, CrashingStateStore, DeferredExchangeRouter, DeterministicModelAdapter,
     InProcessRunEntityTransport, InProcessTaskEntityTransport, ScriptedDispatcher,
 };
 use rakka_agent::{
-    handoff_id_for, run_id_for_assignment, AgentAssignmentGeneration, AgentAssignmentStatus,
-    AgentAuthorityEnvelope, AgentCapabilityId, AgentCoordinationCapabilityKind, AgentDefinition,
-    AgentDefinitionId, AgentDelegationTarget, AgentEntityClass, AgentEntityCommand,
-    AgentEntityState, AgentEntityStore, AgentExchangeRouter, AgentHandoffPolicy, AgentId,
-    AgentModelTurn, AgentOperationId, AgentOperationKind, AgentRevisionNumber,
-    AgentRevisionProvenance, AgentRunDelegationConfig, AgentRunScope, AgentRunState,
-    AgentRunStatus, AgentSchemaId, AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent,
-    AgentTaskDefinition, AgentTaskDefinitionId, AgentTaskEntityStore, AgentTaskHandoffStatus,
-    AgentTaskId, AgentTaskLimits, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId,
-    AgentTaskScope, AgentTaskState, AgentToolCallId, AgentToolCallRequest, AgentToolId,
-    InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore, StaticAgentDelegationCatalog,
-    TenantId, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    handoff_id_for, run_id_for_assignment, AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor,
+    AgentAssignmentGeneration, AgentAssignmentStatus, AgentAuthorityEnvelope, AgentCapabilityId,
+    AgentCoordinationCapabilityKind, AgentDefinition, AgentDefinitionId, AgentDelegationTarget,
+    AgentDispatchError, AgentEffectPolicies, AgentEntityClass, AgentEntityCommand,
+    AgentEntityState, AgentEntityStore, AgentExchangeRouter, AgentHandoffPolicy,
+    AgentHandoffRecord, AgentId, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentRevisionNumber, AgentRevisionProvenance, AgentRunDelegationConfig, AgentRunEffect,
+    AgentRunEffectRequest, AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaId,
+    AgentSchemaRef, AgentScope, AgentSettings, AgentTaskContent, AgentTaskDefinition,
+    AgentTaskDefinitionId, AgentTaskEntityStore, AgentTaskHandoffStatus, AgentTaskId,
+    AgentTaskLimits, AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope,
+    AgentTaskState, AgentToolCallId, AgentToolCallRequest, AgentToolId, InMemoryAgentRunEffectSink,
+    InMemoryAgentTaskHistoryStore, StaticAgentDelegationCatalog, TenantId,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{AgentEffectId, AgentTimestampMillis};
 use rakka_persistence::InMemoryDurableStateStore;
 
 type TaskStore = CrashingStateStore<AgentTaskState>;
@@ -820,4 +822,120 @@ async fn a_handoff_authorizes_as_its_own_operation_class() {
         .expect("the task exists");
     assert!(snapshot.handoff.is_none());
     assert_eq!(snapshot.handoffs, 0);
+}
+
+/// An ambiguous send failure with no recorded transfer is not a definitive
+/// refusal: the write that failed may still land after the probe reads, so
+/// the attempt stays retryable and the deduplicated re-send converges on the
+/// recorded transfer — instead of resuming the source beside it.
+#[tokio::test]
+async fn an_ambiguous_send_stays_retryable_until_the_transfer_records() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture.instantiate(&source()).await;
+    fixture.instantiate(&target()).await;
+    fixture.create_task().await;
+    // Drive the source's acceptance, exactly as the wire test does.
+    for _ in 0..4 {
+        let now = fixture.now();
+        let mut task = AgentTaskEntityStore::new(
+            fixture.task_scope(),
+            fixture.tasks.clone(),
+            fixture.agents.clone(),
+            fixture.history.clone(),
+        );
+        task.recover(now).await.expect("the task recovers");
+        let _ = task
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await;
+    }
+
+    let scope = fixture.run_scope(&source(), 1);
+    let handoff = handoff_id_for(&scope, 7, 0).expect("the handoff id derives");
+    let record = AgentHandoffRecord {
+        handoff: handoff.clone(),
+        goal: None,
+        task: AgentTaskId::new(TASK).expect("the task id is valid"),
+        source_run: scope.clone(),
+        source_generation: AgentAssignmentGeneration::new(1),
+        requested_skill: AgentCapabilityId::new(HANDOFF_SKILL).expect("the skill id is valid"),
+        resolved: AgentDelegationTarget::new(
+            target(),
+            AgentTaskDefinitionId::new(TASK_DEFINITION).expect("the definition id is valid"),
+        ),
+        reason: "needs billing authority".to_string(),
+        policy_revision: AgentRevisionNumber::INITIAL,
+        definition_revision: AgentRevisionNumber::INITIAL,
+        settings_revision: AgentRevisionNumber::INITIAL,
+        context: Vec::new(),
+        a2a_message_id: handoff.as_str().to_string(),
+        deduplication_key: handoff.as_str().to_string(),
+        turn: 7,
+        slot: 0,
+        effect: AgentEffectId::new("effect-1"),
+        call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+        telemetry: Default::default(),
+        created_at: AgentTimestampMillis::new(1),
+    };
+    // The intent is a throwaway for direct executor re-invocation: the
+    // executor reads only the record, exactly as its contract states. The
+    // request variant is loop-constructible only in production; the test
+    // re-encodes the record through serde, the path a durable replay takes.
+    let request: AgentRunEffectRequest =
+        serde_json::from_value(json!({ "a2a-handoff": { "handoff": record } }))
+            .expect("the request round-trips");
+    let spec = AgentEffectPolicies::default().spec_for(&request).clone();
+    let intent = AgentRunEffect::new(
+        &scope,
+        7,
+        0,
+        request,
+        &spec,
+        AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the intent builds");
+    let executor = A2AAgentHandoffSendExecutor::new(fixture.service.clone());
+
+    // Lose the RecordHandoff write before it commits: the send fails
+    // ambiguously and the probe finds no recorded transfer — which cannot
+    // prove the failed write will never land, so the attempt must stay
+    // retryable rather than refusing definitively.
+    fixture.tasks.reset_writes();
+    fixture.tasks.crash_at(1, CrashPoint::BeforeWrite);
+    let finding = executor.execute(&scope, &intent, &record, None).await;
+    fixture.tasks.assert_crash_fired(1, CrashPoint::BeforeWrite);
+    fixture.tasks.survive();
+    assert!(
+        matches!(
+            &finding,
+            Err(AgentDispatchError::Invocation { code, .. }) if *code == "handoff-unrecorded"
+        ),
+        "an unproven absence stays retryable, got {finding:?}"
+    );
+    let mut task = AgentTaskEntityStore::new(
+        fixture.task_scope(),
+        fixture.tasks.clone(),
+        fixture.agents.clone(),
+        fixture.history.clone(),
+    );
+    task.recover(fixture.now())
+        .await
+        .expect("the task recovers");
+    let snapshot = task
+        .snapshot()
+        .expect("the snapshot reads")
+        .expect("the task exists");
+    assert!(snapshot.handoff.is_none(), "nothing was recorded");
+    drop(task);
+
+    // The retry re-drives the same deduplicated send and records the
+    // transfer: the executor converges instead of stranding the source.
+    let finding = executor
+        .execute(&scope, &intent, &record, None)
+        .await
+        .expect("the re-driven send records the transfer");
+    assert!(
+        matches!(finding, AgentA2aHandoffFinding::Recorded { .. }),
+        "the re-driven send converges, got {finding:?}"
+    );
 }

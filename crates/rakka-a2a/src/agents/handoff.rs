@@ -15,15 +15,17 @@
 //! with the v1 extension URI declared.
 //!
 //! On an ambiguous failure the executor probes the task's authoritative
-//! durable state before giving up (the user-approved posture): a task whose
-//! materialized handoff provenance names this handoff proves the transfer
-//! was durably recorded — the finding is `Recorded`, converged exactly as an
-//! in-window replay would have been — while an *unresolved* transfer under a
-//! different identity is the explicit conflict; a settled previous hop is
-//! history and proves this transfer was never recorded. Only a probe that
-//! cannot answer either way leaves the attempt as a retryable error; when
-//! the attempt budget spends out, the source run parks indeterminate rather
-//! than resuming beside a possibly-live transfer.
+//! durable state before giving up: a task whose materialized handoff
+//! provenance names this handoff proves the transfer was durably recorded —
+//! the finding is `Recorded`, converged exactly as an in-window replay would
+//! have been — while an *unresolved* transfer under a different identity is
+//! the explicit conflict. The probe never answers definitively in the
+//! negative: an absent record at read time cannot prove the ambiguously
+//! failed write will never land, so that case — like a probe that cannot
+//! answer at all — leaves the attempt as a retryable error, and the
+//! deduplicated re-send converges on the recorded transfer or records it
+//! fresh. When the attempt budget spends out, the source run parks
+//! indeterminate rather than resuming beside a possibly-live transfer.
 
 use std::sync::Arc;
 
@@ -151,10 +153,12 @@ where
     /// projection, which is an observability read model that may lag the
     /// commit, and never `tasks/get`, whose deployment authorization gates
     /// external callers while this probe is the deployment's own recovery
-    /// step. `Ok(Some(finding))` is a definitive answer either way;
-    /// `Ok(None)` means the task's durable state records no transfer under
-    /// this handoff's identity — a task carrying no handoff, or only a
-    /// *settled previous hop*, proves this transfer was never recorded;
+    /// step. `Ok(Some(finding))` is a definitive answer; `Ok(None)` means
+    /// the task's durable state records no transfer under this handoff's
+    /// identity *at read time* — a task carrying no handoff, or only a
+    /// settled previous hop. That is deliberately not definitive: the write
+    /// that failed ambiguously may still land after this read, so the
+    /// caller keeps the attempt retryable rather than resuming the source;
     /// `Err` means the probe itself could not answer.
     async fn probe(
         &self,
@@ -240,16 +244,19 @@ fn finding_for_error(
             code: "collaboration-version-unsupported".to_string(),
             message: reason.to_string(),
         }),
-        RakkaAgentA2AError::Task(error) => match &error {
-            AgentTaskError::Persistence(_) => Err(AgentDispatchError::Invocation {
-                code: error.code(),
-                message: error.to_string(),
-            }),
-            _ => Ok(AgentA2aHandoffFinding::Refused {
-                code: error.code().to_string(),
-                message: error.to_string(),
-            }),
-        },
+        RakkaAgentA2AError::Task(error) => {
+            if task_error_is_ambiguous(&error) {
+                Err(AgentDispatchError::Invocation {
+                    code: error.code(),
+                    message: error.to_string(),
+                })
+            } else {
+                Ok(AgentA2aHandoffFinding::Refused {
+                    code: error.code().to_string(),
+                    message: error.to_string(),
+                })
+            }
+        }
         RakkaAgentA2AError::Refused { code, message } => {
             Ok(AgentA2aHandoffFinding::Refused { code, message })
         }
@@ -291,16 +298,25 @@ where
                 Ok(task) => task,
                 Err(error) if error_is_retryable(&error) => {
                     // The ambiguous case: the send may or may not have
-                    // committed. The probe decides from the task's durable
-                    // echo; only a probe that cannot answer leaves the
-                    // attempt retryable — and an exhausted budget then parks
-                    // the source indeterminate rather than resuming it.
+                    // committed. The probe answers definitively only in the
+                    // affirmative — a recorded transfer, or a foreign
+                    // unresolved one. An *absent* record is not proof of
+                    // absence: the very write that failed ambiguously may
+                    // still land after the probe reads, so declaring the
+                    // transfer definitively unrecorded would resume the
+                    // source beside a live transfer. The attempt stays
+                    // retryable instead: the deduplicated re-send converges
+                    // — echoing the late-landing write or recording fresh —
+                    // and an exhausted budget parks the source indeterminate
+                    // rather than resuming it.
                     return match self.probe(handoff).await {
                         Ok(Some(finding)) => Ok(finding),
-                        Ok(None) => Ok(AgentA2aHandoffFinding::Refused {
-                            code: "handoff-not-recorded".to_string(),
-                            message: "the send failed and the task's durable state records no \
-                                      transfer"
+                        Ok(None) => Err(AgentDispatchError::Invocation {
+                            code: "handoff-unrecorded",
+                            message: "the send failed and the task's durable state does not \
+                                      record the transfer yet; absence at probe time cannot \
+                                      prove the failed write will never land, so the \
+                                      deduplicated send re-drives"
                                 .to_string(),
                         }),
                         Err(probe_error) => Err(AgentDispatchError::Invocation {
@@ -350,14 +366,29 @@ where
     }
 }
 
+/// Whether a task-entity error leaves the send's outcome unknown: a store
+/// failure that may have struck around the durable commit, whichever layer
+/// wrapped it — the entity facade surfaces a write failure through the
+/// choreography host, not only as a bare persistence error.
+fn task_error_is_ambiguous(error: &AgentTaskError) -> bool {
+    match error {
+        AgentTaskError::Persistence(_) => true,
+        AgentTaskError::Choreography(inner) => matches!(
+            inner.as_ref(),
+            rakka_agent::AgentChoreographyError::Persistence(_)
+        ),
+        _ => false,
+    }
+}
+
 /// Whether a service error leaves the send's outcome unknown: a store or
 /// read failure that may have struck after the durable commit.
 fn error_is_retryable(error: &RakkaAgentA2AError) -> bool {
-    matches!(
-        error,
-        RakkaAgentA2AError::Task(AgentTaskError::Persistence(_))
-            | RakkaAgentA2AError::Entity(_)
-            | RakkaAgentA2AError::Run(_)
-            | RakkaAgentA2AError::Projection(_)
-    )
+    match error {
+        RakkaAgentA2AError::Task(error) => task_error_is_ambiguous(error),
+        RakkaAgentA2AError::Entity(_)
+        | RakkaAgentA2AError::Run(_)
+        | RakkaAgentA2AError::Projection(_) => true,
+        _ => false,
+    }
 }
