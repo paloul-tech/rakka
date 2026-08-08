@@ -678,6 +678,11 @@ pub const METRIC_AGENT_GOAL_STAGNATION: &str = "rakka.agent.goal.stagnation";
 /// ([specification 8.4](../../../docs/plans/rakka-agent/spec.md)).
 pub const METRIC_AGENT_DELEGATION_RESULTS: &str = "rakka.agent.delegation.results";
 
+/// Counter: handoff resolutions accepted or refused at the source run's door,
+/// labeled by bounded `outcome`
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+pub const METRIC_AGENT_HANDOFF_RESULTS: &str = "rakka.agent.handoff.results";
+
 /// Counter: fan-in groups resolved, labeled by the bounded resolution code
 /// (`all-settled` / `any-satisfied` / `quorum-satisfied` / `unsatisfiable` /
 /// `timed-out`) as `outcome`

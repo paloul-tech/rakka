@@ -433,6 +433,14 @@ pub struct AgentLoopState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     workflow_invocations:
         BTreeMap<AgentWorkflowInvocationId, Box<crate::workflow_tool::AgentWorkflowInvocationCell>>,
+    /// The run's one handoff, committed in the same compare-and-set as its
+    /// send effect ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    /// At most one, ever unsettled: an unresolved or accepted cell fences the
+    /// run from new work, a settled refusal or failure may be replaced by a
+    /// later attempt, and an accepted transfer terminates the run. A loop
+    /// state persisted before this field decodes without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff: Option<Box<crate::coordination::AgentHandoffCell>>,
 }
 
 /// One completed goal evaluation and where its report to the coordinating
@@ -511,6 +519,7 @@ impl AgentLoopState {
             delegation_envelope: None,
             fan_in: None,
             workflow_invocations: BTreeMap::new(),
+            handoff: None,
         }
     }
 
@@ -777,6 +786,15 @@ impl AgentLoopState {
     /// "explicit reconciliation decision" the specification names as the
     /// other way out, so an operator can always resolve a child whose real
     /// outcome was established out of band.
+    ///
+    /// # The handoff half holds the wind-down for its resolution
+    ///
+    /// An unresolved handoff — committed, or recorded at the task with the
+    /// target's assignment still open — holds the disposition exactly like an
+    /// unsettled child: the task owes the source one handoff-result exchange
+    /// either way ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)),
+    /// and a wind-down that completed before it arrived could terminalize
+    /// `Cancelled` a run whose responsibility had already durably moved.
     #[must_use]
     pub fn awaits_children(&self) -> bool {
         let delegation_open = self.delegations.values().any(|cell| match &cell.status {
@@ -787,6 +805,13 @@ impl AgentLoopState {
             _ => false,
         });
         if delegation_open {
+            return true;
+        }
+        if self
+            .handoff
+            .as_ref()
+            .is_some_and(|cell| cell.status.awaits_target())
+        {
             return true;
         }
         self.workflow_invocations
@@ -809,12 +834,13 @@ impl AgentLoopState {
     /// abandoned by the fence
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)).
     ///
-    /// A fenced delegation send or workflow start settles its cell as failed
-    /// in the same pass: the send provably never left the run, so the
-    /// winding-down parent never spawned the child, and recovery after the
-    /// wind-down uses a new delegation or invocation, never this one. Fencing
-    /// anywhere else would leave a `Pending` cell under a cancelled effect —
-    /// exactly the disagreement the cell's commit discipline forbids.
+    /// A fenced delegation send, handoff send, or workflow start settles its
+    /// cell as failed in the same pass: the send provably never left the run,
+    /// so the winding-down parent never spawned the child — or never recorded
+    /// the transfer at the task — and recovery after the wind-down uses a new
+    /// delegation, handoff, or invocation, never this one. Fencing anywhere
+    /// else would leave a `Pending` cell under a cancelled effect — exactly
+    /// the disagreement the cell's commit discipline forbids.
     ///
     /// The two kinds the wind-down itself authorizes — a scheduled
     /// compensation and a chased workflow-cancel — are exempt
@@ -848,6 +874,14 @@ impl AgentLoopState {
                 .delegations
                 .values_mut()
                 .find(|cell| cell.record.effect == effect_id)
+            {
+                cell.settle_failed("run-winding-down", now);
+                continue;
+            }
+            if let Some(cell) = self
+                .handoff
+                .as_deref_mut()
+                .filter(|cell| cell.record.effect == effect_id)
             {
                 cell.settle_failed("run-winding-down", now);
             }
@@ -1278,6 +1312,49 @@ impl AgentLoopState {
     #[must_use]
     pub fn delegation_count(&self) -> usize {
         self.delegations.len()
+    }
+
+    /// The run's one handoff cell, when it holds one
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    #[must_use]
+    pub fn handoff(&self) -> Option<&crate::coordination::AgentHandoffCell> {
+        self.handoff.as_deref()
+    }
+
+    /// Mutable access to the handoff cell, for the transitions that mark it
+    /// sent or settle it.
+    pub(crate) fn handoff_mut(&mut self) -> Option<&mut crate::coordination::AgentHandoffCell> {
+        self.handoff.as_deref_mut()
+    }
+
+    /// Commits the handoff cell alongside its send effect.
+    ///
+    /// Idempotent on the handoff identity: a replayed transition finds the
+    /// cell already present and leaves the original in place. A settled
+    /// refusal or failure is replaced — a later attempt is a new handoff
+    /// under a new `(turn, slot)` identity — while an unsettled or accepted
+    /// cell is never overwritten: the interception door refuses a second
+    /// handoff while one holds the fence.
+    pub(crate) fn record_handoff(&mut self, cell: crate::coordination::AgentHandoffCell) {
+        match &self.handoff {
+            Some(existing)
+                if existing.record.handoff == cell.record.handoff
+                    || existing.status.holds_fence() => {}
+            _ => self.handoff = Some(Box::new(cell)),
+        }
+    }
+
+    /// Whether an unresolved or accepted handoff fences this run from new
+    /// work ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived from the cell's status, never a separate marker: the cell
+    /// commits in the same compare-and-set as its send effect, so the fence
+    /// can never disagree with what was committed.
+    #[must_use]
+    pub fn handoff_fenced(&self) -> bool {
+        self.handoff
+            .as_ref()
+            .is_some_and(|cell| cell.status.holds_fence())
     }
 
     /// Direct children this run has spent against its fan-out ceiling: every

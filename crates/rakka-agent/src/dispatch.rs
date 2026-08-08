@@ -497,6 +497,70 @@ pub trait AgentA2aSendExecutor: Send + Sync {
     ) -> AgentDispatchFuture<'a, AgentA2aSendFinding>;
 }
 
+/// What one outbound handoff send established
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentA2aHandoffFinding {
+    /// The task durably recorded — or replayed onto — the handoff's one
+    /// logical transfer and offered the target its assignment generation.
+    /// Never proof the target accepted: acceptance returns later through
+    /// the handoff-result exchange.
+    Recorded {
+        /// The assignment generation the task minted toward the target,
+        /// when the surface reported one.
+        target_generation: Option<crate::task::AgentAssignmentGeneration>,
+        /// The peer's bounded task-state label.
+        peer_status: String,
+    },
+    /// The task holds a transfer this handoff's identity does not own — the
+    /// explicit conflict of
+    /// [specification 14.4](../../../docs/plans/rakka-agent/spec.md). The
+    /// generation settles `Failed` under the code and the cell records the
+    /// conflict; recovery uses a new handoff, never this one.
+    Conflict {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+    /// Definitively refused without recording a transfer: no retry can
+    /// change the answer, and the source run resumes with the failed tool
+    /// result.
+    Refused {
+        /// Stable machine-readable code.
+        code: String,
+        /// Human-readable detail.
+        message: String,
+    },
+}
+
+/// Executes one outbound handoff send inside a bounded dispatch attempt
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)): carries
+/// the handoff record — verbatim, exactly as it was persisted — to the
+/// task's surface with the versioned collaboration metadata, the record's
+/// message id, and its deduplication key, so a retried attempt converges on
+/// the same logical transfer.
+///
+/// An `Err` from `execute` is a *retryable* attempt failure under the
+/// effect's idempotent attempt bound; a finding is definitive. On an
+/// ambiguous transport loss the implementation probes the task's durable
+/// state before giving up: a recorded provenance echoing this handoff id
+/// proves delivery, its absence proves the transfer was never recorded, and
+/// only a probe that cannot answer either way leaves the attempt ambiguous —
+/// the run then parks for a reconciliation decision rather than resuming
+/// beside a live transfer. An absent executor fails closed at `invoke`.
+pub trait AgentA2aHandoffSendExecutor: Send + Sync {
+    /// Performs the send and returns its bounded finding.
+    fn execute<'a>(
+        &'a self,
+        scope: &'a AgentRunScope,
+        intent: &'a AgentRunEffect,
+        handoff: &'a crate::coordination::AgentHandoffRecord,
+        credential: Option<&'a AgentEphemeralCredential>,
+    ) -> AgentDispatchFuture<'a, AgentA2aHandoffFinding>;
+}
+
 /// What one workflow start established
 /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1381,6 +1445,7 @@ where
     memory_promotions: Option<Arc<dyn AgentMemoryPromotionExecutor>>,
     goal_evaluations: Option<Arc<dyn AgentGoalEvaluationExecutor>>,
     a2a_sends: Option<Arc<dyn AgentA2aSendExecutor>>,
+    a2a_handoffs: Option<Arc<dyn AgentA2aHandoffSendExecutor>>,
     workflow_starts: Option<Arc<dyn AgentWorkflowStartExecutor>>,
     workflow_cancels: Option<Arc<dyn AgentWorkflowCancelExecutor>>,
     claim_appends: Option<Arc<dyn AgentClaimAppendExecutor>>,
@@ -1441,6 +1506,7 @@ where
             memory_promotions: None,
             goal_evaluations: None,
             a2a_sends: None,
+            a2a_handoffs: None,
             workflow_starts: None,
             workflow_cancels: None,
             claim_appends: None,
@@ -1535,6 +1601,20 @@ where
     #[must_use]
     pub fn with_a2a_send_executor(mut self, a2a_sends: Arc<dyn AgentA2aSendExecutor>) -> Self {
         self.a2a_sends = Some(a2a_sends);
+        self
+    }
+
+    /// Executes outbound handoff sends through the given executor
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)) —
+    /// usually `rakka-a2a`'s in-process handoff-send executor over the
+    /// deployment's agents surface. Without one, a handoff dispatch fails
+    /// closed with a stable code.
+    #[must_use]
+    pub fn with_a2a_handoff_executor(
+        mut self,
+        a2a_handoffs: Arc<dyn AgentA2aHandoffSendExecutor>,
+    ) -> Self {
+        self.a2a_handoffs = Some(a2a_handoffs);
         self
     }
 
@@ -2646,6 +2726,34 @@ where
                     }),
                     AgentA2aSendFinding::Conflict { code, message }
                     | AgentA2aSendFinding::Refused { code, message } => {
+                        Ok(AgentRunEffectOutcome::Failed { code, message })
+                    }
+                }
+            }
+            AgentRunEffectRequest::A2aHandoff { handoff } => {
+                let Some(executor) = self.a2a_handoffs.as_ref() else {
+                    // Fail closed, definitively, the compensation precedent:
+                    // nothing was invoked, and an absent executor will not
+                    // appear mid-generation.
+                    return Ok(AgentRunEffectOutcome::Failed {
+                        code: "a2a-handoff-executor-missing".to_string(),
+                        message: "no A2A handoff executor is configured for this dispatcher"
+                            .to_string(),
+                    });
+                };
+                match executor.execute(scope, intent, handoff, credential).await? {
+                    AgentA2aHandoffFinding::Recorded {
+                        target_generation,
+                        peer_status,
+                    } => Ok(AgentRunEffectOutcome::A2aHandoff {
+                        receipt: crate::coordination::AgentA2aHandoffReceipt {
+                            handoff: handoff.handoff.clone(),
+                            target_generation,
+                            peer_status,
+                        },
+                    }),
+                    AgentA2aHandoffFinding::Conflict { code, message }
+                    | AgentA2aHandoffFinding::Refused { code, message } => {
                         Ok(AgentRunEffectOutcome::Failed { code, message })
                     }
                 }

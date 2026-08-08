@@ -9,6 +9,16 @@ use rakka_agent_workflow::PrincipalRef;
 pub enum A2AOperation {
     /// `message:send` (blocking or streaming).
     SendMessage,
+    /// A `message:send` carrying the collaboration extension's handoff
+    /// cluster: the state-mutating same-task transfer of responsibility.
+    ///
+    /// A distinct operation class from [`Self::SendMessage`] so a deployment
+    /// authorizer can gate transfers separately from ordinary sends — the
+    /// request carries the claimed transfer as
+    /// [`A2AAuthorizationRequest::handoff`], which is what lets the
+    /// authorizer bind the authenticated caller to the source run the
+    /// cluster claims.
+    RecordHandoff,
     /// `tasks/get`.
     GetTask,
     /// `tasks/list`.
@@ -35,6 +45,7 @@ impl A2AOperation {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::SendMessage => "send-message",
+            Self::RecordHandoff => "record-handoff",
             Self::GetTask => "get-task",
             Self::ListTasks => "list-tasks",
             Self::CancelTask => "cancel-task",
@@ -48,6 +59,27 @@ impl A2AOperation {
     }
 }
 
+/// The transfer claim riding one [`A2AOperation::RecordHandoff`] check.
+///
+/// Every field is the wire cluster's *claim*, surfaced before anything
+/// durable happens so the deployment authorizer can bind the authenticated
+/// caller to the source run the cluster names — the durable transition then
+/// re-validates the same claims against task state, which gates consistency
+/// but never identity.
+#[derive(Debug, Clone, Copy)]
+pub struct A2AHandoffClaim<'a> {
+    /// The handoff identity the cluster carries.
+    pub handoff: &'a str,
+    /// The agent the caller claims initiated the transfer.
+    pub source_agent: &'a str,
+    /// The source run id the caller claims to speak for.
+    pub source_run: &'a str,
+    /// The assignment generation the caller claims the source serves.
+    pub source_generation: u64,
+    /// The agent the transfer targets.
+    pub target_agent: &'a str,
+}
+
 /// One authorization check.
 #[derive(Debug, Clone)]
 pub struct A2AAuthorizationRequest<'a> {
@@ -59,6 +91,8 @@ pub struct A2AAuthorizationRequest<'a> {
     pub task_id: Option<&'a str>,
     /// Authenticated principal, when the request supplied one.
     pub principal: Option<&'a PrincipalRef>,
+    /// The claimed transfer, on [`A2AOperation::RecordHandoff`] checks.
+    pub handoff: Option<A2AHandoffClaim<'a>>,
 }
 
 /// Authorization decision.

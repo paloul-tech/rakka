@@ -286,6 +286,13 @@ pub const AGENT_DELEGATION_CANCEL_PAYLOAD_TYPE: &str = "rakka.agent.DelegationCa
 pub const AGENT_DELEGATION_CANCEL_RECEIPT_PAYLOAD_TYPE: &str =
     "rakka.agent.DelegationCancelReceipt";
 
+/// Payload type of an [`AgentExchangeKind::HandoffResult`] exchange notice.
+pub const AGENT_HANDOFF_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.HandoffResult";
+
+/// Payload type of the source run's receipt replying to an
+/// [`AgentExchangeKind::HandoffResult`].
+pub const AGENT_HANDOFF_RESULT_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.HandoffResultReceipt";
+
 /// Payload type of an [`AgentRunAssignment`] exchange command.
 pub const AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE: &str = "rakka.agent.RunAssignment";
 
@@ -1233,17 +1240,30 @@ pub struct AgentTaskLimits {
     pub max_assignments: u32,
     /// How many dependencies the task may declare.
     pub max_dependencies: usize,
+    /// How many handoffs the task may record over its lifetime
+    /// ([specification 9.6](../../../docs/plans/rakka-agent/spec.md):
+    /// handoffs/reassignments are bounded; this is also what bounds an
+    /// A→B→A oscillation deterministically). Definitions persisted before
+    /// this field load with the default bound.
+    #[serde(default = "default_max_handoffs")]
+    pub max_handoffs: u32,
+}
+
+/// The default handoff bound of [`AgentTaskLimits`].
+const fn default_max_handoffs() -> u32 {
+    4
 }
 
 impl AgentTaskLimits {
-    /// The default bounds: three rejections, three assignments, and the
-    /// crate-level dependency maximum.
+    /// The default bounds: three rejections, three assignments, four
+    /// handoffs, and the crate-level dependency maximum.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             max_result_rejections: 3,
             max_assignments: 3,
             max_dependencies: AGENT_TASK_MAX_DEPENDENCIES,
+            max_handoffs: default_max_handoffs(),
         }
     }
 
@@ -1265,6 +1285,13 @@ impl AgentTaskLimits {
     #[must_use]
     pub const fn with_max_dependencies(mut self, maximum: usize) -> Self {
         self.max_dependencies = maximum;
+        self
+    }
+
+    /// Sets how many handoffs the task may record over its lifetime.
+    #[must_use]
+    pub const fn with_max_handoffs(mut self, maximum: u32) -> Self {
+        self.max_handoffs = maximum;
         self
     }
 
@@ -2077,6 +2104,142 @@ pub struct AgentTaskAssignment {
     pub assigned_at: AgentTimestampMillis,
 }
 
+/// The task's *latest* handoff: the bounded materialized provenance of one
+/// same-task transfer ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only the latest hop is materialized — the chain is history, exactly as
+/// superseded assignments are ([specification 9.6](../../../docs/plans/rakka-agent/spec.md))
+/// — and this record is load-bearing three ways:
+///
+/// - it is the deduplication **echo past the journal's bounded window**: a
+///   replayed handoff command matching [`Self::handoff`] answers with the
+///   recorded target rather than minting a second transfer;
+/// - it is the **source address** every owed derivation reads — the current
+///   assignment names the target after the transfer, so without this record
+///   nothing could reach the source run again; and
+/// - it is the goal view's **source-run join**, the one thing that keeps a
+///   handed-off generation out of the earlier-generations gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskHandoff {
+    /// The handoff identity, derived by the source run.
+    pub handoff: crate::identity::AgentHandoffId,
+    /// The source assignment, stashed whole at the transfer so a refused
+    /// handoff restores it exactly — the source never stopped being its
+    /// generation's accepted owner, and its escrow child was never touched.
+    pub source_assignment: Box<AgentTaskAssignment>,
+    /// The agent the transfer targets.
+    pub target: AgentId,
+    /// The assignment generation minted toward the target, once the decision
+    /// ran.
+    #[serde(default)]
+    pub target_generation: Option<AgentAssignmentGeneration>,
+    /// The bounded reason the source's model supplied.
+    pub reason: String,
+    /// The handoff policy revision that authorized the transfer.
+    pub policy_revision: AgentRevisionNumber,
+    /// Explicit context/artifact references projected to the target — never
+    /// content, never memory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// The communal knowledge spaces the catalog explicitly delegates to the
+    /// target ([specification 8.5](../../../docs/plans/rakka-agent/spec.md)).
+    /// The envelope derivation intersects the task's own grant with this
+    /// statement, so a handoff can never widen communal access.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+    /// Where the transfer stands.
+    pub status: AgentTaskHandoffStatus,
+    /// Whether the handoff-result exchange to the source has settled: the
+    /// durable once-guard past the journal's bounded deduplication window,
+    /// the delegation cell's `cancel` precedent.
+    #[serde(default)]
+    pub result_settled: bool,
+    /// When the transfer was recorded.
+    pub recorded_at: AgentTimestampMillis,
+    /// When the transfer settled, when it has.
+    #[serde(default)]
+    pub settled_at: Option<AgentTimestampMillis>,
+}
+
+impl AgentTaskHandoff {
+    /// Whether the transfer has resolved, accepted or refused.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        !matches!(self.status, AgentTaskHandoffStatus::Initiated)
+    }
+}
+
+/// Where one recorded handoff stands on the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentTaskHandoffStatus {
+    /// Recorded: the source assignment is stashed and the target's
+    /// generation is offered or about to be.
+    Initiated,
+    /// The target's assignment was durably accepted: responsibility has
+    /// transferred.
+    Accepted,
+    /// The transfer resolved without an accepted target; the source
+    /// assignment was restored.
+    Refused {
+        /// Stable machine-readable refusal code.
+        code: String,
+    },
+}
+
+impl AgentTaskHandoffStatus {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Initiated => "initiated",
+            Self::Accepted => "accepted",
+            Self::Refused { .. } => "refused",
+        }
+    }
+}
+
+/// The request an [`AgentTaskEntityCommand::RecordHandoff`] command carries
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Built by the A2A ingress from the collaboration metadata's handoff
+/// cluster. Every field is a *claim* the transition re-validates against the
+/// task's durable state — the source must be the current accepted
+/// assignment, the target contract must match — so forged metadata fails
+/// closed at the transition, never by trusting the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskHandoffRequest {
+    /// The handoff identity the source run derived.
+    pub handoff: crate::identity::AgentHandoffId,
+    /// The agent the source run claims to be.
+    pub source_agent: AgentId,
+    /// The source run claiming the transfer.
+    pub source_run: AgentRunId,
+    /// The assignment generation the source claims to serve.
+    pub source_generation: AgentAssignmentGeneration,
+    /// The agent the transfer targets.
+    pub target: AgentId,
+    /// The task definition the resolved target serves — the contract half of
+    /// specification 8.9's target-acceptance validation.
+    pub target_task_definition: crate::definition::AgentTaskDefinitionId,
+    /// The result schema the resolved target expects, when its catalog entry
+    /// declares one.
+    #[serde(default)]
+    pub result_schema: Option<AgentSchemaRef>,
+    /// The bounded reason the source's model supplied.
+    pub reason: String,
+    /// The handoff policy revision that authorized the transfer.
+    pub policy_revision: AgentRevisionNumber,
+    /// Explicit context/artifact references projected to the target.
+    #[serde(default)]
+    pub context: Vec<String>,
+    /// The communal knowledge spaces the catalog explicitly delegates to the
+    /// target.
+    #[serde(default)]
+    pub knowledge_spaces: BTreeSet<crate::identity::KnowledgeSpaceId>,
+}
+
 /// Why an assignment decision refused an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2276,6 +2439,19 @@ pub enum AgentTaskHistoryKind {
     AssignmentAccepted,
     /// The assigned run refused its assignment, retiring the generation.
     AssignmentReleased,
+    /// A handoff was recorded: the source assignment was stashed and a
+    /// generation offered toward the target
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). The
+    /// entry carries the source assignment; the detail carries the handoff
+    /// id and target agent — this is where handoff lineage lands in
+    /// authorized task history ([specification 14.2](../../../docs/plans/rakka-agent/spec.md)).
+    HandoffInitiated,
+    /// The handoff's target assignment was durably accepted: responsibility
+    /// transferred.
+    HandoffAccepted,
+    /// The handoff resolved without an accepted target; the source
+    /// assignment was restored. The detail carries the refusal code.
+    HandoffRefused,
     /// A run proposed a typed result.
     ResultProposed,
     /// A proposal passed every deterministic rule.
@@ -2343,6 +2519,9 @@ impl AgentTaskHistoryKind {
             Self::AssignmentRefused => "assignment-refused",
             Self::AssignmentAccepted => "assignment-accepted",
             Self::AssignmentReleased => "assignment-released",
+            Self::HandoffInitiated => "handoff-initiated",
+            Self::HandoffAccepted => "handoff-accepted",
+            Self::HandoffRefused => "handoff-refused",
             Self::ResultProposed => "result-proposed",
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
@@ -2833,6 +3012,48 @@ pub struct AgentRunCancelReceipt {
     pub status: crate::run::AgentRunStatus,
 }
 
+/// The notice an [`AgentExchangeKind::HandoffResult`] exchange carries to the
+/// source run: how its handoff resolved
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed by the task whose handoff provenance settled — accepted when the
+/// target's assignment was durably accepted, refused when the transfer
+/// resolved without one — and re-derived by every settle pass until the
+/// exchange settles, so a lost notice is re-owed rather than gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHandoffResultNotice {
+    /// The task reporting the resolution.
+    pub task: AgentTaskScope,
+    /// The handoff this notice resolves. The source run's arm matches it
+    /// against its own cell's record: a mismatch is a forgery, whatever the
+    /// sender claims.
+    pub handoff: crate::identity::AgentHandoffId,
+    /// How the handoff resolved.
+    pub resolution: AgentHandoffResolutionNotice,
+}
+
+/// How a handoff resolved, as its result notice reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentHandoffResolutionNotice {
+    /// The target's assignment was durably accepted: responsibility has
+    /// transferred, and the source terminalizes `HandedOff`.
+    Accepted {
+        /// The target run now serving the task.
+        target_run: AgentRunId,
+        /// The accepted assignment generation.
+        generation: AgentAssignmentGeneration,
+    },
+    /// The transfer resolved without an accepted target: the source
+    /// assignment was restored and the source resumes with the failed tool
+    /// result this code reaches the model as.
+    Refused {
+        /// Stable machine-readable refusal code.
+        code: String,
+    },
+}
+
 /// A run's report of what it finally consumed, carried by an
 /// [`AgentExchangeKind::BudgetSettlement`] exchange
 /// ([specification 9.7](../../../docs/plans/rakka-agent/spec.md)).
@@ -3219,6 +3440,15 @@ pub struct AgentTask {
     pub assignment_generation: AgentAssignmentGeneration,
     /// How many assignment generations the task has consumed.
     pub assignments: u32,
+    /// The latest handoff, when one was recorded
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)); the
+    /// chain is history. Records persisted before this field load without
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Box<AgentTaskHandoff>>,
+    /// How many handoffs the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub handoffs: u32,
     /// The most recent assignment refusal.
     pub last_refusal: Option<AgentAssignmentRefusal>,
     /// The accepted typed result.
@@ -3320,6 +3550,14 @@ impl AgentTask {
         }
         Ok(())
     }
+}
+
+/// The `skip_serializing_if` predicate of the task's handoff counter: a task
+/// that never handed off serializes byte-identically to one persisted before
+/// the field existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The compact result of one accepted task transition.
@@ -3525,6 +3763,8 @@ impl AgentTaskState {
             goal: task.goal.clone(),
             parent: task.parent.clone(),
             delegation: task.delegation.clone(),
+            handoff: task.handoff.clone(),
+            handoffs: task.handoffs,
             assignment: task.assignment.clone(),
             assignment_generation: task.assignment_generation,
             dependencies: task.dependencies.values().cloned().collect(),
@@ -3692,6 +3932,14 @@ pub struct AgentTaskSnapshot {
     /// created it. Snapshots persisted before this field load without one.
     #[serde(default)]
     pub delegation: Option<Box<crate::delegation::AgentTaskDelegationProvenance>>,
+    /// The latest handoff, when one was recorded
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Box<AgentTaskHandoff>>,
+    /// How many handoffs the task has recorded over its lifetime.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub handoffs: u32,
     /// Its current assignment.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation it has decided.
@@ -3847,6 +4095,47 @@ fn narrowed_delegation_budget(
 /// definition's own ceilings when the definition declares any: without an
 /// envelope the delegation door would enforce nothing for these runs.
 fn delegation_envelope_for(
+    task: &AgentTask,
+) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
+    let mut envelope = delegation_envelope_base(task);
+    // The handoff post-step ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+    // a transfer preserves the task's own lineage, depth, and narrowing —
+    // the same task is the same node in the tree, so no fourth branch — but
+    // the target's communal grant is the task's own statement intersected
+    // with what the catalog explicitly delegates to that target, so a
+    // handoff can never widen communal access. Ancestors deliberately do not
+    // gain the source agent: the chains stay parallel to the lineage, and
+    // returning a task to a previous agent is bounded by the handoff limit,
+    // not refused structurally.
+    if let Some(handoff) = task
+        .handoff
+        .as_deref()
+        .filter(|handoff| !matches!(handoff.status, AgentTaskHandoffStatus::Refused { .. }))
+    {
+        if let Some(env) = envelope.as_deref_mut() {
+            env.knowledge_spaces = Some(match env.knowledge_spaces.take() {
+                Some(granted) => handoff
+                    .knowledge_spaces
+                    .intersection(&granted)
+                    .cloned()
+                    .collect(),
+                // A chain without its own grant statement cannot prove what
+                // it may pass on: deny-when-unknown, the ancestry-gap
+                // posture the delegation door takes.
+                None if !env.lineage.is_empty() => BTreeSet::new(),
+                // At the root the definition envelope still bounds every
+                // append, and the catalog's explicit statement becomes the
+                // grant — the delegation door's root posture.
+                None => handoff.knowledge_spaces.clone(),
+            });
+        }
+    }
+    envelope
+}
+
+/// The base envelope of [`delegation_envelope_for`]: the three creation-shape
+/// arms, before the handoff post-step.
+fn delegation_envelope_base(
     task: &AgentTask,
 ) -> Option<Box<crate::delegation::AgentRunDelegationEnvelope>> {
     if let Some(goal_state) = task.goal_state.as_deref() {
@@ -4159,6 +4448,8 @@ fn create_task(
         assignment: None,
         assignment_generation: AgentAssignmentGeneration::UNASSIGNED,
         assignments: 0,
+        handoff: None,
+        handoffs: 0,
         last_refusal: None,
         accepted_result: None,
         rejection_count: 0,
@@ -4526,7 +4817,28 @@ fn request_task_cancellation(
         );
     }
 
-    let mut owed: Vec<AgentExchangeEnvelope> = owed_run_cancel(state, now)?.into_iter().collect();
+    // A pending handoff whose target generation was never minted resolves
+    // refused here, in the same compare-and-set as the marker: the restored
+    // source assignment is the accepted one the run-cancel below reaches,
+    // and the source's fence releases into its wind-down through the owed
+    // handoff result. A minted, still-offered generation is left to its
+    // Assignment settle — acceptance routes the cancel to the target and the
+    // result to the source; refusal restores the source exactly as here
+    // ([specification 8.7 and 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    let unminted_handoff = state.task.as_ref().is_some_and(|task| {
+        task.handoff
+            .as_deref()
+            .is_some_and(|handoff| !handoff.is_settled() && handoff.target_generation.is_none())
+    });
+    let mut owed: Vec<AgentExchangeEnvelope> = Vec::new();
+    if unminted_handoff {
+        owed.extend(resolve_handoff_refusal(
+            state,
+            AGENT_TASK_REFUSAL_CANCEL_REQUESTED,
+            now,
+        )?);
+    }
+    owed.extend(owed_run_cancel(state, now)?);
     owed.extend(finalize_task_cancellation(state, operation_id, now)?);
     Ok(owed)
 }
@@ -4670,6 +4982,358 @@ fn terminate(
         );
     }
     Ok(())
+}
+
+/// Whether the task carries an unresolved handoff
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+fn task_handoff_pending(task: &AgentTask) -> bool {
+    task.handoff
+        .as_deref()
+        .is_some_and(|handoff| !handoff.is_settled())
+}
+
+/// Records one handoff: validates the claim against durable state, stashes
+/// the source assignment whole, and points the task at the target — the
+/// same-task transfer of [specification 8.9](../../../docs/plans/rakka-agent/spec.md).
+///
+/// Atomically validate-then-mutate: a refusal leaves the task exactly as it
+/// found it, which is what lets the source treat a definitive refusal as
+/// proof no transfer was recorded. A replay matching the recorded handoff id
+/// accepts idempotently — the materialized provenance is the deduplication
+/// echo past the journal's bounded window.
+fn record_handoff(
+    state: &mut AgentTaskState,
+    operation_id: &AgentOperationId,
+    request: &AgentTaskHandoffRequest,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<()> {
+    let task = state.task_mut()?;
+    if let Some(existing) = task.handoff.as_deref() {
+        if existing.handoff == request.handoff {
+            // First-writer-wins echo: the transfer is already recorded, and
+            // the reply carries the recorded outcome rather than minting a
+            // second one. Checked before every guard — including the
+            // terminal one — because this is the deduplication echo past the
+            // journal's bounded window: a re-dispatched send replaying after
+            // the target completed the task must converge on the recorded
+            // transfer, not be refused as if none was recorded.
+            return Ok(());
+        }
+    }
+    if task.status.is_terminal() {
+        return Err(AgentTaskError::Terminal {
+            status: task.status,
+        });
+    }
+    if let Some(existing) = task.handoff.as_deref() {
+        if !existing.is_settled() {
+            return Err(AgentTaskError::HandoffRefused {
+                code: "handoff-conflict",
+                message: format!(
+                    "the task already carries the unresolved handoff {}",
+                    existing.handoff
+                ),
+            });
+        }
+    }
+    // The structural re-validation the request's contract promises ("every
+    // field is a claim the transition re-validates"): the wire's context
+    // projection re-passes the sender-side reference bounds, and the whole
+    // claim re-passes the record's serialized ceiling, so an oversized
+    // cluster can never consume the task's bounded materialized headroom and
+    // wedge later transitions that need it.
+    if let Err(error) = crate::coordination::check_context_refs(&request.context) {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-context-invalid",
+            message: error.to_string(),
+        });
+    }
+    let request_bytes = serde_json::to_vec(request)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if request_bytes > crate::coordination::AGENT_HANDOFF_RECORD_MAX_BYTES {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-request-too-large",
+            message: format!(
+                "the handoff cluster serializes to {request_bytes} bytes; at most {} are accepted",
+                crate::coordination::AGENT_HANDOFF_RECORD_MAX_BYTES
+            ),
+        });
+    }
+    if task.cancellation.is_some() {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-task-cancelling",
+            message: "the task's cancellation is propagating; no transfer can be recorded"
+                .to_string(),
+        });
+    }
+    if !task.definition.is_agent_owned() {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-not-agent-owned",
+            message: "only an agent-owned task can be handed off".to_string(),
+        });
+    }
+    let Some(assignment) = task.assignment.as_ref() else {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-source-not-current",
+            message: "the task has no current assignment to transfer from".to_string(),
+        });
+    };
+    if assignment.status != AgentAssignmentStatus::Accepted
+        || assignment.agent != request.source_agent
+        || assignment.run != request.source_run
+        || assignment.generation != request.source_generation
+    {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-source-not-current",
+            message: format!(
+                "the claimed source {}/{} generation {} is not the current accepted assignment",
+                request.source_agent, request.source_run, request.source_generation
+            ),
+        });
+    }
+    if task.handoffs >= task.definition.limits.max_handoffs {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-limit-exceeded",
+            message: format!(
+                "the task already recorded its maximum of {} handoffs",
+                task.definition.limits.max_handoffs
+            ),
+        });
+    }
+    // The target-acceptance validation of specification 8.9: the resolved
+    // target must serve this task's typed contract. The definition identity
+    // must match, and a target that declares an expected result schema must
+    // declare *this* task's.
+    if request.target_task_definition != task.definition.definition_id {
+        return Err(AgentTaskError::HandoffRefused {
+            code: "handoff-contract-mismatch",
+            message: format!(
+                "the target serves task definition {}, not {}",
+                request.target_task_definition, task.definition.definition_id
+            ),
+        });
+    }
+    if let Some(schema) = request.result_schema.as_ref() {
+        if *schema != task.definition.result_schema {
+            return Err(AgentTaskError::HandoffRefused {
+                code: "handoff-contract-mismatch",
+                message: "the target's expected result schema is not this task's".to_string(),
+            });
+        }
+    }
+
+    let source_assignment = Box::new(assignment.clone());
+    let entry_assignment = assignment.clone();
+    task.handoff = Some(Box::new(AgentTaskHandoff {
+        handoff: request.handoff.clone(),
+        source_assignment,
+        target: request.target.clone(),
+        target_generation: None,
+        reason: bounded_detail(request.reason.clone()),
+        policy_revision: request.policy_revision,
+        context: request.context.clone(),
+        knowledge_spaces: request.knowledge_spaces.clone(),
+        status: AgentTaskHandoffStatus::Initiated,
+        result_settled: false,
+        recorded_at: now,
+        settled_at: None,
+    }));
+    task.handoffs += 1;
+    // The source assignment leaves the record — stashed, never released: the
+    // source run is still live, its escrow child stays open, and its late
+    // proposals are fenced by the stale-generation fence once the target's
+    // generation mints. The task dips to its assignable posture so the very
+    // next decision offers the target.
+    task.assignment = None;
+    task.assignee = Some(request.target.clone());
+    task.status = if task.dependencies_satisfied() {
+        AgentTaskStatus::Created
+    } else {
+        AgentTaskStatus::Blocked
+    };
+    let status = task.status;
+    let handoff_id = request.handoff.clone();
+    let target = request.target.clone();
+    task.check_bounds(0)?;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::HandoffInitiated,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_assignment(&entry_assignment)
+        .with_detail(format!("{handoff_id} -> {target}"))
+    });
+    Ok(())
+}
+
+/// Resolves a pending handoff as refused: restores the stashed source
+/// assignment — the source never stopped being its generation's accepted
+/// owner, so the ledger is already consistent — and returns the owed
+/// handoff-result exchange that releases the source's fence
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md): "or resolve
+/// through explicit recovery").
+///
+/// The handoff offer gets exactly one assignment-generation attempt; every
+/// definitive refusal of that attempt — the target's own refusal, a
+/// readiness or affordability refusal, an exhausted assignment budget, a
+/// cancellation arriving before the generation minted — resolves through
+/// this one helper. Escrow is deliberately untouched: the caller that
+/// released a refused generation already released it, and no other caller
+/// minted one.
+fn resolve_handoff_refusal(
+    state: &mut AgentTaskState,
+    code: &str,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+    let scope = state.scope.clone();
+    let task = state.task_mut()?;
+    let Some(handoff) = task
+        .handoff
+        .as_deref_mut()
+        .filter(|handoff| !handoff.is_settled())
+    else {
+        return Ok(Vec::new());
+    };
+    let detail = bounded_detail(code);
+    handoff.status = AgentTaskHandoffStatus::Refused {
+        code: detail.clone(),
+    };
+    handoff.settled_at = Some(now);
+    let source = handoff.source_assignment.as_ref().clone();
+    let operation_id =
+        crate::coordination::handoff_result_operation_id(scope.tenant(), &handoff.handoff)?;
+    // The restore. The generation counter is deliberately NOT rolled back:
+    // the refused generation was durably offered, and a later decision must
+    // mint a fresh one rather than reuse an identity a run entity may have
+    // already seen.
+    task.assignee = Some(source.agent.clone());
+    task.assignment = Some(source.clone());
+    task.status = AgentTaskStatus::InProgress;
+    let status = task.status;
+    state.updated_at = now;
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::HandoffRefused,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_assignment(&source)
+        .with_detail(detail)
+    });
+    Ok(owed_handoff_result(state, now)?.into_iter().collect())
+}
+
+/// The handoff-result exchange the task owes its source run, when it owes
+/// one now ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per handoff — the resolution is absorbing, first writer
+/// wins — and re-derived by every settle pass until the exchange settles:
+/// the journal's initiation record is the once-guard inside its bounded
+/// window, and the provenance's `result_settled` marker is the durable
+/// once-guard past it.
+fn owed_handoff_result(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(handoff) = task.handoff.as_deref() else {
+        return Ok(None);
+    };
+    if !handoff.is_settled() || handoff.result_settled {
+        return Ok(None);
+    }
+    let operation_id =
+        crate::coordination::handoff_result_operation_id(state.scope.tenant(), &handoff.handoff)?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let resolution = match &handoff.status {
+        AgentTaskHandoffStatus::Initiated => return Ok(None),
+        AgentTaskHandoffStatus::Accepted => {
+            let Some(generation) = handoff.target_generation else {
+                // An accepted transfer always recorded its minted generation;
+                // absent one there is nothing coherent to report.
+                return Ok(None);
+            };
+            AgentHandoffResolutionNotice::Accepted {
+                target_run: run_id_for_assignment(state.scope.task(), generation)?,
+                generation,
+            }
+        }
+        AgentTaskHandoffStatus::Refused { code } => {
+            AgentHandoffResolutionNotice::Refused { code: code.clone() }
+        }
+    };
+    let source = handoff.source_assignment.as_ref();
+    let source_scope = AgentRunScope::new(
+        state.scope.tenant().clone(),
+        source.agent.clone(),
+        source.run.clone(),
+    )?;
+    let notice = AgentHandoffResultNotice {
+        task: state.scope.clone(),
+        handoff: handoff.handoff.clone(),
+        resolution,
+    };
+    let payload = AgentExchangePayload::encode(AGENT_HANDOFF_RESULT_PAYLOAD_TYPE, &notice)?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::HandoffResult,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Run(source_scope),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Marks the handoff-result exchange settled on the provenance: the durable
+/// once-guard past the journal's bounded deduplication window.
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the *currently materialized* handoff derives: a settled provenance
+/// can be replaced by a successor hop, and a late settlement of the previous
+/// hop's exchange must not quiesce the successor's owed result — that would
+/// strand its fenced source run forever.
+fn settle_handoff_result_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state
+        .task()
+        .and_then(|task| task.handoff.as_deref())
+        .and_then(|handoff| {
+            crate::coordination::handoff_result_operation_id(state.scope.tenant(), &handoff.handoff)
+                .ok()
+        });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if let Some(handoff) = task.handoff.as_deref_mut() {
+            if handoff.is_settled() && !handoff.result_settled {
+                handoff.result_settled = true;
+                settled = true;
+            }
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
 }
 
 /// The continuous root control task a wake command must address, or the
@@ -6679,13 +7343,26 @@ fn decide_assignment(
         return Ok(Vec::new());
     }
 
+    // The handoff single-attempt rule ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+    // the transfer's target gets exactly one assignment-generation attempt,
+    // and every definitive refusal of it resolves the handoff — restoring the
+    // stashed source — rather than parking the task in a refusal loop or
+    // terminalizing it over a source run that is fenced-alive awaiting the
+    // resolution.
+    let handoff_pending = task_handoff_pending(task);
     if let Some((reason, detail)) = readiness.refusal() {
+        if handoff_pending {
+            return resolve_handoff_refusal(state, reason.code(), now);
+        }
         return Ok(refuse_assignment(state, readiness, reason, detail, now)?
             .into_iter()
             .collect());
     }
 
     if task.assignments >= task.definition.limits.max_assignments {
+        if handoff_pending {
+            return resolve_handoff_refusal(state, "handoff-assignments-exhausted", now);
+        }
         let assignments = task.assignments;
         let operation_id = assignment_operation_id(&scope, task.assignment_generation)?;
         terminate(
@@ -6727,6 +7404,16 @@ fn decide_assignment(
     // the headroom, so this takes the same path a suspended agent's refusal
     // takes.
     if let Some((reason, detail)) = task_budget_refusal(task) {
+        if handoff_pending {
+            // The source's escrow child is still open — settlement travels
+            // only post-terminal, and the source is fenced non-terminal — so
+            // an exact-fit budget cannot afford the target's generation. Fail
+            // closed: the handoff resolves refused and the source resumes
+            // with the failed tool result, rather than the task parking over
+            // a fenced-alive source (the user-approved posture; a reserved
+            // handoff allowance is a recorded policy hook, not this slice).
+            return resolve_handoff_refusal(state, "handoff-budget-unaffordable", now);
+        }
         // A refusal no settlement can relieve — zero headroom and nothing
         // outstanding to return — is the goal scope's own exhaustion, and the
         // goal's persisted policy decides what it does about it.
@@ -6790,6 +7477,17 @@ fn decide_assignment(
     task.status = AgentTaskStatus::Assigned;
     task.last_refusal = None;
     task.assignment = Some(assignment.clone());
+    // A pending handoff records the generation it minted, in this same
+    // compare-and-set: the provenance's target generation is what the
+    // acceptance flip and the result notice key on.
+    if let Some(handoff) = task.handoff.as_deref_mut() {
+        if !handoff.is_settled()
+            && handoff.target == assignment.agent
+            && handoff.target_generation.is_none()
+        {
+            handoff.target_generation = Some(generation);
+        }
+    }
     // The assignment spends growth headroom admission reserved, so it checks
     // the full bound: it cannot fail for a record admission accepted.
     task.check_bounds(0)?;
@@ -7465,6 +8163,25 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                     ),
                 }
             }
+            AgentExchangeKind::HandoffResult if !result.is_accepted() => {
+                // A refused handoff result settles only under the source
+                // run's definitive answers: it holds no such handoff, or the
+                // notice was forged — undeliverable however often it is
+                // re-driven. Every other refusal — an `unsupported-exchange`
+                // from an owner that predates the kind, a payload it could
+                // not decode — leaves the exchange outstanding for re-drive
+                // until an owner that can answer it does (the
+                // rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some("handoff-forged" | "handoff-not-held") => Ok(()),
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::HandoffResult,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -7479,9 +8196,18 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         if envelope.kind() == AgentExchangeKind::Assignment {
             settle_assignment(state, envelope, result, now);
         }
+        if envelope.kind() == AgentExchangeKind::HandoffResult {
+            // The source run answered — accepted, or refused under a code
+            // `check_settle` classified definitive. Either way the marker
+            // settles on the provenance: the durable once-guard that
+            // quiesces the owed derivation past the journal's bounded window.
+            settle_handoff_result_exchange(state, envelope, now);
+        }
         if !matches!(
             envelope.kind(),
-            AgentExchangeKind::Assignment | AgentExchangeKind::RunCancel
+            AgentExchangeKind::Assignment
+                | AgentExchangeKind::RunCancel
+                | AgentExchangeKind::HandoffResult
         ) {
             return Vec::new();
         }
@@ -7490,13 +8216,21 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         // deferred, a refusal released the generation's escrow, and a receipt
         // may have found the run already settled — so the propagation and the
         // finalization it permits are owed from this same compare-and-set.
-        // Settling may not fail; a construction failure is a bug surfaced
-        // loudly in tests and skipped here.
+        // A settled assignment may equally have resolved a pending handoff,
+        // owing the source its handoff result. Settling may not fail; a
+        // construction failure is a bug surfaced loudly in tests and skipped
+        // here.
         let mut owed = Vec::new();
         match owed_run_cancel(state, now) {
             Ok(envelopes) => owed.extend(envelopes),
             Err(error) => {
                 debug_assert!(false, "run-cancel construction failed: {error}");
+            }
+        }
+        match owed_handoff_result(state, now) {
+            Ok(envelopes) => owed.extend(envelopes),
+            Err(error) => {
+                debug_assert!(false, "handoff-result construction failed: {error}");
             }
         }
         match finalize_task_cancellation(state, envelope.operation_id(), now) {
@@ -7565,6 +8299,19 @@ fn settle_assignment(
         assignment.status = AgentAssignmentStatus::Accepted;
         let assignment = assignment.clone();
         task.status = AgentTaskStatus::InProgress;
+        // The handoff acceptance flip ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+        // when the accepted generation is the one a pending handoff minted,
+        // responsibility has durably transferred — the provenance settles
+        // `Accepted` in this same compare-and-set, and the settle pass owes
+        // the source its handoff result.
+        let mut handoff_accepted = None;
+        if let Some(handoff) = task.handoff.as_deref_mut() {
+            if !handoff.is_settled() && handoff.target_generation == Some(assignment.generation) {
+                handoff.status = AgentTaskHandoffStatus::Accepted;
+                handoff.settled_at = Some(now);
+                handoff_accepted = Some(handoff.handoff.clone());
+            }
+        }
         state.updated_at = now;
         state.record_history(|sequence| {
             AgentTaskHistoryEntry::new(
@@ -7576,6 +8323,19 @@ fn settle_assignment(
             )
             .with_assignment(&assignment)
         });
+        if let Some(handoff_id) = handoff_accepted {
+            state.record_history(|sequence| {
+                AgentTaskHistoryEntry::new(
+                    sequence,
+                    AgentTaskHistoryKind::HandoffAccepted,
+                    operation_id.clone(),
+                    AgentTaskStatus::InProgress,
+                    now,
+                )
+                .with_assignment(&assignment)
+                .with_detail(handoff_id.to_string())
+            });
+        }
         return;
     }
 
@@ -7632,8 +8392,26 @@ fn settle_assignment(
             now,
         )
         .with_assignment(&assignment)
-        .with_detail(code)
+        .with_detail(code.clone())
     });
+    // The handoff single-attempt rule: a refused handoff generation resolves
+    // the transfer — restoring the stashed source — rather than re-offering
+    // toward a target that just refused. The refused generation's escrow was
+    // released above; the restored source's child was never touched. The
+    // owed handoff-result exchange is collected by the participant's settle
+    // pass, which runs right after this.
+    let refused_handoff_generation = state.task.as_ref().is_some_and(|task| {
+        task.handoff.as_deref().is_some_and(|handoff| {
+            !handoff.is_settled() && handoff.target_generation == Some(assignment.generation)
+        })
+    });
+    if refused_handoff_generation {
+        let resolved = resolve_handoff_refusal(state, &code, now);
+        debug_assert!(
+            resolved.is_ok(),
+            "handoff refusal resolution failed: {resolved:?}"
+        );
+    }
 }
 
 /// The durable facade over one typed-task entity.
@@ -7886,6 +8664,22 @@ where
                         now,
                     )?;
                     Ok((operation_id, None, owed))
+                })
+                .await?
+            }
+            AgentTaskEntityCommand::RecordHandoff {
+                operation_id,
+                request,
+            } => {
+                self.transition(now, readiness, move |state| {
+                    // The transfer records, and — with the target's readiness
+                    // read before the transition — the wrapper's inline
+                    // assignment decision mints the target's generation in
+                    // this same compare-and-set. A refused readiness resolves
+                    // the handoff refused through the same inline decision
+                    // ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+                    record_handoff(state, &operation_id, &request, now)?;
+                    Ok((operation_id, None, Vec::new()))
                 })
                 .await?
             }
@@ -8192,6 +8986,24 @@ where
                     .is_agent_owned()
                     .then(|| creation.definition.clone()),
             ),
+            // A handoff reads the *target's* readiness — the request names
+            // it — so the transfer and the generation it offers the target
+            // commit in one compare-and-set. The current assignment (the
+            // source's) does not block the read: the transition clears it.
+            AgentTaskEntityCommand::RecordHandoff { request, .. } => {
+                let Some(task) = self.state()?.task() else {
+                    return Ok(None);
+                };
+                if task.status.is_terminal() {
+                    return Ok(None);
+                }
+                (
+                    Some(request.target.clone()),
+                    task.definition
+                        .is_agent_owned()
+                        .then(|| task.definition.clone()),
+                )
+            }
             // Wake transitions never change assignability, so they read no
             // agent state at all: a scanner delivering to a passivated
             // controller costs one entity transition, not an extra durable
@@ -8308,9 +9120,61 @@ where
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
         self.settle_requested_cancellation(now).await?;
+        self.settle_handoff_resolution(now).await?;
         self.decide_assignment(now).await?;
         self.flush_history(now).await?;
         self.park_owed_rewakes(now).await?;
+        Ok(())
+    }
+
+    /// Re-owes the handoff-result exchange a settled handoff still owes its
+    /// source run ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// This is the courier half of the resolution machine: the transition
+    /// that settled the provenance owed the exchange in its own
+    /// compare-and-set, but a crash between that commit and the initiation —
+    /// or a lost initiation — must not strand the fenced source forever. The
+    /// derivation is pure over durable state, the journal's initiation
+    /// record guards the bounded window, and the provenance's
+    /// `result_settled` marker quiesces it past that window.
+    async fn settle_handoff_resolution(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => task.handoff.as_deref().is_some_and(|handoff| {
+                    handoff.is_settled()
+                        && !handoff.result_settled
+                        && crate::coordination::handoff_result_operation_id(
+                            state.scope.tenant(),
+                            &handoff.handoff,
+                        )
+                        .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                }),
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_handoff_result(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
         Ok(())
     }
 
@@ -8531,6 +9395,7 @@ where
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
         self.settle_requested_cancellation(now).await?;
+        self.settle_handoff_resolution(now).await?;
         let assigned = self.decide_assignment(now).await?;
         let flushed = self.flush_history(now).await?;
         let rewakes_parked = self.park_owed_rewakes(now).await?;
@@ -9017,6 +9882,18 @@ pub enum AgentTaskEntityCommand {
         /// A bounded, stable reason.
         reason: String,
     },
+    /// Record one handoff: transfer responsibility for this same task from
+    /// its current accepted assignment to a target agent
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)). The
+    /// operation id comes from the A2A ingress, derived under
+    /// [`crate::identity::AgentOperationKind::Handoff`] from the handoff's
+    /// deduplication key.
+    RecordHandoff {
+        /// The stable operation id this command deduplicates on.
+        operation_id: AgentOperationId,
+        /// The transfer to record, validated against durable state.
+        request: Box<AgentTaskHandoffRequest>,
+    },
     /// Deliver one wake occurrence to the continuous goal's controller.
     ///
     /// Every trigger path — the shared scanner, an external event, an
@@ -9169,6 +10046,7 @@ impl AgentTaskEntityCommand {
             | Self::DeclareDependency { operation_id, .. }
             | Self::RecordDependencyOutcome { operation_id, .. }
             | Self::Cancel { operation_id, .. }
+            | Self::RecordHandoff { operation_id, .. }
             | Self::AdmitWake { operation_id, .. }
             | Self::CompleteWakeOccurrence { operation_id, .. }
             | Self::UpdateContinuousSchedule { operation_id, .. }
@@ -9744,6 +10622,18 @@ pub enum AgentTaskError {
     },
     /// An agent-owned task was created without an assignee.
     MissingAssignee,
+    /// A handoff command was refused without recording a transfer
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Non-committing: the transition validates before it mutates, so this
+    /// refusal proves the task is exactly as the command found it — which is
+    /// what lets the source run settle its cell failed and resume.
+    HandoffRefused {
+        /// The stable machine-readable refusal code.
+        code: &'static str,
+        /// Bounded human-readable detail.
+        message: String,
+    },
     /// A creation carried delegation provenance that violates its structural
     /// bounds.
     DelegationProvenanceInvalid {
@@ -9924,6 +10814,7 @@ impl AgentTaskError {
             Self::AlreadyCreated { .. } => "task-already-created",
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
+            Self::HandoffRefused { code, .. } => code,
             Self::DelegationProvenanceInvalid { .. } => "task-delegation-provenance-invalid",
             Self::ContinuousWithoutGoal => "task-continuous-without-goal",
             Self::EpochWithoutParent => "task-epoch-without-parent",
@@ -9980,6 +10871,9 @@ impl Display for AgentTaskError {
             ),
             Self::MissingAssignee => {
                 write!(f, "an agent-owned task must name the agent it is created for")
+            }
+            Self::HandoffRefused { code, message } => {
+                write!(f, "the handoff was refused ({code}): {message}")
             }
             Self::DelegationProvenanceInvalid { message } => {
                 write!(f, "the creation's delegation provenance is invalid: {message}")

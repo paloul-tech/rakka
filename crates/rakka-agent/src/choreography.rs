@@ -524,11 +524,45 @@ pub enum AgentExchangeKind {
     ///   settle rule accepts as definitive; the cell records the refusal and
     ///   the parent's quiescence no longer waits on that member.
     DelegationCancel,
+    /// A task reporting a handoff's resolution to the source run that
+    /// initiated it ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)):
+    /// accepted — the target's assignment was durably accepted, and the
+    /// source's settle terminalizes it `HandedOff` — or refused, restoring
+    /// the source's fence-released continuation with a failed tool result.
+    /// Initiated by the task entity once its handoff provenance settles; the
+    /// reply is the source run's durable application.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the provenance
+    ///   settled atomically with the assignment decision that settled it;
+    ///   the settle pass re-derives the identical owed envelope under the
+    ///   same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the cell
+    ///   settlement — and, when accepted, the `HandedOff` terminal — committed
+    ///   in one compare-and-set; the re-driven envelope is answered from the
+    ///   applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the cell's settled
+    ///   status is the durable fence — the arm accepts idempotently with no
+    ///   state change.
+    /// - **Never handed off, wrong handoff id, or forged sender**: a settled
+    ///   refusal the task's settle rule accepts as definitive; the
+    ///   provenance's result marker still settles, so the derivation
+    ///   quiesces.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades — the
+    ///   rolling-upgrade posture every new kind takes.
+    HandoffResult,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -540,6 +574,7 @@ impl AgentExchangeKind {
         Self::DelegationResult,
         Self::RunCancel,
         Self::DelegationCancel,
+        Self::HandoffResult,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -557,6 +592,7 @@ impl AgentExchangeKind {
             Self::DelegationResult => "delegation-result",
             Self::RunCancel => "run-cancel",
             Self::DelegationCancel => "delegation-cancel",
+            Self::HandoffResult => "handoff-result",
         }
     }
 }

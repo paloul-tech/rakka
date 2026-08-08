@@ -239,6 +239,19 @@ validated_id! {
 }
 
 validated_id! {
+    /// Identity of one durable handoff of a task from a source run to a
+    /// target agent
+    /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// Derived by [`crate::coordination::handoff_id_for`] as a pure function
+    /// of the source run's `(turn, slot)` coordinate. It doubles verbatim as
+    /// the A2A message id and deduplication key of the handoff send, so
+    /// replaying one handoff resolves to the same recorded transfer or to an
+    /// explicit conflict, never to a second one.
+    pub AgentHandoffId, "agent_handoff_id"
+}
+
+validated_id! {
     /// Identity of one durable workflow-tool invocation
     /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
     ///
