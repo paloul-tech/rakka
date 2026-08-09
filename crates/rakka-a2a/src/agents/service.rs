@@ -180,22 +180,42 @@ where
         // A team command answers with an immediate message, exactly as a
         // management command does — it drives a board decision, never a
         // task creation (specification 8.10). The collaboration engagement
-        // either parses whole or fails the send closed.
-        let metadata =
-            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
-                .map_err(RakkaAgentA2AError::Mapping)?;
+        // either parses whole or fails the send closed, and the one merge
+        // and normalization here serves the dispatch and the chosen branch
+        // alike — the hot path never re-merges or re-parses.
+        let normalized = self.normalized_send(params, request)?;
         if matches!(
-            super::collaboration::parse_collaboration_envelope(&request.message, &metadata)?,
+            normalized.collaboration.as_ref(),
             Some(super::collaboration::AgentCollaborationEnvelope::Team(_))
         ) {
             return self
-                .team_command(params, request)
+                .team_command_normalized(request, &normalized)
                 .await
                 .map(a2a::SendMessageResponse::Message);
         }
-        self.send_message(params, request)
+        self.send_message_normalized(request, &normalized)
             .await
             .map(a2a::SendMessageResponse::Task)
+    }
+
+    /// Merges the request- and message-level metadata and normalizes the
+    /// send once: the shared chokepoint of every send-shaped entry point.
+    fn normalized_send(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> RakkaAgentA2AResult<NormalizedAgentCommand> {
+        let metadata =
+            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
+                .map_err(RakkaAgentA2AError::Mapping)?;
+        normalize_agent_send(
+            self.tenant_resolver.as_ref(),
+            self.default_tenant.as_deref(),
+            params,
+            request.tenant.as_deref(),
+            &request.message,
+            &metadata,
+        )
     }
 
     /// Serves one team board or membership command carried by the
@@ -218,18 +238,18 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<Message> {
+        let normalized = self.normalized_send(params, request)?;
+        self.team_command_normalized(request, &normalized).await
+    }
+
+    /// The normalized half of [`Self::team_command`], shared with
+    /// [`Self::send`]'s dispatch so the send is merged and parsed once.
+    async fn team_command_normalized(
+        &self,
+        request: &SendMessageRequest,
+        normalized: &NormalizedAgentCommand,
+    ) -> RakkaAgentA2AResult<Message> {
         let now = self.clock.now();
-        let metadata =
-            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
-                .map_err(RakkaAgentA2AError::Mapping)?;
-        let normalized = normalize_agent_send(
-            self.tenant_resolver.as_ref(),
-            self.default_tenant.as_deref(),
-            params,
-            request.tenant.as_deref(),
-            &request.message,
-            &metadata,
-        )?;
         let Some(super::collaboration::AgentCollaborationEnvelope::Team(cluster)) =
             normalized.collaboration.as_ref()
         else {
@@ -262,7 +282,7 @@ where
         }
 
         let board_task = cluster.task.clone();
-        let (scope, command) = agent_team_command(&normalized, now)?;
+        let (scope, command) = agent_team_command(normalized, now)?;
         let mut store =
             AgentTeamEntityStore::new(scope.clone(), self.teams.clone(), self.team_history.clone());
         let reply = match store.apply(command, &self.router, now).await {
@@ -493,18 +513,18 @@ where
         params: &ServiceParams,
         request: &SendMessageRequest,
     ) -> RakkaAgentA2AResult<Task> {
+        let normalized = self.normalized_send(params, request)?;
+        self.send_message_normalized(request, &normalized).await
+    }
+
+    /// The normalized half of [`Self::send_message`], shared with
+    /// [`Self::send`]'s dispatch so the send is merged and parsed once.
+    async fn send_message_normalized(
+        &self,
+        request: &SendMessageRequest,
+        normalized: &NormalizedAgentCommand,
+    ) -> RakkaAgentA2AResult<Task> {
         let now = self.clock.now();
-        let metadata =
-            merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
-                .map_err(RakkaAgentA2AError::Mapping)?;
-        let normalized = normalize_agent_send(
-            self.tenant_resolver.as_ref(),
-            self.default_tenant.as_deref(),
-            params,
-            request.tenant.as_deref(),
-            &request.message,
-            &metadata,
-        )?;
         if matches!(
             normalized.intent,
             crate::mapping::A2ATaskIntent::ContinueTask
@@ -526,7 +546,7 @@ where
                 // source run the cluster claims to speak for.
                 self.authorize_claimed(
                     A2AOperation::RecordHandoff,
-                    &normalized,
+                    normalized,
                     Some(crate::auth::A2AHandoffClaim {
                         handoff: &cluster.handoff,
                         source_agent: &cluster.source_agent,
@@ -541,9 +561,9 @@ where
                 // the state-mutating command can commit — or spend one of the
                 // task's bounded handoffs on an unserved target.
                 resolve_handoff_target(self.catalog.as_ref(), cluster)?;
-                let command = agent_task_handoff_command(&normalized)?;
-                let snapshot = self.apply_task_command(&normalized, command, now).await?;
-                let run = self.current_run_status(&normalized, &snapshot).await?;
+                let command = agent_task_handoff_command(normalized)?;
+                let snapshot = self.apply_task_command(normalized, command, now).await?;
+                let run = self.current_run_status(normalized, &snapshot).await?;
                 project_agent_send(
                     self.projections.as_ref(),
                     &snapshot,
@@ -554,23 +574,23 @@ where
                     now,
                 )
                 .await?;
-                return self.public_task(&normalized, None).await;
+                return self.public_task(normalized, None).await;
             }
-            self.authorize(A2AOperation::SendMessage, &normalized)
+            self.authorize(A2AOperation::SendMessage, normalized)
                 .await?;
             return Err(RakkaAgentA2AError::Unsupported {
                 operation: "send-message",
                 reason: "input delivery to an existing agent task is not served yet",
             });
         }
-        self.authorize(A2AOperation::SendMessage, &normalized)
+        self.authorize(A2AOperation::SendMessage, normalized)
             .await?;
         let input = agent_task_input(&request.message)?;
-        let target = resolve_agent_target(self.catalog.as_ref(), &normalized)?;
-        let command = agent_task_create_command(&normalized, &target, input)?;
+        let target = resolve_agent_target(self.catalog.as_ref(), normalized)?;
+        let command = agent_task_create_command(normalized, &target, input)?;
 
-        let snapshot = self.apply_task_command(&normalized, command, now).await?;
-        let run = self.current_run_status(&normalized, &snapshot).await?;
+        let snapshot = self.apply_task_command(normalized, command, now).await?;
+        let run = self.current_run_status(normalized, &snapshot).await?;
         project_agent_send(
             self.projections.as_ref(),
             &snapshot,
@@ -581,7 +601,7 @@ where
             now,
         )
         .await?;
-        self.public_task(&normalized, None).await
+        self.public_task(normalized, None).await
     }
 
     /// Serves one `tasks/get` from the authoritative durable snapshot,

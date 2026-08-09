@@ -5558,6 +5558,34 @@ fn task_team_claim_pending(task: &AgentTask) -> bool {
         .is_some_and(|claim| !claim.is_settled())
 }
 
+/// Refuses a board decision over a task whose assignment record still
+/// stands: an accepted generation is owned, and an offered one is in
+/// flight. Claim and release arbitrate the same board entry through this
+/// one guard so the two can never diverge; only the in-flight code differs
+/// per action — a refused claim reopens the entry, a refused release
+/// restores it pending — so the caller names it.
+fn check_assignment_free(task: &AgentTask, inflight_code: &'static str) -> AgentTaskResult<()> {
+    let Some(assignment) = task.assignment.as_ref() else {
+        return Ok(());
+    };
+    if assignment.status == AgentAssignmentStatus::Accepted {
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-already-owned",
+            message: format!(
+                "generation {} is accepted by {}",
+                assignment.generation, assignment.agent
+            ),
+        });
+    }
+    Err(AgentTaskError::TeamClaimRefused {
+        code: inflight_code,
+        message: format!(
+            "generation {} is offered and undecided",
+            assignment.generation
+        ),
+    })
+}
+
 /// Whether a board-governed task has waited unclaimed past its horizon
 /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -5724,27 +5752,10 @@ fn record_team_claim(
             message: "the task carries an unresolved handoff".to_string(),
         });
     }
-    if let Some(assignment) = task.assignment.as_ref() {
-        if assignment.status == AgentAssignmentStatus::Accepted {
-            return Err(AgentTaskError::TeamClaimRefused {
-                code: "team-claim-already-owned",
-                message: format!(
-                    "generation {} is accepted by {}",
-                    assignment.generation, assignment.agent
-                ),
-            });
-        }
-        // An offered generation belongs to the decision the board is
-        // superseding; refusing keeps exactly one generation in flight
-        // ever, and the board reopens for a retry after the offer resolves.
-        return Err(AgentTaskError::TeamClaimRefused {
-            code: "team-claim-assignment-inflight",
-            message: format!(
-                "generation {} is offered and undecided",
-                assignment.generation
-            ),
-        });
-    }
+    // An offered generation belongs to the decision the board is
+    // superseding; refusing keeps exactly one generation in flight
+    // ever, and the board reopens for a retry after the offer resolves.
+    check_assignment_free(task, "team-claim-assignment-inflight")?;
     if task.team_claims >= task.definition.limits.max_team_claims {
         return Err(AgentTaskError::TeamClaimRefused {
             code: "team-claim-limit-exceeded",
@@ -5876,24 +5887,7 @@ fn release_team_claim(
             ),
         });
     }
-    if let Some(assignment) = task.assignment.as_ref() {
-        if assignment.status == AgentAssignmentStatus::Accepted {
-            return Err(AgentTaskError::TeamClaimRefused {
-                code: "team-claim-already-owned",
-                message: format!(
-                    "generation {} is accepted by {}",
-                    assignment.generation, assignment.agent
-                ),
-            });
-        }
-        return Err(AgentTaskError::TeamClaimRefused {
-            code: "team-release-assignment-inflight",
-            message: format!(
-                "generation {} is offered and undecided",
-                assignment.generation
-            ),
-        });
-    }
+    check_assignment_free(task, "team-release-assignment-inflight")?;
 
     let claim = task
         .team_claim

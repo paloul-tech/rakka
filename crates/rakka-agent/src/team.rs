@@ -2478,6 +2478,48 @@ fn owed_claim_exchange(
     )?)
 }
 
+/// Mints one superseding claim decision over a board entry: bumps the
+/// claim epoch, rewrites the entry to its pending shape toward the
+/// claimant, and builds the claim command the task is owed. The caller has
+/// already arbitrated who may mint — a fresh claim's steal window, a
+/// transfer's holder-or-leader rule — and this shared half is what keeps a
+/// transfer's minted claim structurally identical to a fresh one.
+fn mint_entry_claim(
+    scope: &AgentTeamScope,
+    entry: &mut AgentTeamBoardEntry,
+    task: &AgentTaskId,
+    claimant: &AgentId,
+    policy_revision: AgentRevisionNumber,
+    lease_ms: u64,
+    now: AgentTimestampMillis,
+) -> AgentTeamResult<AgentTeamClaimCommand> {
+    let epoch = entry.claim_epoch + 1;
+    let claim = team_claim_id_for(scope, task, claimant, epoch)?;
+    let lease_expires_at = AgentTimestampMillis::new(now.as_millis().saturating_add(lease_ms));
+    entry.claim_epoch = epoch;
+    entry.status = AgentTeamBoardEntryStatus::Pending;
+    entry.claim = Some(AgentTeamBoardClaim {
+        claim: claim.clone(),
+        member: claimant.clone(),
+        lease_expires_at,
+        claimed_at: now,
+        generation_echo: None,
+        run_echo: None,
+    });
+    entry.last_code = None;
+    Ok(AgentTeamClaimCommand {
+        team: scope.clone(),
+        claim,
+        task: task.clone(),
+        epoch,
+        action: AgentTeamClaimAction::Claim {
+            member: claimant.clone(),
+        },
+        policy_revision,
+        lease_expires_at,
+    })
+}
+
 fn claim_entry(
     state: &mut AgentTeamState,
     operation_id: &AgentOperationId,
@@ -2524,32 +2566,16 @@ fn claim_entry(
         AgentTeamBoardEntryStatus::Done => return Err(AgentTeamError::EntryDone),
     };
 
-    let epoch = entry.claim_epoch + 1;
-    let claim = team_claim_id_for(&scope, &task, &member, epoch)?;
-    let lease_expires_at = AgentTimestampMillis::new(now.as_millis().saturating_add(lease_ms));
-    entry.claim_epoch = epoch;
-    entry.status = AgentTeamBoardEntryStatus::Pending;
-    entry.claim = Some(AgentTeamBoardClaim {
-        claim: claim.clone(),
-        member: member.clone(),
-        lease_expires_at,
-        claimed_at: now,
-        generation_echo: None,
-        run_echo: None,
-    });
-    entry.last_code = None;
-
-    let command = AgentTeamClaimCommand {
-        team: scope,
-        claim: claim.clone(),
-        task: task.clone(),
-        epoch,
-        action: AgentTeamClaimAction::Claim {
-            member: member.clone(),
-        },
+    let command = mint_entry_claim(
+        &scope,
+        entry,
+        &task,
+        &member,
         policy_revision,
-        lease_expires_at,
-    };
+        lease_ms,
+        now,
+    )?;
+    let claim = command.claim.clone();
     let exchange_operation = team_claim_operation_id(state.scope.tenant(), &claim)?;
     let envelope = owed_claim_exchange(state, exchange_operation, &command, now)?;
     let operation = operation_id.clone();
@@ -2693,35 +2719,19 @@ fn transfer_entry(
         });
     }
 
-    let epoch = entry.claim_epoch + 1;
-    let claim = team_claim_id_for(&scope, &task, &target, epoch)?;
-    let lease_expires_at = AgentTimestampMillis::new(now.as_millis().saturating_add(lease_ms));
-    entry.claim_epoch = epoch;
-    entry.status = AgentTeamBoardEntryStatus::Pending;
-    entry.claim = Some(AgentTeamBoardClaim {
-        claim: claim.clone(),
-        member: target.clone(),
-        lease_expires_at,
-        claimed_at: now,
-        generation_echo: None,
-        run_echo: None,
-    });
-    entry.last_code = None;
-
     // At the task a transfer IS a superseding claim: the arbitration that
     // supersedes the prior claimant pre-mint and refuses in-flight or
     // accepted work is reused whole.
-    let command = AgentTeamClaimCommand {
-        team: scope,
-        claim: claim.clone(),
-        task: task.clone(),
-        epoch,
-        action: AgentTeamClaimAction::Claim {
-            member: target.clone(),
-        },
+    let command = mint_entry_claim(
+        &scope,
+        entry,
+        &task,
+        &target,
         policy_revision,
-        lease_expires_at,
-    };
+        lease_ms,
+        now,
+    )?;
+    let claim = command.claim.clone();
     let exchange_operation = team_claim_operation_id(state.scope.tenant(), &claim)?;
     let envelope = owed_claim_exchange(state, exchange_operation, &command, now)?;
     let operation = operation_id.clone();
