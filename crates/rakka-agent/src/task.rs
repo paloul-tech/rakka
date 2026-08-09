@@ -193,6 +193,10 @@ pub const AGENT_TASK_MATERIALIZED_MAX_BYTES: usize = 32 * 1024;
 /// [`AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH`] makes for derived run ids.
 pub const AGENT_TASK_STATE_GROWTH_RESERVE_BYTES: usize = 6 * 1024;
 
+/// Default horizon, in milliseconds, a board-governed task may wait unclaimed
+/// before the settle pass expires it: one day.
+pub const AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS: u64 = 86_400_000;
+
 /// Maximum number of deterministic result rules one task definition may carry.
 pub const AGENT_TASK_MAX_RESULT_RULES: usize = 32;
 
@@ -1254,6 +1258,16 @@ pub struct AgentTaskLimits {
     /// default bound.
     #[serde(default = "default_max_team_claims")]
     pub max_team_claims: u32,
+    /// How long, in milliseconds, a board-governed task may wait unclaimed
+    /// and unassigned before the settle pass expires it
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)): the
+    /// bounded replacement for the assignee fail-fast a team creation
+    /// forgoes — a team id that never produces a claim surfaces as a
+    /// cancelled task instead of parking silently, escrow locked, forever.
+    /// `None` waits unbounded, explicitly. Definitions persisted before this
+    /// field load with the default horizon.
+    #[serde(default = "default_max_unclaimed_millis")]
+    pub max_unclaimed_millis: Option<u64>,
 }
 
 /// The default handoff bound of [`AgentTaskLimits`].
@@ -1264,6 +1278,11 @@ const fn default_max_handoffs() -> u32 {
 /// The default team-claim bound of [`AgentTaskLimits`].
 const fn default_max_team_claims() -> u32 {
     4
+}
+
+/// The default unclaimed-wait horizon of [`AgentTaskLimits`].
+const fn default_max_unclaimed_millis() -> Option<u64> {
+    Some(AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS)
 }
 
 impl AgentTaskLimits {
@@ -1277,6 +1296,7 @@ impl AgentTaskLimits {
             max_dependencies: AGENT_TASK_MAX_DEPENDENCIES,
             max_handoffs: default_max_handoffs(),
             max_team_claims: default_max_team_claims(),
+            max_unclaimed_millis: default_max_unclaimed_millis(),
         }
     }
 
@@ -1308,6 +1328,14 @@ impl AgentTaskLimits {
         self
     }
 
+    /// Sets how long the task may wait unclaimed on a team board, `None` for
+    /// an explicitly unbounded wait.
+    #[must_use]
+    pub const fn with_max_unclaimed_millis(mut self, horizon: Option<u64>) -> Self {
+        self.max_unclaimed_millis = horizon;
+        self
+    }
+
     fn validate(&self) -> AgentTaskResult<()> {
         if self.max_result_rejections == 0 {
             return Err(AgentTaskError::InvalidDefinition {
@@ -1324,6 +1352,11 @@ impl AgentTaskLimits {
                 detail: format!(
                     "a task may not raise the dependency bound above {AGENT_TASK_MAX_DEPENDENCIES}"
                 ),
+            });
+        }
+        if self.max_unclaimed_millis == Some(0) {
+            return Err(AgentTaskError::InvalidDefinition {
+                detail: "a task's unclaimed horizon must be positive when set".to_string(),
             });
         }
         Ok(())
@@ -4484,6 +4517,9 @@ fn create_task(
     // A board-governed creation may defer its assignee: the task waits
     // unassigned — no generation ever mints without an assignee — until a
     // team claim names one ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    // The wait is bounded by the definition's unclaimed horizon, observed by
+    // the settle pass: a team that never claims expires the task instead of
+    // parking it silently forever.
     if agent_owned && creation.assignee.is_none() && creation.team.is_none() {
         return Err(AgentTaskError::MissingAssignee);
     }
@@ -5522,6 +5558,38 @@ fn task_team_claim_pending(task: &AgentTask) -> bool {
         .is_some_and(|claim| !claim.is_settled())
 }
 
+/// Whether a board-governed task has waited unclaimed past its horizon
+/// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the bounded-wait replacement for the assignee fail-fast a team
+/// creation forgoes: a wrong team id, a task never posted, or a board that
+/// expired before any claim would otherwise park the task — and lock its
+/// delegated escrow — silently forever. The wait re-arms from the task's
+/// last transition, so a refused claim's reopened window starts fresh.
+fn task_unclaimed_expired(
+    task: &AgentTask,
+    updated_at: AgentTimestampMillis,
+    now: AgentTimestampMillis,
+) -> bool {
+    if task.status != AgentTaskStatus::Created {
+        return false;
+    }
+    if task.team.is_none()
+        || task.assignee.is_some()
+        || task.assignment.is_some()
+        || task.cancellation.is_some()
+    {
+        return false;
+    }
+    if task_team_claim_pending(task) || task_handoff_pending(task) {
+        return false;
+    }
+    let Some(horizon) = task.definition.limits.max_unclaimed_millis else {
+        return false;
+    };
+    now.as_millis() >= updated_at.as_millis().saturating_add(horizon)
+}
+
 /// The bounded outcome echo one applied team-claim exchange returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTeamClaimApplyOutcome {
@@ -5693,6 +5761,16 @@ fn record_team_claim(
     // committed this decision, so the predecessor has no board slot left to
     // report into and its materialized record is simply replaced; the chain
     // is history.
+    //
+    // Bounds are checked over the fully recorded claim, and a failure
+    // restores every touched field before the refusal leaves: the accept
+    // path persists state even under a refusal, and the board treats a
+    // definitive refusal as proof no claim was recorded.
+    let previous_claim = task.team_claim.take();
+    let previous_claims = task.team_claims;
+    let previous_fence = task.team_claim_fence;
+    let previous_assignee = task.assignee.take();
+    let previous_refusal = task.last_refusal.take();
     task.team_claim = Some(Box::new(AgentTaskTeamClaim {
         claim: command.claim.clone(),
         team: command.team.clone(),
@@ -5707,9 +5785,15 @@ fn record_team_claim(
     task.team_claims += 1;
     task.team_claim_fence = command.epoch;
     task.assignee = Some(member.clone());
-    task.last_refusal = None;
     let status = task.status;
-    task.check_bounds(0)?;
+    if let Err(error) = task.check_bounds(0) {
+        task.team_claim = previous_claim;
+        task.team_claims = previous_claims;
+        task.team_claim_fence = previous_fence;
+        task.assignee = previous_assignee;
+        task.last_refusal = previous_refusal;
+        return Err(error);
+    }
     state.updated_at = now;
     let claim_id = command.claim.clone();
     let member = member.clone();
@@ -5761,6 +5845,19 @@ fn release_team_claim(
             message: "the task holds no such claim to release".to_string(),
         });
     };
+    if existing.status == AgentTaskTeamClaimStatus::Accepted {
+        // Ownership leaves the board only through task-side outcomes: a
+        // release that raced the acceptance refuses owned even though the
+        // claim is settled, so the board marks the entry owned instead of
+        // reopening an entry whose task is durably in progress.
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-already-owned",
+            message: format!(
+                "claim {} is accepted by {}",
+                existing.claim, existing.member
+            ),
+        });
+    }
     if existing.is_settled() {
         // The release replayed past the journal window; the recorded
         // resolution stands.
@@ -9877,6 +9974,7 @@ where
     async fn make_local_progress(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
+        self.observe_unclaimed_expiry(now).await?;
         self.settle_requested_cancellation(now).await?;
         self.settle_handoff_resolution(now).await?;
         self.settle_team_claim_resolution(now).await?;
@@ -10063,6 +10161,76 @@ where
         Ok(())
     }
 
+    /// Expires a board-governed task that has waited unclaimed past its
+    /// definition's horizon ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)),
+    /// observed lazily like every board expiry — no timer ever fires. The
+    /// request rides the cancellation machinery whole: with no claim, no
+    /// assignment, and no children, the marker finalizes in the same
+    /// transition, the terminal report reaches a delegating parent, and the
+    /// locked escrow settles home.
+    ///
+    /// The write is skipped entirely while nothing would expire, so a sweep
+    /// over a healthy task burns no revision.
+    async fn observe_unclaimed_expiry(&mut self, now: AgentTimestampMillis) -> AgentTaskResult<()> {
+        let would_expire = {
+            let state = self.state()?;
+            let updated_at = state.updated_at;
+            state
+                .task()
+                .is_some_and(|task| task_unclaimed_expired(task, updated_at, now))
+        };
+        if !would_expire {
+            return Ok(());
+        }
+        let operation_id = AgentOperationId::new(
+            AgentOperationKind::Command,
+            [
+                self.scope.tenant().as_str(),
+                self.scope.task().as_str(),
+                "unclaimed-expiry",
+            ],
+        )?;
+        let goal_before = self.goal_contract_status();
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| {
+                let step =
+                    |state: &mut AgentTaskState| -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
+                        let updated_at = state.updated_at;
+                        let Some(task) = state.task.as_ref() else {
+                            return Ok(Vec::new());
+                        };
+                        if !task_unclaimed_expired(task, updated_at, now) {
+                            return Ok(Vec::new());
+                        }
+                        request_task_cancellation(
+                            state,
+                            &operation_id,
+                            AgentTaskTerminalReason::CancellationRequested {
+                                reason: "unclaimed-expired".to_string(),
+                            },
+                            now,
+                        )
+                    };
+                match step(state) {
+                    Ok(owed) => Ok(owed),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        self.record_goal_status_transition(goal_before);
+        Ok(())
+    }
+
     /// Advances a requested cancellation from the settle pass
     /// ([specification 8.7](../../../docs/plans/rakka-agent/spec.md)): the
     /// settle pass is the goal entry point that always commits, so a terminal
@@ -10203,6 +10371,7 @@ where
         // pending-history bound.
         self.require_history_headroom(now).await?;
         self.observe_goal_deadline(now).await?;
+        self.observe_unclaimed_expiry(now).await?;
         self.settle_requested_cancellation(now).await?;
         self.settle_handoff_resolution(now).await?;
         self.settle_team_claim_resolution(now).await?;
@@ -11884,6 +12053,123 @@ impl From<AgentTaskError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod team_claim_bounds_tests {
+    use super::*;
+    use crate::coordination::{
+        team_claim_id_for, team_claim_operation_id, AgentTeamClaimAction, AgentTeamClaimCommand,
+        AGENT_TEAM_CLAIM_PAYLOAD_TYPE,
+    };
+    use crate::identity::{AgentTeamId, AgentTeamScope};
+
+    #[test]
+    fn a_claim_refused_for_bounds_persists_no_partial_mutation() {
+        let tenant = TenantId::new("acme");
+        let task_id = AgentTaskId::new("board-task").expect("the task id is valid");
+        let scope =
+            AgentTaskScope::new(tenant.clone(), task_id.clone()).expect("the scope is valid");
+        let team_scope = AgentTeamScope::new(
+            tenant.clone(),
+            AgentTeamId::new("support-team").expect("the team id is valid"),
+        )
+        .expect("the team scope is valid");
+        let member = AgentId::new("worker-a").expect("the member id is valid");
+
+        let mut state = AgentTaskState::uncreated(scope.clone(), AgentTimestampMillis::new(1));
+        let create_op = AgentOperationId::new(
+            AgentOperationKind::TaskCreation,
+            ["acme", "board-task", "1"],
+        )
+        .expect("the operation id derives");
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("triage").expect("the definition id is valid"),
+            "Triage one ticket.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("the definition is valid");
+        let creation = AgentTaskCreation {
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            team: Some(team_scope.team().clone()),
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: None,
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        };
+        create_task(
+            &mut state,
+            &create_op,
+            creation,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the board task creates");
+
+        // Inflate the record to one byte under its cap, bypassing the
+        // admission reserve the way a lifetime of zero-reserve growth would:
+        // the recorded claim itself must push it over.
+        {
+            let task = state.task.as_mut().expect("the task exists");
+            let size = task.materialized_size_bytes();
+            let previous = task.definition.description.len();
+            task.definition.description =
+                "x".repeat(AGENT_TASK_MATERIALIZED_MAX_BYTES - 1 - size + previous);
+        }
+
+        let claim =
+            team_claim_id_for(&team_scope, &task_id, &member, 1).expect("the claim id derives");
+        let command = AgentTeamClaimCommand {
+            team: team_scope.clone(),
+            claim: claim.clone(),
+            task: task_id,
+            epoch: 1,
+            action: AgentTeamClaimAction::Claim {
+                member: member.clone(),
+            },
+            policy_revision: AgentRevisionNumber::INITIAL,
+            lease_expires_at: AgentTimestampMillis::new(300_000),
+        };
+        let operation = team_claim_operation_id(&tenant, &claim).expect("the operation derives");
+        let envelope = AgentExchangeEnvelope::new(
+            operation.clone(),
+            AgentExchangeKind::TeamClaim,
+            AgentEntityAddress::Team(team_scope),
+            AgentEntityAddress::Task(scope),
+            AgentExchangePayload::encode(AGENT_TEAM_CLAIM_PAYLOAD_TYPE, &command)
+                .expect("the payload encodes"),
+            AgentCorrelationId::new(operation.as_str()),
+            AgentTimestampMillis::new(2),
+        )
+        .expect("the envelope builds");
+
+        let before = state.clone();
+        let result = apply_team_claim(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            result.status().rejection_code(),
+            Some("task-state-too-large"),
+            "the oversized record refuses the claim"
+        );
+        assert_eq!(
+            state, before,
+            "a bounds refusal persists no partial mutation: the board treats \
+             a definitive refusal as proof no claim was recorded"
+        );
     }
 }
 

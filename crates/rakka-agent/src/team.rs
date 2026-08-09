@@ -1111,12 +1111,14 @@ impl AgentExchangeParticipant for AgentTeamParticipant {
                     Some(
                         "team-claim-stale-epoch"
                         | "team-claim-already-owned"
+                        | "team-claim-assignment-inflight"
                         | "team-claim-task-terminal"
                         | "team-claim-task-unknown"
                         | "team-claim-wrong-team"
                         | "team-claim-task-cancelling"
                         | "team-claim-handoff-pending"
                         | "team-claim-limit-exceeded"
+                        | "task-state-too-large"
                         | "team-release-assignment-inflight"
                         | "team-release-unknown",
                     ) => Ok(()),
@@ -1269,11 +1271,22 @@ fn apply_claim_result(
         member,
     } = &notice.outcome
     {
-        // The activation of a claim the board superseded — a steal that
-        // raced the original claim's acceptance. The task's fence made the
-        // steal refuse; here the original owner's echo fills the entry the
-        // board marked owned-by-unknown.
-        if entry.status == AgentTeamBoardEntryStatus::Active && entry.claim.is_none() {
+        // The activation of a claim the board superseded — a steal or a
+        // release that raced the original claim's acceptance. The task's
+        // assignment fence durably accepted *this* claim, so every board
+        // decision still in flight over the entry is doomed to a definitive
+        // refusal whose settle leaves a filled echo alone — the owner's echo
+        // therefore fills the entry whatever interim shape the board holds,
+        // however the deliveries interleave. Only an entry the board already
+        // closed, or one whose current claim itself carries an activation
+        // echo, absorbs the notice.
+        let absorbed = entry.status == AgentTeamBoardEntryStatus::Done
+            || entry
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.generation_echo.is_some());
+        if !absorbed {
+            entry.status = AgentTeamBoardEntryStatus::Active;
             entry.claim = Some(AgentTeamBoardClaim {
                 claim: notice.claim.clone(),
                 member: member.clone(),
@@ -1370,11 +1383,23 @@ fn settle_claim_action(
     let Some(code) = result.status().rejection_code() else {
         return;
     };
+    // A restore or reopen speaks for the claim this decision minted. When the
+    // entry's claim has already moved past it — the owner echo of a superseded
+    // activation replaced it before this reply settled — the refusal's board
+    // consequence was superseded too, and the settle changes nothing.
+    let claim_is_current = entry
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.claim == command.claim);
     let (status, clear_claim) = match (&command.action, code) {
         // The steal raced an acceptance: the entry is owned, but by the
         // holder the task's fence protected, not this claimant. The owner
-        // echo arrives with the superseded claim's activation.
+        // echo arrives with the superseded claim's activation — and when it
+        // already has, there is nothing left to clear.
         (AgentTeamClaimAction::Claim { .. }, "team-claim-already-owned") => {
+            if !claim_is_current {
+                return;
+            }
             (AgentTeamBoardEntryStatus::Active, true)
         }
         // Our own claimant's assignment accepted while the release was in
@@ -1385,7 +1410,32 @@ fn settle_claim_action(
         // The generation is offered and undecided: the release restores to
         // pending and may be retried after the offer resolves.
         (AgentTeamClaimAction::Release, "team-release-assignment-inflight") => {
+            if !claim_is_current {
+                return;
+            }
             (AgentTeamBoardEntryStatus::Pending, false)
+        }
+        // The release outran its own claim exchange: the task has not seen
+        // the claim yet, because the two ride independent operations the
+        // courier does not order. The entry restores to pending — the claim
+        // may still record, the release may be retried once it has, and an
+        // expired lease keeps the steal escape hatch open. Releasing must
+        // never be a shape the board cannot leave.
+        (AgentTeamClaimAction::Release, "team-release-unknown") => {
+            if !claim_is_current {
+                return;
+            }
+            (AgentTeamBoardEntryStatus::Pending, false)
+        }
+        // The superseding claim found the superseded offer still undecided:
+        // the entry reopens for a retry after the offer resolves — and if
+        // the offer accepts instead, the superseded activation's owner echo
+        // fills this reopened entry.
+        (AgentTeamClaimAction::Claim { .. }, "team-claim-assignment-inflight") => {
+            if !claim_is_current {
+                return;
+            }
+            (AgentTeamBoardEntryStatus::Open, true)
         }
         (_, "team-claim-task-terminal" | "team-claim-task-unknown" | "team-claim-wrong-team") => {
             (AgentTeamBoardEntryStatus::Done, true)
@@ -1394,11 +1444,17 @@ fn settle_claim_action(
             _,
             "team-claim-task-cancelling"
             | "team-claim-handoff-pending"
-            | "team-claim-limit-exceeded",
-        ) => (AgentTeamBoardEntryStatus::Open, true),
-        // A stale epoch or an unknown release names a decision the board
-        // itself superseded; the epoch guard above already absorbs most of
-        // these, and the rest change nothing.
+            | "team-claim-limit-exceeded"
+            | "task-state-too-large",
+        ) => {
+            if !claim_is_current {
+                return;
+            }
+            (AgentTeamBoardEntryStatus::Open, true)
+        }
+        // A stale epoch names a decision the board itself superseded; the
+        // epoch guard above already absorbs most of these, and the rest
+        // change nothing.
         _ => return,
     };
     let member = entry.claim.as_ref().map(|claim| claim.member.clone());
@@ -2368,6 +2424,15 @@ fn post_task(
         return Err(AgentTeamError::TaskAlreadyPosted { task });
     }
     let maximum = team.policy.effective_max_board_entries() as usize;
+    if team.board.len() >= maximum {
+        // Done entries are settled facts kept only while space allows: under
+        // ceiling pressure they are evicted, lazily like every board expiry,
+        // so a long-lived board can never be exhausted by its own finished
+        // work. A re-post after eviction simply re-arbitrates at the task,
+        // which refuses terminal work and closes the fresh entry again.
+        team.board
+            .retain(|_, entry| entry.status != AgentTeamBoardEntryStatus::Done);
+    }
     if team.board.len() >= maximum {
         return Err(AgentTeamError::BoardExhausted { maximum });
     }

@@ -718,6 +718,12 @@ a replicated/quorum execution mode with separate runs and result policy. Team
 membership, backlog, and peer messages are correctness/coordination state and
 MUST NOT be implemented only as communal knowledge-graph claims.
 
+A board-governed task creation MAY defer its assignee, but the unclaimed wait
+MUST be bounded by a definition horizon observed lazily — a task whose team
+never produces a claim expires with a stable terminal reason and settles its
+escrow rather than parking silently — unless the definition explicitly opts
+into an unbounded wait.
+
 The team board does not grant access to member private memory. Shared artifacts
 and knowledge spaces remain explicitly authorized. An idle team or member MUST
 passivate; a shared board is durable data, not a resident coordinator.

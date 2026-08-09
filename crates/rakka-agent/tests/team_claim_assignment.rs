@@ -804,6 +804,325 @@ async fn replayed_claim_commands_and_deliveries_converge_on_one_claim() {
 }
 
 #[tokio::test]
+async fn a_steal_racing_an_undecided_offer_settles_and_reopens_the_board() {
+    let fx = fixture();
+    claimable_world(&fx).await;
+
+    // A's claim reaches the task and mints its offer, which stays undecided:
+    // the assignment exchange to the run has not been driven yet.
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-a"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the claim applies");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+
+    // The lease lapses and B steals the still-pending entry; the task
+    // refuses the superseding claim because A's offer is still in flight.
+    fx.clock.store(400_000, std::sync::atomic::Ordering::SeqCst);
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("steal-b"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_B),
+            expected_epoch: 1,
+        },
+    )
+    .await
+    .expect("the expired-lease steal applies");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("the refused steal settles instead of livelocking");
+
+    // The refusal is definitive and the entry reopens for a retry after the
+    // offer resolves — the exact promise the task-side refusal makes.
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Open);
+    assert!(entry.claim.is_none());
+    assert_eq!(
+        entry.last_code.as_deref(),
+        Some("team-claim-assignment-inflight")
+    );
+
+    // The offer resolves as accepted, and the owner echo fills the reopened
+    // entry: the board converges on the owner the fence protected.
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Active);
+    let echo = entry.claim.as_ref().expect("the owner echo stands");
+    assert_eq!(echo.member, member(MEMBER_A));
+    assert_eq!(
+        echo.generation_echo,
+        Some(AgentAssignmentGeneration::new(1))
+    );
+    let task = fx.task_snapshot().await;
+    assert_eq!(
+        task.assignment.expect("the assignment stands").agent,
+        member(MEMBER_A)
+    );
+    assert_eq!(task.team_claims, 1, "the refused steal recorded nothing");
+}
+
+#[tokio::test]
+async fn an_early_owner_echo_survives_the_superseded_steals_refusal() {
+    let fx = fixture();
+    claimable_world(&fx).await;
+
+    // A's claim records, its offer is driven, and the run accepts: the task
+    // durably owns the work and owes the board the activated claim result.
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-a"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the claim applies");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+
+    // The activated result has not reached the board yet, so the entry is
+    // still pending and the lapsed lease lets B steal it.
+    fx.clock.store(400_000, std::sync::atomic::Ordering::SeqCst);
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("steal-b"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_B),
+            expected_epoch: 1,
+        },
+    )
+    .await
+    .expect("the expired-lease steal applies");
+
+    // The superseded claim's activation is delivered first: the owner echo
+    // must fill the entry even though the steal's claim currently holds it.
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Active);
+    assert_eq!(
+        entry.claim.as_ref().expect("the echo stands").member,
+        member(MEMBER_A)
+    );
+
+    // The steal's already-owned refusal settles after the echo and must not
+    // clobber it: the board keeps showing who owns the task.
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Active);
+    let echo = entry.claim.as_ref().expect("the owner echo survives");
+    assert_eq!(echo.member, member(MEMBER_A));
+    assert_eq!(
+        echo.generation_echo,
+        Some(AgentAssignmentGeneration::new(1))
+    );
+    let task = fx.task_snapshot().await;
+    assert_eq!(
+        task.assignment.expect("the assignment stands").agent,
+        member(MEMBER_A)
+    );
+}
+
+#[tokio::test]
+async fn a_release_racing_the_acceptance_refuses_owned_and_the_owner_echo_fills() {
+    let fx = fixture();
+    claimable_world(&fx).await;
+
+    // A's claim records and its offer is accepted; the activated result is
+    // still in flight toward the board when the release decision commits.
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-a"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the claim applies");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Release {
+            operation_id: op("release-a"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 1,
+        },
+    )
+    .await
+    .expect("the release applies at the board");
+
+    // The task refuses the release of a settled, accepted claim as owned —
+    // ownership leaves the board only through task-side outcomes — and the
+    // board marks the entry owned instead of reopening it.
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(
+        entry.status,
+        AgentTeamBoardEntryStatus::Active,
+        "a released acceptance must not reopen the entry"
+    );
+    assert_eq!(entry.last_code.as_deref(), Some("team-claim-already-owned"));
+
+    // The activated result lands and completes the echo.
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Active);
+    let echo = entry.claim.as_ref().expect("the owner echo stands");
+    assert_eq!(echo.member, member(MEMBER_A));
+    assert_eq!(
+        echo.generation_echo,
+        Some(AgentAssignmentGeneration::new(1))
+    );
+    let task = fx.task_snapshot().await;
+    assert_eq!(
+        task.assignment.expect("the assignment stands").status,
+        AgentAssignmentStatus::Accepted
+    );
+}
+
+#[tokio::test]
+async fn a_release_outrunning_its_claim_restores_the_pending_entry() {
+    let fx = fixture();
+    claimable_world(&fx).await;
+
+    // Both decisions are outstanding when the courier drives, and the claim
+    // exchange is lost in transit: the release reaches a task that has never
+    // seen the claim and refuses it as unknown.
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-a"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the claim applies");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Release {
+            operation_id: op("release-a"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 1,
+        },
+    )
+    .await
+    .expect("the release applies at the board");
+    fx.task_transport
+        .inject(rakka_agent::testkit::ExchangeFault::LoseEnvelope);
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+
+    // The definitive refusal must not wedge the entry in Releasing: it
+    // restores to pending, where the release can be retried and the lease
+    // keeps the steal escape hatch open.
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(
+        entry.status,
+        AgentTeamBoardEntryStatus::Pending,
+        "a release the task has not seen the claim for must not wedge the entry"
+    );
+    assert_eq!(
+        entry.claim.as_ref().expect("the claim stands").member,
+        member(MEMBER_A)
+    );
+    assert_eq!(entry.last_code.as_deref(), Some("team-release-unknown"));
+
+    // The lost claim redelivers and the choreography converges normally.
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    assert_eq!(board_entry(&team).status, AgentTeamBoardEntryStatus::Active);
+    let task = fx.task_snapshot().await;
+    assert_eq!(
+        task.assignment.expect("the assignment stands").status,
+        AgentAssignmentStatus::Accepted
+    );
+}
+
+#[tokio::test]
 async fn pre_team_records_serialize_byte_identically() {
     let fx = fixture();
     fx.instantiate_agent().await;

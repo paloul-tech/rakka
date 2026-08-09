@@ -493,3 +493,87 @@ async fn the_audit_trail_is_history_recorded_once_per_transition() {
         "one ordered row per durable transition, none for the replay"
     );
 }
+
+#[tokio::test]
+async fn done_entries_are_evicted_before_the_ceiling_refuses_a_post() {
+    // A one-entry board: the smallest ceiling makes exhaustion immediate.
+    let fx = created_fixture(
+        AgentTeamPolicy::new(AgentRevisionNumber::INITIAL).with_max_board_entries(1),
+    )
+    .await;
+
+    // A claim against a task entity that was never created closes the entry
+    // as Done — a settled fact that must not hold the ceiling forever.
+    let phantom = rakka_agent::AgentTaskId::new("phantom").expect("the task id is valid");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post-phantom"),
+            task: phantom.clone(),
+            posted_by: member_id(MEMBER),
+        },
+    )
+    .await
+    .expect("the post applies");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-phantom"),
+            task: phantom.clone(),
+            member: member_id(MEMBER),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the claim applies at the board");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    let snapshot = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = snapshot
+        .board
+        .iter()
+        .find(|entry| entry.task == phantom)
+        .expect("the phantom entry stands");
+    assert_eq!(entry.status, rakka_agent::AgentTeamBoardEntryStatus::Done);
+
+    // The full board evicts its Done entry instead of refusing every future
+    // post: a long-lived team is never exhausted by its own finished work.
+    let next = rakka_agent::AgentTaskId::new("board-next").expect("the task id is valid");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post-next"),
+            task: next.clone(),
+            posted_by: member_id(MEMBER),
+        },
+    )
+    .await
+    .expect("the Done entry yields its slot to live work");
+    let snapshot = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    assert_eq!(snapshot.board.len(), 1);
+    assert_eq!(snapshot.board[0].task, next);
+
+    // A live entry is never evicted: the ceiling still refuses over open work.
+    let refused = fx
+        .apply_team_command_at(
+            &team_scope(),
+            AgentTeamEntityCommand::PostTask {
+                operation_id: op("post-over"),
+                task: rakka_agent::AgentTaskId::new("board-over").expect("the task id is valid"),
+                posted_by: member_id(MEMBER),
+            },
+        )
+        .await
+        .expect_err("a full board of live work still refuses");
+    assert_eq!(refused.code(), "team-board-exhausted");
+}
