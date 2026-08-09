@@ -642,3 +642,88 @@ async fn goal_contract_status_transitions_count_by_status_difference() {
         "the decision counted once and its replay counted nothing"
     );
 }
+
+/// Team board operations count once per durable transition under bounded
+/// `operation`/`outcome` labels, a duplicate command counts nothing, and
+/// every observation still passes the bounded guard
+/// ([specification 8.10 and 17.12](../../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn team_operations_count_once_under_bounded_labels() {
+    use rakka_agent::{
+        AgentGoalId, AgentRevisionNumber, AgentTeamCreation, AgentTeamEntityCommand, AgentTeamId,
+        AgentTeamPolicy, AgentTeamScope, METRIC_AGENT_TEAM_OPERATIONS,
+    };
+
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ))
+    .with_metrics(metrics.clone());
+
+    let scope = AgentTeamScope::new(
+        tenant(),
+        AgentTeamId::new("metrics-team").expect("the team id is valid"),
+    )
+    .expect("the team scope is valid");
+    let op = |discriminator: &str| {
+        AgentOperationId::new(
+            AgentOperationKind::TeamOperation,
+            [TENANT, "metrics-team", discriminator],
+        )
+        .expect("the operation id derives")
+    };
+    let create = AgentTeamEntityCommand::Create {
+        operation_id: op("create"),
+        creation: Box::new(AgentTeamCreation {
+            leader: agent_id(),
+            root_goal: AgentGoalId::new("metrics-goal").expect("the goal id is valid"),
+            policy: AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+            members: Default::default(),
+        }),
+    };
+    fx.apply_team_command_at(&scope, create.clone())
+        .await
+        .expect("the team creates");
+    // The duplicate answers from the operation log and counts nothing.
+    fx.apply_team_command_at(&scope, create)
+        .await
+        .expect("the replay answers");
+    // A domain refusal counts as refused.
+    fx.apply_team_command_at(
+        &scope,
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post-foreign"),
+            task: rakka_agent::AgentTaskId::new("board-1").expect("the task id is valid"),
+            posted_by: rakka_agent::AgentId::new("outsider").expect("the member id is valid"),
+        },
+    )
+    .await
+    .expect_err("a non-member post refuses");
+
+    let snapshot = metrics.snapshot();
+    for observation in snapshot.observations_named(METRIC_AGENT_TEAM_OPERATIONS) {
+        assert_eq!(observation.kind(), MetricKind::Counter);
+        let attributes: Vec<(&str, &str)> = observation
+            .attributes()
+            .iter()
+            .map(|attribute| (attribute.key(), attribute.value()))
+            .collect();
+        validate_agent_domain_metric_attributes(&attributes)
+            .expect("every team-operation label is bounded");
+    }
+    let labels = labels_of(&snapshot, METRIC_AGENT_TEAM_OPERATIONS);
+    assert_eq!(
+        labels,
+        vec![
+            vec![
+                ("operation".to_string(), "create".to_string()),
+                ("outcome".to_string(), "applied".to_string()),
+            ],
+            vec![
+                ("operation".to_string(), "post".to_string()),
+                ("outcome".to_string(), "refused".to_string()),
+            ],
+        ],
+        "one observation per durable decision, none for the replay"
+    );
+}

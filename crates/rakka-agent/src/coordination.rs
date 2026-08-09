@@ -20,13 +20,16 @@
 //! generation on the *same* task, so the transfer debits no descendant and
 //! opens no fan-in membership.
 //!
-//! Team coordination owns `AgentTeamId`, bounded membership, and a
-//! durable shared task board whose claims, releases, and transfers are atomic
-//! under revision and lease fencing. Moderation owns `AgentConversationId`,
-//! the participant set, durable turn and round state, and transcript artifacts,
-//! where only the current participant may submit and duplicates are rejected.
-//! Their policy payloads are revision-only shells here; their fields arrive
-//! with their own slices.
+//! Team coordination owns [`crate::identity::AgentTeamId`], bounded
+//! membership, and a durable shared task board whose claims, releases, and
+//! transfers are atomic under revision and lease fencing. The
+//! [`AgentTeamPolicy`] payload carries the board's bounded ceilings and the
+//! claim-lease duration; the board itself is the team entity's durable state
+//! ([`crate::team`]). Moderation owns `AgentConversationId`, the participant
+//! set, durable turn and round state, and transcript artifacts, where only
+//! the current participant may submit and duplicates are rejected. Its policy
+//! payload stays a revision-only shell here; its fields arrive with its own
+//! slice.
 //!
 //! Every one of these exchanges travels the outbox, inbox, and `rakka-a2a` path
 //! even when the participants are colocated, and idle teams, boards, and
@@ -46,8 +49,9 @@ use crate::definition::{
 };
 use crate::delegation::AgentDelegationTarget;
 use crate::identity::{
-    validate_tenant, AgentGoalId, AgentHandoffId, AgentIdentityError, AgentOperationId,
-    AgentOperationKind, AgentRunId, AgentRunScope, AgentTaskId, TenantId,
+    validate_tenant, AgentGoalId, AgentHandoffId, AgentId, AgentIdentityError, AgentOperationId,
+    AgentOperationKind, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, AgentTeamClaimId,
+    AgentTeamScope, TenantId,
 };
 use crate::model::AgentToolCallId;
 use crate::task::{AgentAssignmentGeneration, AgentContentDigest};
@@ -121,6 +125,180 @@ pub fn handoff_result_operation_id(
         AgentOperationKind::Handoff,
         [tenant.as_str(), handoff.as_str(), "result"],
     )
+}
+
+/// Prefix of every derived [`AgentTeamClaimId`].
+///
+/// The suffix is a fixed-length digest, so the id always satisfies the
+/// identity bounds whatever the board coordinate contains, and an id without
+/// this prefix was not derived by [`team_claim_id_for`].
+pub const AGENT_TEAM_CLAIM_ID_PREFIX: &str = "team-claim-";
+
+/// Derives the identity of the claim one team's board decision records for
+/// one `(task, member, epoch)` coordinate.
+///
+/// The derivation is pure over durable board state at the claiming
+/// transition — the same length-prefixed digest construction as
+/// [`handoff_id_for`], with a leading domain segment so a claim can never
+/// collide with any other derived identity family — so replaying the command
+/// that decided the claim re-derives the identical id and converges on the
+/// same recorded arbitration rather than a second owner.
+pub fn team_claim_id_for(
+    scope: &AgentTeamScope,
+    task: &AgentTaskId,
+    member: &AgentId,
+    epoch: u64,
+) -> AgentCoordinationResult<AgentTeamClaimId> {
+    validate_tenant(scope.tenant())?;
+    let digest = AgentContentDigest::sha256_of_segments([
+        "team-claim",
+        scope.tenant().as_str(),
+        scope.team().as_str(),
+        task.as_str(),
+        member.as_str(),
+        &epoch.to_string(),
+    ]);
+    Ok(AgentTeamClaimId::new(format!(
+        "{AGENT_TEAM_CLAIM_ID_PREFIX}{}",
+        digest.value
+    ))?)
+}
+
+/// Derives the stable operation id of the one claim-apply exchange a team
+/// ever owes one claim.
+///
+/// Pure over `(tenant, claim)`: the claim id already binds the board's
+/// `(task, member, epoch)` coordinate, and a board decision owes exactly one
+/// apply exchange, so every re-drive after any loss owes the identical
+/// operation ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+pub fn team_claim_operation_id(
+    tenant: &TenantId,
+    claim: &AgentTeamClaimId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::TeamClaim,
+        [tenant.as_str(), claim.as_str(), "apply"],
+    )
+}
+
+/// Derives the stable operation id of one release exchange over one
+/// recorded claim.
+///
+/// The board epoch qualifies the id: a release the task refused as
+/// in-flight restores the entry, and a *retried* release is a new board
+/// decision at a new epoch — it must not collide in the journal with the
+/// attempt it retries.
+pub fn team_claim_release_operation_id(
+    tenant: &TenantId,
+    claim: &AgentTeamClaimId,
+    epoch: u64,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    let epoch = epoch.to_string();
+    AgentOperationId::new(
+        AgentOperationKind::TeamClaim,
+        [tenant.as_str(), claim.as_str(), "release", epoch.as_str()],
+    )
+}
+
+/// Derives the stable operation id of the one claim-result exchange a task
+/// ever owes one claim's team.
+///
+/// Pure over `(tenant, claim)`: the claim's resolution is absorbing —
+/// activated or refused, first writer wins — so one logical result exists per
+/// claim, ever, and every re-drive after any loss owes the identical
+/// operation.
+pub fn team_claim_result_operation_id(
+    tenant: &TenantId,
+    claim: &AgentTeamClaimId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::TeamClaim,
+        [tenant.as_str(), claim.as_str(), "result"],
+    )
+}
+
+/// Payload type of the team-claim exchange a team drives onto a task.
+pub const AGENT_TEAM_CLAIM_PAYLOAD_TYPE: &str = "rakka.agent.TeamClaim";
+
+/// Payload type of the claim-result exchange a task owes a claim's team.
+pub const AGENT_TEAM_CLAIM_RESULT_PAYLOAD_TYPE: &str = "rakka.agent.TeamClaimResult";
+
+/// The board decision one team-claim exchange carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentTeamClaimAction {
+    /// Claim the entry for one member — a fresh claim, an expired-lease
+    /// steal, and a transfer's superseding claim are all this action; the
+    /// task's arbitration cannot and need not tell them apart.
+    Claim {
+        /// The member the board recorded as the claimant.
+        member: AgentId,
+    },
+    /// Release the recorded claim before its assignment accepted.
+    Release,
+}
+
+/// The command payload of one [`crate::choreography::AgentExchangeKind::TeamClaim`]
+/// exchange (team → task).
+///
+/// Every field is durable board state re-validated by the task's own
+/// arbitration; nothing here is model output. The task fences the `epoch`
+/// against its own recorded claim fence, so a courier-reordered stale action
+/// refuses rather than reviving a superseded decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTeamClaimCommand {
+    /// The team whose board decision this is.
+    pub team: AgentTeamScope,
+    /// The derived claim this action applies or releases.
+    pub claim: AgentTeamClaimId,
+    /// The claimed task.
+    pub task: AgentTaskId,
+    /// The board entry's claim epoch after the deciding transition.
+    pub epoch: u64,
+    /// The decision.
+    pub action: AgentTeamClaimAction,
+    /// The team policy revision in force at the decision.
+    pub policy_revision: AgentRevisionNumber,
+    /// When the recorded claim's pending window lapses. Advisory to the
+    /// task — the board observes expiry itself, lazily.
+    pub lease_expires_at: AgentTimestampMillis,
+}
+
+/// How one recorded claim resolved at its task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentTeamClaimOutcome {
+    /// The claimant's assignment was durably accepted; the echoes let the
+    /// board mirror the owner without ever holding ownership.
+    Activated {
+        /// The accepted assignment generation.
+        generation: AgentAssignmentGeneration,
+        /// The run serving that generation.
+        run: AgentRunId,
+        /// The member the assignment accepted under.
+        member: AgentId,
+    },
+    /// The claim refused — arbitration, readiness, exhaustion, budget, or
+    /// cancellation — under a stable code; the board entry reopens.
+    Refused {
+        /// The stable refusal code.
+        code: String,
+    },
+}
+
+/// The notice payload of one
+/// [`crate::choreography::AgentExchangeKind::TeamClaimResult`] exchange
+/// (task → source team).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTeamClaimResultNotice {
+    /// The task reporting the resolution.
+    pub task: AgentTaskScope,
+    /// The claim that resolved.
+    pub claim: AgentTeamClaimId,
+    /// The board epoch the claim was recorded under.
+    pub epoch: u64,
+    /// How it resolved.
+    pub outcome: AgentTeamClaimOutcome,
 }
 
 /// One coordination capability descriptor: the policy payload behind one
@@ -246,23 +424,177 @@ impl AgentDelegationPolicy {
     }
 }
 
+/// Hard ceiling on a team's bounded membership; a policy value above it
+/// clamps.
+pub const AGENT_TEAM_MAX_MEMBERS: u32 = 16;
+
+/// Hard ceiling on a team board's entries; a policy value above it clamps.
+pub const AGENT_TEAM_MAX_BOARD_ENTRIES: u32 = 32;
+
+/// Hard ceiling on a team's mediated-message ring; a policy value above it
+/// clamps.
+pub const AGENT_TEAM_MAX_MESSAGES: u32 = 16;
+
+/// Hard ceiling on one mediated message's body bytes; a policy value above
+/// it clamps.
+pub const AGENT_TEAM_MESSAGE_MAX_BYTES: usize = 1024;
+
+const fn default_team_max_members() -> u32 {
+    8
+}
+
+const fn default_team_max_board_entries() -> u32 {
+    16
+}
+
+const fn default_team_max_messages() -> u32 {
+    8
+}
+
+const fn default_team_max_message_bytes() -> usize {
+    AGENT_TEAM_MESSAGE_MAX_BYTES
+}
+
+const fn default_team_claim_lease_ms() -> u64 {
+    300_000
+}
+
 /// The team-leadership capability's policy payload
 /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// A revision-only shell: membership bounds, capability scopes, and
-/// creation/expiry policy arrive with the team slice.
+/// Trusted definition/setup data: the board's bounded ceilings, the
+/// claim-lease duration, and the creation/expiry policy. The lease bounds the
+/// claim-*pending* window only — an accepted assignment is never stealable by
+/// lease expiry; run budgets bound execution. Every field is serde-defaulted,
+/// so a pre-slice revision-only payload still decodes.
+///
+/// The `tool` field is the shaped-but-dormant hook for a later model-visible
+/// team coordination tool: this slice wires no run-loop interception, no team
+/// effect kind, and no executor port, so a declared tool id is carried but
+/// never dispatched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentTeamPolicy {
     /// The policy revision.
     pub revision: AgentRevisionNumber,
+    /// Bounded membership ceiling, clamped to [`AGENT_TEAM_MAX_MEMBERS`].
+    #[serde(default = "default_team_max_members")]
+    pub max_members: u32,
+    /// Bounded board ceiling, clamped to [`AGENT_TEAM_MAX_BOARD_ENTRIES`].
+    #[serde(default = "default_team_max_board_entries")]
+    pub max_board_entries: u32,
+    /// Bounded message-ring ceiling, clamped to [`AGENT_TEAM_MAX_MESSAGES`].
+    #[serde(default = "default_team_max_messages")]
+    pub max_messages: u32,
+    /// Bounded message-body ceiling, clamped to
+    /// [`AGENT_TEAM_MESSAGE_MAX_BYTES`].
+    #[serde(default = "default_team_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Milliseconds a recorded claim may stay pending before another member
+    /// may steal the entry. Observed lazily at the next board command — no
+    /// timer ever fires to expire a lease.
+    #[serde(default = "default_team_claim_lease_ms")]
+    pub claim_lease_ms: u64,
+    /// Milliseconds after creation at which the team expires, observed
+    /// lazily. `None` means the team never expires on its own.
+    #[serde(default)]
+    pub expires_after_ms: Option<u64>,
+    /// The declared coordination tool a later slice's loop interception will
+    /// realize. Dormant in this slice: carried, validated, never dispatched.
+    #[serde(default)]
+    pub tool: Option<AgentToolId>,
 }
 
 impl AgentTeamPolicy {
-    /// Creates the policy.
+    /// Creates the policy with the default ceilings and lease.
     #[must_use]
     pub const fn new(revision: AgentRevisionNumber) -> Self {
-        Self { revision }
+        Self {
+            revision,
+            max_members: default_team_max_members(),
+            max_board_entries: default_team_max_board_entries(),
+            max_messages: default_team_max_messages(),
+            max_message_bytes: default_team_max_message_bytes(),
+            claim_lease_ms: default_team_claim_lease_ms(),
+            expires_after_ms: None,
+            tool: None,
+        }
+    }
+
+    /// Sets the membership ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_members(mut self, max_members: u32) -> Self {
+        self.max_members = max_members.min(AGENT_TEAM_MAX_MEMBERS);
+        self
+    }
+
+    /// Sets the board ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_board_entries(mut self, max_board_entries: u32) -> Self {
+        self.max_board_entries = max_board_entries.min(AGENT_TEAM_MAX_BOARD_ENTRIES);
+        self
+    }
+
+    /// Sets the message-ring ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_messages(mut self, max_messages: u32) -> Self {
+        self.max_messages = max_messages.min(AGENT_TEAM_MAX_MESSAGES);
+        self
+    }
+
+    /// Sets the message-body ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = max_message_bytes.min(AGENT_TEAM_MESSAGE_MAX_BYTES);
+        self
+    }
+
+    /// Sets the claim-lease duration.
+    #[must_use]
+    pub const fn with_claim_lease_ms(mut self, claim_lease_ms: u64) -> Self {
+        self.claim_lease_ms = claim_lease_ms;
+        self
+    }
+
+    /// Sets the lazy expiry horizon.
+    #[must_use]
+    pub const fn with_expiry_after_ms(mut self, expires_after_ms: u64) -> Self {
+        self.expires_after_ms = Some(expires_after_ms);
+        self
+    }
+
+    /// Declares the dormant coordination tool.
+    #[must_use]
+    pub fn with_tool(mut self, tool: AgentToolId) -> Self {
+        self.tool = Some(tool);
+        self
+    }
+
+    /// Membership ceiling with the hard cap applied, whatever a stored or
+    /// wire-carried payload claims.
+    #[must_use]
+    pub fn effective_max_members(&self) -> u32 {
+        self.max_members.clamp(1, AGENT_TEAM_MAX_MEMBERS)
+    }
+
+    /// Board ceiling with the hard cap applied.
+    #[must_use]
+    pub fn effective_max_board_entries(&self) -> u32 {
+        self.max_board_entries
+            .clamp(1, AGENT_TEAM_MAX_BOARD_ENTRIES)
+    }
+
+    /// Message-ring ceiling with the hard cap applied.
+    #[must_use]
+    pub fn effective_max_messages(&self) -> u32 {
+        self.max_messages.clamp(1, AGENT_TEAM_MAX_MESSAGES)
+    }
+
+    /// Message-body ceiling with the hard cap applied.
+    #[must_use]
+    pub fn effective_max_message_bytes(&self) -> usize {
+        self.max_message_bytes
+            .clamp(1, AGENT_TEAM_MESSAGE_MAX_BYTES)
     }
 }
 

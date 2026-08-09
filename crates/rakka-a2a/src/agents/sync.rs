@@ -69,6 +69,11 @@ fn agent_metadata_from_snapshot(
             collaboration.extend(echo);
         }
     }
+    if let Some(claim) = snapshot.team_claim.as_deref() {
+        if let Value::Object(echo) = super::collaboration::team_echo(claim) {
+            collaboration.extend(echo);
+        }
+    }
     if !collaboration.is_empty() {
         metadata.insert(
             super::collaboration::META_COLLABORATION.to_string(),

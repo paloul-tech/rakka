@@ -39,28 +39,35 @@ use super::service::RakkaAgentA2AService;
 ///
 /// Wraps the agents-surface service core with a fixed caller identity: the
 /// service params, tenant, and default principal every call carries.
-pub struct A2AAgentClientTransport<Tasks, Agents, History, Runs>
+pub struct A2AAgentClientTransport<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
 {
-    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>,
+    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
     tenant: Option<String>,
     principal: Option<PrincipalRef>,
 }
 
-impl<Tasks, Agents, History, Runs> A2AAgentClientTransport<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory>
+    A2AAgentClientTransport<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
 {
     /// Wraps a service.
     #[must_use]
-    pub const fn new(service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs>>) -> Self {
+    pub const fn new(
+        service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
+    ) -> Self {
         Self {
             service,
             tenant: None,
@@ -213,13 +220,15 @@ fn management_command(
     })
 }
 
-impl<Tasks, Agents, History, Runs> AgentClientTransport
-    for A2AAgentClientTransport<Tasks, Agents, History, Runs>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory> AgentClientTransport
+    for A2AAgentClientTransport<Tasks, Agents, History, Runs, Teams, TeamHistory>
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
+    Teams: DurableStateStore<rakka_agent::AgentTeamState>,
+    TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
 {
     fn create_task(
         &self,

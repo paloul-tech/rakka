@@ -363,6 +363,7 @@ impl World {
                     input: AgentTaskContent::inline(serde_json::json!({ "goal": GOAL }))
                         .expect("the input is inline-bounded"),
                     assignee: None,
+                    team: None,
                     goal: Some(goal_id()),
                     goal_mode: continuous_goal_mode(initial_policy()),
                     goal_spec: None,

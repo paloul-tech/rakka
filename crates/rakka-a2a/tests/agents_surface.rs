@@ -27,6 +27,7 @@ use rakka_agent::testkit::{
     sweep_crash_points, CrashingStateStore, DeferredExchangeRouter, InProcessRunEntityTransport,
     InProcessTaskEntityTransport, ScriptedDispatcher,
 };
+use rakka_agent::InMemoryAgentTeamHistoryStore;
 use rakka_agent::{
     run_id_for_assignment, AgentAssignmentGeneration, AgentAuthorityEnvelope,
     AgentClientManagementCommand, AgentClientManagementResponse, AgentClientTaskRequest,
@@ -47,7 +48,15 @@ use rakka_persistence::InMemoryDurableStateStore;
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = CrashingStateStore<AgentRunState>;
-type Service = RakkaAgentA2AService<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore, RunStore>;
+type Service = RakkaAgentA2AService<
+    TaskStore,
+    AgentStore,
+    InMemoryAgentTaskHistoryStore,
+    RunStore,
+    TeamStore,
+    InMemoryAgentTeamHistoryStore,
+>;
+type TeamStore = InMemoryDurableStateStore<rakka_agent::AgentTeamState>;
 
 const TENANT: &str = "acme";
 const AGENT: &str = "support-agent";
@@ -169,6 +178,8 @@ impl Fixture {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                TeamStore::default(),
+                InMemoryAgentTeamHistoryStore::new(),
                 router.clone(),
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),

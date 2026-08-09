@@ -486,6 +486,7 @@ fn pre_slice_records_decode_without_the_delegation_fields() {
         definition: task_definition(),
         input: AgentTaskContent::inline(json!({ "ticket": 1 })).expect("bounded"),
         assignee: None,
+        team: None,
         goal: None,
         goal_mode: Default::default(),
         goal_spec: None,

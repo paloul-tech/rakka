@@ -29,6 +29,7 @@ use rakka_agent::testkit::{
     run_entity, CrashingStateStore, DeferredExchangeRouter, DeterministicModelAdapter,
     InProcessRunEntityTransport, InProcessTaskEntityTransport, ScriptedDispatcher,
 };
+use rakka_agent::InMemoryAgentTeamHistoryStore;
 use rakka_agent::{
     delegation_id_for, effect_id_for, run_id_for_assignment, AgentA2aSendExecutor,
     AgentA2aSendFinding, AgentAssignmentGeneration, AgentAuthorityEnvelope, AgentCapabilityId,
@@ -50,7 +51,15 @@ use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore};
 type TaskStore = CrashingStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = CrashingStateStore<AgentRunState>;
-type Service = RakkaAgentA2AService<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore, RunStore>;
+type Service = RakkaAgentA2AService<
+    TaskStore,
+    AgentStore,
+    InMemoryAgentTaskHistoryStore,
+    RunStore,
+    TeamStore,
+    InMemoryAgentTeamHistoryStore,
+>;
+type TeamStore = InMemoryDurableStateStore<rakka_agent::AgentTeamState>;
 
 const TENANT: &str = "acme";
 const COORDINATOR: &str = "coordinator";
@@ -181,6 +190,8 @@ impl Fixture {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                TeamStore::default(),
+                InMemoryAgentTeamHistoryStore::new(),
                 router.clone(),
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),
@@ -360,6 +371,7 @@ impl Fixture {
                     input: AgentTaskContent::inline(json!({ "goal": "translate everything" }))
                         .expect("the input is inline-bounded"),
                     assignee: Some(coordinator()),
+                    team: None,
                     goal: None,
                     goal_mode: Default::default(),
                     goal_spec: None,

@@ -257,6 +257,7 @@ impl Sharded {
                             input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                                 .expect("the input is inline-bounded"),
                             assignee: Some(agent_id()),
+                            team: None,
                             goal: Some(goal_id()),
                             goal_mode: Default::default(),
                             goal_spec: goal_spec.clone(),

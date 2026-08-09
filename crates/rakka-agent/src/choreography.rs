@@ -169,7 +169,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::{
     AgentIdentityError, AgentIdentityResult, AgentOperationId, AgentRunScope, AgentScope,
-    AgentTaskScope, TenantId, AGENT_SCOPE_SEPARATOR,
+    AgentTaskScope, AgentTeamScope, TenantId, AGENT_SCOPE_SEPARATOR,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -220,6 +220,8 @@ pub enum AgentEntityClass {
     Task,
     /// The sharded run entity, keyed `(TenantId, AgentId, AgentRunId)`.
     Run,
+    /// The sharded team entity, keyed `(TenantId, AgentTeamId)`.
+    Team,
 }
 
 impl AgentEntityClass {
@@ -230,6 +232,7 @@ impl AgentEntityClass {
             Self::Agent => "agent",
             Self::Task => "task",
             Self::Run => "run",
+            Self::Team => "team",
         }
     }
 
@@ -240,6 +243,7 @@ impl AgentEntityClass {
             "agent" => Some(Self::Agent),
             "task" => Some(Self::Task),
             "run" => Some(Self::Run),
+            "team" => Some(Self::Team),
             _ => None,
         }
     }
@@ -267,6 +271,8 @@ pub enum AgentEntityAddress {
     Task(AgentTaskScope),
     /// One run entity.
     Run(AgentRunScope),
+    /// One team entity.
+    Team(AgentTeamScope),
 }
 
 impl AgentEntityAddress {
@@ -277,6 +283,7 @@ impl AgentEntityAddress {
             Self::Agent(_) => AgentEntityClass::Agent,
             Self::Task(_) => AgentEntityClass::Task,
             Self::Run(_) => AgentEntityClass::Run,
+            Self::Team(_) => AgentEntityClass::Team,
         }
     }
 
@@ -287,6 +294,7 @@ impl AgentEntityAddress {
             Self::Agent(scope) => scope.tenant(),
             Self::Task(scope) => scope.tenant(),
             Self::Run(scope) => scope.tenant(),
+            Self::Team(scope) => scope.tenant(),
         }
     }
 
@@ -297,6 +305,7 @@ impl AgentEntityAddress {
             Self::Agent(scope) => scope.entity_id(),
             Self::Task(scope) => scope.entity_id(),
             Self::Run(scope) => scope.entity_id(),
+            Self::Team(scope) => scope.entity_id(),
         }
     }
 
@@ -307,6 +316,7 @@ impl AgentEntityAddress {
             Self::Agent(scope) => scope.persistence_id(),
             Self::Task(scope) => scope.persistence_id(),
             Self::Run(scope) => scope.persistence_id(),
+            Self::Team(scope) => scope.persistence_id(),
         }
     }
 
@@ -317,6 +327,7 @@ impl AgentEntityAddress {
             Self::Agent(scope) => scope.key(),
             Self::Task(scope) => scope.key(),
             Self::Run(scope) => scope.key(),
+            Self::Team(scope) => scope.key(),
         };
         format!("{}{AGENT_SCOPE_SEPARATOR}{scope}", self.class().as_label())
     }
@@ -335,6 +346,7 @@ impl AgentEntityAddress {
             AgentEntityClass::Agent => Self::Agent(AgentScope::from_entity_id(entity_id)?),
             AgentEntityClass::Task => Self::Task(AgentTaskScope::from_entity_id(entity_id)?),
             AgentEntityClass::Run => Self::Run(AgentRunScope::from_entity_id(entity_id)?),
+            AgentEntityClass::Team => Self::Team(AgentTeamScope::from_entity_id(entity_id)?),
         })
     }
 
@@ -357,6 +369,7 @@ impl AgentEntityAddress {
             AgentEntityClass::Agent => Self::Agent(AgentScope::parse(scope)?),
             AgentEntityClass::Task => Self::Task(AgentTaskScope::parse(scope)?),
             AgentEntityClass::Run => Self::Run(AgentRunScope::parse(scope)?),
+            AgentEntityClass::Team => Self::Team(AgentTeamScope::parse(scope)?),
         })
     }
 }
@@ -558,11 +571,76 @@ pub enum AgentExchangeKind {
     ///   envelope stays outstanding until the binary upgrades — the
     ///   rolling-upgrade posture every new kind takes.
     HandoffResult,
+    /// A team driving a board decision — claim, superseding transfer, or
+    /// release — onto the claimed task
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    /// Initiated by the team entity in the same compare-and-set as the board
+    /// mutation; the task's apply arbitrates the action against its own
+    /// durable claim fence and assignment record, and its local-progress
+    /// pass then decides the assignment. The reply means "claim recorded",
+    /// never "assignment made" — the assignment outcome returns by
+    /// [`Self::TeamClaimResult`].
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the board
+    ///   entry never changed; the member's command replays and commits the
+    ///   identical entry and owed envelope under the same derived operation
+    ///   id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the claim
+    ///   provenance and assignee committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the task's claim
+    ///   provenance is the durable echo — a recorded claim id answers
+    ///   idempotently with no state change.
+    /// - **Stale epoch, foreign team, terminal task, unresolved handoff,
+    ///   cancellation, accepted assignment, or claim ceiling**: a settled
+    ///   refusal the team's settle rule accepts as definitive; the board
+    ///   entry reopens (or restores) rather than waiting forever.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades.
+    TeamClaim,
+    /// A task reporting a board claim's assignment outcome to the team that
+    /// drove it ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)):
+    /// activated — the claimant's assignment was durably accepted — or
+    /// refused with the arbitration or assignment refusal code. Initiated by
+    /// the task entity once its claim provenance settles; the reply is the
+    /// team's durable board settlement.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the provenance
+    ///   settled atomically with the assignment decision that settled it;
+    ///   the settle pass re-derives the identical owed envelope under the
+    ///   same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the board
+    ///   settlement committed in one compare-and-set; the re-driven envelope
+    ///   is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the board entry's
+    ///   settled status and epoch are the durable fence — the arm accepts
+    ///   idempotently with no state change.
+    /// - **Unknown claim, unknown task, or forged sender**: a settled
+    ///   refusal the task's settle rule accepts as definitive; the
+    ///   provenance's result marker still settles, so the derivation
+    ///   quiesces.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades.
+    TeamClaimResult,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -575,6 +653,8 @@ impl AgentExchangeKind {
         Self::RunCancel,
         Self::DelegationCancel,
         Self::HandoffResult,
+        Self::TeamClaim,
+        Self::TeamClaimResult,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -593,6 +673,8 @@ impl AgentExchangeKind {
             Self::RunCancel => "run-cancel",
             Self::DelegationCancel => "delegation-cancel",
             Self::HandoffResult => "handoff-result",
+            Self::TeamClaim => "team-claim",
+            Self::TeamClaimResult => "team-claim-result",
         }
     }
 }

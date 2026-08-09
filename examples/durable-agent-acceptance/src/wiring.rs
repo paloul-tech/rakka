@@ -53,6 +53,8 @@ pub type Service = RakkaAgentA2AService<
     InMemoryDurableStateStore<AgentEntityState>,
     InMemoryAgentTaskHistoryStore,
     CrashingStateStore<AgentRunState>,
+    InMemoryDurableStateStore<rakka_agent::AgentTeamState>,
+    rakka_agent::InMemoryAgentTeamHistoryStore,
 >;
 
 /// The production dispatch pipeline over this world's stores.
@@ -287,6 +289,8 @@ impl World {
                 agents.clone(),
                 history.clone(),
                 runs.clone(),
+                InMemoryDurableStateStore::default(),
+                rakka_agent::InMemoryAgentTeamHistoryStore::new(),
                 router.clone(),
                 Arc::new(A2AStaticAgentCatalog::single(catalog_target)),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),

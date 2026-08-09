@@ -122,6 +122,7 @@ fn creation(dependencies: Vec<AgentTaskDependencyDeclaration>) -> AgentTaskCreat
         input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
             .expect("the input is inline-bounded"),
         assignee: Some(agent_id()),
+        team: None,
         goal: None,
         goal_mode: Default::default(),
         goal_spec: None,

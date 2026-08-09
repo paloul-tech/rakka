@@ -173,6 +173,64 @@ pub fn normalize_agent_send(
             }
             AgentOperationKind::Handoff
         }
+        Some(super::collaboration::AgentCollaborationEnvelope::Team(cluster)) => {
+            // A team command is not a task continuation: the board task it
+            // touches rides the cluster's own `task` field, and a send that
+            // names `message.task_id` is a half-formed engagement refused
+            // where it enters rather than routed ambiguously.
+            if !matches!(intent, A2ATaskIntent::NewTask) {
+                return Err(RakkaAgentA2AError::Refused {
+                    code: "team-send-names-task".to_string(),
+                    message: "a team command must not name message.task_id; the board task \
+                              rides the cluster's task field"
+                        .to_string(),
+                });
+            }
+            let team = rakka_agent::AgentTeamId::new(&cluster.team)?;
+            let kind = match cluster.operation {
+                super::collaboration::AgentTeamWireOperation::Claim
+                | super::collaboration::AgentTeamWireOperation::Release
+                | super::collaboration::AgentTeamWireOperation::Transfer => {
+                    AgentOperationKind::TeamClaim
+                }
+                super::collaboration::AgentTeamWireOperation::Message => {
+                    AgentOperationKind::TeamMessage
+                }
+                super::collaboration::AgentTeamWireOperation::PostTask
+                | super::collaboration::AgentTeamWireOperation::Join
+                | super::collaboration::AgentTeamWireOperation::Leave => {
+                    AgentOperationKind::TeamOperation
+                }
+            };
+            // The team command deduplicates under the team's own scope, not
+            // the synthesized placeholder task id, so two retries of one
+            // board decision converge on one durable operation at the team
+            // entity's inbox.
+            let operation_id = AgentOperationId::new(
+                kind,
+                [tenant.as_str(), team.as_str(), discriminator.as_str()],
+            )?;
+            return Ok(NormalizedAgentCommand {
+                tenant,
+                tenant_source,
+                task,
+                context_id,
+                intent,
+                operation_id,
+                discriminator,
+                principal: metadata
+                    .get(crate::mapping::META_PRINCIPAL_REF)
+                    .map(principal_ref_from_value)
+                    .transpose()
+                    .map_err(RakkaAgentA2AError::Mapping)?,
+                agent: metadata_string(metadata, META_AGENT_ID)
+                    .map_err(RakkaAgentA2AError::Mapping)?,
+                task_definition: metadata_string(metadata, META_TASK_DEFINITION)
+                    .map_err(RakkaAgentA2AError::Mapping)?,
+                telemetry: extract_ingress_telemetry(metadata),
+                collaboration,
+            });
+        }
         _ => AgentOperationKind::TaskCreation,
     };
     let operation_id = AgentOperationId::new(
@@ -354,6 +412,14 @@ pub fn agent_task_create_command(
                 reason: "a handoff envelope cannot create a task",
             });
         }
+        // A team command drives a board decision, never a task creation;
+        // reaching here with the team cluster is the same routing bug.
+        Some(super::collaboration::AgentCollaborationEnvelope::Team(_)) => {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "a team envelope cannot create a task",
+            });
+        }
         None => (None, None, None),
     };
     Ok(AgentTaskEntityCommand::Create {
@@ -362,6 +428,7 @@ pub fn agent_task_create_command(
             definition: target.definition.clone(),
             input: AgentTaskContent::inline(input)?,
             assignee: Some(target.agent.clone()),
+            team: None,
             goal,
             // An A2A message creates a finite unit of work; a continuous root
             // control task is instituted by the goal surface, never by
@@ -402,6 +469,147 @@ pub fn agent_task_handoff_command(
         operation_id: normalized.operation_id.clone(),
         request: Box::new(envelope.to_request()?),
     })
+}
+
+/// Builds the deduplicated team entity command for one normalized team send
+/// ([specification 8.10](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every cluster field is a claim the team entity's transition re-validates;
+/// a field the named operation requires but the cluster omits fails closed
+/// here, before anything durable happens. Membership changes require an
+/// authenticated principal — the management-write precedent — because their
+/// provenance records who accepted them.
+pub fn agent_team_command(
+    normalized: &NormalizedAgentCommand,
+    now: rakka_agent_workflow::AgentTimestampMillis,
+) -> RakkaAgentA2AResult<(
+    rakka_agent::AgentTeamScope,
+    rakka_agent::AgentTeamEntityCommand,
+)> {
+    use rakka_agent::{AgentTeamEntityCommand, AgentTeamId, AgentTeamScope};
+
+    use super::collaboration::{AgentCollaborationEnvelope, AgentTeamWireOperation};
+
+    let Some(AgentCollaborationEnvelope::Team(cluster)) = normalized.collaboration.as_ref() else {
+        return Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "the send carries no team envelope",
+        });
+    };
+    let scope = AgentTeamScope::new(normalized.tenant.clone(), AgentTeamId::new(&cluster.team)?)?;
+    let operation_id = normalized.operation_id.clone();
+
+    let required = |value: &Option<String>, field: &'static str| -> RakkaAgentA2AResult<String> {
+        value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+            .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                field,
+            }))
+    };
+    let board_task = |value: &Option<String>| -> RakkaAgentA2AResult<AgentTaskId> {
+        Ok(AgentTaskId::new(required(
+            value,
+            "io.rakka.collaboration.task",
+        )?)?)
+    };
+    let member_id = |value: &Option<String>,
+                     field: &'static str|
+     -> RakkaAgentA2AResult<rakka_agent::AgentId> {
+        Ok(rakka_agent::AgentId::new(required(value, field)?)?)
+    };
+    let expected_epoch =
+        cluster
+            .expected_epoch
+            .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                field: "io.rakka.collaboration.expected-epoch",
+            }));
+    let lifecycle_revision =
+        cluster
+            .expected_lifecycle_revision
+            .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                field: "io.rakka.collaboration.expected-lifecycle-revision",
+            }));
+    // A membership change records who accepted it (specification 7.2); an
+    // unauthenticated one fails closed exactly as a management write does.
+    let provenance = || -> RakkaAgentA2AResult<Box<rakka_agent::AgentRevisionProvenance>> {
+        let principal = normalized
+            .principal
+            .clone()
+            .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                field: "io.rakka.principal.ref",
+            }))?;
+        Ok(Box::new(super::management::management_provenance(
+            principal,
+            &normalized.discriminator,
+            None,
+            now,
+        )))
+    };
+
+    let command = match cluster.operation {
+        AgentTeamWireOperation::Claim => AgentTeamEntityCommand::Claim {
+            operation_id,
+            task: board_task(&cluster.task)?,
+            member: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+            expected_epoch: expected_epoch?,
+        },
+        AgentTeamWireOperation::Release => AgentTeamEntityCommand::Release {
+            operation_id,
+            task: board_task(&cluster.task)?,
+            member: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+            expected_epoch: expected_epoch?,
+        },
+        AgentTeamWireOperation::Transfer => AgentTeamEntityCommand::Transfer {
+            operation_id,
+            task: board_task(&cluster.task)?,
+            member: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+            target: member_id(
+                &cluster.target_member,
+                "io.rakka.collaboration.target-member",
+            )?,
+            expected_epoch: expected_epoch?,
+        },
+        AgentTeamWireOperation::PostTask => AgentTeamEntityCommand::PostTask {
+            operation_id,
+            task: board_task(&cluster.task)?,
+            posted_by: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+        },
+        AgentTeamWireOperation::Message => AgentTeamEntityCommand::AppendMessage {
+            operation_id,
+            from: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+            to: cluster
+                .target_member
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(rakka_agent::AgentId::new)
+                .transpose()?,
+            body: required(&cluster.body, "io.rakka.collaboration.body")?,
+        },
+        AgentTeamWireOperation::Join => {
+            let mut capability_scopes = std::collections::BTreeSet::new();
+            for scope in &cluster.capability_scopes {
+                capability_scopes.insert(rakka_agent::AgentCapabilityId::new(scope)?);
+            }
+            AgentTeamEntityCommand::AddMember {
+                operation_id,
+                member: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+                capability_scopes,
+                expected_lifecycle_revision: rakka_agent::AgentRevisionNumber::new(
+                    lifecycle_revision?,
+                ),
+                provenance: provenance()?,
+            }
+        }
+        AgentTeamWireOperation::Leave => AgentTeamEntityCommand::RemoveMember {
+            operation_id,
+            member: member_id(&cluster.member, "io.rakka.collaboration.member")?,
+            expected_lifecycle_revision: rakka_agent::AgentRevisionNumber::new(lifecycle_revision?),
+            provenance: provenance()?,
+        },
+    };
+    Ok((scope, command))
 }
 
 /// Builds the deduplicated cancellation command for one normalized cancel.
