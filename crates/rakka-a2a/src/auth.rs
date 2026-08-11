@@ -29,6 +29,16 @@ pub enum A2AOperation {
     /// authorizer can gate each verb and bind the authenticated caller to
     /// the member the cluster claims to speak for.
     TeamCommand,
+    /// A `message:send` carrying the collaboration extension's conversation
+    /// cluster: a state-mutating turn-protocol command over a moderated
+    /// conversation entity (submit-turn, end).
+    ///
+    /// One operation class with the per-command granularity riding
+    /// [`A2AAuthorizationRequest::conversation`]: the claim carries the
+    /// cluster's operation label and the participant/coordinate it names, so
+    /// a deployment authorizer can gate each verb and bind the authenticated
+    /// caller to the speaker the cluster claims to be.
+    ConversationCommand,
     /// `tasks/get`.
     GetTask,
     /// `tasks/list`.
@@ -57,6 +67,7 @@ impl A2AOperation {
             Self::SendMessage => "send-message",
             Self::RecordHandoff => "record-handoff",
             Self::TeamCommand => "team-command",
+            Self::ConversationCommand => "conversation-command",
             Self::GetTask => "get-task",
             Self::ListTasks => "list-tasks",
             Self::CancelTask => "cancel-task",
@@ -113,6 +124,29 @@ pub struct A2ATeamClaim<'a> {
     pub target_member: Option<&'a str>,
 }
 
+/// The conversation claim riding one [`A2AOperation::ConversationCommand`]
+/// check.
+///
+/// Every field is the wire cluster's *claim*, surfaced before anything
+/// durable happens so the deployment authorizer can gate each turn-protocol
+/// verb and bind the authenticated caller to the speaker the cluster names —
+/// the conversation entity's transition then re-validates the same claims
+/// against durable state (the roster gate and the cursor's derived owner
+/// fence), which gates consistency but never identity.
+#[derive(Debug, Clone, Copy)]
+pub struct A2AConversationClaim<'a> {
+    /// The conversation the command addresses.
+    pub conversation: &'a str,
+    /// The cluster's operation label (`submit-turn`, `end`).
+    pub operation: &'a str,
+    /// The speaker the caller claims to be, when the operation names one.
+    pub participant: Option<&'a str>,
+    /// The round the command claims, when it names one.
+    pub round: Option<u64>,
+    /// The turn index the command claims, when it names one.
+    pub turn: Option<u32>,
+}
+
 /// One authorization check.
 #[derive(Debug, Clone)]
 pub struct A2AAuthorizationRequest<'a> {
@@ -128,6 +162,9 @@ pub struct A2AAuthorizationRequest<'a> {
     pub handoff: Option<A2AHandoffClaim<'a>>,
     /// The claimed team command, on [`A2AOperation::TeamCommand`] checks.
     pub team: Option<A2ATeamClaim<'a>>,
+    /// The claimed conversation command, on
+    /// [`A2AOperation::ConversationCommand`] checks.
+    pub conversation: Option<A2AConversationClaim<'a>>,
 }
 
 /// Authorization decision.

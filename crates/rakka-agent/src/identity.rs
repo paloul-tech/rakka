@@ -273,6 +273,17 @@ validated_id! {
 }
 
 validated_id! {
+    /// Identity of one durable moderated conversation
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The sharding key of the conversation entity, whose durable state holds
+    /// the ordered turn protocol. A conversation is trusted application data:
+    /// its id is chosen by the wiring that creates it, never by model output
+    /// or a wire send.
+    pub AgentConversationId, "agent_conversation_id"
+}
+
+validated_id! {
     /// Identity of one durable workflow-tool invocation
     /// ([specification 8.6](../../../docs/plans/rakka-agent/spec.md)).
     ///
@@ -637,6 +648,83 @@ impl Display for AgentTeamScope {
     }
 }
 
+/// Durable scope of one moderated-conversation entity:
+/// `(TenantId, AgentConversationId)`
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// This is the sharding key of the conversation entity delivered by slice
+/// 5.3. Its durable state is the ordered turn protocol; the scope must not
+/// change once records exist.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentConversationScope {
+    tenant: TenantId,
+    conversation: AgentConversationId,
+}
+
+impl AgentConversationScope {
+    /// Creates a conversation scope, validating the tenant value.
+    pub fn new(tenant: TenantId, conversation: AgentConversationId) -> AgentIdentityResult<Self> {
+        validate_tenant(&tenant)?;
+        Ok(Self {
+            tenant,
+            conversation,
+        })
+    }
+
+    /// Tenant boundary of this conversation.
+    #[must_use]
+    pub const fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// Conversation identity within the tenant.
+    #[must_use]
+    pub const fn conversation(&self) -> &AgentConversationId {
+        &self.conversation
+    }
+
+    /// Flattened, injective key string for this scope.
+    #[must_use]
+    pub fn key(&self) -> String {
+        join_segments(&[self.tenant.as_str(), self.conversation.as_str()])
+    }
+
+    /// Sharded entity id addressing this conversation.
+    #[must_use]
+    pub fn entity_id(&self) -> EntityId {
+        EntityId::new(self.key())
+    }
+
+    /// Durable persistence id of this conversation's entity state.
+    #[must_use]
+    pub fn persistence_id(&self) -> PersistenceId {
+        PersistenceId::new(format!(
+            "{AGENT_CONVERSATION_ENTITY_PERSISTENCE_PREFIX}:{}",
+            self.key()
+        ))
+    }
+
+    /// Parses a flattened scope key, failing closed on a malformed value.
+    pub fn parse(key: &str) -> AgentIdentityResult<Self> {
+        let [tenant, conversation] = split_segments(SCOPE_FIELD_CONVERSATION, key)?;
+        Self::new(
+            TenantId::new(tenant),
+            AgentConversationId::new(conversation)?,
+        )
+    }
+
+    /// Parses the scope back out of a sharded entity id.
+    pub fn from_entity_id(entity_id: &EntityId) -> AgentIdentityResult<Self> {
+        Self::parse(entity_id.as_str())
+    }
+}
+
+impl Display for AgentConversationScope {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.key())
+    }
+}
+
 /// The immutable binding of one run to the single task it serves
 /// ([specification 6.5](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -727,6 +815,9 @@ pub const AGENT_RUN_ENTITY_PERSISTENCE_PREFIX: &str = "agent-run-entity";
 /// Prefix of the durable persistence id of a team entity's state.
 pub const AGENT_TEAM_ENTITY_PERSISTENCE_PREFIX: &str = "agent-team-entity";
 
+/// Prefix of the durable persistence id of a conversation entity's state.
+pub const AGENT_CONVERSATION_ENTITY_PERSISTENCE_PREFIX: &str = "agent-conversation-entity";
+
 /// Prefix of an agent-private memory namespace.
 pub const AGENT_MEMORY_NAMESPACE_PREFIX: &str = "agent-memory";
 
@@ -734,6 +825,7 @@ const SCOPE_FIELD_AGENT: &str = "agent scope";
 const SCOPE_FIELD_TASK: &str = "task scope";
 const SCOPE_FIELD_RUN: &str = "run scope";
 const SCOPE_FIELD_TEAM: &str = "team scope";
+const SCOPE_FIELD_CONVERSATION: &str = "conversation scope";
 
 fn join_segments(segments: &[&str]) -> String {
     let mut key = String::new();
@@ -787,6 +879,7 @@ scope_serde!(AgentScope);
 scope_serde!(AgentTaskScope);
 scope_serde!(AgentRunScope);
 scope_serde!(AgentTeamScope);
+scope_serde!(AgentConversationScope);
 
 /// Class of durable operation a stable operation id names
 /// ([specification 6.10](../../../docs/plans/rakka-agent/spec.md)).
@@ -858,6 +951,9 @@ pub enum AgentOperationKind {
     TeamOperation,
     /// One moderated conversation turn.
     ConversationTurn,
+    /// A conversation lifecycle operation other than a turn: creation, an
+    /// early end, or the lazy expiry observation.
+    ConversationOperation,
     /// Publication of a new agent definition revision.
     DefinitionUpdate,
     /// Acceptance of a settings update.
@@ -907,6 +1003,7 @@ impl AgentOperationKind {
             Self::TeamMessage => "team-message",
             Self::TeamOperation => "team-operation",
             Self::ConversationTurn => "conversation-turn",
+            Self::ConversationOperation => "conversation-operation",
             Self::DefinitionUpdate => "definition-update",
             Self::SettingsUpdate => "settings-update",
             Self::LifecycleCommand => "lifecycle-command",

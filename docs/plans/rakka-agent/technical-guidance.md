@@ -1100,7 +1100,7 @@ Add Rakka metrics for durable/runtime concerns not covered upstream:
 | `rakka.agent.task.result_rejections` | Counter | bounded rule class, outcome |
 | `rakka.agent.handoffs` | Counter | target class, outcome |
 | `rakka.agent.team.operations` | Counter | operation, outcome |
-| `rakka.agent.moderation.turns` | Counter | mode, outcome |
+| `rakka.agent.moderation.turns` | Counter | operation, outcome (amended by slice 5.3: labeled like the team counter from the closed key set; the `mode` label is owed with the model-visible moderation tool) |
 | `rakka.agent.goal.evaluations` | Counter | goal mode, evaluator class, outcome |
 | `rakka.agent.delegations` | Counter | peer/skill class, outcome |
 | `rakka.agent.decision.duration` | Histogram, seconds | decision kind/source |

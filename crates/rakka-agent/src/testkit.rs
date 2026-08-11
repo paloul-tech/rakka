@@ -1174,6 +1174,159 @@ fn team_delivery_error(error: crate::team::AgentTeamError) -> AgentExchangeDeliv
     AgentExchangeDeliveryError::new(error.code(), error.to_string())
 }
 
+/// Delivers exchanges to a real
+/// [`crate::conversation::AgentConversationEntityStore`] over a shared durable
+/// store, exactly as [`InProcessTaskEntityTransport`] does for tasks: every
+/// delivery re-materializes the entity from durable state alone, so it
+/// exercises the passivate-anytime contract, and the same [`ExchangeFault`]
+/// queue injects the failure windows.
+pub struct InProcessConversationEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    store: Store,
+    history: History,
+    router: AgentExchangeRouter,
+    clock: Arc<AtomicU64>,
+    faults: Arc<Mutex<VecDeque<ExchangeFault>>>,
+    acceptances: Arc<AtomicUsize>,
+}
+
+impl<Store, History> Clone for InProcessConversationEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            history: self.history.clone(),
+            router: self.router.clone(),
+            clock: self.clock.clone(),
+            faults: self.faults.clone(),
+            acceptances: self.acceptances.clone(),
+        }
+    }
+}
+
+impl<Store, History> InProcessConversationEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    /// Creates a transport that delivers to conversation entities in one
+    /// durable store.
+    #[must_use]
+    pub fn new(
+        store: Store,
+        history: History,
+        router: AgentExchangeRouter,
+        clock: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            store,
+            history,
+            router,
+            clock,
+            faults: Arc::new(Mutex::new(VecDeque::new())),
+            acceptances: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Queues a fault to inject into the next delivery.
+    pub fn inject(&self, fault: ExchangeFault) {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .push_back(fault);
+    }
+
+    /// How many envelopes reached a conversation entity's durable accept
+    /// path, including the ones whose reply was then lost.
+    #[must_use]
+    pub fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn take_fault(&self) -> Option<ExchangeFault> {
+        self.faults
+            .lock()
+            .expect("the fault queue should not be poisoned")
+            .pop_front()
+    }
+
+    fn now(&self) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+impl<Store, History> AgentExchangeTransport for InProcessConversationEntityTransport<Store, History>
+where
+    Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    History: crate::conversation::AgentConversationHistoryStore,
+{
+    fn deliver<'a>(
+        &'a self,
+        envelope: &'a AgentExchangeEnvelope,
+    ) -> AgentExchangeDeliveryFuture<'a> {
+        let fault = self.take_fault();
+
+        Box::pin(async move {
+            if matches!(fault, Some(ExchangeFault::LoseEnvelope)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-envelope",
+                    "the envelope never reached the conversation entity",
+                ));
+            }
+
+            let AgentEntityAddress::Conversation(scope) = envelope.target().clone() else {
+                return Err(AgentExchangeDeliveryError::new(
+                    "exchange-no-route",
+                    "this transport serves conversation entities only",
+                ));
+            };
+
+            let mut entity = crate::conversation::AgentConversationEntityStore::new(
+                scope,
+                self.store.clone(),
+                self.history.clone(),
+            );
+
+            self.acceptances.fetch_add(1, Ordering::SeqCst);
+            let now = self.now();
+            let mut reply = entity
+                .accept(envelope, &self.router, now)
+                .await
+                .map_err(conversation_delivery_error)?;
+
+            if matches!(fault, Some(ExchangeFault::DeliverTwice)) {
+                self.acceptances.fetch_add(1, Ordering::SeqCst);
+                let now = self.now();
+                reply = entity
+                    .accept(envelope, &self.router, now)
+                    .await
+                    .map_err(conversation_delivery_error)?;
+            }
+
+            if matches!(fault, Some(ExchangeFault::LoseReply)) {
+                return Err(AgentExchangeDeliveryError::new(
+                    "injected-lost-reply",
+                    "the conversation accepted the exchange, and its reply was lost",
+                ));
+            }
+
+            Ok(reply)
+        })
+    }
+}
+
+fn conversation_delivery_error(
+    error: crate::conversation::AgentConversationError,
+) -> AgentExchangeDeliveryError {
+    AgentExchangeDeliveryError::new(error.code(), error.to_string())
+}
+
 /// Delivers wake admission commands to a real [`AgentTaskEntityStore`] over a
 /// shared durable store.
 ///
@@ -3546,7 +3699,8 @@ impl DeferredExchangeRouter {
             .with_route(AgentEntityClass::Agent, transport.clone())
             .with_route(AgentEntityClass::Task, transport.clone())
             .with_route(AgentEntityClass::Run, transport.clone())
-            .with_route(AgentEntityClass::Team, transport)
+            .with_route(AgentEntityClass::Team, transport.clone())
+            .with_route(AgentEntityClass::Conversation, transport)
     }
 }
 

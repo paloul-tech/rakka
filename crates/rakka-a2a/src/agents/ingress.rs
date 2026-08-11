@@ -231,6 +231,93 @@ pub fn normalize_agent_send(
                 collaboration,
             });
         }
+        Some(super::collaboration::AgentCollaborationEnvelope::Conversation(cluster)) => {
+            // A conversation command is not a task continuation: the
+            // governing task is bound at creation, and a send that names
+            // `message.task_id` is a half-formed engagement refused where
+            // it enters rather than routed ambiguously.
+            if !matches!(intent, A2ATaskIntent::NewTask) {
+                return Err(RakkaAgentA2AError::Refused {
+                    code: "conversation-send-names-task".to_string(),
+                    message: "a conversation command must not name message.task_id; the \
+                              governing task is bound at creation"
+                        .to_string(),
+                });
+            }
+            let conversation = rakka_agent::AgentConversationId::new(&cluster.conversation)?;
+            fn cluster_field<'a>(
+                value: Option<&'a str>,
+                field: &'static str,
+            ) -> RakkaAgentA2AResult<&'a str> {
+                value
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                        field,
+                    }))
+            }
+            // The operation id derives from the decision's own logical
+            // coordinates — never the wire discriminator — so a retried
+            // send re-derives the same durable operation whatever its
+            // message id, while a regenerated submission with different
+            // content derives a new one that the entity's turn ledger
+            // refuses loudly instead of silently absorbing.
+            let operation_id = match cluster.operation {
+                super::collaboration::AgentConversationWireOperation::SubmitTurn => {
+                    let participant = cluster_field(
+                        cluster.participant.as_deref(),
+                        "io.rakka.collaboration.participant",
+                    )?;
+                    let round = cluster.round.ok_or(RakkaAgentA2AError::Mapping(
+                        A2AMappingError::MissingField {
+                            field: "io.rakka.collaboration.round",
+                        },
+                    ))?;
+                    let turn = cluster.turn.ok_or(RakkaAgentA2AError::Mapping(
+                        A2AMappingError::MissingField {
+                            field: "io.rakka.collaboration.turn",
+                        },
+                    ))?;
+                    let body =
+                        cluster_field(cluster.body.as_deref(), "io.rakka.collaboration.body")?;
+                    rakka_agent::conversation_turn_operation_id(
+                        &tenant,
+                        &conversation,
+                        round,
+                        turn,
+                        &rakka_agent::AgentId::new(participant)?,
+                        &rakka_agent::conversation_turn_body_digest(body),
+                    )?
+                }
+                super::collaboration::AgentConversationWireOperation::End => {
+                    let round = cluster.expected_round.ok_or(RakkaAgentA2AError::Mapping(
+                        A2AMappingError::MissingField {
+                            field: "io.rakka.collaboration.expected-round",
+                        },
+                    ))?;
+                    rakka_agent::conversation_end_operation_id(&tenant, &conversation, round)?
+                }
+            };
+            return Ok(NormalizedAgentCommand {
+                tenant,
+                tenant_source,
+                task,
+                context_id,
+                intent,
+                operation_id,
+                discriminator,
+                principal: metadata
+                    .get(crate::mapping::META_PRINCIPAL_REF)
+                    .map(principal_ref_from_value)
+                    .transpose()
+                    .map_err(RakkaAgentA2AError::Mapping)?,
+                agent: metadata_string(metadata, META_AGENT_ID)
+                    .map_err(RakkaAgentA2AError::Mapping)?,
+                task_definition: metadata_string(metadata, META_TASK_DEFINITION)
+                    .map_err(RakkaAgentA2AError::Mapping)?,
+                telemetry: extract_ingress_telemetry(metadata),
+                collaboration,
+            });
+        }
         _ => AgentOperationKind::TaskCreation,
     };
     let operation_id = AgentOperationId::new(
@@ -418,6 +505,15 @@ pub fn agent_task_create_command(
             return Err(RakkaAgentA2AError::Unsupported {
                 operation: "agent-collaboration",
                 reason: "a team envelope cannot create a task",
+            });
+        }
+        // A conversation command drives a turn-protocol decision, never a
+        // task creation; reaching here with the conversation cluster is the
+        // same routing bug.
+        Some(super::collaboration::AgentCollaborationEnvelope::Conversation(_)) => {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "a conversation envelope cannot create a task",
             });
         }
         None => (None, None, None),
@@ -608,6 +704,131 @@ pub fn agent_team_command(
             expected_lifecycle_revision: rakka_agent::AgentRevisionNumber::new(lifecycle_revision?),
             provenance: provenance()?,
         },
+    };
+    Ok((scope, command))
+}
+
+/// Builds the deduplicated conversation entity command for one normalized
+/// conversation send
+/// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every cluster field is a claim the conversation entity's transition
+/// re-validates — the roster gate and the cursor's derived owner fence
+/// decide, never the wire; a field the named operation requires but the
+/// cluster omits fails closed here, before anything durable happens. The
+/// early end requires an authenticated principal — the management-write
+/// precedent — because its provenance records who accepted it.
+pub fn agent_conversation_command(
+    normalized: &NormalizedAgentCommand,
+    now: rakka_agent_workflow::AgentTimestampMillis,
+) -> RakkaAgentA2AResult<(
+    rakka_agent::AgentConversationScope,
+    rakka_agent::AgentConversationEntityCommand,
+)> {
+    use rakka_agent::{
+        AgentConversationDirection, AgentConversationEntityCommand, AgentConversationId,
+        AgentConversationScope, AgentConversationTurnSubmit,
+    };
+
+    use super::collaboration::{AgentCollaborationEnvelope, AgentConversationWireOperation};
+
+    let Some(AgentCollaborationEnvelope::Conversation(cluster)) = normalized.collaboration.as_ref()
+    else {
+        return Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "the send carries no conversation envelope",
+        });
+    };
+    let scope = AgentConversationScope::new(
+        normalized.tenant.clone(),
+        AgentConversationId::new(&cluster.conversation)?,
+    )?;
+    let operation_id = normalized.operation_id.clone();
+
+    let required = |value: &Option<String>, field: &'static str| -> RakkaAgentA2AResult<String> {
+        value
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string)
+            .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                field,
+            }))
+    };
+
+    let command = match cluster.operation {
+        AgentConversationWireOperation::SubmitTurn => {
+            let round = cluster.round.ok_or(RakkaAgentA2AError::Mapping(
+                A2AMappingError::MissingField {
+                    field: "io.rakka.collaboration.round",
+                },
+            ))?;
+            let turn =
+                cluster
+                    .turn
+                    .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                        field: "io.rakka.collaboration.turn",
+                    }))?;
+            let participant = rakka_agent::AgentId::new(required(
+                &cluster.participant,
+                "io.rakka.collaboration.participant",
+            )?)?;
+            let body = required(&cluster.body, "io.rakka.collaboration.body")?;
+            // The two direction spellings are mutually exclusive: a payload
+            // carrying both is a half-formed engagement refused whole.
+            let direction = match (cluster.designate.as_deref(), cluster.close_round) {
+                (Some(_), Some(true)) => {
+                    return Err(RakkaAgentA2AError::Unsupported {
+                        operation: "agent-collaboration",
+                        reason: "a moderator turn cannot both designate and close the round",
+                    });
+                }
+                (Some(designated), _) => Some(AgentConversationDirection::Designate(
+                    rakka_agent::AgentId::new(designated)?,
+                )),
+                (None, Some(true)) => Some(AgentConversationDirection::CloseRound),
+                (None, _) => None,
+            };
+            let mut usage = rakka_agent::AgentBudgetConsumption::zero();
+            usage.tokens = cluster.tokens_consumed.unwrap_or(0);
+            AgentConversationEntityCommand::SubmitTurn {
+                operation_id,
+                submit: Box::new(AgentConversationTurnSubmit {
+                    round,
+                    turn,
+                    participant,
+                    body,
+                    direction,
+                    usage,
+                }),
+            }
+        }
+        AgentConversationWireOperation::End => {
+            let expected_round = cluster.expected_round.ok_or(RakkaAgentA2AError::Mapping(
+                A2AMappingError::MissingField {
+                    field: "io.rakka.collaboration.expected-round",
+                },
+            ))?;
+            // An early end records who accepted it (specification 7.2); an
+            // unauthenticated one fails closed exactly as a management
+            // write does.
+            let principal = normalized
+                .principal
+                .clone()
+                .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+                    field: "io.rakka.principal.ref",
+                }))?;
+            AgentConversationEntityCommand::EndEarly {
+                operation_id,
+                expected_round,
+                reason: cluster.reason.clone().unwrap_or_default(),
+                provenance: Box::new(super::management::management_provenance(
+                    principal,
+                    &normalized.discriminator,
+                    None,
+                    now,
+                )),
+            }
+        }
     };
     Ok((scope, command))
 }
