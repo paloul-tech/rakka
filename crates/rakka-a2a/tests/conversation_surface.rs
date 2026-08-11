@@ -118,6 +118,7 @@ impl rakka_a2a::agents::A2AAgentClock for TestClock {
 }
 
 struct Fixture {
+    metrics: Arc<rakka_core::InMemoryMetricsRecorder>,
     agents: AgentStore,
     conversations: ConversationStore,
     conversation_history: rakka_agent::InMemoryAgentConversationHistoryStore,
@@ -142,6 +143,7 @@ impl Fixture {
         let conversation_history = rakka_agent::InMemoryAgentConversationHistoryStore::new();
         let effects = InMemoryAgentRunEffectSink::new();
         let clock = Arc::new(AtomicU64::new(1));
+        let metrics = Arc::new(rakka_core::InMemoryMetricsRecorder::new());
 
         let deferred = DeferredExchangeRouter::new();
         let task_transport = InProcessTaskEntityTransport::new(
@@ -198,10 +200,12 @@ impl Fixture {
                 authorizer,
             )
             .with_clock(Arc::new(TestClock(clock.clone())))
-            .with_default_tenant(TENANT),
+            .with_default_tenant(TENANT)
+            .with_metrics(metrics.clone()),
         );
 
         Self {
+            metrics,
             agents,
             conversations,
             conversation_history,
@@ -862,4 +866,66 @@ async fn the_wire_direction_spellings_map_and_bind_the_turn_identity() {
         "the redelivery converges: {payload}"
     );
     assert_eq!(fixture.conversation_snapshot().await.turns.len(), 1);
+}
+
+/// The wire is the turn protocol's only production carrier, and it builds its
+/// own entity store rather than routing through the sharded entity — so the
+/// moderation counter has to be wired here or it stays at zero for every
+/// deployment that actually serves turns.
+#[tokio::test]
+async fn the_wire_records_the_moderation_counter() {
+    let fixture = Fixture::new();
+    fixture.conversation_world().await;
+
+    fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "counted-turn",
+                submit_cluster(MEMBER_A, 0, 0, "opening", 3),
+            )),
+        )
+        .await
+        .expect("the turn is served");
+
+    // A refusal counts too, under its own outcome label.
+    fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "counted-refusal",
+                submit_cluster(MEMBER_A, 0, 1, "out of turn", 0),
+            )),
+        )
+        .await
+        .expect("the refusal is served as a decision");
+
+    let snapshot = fixture.metrics.snapshot();
+    let observed: Vec<Vec<(String, String)>> = snapshot
+        .observations_named(rakka_agent::METRIC_AGENT_MODERATION_TURNS)
+        .into_iter()
+        .map(|observation| {
+            observation
+                .attributes()
+                .iter()
+                .map(|attribute| (attribute.key().to_string(), attribute.value().to_string()))
+                .collect()
+        })
+        .collect();
+    assert!(
+        observed.contains(&vec![
+            ("operation".to_string(), "turn".to_string()),
+            ("outcome".to_string(), "applied".to_string()),
+        ]),
+        "the applied turn counted: {observed:?}"
+    );
+    assert!(
+        observed.contains(&vec![
+            ("operation".to_string(), "turn".to_string()),
+            ("outcome".to_string(), "refused".to_string()),
+        ]),
+        "the refused turn counted: {observed:?}"
+    );
 }

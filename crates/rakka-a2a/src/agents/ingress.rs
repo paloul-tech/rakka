@@ -300,7 +300,17 @@ pub fn normalize_agent_send(
                             field: "io.rakka.collaboration.expected-round",
                         },
                     ))?;
-                    rakka_agent::conversation_end_operation_id(&tenant, &conversation, round)?
+                    // The reason is part of the decision, so it is part of
+                    // its identity: an end regenerated with different
+                    // reasoning must not be absorbed as a duplicate of the
+                    // one already recorded.
+                    let reason = cluster.reason.as_deref().unwrap_or_default();
+                    rakka_agent::conversation_end_operation_id(
+                        &tenant,
+                        &conversation,
+                        round,
+                        reason,
+                    )?
                 }
             };
             return Ok(NormalizedAgentCommand {

@@ -1407,6 +1407,21 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             .map(|bytes| bytes.len())
     }
 
+    /// How many history entries one conversation still owes its sink.
+    pub async fn conversation_pending_history(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<usize> {
+        use rakka_persistence::DurableStateStore;
+
+        let record = self
+            .conversations
+            .load(&scope.persistence_id())
+            .await
+            .ok()??;
+        Some(record.state.pending_history().len())
+    }
+
     /// Drives the root controller, one epoch task, and that epoch's run until
     /// the epoch run terminates and every owed exchange settles — the
     /// recovery sweep of the continuous world. Every entity is rebuilt from

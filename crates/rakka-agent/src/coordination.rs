@@ -291,6 +291,10 @@ pub fn conversation_turn_content_digest(
 /// Pure over `(tenant, conversation)`: a conversation is created exactly once
 /// by trusted wiring, so every replay of the creating command names the
 /// identical operation.
+///
+/// Deliberately blind to the creation's content, unlike
+/// [`conversation_create_content_operation_id`] — kept for callers that only
+/// need the identity of "the creation of this conversation".
 pub fn conversation_create_operation_id(
     tenant: &TenantId,
     conversation: &AgentConversationId,
@@ -301,6 +305,34 @@ pub fn conversation_create_operation_id(
     )
 }
 
+/// Derives the stable operation id of one conversation's creation, qualified
+/// by the creation record itself.
+///
+/// The turn identity's discipline applied to creation: a replay carrying the
+/// *same* record re-derives the same operation and converges, while a second
+/// creation with a different roster, mode, policy, or budget derives a
+/// different one — so it falls through to the entity's own guard and refuses
+/// `conversation-already-created` instead of being absorbed as a duplicate of
+/// a conversation it does not describe.
+pub fn conversation_create_content_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+    creation: &crate::conversation::AgentConversationCreation,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    let digest = serde_json::to_value(creation)
+        .map(|value| AgentContentDigest::sha256_of_json(&value))
+        .unwrap_or_else(|_| AgentContentDigest::sha256_of_segments(["conversation-create-unset"]));
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [
+            tenant.as_str(),
+            conversation.as_str(),
+            "create",
+            digest.value.as_str(),
+        ],
+    )
+}
+
 /// Derives the stable operation id of one early-end decision over one
 /// conversation.
 ///
@@ -308,12 +340,21 @@ pub fn conversation_create_operation_id(
 /// as stale, and a *retried* end at a later round is a new decision — it must
 /// not collide in the operation log with the attempt it retries (the
 /// [`team_claim_release_operation_id`] hazard).
+///
+/// The reason qualifies it too, for the same reason a turn's body digest
+/// qualifies the turn's: a redelivery carries the same reason and converges
+/// on the recorded end, while an end *regenerated* with different reasoning
+/// is a different decision. Sharing one identity would answer it `Duplicate`
+/// while the audited reason in the append-only history stayed the first
+/// attempt's — success-shaped, and wrong.
 pub fn conversation_end_operation_id(
     tenant: &TenantId,
     conversation: &AgentConversationId,
     round: u64,
+    reason: &str,
 ) -> Result<AgentOperationId, AgentIdentityError> {
     let round = round.to_string();
+    let digest = conversation_end_reason_digest(reason);
     AgentOperationId::new(
         AgentOperationKind::ConversationOperation,
         [
@@ -321,8 +362,18 @@ pub fn conversation_end_operation_id(
             conversation.as_str(),
             "end",
             round.as_str(),
+            digest.value.as_str(),
         ],
     )
+}
+
+/// Digests one early-end reason for identity derivation.
+///
+/// The leading domain segment keeps the digest family injective against every
+/// other derived identity, the [`handoff_id_for`] discipline.
+#[must_use]
+pub fn conversation_end_reason_digest(reason: &str) -> AgentContentDigest {
+    AgentContentDigest::sha256_of_segments(["conversation-end-reason", reason])
 }
 
 /// Derives the stable operation id of the lazy deadline-expiry observation

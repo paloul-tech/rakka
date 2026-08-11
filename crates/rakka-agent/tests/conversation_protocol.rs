@@ -135,6 +135,7 @@ fn end_command_by(
             &tenant(),
             &AgentConversationId::new(CONVERSATION).expect("the conversation id is valid"),
             expected_round,
+            reason,
         )
         .expect("the operation id derives"),
         moderator: agent(moderator),
@@ -524,16 +525,304 @@ async fn only_the_moderators_end_terminalizes_the_conversation() {
 
 #[tokio::test]
 async fn an_end_forbidden_by_policy_refuses() {
-    let fx = created_fixture(creation(
+    // Forbidding the early end is admissible as long as some other road to
+    // a terminal state remains — here the wall-clock deadline.
+    let mut forbidden = creation(
         AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
         &["alpha"],
-    ))
-    .await;
+    );
+    forbidden.max_wall_clock_millis = Some(60_000);
+    let fx = created_fixture(forbidden).await;
     let refused = fx
         .apply_conversation_command_at(&conversation_scope(), end_command(0, "premature"))
         .await
         .expect_err("the policy forbids the early end");
     assert_eq!(refused.code(), "conversation-end-not-permitted");
+}
+
+#[tokio::test]
+async fn the_early_end_records_who_ended_it_why_and_bounds_the_reason() {
+    let fx = created_fixture(creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    ))
+    .await;
+
+    // The reason is caller-supplied free text on a durable append, so it is
+    // bounded at the ceiling the constant advertises — not silently
+    // truncated at twice it.
+    let oversized = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            end_command(
+                0,
+                &"r".repeat(rakka_agent::AGENT_CONVERSATION_REASON_MAX_BYTES + 1),
+            ),
+        )
+        .await
+        .expect_err("an over-long reason refuses");
+    assert_eq!(oversized.code(), "conversation-reason-too-large");
+    assert_eq!(
+        fx.conversation_snapshot_at(&conversation_scope())
+            .await
+            .expect("the conversation snapshots")
+            .status,
+        AgentConversationStatus::Active,
+        "the refused end terminalized nothing"
+    );
+
+    fx.apply_conversation_command_at(&conversation_scope(), end_command(0, "consensus reached"))
+        .await
+        .expect("the end applies");
+
+    // The audit trail answers who terminalized the conversation, against
+    // which round, and why — each in its own field, so `detail` is the
+    // stable terminal code and nothing has to be inferred from it.
+    let page = rakka_agent::AgentConversationHistoryStore::read(
+        &fx.conversation_history,
+        &conversation_scope(),
+        rakka_agent::AgentConversationHistoryCursor::start(),
+    )
+    .await
+    .expect("the history reads");
+    let ended = page
+        .entries
+        .iter()
+        .find(|entry| entry.kind == rakka_agent::AgentConversationHistoryKind::Ended)
+        .expect("the early end is audited");
+    assert_eq!(ended.principal.as_deref(), Some("user:operator-7"));
+    assert_eq!(ended.participant.as_ref(), Some(&agent(MODERATOR)));
+    assert_eq!(ended.round, Some(0));
+    assert_eq!(ended.reason.as_deref(), Some("consensus reached"));
+    assert_eq!(
+        ended.detail,
+        AgentConversationTerminalReason::ModeratorEnded.code(),
+        "detail is the stable terminal code, never the caller's free text"
+    );
+}
+
+#[tokio::test]
+async fn an_end_regenerated_with_a_different_reason_is_not_absorbed_as_a_duplicate() {
+    let fx = created_fixture(creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    ))
+    .await;
+
+    fx.apply_conversation_command_at(&conversation_scope(), end_command(0, "consensus reached"))
+        .await
+        .expect("the end applies");
+
+    // The identical redelivery converges from the operation log.
+    let replay = fx
+        .apply_conversation_command_at(&conversation_scope(), end_command(0, "consensus reached"))
+        .await
+        .expect("the identical redelivery is answered");
+    assert!(matches!(
+        replay,
+        AgentConversationEntityReply::Duplicate { .. }
+    ));
+
+    // A *regenerated* end at the same round carries different reasoning, so
+    // it is a different decision: it derives its own operation id, misses
+    // the log, and meets the terminal guard — rather than being answered
+    // `Duplicate` while the audited reason stays the first attempt's.
+    let regenerated = fx
+        .apply_conversation_command_at(&conversation_scope(), end_command(0, "deadline exceeded"))
+        .await
+        .expect_err("a regenerated end refuses loudly");
+    assert_eq!(regenerated.code(), "conversation-ended");
+
+    // And the audited reason is still the one that actually decided it.
+    let page = rakka_agent::AgentConversationHistoryStore::read(
+        &fx.conversation_history,
+        &conversation_scope(),
+        rakka_agent::AgentConversationHistoryCursor::start(),
+    )
+    .await
+    .expect("the history reads");
+    let ends: Vec<_> = page
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == rakka_agent::AgentConversationHistoryKind::Ended)
+        .collect();
+    assert_eq!(ends.len(), 1, "one end, one audit entry");
+    assert_eq!(ends[0].reason.as_deref(), Some("consensus reached"));
+}
+
+#[tokio::test]
+async fn a_creation_replayed_with_different_content_refuses_rather_than_echoing() {
+    // The turn identity's discipline applied to creation: same record,
+    // converge; different record, refuse. A content-blind id would answer a
+    // second creation `Duplicate` with the outcome of a conversation it does
+    // not describe.
+    let fx = fixture();
+    let first = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    );
+    let content_op = |creation: &AgentConversationCreation| {
+        rakka_agent::conversation_create_content_operation_id(
+            &tenant(),
+            &AgentConversationId::new(CONVERSATION).expect("the conversation id is valid"),
+            creation,
+        )
+        .expect("the operation id derives")
+    };
+
+    fx.apply_conversation_command_at(
+        &conversation_scope(),
+        AgentConversationEntityCommand::Create {
+            operation_id: content_op(&first),
+            creation: Box::new(first.clone()),
+        },
+    )
+    .await
+    .expect("the conversation creates");
+
+    // The identical creation re-derives the identical operation and echoes.
+    let replay = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            AgentConversationEntityCommand::Create {
+                operation_id: content_op(&first),
+                creation: Box::new(first.clone()),
+            },
+        )
+        .await
+        .expect("the identical replay is answered");
+    assert!(matches!(
+        replay,
+        AgentConversationEntityReply::Duplicate { .. }
+    ));
+
+    // A different roster is a different creation, so it derives a different
+    // operation and meets the entity's own guard.
+    let second = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "gamma"],
+    );
+    assert_ne!(content_op(&first), content_op(&second));
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            AgentConversationEntityCommand::Create {
+                operation_id: content_op(&second),
+                creation: Box::new(second),
+            },
+        )
+        .await
+        .expect_err("a different creation refuses");
+    assert_eq!(refused.code(), "conversation-already-created");
+
+    // The roster the conversation actually has is the first one.
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(snapshot.participants, vec![agent("alpha"), agent("beta")]);
+}
+
+#[tokio::test]
+async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() {
+    // Under the moderator-decides rule the round ceiling only parks the
+    // cursor, so the early end is the sole exit. Forbidding it without a
+    // deadline leaves a conversation that can never terminalize — the
+    // governing task would wait on a signal that cannot come, so the door
+    // refuses it beside the other wedge guards.
+    let unreachable = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
+        &["alpha", "beta"],
+    );
+    let refused = fixture()
+        .apply_conversation_command_at(&conversation_scope(), create_command(unreachable))
+        .await
+        .expect_err("a configuration with no terminal state refuses");
+    assert_eq!(refused.code(), "conversation-completion-unreachable");
+
+    // Each of the three ways out makes it admissible again: the early end…
+    let with_end = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    );
+    fixture()
+        .apply_conversation_command_at(&conversation_scope(), create_command(with_end))
+        .await
+        .expect("the early end is a road to terminal");
+
+    // …a deadline…
+    let mut with_deadline = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
+        &["alpha", "beta"],
+    );
+    with_deadline.max_wall_clock_millis = Some(60_000);
+    fixture()
+        .apply_conversation_command_at(&conversation_scope(), create_command(with_deadline))
+        .await
+        .expect("a deadline is a road to terminal");
+
+    // …and the all-rounds completion rule, which ends the conversation in
+    // the same commit that completes its final round.
+    let mut all_rounds = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
+        &["alpha", "beta"],
+    );
+    all_rounds.completion = AgentConversationCompletionRule::AllRounds;
+    fixture()
+        .apply_conversation_command_at(&conversation_scope(), create_command(all_rounds))
+        .await
+        .expect("completing every round is a road to terminal");
+}
+
+#[tokio::test]
+async fn a_parked_conversation_names_no_next_speaker() {
+    // The round ceiling parks the cursor with the conversation still
+    // active. Naming a speaker there would send that speaker into
+    // `conversation-rounds-exhausted` forever, and a driver polling
+    // `current_speaker` would retry instead of routing the moderator to its
+    // early end.
+    let fx = created_fixture(creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
+            .with_max_rounds(1)
+            .with_max_turns_per_round(2),
+        &["alpha", "beta"],
+    ))
+    .await;
+
+    for (turn, speaker) in ["alpha", "beta"].into_iter().enumerate() {
+        fx.apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(0, turn as u32, speaker, "statement", 0),
+        )
+        .await
+        .expect("the turn records");
+    }
+
+    let parked = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the parked conversation snapshots");
+    assert_eq!(parked.status, AgentConversationStatus::Active);
+    assert_eq!(parked.round, 1, "the cursor parked at the round ceiling");
+    assert_eq!(
+        parked.current_speaker, None,
+        "a parked cursor owns nothing, so the projection names nobody"
+    );
+
+    // And the refusal the projection is now honest about.
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(1, 0, "alpha", "another", 0),
+        )
+        .await
+        .expect_err("a turn past the round ceiling refuses");
+    assert_eq!(refused.code(), "conversation-rounds-exhausted");
+
+    // The moderator's early end is the move that remains, and it lands.
+    fx.apply_conversation_command_at(&conversation_scope(), end_command(1, "we are done"))
+        .await
+        .expect("the moderator's end still lands on a parked conversation");
 }
 
 #[tokio::test]

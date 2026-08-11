@@ -167,7 +167,7 @@ pub const AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES: usize = 320;
 /// Bytes the creation-time worst-case arithmetic reserves per history entry
 /// waiting in the outbox — including a detail at
 /// [`AGENT_CONVERSATION_DETAIL_MAX_LENGTH`].
-pub const AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES: usize = 768;
+pub const AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES: usize = 1024;
 
 /// Bytes the creation-time worst-case arithmetic reserves for everything
 /// outside the turn ledger, the transcript ring, the operation log, and the
@@ -510,6 +510,20 @@ impl AgentConversation {
         if self.status != AgentConversationStatus::Active {
             return None;
         }
+        // A parked cursor owns nothing. Under the moderator-decides rule the
+        // round ceiling leaves the conversation active with the cursor at
+        // the rim, and every turn from there refuses
+        // `conversation-rounds-exhausted` — so naming a next speaker would
+        // send that speaker into a refusal forever, and a driver polling
+        // `current_speaker` would retry instead of routing the moderator to
+        // its early end. The projection has to say what is true: nobody's
+        // turn.
+        if self.round >= u64::from(self.policy.effective_max_rounds()) {
+            return None;
+        }
+        if self.turn_in_round >= self.policy.effective_max_turns_per_round() {
+            return None;
+        }
         match self.mode {
             AgentConversationMode::RoundRobin => self.participants.get(self.turn_in_round as usize),
             AgentConversationMode::ModeratorDirected => {
@@ -682,8 +696,25 @@ pub struct AgentConversationHistoryEntry {
     pub round: Option<u64>,
     /// The turn index involved, when one was.
     pub turn: Option<u32>,
-    /// Bounded detail: the refusal code, the terminal reason, the count.
+    /// Bounded detail: a stable code or count, never free text. The one
+    /// terminalizing operation a caller can reach records its free-text
+    /// reason in [`Self::reason`] instead, so a reader never has to guess
+    /// which of the two this field holds.
     pub detail: String,
+    /// The authenticated principal that accepted the operation, when one
+    /// was required — the durable answer to *who did this*.
+    ///
+    /// Recorded as `type:id`. Added after the initial slice, so a history
+    /// entry written before it decodes with `None`.
+    #[serde(default)]
+    pub principal: Option<String>,
+    /// The caller's bounded free-text reason, when the operation carried
+    /// one. Bounded by [`AGENT_CONVERSATION_REASON_MAX_BYTES`].
+    ///
+    /// Added after the initial slice, so a history entry written before it
+    /// decodes with `None`.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// When the transition committed.
     pub at: AgentTimestampMillis,
 }
@@ -704,12 +735,43 @@ impl AgentConversationHistoryEntry {
             round: None,
             turn: None,
             detail: String::new(),
+            principal: None,
+            reason: None,
             at,
         }
     }
 
     fn with_participant(mut self, participant: AgentId) -> Self {
         self.participant = Some(participant);
+        self
+    }
+
+    /// Records who accepted the operation and why they said they did.
+    ///
+    /// The reason is truncated to [`AGENT_CONVERSATION_REASON_MAX_BYTES`] on
+    /// a character boundary; `end_early` refuses an over-long one before
+    /// reaching here, so truncation is the defensive half of that bound.
+    fn with_provenance(mut self, provenance: &AgentRevisionProvenance, reason: &str) -> Self {
+        self.principal = Some(format!(
+            "{}:{}",
+            provenance.principal.principal_type, provenance.principal.principal_id
+        ));
+        if !reason.is_empty() {
+            let mut bounded = reason.to_string();
+            if bounded.len() > AGENT_CONVERSATION_REASON_MAX_BYTES {
+                let cut = (0..=AGENT_CONVERSATION_REASON_MAX_BYTES)
+                    .rev()
+                    .find(|index| bounded.is_char_boundary(*index))
+                    .unwrap_or(0);
+                bounded.truncate(cut);
+            }
+            self.reason = Some(bounded);
+        }
+        self
+    }
+
+    fn with_round(mut self, round: u64) -> Self {
+        self.round = Some(round);
         self
     }
 
@@ -2072,6 +2134,19 @@ fn create_conversation(
             ),
         });
     }
+    // A conversation must have some road to a terminal state, or the
+    // governing task waits on a signal that can never come. Under the
+    // moderator-decides rule the round ceiling only *parks* the cursor, so
+    // the early end is the sole exit — and forbidding it without a
+    // wall-clock deadline leaves none at all. Refused at the door, beside
+    // the other wedge guards, because there is no later moment at which the
+    // configuration could become satisfiable.
+    if creation.completion == AgentConversationCompletionRule::ModeratorDecides
+        && !creation.policy.moderator_may_end_early
+        && creation.max_wall_clock_millis.is_none()
+    {
+        return Err(AgentConversationError::CompletionUnreachable);
+    }
     if let Some(reference) = &creation.transcript_ref {
         if reference.len() > AGENT_CONVERSATION_TRANSCRIPT_REF_MAX_BYTES {
             return Err(AgentConversationError::TranscriptRefInvalid {
@@ -2439,6 +2514,16 @@ fn end_early(
 ) -> AgentConversationResult<()> {
     state.require_active(now)?;
     let conversation = state.conversation_mut()?;
+    // The reason is caller-supplied free text riding a durable append, so
+    // it is bounded like every other caller-supplied field — at the ceiling
+    // the constant has always advertised, rather than being silently
+    // truncated at the generic detail bound to twice it.
+    if reason.len() > AGENT_CONVERSATION_REASON_MAX_BYTES {
+        return Err(AgentConversationError::ReasonTooLarge {
+            bytes: reason.len(),
+            maximum: AGENT_CONVERSATION_REASON_MAX_BYTES,
+        });
+    }
     // The policy refusal comes first because it does not depend on who asks
     // — the same discipline that puts the round ceiling ahead of the turn
     // owner fence. Then the identity fence: the spec grants the early end to
@@ -2464,8 +2549,14 @@ fn end_early(
     conversation.status = AgentConversationStatus::Ended;
     conversation.terminal_reason = Some(AgentConversationTerminalReason::ModeratorEnded);
     conversation.ended_at = Some(now);
+    // The one terminalizing operation a caller can reach records who
+    // accepted it: the principal in its own field, the moderator as the
+    // participant, the round it was decided against, and the caller's
+    // reason separately from the stable terminal code. Nothing about the
+    // decision has to be inferred from an overloaded detail string.
     let operation = operation_id.clone();
-    let principal = provenance.principal.principal_id.clone();
+    let round = conversation.round;
+    let moderator = moderator.clone();
     state.record_history(|sequence| {
         AgentConversationHistoryEntry::new(
             sequence,
@@ -2473,7 +2564,10 @@ fn end_early(
             operation,
             now,
         )
-        .with_detail(if reason.is_empty() { principal } else { reason })
+        .with_participant(moderator)
+        .with_round(round)
+        .with_detail(AgentConversationTerminalReason::ModeratorEnded.code())
+        .with_provenance(provenance, &reason)
     });
     Ok(())
 }
@@ -2965,6 +3059,16 @@ pub enum AgentConversationError {
     /// A creation-fixed budget is exhausted; the turn is refused, nothing
     /// parks.
     BudgetExhausted(AgentBudgetExhaustion),
+    /// The early-end reason exceeds its bounded ceiling.
+    ReasonTooLarge {
+        /// The reason's size.
+        bytes: usize,
+        /// The effective ceiling.
+        maximum: usize,
+    },
+    /// The completion rule and the early-end policy leave no reachable
+    /// terminal state.
+    CompletionUnreachable,
     /// The policy forbids the moderator from ending early.
     EndNotPermitted,
     /// The agent claiming the early end is not the conversation's moderator.
@@ -3030,6 +3134,8 @@ impl AgentConversationError {
             Self::MessageTooLarge { .. } => "conversation-message-too-large",
             Self::TurnUsageImplausible { .. } => "conversation-turn-usage-too-large",
             Self::BudgetExhausted(exhaustion) => exhaustion.code(),
+            Self::ReasonTooLarge { .. } => "conversation-reason-too-large",
+            Self::CompletionUnreachable => "conversation-completion-unreachable",
             Self::EndNotPermitted => "conversation-end-not-permitted",
             Self::EndNotModerator { .. } => "conversation-end-not-moderator",
             Self::EndStaleRound { .. } => "conversation-end-stale-round",
@@ -3124,6 +3230,14 @@ impl Display for AgentConversationError {
                 "the turn reports {reported} tokens; one turn may report at most {maximum}"
             ),
             Self::BudgetExhausted(exhaustion) => Display::fmt(exhaustion, f),
+            Self::ReasonTooLarge { bytes, maximum } => write!(
+                f,
+                "the early-end reason is {bytes} bytes; the ceiling is {maximum}"
+            ),
+            Self::CompletionUnreachable => f.write_str(
+                "a moderator-decides conversation that forbids the early end and sets no \
+                 wall-clock deadline can never reach a terminal state",
+            ),
             Self::EndNotPermitted => {
                 f.write_str("the policy forbids the moderator from ending early")
             }

@@ -346,7 +346,8 @@ pub use conversation::{
     AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES, DEFAULT_AGENT_CONVERSATION_ENTITY_TYPE,
 };
 pub use coordination::{
-    conversation_create_operation_id, conversation_end_operation_id,
+    conversation_create_content_operation_id, conversation_create_operation_id,
+    conversation_end_operation_id, conversation_end_reason_digest,
     conversation_expiry_operation_id, conversation_turn_content_digest,
     conversation_turn_operation_id, handoff_id_for, handoff_result_operation_id, team_claim_id_for,
     team_claim_operation_id, team_claim_release_operation_id, team_claim_result_operation_id,

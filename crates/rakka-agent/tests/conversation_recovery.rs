@@ -13,6 +13,9 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use common::{tenant, Fixture};
 use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
@@ -179,19 +182,203 @@ async fn the_round_converges_across_every_conversation_store_crash_point() {
     }
 }
 
+/// A history sink that is down until it is healed, then behaves normally.
+///
+/// The only way to *create* the committed-but-unflushed window on purpose:
+/// with a working sink the apply path drains the outbox on every command, so
+/// the window this test is named for would never exist.
+#[derive(Clone)]
+struct HealableHistory {
+    inner: rakka_agent::InMemoryAgentConversationHistoryStore,
+    down: Arc<AtomicBool>,
+}
+
+impl HealableHistory {
+    fn down() -> Self {
+        Self {
+            inner: rakka_agent::InMemoryAgentConversationHistoryStore::new(),
+            down: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn heal(&self) {
+        self.down.store(false, Ordering::SeqCst);
+    }
+
+    fn unavailable() -> rakka_agent::AgentConversationError {
+        rakka_agent::AgentConversationError::Choreography(Box::new(
+            rakka_agent::AgentChoreographyError::Persistence(
+                rakka_persistence::DurableError::Store {
+                    backend: "healable",
+                    message: "the history sink is down".to_string(),
+                },
+            ),
+        ))
+    }
+}
+
+impl rakka_agent::AgentConversationHistoryStore for HealableHistory {
+    fn backend_name(&self) -> &'static str {
+        "healable"
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a AgentConversationScope,
+        entry: &'a rakka_agent::AgentConversationHistoryEntry,
+    ) -> rakka_agent::AgentConversationHistoryFuture<'a, ()> {
+        Box::pin(async move {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(Self::unavailable());
+            }
+            self.inner.append(scope, entry).await
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        scope: &'a AgentConversationScope,
+        cursor: rakka_agent::AgentConversationHistoryCursor,
+    ) -> rakka_agent::AgentConversationHistoryFuture<'a, rakka_agent::AgentConversationHistoryPage>
+    {
+        Box::pin(async move {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(Self::unavailable());
+            }
+            self.inner.read(scope, cursor).await
+        })
+    }
+}
+
 #[tokio::test]
 async fn a_loss_between_the_commit_and_the_history_flush_re_flushes_the_same_slots() {
     // The window the pending-history outbox exists for: the turn committed
-    // — ledger record, cursor advance, owed history — and the owner died
-    // before the flush. Recovery flushes the identical entries to the
-    // identical slots.
+    // — ledger record, cursor advance, owed history — and the flush did not
+    // land. Recovery flushes the identical entries to the identical slots.
     let fx = world().await;
-    fx.apply_conversation_command_at(&conversation_scope(), submit(0, 0, "p1", "opening"))
+    let history = HealableHistory::down();
+    let mut store = rakka_agent::AgentConversationEntityStore::new(
+        conversation_scope(),
+        fx.conversations.clone(),
+        history.clone(),
+    );
+
+    // The turn commits and the flush fails, so the window is real rather
+    // than assumed.
+    let _ = store
+        .apply(submit(0, 0, "p1", "opening"), &fx.router, fx.now())
+        .await;
+    let owed = fx
+        .conversation_pending_history(&conversation_scope())
         .await
-        .expect("the turn commits");
-    // No settle ran: whatever the apply-path flush left behind, the next
-    // drive is a restart that owes at most the same idempotent appends.
-    assert_converged(&fx).await;
+        .expect("the state loads");
+    assert!(owed > 0, "the committed turn left history owed to the sink");
+
+    // The sink comes back. A settle pass — the restart's own work — flushes
+    // exactly what was owed, to the slots the transition assigned.
+    history.heal();
+    let mut recovered = rakka_agent::AgentConversationEntityStore::new(
+        conversation_scope(),
+        fx.conversations.clone(),
+        history.clone(),
+    );
+    recovered
+        .recover(fx.now())
+        .await
+        .expect("the restarted entity recovers");
+    recovered
+        .settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("the owed history flushes");
+    assert_eq!(
+        fx.conversation_pending_history(&conversation_scope())
+            .await
+            .expect("the state loads"),
+        0,
+        "the outbox drained"
+    );
+
+    // Re-driving is idempotent: the same slots, appended once each. A
+    // re-flush that wrote a *different* entry at an occupied sequence would
+    // fail closed rather than overwrite.
+    recovered
+        .settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("a second settle owes nothing");
+    let page = rakka_agent::AgentConversationHistoryStore::read(
+        &history,
+        &conversation_scope(),
+        rakka_agent::AgentConversationHistoryCursor::start(),
+    )
+    .await
+    .expect("the history reads");
+    let sequences: Vec<u64> = page
+        .entries
+        .iter()
+        .map(|entry| entry.sequence.get())
+        .collect();
+    let mut unique = sequences.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        sequences.len(),
+        unique.len(),
+        "each sequence occupied exactly once: {sequences:?}"
+    );
+    // This sink only ever saw what the degraded store owed it — the
+    // creation was flushed to the fixture's own sink before the outage.
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.kind == rakka_agent::AgentConversationHistoryKind::TurnRecorded),
+        "the turn committed during the outage reached the sink once it healed: {sequences:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_history_pages_through_its_cursor_without_gaps_or_repeats() {
+    // The read cursor is the only way an operator gets at the audit trail,
+    // and its paging was never exercised: a page size smaller than the
+    // history is the case that matters.
+    let fx = world().await;
+    for round in 0..3u64 {
+        for (turn, speaker) in ["p1", "p2"].into_iter().enumerate() {
+            fx.apply_conversation_command_at(
+                &conversation_scope(),
+                submit(round, turn as u32, speaker, "statement"),
+            )
+            .await
+            .expect("the turn records");
+        }
+    }
+    let _ = fx.settle_conversation_at(&conversation_scope()).await;
+
+    let total = fx.conversation_history.len(&conversation_scope());
+    assert!(total > 3, "enough history to need more than one page");
+
+    let mut cursor = rakka_agent::AgentConversationHistoryCursor::start().with_limit(2);
+    let mut seen: Vec<u64> = Vec::new();
+    for _ in 0..64 {
+        let page = rakka_agent::AgentConversationHistoryStore::read(
+            &fx.conversation_history,
+            &conversation_scope(),
+            cursor,
+        )
+        .await
+        .expect("the page reads");
+        assert!(page.entries.len() <= 2, "the page honors its limit");
+        seen.extend(page.entries.iter().map(|entry| entry.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+
+    assert_eq!(seen.len(), total, "paging saw every entry exactly once");
+    let mut ordered = seen.clone();
+    ordered.sort_unstable();
+    ordered.dedup();
+    assert_eq!(seen, ordered, "in sequence order, with no gaps or repeats");
 }
 
 #[tokio::test]

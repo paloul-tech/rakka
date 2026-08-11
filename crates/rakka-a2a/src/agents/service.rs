@@ -28,6 +28,7 @@ use rakka_agent::{
     AgentTeamEntityStore, AgentTeamHistoryStore, AgentTeamState, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
 use rakka_persistence::DurableStateStore;
 
 use crate::auth::{A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, A2AOperation};
@@ -136,6 +137,7 @@ pub struct RakkaAgentA2AService<
     authorizer: Arc<dyn A2AAuthorizer>,
     clock: Arc<dyn A2AAgentClock>,
     default_tenant: Option<String>,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
 impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
@@ -195,7 +197,21 @@ where
             authorizer,
             clock: Arc::new(SystemA2AAgentClock),
             default_tenant: None,
+            metrics: Arc::new(NoopMetricsRecorder),
         }
+    }
+
+    /// Records the agent domain's bounded counters through this recorder.
+    ///
+    /// The service builds its own entity stores rather than routing through
+    /// the sharded entities, so without this the domain counters those
+    /// stores emit — `rakka.agent.moderation.turns` above all — would stay
+    /// at zero for the wire, which is the only carrier the turn protocol
+    /// has.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Uses an explicit time source.
@@ -459,7 +475,8 @@ where
             scope,
             self.conversations.clone(),
             self.conversation_history.clone(),
-        );
+        )
+        .with_metrics(self.metrics.clone());
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
             // A domain refusal is a decision the caller rebases on, not a
