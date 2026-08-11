@@ -345,11 +345,12 @@ fn submit_cluster(participant: &str, round: u64, turn: u32, body: &str, tokens: 
     })
 }
 
-fn end_cluster(expected_round: u64, reason: &str) -> Value {
+fn end_cluster(participant: &str, expected_round: u64, reason: &str) -> Value {
     json!({
         "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
         "conversation": CONVERSATION,
         "operation": "end",
+        "participant": participant,
         "expected-round": expected_round,
         "reason": reason,
     })
@@ -556,12 +557,56 @@ async fn wire_level_conversation_sends_fail_closed() {
             &params(),
             &send_request(conversation_message(
                 "end-anon",
-                end_cluster(0, "premature"),
+                end_cluster(MODERATOR, 0, "premature"),
             )),
         )
         .await
         .expect_err("an unauthenticated end fails closed");
     assert!(matches!(error, RakkaAgentA2AError::Mapping(_)));
+
+    // …an end naming no agent fails closed the same way, before anything
+    // durable happens: the end's claim is as required as a turn's speaker.
+    let mut agentless = end_cluster(MODERATOR, 0, "premature");
+    agentless
+        .as_object_mut()
+        .expect("the cluster is an object")
+        .remove("participant");
+    let mut agentless = conversation_message("end-agentless", agentless);
+    agentless
+        .metadata
+        .as_mut()
+        .expect("the message carries metadata")
+        .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+    let error = fixture
+        .service
+        .send(&params(), &send_request(agentless))
+        .await
+        .expect_err("an end naming no agent fails closed");
+    assert!(matches!(error, RakkaAgentA2AError::Mapping(_)));
+
+    // …and an authenticated end claiming a roster participant rather than
+    // the moderator is a domain refusal the caller rebases on, not a
+    // terminalized conversation.
+    let mut impostor = conversation_message("end-impostor", end_cluster("alpha", 0, "i am done"));
+    impostor
+        .metadata
+        .as_mut()
+        .expect("the message carries metadata")
+        .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+    let response = fixture
+        .service
+        .send(&params(), &send_request(impostor))
+        .await
+        .expect("the refusal is served as a decision");
+    let payload = response_payload(&response);
+    assert_eq!(
+        payload
+            .get("Rejected")
+            .and_then(|rejected| rejected.get("code"))
+            .and_then(Value::as_str),
+        Some("conversation-end-not-moderator"),
+        "a non-moderator end refuses: {payload}"
+    );
 
     // Nothing above touched the protocol.
     let snapshot = fixture.conversation_snapshot().await;
@@ -569,7 +614,8 @@ async fn wire_level_conversation_sends_fail_closed() {
     assert_eq!(snapshot.status, AgentConversationStatus::Active);
 
     // …and the same end with an authenticated principal applies.
-    let mut authenticated = conversation_message("end-auth", end_cluster(0, "consensus"));
+    let mut authenticated =
+        conversation_message("end-auth", end_cluster(MODERATOR, 0, "consensus"));
     authenticated
         .metadata
         .as_mut()

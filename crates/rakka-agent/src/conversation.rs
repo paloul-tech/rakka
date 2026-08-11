@@ -28,7 +28,10 @@
 //! when it overshoots, because the spend already happened in the speaker's
 //! run. The moderator's early end terminalizes the conversation only; its
 //! *result* rides the governing task's existing typed-result and
-//! goal-evaluation doors on the run side.
+//! goal-evaluation doors on the run side. The end is the moderator's alone:
+//! the ending agent is a claim the transition fences against the durable
+//! moderator, exactly as a turn's speaker is fenced against the cursor's
+//! derived owner, so a roster participant may speak but never terminalize.
 //!
 //! The entity embeds the exchange host for uniform routing and recovery,
 //! but initiates no exchange this slice: the conversation-terminal
@@ -1352,11 +1355,16 @@ pub enum AgentConversationEntityCommand {
         /// The submission.
         submit: Box<AgentConversationTurnSubmit>,
     },
-    /// Ends the conversation early under policy, fenced on the round.
+    /// Ends the conversation early under policy, fenced on the claimed
+    /// moderator and the round.
     EndEarly {
         /// Stable dedup identity of this end decision, round-qualified by
         /// [`crate::coordination::conversation_end_operation_id`].
         operation_id: AgentOperationId,
+        /// The agent claiming the end. A claim, like a turn's speaker: the
+        /// transition fences it against the durable moderator, so only the
+        /// moderator's end terminalizes the conversation.
+        moderator: AgentId,
         /// The round this end decision was made against. An end decided
         /// against a round the conversation moved past fails closed — the
         /// round is the end decision's epoch.
@@ -1681,6 +1689,7 @@ where
             }
             AgentConversationEntityCommand::EndEarly {
                 operation_id,
+                moderator,
                 expected_round,
                 reason,
                 provenance,
@@ -1689,6 +1698,7 @@ where
                     end_early(
                         state,
                         &operation_id,
+                        &moderator,
                         expected_round,
                         &provenance,
                         reason,
@@ -1875,7 +1885,13 @@ where
     }
 
     async fn ensure_recovered(&mut self, now: AgentTimestampMillis) -> AgentConversationResult<()> {
-        if !self.recovered {
+        // The host drops its cached record when a compare-and-set loses, and
+        // a conversation has two writers by construction — the resident
+        // sharded entity and the A2A service's own store. Asking the host
+        // rather than trusting this facade's flag is what keeps a lost race
+        // from wedging the entity for the rest of its residency (the task and
+        // run stores hold the same rule).
+        if !self.recovered || self.host.state().is_err() {
             self.recover(now).await?;
         }
         Ok(())
@@ -2278,6 +2294,7 @@ fn record_turn(
 fn end_early(
     state: &mut AgentConversationState,
     operation_id: &AgentOperationId,
+    moderator: &AgentId,
     expected_round: u64,
     provenance: &AgentRevisionProvenance,
     reason: String,
@@ -2285,8 +2302,18 @@ fn end_early(
 ) -> AgentConversationResult<()> {
     state.require_active(now)?;
     let conversation = state.conversation_mut()?;
+    // The policy refusal comes first because it does not depend on who asks
+    // — the same discipline that puts the round ceiling ahead of the turn
+    // owner fence. Then the identity fence: the spec grants the early end to
+    // the moderator alone, so a roster participant's end refuses here rather
+    // than terminalizing a conversation it only speaks in.
     if !conversation.policy.moderator_may_end_early {
         return Err(AgentConversationError::EndNotPermitted);
+    }
+    if &conversation.moderator != moderator {
+        return Err(AgentConversationError::EndNotModerator {
+            participant: moderator.clone(),
+        });
     }
     if conversation.round != expected_round {
         // An end decided against a round the conversation moved past must
@@ -2795,6 +2822,11 @@ pub enum AgentConversationError {
     BudgetExhausted(AgentBudgetExhaustion),
     /// The policy forbids the moderator from ending early.
     EndNotPermitted,
+    /// The agent claiming the early end is not the conversation's moderator.
+    EndNotModerator {
+        /// The claimed moderator.
+        participant: AgentId,
+    },
     /// An end decision was made against a round the conversation moved
     /// past.
     EndStaleRound {
@@ -2853,6 +2885,7 @@ impl AgentConversationError {
             Self::MessageTooLarge { .. } => "conversation-message-too-large",
             Self::BudgetExhausted(exhaustion) => exhaustion.code(),
             Self::EndNotPermitted => "conversation-end-not-permitted",
+            Self::EndNotModerator { .. } => "conversation-end-not-moderator",
             Self::EndStaleRound { .. } => "conversation-end-stale-round",
             Self::HistoryConflict { .. } => "conversation-history-conflict",
             Self::HistoryBacklog { .. } => "conversation-history-backlog",
@@ -2944,6 +2977,10 @@ impl Display for AgentConversationError {
             Self::EndNotPermitted => {
                 f.write_str("the policy forbids the moderator from ending early")
             }
+            Self::EndNotModerator { participant } => write!(
+                f,
+                "{participant} is not the conversation's moderator and cannot end it early"
+            ),
             Self::EndStaleRound { expected, actual } => write!(
                 f,
                 "the end decision was made against round {expected} but round {actual} is in force"

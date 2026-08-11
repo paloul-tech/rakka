@@ -193,3 +193,73 @@ async fn a_loss_between_the_commit_and_the_history_flush_re_flushes_the_same_slo
     // drive is a restart that owes at most the same idempotent appends.
     assert_converged(&fx).await;
 }
+
+#[tokio::test]
+async fn a_resident_store_that_loses_a_compare_and_set_recovers_and_keeps_serving() {
+    // A conversation has two writers by construction — the resident sharded
+    // entity, which holds one store for its whole residency, and the A2A
+    // service, which builds its own store on any node. The loser of a race
+    // between them must reload the authoritative record, not answer
+    // `exchange-not-recovered` until it happens to passivate.
+    let fx = world().await;
+    let mut resident = rakka_agent::AgentConversationEntityStore::new(
+        conversation_scope(),
+        fx.conversations.clone(),
+        fx.conversation_history.clone(),
+    );
+    resident
+        .recover(fx.now())
+        .await
+        .expect("the resident loads");
+
+    // The other writer commits the round's first turn — the same turn the
+    // resident is about to be handed — so the resident's cached revision is
+    // now stale.
+    fx.apply_conversation_command_at(&conversation_scope(), submit(0, 0, "p1", "opening"))
+        .await
+        .expect("the other writer's turn commits");
+
+    // Computed against the stale cache the turn is legitimate, so the
+    // resident reaches its compare-and-set and loses it; the host drops the
+    // record the transition was computed from.
+    let conflict = resident
+        .apply(submit(0, 0, "p1", "opening"), &fx.router, fx.now())
+        .await
+        .expect_err("the stale resident loses the compare-and-set");
+    assert!(
+        !conflict.is_domain_refusal(),
+        "a lost race is an infrastructure fault, not a decision: {conflict}"
+    );
+
+    // The retry is the whole point: the same resident store reloads the
+    // authoritative record and answers the redelivery from the ledger.
+    // Before the fix this answered `exchange-not-recovered` for the rest of
+    // the entity's residency.
+    let reply = resident
+        .apply(submit(0, 0, "p1", "opening"), &fx.router, fx.now())
+        .await
+        .expect("the resident recovers and serves the retry");
+    assert!(matches!(
+        reply,
+        rakka_agent::AgentConversationEntityReply::Duplicate { .. }
+    ));
+
+    // And it keeps serving live traffic, not just replays.
+    let reply = resident
+        .apply(submit(0, 1, "p2", "reply"), &fx.router, fx.now())
+        .await
+        .expect("the recovered resident serves the next turn");
+    assert!(matches!(
+        reply,
+        rakka_agent::AgentConversationEntityReply::Applied { .. }
+    ));
+
+    // And the conversation converged exactly as an uncontended round does.
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(snapshot.turns.len(), 2, "one ledger record per coordinate");
+    assert_eq!(snapshot.round, 1, "the round advanced exactly once");
+    assert_eq!(snapshot.budgets.consumed.tokens, 20);
+}

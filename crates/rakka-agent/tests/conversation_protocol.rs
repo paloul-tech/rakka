@@ -121,6 +121,14 @@ fn submit_command(
 }
 
 fn end_command(expected_round: u64, reason: &str) -> AgentConversationEntityCommand {
+    end_command_by(MODERATOR, expected_round, reason)
+}
+
+fn end_command_by(
+    moderator: &str,
+    expected_round: u64,
+    reason: &str,
+) -> AgentConversationEntityCommand {
     AgentConversationEntityCommand::EndEarly {
         operation_id: conversation_end_operation_id(
             &tenant(),
@@ -128,6 +136,7 @@ fn end_command(expected_round: u64, reason: &str) -> AgentConversationEntityComm
             expected_round,
         )
         .expect("the operation id derives"),
+        moderator: agent(moderator),
         expected_round,
         reason: reason.to_string(),
         provenance: Box::new(provenance(1)),
@@ -320,6 +329,55 @@ async fn the_moderator_ends_early_under_policy_and_the_round_is_the_fence() {
         .await
         .expect_err("a turn after the end refuses");
     assert_eq!(turn.code(), "conversation-ended");
+}
+
+#[tokio::test]
+async fn only_the_moderators_end_terminalizes_the_conversation() {
+    let fx = created_fixture(creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    ))
+    .await;
+
+    // A roster participant may speak but may not end: specification 8.11
+    // grants the early end to the moderator alone.
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            end_command_by("alpha", 0, "i am done"),
+        )
+        .await
+        .expect_err("a participant's end refuses");
+    assert_eq!(refused.code(), "conversation-end-not-moderator");
+
+    // An agent outside the conversation entirely refuses under the same
+    // fence — the durable moderator is the only admitted claim.
+    let stranger = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            end_command_by("outsider", 0, "on your behalf"),
+        )
+        .await
+        .expect_err("a stranger's end refuses");
+    assert_eq!(stranger.code(), "conversation-end-not-moderator");
+
+    // Nothing flipped: the conversation is still live and still the
+    // moderator's to end.
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the live conversation snapshots");
+    assert_eq!(snapshot.status, AgentConversationStatus::Active);
+    assert_eq!(snapshot.terminal_reason, None);
+
+    let reply = fx
+        .apply_conversation_command_at(&conversation_scope(), end_command(0, "consensus reached"))
+        .await
+        .expect("the moderator's end applies");
+    assert!(matches!(
+        reply,
+        AgentConversationEntityReply::Applied { .. }
+    ));
 }
 
 #[tokio::test]

@@ -713,11 +713,13 @@ pub fn agent_team_command(
 /// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// Every cluster field is a claim the conversation entity's transition
-/// re-validates — the roster gate and the cursor's derived owner fence
-/// decide, never the wire; a field the named operation requires but the
-/// cluster omits fails closed here, before anything durable happens. The
-/// early end requires an authenticated principal — the management-write
-/// precedent — because its provenance records who accepted it.
+/// re-validates — the roster gate, the cursor's derived owner fence, and the
+/// early end's moderator fence decide, never the wire; a field the named
+/// operation requires but the cluster omits fails closed here, before
+/// anything durable happens. The early end requires an authenticated
+/// principal — the management-write precedent — because its provenance
+/// records who accepted it, and names its claimed agent because only the
+/// moderator's end terminalizes a conversation.
 pub fn agent_conversation_command(
     normalized: &NormalizedAgentCommand,
     now: rakka_agent_workflow::AgentTimestampMillis,
@@ -817,8 +819,17 @@ pub fn agent_conversation_command(
                 .ok_or(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
                     field: "io.rakka.principal.ref",
                 }))?;
+            // The end names its claimed agent in the same field a turn names
+            // its speaker; specification 8.11 grants the early end to the
+            // moderator alone, and the entity fences the claim against the
+            // durable moderator.
+            let moderator = rakka_agent::AgentId::new(required(
+                &cluster.participant,
+                "io.rakka.collaboration.participant",
+            )?)?;
             AgentConversationEntityCommand::EndEarly {
                 operation_id,
+                moderator,
                 expected_round,
                 reason: cluster.reason.clone().unwrap_or_default(),
                 provenance: Box::new(super::management::management_provenance(
