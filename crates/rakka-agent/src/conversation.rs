@@ -105,8 +105,21 @@ pub fn system_conversation_clock() -> AgentConversationClock {
 /// The default sharded entity type of conversation entities.
 pub const DEFAULT_AGENT_CONVERSATION_ENTITY_TYPE: &str = "RakkaAgentConversation";
 
-/// Maximum serialized bytes of one conversation's materialized state.
-pub const AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES: usize = 32 * 1024;
+/// Maximum serialized bytes of one conversation's *persisted state* — the
+/// whole [`AgentConversationState`], not just the materialized conversation
+/// inside it.
+///
+/// The bound covers what the compare-and-set actually writes: the
+/// conversation, the bounded operation log, the pending history outbox, and
+/// the exchange journal. An earlier 32 KiB figure measured only the
+/// conversation, and could never have held a full operation log and outbox
+/// beside even a *default* ledger and ring — so the creation-time arithmetic
+/// it was paired with was not an upper bound on anything.
+///
+/// Sized so every policy the hard caps admit provably fits: the wedge the
+/// creation-time guard exists to prevent is then impossible by construction
+/// rather than merely refused at the door.
+pub const AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES: usize = 128 * 1024;
 
 /// Bytes held back from the materialized bound so a settle transition never
 /// finds the record too large to write.
@@ -141,8 +154,25 @@ pub const AGENT_CONVERSATION_REASON_MAX_BYTES: usize = 256;
 /// record.
 pub const AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES: usize = 128;
 
+/// Bytes the creation-time worst-case arithmetic reserves per transcript
+/// message *beside* its body — the coordinate, speaker id, timestamp, and
+/// JSON envelope around it.
+pub const AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES: usize = 128;
+
+/// Bytes the creation-time worst-case arithmetic reserves per resolved
+/// operation the deduplication log remembers: its id and the full outcome it
+/// echoes.
+pub const AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES: usize = 320;
+
+/// Bytes the creation-time worst-case arithmetic reserves per history entry
+/// waiting in the outbox — including a detail at
+/// [`AGENT_CONVERSATION_DETAIL_MAX_LENGTH`].
+pub const AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES: usize = 768;
+
 /// Bytes the creation-time worst-case arithmetic reserves for everything
-/// outside the turn ledger and the transcript ring.
+/// outside the turn ledger, the transcript ring, the operation log, and the
+/// history outbox: the scope, the roster, the policy, the cursor, the
+/// budgets, the transcript reference, and the exchange journal.
 pub const AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES: usize = 8 * 1024;
 
 /// Hex characters of the turn body digest the ledger records.
@@ -499,18 +529,6 @@ impl AgentConversation {
             AgentConversationSpeaker::Moderator => Some(&self.moderator),
             AgentConversationSpeaker::Participant(index) => self.participants.get(index as usize),
         }
-    }
-
-    fn check_bounds(&self) -> AgentConversationResult<()> {
-        let bytes = serde_json::to_vec(self)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-        let maximum = AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES
-            .saturating_sub(AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES);
-        if bytes > maximum {
-            return Err(AgentConversationError::StateBounds { bytes, maximum });
-        }
-        Ok(())
     }
 }
 
@@ -1123,6 +1141,30 @@ impl AgentConversationState {
     #[must_use]
     pub fn history_headroom(&self) -> usize {
         AGENT_CONVERSATION_PENDING_HISTORY_CAPACITY.saturating_sub(self.pending_history.len())
+    }
+
+    /// Refuses a state that would exceed its persisted bound.
+    ///
+    /// Measured over the whole record the compare-and-set writes — the
+    /// conversation *and* the operation log, the pending history outbox, and
+    /// the exchange journal beside it. Measuring only the conversation would
+    /// leave the three bounded collections growing under no bound at all,
+    /// and it is the whole record a durable store's per-value limit applies
+    /// to.
+    ///
+    /// This stays a defensive guard: [`create_conversation`] refuses at the
+    /// door any policy whose worst case could reach here, because a
+    /// mid-round refusal would wedge the protocol.
+    fn check_bounds(&self) -> AgentConversationResult<()> {
+        let bytes = serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        let maximum = AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES
+            .saturating_sub(AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES);
+        if bytes > maximum {
+            return Err(AgentConversationError::StateBounds { bytes, maximum });
+        }
+        Ok(())
     }
 
     /// The compact outcome describing the current state.
@@ -1921,6 +1963,18 @@ where
     }
 }
 
+/// What one turn body costs the serialized state: its JSON-escaped length,
+/// without the surrounding quotes.
+///
+/// Plain text costs exactly what it measures; a body full of quotes or
+/// control characters costs more, which is the number the state bound will
+/// see and therefore the number `max_message_bytes` has to govern.
+fn stored_body_bytes(body: &str) -> usize {
+    serde_json::to_string(body)
+        .map(|escaped| escaped.len().saturating_sub(2))
+        .unwrap_or(usize::MAX)
+}
+
 /// The stored prefix of one turn's content digest — body *and* direction, so
 /// the ledger echo fences a regenerated direction exactly as it fences
 /// regenerated words.
@@ -2026,17 +2080,30 @@ fn create_conversation(
             });
         }
     }
-    // A policy whose maxed-out ledger and ring cannot fit the state bound
-    // refuses at creation: a mid-round state-bounds refusal would wedge the
-    // protocol with the early end as its only exit, so the door is where
-    // the arithmetic must hold. The in-flight bounds check stays a
-    // defensive guard only.
+    // A policy whose worst case cannot fit the state bound refuses at
+    // creation: a mid-round state-bounds refusal would wedge the protocol
+    // with the early end as its only exit, so the door is where the
+    // arithmetic must hold. The in-flight bounds check stays a defensive
+    // guard only — which is true only while this sum is a genuine upper
+    // bound on everything `check_bounds` measures, so every bounded
+    // collection in the persisted record is a term here.
+    //
+    // The ring is charged its *stored* cost: `max_message_bytes` bounds a
+    // body's escaped length (`record_turn`), so the same number bounds what
+    // the ring contributes to the serialized state.
     let ledger = creation.policy.effective_max_rounds() as usize
         * creation.policy.effective_max_turns_per_round() as usize
         * AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES;
     let ring = creation.policy.effective_max_messages() as usize
-        * creation.policy.effective_max_message_bytes();
-    let worst_case = ledger + ring + AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES;
+        * (creation
+            .policy
+            .effective_max_message_bytes()
+            .saturating_add(AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES));
+    let operations = AGENT_CONVERSATION_OPERATION_LOG_CAPACITY
+        * AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES;
+    let outbox = AGENT_CONVERSATION_PENDING_HISTORY_CAPACITY
+        * AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES;
+    let worst_case = ledger + ring + operations + outbox + AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES;
     let maximum = AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES
         .saturating_sub(AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES);
     if worst_case > maximum {
@@ -2073,8 +2140,8 @@ fn create_conversation(
         created_at: now,
         ended_at: None,
     };
-    conversation.check_bounds()?;
     state.conversation = Some(conversation);
+    state.check_bounds()?;
     let moderator = creation.moderator;
     let operation = operation_id.clone();
     state.record_history(|sequence| {
@@ -2148,6 +2215,26 @@ fn record_turn(
             maximum: max_rounds,
         });
     }
+    // The turns-per-round ceiling is a ceiling on *records*, so it is
+    // checked for every turn, not only the moderator's designating one —
+    // enforcing it on one branch let a round record one more turn than the
+    // policy declared, billing a turn the operator did not admit and
+    // eroding the ledger reserve the creation arithmetic holds. Like the
+    // round ceiling above, it refuses before the owner fence: the answer
+    // does not depend on who asks.
+    // The turns-per-round ceiling stated directly: it bounds *records*, so
+    // it is checked for every turn rather than only the moderator's
+    // designating one, which is what let a round record one turn more than
+    // the policy declared — billing a turn the operator never admitted and
+    // eroding the per-round ledger reserve the creation arithmetic holds.
+    // The designation look-ahead below is what normally keeps a round
+    // inside this bound; this is the bound itself, and like the round
+    // ceiling above it refuses before the owner fence, because the answer
+    // does not depend on who asks.
+    let max_turns = conversation.policy.effective_max_turns_per_round();
+    if conversation.turn_in_round >= max_turns {
+        return Err(AgentConversationError::TurnsExhausted { maximum: max_turns });
+    }
     let owner = conversation.turn_owner().cloned();
     if owner.as_ref() != Some(&submit.participant) {
         return Err(AgentConversationError::TurnNotOwner {
@@ -2186,19 +2273,30 @@ fn record_turn(
                     participant: designated.clone(),
                 });
             }
-            let max_turns = conversation.policy.effective_max_turns_per_round();
-            if conversation.turn_in_round + 1 >= max_turns {
-                // The designated turn would land past the rim; only closing
-                // the round is accepted here.
+            // A designation commits three slots: this turn, the designated
+            // participant's, and the moderator's turn after it — which is
+            // the only way a moderator-directed round ever closes. All three
+            // must fit inside the ceiling, or the round would reach the rim
+            // with no move left that the ceiling admits and no way to close.
+            if conversation.turn_in_round.saturating_add(3) > max_turns {
+                // The designated exchange would land past the rim; only
+                // closing the round is accepted here.
                 return Err(AgentConversationError::TurnsExhausted { maximum: max_turns });
             }
         }
         (Some(AgentConversationDirection::CloseRound), true) | (None, false) => {}
     }
+    // Measured as *stored*, not as typed: the ring lives inside the
+    // serialized state, where a quote doubles and a control character
+    // expands sixfold. Charging the raw length here while the state bound
+    // measures the escaped one is what let a policy pass the door and still
+    // blow the bound mid-round. Plain text is unaffected — its escaped
+    // length is its raw length.
     let max_bytes = conversation.policy.effective_max_message_bytes();
-    if submit.body.len() > max_bytes {
+    let stored_bytes = stored_body_bytes(&submit.body);
+    if stored_bytes > max_bytes {
         return Err(AgentConversationError::MessageTooLarge {
-            bytes: submit.body.len(),
+            bytes: stored_bytes,
             maximum: max_bytes,
         });
     }
@@ -2282,8 +2380,6 @@ fn record_turn(
             }
         },
     }
-    conversation.check_bounds()?;
-
     let participant = submit.participant.clone();
     let operation = operation_id.clone();
     // The spend is attributed: the shared grant is drawn down by a named
@@ -2326,7 +2422,10 @@ fn record_turn(
             .with_detail(AgentConversationTerminalReason::RoundsComplete.code())
         });
     }
-    Ok(())
+    // Measured last, over everything this transition wrote — the ledger
+    // record and ring append above *and* the history entries it just owed
+    // the outbox, all of which the same compare-and-set persists.
+    state.check_bounds()
 }
 
 fn end_early(

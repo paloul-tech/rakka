@@ -516,6 +516,93 @@ async fn a_redelivered_turn_converges_while_the_history_sink_is_down() {
 }
 
 #[tokio::test]
+async fn a_round_never_records_more_turns_than_its_ceiling_declares() {
+    // The ceiling is a ceiling on records. Enforcing it only where the
+    // moderator designates let a round record one turn more than the policy
+    // declared — billing a turn the operator never admitted, and eroding
+    // the per-round ledger reserve the creation arithmetic holds.
+    for max_turns in [2u32, 3, 4, 8] {
+        let fx = created(
+            AgentConversationMode::ModeratorDirected,
+            AgentConversationCompletionRule::ModeratorDecides,
+            AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
+                .with_max_rounds(2)
+                .with_max_turns_per_round(max_turns),
+            &["p1", "p2"],
+        )
+        .await;
+
+        // Drive one round to its close, taking whichever move the protocol
+        // admits: designate while there is room for the closing turn, close
+        // the round once there is not.
+        for _ in 0..(max_turns + 4) {
+            let snapshot = fx
+                .conversation_snapshot_at(&conversation_scope())
+                .await
+                .expect("the conversation snapshots");
+            if snapshot.round > 0 {
+                break;
+            }
+            let Some(speaker) = snapshot.current_speaker.clone() else {
+                break;
+            };
+            let moderator = speaker == agent(MODERATOR);
+            let direction = if !moderator {
+                None
+            } else if fx
+                .apply_conversation_command_at(
+                    &conversation_scope(),
+                    submit(
+                        snapshot.round,
+                        snapshot.turn_in_round,
+                        speaker.as_str(),
+                        "designating",
+                        Some(AgentConversationDirection::Designate(agent("p1"))),
+                    ),
+                )
+                .await
+                .is_ok()
+            {
+                continue;
+            } else {
+                Some(AgentConversationDirection::CloseRound)
+            };
+            if fx
+                .apply_conversation_command_at(
+                    &conversation_scope(),
+                    submit(
+                        snapshot.round,
+                        snapshot.turn_in_round,
+                        speaker.as_str(),
+                        "speaking",
+                        direction,
+                    ),
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let snapshot = fx
+            .conversation_snapshot_at(&conversation_scope())
+            .await
+            .expect("the conversation snapshots");
+        let in_round = snapshot
+            .turns
+            .iter()
+            .filter(|record| record.round == 0)
+            .count();
+        assert!(
+            in_round <= max_turns as usize,
+            "a round declared {max_turns} turns and recorded {in_round}"
+        );
+        assert_eq!(snapshot.round, 1, "and the round still closed");
+    }
+}
+
+#[tokio::test]
 async fn a_turn_regenerated_with_a_different_direction_refuses_at_both_layers() {
     // The direction is content: the same words that designate a speaker and
     // the same words that close the round are different decisions, and a

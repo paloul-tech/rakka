@@ -248,25 +248,166 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     assert_eq!(oversized.code(), "conversation-transcript-ref-invalid");
 }
 
+/// A history sink that is down, so the pending outbox reaches its capacity —
+/// the only way the persisted state ever holds a full one.
+#[derive(Clone, Default)]
+struct UnavailableHistory;
+
+impl rakka_agent::AgentConversationHistoryStore for UnavailableHistory {
+    fn backend_name(&self) -> &'static str {
+        "unavailable"
+    }
+
+    fn append<'a>(
+        &'a self,
+        _scope: &'a AgentConversationScope,
+        _entry: &'a rakka_agent::AgentConversationHistoryEntry,
+    ) -> rakka_agent::AgentConversationHistoryFuture<'a, ()> {
+        Box::pin(async move { Err(unavailable()) })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _scope: &'a AgentConversationScope,
+        _cursor: rakka_agent::AgentConversationHistoryCursor,
+    ) -> rakka_agent::AgentConversationHistoryFuture<'a, rakka_agent::AgentConversationHistoryPage>
+    {
+        Box::pin(async move { Err(unavailable()) })
+    }
+}
+
+fn unavailable() -> rakka_agent::AgentConversationError {
+    rakka_agent::AgentConversationError::Choreography(Box::new(
+        rakka_agent::AgentChoreographyError::Persistence(rakka_persistence::DurableError::Store {
+            backend: "unavailable",
+            message: "the history sink is down".to_string(),
+        }),
+    ))
+}
+
 #[tokio::test]
-async fn an_unfittable_policy_refuses_at_creation() {
-    // Maxed everything: 16 rounds x 16 turns x 128 reserved bytes alone
-    // exceeds the state bound, so a conversation under this policy could
-    // wedge mid-round on the state-bounds guard — the door is where the
-    // arithmetic must hold.
+async fn the_creation_arithmetic_upper_bounds_what_the_state_guard_measures() {
+    // The whole point of the creation-time reserve: it must be an upper
+    // bound on every byte the in-flight guard can ever measure. If it is
+    // not, a policy passes the door and the protocol wedges mid-round on
+    // `conversation-state-too-large`, with the early end as its only exit.
+    // Checked here by *saturating* the maxed-out policy — a full ledger, a
+    // full ring of maximally escape-expensive bodies, a full operation log,
+    // and a full history outbox — and comparing the real serialized size to
+    // the reserve creation charged for it.
     let maxed = AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
         .with_max_rounds(16)
         .with_max_turns_per_round(16)
         .with_max_messages(16)
         .with_max_message_bytes(1024);
-    let refused = fixture()
-        .apply_conversation_command_at(
-            &conversation_scope(),
-            create_command(creation(maxed, &["alpha"])),
-        )
+
+    let reserved = 16 * 16 * rakka_agent::AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES
+        + 16 * (1024 + rakka_agent::AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES)
+        + rakka_agent::AGENT_CONVERSATION_OPERATION_LOG_CAPACITY
+            * rakka_agent::AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES
+        + rakka_agent::AGENT_CONVERSATION_PENDING_HISTORY_CAPACITY
+            * rakka_agent::AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES
+        + rakka_agent::AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES;
+    let bound = rakka_agent::AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES
+        - rakka_agent::AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES;
+    assert!(
+        reserved <= bound,
+        "every policy the hard caps admit must fit: reserved {reserved} against bound {bound}"
+    );
+
+    // The maxed policy therefore creates rather than refusing — the wedge is
+    // impossible by construction, not merely turned away at the door.
+    let roster: Vec<String> = (0..8).map(|index| format!("p{index}")).collect();
+    let names: Vec<&str> = roster.iter().map(String::as_str).collect();
+    let fx = created_fixture(creation(maxed, &names)).await;
+
+    // Now saturate every bounded collection at once. Bodies are all quotes:
+    // each byte escapes to two, so a 512-character body stores as the full
+    // 1024-byte ceiling — the most expensive body the policy admits.
+    let body = "\"".repeat(512);
+    // Follow the cursor rather than assuming it: the round closes on its
+    // own, and a coordinate behind the cursor would be answered by the
+    // ledger instead of recording anything.
+    for _ in 0..256 {
+        let Some(snapshot) = fx.conversation_snapshot_at(&conversation_scope()).await else {
+            break;
+        };
+        let Some(speaker) = snapshot.current_speaker.clone() else {
+            break;
+        };
+        // Two rounds are left for the degraded stretch below, which is the
+        // only way the pending outbox ever reaches its capacity.
+        if snapshot.round >= 14 {
+            break;
+        }
+        if fx
+            .apply_conversation_command_at(
+                &conversation_scope(),
+                submit_command(
+                    snapshot.round,
+                    snapshot.turn_in_round,
+                    speaker.as_str(),
+                    &body,
+                    1,
+                ),
+            )
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    // The ledger, ring, and operation log are now as full as this policy
+    // allows. The outbox is not — the fixture's sink drains it — so the last
+    // stretch runs against a sink that is down, which is the only way the
+    // pending history reaches its capacity.
+    let mut degraded = rakka_agent::AgentConversationEntityStore::new(
+        conversation_scope(),
+        fx.conversations.clone(),
+        UnavailableHistory,
+    );
+    for _ in 0..64 {
+        let Some(snapshot) = fx.conversation_snapshot_at(&conversation_scope()).await else {
+            break;
+        };
+        let Some(speaker) = snapshot.current_speaker.clone() else {
+            break;
+        };
+        let command = submit_command(
+            snapshot.round,
+            snapshot.turn_in_round,
+            speaker.as_str(),
+            &body,
+            1,
+        );
+        let _ = degraded.apply(command, &fx.router, fx.now()).await;
+    }
+
+    let serialized = fx
+        .conversation_state_bytes(&conversation_scope())
         .await
-        .expect_err("the unfittable policy refuses");
-    assert_eq!(refused.code(), "conversation-policy-too-large");
+        .expect("the persisted state serializes");
+    // The measurement is only worth anything if the state really is
+    // saturated, so assert that before comparing sizes.
+    let saturated = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the saturated conversation snapshots");
+    assert_eq!(saturated.turns.len(), 128, "the ledger filled");
+    assert_eq!(saturated.messages.len(), 16, "the ring filled");
+    assert!(
+        serialized > rakka_agent::AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES,
+        "a state this size is a real measurement, not an empty one: {serialized}"
+    );
+    assert!(
+        serialized <= reserved,
+        "the saturated state must fit the reserve creation charged: {serialized} > {reserved}"
+    );
+    assert!(
+        serialized <= bound,
+        "and it must fit the guard's own bound: {serialized} > {bound}"
+    );
 }
 
 #[tokio::test]
@@ -393,6 +534,60 @@ async fn an_end_forbidden_by_policy_refuses() {
         .await
         .expect_err("the policy forbids the early end");
     assert_eq!(refused.code(), "conversation-end-not-permitted");
+}
+
+#[tokio::test]
+async fn the_message_ceiling_measures_what_the_body_costs_to_store() {
+    // `max_message_bytes` governs the ring's contribution to the serialized
+    // state, so it has to measure the body the way the state does. Charging
+    // the raw length while the bound measured the escaped one is what let a
+    // policy pass the door and still blow the bound mid-round.
+    let fx = created_fixture(creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).with_max_message_bytes(64),
+        &["alpha", "beta"],
+    ))
+    .await;
+
+    // Plain text is unaffected: 64 characters cost 64 bytes stored.
+    let reply = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(0, 0, "alpha", &"a".repeat(64), 0),
+        )
+        .await
+        .expect("a plain body at the ceiling records");
+    assert!(matches!(
+        reply,
+        AgentConversationEntityReply::Applied { .. }
+    ));
+
+    // The same 64 characters as quotes cost 128 stored, and are refused —
+    // with the stored cost, not the typed one, in the refusal.
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(0, 1, "beta", &"\"".repeat(64), 0),
+        )
+        .await
+        .expect_err("an escape-expensive body over the stored ceiling refuses");
+    assert_eq!(refused.code(), "conversation-message-too-large");
+    assert!(
+        refused.to_string().contains("128"),
+        "the refusal reports the stored cost: {refused}"
+    );
+
+    // And half as many quotes fit exactly.
+    let reply = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(0, 1, "beta", &"\"".repeat(32), 0),
+        )
+        .await
+        .expect("an escaped body at the stored ceiling records");
+    assert!(matches!(
+        reply,
+        AgentConversationEntityReply::Applied { .. }
+    ));
 }
 
 #[tokio::test]

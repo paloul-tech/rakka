@@ -1388,6 +1388,25 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         conversation.snapshot().ok().flatten()
     }
 
+    /// The serialized size of one conversation's persisted state — the whole
+    /// record the compare-and-set writes, which is what the state bound
+    /// governs.
+    pub async fn conversation_state_bytes(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<usize> {
+        use rakka_persistence::DurableStateStore;
+
+        let record = self
+            .conversations
+            .load(&scope.persistence_id())
+            .await
+            .ok()??;
+        serde_json::to_vec(&record.state)
+            .ok()
+            .map(|bytes| bytes.len())
+    }
+
     /// Drives the root controller, one epoch task, and that epoch's run until
     /// the epoch run terminates and every owed exchange settles — the
     /// recovery sweep of the continuous world. Every entity is rebuilt from
