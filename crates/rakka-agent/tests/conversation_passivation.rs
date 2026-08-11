@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::{ConversationStore, ShardedWorld};
 use rakka_agent::testkit::ScriptedDispatcher;
 use rakka_agent::{
-    conversation_turn_body_digest, conversation_turn_operation_id,
+    conversation_turn_content_digest, conversation_turn_operation_id,
     passivate_agent_conversation_entity, AgentBudgetConsumption, AgentConversationCompletionRule,
     AgentConversationCreation, AgentConversationDirection, AgentConversationEntityCommand,
     AgentConversationEntityMessage, AgentConversationEntityReply, AgentConversationId,
@@ -83,7 +83,7 @@ fn submit(
             round,
             turn,
             &agent(participant),
-            &conversation_turn_body_digest(body),
+            &conversation_turn_content_digest(body, direction.as_ref()),
         )
         .expect("the operation id derives"),
         submit: Box::new(AgentConversationTurnSubmit {

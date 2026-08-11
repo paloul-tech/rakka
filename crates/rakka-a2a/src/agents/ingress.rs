@@ -279,13 +279,19 @@ pub fn normalize_agent_send(
                     ))?;
                     let body =
                         cluster_field(cluster.body.as_deref(), "io.rakka.collaboration.body")?;
+                    // The direction is part of the decision's content, so it
+                    // is part of its identity: two turns with the same words
+                    // that steer the protocol differently must not share an
+                    // operation id. Mapped by the same helper the command
+                    // build uses, so the two can never drift.
+                    let direction = conversation_direction(cluster)?;
                     rakka_agent::conversation_turn_operation_id(
                         &tenant,
                         &conversation,
                         round,
                         turn,
                         &rakka_agent::AgentId::new(participant)?,
-                        &rakka_agent::conversation_turn_body_digest(body),
+                        &rakka_agent::conversation_turn_content_digest(body, direction.as_ref()),
                     )?
                 }
                 super::collaboration::AgentConversationWireOperation::End => {
@@ -708,6 +714,34 @@ pub fn agent_team_command(
     Ok((scope, command))
 }
 
+/// Maps the conversation cluster's two direction spellings to the entity's
+/// direction, failing closed on a payload carrying both.
+///
+/// One mapping serves both the operation-id derivation in
+/// [`normalize_agent_send`] and the command build below, because the two must
+/// agree: the id covers the direction, so a spelling one side honored and the
+/// other dropped would put a turn's identity out of step with the decision it
+/// names.
+fn conversation_direction(
+    cluster: &super::collaboration::AgentConversationCollaborationMetadata,
+) -> RakkaAgentA2AResult<Option<rakka_agent::AgentConversationDirection>> {
+    use rakka_agent::AgentConversationDirection;
+
+    // The two spellings are mutually exclusive: a payload carrying both is a
+    // half-formed engagement refused whole.
+    match (cluster.designate.as_deref(), cluster.close_round) {
+        (Some(_), Some(true)) => Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "a moderator turn cannot both designate and close the round",
+        }),
+        (Some(designated), _) => Ok(Some(AgentConversationDirection::Designate(
+            rakka_agent::AgentId::new(designated)?,
+        ))),
+        (None, Some(true)) => Ok(Some(AgentConversationDirection::CloseRound)),
+        (None, _) => Ok(None),
+    }
+}
+
 /// Builds the deduplicated conversation entity command for one normalized
 /// conversation send
 /// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
@@ -728,8 +762,8 @@ pub fn agent_conversation_command(
     rakka_agent::AgentConversationEntityCommand,
 )> {
     use rakka_agent::{
-        AgentConversationDirection, AgentConversationEntityCommand, AgentConversationId,
-        AgentConversationScope, AgentConversationTurnSubmit,
+        AgentConversationEntityCommand, AgentConversationId, AgentConversationScope,
+        AgentConversationTurnSubmit,
     };
 
     use super::collaboration::{AgentCollaborationEnvelope, AgentConversationWireOperation};
@@ -775,21 +809,7 @@ pub fn agent_conversation_command(
                 "io.rakka.collaboration.participant",
             )?)?;
             let body = required(&cluster.body, "io.rakka.collaboration.body")?;
-            // The two direction spellings are mutually exclusive: a payload
-            // carrying both is a half-formed engagement refused whole.
-            let direction = match (cluster.designate.as_deref(), cluster.close_round) {
-                (Some(_), Some(true)) => {
-                    return Err(RakkaAgentA2AError::Unsupported {
-                        operation: "agent-collaboration",
-                        reason: "a moderator turn cannot both designate and close the round",
-                    });
-                }
-                (Some(designated), _) => Some(AgentConversationDirection::Designate(
-                    rakka_agent::AgentId::new(designated)?,
-                )),
-                (None, Some(true)) => Some(AgentConversationDirection::CloseRound),
-                (None, _) => None,
-            };
+            let direction = conversation_direction(cluster)?;
             let mut usage = rakka_agent::AgentBudgetConsumption::zero();
             usage.tokens = cluster.tokens_consumed.unwrap_or(0);
             AgentConversationEntityCommand::SubmitTurn {

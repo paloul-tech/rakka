@@ -15,12 +15,13 @@ use std::sync::atomic::Ordering;
 use common::{tenant, Fixture};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    conversation_end_operation_id, conversation_turn_body_digest, conversation_turn_operation_id,
-    AgentBudgetConsumption, AgentConversationCompletionRule, AgentConversationCreation,
-    AgentConversationEntityCommand, AgentConversationEntityReply, AgentConversationId,
-    AgentConversationMode, AgentConversationScope, AgentConversationStatus,
-    AgentConversationTerminalReason, AgentConversationTurnSubmit, AgentId, AgentModerationPolicy,
-    AgentOperationId, AgentOperationKind, AgentRevisionNumber, AgentTaskId,
+    conversation_end_operation_id, conversation_turn_content_digest,
+    conversation_turn_operation_id, AgentBudgetConsumption, AgentConversationCompletionRule,
+    AgentConversationCreation, AgentConversationDirection, AgentConversationEntityCommand,
+    AgentConversationEntityReply, AgentConversationId, AgentConversationMode,
+    AgentConversationScope, AgentConversationStatus, AgentConversationTerminalReason,
+    AgentConversationTurnSubmit, AgentId, AgentModerationPolicy, AgentOperationId,
+    AgentOperationKind, AgentRevisionNumber, AgentTaskId,
 };
 use rakka_agent_workflow::{
     AgentAuditEventId, AgentCausationId, AgentTimestampMillis, PrincipalRef,
@@ -106,7 +107,7 @@ fn submit_command(
             round,
             turn,
             &agent(participant),
-            &conversation_turn_body_digest(body),
+            &conversation_turn_content_digest(body, None),
         )
         .expect("the operation id derives"),
         submit: Box::new(AgentConversationTurnSubmit {
@@ -395,6 +396,76 @@ async fn an_end_forbidden_by_policy_refuses() {
 }
 
 #[tokio::test]
+async fn an_implausible_usage_report_refuses_before_it_can_spend_the_shared_grant() {
+    // The reported spend is the speaker's own claim about its own run, and
+    // the grant it draws down belongs to every participant. Bounding the
+    // claim is what keeps one turn from exhausting the conversation for
+    // everyone — exhaustion refuses rather than parks, so a poisoned total
+    // leaves no reachable progress at all.
+    let mut creation = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).with_max_turn_tokens(500),
+        &["alpha", "beta"],
+    );
+    creation.tokens = Some(1_000);
+    let fx = created_fixture(creation).await;
+
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(0, 0, "alpha", "an opening", u64::MAX),
+        )
+        .await
+        .expect_err("an implausible report refuses");
+    assert_eq!(refused.code(), "conversation-turn-usage-too-large");
+
+    // Nothing was spent and nothing was recorded: the refusal precedes the
+    // accounting, so the grant is intact for every other participant.
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(snapshot.budgets.consumed.tokens, 0);
+    assert!(snapshot.turns.is_empty());
+    assert_eq!(snapshot.current_speaker, Some(agent("alpha")));
+
+    // A report at the ceiling still lands, and overshooting what *remains*
+    // stays legal below it — that spend already happened.
+    let reply = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit_command(0, 0, "alpha", "an opening", 500),
+        )
+        .await
+        .expect("a report at the ceiling records");
+    assert!(matches!(
+        reply,
+        AgentConversationEntityReply::Applied { .. }
+    ));
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(snapshot.budgets.consumed.tokens, 500);
+
+    // And the spend is attributed: the audit trail names who reported it,
+    // so an exhausted conversation is never an anonymous total.
+    let page = rakka_agent::AgentConversationHistoryStore::read(
+        &fx.conversation_history,
+        &conversation_scope(),
+        rakka_agent::AgentConversationHistoryCursor::start(),
+    )
+    .await
+    .expect("the history reads");
+    let turn_entry = page
+        .entries
+        .iter()
+        .find(|entry| entry.kind == rakka_agent::AgentConversationHistoryKind::TurnRecorded)
+        .expect("the recorded turn is audited");
+    assert_eq!(turn_entry.participant.as_ref(), Some(&agent("alpha")));
+    assert_eq!(turn_entry.detail, "tokens=500");
+}
+
+#[tokio::test]
 async fn token_exhaustion_refuses_the_next_turn_and_never_parks() {
     let mut creation = creation(
         AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
@@ -581,6 +652,11 @@ async fn a_pre_slice_policy_decodes_with_defaults_and_the_identity_pins_hold() {
     assert_eq!(decoded.max_turns_per_round, 8);
     assert_eq!(decoded.max_messages, 8);
     assert_eq!(decoded.max_message_bytes, 1024);
+    assert_eq!(
+        decoded.max_turn_tokens,
+        Some(rakka_agent::AGENT_CONVERSATION_DEFAULT_MAX_TURN_TOKENS),
+        "a policy stored before the per-turn ceiling existed decodes into it"
+    );
     assert!(decoded.moderator_may_end_early);
     assert!(decoded.tool.is_none());
 
@@ -606,7 +682,7 @@ async fn a_pre_slice_policy_decodes_with_defaults_and_the_identity_pins_hold() {
             round,
             turn,
             &agent(participant),
-            &conversation_turn_body_digest(body),
+            &conversation_turn_content_digest(body, None),
         )
         .expect("the operation id derives")
     };
@@ -626,11 +702,50 @@ async fn a_pre_slice_policy_decodes_with_defaults_and_the_identity_pins_hold() {
         derive(0, 0, "alpha", "hello"),
         derive(0, 0, "beta", "hello")
     );
-    // The golden vector: a persisted operation id must re-derive byte for
-    // byte forever.
+
+    // The direction is content: the same words steering the protocol
+    // differently are different decisions, and each must derive its own
+    // identity or a regenerated one would be absorbed as a duplicate.
+    let directed = |body: &str, direction: Option<AgentConversationDirection>| {
+        conversation_turn_operation_id(
+            &tenant(),
+            &conversation,
+            0,
+            0,
+            &agent(MODERATOR),
+            &conversation_turn_content_digest(body, direction.as_ref()),
+        )
+        .expect("the operation id derives")
+    };
+    let close = || Some(AgentConversationDirection::CloseRound);
+    let designate = |name: &str| Some(AgentConversationDirection::Designate(agent(name)));
+    assert_eq!(directed("next", close()), directed("next", close()));
+    assert_ne!(directed("next", close()), directed("next", None));
+    assert_ne!(
+        directed("next", close()),
+        directed("next", designate("beta"))
+    );
+    assert_ne!(directed("next", designate("beta")), directed("next", None));
+    assert_ne!(
+        directed("next", designate("beta")),
+        directed("next", designate("gamma"))
+    );
+
+    // The golden vectors: a persisted operation id must re-derive byte for
+    // byte forever, one per direction shape.
     assert_eq!(
         derive(2, 3, "alpha", "hello").as_str(),
         "conversation-turn/acme/design-review/2/3/alpha/\
-         8beb02cd912c0e3c37adcaec911fc0f2cb7dc10569d4ad64a9782ca8aea47285"
+         7854c55b74459b37aa6fb941d194edd619b425091d8442d9d9c44a33a48fcb72"
+    );
+    assert_eq!(
+        directed("next", close()).as_str(),
+        "conversation-turn/acme/design-review/0/0/moderator/\
+         829398ee019816a08ad58fcedb4b55a2a695158a3b9c3c0d8c9d360fcab0436c"
+    );
+    assert_eq!(
+        directed("next", designate("beta")).as_str(),
+        "conversation-turn/acme/design-review/0/0/moderator/\
+         3723686f2b03ee546b9980be44391adac55c617054f848eb8669f1343083f83d"
     );
 }

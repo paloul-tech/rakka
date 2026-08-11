@@ -68,7 +68,7 @@ use crate::choreography::{
     AgentExchangeTransition,
 };
 use crate::coordination::{
-    conversation_expiry_operation_id, conversation_turn_body_digest, AgentCoordinationError,
+    conversation_expiry_operation_id, conversation_turn_content_digest, AgentCoordinationError,
     AgentModerationPolicy,
 };
 use crate::definition::{AgentRevisionNumber, AgentRevisionProvenance};
@@ -1620,9 +1620,32 @@ where
                 self.snapshot()?.map(Box::new),
             ));
         }
-        self.require_history_headroom(now).await?;
 
         let operation = command.operation_label();
+        // The past-window ledger echo is answered before every other guard,
+        // including the history headroom one: it writes nothing at all, so a
+        // redelivered turn must converge on the recorded turn even while the
+        // history sink — pure observability — is unavailable. Refusing an
+        // idempotent convergence with `conversation-history-backlog` would
+        // leave the retrying caller unable to learn its turn had landed.
+        if let AgentConversationEntityCommand::SubmitTurn { submit, .. } = &command {
+            if let Some(echo) = probe_turn_echo(self.state()?, submit) {
+                return match echo {
+                    Ok(()) => Ok(AgentConversationEntityReply::Duplicate {
+                        outcome: self.state()?.outcome(),
+                    }),
+                    Err(error) => {
+                        if error.is_domain_refusal() {
+                            self.count_operation(operation, "refused");
+                        }
+                        Err(error)
+                    }
+                };
+            }
+        }
+
+        self.require_history_headroom(now).await?;
+
         let reply = self.apply_transition(command, now).await;
         match &reply {
             // A duplicate — the past-window ledger echo — made no durable
@@ -1669,18 +1692,9 @@ where
                 operation_id,
                 submit,
             } => {
-                // The ledger echo is answered before any write — checked
-                // before every other guard, including the terminal one, so
-                // a past-window replay converges without burning a revision
-                // even after the conversation ended.
-                if let Some(echo) = probe_turn_echo(self.state()?, &submit) {
-                    return match echo {
-                        Ok(()) => Ok(AgentConversationEntityReply::Duplicate {
-                            outcome: self.state()?.outcome(),
-                        }),
-                        Err(error) => Err(error),
-                    };
-                }
+                // The ledger echo already answered in `apply`, ahead of
+                // every other guard; `record_turn` re-probes so the pure
+                // transition stays self-contained for a direct caller.
                 self.transition(now, move |state| {
                     record_turn(state, &operation_id, &submit, now)?;
                     Ok(operation_id)
@@ -1907,8 +1921,11 @@ where
     }
 }
 
-fn digest_prefix(body: &str) -> String {
-    conversation_turn_body_digest(body)
+/// The stored prefix of one turn's content digest — body *and* direction, so
+/// the ledger echo fences a regenerated direction exactly as it fences
+/// regenerated words.
+fn digest_prefix(body: &str, direction: Option<&AgentConversationDirection>) -> String {
+    conversation_turn_content_digest(body, direction)
         .value
         .chars()
         .take(AGENT_CONVERSATION_DIGEST_PREFIX_LENGTH)
@@ -1947,11 +1964,14 @@ fn probe_turn_echo(
     if recorded_speaker != Some(&submit.participant) {
         return Some(Err(AgentConversationError::TurnSuperseded));
     }
-    if record.digest_prefix != digest_prefix(&submit.body) {
+    if record.digest_prefix != digest_prefix(&submit.body, submit.direction.as_ref()) {
         // The coordinate is occupied by this speaker's *other* content: a
         // regenerated submission after a crash, not a redelivery. Echoing
         // the recorded turn would silently persuade the speaker its new
         // content was recorded; refusing loudly is the only honest answer.
+        // The direction is content too — a turn regenerated to designate
+        // where the recorded one closed the round decides something else
+        // entirely, however identical its words.
         return Some(Err(AgentConversationError::TurnContentMismatch));
     }
     Some(Ok(()))
@@ -2182,6 +2202,18 @@ fn record_turn(
             maximum: max_bytes,
         });
     }
+    // The reported usage is the speaker's own claim about its own run, and
+    // the grant it spends is shared — so it is bounded like every other wire
+    // claim, before it can be added to anything. Overshooting what remains
+    // stays legal below the ceiling; an implausible report is refused whole.
+    if let Some(maximum) = conversation.policy.max_turn_tokens {
+        if submit.usage.tokens > maximum {
+            return Err(AgentConversationError::TurnUsageImplausible {
+                reported: submit.usage.tokens,
+                maximum,
+            });
+        }
+    }
     if let Some(limit) = conversation.budgets.tokens {
         let consumed = conversation.budgets.consumed.tokens;
         if consumed >= limit {
@@ -2202,7 +2234,7 @@ fn record_turn(
         round,
         turn,
         speaker,
-        digest_prefix: digest_prefix(&submit.body),
+        digest_prefix: digest_prefix(&submit.body, submit.direction.as_ref()),
         at: now,
     });
     conversation.messages.push_back(AgentConversationMessage {
@@ -2254,6 +2286,11 @@ fn record_turn(
 
     let participant = submit.participant.clone();
     let operation = operation_id.clone();
+    // The spend is attributed: the shared grant is drawn down by a named
+    // speaker's own claim, so the audit trail records who reported what
+    // rather than leaving an exhausted conversation with an anonymous
+    // total. Counts and coordinates only — never the body.
+    let reported = submit.usage.tokens;
     state.record_history(|sequence| {
         AgentConversationHistoryEntry::new(
             sequence,
@@ -2263,6 +2300,7 @@ fn record_turn(
         )
         .with_participant(participant)
         .with_coordinate(round, turn)
+        .with_detail(format!("tokens={reported}"))
     });
     if round_closed {
         let operation = operation_id.clone();
@@ -2817,6 +2855,14 @@ pub enum AgentConversationError {
         /// The effective ceiling.
         maximum: usize,
     },
+    /// The turn reports more token usage than the policy admits for one
+    /// turn.
+    TurnUsageImplausible {
+        /// The reported usage.
+        reported: u64,
+        /// The per-turn ceiling.
+        maximum: u64,
+    },
     /// A creation-fixed budget is exhausted; the turn is refused, nothing
     /// parks.
     BudgetExhausted(AgentBudgetExhaustion),
@@ -2883,6 +2929,7 @@ impl AgentConversationError {
             Self::RoundsExhausted { .. } => "conversation-rounds-exhausted",
             Self::TurnsExhausted { .. } => "conversation-turns-exhausted",
             Self::MessageTooLarge { .. } => "conversation-message-too-large",
+            Self::TurnUsageImplausible { .. } => "conversation-turn-usage-too-large",
             Self::BudgetExhausted(exhaustion) => exhaustion.code(),
             Self::EndNotPermitted => "conversation-end-not-permitted",
             Self::EndNotModerator { .. } => "conversation-end-not-moderator",
@@ -2972,6 +3019,10 @@ impl Display for AgentConversationError {
             Self::MessageTooLarge { bytes, maximum } => write!(
                 f,
                 "the turn body is {bytes} bytes; the ceiling is {maximum}"
+            ),
+            Self::TurnUsageImplausible { reported, maximum } => write!(
+                f,
+                "the turn reports {reported} tokens; one turn may report at most {maximum}"
             ),
             Self::BudgetExhausted(exhaustion) => Display::fmt(exhaustion, f),
             Self::EndNotPermitted => {

@@ -16,7 +16,7 @@ mod common;
 use common::{tenant, Fixture};
 use rakka_agent::testkit::{CrashPoint, DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    conversation_turn_body_digest, conversation_turn_operation_id, AgentBudgetConsumption,
+    conversation_turn_content_digest, conversation_turn_operation_id, AgentBudgetConsumption,
     AgentConversationCompletionRule, AgentConversationCreation, AgentConversationEntityCommand,
     AgentConversationId, AgentConversationMode, AgentConversationScope, AgentConversationStatus,
     AgentConversationTurnSubmit, AgentId, AgentModerationPolicy, AgentRevisionNumber, AgentTaskId,
@@ -46,7 +46,7 @@ fn submit(round: u64, turn: u32, participant: &str, body: &str) -> AgentConversa
             round,
             turn,
             &agent(participant),
-            &conversation_turn_body_digest(body),
+            &conversation_turn_content_digest(body, None),
         )
         .expect("the operation id derives"),
         submit: Box::new(AgentConversationTurnSubmit {

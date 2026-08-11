@@ -735,7 +735,7 @@ async fn team_operations_count_once_under_bounded_labels() {
 #[tokio::test]
 async fn moderation_turns_count_once_under_bounded_labels() {
     use rakka_agent::{
-        conversation_turn_body_digest, conversation_turn_operation_id, AgentBudgetConsumption,
+        conversation_turn_content_digest, conversation_turn_operation_id, AgentBudgetConsumption,
         AgentConversationCompletionRule, AgentConversationCreation, AgentConversationEntityCommand,
         AgentConversationId, AgentConversationMode, AgentConversationScope,
         AgentConversationTurnSubmit, AgentModerationPolicy, AgentRevisionNumber,
@@ -784,7 +784,7 @@ async fn moderation_turns_count_once_under_bounded_labels() {
                 0,
                 0,
                 speaker,
-                &conversation_turn_body_digest(body),
+                &conversation_turn_content_digest(body, None),
             )
             .expect("the operation id derives"),
             submit: Box::new(AgentConversationTurnSubmit {

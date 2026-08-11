@@ -284,6 +284,44 @@ impl Fixture {
             .expect("the conversation creates");
     }
 
+    /// The same world, moderator-directed: the mode whose turns carry the
+    /// wire's `designate` / `close-round` spellings.
+    async fn moderator_directed_world(&self) {
+        let mut store = AgentConversationEntityStore::new(
+            conversation_scope(),
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        );
+        let now = self.now();
+        store.recover(now).await.expect("the conversation recovers");
+        store
+            .apply(
+                AgentConversationEntityCommand::Create {
+                    operation_id: rakka_agent::conversation_create_operation_id(
+                        &tenant(),
+                        &AgentConversationId::new(CONVERSATION)
+                            .expect("the conversation id is valid"),
+                    )
+                    .expect("the operation id derives"),
+                    creation: Box::new(AgentConversationCreation {
+                        moderator: agent(MODERATOR),
+                        participants: vec![agent(MEMBER_A), agent(MEMBER_B)],
+                        mode: AgentConversationMode::ModeratorDirected,
+                        completion: AgentConversationCompletionRule::ModeratorDecides,
+                        policy: AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+                        task: AgentTaskId::new("moderated-task").expect("the task id is valid"),
+                        tokens: Some(500),
+                        max_wall_clock_millis: None,
+                        transcript_ref: None,
+                    }),
+                },
+                &self.router,
+                self.now(),
+            )
+            .await
+            .expect("the conversation creates");
+    }
+
     async fn conversation_snapshot(&self) -> rakka_agent::AgentConversationSnapshot {
         let mut store = AgentConversationEntityStore::new(
             conversation_scope(),
@@ -343,6 +381,19 @@ fn submit_cluster(participant: &str, round: u64, turn: u32, body: &str, tokens: 
         "body": body,
         "tokens-consumed": tokens,
     })
+}
+
+/// A moderator turn carrying one of the wire's two direction spellings.
+fn directed_cluster(body: &str, designate: Option<&str>, close_round: Option<bool>) -> Value {
+    let mut cluster = submit_cluster(MODERATOR, 0, 0, body, 0);
+    let object = cluster.as_object_mut().expect("the cluster is an object");
+    if let Some(designated) = designate {
+        object.insert("designate".to_string(), json!(designated));
+    }
+    if let Some(close) = close_round {
+        object.insert("close-round".to_string(), json!(close));
+    }
+    cluster.clone()
 }
 
 fn end_cluster(participant: &str, expected_round: u64, reason: &str) -> Value {
@@ -714,4 +765,101 @@ async fn a_plain_client_send_is_untouched_by_the_conversation_surface() {
         matches!(response, a2a::SendMessageResponse::Task(_)),
         "an ordinary send creates a task"
     );
+}
+
+/// The direction is part of the turn's identity, so the wire's two spellings
+/// must reach the entity intact: a mapping that dropped or swapped one would
+/// put a turn's operation id out of step with the decision it names.
+#[tokio::test]
+async fn the_wire_direction_spellings_map_and_bind_the_turn_identity() {
+    let fixture = Fixture::new();
+    fixture.moderator_directed_world().await;
+
+    // A payload carrying both spellings is a half-formed engagement refused
+    // whole, before anything durable happens.
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "both-directions",
+                directed_cluster("next", Some(MEMBER_A), Some(true)),
+            )),
+        )
+        .await
+        .expect_err("a turn that both designates and closes the round fails closed");
+    assert!(matches!(error, RakkaAgentA2AError::Unsupported { .. }));
+    assert!(
+        fixture.conversation_snapshot().await.turns.is_empty(),
+        "nothing durable happened"
+    );
+
+    // `designate` reaches the entity as the durable owner fact.
+    let response = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "designate",
+                directed_cluster("next", Some(MEMBER_A), None),
+            )),
+        )
+        .await
+        .expect("the designating turn is served");
+    let payload = response_payload(&response);
+    assert!(
+        payload.get("Applied").is_some(),
+        "the designating turn applies: {payload}"
+    );
+    let snapshot = fixture.conversation_snapshot().await;
+    assert_eq!(snapshot.designated, Some(agent(MEMBER_A)));
+    assert_eq!(snapshot.current_speaker, Some(agent(MEMBER_A)));
+
+    // The same words with the *other* spelling are a different decision, so
+    // they derive a different operation id and the ledger refuses them —
+    // rather than the wire absorbing them as a duplicate of the designation.
+    let response = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "close-instead",
+                directed_cluster("next", None, Some(true)),
+            )),
+        )
+        .await
+        .expect("the refusal is served as a decision");
+    let payload = response_payload(&response);
+    assert_eq!(
+        payload
+            .get("Rejected")
+            .and_then(|rejected| rejected.get("code"))
+            .and_then(Value::as_str),
+        Some("conversation-turn-content-mismatch"),
+        "the regenerated direction refuses loudly: {payload}"
+    );
+
+    // The designation the protocol recorded still stands.
+    let snapshot = fixture.conversation_snapshot().await;
+    assert_eq!(snapshot.designated, Some(agent(MEMBER_A)));
+    assert_eq!(snapshot.round, 0, "the refused close-round did not advance");
+
+    // And the identical redelivery under a fresh message id still converges.
+    let response = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(conversation_message(
+                "designate-again",
+                directed_cluster("next", Some(MEMBER_A), None),
+            )),
+        )
+        .await
+        .expect("the redelivery is served");
+    let payload = response_payload(&response);
+    assert!(
+        payload.get("Duplicate").is_some(),
+        "the redelivery converges: {payload}"
+    );
+    assert_eq!(fixture.conversation_snapshot().await.turns.len(), 1);
 }

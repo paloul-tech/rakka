@@ -14,7 +14,7 @@ mod common;
 use common::{tenant, Fixture};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
-    conversation_turn_body_digest, conversation_turn_operation_id, AgentBudgetConsumption,
+    conversation_turn_content_digest, conversation_turn_operation_id, AgentBudgetConsumption,
     AgentConversationCompletionRule, AgentConversationCreation, AgentConversationDirection,
     AgentConversationEntityCommand, AgentConversationEntityReply, AgentConversationId,
     AgentConversationMode, AgentConversationScope, AgentConversationStatus,
@@ -83,7 +83,7 @@ fn submit(
             round,
             turn,
             &agent(participant),
-            &conversation_turn_body_digest(body),
+            &conversation_turn_content_digest(body, direction.as_ref()),
         )
         .expect("the operation id derives"),
         submit: Box::new(AgentConversationTurnSubmit {
@@ -353,6 +353,238 @@ async fn a_past_window_replay_echoes_the_recorded_turn_even_after_the_end() {
         .await
         .expect_err("a foreign speaker's claim refuses");
     assert_eq!(superseded.code(), "conversation-turn-superseded");
+}
+
+/// A history sink that is simply down: every append fails as an unavailable
+/// backend, distinguishably from the entity's own outbox refusal.
+#[derive(Clone, Default)]
+struct UnavailableHistory;
+
+impl UnavailableHistory {
+    fn unavailable() -> rakka_agent::AgentConversationError {
+        rakka_agent::AgentConversationError::Choreography(Box::new(
+            rakka_agent::AgentChoreographyError::Persistence(
+                rakka_persistence::DurableError::Store {
+                    backend: "unavailable",
+                    message: "the history sink is down".to_string(),
+                },
+            ),
+        ))
+    }
+}
+
+impl rakka_agent::AgentConversationHistoryStore for UnavailableHistory {
+    fn backend_name(&self) -> &'static str {
+        "unavailable"
+    }
+
+    fn append<'a>(
+        &'a self,
+        _scope: &'a AgentConversationScope,
+        _entry: &'a rakka_agent::AgentConversationHistoryEntry,
+    ) -> rakka_agent::AgentConversationHistoryFuture<'a, ()> {
+        Box::pin(async move { Err(Self::unavailable()) })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _scope: &'a AgentConversationScope,
+        _cursor: rakka_agent::AgentConversationHistoryCursor,
+    ) -> rakka_agent::AgentConversationHistoryFuture<'a, rakka_agent::AgentConversationHistoryPage>
+    {
+        Box::pin(async move { Err(Self::unavailable()) })
+    }
+}
+
+#[tokio::test]
+async fn a_redelivered_turn_converges_while_the_history_sink_is_down() {
+    // History is observability; the durable turn ledger is the truth. A
+    // redelivery whose coordinate is already in the ledger writes nothing at
+    // all, so it must converge even while the sink is unavailable — the
+    // retrying caller has no other way to learn its turn landed.
+    let roster = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"];
+    let fx = created(
+        AgentConversationMode::RoundRobin,
+        AgentConversationCompletionRule::ModeratorDecides,
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
+            .with_max_rounds(16)
+            .with_max_turns_per_round(8)
+            .with_max_messages(1)
+            .with_max_message_bytes(64),
+        &roster,
+    )
+    .await;
+
+    // Nine rounds of eight is 72 operations: enough to evict the very first
+    // turn from the bounded 64-entry log, so its redelivery is answered by
+    // the dense ledger rather than the operation log.
+    let body = |round: u64, speaker: &str| format!("r{round} {speaker}");
+    for round in 0..9u64 {
+        for (turn, speaker) in roster.into_iter().enumerate() {
+            fx.apply_conversation_command_at(
+                &conversation_scope(),
+                submit(round, turn as u32, speaker, &body(round, speaker), None),
+            )
+            .await
+            .expect("the turn records");
+        }
+    }
+
+    // The same durable conversation, now served by an entity whose history
+    // sink is down. Each committed turn owes entries the flush cannot
+    // deliver, so the pending outbox fills.
+    let mut degraded = rakka_agent::AgentConversationEntityStore::new(
+        conversation_scope(),
+        fx.conversations.clone(),
+        UnavailableHistory,
+    );
+    for round in 9..16u64 {
+        for (turn, speaker) in roster.into_iter().enumerate() {
+            // Early attempts commit and fail only at the flush; once the
+            // outbox has no headroom the guard refuses before the commit.
+            let command = submit(round, turn as u32, speaker, &body(round, speaker), None);
+            let _ = degraded.apply(command, &fx.router, fx.now()).await;
+        }
+    }
+
+    // The contrast that proves the ordering, at this exact moment on this
+    // exact store. A *new* turn at the cursor the protocol actually holds
+    // is refused, and records nothing — the outbox guard turned it away
+    // before any commit.
+    let parked = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    let speaker = parked
+        .current_speaker
+        .clone()
+        .expect("the parked conversation still names its next speaker");
+    let fresh = degraded
+        .apply(
+            submit(
+                parked.round,
+                parked.turn_in_round,
+                speaker.as_str(),
+                "a new decision",
+                None,
+            ),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect_err("a new turn refuses while the sink is down");
+    assert!(
+        !fresh.is_domain_refusal() || fresh.code() == "conversation-history-backlog",
+        "the refusal is the history outbox, not a protocol decision: {fresh}"
+    );
+    let after = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(
+        after.turns.len(),
+        parked.turns.len(),
+        "the refused turn committed nothing"
+    );
+
+    // …while the redelivery of a turn the ledger already holds converges,
+    // because it writes nothing and owes the sink nothing.
+    let replay = degraded
+        .apply(
+            submit(0, 0, "p1", &body(0, "p1"), None),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect("the past-window redelivery converges through the outage");
+    assert!(matches!(
+        replay,
+        AgentConversationEntityReply::Duplicate { .. }
+    ));
+
+    // And a regenerated submission still refuses loudly through the outage —
+    // the echo answers honestly, it does not wave everything through.
+    let regenerated = degraded
+        .apply(
+            submit(0, 0, "p1", "a rewritten opening", None),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect_err("a regenerated submission refuses through the outage too");
+    assert_eq!(regenerated.code(), "conversation-turn-content-mismatch");
+}
+
+#[tokio::test]
+async fn a_turn_regenerated_with_a_different_direction_refuses_at_both_layers() {
+    // The direction is content: the same words that designate a speaker and
+    // the same words that close the round are different decisions, and a
+    // durable redelivery must never absorb one as the other.
+    let fx = created(
+        AgentConversationMode::ModeratorDirected,
+        AgentConversationCompletionRule::ModeratorDecides,
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).with_max_turns_per_round(4),
+        &["p1", "p2"],
+    )
+    .await;
+
+    let designate = || Some(AgentConversationDirection::Designate(agent("p1")));
+    let close = || Some(AgentConversationDirection::CloseRound);
+
+    fx.apply_conversation_command_at(
+        &conversation_scope(),
+        submit(0, 0, MODERATOR, "next", designate()),
+    )
+    .await
+    .expect("the designating turn records");
+
+    // In-window: the two directions derive different operation ids, so the
+    // regenerated turn is not answered from the operation log at all — it
+    // reaches the transition and the ledger refuses it.
+    let regenerated = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit(0, 0, MODERATOR, "next", close()),
+        )
+        .await
+        .expect_err("the same words closing the round is a different decision");
+    assert_eq!(regenerated.code(), "conversation-turn-content-mismatch");
+
+    // The identical redelivery still converges.
+    let replay = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit(0, 0, MODERATOR, "next", designate()),
+        )
+        .await
+        .expect("the identical redelivery is answered");
+    assert!(matches!(
+        replay,
+        AgentConversationEntityReply::Duplicate { .. }
+    ));
+
+    // And the designation the protocol actually recorded still stands: the
+    // refused close-round changed nothing.
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(snapshot.designated, Some(agent("p1")));
+    assert_eq!(snapshot.round, 0, "the refused close-round did not advance");
+    assert_eq!(snapshot.turns.len(), 1);
+
+    // Past the operation-log window the dense ledger is the echo, and it
+    // fences the direction there too — the digest it stores covers the
+    // whole decision, not just the words.
+    let designated_again = Some(AgentConversationDirection::Designate(agent("p2")));
+    let superseding = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit(0, 0, MODERATOR, "next", designated_again),
+        )
+        .await
+        .expect_err("a third direction at the recorded coordinate refuses");
+    assert_eq!(superseding.code(), "conversation-turn-content-mismatch");
 }
 
 #[tokio::test]
