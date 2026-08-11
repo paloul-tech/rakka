@@ -53,6 +53,16 @@ pub const CURRENT_AGENT_TEAM_STATE_SCHEMA_VERSION: StateSchemaVersion = StateSch
 pub const CURRENT_AGENT_TEAM_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
     StateSchemaVersion::new(1);
 
+/// Current schema version of the durable
+/// [`crate::conversation::AgentConversationState`].
+pub const CURRENT_AGENT_CONVERSATION_STATE_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
+/// Current schema version of a persisted
+/// [`crate::conversation::AgentConversationHistoryEntry`].
+pub const CURRENT_AGENT_CONVERSATION_HISTORY_SCHEMA_VERSION: StateSchemaVersion =
+    StateSchemaVersion::new(1);
+
 /// Current schema version of a persisted [`crate::loop_runtime::AgentLoopState`].
 ///
 /// The loop state versions separately from the run state that carries it,
@@ -271,11 +281,16 @@ pub enum AgentRecordKind {
     TeamState,
     /// One append-only team history entry.
     TeamHistoryEntry,
+    /// Durable state of the sharded moderated-conversation entity, whose
+    /// ordered turn protocol it holds.
+    ConversationState,
+    /// One append-only conversation history entry.
+    ConversationHistoryEntry,
 }
 
 impl AgentRecordKind {
     /// Every record kind this binary versions.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 29] = [
         Self::EntityState,
         Self::DefinitionRevision,
         Self::SettingsRevision,
@@ -303,6 +318,8 @@ impl AgentRecordKind {
         Self::GoalEvaluation,
         Self::TeamState,
         Self::TeamHistoryEntry,
+        Self::ConversationState,
+        Self::ConversationHistoryEntry,
     ];
 
     /// Stable kebab-case label for errors, logs, and metrics.
@@ -336,6 +353,8 @@ impl AgentRecordKind {
             Self::GoalEvaluation => "agent-goal-evaluation",
             Self::TeamState => "agent-team-state",
             Self::TeamHistoryEntry => "agent-team-history-entry",
+            Self::ConversationState => "agent-conversation-state",
+            Self::ConversationHistoryEntry => "agent-conversation-history-entry",
         }
     }
 
@@ -370,6 +389,8 @@ impl AgentRecordKind {
             Self::GoalEvaluation => CURRENT_AGENT_GOAL_EVALUATION_SCHEMA_VERSION,
             Self::TeamState => CURRENT_AGENT_TEAM_STATE_SCHEMA_VERSION,
             Self::TeamHistoryEntry => CURRENT_AGENT_TEAM_HISTORY_SCHEMA_VERSION,
+            Self::ConversationState => CURRENT_AGENT_CONVERSATION_STATE_SCHEMA_VERSION,
+            Self::ConversationHistoryEntry => CURRENT_AGENT_CONVERSATION_HISTORY_SCHEMA_VERSION,
         }
     }
 
@@ -402,6 +423,8 @@ impl AgentRecordKind {
             Self::GoalEvaluation => 24,
             Self::TeamState => 25,
             Self::TeamHistoryEntry => 26,
+            Self::ConversationState => 27,
+            Self::ConversationHistoryEntry => 28,
         }
     }
 }

@@ -4,7 +4,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use rakka_agent::{
-    AgentEntityError, AgentIdentityError, AgentRunError, AgentTaskError, AgentTeamError,
+    AgentConversationError, AgentEntityError, AgentIdentityError, AgentRunError, AgentTaskError,
+    AgentTeamError,
 };
 
 use crate::mapping::A2AMappingError;
@@ -31,6 +32,8 @@ pub enum RakkaAgentA2AError {
     Entity(AgentEntityError),
     /// The team entity refused or failed the command.
     Team(AgentTeamError),
+    /// The conversation entity refused or failed the command.
+    Conversation(AgentConversationError),
     /// Reading run state for the projection failed.
     Run(AgentRunError),
     /// The public projection read model failed.
@@ -76,6 +79,7 @@ impl RakkaAgentA2AError {
             Self::Task(error) => error.code(),
             Self::Entity(error) => error.code(),
             Self::Team(error) => error.code(),
+            Self::Conversation(error) => error.code(),
             Self::Run(error) => error.code(),
             Self::Projection(_) => "projection",
             Self::Refused { .. } => "refused",
@@ -95,6 +99,7 @@ impl Display for RakkaAgentA2AError {
             Self::Task(error) => Display::fmt(error, f),
             Self::Entity(error) => Display::fmt(error, f),
             Self::Team(error) => Display::fmt(error, f),
+            Self::Conversation(error) => Display::fmt(error, f),
             Self::Run(error) => Display::fmt(error, f),
             Self::Projection(error) => Display::fmt(error, f),
             Self::Refused { code, message } => write!(f, "refused ({code}): {message}"),
@@ -122,6 +127,7 @@ impl Error for RakkaAgentA2AError {
             Self::Task(error) => Some(error),
             Self::Entity(error) => Some(error),
             Self::Team(error) => Some(error),
+            Self::Conversation(error) => Some(error),
             Self::Run(error) => Some(error),
             Self::Projection(error) => Some(error),
             _ => None,
@@ -144,6 +150,12 @@ impl From<AgentIdentityError> for RakkaAgentA2AError {
 impl From<AgentTeamError> for RakkaAgentA2AError {
     fn from(error: AgentTeamError) -> Self {
         Self::Team(error)
+    }
+}
+
+impl From<AgentConversationError> for RakkaAgentA2AError {
+    fn from(error: AgentConversationError) -> Self {
+        Self::Conversation(error)
     }
 }
 

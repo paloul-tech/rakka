@@ -62,6 +62,7 @@ pub type WakeStore = CrashingStateStore<AgentWakeTimerStoreState>;
 
 /// The crash-armable team store every fixture wires.
 pub type TeamStore = CrashingStateStore<rakka_agent::AgentTeamState>;
+pub type ConversationStore = CrashingStateStore<rakka_agent::AgentConversationState>;
 /// The wake delivery the scanner injects admission commands through.
 pub type WakeDelivery = InProcessWakeDelivery<TaskStore, AgentStore, InMemoryAgentTaskHistoryStore>;
 /// The scanner the wake tests drive.
@@ -747,6 +748,11 @@ pub struct Fixture<
     pub teams: TeamStore,
     /// The team history sink the team entities flush to.
     pub team_history: rakka_agent::InMemoryAgentTeamHistoryStore,
+    /// The conversation entity's durable store, crash-armable like every
+    /// other.
+    pub conversations: ConversationStore,
+    /// The conversation history sink the conversation entities flush to.
+    pub conversation_history: rakka_agent::InMemoryAgentConversationHistoryStore,
     pub effects: S,
     pub policies: AgentEffectPolicies,
     pub router: AgentExchangeRouter,
@@ -756,6 +762,12 @@ pub struct Fixture<
     pub team_transport: rakka_agent::testkit::InProcessTeamEntityTransport<
         TeamStore,
         rakka_agent::InMemoryAgentTeamHistoryStore,
+    >,
+    /// The transport the router delivers conversation-bound exchanges
+    /// through.
+    pub conversation_transport: rakka_agent::testkit::InProcessConversationEntityTransport<
+        ConversationStore,
+        rakka_agent::InMemoryAgentConversationHistoryStore,
     >,
     /// The transport the router delivers run-bound exchanges through. Held so a
     /// test's memory wiring reaches the run entities the transport builds — the
@@ -810,6 +822,8 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         let history = InMemoryAgentTaskHistoryStore::new();
         let teams = TeamStore::new();
         let team_history = rakka_agent::InMemoryAgentTeamHistoryStore::new();
+        let conversations = ConversationStore::new();
+        let conversation_history = rakka_agent::InMemoryAgentConversationHistoryStore::new();
 
         // The task and the run exchange with each other, so each transport needs
         // the router the other lives in. The deferred router is that late binding
@@ -835,10 +849,21 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             deferred.as_router(),
             clock.clone(),
         );
+        let conversation_transport =
+            rakka_agent::testkit::InProcessConversationEntityTransport::new(
+                conversations.clone(),
+                conversation_history.clone(),
+                deferred.as_router(),
+                clock.clone(),
+            );
         let router = AgentExchangeRouter::new()
             .with_route(AgentEntityClass::Task, Arc::new(task_transport.clone()))
             .with_route(AgentEntityClass::Run, Arc::new(run_transport.clone()))
-            .with_route(AgentEntityClass::Team, Arc::new(team_transport.clone()));
+            .with_route(AgentEntityClass::Team, Arc::new(team_transport.clone()))
+            .with_route(
+                AgentEntityClass::Conversation,
+                Arc::new(conversation_transport.clone()),
+            );
         deferred.install(router.clone());
         let rewake_parker: std::sync::Arc<dyn rakka_agent::AgentWakeRewakeParker> =
             std::sync::Arc::new(rakka_agent::SharedWakeTimerParker::new(wakes.clone()));
@@ -861,11 +886,14 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
             history,
             teams,
             team_history,
+            conversations,
+            conversation_history,
             effects,
             policies,
             router,
             task_transport,
             team_transport,
+            conversation_transport,
             run_transport,
             dispatcher,
             clock,
@@ -1296,6 +1324,104 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         team.snapshot().ok().flatten()
     }
 
+    /// Applies one command to a conversation entity at an explicit scope,
+    /// rebuilding the entity from durable state — every call is already a
+    /// restart.
+    pub async fn apply_conversation_command_at(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+        command: rakka_agent::AgentConversationEntityCommand,
+    ) -> Result<rakka_agent::AgentConversationEntityReply, rakka_agent::AgentConversationError>
+    {
+        let mut conversation = rakka_agent::AgentConversationEntityStore::new(
+            scope.clone(),
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        );
+        if let Some(metrics) = &self.metrics {
+            conversation = conversation.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        conversation.recover(now).await?;
+        conversation.apply(command, &self.router, self.now()).await
+    }
+
+    /// Settles one conversation entity at an explicit scope, the way a
+    /// recovery sweep would: expiry observation, history flush, and the
+    /// courier.
+    pub async fn settle_conversation_at(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Result<rakka_agent::AgentConversationProgress, String> {
+        let mut conversation = rakka_agent::AgentConversationEntityStore::new(
+            scope.clone(),
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        );
+        if let Some(metrics) = &self.metrics {
+            conversation = conversation.with_metrics(metrics.clone());
+        }
+        let now = self.now();
+        conversation
+            .recover(now)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        conversation
+            .settle_side_effects(&self.router, self.now())
+            .await
+            .map_err(|error| error.code().to_string())
+    }
+
+    /// The bounded projection of one conversation entity, rebuilt from
+    /// durable state.
+    pub async fn conversation_snapshot_at(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<rakka_agent::AgentConversationSnapshot> {
+        let mut conversation = rakka_agent::AgentConversationEntityStore::new(
+            scope.clone(),
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        );
+        let now = self.now();
+        conversation.recover(now).await.ok()?;
+        conversation.snapshot().ok().flatten()
+    }
+
+    /// The serialized size of one conversation's persisted state — the whole
+    /// record the compare-and-set writes, which is what the state bound
+    /// governs.
+    pub async fn conversation_state_bytes(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<usize> {
+        use rakka_persistence::DurableStateStore;
+
+        let record = self
+            .conversations
+            .load(&scope.persistence_id())
+            .await
+            .ok()??;
+        serde_json::to_vec(&record.state)
+            .ok()
+            .map(|bytes| bytes.len())
+    }
+
+    /// How many history entries one conversation still owes its sink.
+    pub async fn conversation_pending_history(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> Option<usize> {
+        use rakka_persistence::DurableStateStore;
+
+        let record = self
+            .conversations
+            .load(&scope.persistence_id())
+            .await
+            .ok()??;
+        Some(record.state.pending_history().len())
+    }
+
     /// Drives the root controller, one epoch task, and that epoch's run until
     /// the epoch run terminates and every owed exchange settles — the
     /// recovery sweep of the continuous world. Every entity is rebuilt from
@@ -1484,6 +1610,11 @@ pub struct ShardedWorld {
     pub teams: TeamStore,
     /// The team history sink the sharded team entities flush to.
     pub team_history: rakka_agent::InMemoryAgentTeamHistoryStore,
+    /// Durable conversation-entity store.
+    pub conversations: ConversationStore,
+    /// The conversation history sink the sharded conversation entities
+    /// flush to.
+    pub conversation_history: rakka_agent::InMemoryAgentConversationHistoryStore,
     /// The scripted model/tool answers a test drives ready effects with.
     pub dispatcher: ScriptedDispatcher,
     /// The agent entity type's sharding registration.
@@ -1494,6 +1625,8 @@ pub struct ShardedWorld {
     pub run_registration: rakka_agent::AgentRunEntityRegistration,
     /// The team entity type's sharding registration.
     pub team_registration: rakka_agent::AgentTeamEntityRegistration,
+    /// The conversation entity type's sharding registration.
+    pub conversation_registration: rakka_agent::AgentConversationEntityRegistration,
 }
 
 impl ShardedWorld {
@@ -1512,11 +1645,14 @@ impl ShardedWorld {
     ) -> Self {
         use rakka_agent::testkit::LocalShardedExchangeRoute;
         use rakka_agent::{
-            agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
-            agent_team_entity_type_key, init_agent_entity_sharding, init_agent_run_entity_sharding,
-            init_agent_task_entity_sharding, init_agent_team_entity_sharding,
-            AgentEntityShardingSettings, AgentRunEntityMessage, AgentRunEntityShardingSettings,
-            AgentTaskEntityMessage, AgentTaskEntityShardingSettings, AgentTeamEntityMessage,
+            agent_conversation_entity_type_key, agent_entity_type_key, agent_run_entity_type_key,
+            agent_task_entity_type_key, agent_team_entity_type_key,
+            init_agent_conversation_entity_sharding, init_agent_entity_sharding,
+            init_agent_run_entity_sharding, init_agent_task_entity_sharding,
+            init_agent_team_entity_sharding, AgentConversationEntityMessage,
+            AgentConversationEntityShardingSettings, AgentEntityShardingSettings,
+            AgentRunEntityMessage, AgentRunEntityShardingSettings, AgentTaskEntityMessage,
+            AgentTaskEntityShardingSettings, AgentTeamEntityMessage,
             AgentTeamEntityShardingSettings,
         };
 
@@ -1527,6 +1663,8 @@ impl ShardedWorld {
         let runs = RunStore::new();
         let teams = TeamStore::new();
         let team_history = rakka_agent::InMemoryAgentTeamHistoryStore::new();
+        let conversations = ConversationStore::new();
+        let conversation_history = rakka_agent::InMemoryAgentConversationHistoryStore::new();
         let history = InMemoryAgentTaskHistoryStore::new();
         let effects = InMemoryAgentRunEffectSink::new();
         let clock = Arc::new(AtomicU64::new(1));
@@ -1585,6 +1723,21 @@ impl ShardedWorld {
                 }),
         )
         .expect("team entity sharding initializes");
+        let conversation_registration = init_agent_conversation_entity_sharding(
+            &sharding,
+            conversations.clone(),
+            conversation_history.clone(),
+            deferred.as_router(),
+            AgentConversationEntityShardingSettings::new(agent_conversation_entity_type_key())
+                .with_idle_passivation(idle)
+                .with_clock({
+                    let clock = clock.clone();
+                    Arc::new(move || {
+                        AgentTimestampMillis::new(clock.fetch_add(1, Ordering::SeqCst))
+                    })
+                }),
+        )
+        .expect("conversation entity sharding initializes");
 
         let router = AgentExchangeRouter::new()
             .with_route(
@@ -1622,6 +1775,18 @@ impl ShardedWorld {
                         reply_to,
                     },
                 )),
+            )
+            .with_route(
+                AgentEntityClass::Conversation,
+                Arc::new(LocalShardedExchangeRoute::new(
+                    sharding.clone(),
+                    conversation_registration.key().clone(),
+                    Self::ASK_TIMEOUT,
+                    |envelope, reply_to| AgentConversationEntityMessage::Exchange {
+                        envelope: Box::new(envelope),
+                        reply_to,
+                    },
+                )),
             );
         deferred.install(router);
 
@@ -1633,11 +1798,14 @@ impl ShardedWorld {
             runs,
             teams,
             team_history,
+            conversations,
+            conversation_history,
             dispatcher,
             agent_registration,
             task_registration,
             run_registration,
             team_registration,
+            conversation_registration,
         }
     }
 
@@ -1659,6 +1827,17 @@ impl ShardedWorld {
     /// The sharded ref for one team scope.
     pub fn team_ref(&self, scope: &rakka_agent::AgentTeamScope) -> rakka_agent::AgentTeamEntityRef {
         rakka_agent::registered_agent_team_entity_ref(&self.team_registration, scope)
+    }
+
+    /// The sharded ref for one conversation scope.
+    pub fn conversation_ref(
+        &self,
+        scope: &rakka_agent::AgentConversationScope,
+    ) -> rakka_agent::AgentConversationEntityRef {
+        rakka_agent::registered_agent_conversation_entity_ref(
+            &self.conversation_registration,
+            scope,
+        )
     }
 
     /// How many entity actors of any class are resident on this node.
@@ -1683,6 +1862,11 @@ impl ShardedWorld {
             .registration_state(self.team_registration.key())
             .expect("the team registration exists")
             .local_entity_count();
-        agent + task + run + team
+        let conversation = self
+            .sharding
+            .registration_state(self.conversation_registration.key())
+            .expect("the conversation registration exists")
+            .local_entity_count();
+        agent + task + run + team + conversation
     }
 }

@@ -3540,6 +3540,108 @@ Spec: [8.11](spec.md#811-moderation).
 Done when: scenario 43 passes (turn recovery without duplication across
 passivation/shard movement).
 
+**Amended as implemented (2026-08-10).** Landed as specified, with the
+in-slice decisions resolved as follows (scope decisions user-approved):
+
+- **Turn ingress is A2A/entity commands only** (user-approved, the 5.2
+  posture): no model-visible moderation tool this slice — no
+  interception-door arm, no conversation effect kind, no executor port.
+  `AgentModerationPolicy` filled out with the clamped serde-defaulted
+  ceilings (`max_rounds` 4/16, `max_turns_per_round` 8/16, `max_messages`
+  8/16, `max_message_bytes` 1024, `moderator_may_end_early`) and the
+  shaped-but-dormant `tool: Option<AgentToolId>` hook, so the 5.1
+  revision-only shell still decodes. **Budgets reuse the existing
+  vocabulary with no new conserved dimension** (user-approved):
+  the creation carries a token grant and a wall-clock horizon whose
+  deadline fixes at creation (the run-budget idiom), consumption is
+  `AgentBudgetConsumption` recorded even when a turn overshoots (the
+  spend already happened in the speaker's run), and exhaustion refuses
+  the next turn under the dimension's own code — never parking, never a
+  task escrow child. **The task binding is required and observational**
+  (user-approved): creation names the governing `AgentTaskId`, the
+  moderator is that task's assignee, and the early-end *result* rides
+  the existing run-side evaluation and result-proposal doors unchanged —
+  zero new door machinery, the assignee sender fences already enforce
+  it. **The transcript is the bounded in-state ring plus an
+  identity-only artifact reference** (user-approved): drop-oldest with
+  visible `messages_dropped`, never a deduplication surface, the
+  reference recovered verbatim per scenario 43.
+- **Zero new exchange kinds and no task-side machinery**: unlike the
+  team claim, a conversation drives nothing on the task, so
+  `AgentExchangeKind::ALL` stays at fourteen and `task.rs` is untouched;
+  the conversation (`conversation.rs`, `RakkaAgentConversation`, the
+  fifth sharded entity under `AgentEntityClass::Conversation`) embeds
+  the exchange host with a refuse-all participant and an empty journal
+  so 5.5's terminal-notification exchange is a code change, not a schema
+  migration. Task-side conversation provenance and the projection echo
+  ride 5.5 with it.
+- **Turn identity carries the body digest**: the operation id derives
+  over (tenant, conversation, round, turn, participant, body digest)
+  under the reserved `ConversationTurn` kind — a durable redelivery
+  re-derives the same operation and converges; a *regenerated*
+  same-coordinate submission derives a new one that the dense turn
+  ledger refuses loudly (`conversation-turn-content-mismatch`) instead
+  of silently absorbing. The ledger is the durable echo past the bounded
+  operation-log window, checked before every guard including the
+  terminal one (the `record_handoff` idiom); a creation-time worst-case
+  arithmetic (`conversation-policy-too-large`) keeps it affordable so a
+  mid-round state-bounds refusal cannot wedge the protocol. The new
+  `AgentOperationKind::ConversationOperation` covers create/end/expiry,
+  the end round-qualified (the release-epoch hazard); ingress derives
+  turn operations from these coordinates, never the wire discriminator.
+- **Two modes, owner derived not stored**: round-robin (owner =
+  `participants[turn]`) and moderator-directed (moderator owns even
+  turns; each carries `Designate` or `CloseRound`; `designated` is the
+  one stored owner fact) — the derived-owner and stored-owner recovery
+  shapes scenario 43 must prove. `AllRounds` completion ends the
+  conversation in the compare-and-set that finishes the final round
+  (completion beats exhaustion); `ModeratorDecides` parks the cursor at
+  the ceiling with the status active. One deliberate deviation from the
+  planned ladder: a passed deadline refuses `conversation-expired`
+  before *and* after the durable flip (the team `require_active` rule —
+  the refusal code must not depend on whether the sweep ran) rather
+  than a separate pre-flip `wall-clock` code.
+- **Wire**: the conversation cluster is the fourth shape under
+  `io.rakka.collaboration`, discriminated by its `conversation` field
+  checked before `team` and `handoff`; verbs are submit-turn/end —
+  create is entity-command-only trusted wiring. A conversation send must
+  not name `message.task_id` (`conversation-send-names-task`); the end
+  requires an authenticated principal. The command authorizes under its
+  own `A2AOperation::ConversationCommand` with the typed
+  `A2AConversationClaim` bound in, answers with an immediate message,
+  returns domain refusals as structured `Rejected` payloads, and the
+  service gained conversation store generics (eight, spelled once via
+  the new `SharedRakkaAgentA2AService` alias); the
+  `AgentConversationHistoryStore` PostgreSQL backend is owed, the team
+  precedent.
+- **Audit + metrics**: a parallel `AgentConversationHistoryStore`
+  (idempotent slot-keyed appends; identities, coordinates, and codes
+  only), five conversation history kinds
+  (`conversation-created/turn-recorded/round-advanced/ended/expired`),
+  and `rakka.agent.moderation.turns` {operation, outcome} counted once
+  per durable decision at the entity boundary — duplicates and ledger
+  echoes count nothing; both keys were already in the closed metric
+  vocabulary, so the guidance table's `mode` label is owed with the
+  model-visible tool, as are the otel moderation span rows.
+- Proof roster: `tests/conversation_protocol.rs` (9, lifecycle +
+  budgets + expiry + the golden-vector operation-id pin),
+  `tests/conversation_turns.rs` (7, ownership/ordering/dedup incl. the
+  seventy-turn past-window ledger echo converging after the end),
+  `tests/conversation_recovery.rs` (2, self-covering crash sweeps over
+  every conversation-store write of a full round), and
+  `tests/conversation_passivation.rs` (3, real sharded entities:
+  scenario 43's five nouns recovered at zero residency without
+  duplicating a turn, the stored designation surviving, idle
+  auto-passivation), the moderation-turns metric assertion, and
+  rakka-a2a's `tests/conversation_surface.rs` (4, scenario 43's wire
+  half + fail-closed matrix + per-operation authorization). Owed
+  onward: 5.5's replayable turn events, the conversation-terminal →
+  task notification, task-side conversation provenance + projection
+  echo, goal/collaboration-view conversation dimensions, the moderation
+  otel rows, the Postgres conversation-history backend, and the
+  model-visible moderation tool door (+ its reserved
+  `AgentDecisionKind` label and `mode` metric label).
+
 ### Slice 5.4 — Human-owned tasks
 
 Spec: [8.12](spec.md#812-human-owned-tasks),

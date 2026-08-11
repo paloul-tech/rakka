@@ -19,14 +19,16 @@ use a2a::{CancelTaskRequest, Message, SendMessageRequest, Task};
 use a2a_server::ServiceParams;
 use rakka_agent::AgentExchangeRouter;
 use rakka_agent::{
-    load_agent_run_state, AgentEntityCommand, AgentEntityReply, AgentEntityState, AgentEntityStore,
-    AgentId, AgentOperationId, AgentOperationKind, AgentRunScope, AgentRunState, AgentRunStatus,
-    AgentSchemaPolicy, AgentScope, AgentTaskEntityCommand, AgentTaskEntityReply,
-    AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskId, AgentTaskScope, AgentTaskSnapshot,
-    AgentTaskState, AgentTeamEntityReply, AgentTeamEntityStore, AgentTeamHistoryStore,
-    AgentTeamState, TenantId,
+    load_agent_run_state, AgentConversationEntityReply, AgentConversationEntityStore,
+    AgentConversationHistoryStore, AgentConversationState, AgentEntityCommand, AgentEntityReply,
+    AgentEntityState, AgentEntityStore, AgentId, AgentOperationId, AgentOperationKind,
+    AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaPolicy, AgentScope,
+    AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskEntityStore, AgentTaskHistoryStore,
+    AgentTaskId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTeamEntityReply,
+    AgentTeamEntityStore, AgentTeamHistoryStore, AgentTeamState, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
 use rakka_persistence::DurableStateStore;
 
 use crate::auth::{A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, A2AOperation};
@@ -39,9 +41,9 @@ use crate::projection::A2ATaskProjectionStore;
 use super::catalog::A2AAgentCatalog;
 use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
-    agent_task_cancel_command, agent_task_create_command, agent_task_handoff_command,
-    agent_task_input, agent_team_command, normalize_agent_cancel, normalize_agent_send,
-    resolve_agent_target, resolve_handoff_target, NormalizedAgentCommand,
+    agent_conversation_command, agent_task_cancel_command, agent_task_create_command,
+    agent_task_handoff_command, agent_task_input, agent_team_command, normalize_agent_cancel,
+    normalize_agent_send, resolve_agent_target, resolve_handoff_target, NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -49,6 +51,33 @@ use super::management::{
     META_AUDIT_REF,
 };
 use super::sync::{project_agent_send, sync_agent_status};
+
+/// A shared handle to one [`RakkaAgentA2AService`], spelled once.
+///
+/// The store-generic parameter list is wide by construction — one durable
+/// store per entity family the service drives — so the executors and
+/// transports that wrap a service name it through this alias.
+pub type SharedRakkaAgentA2AService<
+    Tasks,
+    Agents,
+    History,
+    Runs,
+    Teams,
+    TeamHistory,
+    Conversations,
+    ConversationHistory,
+> = Arc<
+    RakkaAgentA2AService<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >,
+>;
 
 /// Time source for durable acceptance timestamps.
 ///
@@ -74,14 +103,24 @@ impl A2AAgentClock for SystemA2AAgentClock {
 /// Generic over the durable stores exactly like the entity facades it
 /// drives; every store is cheap-clone by the [`DurableStateStore`] contract,
 /// so each request materializes its own entity facade over shared state.
-pub struct RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>
-where
+pub struct RakkaAgentA2AService<
+    Tasks,
+    Agents,
+    History,
+    Runs,
+    Teams,
+    TeamHistory,
+    Conversations,
+    ConversationHistory,
+> where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<AgentTeamState>,
     TeamHistory: AgentTeamHistoryStore + Clone,
+    Conversations: DurableStateStore<AgentConversationState>,
+    ConversationHistory: AgentConversationHistoryStore + Clone,
 {
     tasks: Tasks,
     agents: Agents,
@@ -89,6 +128,8 @@ where
     runs: Runs,
     teams: Teams,
     team_history: TeamHistory,
+    conversations: Conversations,
+    conversation_history: ConversationHistory,
     router: AgentExchangeRouter,
     catalog: Arc<dyn A2AAgentCatalog>,
     projections: Arc<dyn A2ATaskProjectionStore>,
@@ -96,10 +137,20 @@ where
     authorizer: Arc<dyn A2AAuthorizer>,
     clock: Arc<dyn A2AAgentClock>,
     default_tenant: Option<String>,
+    metrics: Arc<dyn MetricsRecorder>,
 }
 
-impl<Tasks, Agents, History, Runs, Teams, TeamHistory>
-    RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    RakkaAgentA2AService<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
@@ -107,6 +158,8 @@ where
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<AgentTeamState>,
     TeamHistory: AgentTeamHistoryStore + Clone,
+    Conversations: DurableStateStore<AgentConversationState>,
+    ConversationHistory: AgentConversationHistoryStore + Clone,
 {
     /// Creates a service over the given durable stores and policy seams.
     #[expect(
@@ -120,6 +173,8 @@ where
         runs: Runs,
         teams: Teams,
         team_history: TeamHistory,
+        conversations: Conversations,
+        conversation_history: ConversationHistory,
         router: AgentExchangeRouter,
         catalog: Arc<dyn A2AAgentCatalog>,
         projections: Arc<dyn A2ATaskProjectionStore>,
@@ -133,6 +188,8 @@ where
             runs,
             teams,
             team_history,
+            conversations,
+            conversation_history,
             router,
             catalog,
             projections,
@@ -140,7 +197,21 @@ where
             authorizer,
             clock: Arc::new(SystemA2AAgentClock),
             default_tenant: None,
+            metrics: Arc::new(NoopMetricsRecorder),
         }
+    }
+
+    /// Records the agent domain's bounded counters through this recorder.
+    ///
+    /// The service builds its own entity stores rather than routing through
+    /// the sharded entities, so without this the domain counters those
+    /// stores emit — `rakka.agent.moderation.turns` above all — would stay
+    /// at zero for the wire, which is the only carrier the turn protocol
+    /// has.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Uses an explicit time source.
@@ -190,6 +261,18 @@ where
         ) {
             return self
                 .team_command_normalized(request, &normalized)
+                .await
+                .map(a2a::SendMessageResponse::Message);
+        }
+        // A conversation command likewise answers with an immediate message:
+        // it drives a turn-protocol decision, never a task creation
+        // (specification 8.11).
+        if matches!(
+            normalized.collaboration.as_ref(),
+            Some(super::collaboration::AgentCollaborationEnvelope::Conversation(_))
+        ) {
+            return self
+                .conversation_command_normalized(request, &normalized)
                 .await
                 .map(a2a::SendMessageResponse::Message);
         }
@@ -268,6 +351,7 @@ where
             task_id: cluster.task.as_deref(),
             principal: normalized.principal.as_ref(),
             handoff: None,
+            conversation: None,
             team: Some(crate::auth::A2ATeamClaim {
                 team: &cluster.team,
                 operation: cluster.operation.as_label(),
@@ -321,6 +405,99 @@ where
         Ok(team_response_message(&request.message.message_id, &reply))
     }
 
+    /// Serves one moderated-conversation turn-protocol command carried by
+    /// the collaboration extension's conversation cluster
+    /// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)):
+    /// authorizes it under its own operation class with the claimed
+    /// conversation command bound in, durably applies it through the
+    /// conversation entity's deduplicated inbox, drives the settle pass, and
+    /// answers with an immediate response message.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on normalization, a missing required cluster field, an
+    /// unauthenticated early end, or authorization denial. A domain refusal
+    /// — a stale coordinate, a non-participant, an exhausted budget — is not
+    /// an error: it answers as a structured refusal message so the caller
+    /// can rebase on the current protocol state.
+    pub async fn conversation_command(
+        &self,
+        params: &ServiceParams,
+        request: &SendMessageRequest,
+    ) -> RakkaAgentA2AResult<Message> {
+        let normalized = self.normalized_send(params, request)?;
+        self.conversation_command_normalized(request, &normalized)
+            .await
+    }
+
+    /// The normalized half of [`Self::conversation_command`], shared with
+    /// [`Self::send`]'s dispatch so the send is merged and parsed once.
+    async fn conversation_command_normalized(
+        &self,
+        request: &SendMessageRequest,
+        normalized: &NormalizedAgentCommand,
+    ) -> RakkaAgentA2AResult<Message> {
+        let now = self.clock.now();
+        let Some(super::collaboration::AgentCollaborationEnvelope::Conversation(cluster)) =
+            normalized.collaboration.as_ref()
+        else {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-collaboration",
+                reason: "the send carries no conversation envelope",
+            });
+        };
+        // The command is its own operation class at the authorization
+        // boundary: the deployment authorizer sees `ConversationCommand`
+        // with the cluster's claimed verb, speaker, and coordinate bound
+        // into the request — never an undifferentiated send.
+        let authorization = A2AAuthorizationRequest {
+            operation: A2AOperation::ConversationCommand,
+            tenant: Some(normalized.tenant.as_str()),
+            task_id: None,
+            principal: normalized.principal.as_ref(),
+            handoff: None,
+            team: None,
+            conversation: Some(crate::auth::A2AConversationClaim {
+                conversation: &cluster.conversation,
+                operation: cluster.operation.as_label(),
+                participant: cluster.participant.as_deref(),
+                round: cluster.round,
+                turn: cluster.turn,
+            }),
+        };
+        match self.authorizer.authorize(&authorization).await {
+            A2AAuthorizationDecision::Allow => {}
+            A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
+        }
+
+        let (scope, command) = agent_conversation_command(normalized, now)?;
+        let mut store = AgentConversationEntityStore::new(
+            scope,
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        )
+        .with_metrics(self.metrics.clone());
+        let reply = match store.apply(command, &self.router, now).await {
+            Ok(reply) => reply,
+            // A domain refusal is a decision the caller rebases on, not a
+            // transport failure; infrastructure faults stay errors.
+            Err(error) if error.is_domain_refusal() => AgentConversationEntityReply::Rejected {
+                code: error.code().to_string(),
+                message: error.to_string(),
+            },
+            Err(error) => return Err(error.into()),
+        };
+        // One best-effort settle pass flushes the history the decision owed.
+        // The conversation initiates no exchange this slice, so there is no
+        // courier hop to any other entity — convergence never depends on
+        // this call.
+        let _ = store.settle_side_effects(&self.router, now).await;
+        Ok(conversation_response_message(
+            &request.message.message_id,
+            &reply,
+        ))
+    }
+
     /// Serves one agent-management command: parses the versioned envelope
     /// (failing closed on an unsupported version), authorizes it, applies it
     /// through the agent entity's durable deduplicated inbox, and answers
@@ -368,6 +545,7 @@ where
             principal: principal.as_ref(),
             handoff: None,
             team: None,
+            conversation: None,
         };
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
@@ -876,6 +1054,7 @@ where
             principal: normalized.principal.as_ref(),
             handoff,
             team: None,
+            conversation: None,
         };
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),
@@ -915,5 +1094,30 @@ pub fn team_response_message(
         super::collaboration::AGENT_COLLABORATION_EXTENSION_URI.to_string(),
     ]);
     message.message_id = format!("{request_message_id}::team-response");
+    message
+}
+
+/// Builds the immediate response message one conversation command answers
+/// with — the management-response precedent: a conversation command never
+/// creates a task, so its outcome rides a message, not a task projection.
+#[must_use]
+pub fn conversation_response_message(
+    request_message_id: &str,
+    reply: &rakka_agent::AgentConversationEntityReply,
+) -> Message {
+    let payload = serde_json::to_value(reply).unwrap_or(serde_json::Value::Null);
+    let mut message = Message::new(
+        a2a::Role::Agent,
+        vec![a2a::Part {
+            content: a2a::PartContent::Data(payload),
+            filename: None,
+            media_type: Some("application/json".to_string()),
+            metadata: None,
+        }],
+    );
+    message.extensions = Some(vec![
+        super::collaboration::AGENT_COLLABORATION_EXTENSION_URI.to_string(),
+    ]);
+    message.message_id = format!("{request_message_id}::conversation-response");
     message
 }

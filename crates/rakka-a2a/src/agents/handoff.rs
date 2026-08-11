@@ -27,8 +27,6 @@
 //! fresh. When the attempt budget spends out, the source run parks
 //! indeterminate rather than resuming beside a possibly-live transfer.
 
-use std::sync::Arc;
-
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState};
 use a2a_server::ServiceParams;
 use rakka_agent::{
@@ -48,25 +46,53 @@ use super::collaboration::{
 use super::error::RakkaAgentA2AError;
 use super::ingress::{META_AGENT_ID, META_TASK_DEFINITION};
 use super::projection::{agent_task_state, AgentTaskCondition};
-use super::service::RakkaAgentA2AService;
+use super::service::SharedRakkaAgentA2AService;
 
 /// In-process [`AgentA2aHandoffSendExecutor`] over the agents-surface
 /// service core.
-pub struct A2AAgentHandoffSendExecutor<Tasks, Agents, History, Runs, Teams, TeamHistory>
-where
+pub struct A2AAgentHandoffSendExecutor<
+    Tasks,
+    Agents,
+    History,
+    Runs,
+    Teams,
+    TeamHistory,
+    Conversations,
+    ConversationHistory,
+> where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<rakka_agent::AgentTeamState>,
     TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
-    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
+    service: SharedRakkaAgentA2AService<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >,
     principal: Option<PrincipalRef>,
 }
 
-impl<Tasks, Agents, History, Runs, Teams, TeamHistory>
-    A2AAgentHandoffSendExecutor<Tasks, Agents, History, Runs, Teams, TeamHistory>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    A2AAgentHandoffSendExecutor<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
@@ -74,11 +100,22 @@ where
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<rakka_agent::AgentTeamState>,
     TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     /// Wraps a service.
     #[must_use]
     pub const fn new(
-        service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
+        service: SharedRakkaAgentA2AService<
+            Tasks,
+            Agents,
+            History,
+            Runs,
+            Teams,
+            TeamHistory,
+            Conversations,
+            ConversationHistory,
+        >,
     ) -> Self {
         Self {
             service,
@@ -280,8 +317,18 @@ fn finding_for_error(
     }
 }
 
-impl<Tasks, Agents, History, Runs, Teams, TeamHistory> AgentA2aHandoffSendExecutor
-    for A2AAgentHandoffSendExecutor<Tasks, Agents, History, Runs, Teams, TeamHistory>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    AgentA2aHandoffSendExecutor
+    for A2AAgentHandoffSendExecutor<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
@@ -289,6 +336,8 @@ where
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<rakka_agent::AgentTeamState>,
     TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     fn execute<'a>(
         &'a self,

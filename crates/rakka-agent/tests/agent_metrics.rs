@@ -727,3 +727,115 @@ async fn team_operations_count_once_under_bounded_labels() {
         "one observation per durable decision, none for the replay"
     );
 }
+
+/// Moderation turn operations count once per durable decision under bounded
+/// `operation`/`outcome` labels, a duplicate — or a past-window ledger echo
+/// — counts nothing, and every observation still passes the bounded guard
+/// ([specification 8.11 and 17.12](../../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn moderation_turns_count_once_under_bounded_labels() {
+    use rakka_agent::{
+        conversation_turn_content_digest, conversation_turn_operation_id, AgentBudgetConsumption,
+        AgentConversationCompletionRule, AgentConversationCreation, AgentConversationEntityCommand,
+        AgentConversationId, AgentConversationMode, AgentConversationScope,
+        AgentConversationTurnSubmit, AgentModerationPolicy, AgentRevisionNumber,
+        METRIC_AGENT_MODERATION_TURNS,
+    };
+
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ))
+    .with_metrics(metrics.clone());
+
+    let conversation =
+        AgentConversationId::new("metrics-conversation").expect("the conversation id is valid");
+    let scope = AgentConversationScope::new(tenant(), conversation.clone())
+        .expect("the conversation scope is valid");
+    let participant = rakka_agent::AgentId::new("speaker").expect("the participant id is valid");
+    let create = AgentConversationEntityCommand::Create {
+        operation_id: rakka_agent::conversation_create_operation_id(&tenant(), &conversation)
+            .expect("the operation id derives"),
+        creation: Box::new(AgentConversationCreation {
+            moderator: agent_id(),
+            participants: vec![participant.clone()],
+            mode: AgentConversationMode::RoundRobin,
+            completion: AgentConversationCompletionRule::ModeratorDecides,
+            policy: AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+            task: rakka_agent::AgentTaskId::new("metrics-task").expect("the task id is valid"),
+            tokens: None,
+            max_wall_clock_millis: None,
+            transcript_ref: None,
+        }),
+    };
+    fx.apply_conversation_command_at(&scope, create.clone())
+        .await
+        .expect("the conversation creates");
+    // The duplicate answers from the operation log and counts nothing.
+    fx.apply_conversation_command_at(&scope, create)
+        .await
+        .expect("the replay answers");
+    // A domain refusal counts as refused.
+    let submit =
+        |speaker: &rakka_agent::AgentId, body: &str| AgentConversationEntityCommand::SubmitTurn {
+            operation_id: conversation_turn_operation_id(
+                &tenant(),
+                &conversation,
+                0,
+                0,
+                speaker,
+                &conversation_turn_content_digest(body, None),
+            )
+            .expect("the operation id derives"),
+            submit: Box::new(AgentConversationTurnSubmit {
+                round: 0,
+                turn: 0,
+                participant: speaker.clone(),
+                body: body.to_string(),
+                direction: None,
+                usage: AgentBudgetConsumption::zero(),
+            }),
+        };
+    let stranger = rakka_agent::AgentId::new("stranger").expect("the id is valid");
+    fx.apply_conversation_command_at(&scope, submit(&stranger, "barging in"))
+        .await
+        .expect_err("a non-participant turn refuses");
+    fx.apply_conversation_command_at(&scope, submit(&participant, "an opening"))
+        .await
+        .expect("the turn records");
+    // The replayed turn answers from the operation log and counts nothing.
+    fx.apply_conversation_command_at(&scope, submit(&participant, "an opening"))
+        .await
+        .expect("the replay answers");
+
+    let snapshot = metrics.snapshot();
+    for observation in snapshot.observations_named(METRIC_AGENT_MODERATION_TURNS) {
+        assert_eq!(observation.kind(), MetricKind::Counter);
+        let attributes: Vec<(&str, &str)> = observation
+            .attributes()
+            .iter()
+            .map(|attribute| (attribute.key(), attribute.value()))
+            .collect();
+        validate_agent_domain_metric_attributes(&attributes)
+            .expect("every moderation-turn label is bounded");
+    }
+    let labels = labels_of(&snapshot, METRIC_AGENT_MODERATION_TURNS);
+    assert_eq!(
+        labels,
+        vec![
+            vec![
+                ("operation".to_string(), "create".to_string()),
+                ("outcome".to_string(), "applied".to_string()),
+            ],
+            vec![
+                ("operation".to_string(), "turn".to_string()),
+                ("outcome".to_string(), "refused".to_string()),
+            ],
+            vec![
+                ("operation".to_string(), "turn".to_string()),
+                ("outcome".to_string(), "applied".to_string()),
+            ],
+        ],
+        "one observation per durable decision, none for the replays"
+    );
+}

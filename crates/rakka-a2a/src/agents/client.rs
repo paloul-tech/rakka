@@ -2,13 +2,11 @@
 //!
 //! `rakka-agent` defines [`rakka_agent::RakkaAgentClient`] over a durable
 //! command port; this module is the port's transport. Every call encodes
-//! onto the same [`RakkaAgentA2AService`] operations an external A2A caller
+//! onto the same [`super::service::RakkaAgentA2AService`] operations an external A2A caller
 //! uses — the same normalization, authorization, durable deduplicated
 //! acceptance, and projection — so a client call and a network call are
 //! indistinguishable to the entities. There is no local actor shortcut
 //! (specification 14.5).
-
-use std::sync::Arc;
 
 use a2a::{
     CancelTaskRequest, Message, Part, PartContent, Role, SendMessageRequest, Task, TaskState,
@@ -33,28 +31,56 @@ use super::management::{
     management_request_message, parse_management_response, AgentManagementCommand,
     AgentManagementRequest, AgentManagementResponse, AGENT_MANAGEMENT_SCHEMA_VERSION,
 };
-use super::service::RakkaAgentA2AService;
+use super::service::SharedRakkaAgentA2AService;
 
 /// A2A-backed transport for [`rakka_agent::RakkaAgentClient`].
 ///
 /// Wraps the agents-surface service core with a fixed caller identity: the
 /// service params, tenant, and default principal every call carries.
-pub struct A2AAgentClientTransport<Tasks, Agents, History, Runs, Teams, TeamHistory>
-where
+pub struct A2AAgentClientTransport<
+    Tasks,
+    Agents,
+    History,
+    Runs,
+    Teams,
+    TeamHistory,
+    Conversations,
+    ConversationHistory,
+> where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
     History: AgentTaskHistoryStore + Clone,
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<rakka_agent::AgentTeamState>,
     TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
-    service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
+    service: SharedRakkaAgentA2AService<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >,
     tenant: Option<String>,
     principal: Option<PrincipalRef>,
 }
 
-impl<Tasks, Agents, History, Runs, Teams, TeamHistory>
-    A2AAgentClientTransport<Tasks, Agents, History, Runs, Teams, TeamHistory>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    A2AAgentClientTransport<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
@@ -62,11 +88,22 @@ where
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<rakka_agent::AgentTeamState>,
     TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     /// Wraps a service.
     #[must_use]
     pub const fn new(
-        service: Arc<RakkaAgentA2AService<Tasks, Agents, History, Runs, Teams, TeamHistory>>,
+        service: SharedRakkaAgentA2AService<
+            Tasks,
+            Agents,
+            History,
+            Runs,
+            Teams,
+            TeamHistory,
+            Conversations,
+            ConversationHistory,
+        >,
     ) -> Self {
         Self {
             service,
@@ -220,8 +257,18 @@ fn management_command(
     })
 }
 
-impl<Tasks, Agents, History, Runs, Teams, TeamHistory> AgentClientTransport
-    for A2AAgentClientTransport<Tasks, Agents, History, Runs, Teams, TeamHistory>
+impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
+    AgentClientTransport
+    for A2AAgentClientTransport<
+        Tasks,
+        Agents,
+        History,
+        Runs,
+        Teams,
+        TeamHistory,
+        Conversations,
+        ConversationHistory,
+    >
 where
     Tasks: DurableStateStore<AgentTaskState>,
     Agents: DurableStateStore<AgentEntityState>,
@@ -229,6 +276,8 @@ where
     Runs: DurableStateStore<AgentRunState>,
     Teams: DurableStateStore<rakka_agent::AgentTeamState>,
     TeamHistory: rakka_agent::AgentTeamHistoryStore + Clone,
+    Conversations: rakka_persistence::DurableStateStore<rakka_agent::AgentConversationState>,
+    ConversationHistory: rakka_agent::AgentConversationHistoryStore + Clone,
 {
     fn create_task(
         &self,

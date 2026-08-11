@@ -25,11 +25,13 @@
 //! transfers are atomic under revision and lease fencing. The
 //! [`AgentTeamPolicy`] payload carries the board's bounded ceilings and the
 //! claim-lease duration; the board itself is the team entity's durable state
-//! ([`crate::team`]). Moderation owns `AgentConversationId`, the participant
-//! set, durable turn and round state, and transcript artifacts, where only
-//! the current participant may submit and duplicates are rejected. Its policy
-//! payload stays a revision-only shell here; its fields arrive with its own
-//! slice.
+//! ([`crate::team`]). Moderation owns
+//! [`crate::identity::AgentConversationId`], the authorized participant set,
+//! durable turn and round state, and the bounded transcript, where only the
+//! current participant may submit and duplicates are rejected. The
+//! [`AgentModerationPolicy`] payload carries the turn protocol's bounded
+//! ceilings; the protocol itself is the conversation entity's durable state
+//! ([`crate::conversation`]).
 //!
 //! Every one of these exchanges travels the outbox, inbox, and `rakka-a2a` path
 //! even when the participants are colocated, and idle teams, boards, and
@@ -49,9 +51,9 @@ use crate::definition::{
 };
 use crate::delegation::AgentDelegationTarget;
 use crate::identity::{
-    validate_tenant, AgentGoalId, AgentHandoffId, AgentId, AgentIdentityError, AgentOperationId,
-    AgentOperationKind, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, AgentTeamClaimId,
-    AgentTeamScope, TenantId,
+    validate_tenant, AgentConversationId, AgentGoalId, AgentHandoffId, AgentId, AgentIdentityError,
+    AgentOperationId, AgentOperationKind, AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope,
+    AgentTeamClaimId, AgentTeamScope, TenantId,
 };
 use crate::model::AgentToolCallId;
 use crate::task::{AgentAssignmentGeneration, AgentContentDigest};
@@ -214,6 +216,178 @@ pub fn team_claim_result_operation_id(
     AgentOperationId::new(
         AgentOperationKind::TeamClaim,
         [tenant.as_str(), claim.as_str(), "result"],
+    )
+}
+
+/// Derives the stable operation id of one submitted conversation turn.
+///
+/// Every input is a logical coordinate of the decision itself — the
+/// [`wake identity`](crate::wake::wake_id_for_occurrence) discipline — and the
+/// content digest is deliberately one of them: a durable redelivery carries
+/// the same content and re-derives the same operation, so it converges on the
+/// recorded turn; a *regenerated* submission with different content at the
+/// same `(round, turn)` coordinate is a new, illegal decision, and deriving a
+/// different id keeps it from being silently answered with the recorded
+/// turn's echo — it falls through to the ledger guard and refuses loudly.
+///
+/// "Content" is the whole decision, not just the words:
+/// [`conversation_turn_content_digest`] covers the moderator's direction too,
+/// because designating a speaker and closing the round are different
+/// decisions however identical their bodies.
+pub fn conversation_turn_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+    round: u64,
+    turn: u32,
+    participant: &AgentId,
+    content_digest: &AgentContentDigest,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    let round = round.to_string();
+    let turn = turn.to_string();
+    AgentOperationId::new(
+        AgentOperationKind::ConversationTurn,
+        [
+            tenant.as_str(),
+            conversation.as_str(),
+            round.as_str(),
+            turn.as_str(),
+            participant.as_str(),
+            content_digest.value.as_str(),
+        ],
+    )
+}
+
+/// Digests one conversation turn's content — its body *and* the moderator's
+/// direction — for identity derivation.
+///
+/// The direction belongs to the digest because it is the half of a moderator
+/// turn that steers the protocol: a turn regenerated with the same words but
+/// `Designate` where the recorded one closed the round is a different
+/// decision, and one identity for both would let it be absorbed as a
+/// duplicate instead of refusing loudly. Segments are length-prefixed, so the
+/// encoding stays injective across the three direction shapes.
+///
+/// The leading domain segment keeps the digest family injective against every
+/// other derived identity, the [`handoff_id_for`] discipline.
+#[must_use]
+pub fn conversation_turn_content_digest(
+    body: &str,
+    direction: Option<&crate::conversation::AgentConversationDirection>,
+) -> AgentContentDigest {
+    use crate::conversation::AgentConversationDirection;
+
+    let (kind, target) = match direction {
+        None => ("none", ""),
+        Some(AgentConversationDirection::CloseRound) => ("close-round", ""),
+        Some(AgentConversationDirection::Designate(designated)) => {
+            ("designate", designated.as_str())
+        }
+    };
+    AgentContentDigest::sha256_of_segments(["conversation-turn-content", body, kind, target])
+}
+
+/// Derives the stable operation id of one conversation's creation.
+///
+/// Pure over `(tenant, conversation)`: a conversation is created exactly once
+/// by trusted wiring, so every replay of the creating command names the
+/// identical operation.
+///
+/// Deliberately blind to the creation's content, unlike
+/// [`conversation_create_content_operation_id`] — kept for callers that only
+/// need the identity of "the creation of this conversation".
+pub fn conversation_create_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [tenant.as_str(), conversation.as_str(), "create"],
+    )
+}
+
+/// Derives the stable operation id of one conversation's creation, qualified
+/// by the creation record itself.
+///
+/// The turn identity's discipline applied to creation: a replay carrying the
+/// *same* record re-derives the same operation and converges, while a second
+/// creation with a different roster, mode, policy, or budget derives a
+/// different one — so it falls through to the entity's own guard and refuses
+/// `conversation-already-created` instead of being absorbed as a duplicate of
+/// a conversation it does not describe.
+pub fn conversation_create_content_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+    creation: &crate::conversation::AgentConversationCreation,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    let digest = serde_json::to_value(creation)
+        .map(|value| AgentContentDigest::sha256_of_json(&value))
+        .unwrap_or_else(|_| AgentContentDigest::sha256_of_segments(["conversation-create-unset"]));
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [
+            tenant.as_str(),
+            conversation.as_str(),
+            "create",
+            digest.value.as_str(),
+        ],
+    )
+}
+
+/// Derives the stable operation id of one early-end decision over one
+/// conversation.
+///
+/// The round qualifies the id: an end decided against an old round is fenced
+/// as stale, and a *retried* end at a later round is a new decision — it must
+/// not collide in the operation log with the attempt it retries (the
+/// [`team_claim_release_operation_id`] hazard).
+///
+/// The reason qualifies it too, for the same reason a turn's body digest
+/// qualifies the turn's: a redelivery carries the same reason and converges
+/// on the recorded end, while an end *regenerated* with different reasoning
+/// is a different decision. Sharing one identity would answer it `Duplicate`
+/// while the audited reason in the append-only history stayed the first
+/// attempt's — success-shaped, and wrong.
+pub fn conversation_end_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+    round: u64,
+    reason: &str,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    let round = round.to_string();
+    let digest = conversation_end_reason_digest(reason);
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [
+            tenant.as_str(),
+            conversation.as_str(),
+            "end",
+            round.as_str(),
+            digest.value.as_str(),
+        ],
+    )
+}
+
+/// Digests one early-end reason for identity derivation.
+///
+/// The leading domain segment keeps the digest family injective against every
+/// other derived identity, the [`handoff_id_for`] discipline.
+#[must_use]
+pub fn conversation_end_reason_digest(reason: &str) -> AgentContentDigest {
+    AgentContentDigest::sha256_of_segments(["conversation-end-reason", reason])
+}
+
+/// Derives the stable operation id of the lazy deadline-expiry observation
+/// over one conversation.
+///
+/// Pure over `(tenant, conversation)`: the flip is absorbing, so one logical
+/// expiry observation exists per conversation, ever.
+pub fn conversation_expiry_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [tenant.as_str(), conversation.as_str(), "expiry"],
     )
 }
 
@@ -598,23 +772,212 @@ impl AgentTeamPolicy {
     }
 }
 
+/// Hard cap on a conversation's authorized participant roster.
+pub const AGENT_CONVERSATION_MAX_PARTICIPANTS: u32 = 8;
+
+/// Hard cap on the round ceiling any moderation policy may declare.
+pub const AGENT_CONVERSATION_MAX_ROUNDS: u32 = 16;
+
+/// Hard cap on the turns-per-round ceiling any moderation policy may declare.
+pub const AGENT_CONVERSATION_MAX_TURNS_PER_ROUND: u32 = 16;
+
+/// Hard cap on the transcript message-ring ceiling.
+pub const AGENT_CONVERSATION_MAX_MESSAGES: u32 = 16;
+
+/// Hard cap on one transcript message body's bytes.
+pub const AGENT_CONVERSATION_MESSAGE_MAX_BYTES: usize = 1024;
+
+/// Default ceiling on the token usage one conversation turn may report.
+///
+/// Sized well above any single model call's plausible total so an honest
+/// report is never refused, and far below the point where one self-report
+/// can silently exhaust a shared grant on behalf of everyone else. A
+/// deployment whose turns legitimately run larger raises it — or opts out
+/// entirely — through
+/// [`AgentModerationPolicy::with_max_turn_tokens`].
+pub const AGENT_CONVERSATION_DEFAULT_MAX_TURN_TOKENS: u64 = 1_000_000;
+
+const fn default_conversation_max_rounds() -> u32 {
+    4
+}
+
+const fn default_conversation_max_turns_per_round() -> u32 {
+    8
+}
+
+const fn default_conversation_max_messages() -> u32 {
+    8
+}
+
+const fn default_conversation_max_message_bytes() -> usize {
+    AGENT_CONVERSATION_MESSAGE_MAX_BYTES
+}
+
+const fn default_conversation_max_turn_tokens() -> Option<u64> {
+    Some(AGENT_CONVERSATION_DEFAULT_MAX_TURN_TOKENS)
+}
+
+const fn default_moderator_may_end_early() -> bool {
+    true
+}
+
 /// The moderation capability's policy payload
 /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// A revision-only shell: participant, mode, and budget fields arrive with
-/// the moderation slice.
+/// Trusted definition/setup data: the turn protocol's bounded ceilings and
+/// the moderator's early-end permission. Every field is serde-defaulted, so a
+/// pre-slice revision-only payload still decodes. The wall-clock and token
+/// budgets are not policy — they are per-conversation creation data, fixed at
+/// creation the way a run's deadline is fixed at assignment acceptance.
+///
+/// The `tool` field is the shaped-but-dormant hook for a later model-visible
+/// moderation tool: this slice wires no run-loop interception, no
+/// conversation effect kind, and no executor port, so a declared tool id is
+/// carried but never dispatched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentModerationPolicy {
     /// The policy revision.
     pub revision: AgentRevisionNumber,
+    /// Bounded round ceiling, clamped to [`AGENT_CONVERSATION_MAX_ROUNDS`].
+    #[serde(default = "default_conversation_max_rounds")]
+    pub max_rounds: u32,
+    /// Bounded turns-per-round ceiling, clamped to
+    /// [`AGENT_CONVERSATION_MAX_TURNS_PER_ROUND`].
+    #[serde(default = "default_conversation_max_turns_per_round")]
+    pub max_turns_per_round: u32,
+    /// Bounded transcript-ring ceiling, clamped to
+    /// [`AGENT_CONVERSATION_MAX_MESSAGES`].
+    #[serde(default = "default_conversation_max_messages")]
+    pub max_messages: u32,
+    /// Bounded message-body ceiling, clamped to
+    /// [`AGENT_CONVERSATION_MESSAGE_MAX_BYTES`].
+    #[serde(default = "default_conversation_max_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Ceiling on the token usage one turn may *report*, or `None` to accept
+    /// any self-report.
+    ///
+    /// The reported spend is the speaker's own claim, and the conversation's
+    /// token grant is shared: without a ceiling one turn's implausible
+    /// report exhausts the grant for every other participant, and because
+    /// exhaustion refuses rather than parks, the conversation has no
+    /// reachable progress left. The ceiling bounds the claim the way
+    /// `max_message_bytes` bounds the body; overshooting the *remaining*
+    /// grant stays legal, because that spend already happened.
+    #[serde(default = "default_conversation_max_turn_tokens")]
+    pub max_turn_tokens: Option<u64>,
+    /// Whether the moderator may end the conversation before its completion
+    /// rule is met. The early-end *result* still passes the task's typed
+    /// result validation and the goal's evaluation door on the run side.
+    #[serde(default = "default_moderator_may_end_early")]
+    pub moderator_may_end_early: bool,
+    /// The declared coordination tool a later slice's loop interception will
+    /// realize. Dormant in this slice: carried, validated, never dispatched.
+    #[serde(default)]
+    pub tool: Option<AgentToolId>,
 }
 
 impl AgentModerationPolicy {
-    /// Creates the policy.
+    /// Creates the policy with the default ceilings.
     #[must_use]
     pub const fn new(revision: AgentRevisionNumber) -> Self {
-        Self { revision }
+        Self {
+            revision,
+            max_rounds: default_conversation_max_rounds(),
+            max_turns_per_round: default_conversation_max_turns_per_round(),
+            max_messages: default_conversation_max_messages(),
+            max_message_bytes: default_conversation_max_message_bytes(),
+            max_turn_tokens: default_conversation_max_turn_tokens(),
+            moderator_may_end_early: default_moderator_may_end_early(),
+            tool: None,
+        }
+    }
+
+    /// Sets the round ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_rounds(mut self, max_rounds: u32) -> Self {
+        self.max_rounds = max_rounds.min(AGENT_CONVERSATION_MAX_ROUNDS);
+        self
+    }
+
+    /// Sets the turns-per-round ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_turns_per_round(mut self, max_turns_per_round: u32) -> Self {
+        self.max_turns_per_round = max_turns_per_round.min(AGENT_CONVERSATION_MAX_TURNS_PER_ROUND);
+        self
+    }
+
+    /// Sets the transcript-ring ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_messages(mut self, max_messages: u32) -> Self {
+        self.max_messages = max_messages.min(AGENT_CONVERSATION_MAX_MESSAGES);
+        self
+    }
+
+    /// Sets the message-body ceiling, clamped to the hard cap.
+    #[must_use]
+    pub fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = max_message_bytes.min(AGENT_CONVERSATION_MESSAGE_MAX_BYTES);
+        self
+    }
+
+    /// Sets the ceiling on the token usage one turn may report.
+    #[must_use]
+    pub const fn with_max_turn_tokens(mut self, max_turn_tokens: u64) -> Self {
+        self.max_turn_tokens = Some(max_turn_tokens);
+        self
+    }
+
+    /// Accepts any reported per-turn usage, however large.
+    ///
+    /// Only for a deployment whose speakers are as trusted as the moderation
+    /// policy itself: one implausible report exhausts the shared grant for
+    /// every participant.
+    #[must_use]
+    pub const fn without_turn_token_ceiling(mut self) -> Self {
+        self.max_turn_tokens = None;
+        self
+    }
+
+    /// Forbids the moderator from ending before the completion rule is met.
+    #[must_use]
+    pub const fn without_early_end(mut self) -> Self {
+        self.moderator_may_end_early = false;
+        self
+    }
+
+    /// Declares the dormant coordination tool.
+    #[must_use]
+    pub fn with_tool(mut self, tool: AgentToolId) -> Self {
+        self.tool = Some(tool);
+        self
+    }
+
+    /// Round ceiling with the hard cap applied, whatever a stored or
+    /// wire-carried payload claims.
+    #[must_use]
+    pub fn effective_max_rounds(&self) -> u32 {
+        self.max_rounds.clamp(1, AGENT_CONVERSATION_MAX_ROUNDS)
+    }
+
+    /// Turns-per-round ceiling with the hard cap applied.
+    #[must_use]
+    pub fn effective_max_turns_per_round(&self) -> u32 {
+        self.max_turns_per_round
+            .clamp(1, AGENT_CONVERSATION_MAX_TURNS_PER_ROUND)
+    }
+
+    /// Transcript-ring ceiling with the hard cap applied.
+    #[must_use]
+    pub fn effective_max_messages(&self) -> u32 {
+        self.max_messages.clamp(1, AGENT_CONVERSATION_MAX_MESSAGES)
+    }
+
+    /// Message-body ceiling with the hard cap applied.
+    #[must_use]
+    pub fn effective_max_message_bytes(&self) -> usize {
+        self.max_message_bytes
+            .clamp(1, AGENT_CONVERSATION_MESSAGE_MAX_BYTES)
     }
 }
 

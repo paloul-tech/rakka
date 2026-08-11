@@ -168,8 +168,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{
-    AgentIdentityError, AgentIdentityResult, AgentOperationId, AgentRunScope, AgentScope,
-    AgentTaskScope, AgentTeamScope, TenantId, AGENT_SCOPE_SEPARATOR,
+    AgentConversationScope, AgentIdentityError, AgentIdentityResult, AgentOperationId,
+    AgentRunScope, AgentScope, AgentTaskScope, AgentTeamScope, TenantId, AGENT_SCOPE_SEPARATOR,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -222,6 +222,9 @@ pub enum AgentEntityClass {
     Run,
     /// The sharded team entity, keyed `(TenantId, AgentTeamId)`.
     Team,
+    /// The sharded moderated-conversation entity, keyed
+    /// `(TenantId, AgentConversationId)`.
+    Conversation,
 }
 
 impl AgentEntityClass {
@@ -233,6 +236,7 @@ impl AgentEntityClass {
             Self::Task => "task",
             Self::Run => "run",
             Self::Team => "team",
+            Self::Conversation => "conversation",
         }
     }
 
@@ -244,6 +248,7 @@ impl AgentEntityClass {
             "task" => Some(Self::Task),
             "run" => Some(Self::Run),
             "team" => Some(Self::Team),
+            "conversation" => Some(Self::Conversation),
             _ => None,
         }
     }
@@ -273,6 +278,8 @@ pub enum AgentEntityAddress {
     Run(AgentRunScope),
     /// One team entity.
     Team(AgentTeamScope),
+    /// One moderated-conversation entity.
+    Conversation(AgentConversationScope),
 }
 
 impl AgentEntityAddress {
@@ -284,6 +291,7 @@ impl AgentEntityAddress {
             Self::Task(_) => AgentEntityClass::Task,
             Self::Run(_) => AgentEntityClass::Run,
             Self::Team(_) => AgentEntityClass::Team,
+            Self::Conversation(_) => AgentEntityClass::Conversation,
         }
     }
 
@@ -295,6 +303,7 @@ impl AgentEntityAddress {
             Self::Task(scope) => scope.tenant(),
             Self::Run(scope) => scope.tenant(),
             Self::Team(scope) => scope.tenant(),
+            Self::Conversation(scope) => scope.tenant(),
         }
     }
 
@@ -306,6 +315,7 @@ impl AgentEntityAddress {
             Self::Task(scope) => scope.entity_id(),
             Self::Run(scope) => scope.entity_id(),
             Self::Team(scope) => scope.entity_id(),
+            Self::Conversation(scope) => scope.entity_id(),
         }
     }
 
@@ -317,6 +327,7 @@ impl AgentEntityAddress {
             Self::Task(scope) => scope.persistence_id(),
             Self::Run(scope) => scope.persistence_id(),
             Self::Team(scope) => scope.persistence_id(),
+            Self::Conversation(scope) => scope.persistence_id(),
         }
     }
 
@@ -328,6 +339,7 @@ impl AgentEntityAddress {
             Self::Task(scope) => scope.key(),
             Self::Run(scope) => scope.key(),
             Self::Team(scope) => scope.key(),
+            Self::Conversation(scope) => scope.key(),
         };
         format!("{}{AGENT_SCOPE_SEPARATOR}{scope}", self.class().as_label())
     }
@@ -347,6 +359,9 @@ impl AgentEntityAddress {
             AgentEntityClass::Task => Self::Task(AgentTaskScope::from_entity_id(entity_id)?),
             AgentEntityClass::Run => Self::Run(AgentRunScope::from_entity_id(entity_id)?),
             AgentEntityClass::Team => Self::Team(AgentTeamScope::from_entity_id(entity_id)?),
+            AgentEntityClass::Conversation => {
+                Self::Conversation(AgentConversationScope::from_entity_id(entity_id)?)
+            }
         })
     }
 
@@ -370,6 +385,9 @@ impl AgentEntityAddress {
             AgentEntityClass::Task => Self::Task(AgentTaskScope::parse(scope)?),
             AgentEntityClass::Run => Self::Run(AgentRunScope::parse(scope)?),
             AgentEntityClass::Team => Self::Team(AgentTeamScope::parse(scope)?),
+            AgentEntityClass::Conversation => {
+                Self::Conversation(AgentConversationScope::parse(scope)?)
+            }
         })
     }
 }

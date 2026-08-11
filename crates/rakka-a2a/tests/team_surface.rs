@@ -44,6 +44,7 @@ type TaskStore = InMemoryDurableStateStore<AgentTaskState>;
 type AgentStore = InMemoryDurableStateStore<AgentEntityState>;
 type RunStore = InMemoryDurableStateStore<AgentRunState>;
 type TeamStore = InMemoryDurableStateStore<AgentTeamState>;
+type ConversationStore = InMemoryDurableStateStore<rakka_agent::AgentConversationState>;
 type Service = RakkaAgentA2AService<
     TaskStore,
     AgentStore,
@@ -51,6 +52,8 @@ type Service = RakkaAgentA2AService<
     RunStore,
     TeamStore,
     InMemoryAgentTeamHistoryStore,
+    ConversationStore,
+    rakka_agent::InMemoryAgentConversationHistoryStore,
 >;
 
 const TENANT: &str = "acme";
@@ -184,6 +187,8 @@ impl Fixture {
                 runs,
                 teams.clone(),
                 team_history.clone(),
+                ConversationStore::default(),
+                rakka_agent::InMemoryAgentConversationHistoryStore::new(),
                 router.clone(),
                 Arc::new(catalog),
                 Arc::new(InMemoryA2ATaskProjectionStore::local()),

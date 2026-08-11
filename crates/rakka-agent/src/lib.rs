@@ -58,6 +58,7 @@ pub mod budget;
 pub mod checkpoints;
 pub mod choreography;
 pub mod client;
+pub mod conversation;
 pub mod coordination;
 pub mod definition;
 pub mod delegation;
@@ -225,9 +226,10 @@ pub use observability::{
     METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS, METRIC_AGENT_FAN_IN_RESOLUTIONS,
     METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
     METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TEAM_OPERATIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_WAKE_DISPOSITIONS, METRIC_AGENT_WORKFLOW_RESULTS,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODERATION_TURNS, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TEAM_OPERATIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_WORKFLOW_RESULTS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
@@ -314,13 +316,48 @@ pub use wake_timers::{
     AGENT_WAKE_TIMER_PERSISTENCE_PREFIX, DEFAULT_AGENT_WAKE_TIMER_STORE_ID,
 };
 
+pub use conversation::{
+    agent_conversation_entity_id, agent_conversation_entity_persistence_id,
+    agent_conversation_entity_ref, agent_conversation_entity_type_key,
+    init_agent_conversation_entity_remote_sharding, init_agent_conversation_entity_sharding,
+    passivate_agent_conversation_entity, registered_agent_conversation_entity_ref,
+    system_conversation_clock, AgentConversation, AgentConversationBudgets, AgentConversationClock,
+    AgentConversationCompletionRule, AgentConversationCreation, AgentConversationDirection,
+    AgentConversationEntity, AgentConversationEntityCommand, AgentConversationEntityMessage,
+    AgentConversationEntityRef, AgentConversationEntityRegistration, AgentConversationEntityReply,
+    AgentConversationEntityShardingSettings, AgentConversationEntityStore,
+    AgentConversationEntityTypeKey, AgentConversationError, AgentConversationHistoryCursor,
+    AgentConversationHistoryEntry, AgentConversationHistoryFuture, AgentConversationHistoryKind,
+    AgentConversationHistoryPage, AgentConversationHistorySequence, AgentConversationHistoryStore,
+    AgentConversationMessage, AgentConversationMode, AgentConversationOperationLog,
+    AgentConversationOutcome, AgentConversationParticipant, AgentConversationProgress,
+    AgentConversationResult, AgentConversationSnapshot, AgentConversationSpeaker,
+    AgentConversationState, AgentConversationStatus, AgentConversationTerminalReason,
+    AgentConversationTurnRecord, AgentConversationTurnSubmit,
+    InMemoryAgentConversationHistoryStore, AGENT_CONVERSATION_DETAIL_MAX_LENGTH,
+    AGENT_CONVERSATION_DIGEST_PREFIX_LENGTH, AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES,
+    AGENT_CONVERSATION_HISTORY_DEFAULT_PAGE_SIZE, AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES,
+    AGENT_CONVERSATION_HISTORY_MAX_PAGE_SIZE, AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES,
+    AGENT_CONVERSATION_MAX_HISTORY_PER_TRANSITION, AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES,
+    AGENT_CONVERSATION_OPERATION_LOG_CAPACITY,
+    AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES,
+    AGENT_CONVERSATION_PENDING_HISTORY_CAPACITY, AGENT_CONVERSATION_REASON_MAX_BYTES,
+    AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES, AGENT_CONVERSATION_TRANSCRIPT_REF_MAX_BYTES,
+    AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES, DEFAULT_AGENT_CONVERSATION_ENTITY_TYPE,
+};
 pub use coordination::{
-    handoff_id_for, handoff_result_operation_id, team_claim_id_for, team_claim_operation_id,
-    team_claim_release_operation_id, team_claim_result_operation_id, AgentA2aHandoffReceipt,
-    AgentCoordinationCapability, AgentCoordinationError, AgentCoordinationResult,
-    AgentDelegationPolicy, AgentHandoffCell, AgentHandoffPolicy, AgentHandoffRecord,
-    AgentHandoffStatus, AgentHandoffToolCall, AgentModerationPolicy, AgentTeamClaimAction,
-    AgentTeamClaimCommand, AgentTeamClaimOutcome, AgentTeamClaimResultNotice, AgentTeamPolicy,
+    conversation_create_content_operation_id, conversation_create_operation_id,
+    conversation_end_operation_id, conversation_end_reason_digest,
+    conversation_expiry_operation_id, conversation_turn_content_digest,
+    conversation_turn_operation_id, handoff_id_for, handoff_result_operation_id, team_claim_id_for,
+    team_claim_operation_id, team_claim_release_operation_id, team_claim_result_operation_id,
+    AgentA2aHandoffReceipt, AgentCoordinationCapability, AgentCoordinationError,
+    AgentCoordinationResult, AgentDelegationPolicy, AgentHandoffCell, AgentHandoffPolicy,
+    AgentHandoffRecord, AgentHandoffStatus, AgentHandoffToolCall, AgentModerationPolicy,
+    AgentTeamClaimAction, AgentTeamClaimCommand, AgentTeamClaimOutcome, AgentTeamClaimResultNotice,
+    AgentTeamPolicy, AGENT_CONVERSATION_DEFAULT_MAX_TURN_TOKENS, AGENT_CONVERSATION_MAX_MESSAGES,
+    AGENT_CONVERSATION_MAX_PARTICIPANTS, AGENT_CONVERSATION_MAX_ROUNDS,
+    AGENT_CONVERSATION_MAX_TURNS_PER_ROUND, AGENT_CONVERSATION_MESSAGE_MAX_BYTES,
     AGENT_HANDOFF_CONTEXT_REF_MAX_BYTES, AGENT_HANDOFF_ID_PREFIX, AGENT_HANDOFF_MAX_CONTEXT_REFS,
     AGENT_HANDOFF_REASON_MAX_BYTES, AGENT_HANDOFF_RECORD_MAX_BYTES, AGENT_TEAM_CLAIM_ID_PREFIX,
     AGENT_TEAM_CLAIM_PAYLOAD_TYPE, AGENT_TEAM_CLAIM_RESULT_PAYLOAD_TYPE,
@@ -356,13 +393,14 @@ pub use fan_in::{
     AgentFanInToolCall, AGENT_RUN_MAX_FAN_IN_MEMBERS,
 };
 pub use identity::{
-    validate_identity_segment, validate_tenant, AgentCommunalClaimId, AgentDelegationId,
-    AgentEnvironmentRef, AgentGoalId, AgentHandoffId, AgentId, AgentIdentityError,
-    AgentIdentityResult, AgentMemoryNamespace, AgentOperationId, AgentOperationKind,
-    AgentRunBinding, AgentRunId, AgentRunScope, AgentScope, AgentTaskId, AgentTaskScope,
-    AgentTeamClaimId, AgentTeamId, AgentTeamScope, AgentWakeId, AgentWorkflowInvocationId,
-    KnowledgeSpaceId, TenantId, AGENT_ENTITY_PERSISTENCE_PREFIX, AGENT_IDENTITY_MAX_LENGTH,
-    AGENT_MEMORY_NAMESPACE_PREFIX, AGENT_PERSISTENCE_SEPARATOR,
+    validate_identity_segment, validate_tenant, AgentCommunalClaimId, AgentConversationId,
+    AgentConversationScope, AgentDelegationId, AgentEnvironmentRef, AgentGoalId, AgentHandoffId,
+    AgentId, AgentIdentityError, AgentIdentityResult, AgentMemoryNamespace, AgentOperationId,
+    AgentOperationKind, AgentRunBinding, AgentRunId, AgentRunScope, AgentScope, AgentTaskId,
+    AgentTaskScope, AgentTeamClaimId, AgentTeamId, AgentTeamScope, AgentWakeId,
+    AgentWorkflowInvocationId, KnowledgeSpaceId, TenantId,
+    AGENT_CONVERSATION_ENTITY_PERSISTENCE_PREFIX, AGENT_ENTITY_PERSISTENCE_PREFIX,
+    AGENT_IDENTITY_MAX_LENGTH, AGENT_MEMORY_NAMESPACE_PREFIX, AGENT_PERSISTENCE_SEPARATOR,
     AGENT_RUN_ENTITY_PERSISTENCE_PREFIX, AGENT_SCOPE_SEPARATOR,
     AGENT_TASK_ENTITY_PERSISTENCE_PREFIX, AGENT_TEAM_ENTITY_PERSISTENCE_PREFIX,
 };

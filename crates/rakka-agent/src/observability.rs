@@ -703,6 +703,16 @@ pub const METRIC_AGENT_WORKFLOW_RESULTS: &str = "rakka.agent.workflow.results";
 /// replay never double-counts.
 pub const METRIC_AGENT_TEAM_OPERATIONS: &str = "rakka.agent.team.operations";
 
+/// Counter: moderated-conversation turn and lifecycle operations committed at
+/// the conversation entity's door, labeled by bounded `operation` (the
+/// command's closed label) and `outcome` (`applied` / `refused`)
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)). A
+/// duplicate command answered from the operation log — including a
+/// past-window replay echoed from the turn ledger — records nothing, so a
+/// replay never double-counts. The bounded `mode` label is owed to the slice
+/// that lands the model-visible moderation tool.
+pub const METRIC_AGENT_MODERATION_TURNS: &str = "rakka.agent.moderation.turns";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the

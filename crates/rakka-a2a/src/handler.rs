@@ -583,6 +583,7 @@ impl RakkaA2ARequestHandler {
             principal,
             handoff: None,
             team: None,
+            conversation: None,
         };
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),
