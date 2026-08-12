@@ -713,6 +713,23 @@ pub const METRIC_AGENT_TEAM_OPERATIONS: &str = "rakka.agent.team.operations";
 /// that lands the model-visible moderation tool.
 pub const METRIC_AGENT_MODERATION_TURNS: &str = "rakka.agent.moderation.turns";
 
+/// Counter: authenticated human-result submissions decided at the task
+/// entity's door, labeled by bounded `outcome`
+/// (`accepted` / `rejected` / `exhausted`)
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)). Counted
+/// as the difference of the task's durable result cells across the committed
+/// transition — the admitted-epoch idiom — so duplicates, durable echoes,
+/// and non-committing refusals record nothing.
+pub const METRIC_AGENT_HUMAN_RESULTS: &str = "rakka.agent.human.results";
+
+/// Counter: dependency outcomes durably applied at the dependent task's
+/// door, labeled by bounded `outcome` (`completed` / `failed` / `cancelled`)
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)). Counted
+/// as the difference of the task's resolved-edge count across the committed
+/// transition, whichever path — registry exchange or application relay —
+/// resolved the edge; a replayed or conflicting delivery records nothing.
+pub const METRIC_AGENT_DEPENDENCY_OUTCOMES: &str = "rakka.agent.dependency.outcomes";
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the

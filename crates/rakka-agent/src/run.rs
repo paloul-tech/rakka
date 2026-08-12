@@ -8882,7 +8882,8 @@ mod tests {
         });
         run.loop_state.set_accepted_result(AgentAcceptedResult {
             proposal_id,
-            run: scope.run().clone(),
+            run: Some(scope.run().clone()),
+            principal: None,
             definition_id: definition.definition_id.clone(),
             definition_version: definition.version,
             result_schema: definition.result_schema,

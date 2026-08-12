@@ -654,11 +654,85 @@ pub enum AgentExchangeKind {
     /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
     ///   envelope stays outstanding until the binary upgrades.
     TeamClaimResult,
+    /// A dependent task registering itself with the upstream task it depends
+    /// on ([specification 9.2](../../../docs/plans/rakka-agent/spec.md):
+    /// dependencies are durable, bounded, and created with stable operation
+    /// ids). Initiated by the dependent in the same compare-and-set that
+    /// records the forward edge; the upstream records the reverse edge in its
+    /// bounded dependents registry, and the reply is its durable receipt —
+    /// which carries the terminal outcome directly when the upstream is
+    /// already terminal, so a late registration never waits for a
+    /// notification the upstream will not owe again.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the forward
+    ///   edge never committed; the declaring command replays and commits the
+    ///   identical edge and owed envelope under the same derived operation
+    ///   id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the dependents
+    ///   entry and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the upstream's
+    ///   recorded dependents entry is the durable echo — the arm accepts
+    ///   idempotently with no state change.
+    /// - **Upstream not yet created**: a retryable refusal that stays
+    ///   outstanding — a racing create converges on the next re-drive, and a
+    ///   never-created upstream leaves the dependent durably `Blocked`, the
+    ///   documented stuck-dependency struggle signal.
+    /// - **Forged sender or dependents ceiling**: a settled refusal the
+    ///   dependent's settle rule accepts as definitive; the dependent stays
+    ///   `Blocked` on the application relay path rather than re-driving
+    ///   forever.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades.
+    DependencyRegistration,
+    /// An upstream task reporting its terminal outcome to one registered
+    /// dependent ([specification 9.2](../../../docs/plans/rakka-agent/spec.md):
+    /// a task must not become eligible until its dependency rule is
+    /// satisfied; the default failed-dependency policy cancels dependents).
+    /// Initiated by the upstream once terminal — immediately at the terminal
+    /// commit, with no escrow gate, because the payload (status, terminal
+    /// reason, result digest) is absorbing the moment `terminate` commits —
+    /// and the reply is the dependent's durable application of the outcome
+    /// through the same core the `RecordDependencyOutcome` relay command
+    /// uses, so a failing edge takes the cancellation *request* path over a
+    /// live run, never a direct terminalization.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the terminal
+    ///   status committed; the settle pass re-derives the identical owed
+    ///   envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the resolved
+    ///   edge and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the resolved edge is
+    ///   the durable echo — the same outcome accepts idempotently with no
+    ///   state change, and a conflicting one fails closed as a conflict,
+    ///   never a correction.
+    /// - **Unknown edge, unknown task, conflicting outcome, or forged
+    ///   sender**: a settled refusal the upstream's settle rule accepts as
+    ///   definitive; the dependents entry's settled marker still flips, so
+    ///   the derivation quiesces.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades.
+    DependencyOutcome,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -673,6 +747,8 @@ impl AgentExchangeKind {
         Self::HandoffResult,
         Self::TeamClaim,
         Self::TeamClaimResult,
+        Self::DependencyRegistration,
+        Self::DependencyOutcome,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -693,6 +769,8 @@ impl AgentExchangeKind {
             Self::HandoffResult => "handoff-result",
             Self::TeamClaim => "team-claim",
             Self::TeamClaimResult => "team-claim-result",
+            Self::DependencyRegistration => "dependency-registration",
+            Self::DependencyOutcome => "dependency-outcome",
         }
     }
 }
@@ -2148,12 +2226,26 @@ where
                         actual: reply.operation_id().clone(),
                     });
                 }
-                match host.settle(&reply, now).await? {
-                    AgentExchangeSettlement::Settled { .. } => report.settled += 1,
-                    AgentExchangeSettlement::AlreadySettled { .. } => {
+                match host.settle(&reply, now).await {
+                    Ok(AgentExchangeSettlement::Settled { .. }) => report.settled += 1,
+                    Ok(AgentExchangeSettlement::AlreadySettled { .. }) => {
                         report.duplicate_replies += 1;
                     }
-                    AgentExchangeSettlement::Unknown => report.unknown_replies += 1,
+                    Ok(AgentExchangeSettlement::Unknown) => report.unknown_replies += 1,
+                    Err(AgentChoreographyError::UnsettleableRefusal { code, .. }) => {
+                        // The participant classified the refusal as one only
+                        // a future receiver can answer — an upstream not yet
+                        // created, a binary that predates the kind. The
+                        // exchange stays durably outstanding with the code
+                        // recorded, exactly as `AgentExchangeHost::settle`
+                        // documents; erroring the pass instead would let one
+                        // unanswerable envelope wedge every other exchange
+                        // this entity owes.
+                        host.record_delivery_failure(envelope.operation_id(), &code, now)
+                            .await?;
+                        report.failed += 1;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             Err(error) => {

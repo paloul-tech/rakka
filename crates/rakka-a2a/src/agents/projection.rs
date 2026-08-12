@@ -39,6 +39,20 @@ pub const META_AGENT_RUN_CONDITION: &str = "io.rakka.agent.run-condition";
 /// One of `input`, `approval`, `authorization`, or `indeterminate-effect`.
 pub const META_AGENT_WAIT_REASON: &str = "io.rakka.agent.wait-reason";
 
+/// Task-status metadata key: how many result proposals the task's
+/// deterministic rules have refused, emitted once the count is nonzero.
+///
+/// The bounded rejection echo (specification 8.12, 9.2): a typed-result
+/// submission whose validation rejected answers with the ordinary task view,
+/// so the view itself carries the decision — for human submitters through
+/// this surface and, equally, for run proposals on agent-owned tasks.
+pub const META_AGENT_REJECTIONS: &str = "io.rakka.agent.rejections";
+
+/// Task-status metadata key: the most recent rejection decision, as one
+/// bounded object `{ "reason": <stable code>, "rule": <rule id when a rule
+/// refused> }`. Emitted beside [`META_AGENT_REJECTIONS`].
+pub const META_AGENT_LAST_REJECTION: &str = "io.rakka.agent.last-rejection";
+
 /// The authoritative Rakka condition one public A2A task state projects from.
 ///
 /// `task` is the owning [`rakka_agent::AgentTaskEntity`] status — always the

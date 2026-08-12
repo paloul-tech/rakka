@@ -94,7 +94,7 @@ async fn a_run_serves_its_task_through_the_durable_loop_and_never_completes_it_a
     assert_eq!(task.status, AgentTaskStatus::Completed);
     assert_eq!(
         task.accepted_result.expect("the task holds the result").run,
-        *run_scope().run()
+        Some(run_scope().run().clone())
     );
 
     // One turn, one model call, one durable effect.

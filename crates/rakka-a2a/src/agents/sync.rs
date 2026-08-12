@@ -80,6 +80,31 @@ fn agent_metadata_from_snapshot(
             Value::Object(collaboration),
         );
     }
+    // The bounded rejection echo (specification 8.12): a rejected
+    // typed-result submission answers with the ordinary task view, so the
+    // rule code must ride the view. Assembled here — never a bootstrap-only
+    // write — so the metadata half of `sync_agent_status` heals it on every
+    // read and write path.
+    if snapshot.rejection_count > 0 {
+        metadata.insert(
+            super::projection::META_AGENT_REJECTIONS.to_string(),
+            Value::Number(snapshot.rejection_count.into()),
+        );
+    }
+    if let Some(rejection) = snapshot.last_rejection.as_deref() {
+        let mut echo = serde_json::Map::new();
+        echo.insert(
+            "reason".to_string(),
+            Value::String(rejection.cause.reason.clone()),
+        );
+        if let Some(rule) = &rejection.cause.rule_id {
+            echo.insert("rule".to_string(), Value::String(rule.as_str().to_string()));
+        }
+        metadata.insert(
+            super::projection::META_AGENT_LAST_REJECTION.to_string(),
+            Value::Object(echo),
+        );
+    }
     metadata.insert(
         META_PROJECTION_REVISION.to_string(),
         Value::Number(projection_revision.into()),

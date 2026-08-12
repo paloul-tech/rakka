@@ -42,8 +42,9 @@ use super::catalog::A2AAgentCatalog;
 use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
     agent_conversation_command, agent_task_cancel_command, agent_task_create_command,
-    agent_task_handoff_command, agent_task_input, agent_team_command, normalize_agent_cancel,
-    normalize_agent_send, resolve_agent_target, resolve_handoff_target, NormalizedAgentCommand,
+    agent_task_handoff_command, agent_task_input, agent_task_result_command, agent_team_command,
+    normalize_agent_cancel, normalize_agent_send, resolve_agent_target, resolve_handoff_target,
+    NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -352,6 +353,7 @@ where
             principal: normalized.principal.as_ref(),
             handoff: None,
             conversation: None,
+            task_result: None,
             team: Some(crate::auth::A2ATeamClaim {
                 team: &cluster.team,
                 operation: cluster.operation.as_label(),
@@ -457,6 +459,7 @@ where
             principal: normalized.principal.as_ref(),
             handoff: None,
             team: None,
+            task_result: None,
             conversation: Some(crate::auth::A2AConversationClaim {
                 conversation: &cluster.conversation,
                 operation: cluster.operation.as_label(),
@@ -546,6 +549,7 @@ where
             handoff: None,
             team: None,
             conversation: None,
+            task_result: None,
         };
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
@@ -710,9 +714,9 @@ where
             // A continuation carrying the handoff cluster is the same-task
             // transfer of specification 8.9: the deduplicated handoff command
             // records the transfer, and the inline assignment decision offers
-            // the target its generation in the same compare-and-set. Plain
-            // input delivery stays parked for its own slice, cleanly
-            // distinguished by the collaboration metadata.
+            // the target its generation in the same compare-and-set. A plain
+            // continuation is the typed-result submission of specification
+            // 8.12, cleanly distinguished by the collaboration metadata.
             if let Some(super::collaboration::AgentCollaborationEnvelope::Handoff(cluster)) =
                 normalized.collaboration.as_ref()
             {
@@ -732,6 +736,7 @@ where
                         source_generation: cluster.source_generation,
                         target_agent: &cluster.target_agent,
                     }),
+                    None,
                 )
                 .await?;
                 // The same catalog gate the creation path passes: the wire's
@@ -754,12 +759,82 @@ where
                 .await?;
                 return self.public_task(normalized, None).await;
             }
-            self.authorize(A2AOperation::SendMessage, normalized)
-                .await?;
-            return Err(RakkaAgentA2AError::Unsupported {
-                operation: "send-message",
-                reason: "input delivery to an existing agent task is not served yet",
-            });
+            // A plain continuation is the authenticated typed-result
+            // submission of specification 8.12 — the ingress door slice 1.12
+            // deferred. Ownership stays the entity's decision: the wire
+            // builds the deduplicated command for whatever task the send
+            // names, and an agent-owned target answers the stable
+            // `task-not-human-owned` refusal. The submission authorizes
+            // under its own operation class with the claimed contract bound
+            // in — never an undifferentiated send.
+            self.authorize_claimed(
+                A2AOperation::SubmitTaskResult,
+                normalized,
+                None,
+                Some(crate::auth::A2ATaskResultClaim {
+                    definition: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.definition.as_str()),
+                    definition_version: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.definition_version),
+                    result_schema: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.result_schema.as_str()),
+                    result_schema_version: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.result_schema_version),
+                    evidence_digest: normalized
+                        .result
+                        .as_ref()
+                        .and_then(|binding| binding.evidence_digest.as_deref()),
+                }),
+            )
+            .await?;
+            let input = agent_task_input(&request.message)?;
+            let command =
+                agent_task_result_command(normalized, input, &request.message.message_id, now)?;
+            // A non-committing entity refusal — unknown task, agent-owned
+            // target, terminal or cancelling task, an unboundable record —
+            // is a decision the caller rebases on, never a transport
+            // failure; infrastructure faults stay errors.
+            let snapshot = match self.apply_task_command(normalized, command, now).await {
+                Ok(snapshot) => snapshot,
+                Err(RakkaAgentA2AError::Task(error))
+                    if matches!(
+                        error,
+                        rakka_agent::AgentTaskError::SubmissionRefused { .. }
+                            | rakka_agent::AgentTaskError::NotCreated { .. }
+                            | rakka_agent::AgentTaskError::Terminal { .. }
+                            | rakka_agent::AgentTaskError::MaterializedStateTooLarge { .. }
+                    ) =>
+                {
+                    return Err(RakkaAgentA2AError::Refused {
+                        code: error.code().to_string(),
+                        message: error.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            // A validation rejection is a committed durable decision, so it
+            // answers as the task view — never an error that claims nothing
+            // happened; the rule code rides the projection's rejection echo.
+            let run = self.current_run_status(normalized, &snapshot).await?;
+            project_agent_send(
+                self.projections.as_ref(),
+                &snapshot,
+                run,
+                normalized.tenant.as_str(),
+                &normalized.context_id,
+                &request.message,
+                now,
+            )
+            .await?;
+            return self.public_task(normalized, None).await;
         }
         self.authorize(A2AOperation::SendMessage, normalized)
             .await?;
@@ -1036,16 +1111,19 @@ where
         operation: A2AOperation,
         normalized: &NormalizedAgentCommand,
     ) -> RakkaAgentA2AResult<()> {
-        self.authorize_claimed(operation, normalized, None).await
+        self.authorize_claimed(operation, normalized, None, None)
+            .await
     }
 
     /// Runs the deployment authorizer for one operation, binding the claimed
-    /// transfer into the request on a record-handoff check.
+    /// transfer into the request on a record-handoff check and the claimed
+    /// result contract on a submit-task-result check.
     async fn authorize_claimed(
         &self,
         operation: A2AOperation,
         normalized: &NormalizedAgentCommand,
         handoff: Option<crate::auth::A2AHandoffClaim<'_>>,
+        task_result: Option<crate::auth::A2ATaskResultClaim<'_>>,
     ) -> RakkaAgentA2AResult<()> {
         let request = A2AAuthorizationRequest {
             operation,
@@ -1055,6 +1133,7 @@ where
             handoff,
             team: None,
             conversation: None,
+            task_result,
         };
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),

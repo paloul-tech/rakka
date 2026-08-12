@@ -39,6 +39,17 @@ pub enum A2AOperation {
     /// a deployment authorizer can gate each verb and bind the authenticated
     /// caller to the speaker the cluster claims to be.
     ConversationCommand,
+    /// A `message:send` naming an existing task and carrying a typed-result
+    /// submission: the authenticated completion of a human-owned task
+    /// (specification 8.12).
+    ///
+    /// A distinct operation class from [`Self::SendMessage`] so a deployment
+    /// authorizer can permit ordinary sends yet gate completions — the
+    /// request carries the claimed result contract as
+    /// [`A2AAuthorizationRequest::task_result`], which is what lets the
+    /// authorizer bind the authenticated caller to the definition and schema
+    /// the submission claims to fulfill.
+    SubmitTaskResult,
     /// `tasks/get`.
     GetTask,
     /// `tasks/list`.
@@ -68,6 +79,7 @@ impl A2AOperation {
             Self::RecordHandoff => "record-handoff",
             Self::TeamCommand => "team-command",
             Self::ConversationCommand => "conversation-command",
+            Self::SubmitTaskResult => "submit-task-result",
             Self::GetTask => "get-task",
             Self::ListTasks => "list-tasks",
             Self::CancelTask => "cancel-task",
@@ -147,6 +159,31 @@ pub struct A2AConversationClaim<'a> {
     pub turn: Option<u32>,
 }
 
+/// The result-contract claim riding one [`A2AOperation::SubmitTaskResult`]
+/// check.
+///
+/// Every field is the submission's *claim*, surfaced before anything durable
+/// happens so the deployment authorizer can bind the authenticated caller —
+/// who rides [`A2AAuthorizationRequest::principal`], with the task on
+/// [`A2AAuthorizationRequest::task_id`] — to the contract the submission
+/// claims to fulfill. The task entity then re-validates the same claims
+/// against its durable definition, which gates consistency but never
+/// identity. Fields are optional because the claim rides the check even when
+/// the binding is half-absent; the command build fails closed afterwards.
+#[derive(Debug, Clone, Copy)]
+pub struct A2ATaskResultClaim<'a> {
+    /// The task-definition contract the submission claims to fulfill.
+    pub definition: Option<&'a str>,
+    /// The claimed revision of that definition.
+    pub definition_version: Option<u64>,
+    /// The schema the result claims to be expressed in.
+    pub result_schema: Option<&'a str>,
+    /// The claimed revision of that schema.
+    pub result_schema_version: Option<u64>,
+    /// The claimed evidence digest, when the submission carries one.
+    pub evidence_digest: Option<&'a str>,
+}
+
 /// One authorization check.
 #[derive(Debug, Clone)]
 pub struct A2AAuthorizationRequest<'a> {
@@ -165,6 +202,9 @@ pub struct A2AAuthorizationRequest<'a> {
     /// The claimed conversation command, on
     /// [`A2AOperation::ConversationCommand`] checks.
     pub conversation: Option<A2AConversationClaim<'a>>,
+    /// The claimed result contract, on [`A2AOperation::SubmitTaskResult`]
+    /// checks.
+    pub task_result: Option<A2ATaskResultClaim<'a>>,
 }
 
 /// Authorization decision.

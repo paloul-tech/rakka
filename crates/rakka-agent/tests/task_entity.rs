@@ -311,7 +311,7 @@ impl Fixture {
     /// [`Self::settle`], but surfacing the first error instead of panicking —
     /// what a sweep needs, because an armed crash point kills the owner
     /// mid-settle and the injected loss is the point, not a failure.
-    async fn try_settle(&self) -> Result<(), String> {
+    async fn try_settle(&self) -> Result<rakka_agent::AgentTaskProgress, String> {
         let mut entity = AgentTaskEntityStore::new(
             task_scope(),
             self.tasks.clone(),
@@ -325,8 +325,7 @@ impl Fixture {
         entity
             .settle_side_effects(&self.router, self.now())
             .await
-            .map_err(|error| error.code().to_string())?;
-        Ok(())
+            .map_err(|error| error.code().to_string())
     }
 
     async fn snapshot(&self) -> AgentTaskSnapshot {
@@ -850,11 +849,14 @@ async fn an_assignments_exhausted_delegated_child_owes_its_delegation_result() {
     );
 
     // The terminating sweep owed and delivered the delegation result; the
-    // probe predates the kind, so its refusal is unsettleable and the sweep
-    // surfaces it while the exchange stays outstanding.
-    assert!(
-        exhausting.is_err(),
-        "the owed report's refusal is the receiver's inability, surfaced loudly"
+    // probe predates the kind, so its refusal is unsettleable — the sweep
+    // records the failed attempt on the outstanding exchange rather than
+    // erroring the pass, so one unanswerable envelope cannot wedge every
+    // other exchange the entity owes.
+    let progress = exhausting.expect("the sweep reports the inability without failing the pass");
+    assert_eq!(
+        progress.failed, 1,
+        "the owed report's refusal is the receiver's inability, recorded as a failed attempt"
     );
     assert_eq!(
         fx.run_transport.deliveries(),
@@ -864,7 +866,11 @@ async fn an_assignments_exhausted_delegated_child_owes_its_delegation_result() {
 
     // A later sweep re-drives the same exchange: still owed, still answered
     // with the owner's inability, never dropped.
-    assert!(fx.try_settle().await.is_err());
+    let progress = fx
+        .try_settle()
+        .await
+        .expect("the re-drive reports the inability without failing the pass");
+    assert_eq!(progress.failed, 1);
     assert_eq!(fx.run_transport.deliveries(), deliveries_before + 2);
 }
 
@@ -1206,7 +1212,7 @@ async fn drive_dependency_flow(fx: &Fixture) -> Result<(), String> {
         })
         .await?)?;
     fx.try_settle().await?;
-    fx.try_settle().await
+    fx.try_settle().await.map(|_| ())
 }
 
 #[tokio::test]

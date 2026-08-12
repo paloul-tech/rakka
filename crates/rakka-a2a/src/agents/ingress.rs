@@ -50,6 +50,57 @@ pub const META_TASK_DEFINITION: &str = "io.rakka.agent.task-definition";
 /// sends that share it converge on one task whatever their message ids.
 pub const META_DEDUPLICATION_KEY: &str = crate::mapping::META_DEDUPLICATION_KEY;
 
+/// Metadata key carrying a typed-result submission's declared contract
+/// (specification 8.12): one structured object naming the task definition,
+/// its revision, and the result schema the submission claims to fulfill.
+///
+/// A `message/send` naming an existing `task_id` and carrying this key is
+/// the authenticated completion of a human-owned task; the message parts
+/// carry the typed result itself. The object parses whole or fails the send
+/// closed — a field this build does not serve is refused, never silently
+/// dropped — and the entity re-validates every claim against its durable
+/// definition.
+pub const META_AGENT_RESULT: &str = "io.rakka.agent.result";
+
+/// The declared contract of one typed-result submission, parsed whole from
+/// [`META_AGENT_RESULT`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AgentTaskResultBinding {
+    /// The task-definition id the submission claims to fulfill.
+    pub definition: String,
+    /// The claimed revision of that definition.
+    pub definition_version: u64,
+    /// The schema the result is expressed in.
+    pub result_schema: String,
+    /// The claimed revision of that schema.
+    pub result_schema_version: u64,
+    /// The claimed evidence digest, when the submission carries one.
+    /// Advisory for the deployment authorizer; the surface accepts no
+    /// evidence artifacts yet.
+    #[serde(default)]
+    pub evidence_digest: Option<String>,
+}
+
+/// Parses the result binding when the key is present: present means it
+/// parses whole, the collaboration extension's rule.
+fn parse_result_binding(
+    metadata: &HashMap<String, Value>,
+) -> RakkaAgentA2AResult<Option<AgentTaskResultBinding>> {
+    let Some(value) = metadata.get(META_AGENT_RESULT) else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| {
+            RakkaAgentA2AError::Mapping(A2AMappingError::InvalidMetadata {
+                field: META_AGENT_RESULT.to_string(),
+                reason: "the result binding must be one object with definition, \
+                     definition-version, result-schema, and result-schema-version",
+            })
+        })
+}
+
 /// Normalized identity for one agents-surface command request.
 #[derive(Debug, Clone)]
 pub struct NormalizedAgentCommand {
@@ -84,6 +135,10 @@ pub struct NormalizedAgentCommand {
     /// handoff cluster — when the send engaged the versioned collaboration
     /// extension (specification 14.4). `None` for an ordinary send.
     pub collaboration: Option<super::collaboration::AgentCollaborationEnvelope>,
+    /// The typed-result submission's declared contract, when the send
+    /// carried [`META_AGENT_RESULT`] (specification 8.12). `None` for every
+    /// other command.
+    pub result: Option<AgentTaskResultBinding>,
 }
 
 impl NormalizedAgentCommand {
@@ -147,6 +202,17 @@ pub fn normalize_agent_send(
     // it continues an existing task, never creates one, and deduplicates
     // under its own reserved kind.
     let collaboration = super::collaboration::parse_collaboration_envelope(message, metadata)?;
+    // The result binding parses at the same chokepoint. Two engagements on
+    // one send are refused whole: a submission riding a collaboration
+    // cluster is a half-formed engagement, not a message to route by
+    // precedence.
+    let result = parse_result_binding(metadata)?;
+    if result.is_some() && collaboration.is_some() {
+        return Err(RakkaAgentA2AError::Refused {
+            code: "result-binding-conflicts-with-collaboration".to_string(),
+            message: "a typed-result submission cannot ride a collaboration engagement".to_string(),
+        });
+    }
     let operation_kind = match collaboration.as_ref() {
         Some(super::collaboration::AgentCollaborationEnvelope::Handoff(cluster)) => {
             if !matches!(intent, A2ATaskIntent::ContinueTask) {
@@ -229,6 +295,7 @@ pub fn normalize_agent_send(
                     .map_err(RakkaAgentA2AError::Mapping)?,
                 telemetry: extract_ingress_telemetry(metadata),
                 collaboration,
+                result: None,
             });
         }
         Some(super::collaboration::AgentCollaborationEnvelope::Conversation(cluster)) => {
@@ -332,9 +399,43 @@ pub fn normalize_agent_send(
                     .map_err(RakkaAgentA2AError::Mapping)?,
                 telemetry: extract_ingress_telemetry(metadata),
                 collaboration,
+                result: None,
             });
         }
-        _ => AgentOperationKind::TaskCreation,
+        // A delegation envelope creates a child task; a continuation naming
+        // `message.task_id` under it is a half-formed engagement refused
+        // where it enters — the accidental fall-through into the parked
+        // input path is closed for good.
+        Some(super::collaboration::AgentCollaborationEnvelope::Delegation(_))
+            if matches!(intent, A2ATaskIntent::ContinueTask) =>
+        {
+            return Err(RakkaAgentA2AError::Refused {
+                code: "delegation-send-names-task".to_string(),
+                message: "a delegation creates a child task; it must not name message.task_id"
+                    .to_string(),
+            });
+        }
+        // One arm, one kind per intent: a continuation is a typed-result
+        // submission (specification 8.12) — there is deliberately no
+        // normalize-time discrimination between "result" and "plain input";
+        // the task entity decides by ownership. The kind split keeps a
+        // submission's operation id from ever aliasing a creation's over
+        // identical segments. A declared contract on a task-creating send is
+        // a half-formed engagement, refused rather than silently dropped.
+        _ => match intent {
+            A2ATaskIntent::NewTask => {
+                if result.is_some() {
+                    return Err(RakkaAgentA2AError::Refused {
+                        code: "result-submission-requires-task".to_string(),
+                        message: "a typed-result submission must name the task it completes \
+                                  via message.task_id"
+                            .to_string(),
+                    });
+                }
+                AgentOperationKind::TaskCreation
+            }
+            A2ATaskIntent::ContinueTask => AgentOperationKind::ResultSubmission,
+        },
     };
     let operation_id = AgentOperationId::new(
         operation_kind,
@@ -359,6 +460,7 @@ pub fn normalize_agent_send(
             .map_err(RakkaAgentA2AError::Mapping)?,
         telemetry: extract_ingress_telemetry(metadata),
         collaboration,
+        result,
     })
 }
 
@@ -409,6 +511,7 @@ pub fn normalize_agent_cancel(
         task_definition: None,
         telemetry: extract_ingress_telemetry(metadata),
         collaboration: None,
+        result: None,
     })
 }
 
@@ -555,6 +658,60 @@ pub fn agent_task_create_command(
             delegation,
             telemetry: normalized.telemetry.clone(),
         }),
+    })
+}
+
+/// Builds the deduplicated typed-result submission command for one
+/// normalized continuation carrying the result binding
+/// ([specification 8.12](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The deduplication contract the caller signs up to: the discriminator —
+/// the explicit `io.rakka.command.deduplication_key`, or the message id —
+/// identifies one logical submission, and a retry under it converges on the
+/// original decision, a recorded *rejection* included. A corrected
+/// resubmission after a rejection is a new decision and must carry a new
+/// key.
+///
+/// # Errors
+///
+/// Fails closed when the binding is absent (`io.rakka.agent.result` — there
+/// is no plain-input path to fall back to), when no authenticated principal
+/// rides the send (specification 8.12: an *authenticated* human or
+/// service), or when the input exceeds the bounded inline content limit.
+/// Every binding field is a claim the task entity re-validates against its
+/// durable definition.
+pub fn agent_task_result_command(
+    normalized: &NormalizedAgentCommand,
+    input: Value,
+    causation: &str,
+    now: rakka_agent_workflow::AgentTimestampMillis,
+) -> RakkaAgentA2AResult<AgentTaskEntityCommand> {
+    let Some(binding) = normalized.result.as_ref() else {
+        return Err(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+            field: "io.rakka.agent.result",
+        }));
+    };
+    let Some(principal) = normalized.principal.as_ref() else {
+        return Err(RakkaAgentA2AError::Mapping(A2AMappingError::MissingField {
+            field: crate::mapping::META_PRINCIPAL_REF,
+        }));
+    };
+    let submission = rakka_agent::AgentHumanResultSubmission {
+        principal: format!("{}:{}", principal.principal_type, principal.principal_id),
+        definition_id: rakka_agent::AgentTaskDefinitionId::new(&binding.definition)?,
+        definition_version: rakka_agent::AgentRevisionNumber::new(binding.definition_version),
+        result_schema: rakka_agent::AgentSchemaRef::new(
+            rakka_agent::AgentSchemaId::new(&binding.result_schema)?,
+            rakka_agent::AgentRevisionNumber::new(binding.result_schema_version),
+        ),
+        content: AgentTaskContent::inline(input)?,
+        evidence: Vec::new(),
+        causation_id: rakka_agent_workflow::AgentCausationId::new(causation),
+        submitted_at: now,
+    };
+    Ok(AgentTaskEntityCommand::SubmitHumanResult {
+        operation_id: normalized.operation_id.clone(),
+        submission: Box::new(submission),
     })
 }
 

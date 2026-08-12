@@ -39,7 +39,10 @@ pub use collaboration::{
 pub use delegation::A2AAgentDelegationSendExecutor;
 pub use error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 pub use handoff::A2AAgentHandoffSendExecutor;
-pub use ingress::{NormalizedAgentCommand, META_AGENT_ID, META_TASK_DEFINITION};
+pub use ingress::{
+    AgentTaskResultBinding, NormalizedAgentCommand, META_AGENT_ID, META_AGENT_RESULT,
+    META_TASK_DEFINITION,
+};
 pub use management::{
     agent_management_extension, management_request_message, parse_management_response,
     AgentManagementCommand, AgentManagementDescription, AgentManagementOutcome,

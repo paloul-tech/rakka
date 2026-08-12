@@ -339,6 +339,76 @@ where
         })
     }
 
+    fn submit_task_result(
+        &self,
+        request: rakka_agent::AgentClientTaskResultRequest,
+    ) -> AgentClientFuture<'_, AgentClientTaskView> {
+        Box::pin(async move {
+            let mut message = Message::new(
+                Role::User,
+                vec![Part {
+                    content: PartContent::Data(request.result),
+                    filename: None,
+                    media_type: Some("application/json".to_string()),
+                    metadata: None,
+                }],
+            );
+            message.task_id = Some(request.task);
+            let mut metadata = serde_json::Map::new();
+            if let Some(key) = request.deduplication_key {
+                metadata.insert(META_DEDUPLICATION_KEY.to_string(), Value::String(key));
+            }
+            let mut binding = serde_json::Map::new();
+            binding.insert("definition".to_string(), Value::String(request.definition));
+            binding.insert(
+                "definition-version".to_string(),
+                Value::Number(request.definition_version.into()),
+            );
+            binding.insert(
+                "result-schema".to_string(),
+                Value::String(request.result_schema),
+            );
+            binding.insert(
+                "result-schema-version".to_string(),
+                Value::Number(request.result_schema_version.into()),
+            );
+            if let Some(digest) = request.evidence_digest {
+                binding.insert("evidence-digest".to_string(), Value::String(digest));
+            }
+            metadata.insert(
+                super::ingress::META_AGENT_RESULT.to_string(),
+                Value::Object(binding),
+            );
+            if let Some(principal) = request.principal.as_ref().or(self.principal.as_ref()) {
+                metadata.insert(
+                    META_PRINCIPAL_REF.to_string(),
+                    Self::principal_metadata(principal),
+                );
+            }
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                let mut carrier = rakka_agent_workflow::AgentAttributes::new();
+                if rakka_agent_workflow::inject_agent_trace_context(telemetry, &mut carrier).is_ok()
+                {
+                    for (key, value) in carrier {
+                        metadata.insert(key, Value::String(value));
+                    }
+                }
+            }
+            let send = SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: Some(metadata.into_iter().collect()),
+                tenant: self.tenant.clone(),
+            };
+            let task = self
+                .service
+                .send_message(&Self::params(), &send)
+                .await
+                .map_err(client_error)?;
+            client_view(&task)
+        })
+    }
+
     fn task<'a>(&'a self, task: &'a str) -> AgentClientFuture<'a, Option<AgentClientTaskView>> {
         Box::pin(async move {
             match self
