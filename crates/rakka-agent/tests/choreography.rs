@@ -20,8 +20,8 @@ use rakka_agent::testkit::{
 use rakka_agent::{
     drive_pending_exchanges, AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeHost,
     AgentExchangeInitiation, AgentExchangeKind, AgentExchangePayload, AgentExchangeReply,
-    AgentExchangeSettlement, AgentId, AgentOperationId, AgentOperationKind, AgentRunId,
-    AgentRunScope, AgentTaskId, AgentTaskScope, TenantId, AGENT_EXCHANGE_LOG_CAPACITY,
+    AgentExchangeSettlement, AgentExchangeState, AgentId, AgentOperationId, AgentOperationKind,
+    AgentRunId, AgentRunScope, AgentTaskId, AgentTaskScope, TenantId, AGENT_EXCHANGE_LOG_CAPACITY,
     AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
@@ -759,6 +759,65 @@ async fn an_entity_may_not_owe_more_exchanges_than_durable_state_holds() {
         .await
         .expect_err("an entity may not owe an unbounded number of exchanges");
     assert_eq!(error.code(), "exchange-pending-overflow");
+}
+
+#[tokio::test]
+async fn a_withdrawn_exchange_frees_its_slot_and_is_never_re_driven() {
+    // Withdrawal is the escape valve for an exchange whose result the
+    // initiator can no longer consume: the slot returns to the bounded pending
+    // list, and the envelope is gone from the re-drive list for good.
+    let fx = Fixture::new();
+    let mut host = fx.host(run_address()).await;
+
+    for index in 0..AGENT_EXCHANGE_PENDING_CAPACITY {
+        let envelope = fx.envelope(
+            AgentExchangeKind::BudgetSettlement,
+            &format!("owed-{index}"),
+        );
+        initiate(&mut host, envelope, fx.now()).await;
+    }
+    let withdrawn = operation("owed-0");
+
+    host.initiate(fx.now(), |state| {
+        assert!(state.exchange_journal_mut().withdraw(&withdrawn));
+        // Withdrawing what is not owed reports it, and changes nothing.
+        assert!(!state
+            .exchange_journal_mut()
+            .withdraw(&operation("never-owed")));
+        Ok(Vec::new())
+    })
+    .await
+    .expect("the withdrawal commits");
+
+    let outstanding = host.outstanding().expect("the participant is recovered");
+    assert_eq!(outstanding.len(), AGENT_EXCHANGE_PENDING_CAPACITY - 1);
+    assert!(
+        !outstanding
+            .iter()
+            .any(|pending| pending.operation_id() == &operation("owed-0")),
+        "the withdrawn envelope left the re-drive list"
+    );
+
+    // The freed slot is usable, which is the point of the withdrawal.
+    let replacement = fx.envelope(AgentExchangeKind::BudgetSettlement, "replacement");
+    initiate(&mut host, replacement, fx.now()).await;
+    assert_eq!(
+        host.outstanding()
+            .expect("the participant is recovered")
+            .len(),
+        AGENT_EXCHANGE_PENDING_CAPACITY
+    );
+
+    // And it survives passivation: withdrawal is a durable edit, not a
+    // materialized one.
+    let recovered = fx.host(run_address()).await;
+    assert_eq!(
+        recovered
+            .outstanding()
+            .expect("the participant is recovered")
+            .len(),
+        AGENT_EXCHANGE_PENDING_CAPACITY
+    );
 }
 
 #[test]

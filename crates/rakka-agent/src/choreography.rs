@@ -73,9 +73,17 @@
 //! A receiver that rejects an exchange — a task's deterministic rules reject a
 //! proposed result — has made a *durable decision*. It is recorded in the
 //! journal, returned on replay like any other result, and settled by the
-//! initiator. Only a transport failure leaves an exchange outstanding. This is
-//! what makes "a lost rejection" impossible
+//! initiator. This is what makes "a lost rejection" impossible
 //! ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 59).
+//!
+//! The one refusal that is *not* a decision is the one a participant's
+//! [`AgentExchangeParticipant::check_settle`] classifies unsettleable: an
+//! inability to answer at all — the receiving entity does not exist yet, the
+//! payload was written by a newer binary, the kind postdates this owner. Those
+//! leave the exchange outstanding on the initiator, and the receiver does not
+//! record them either, so the next re-drive re-runs the transition instead of
+//! replaying the inability. Alongside a transport failure, that is the only
+//! way an exchange stays owed.
 //!
 //! # Deduplication windows are bounded, so transitions are also fenced
 //!
@@ -1384,6 +1392,23 @@ impl AgentExchangeJournal {
             .find(|pending| &pending.envelope.operation_id == operation_id)
     }
 
+    /// Withdraws an exchange this entity owes but can no longer act on.
+    ///
+    /// The at-least-once promise covers exchanges whose result the initiator can
+    /// still consume. A terminal task's dependency registration is not one: no
+    /// upstream outcome could move it, and the derivation that owed it already
+    /// derives nothing for a terminal task — so the envelope only holds a
+    /// pending slot that the task's own terminal notifications need. Withdrawal
+    /// is by operation id and reports whether anything was owed; call it only
+    /// from a transition that can prove the exchange moot. Everything else
+    /// re-drives.
+    pub fn withdraw(&mut self, operation_id: &AgentOperationId) -> bool {
+        let before = self.pending.len();
+        self.pending
+            .retain(|pending| &pending.envelope.operation_id != operation_id);
+        self.pending.len() != before
+    }
+
     /// Records a failed delivery attempt.
     ///
     /// The exchange stays outstanding. A delivery failure is never evidence that
@@ -1951,6 +1976,14 @@ where
     /// logical result, no transition, no write. A new one transitions the
     /// participant and records its result in the same compare-and-set, so the
     /// result is durable before the reply leaves.
+    ///
+    /// One class of result is deliberately not recorded: a refusal this
+    /// participant's own [`AgentExchangeParticipant::check_settle`] classifies
+    /// unsettleable. Such a refusal is what the *initiator* treats as "not yet"
+    /// — it leaves the exchange outstanding for re-drive — so memoizing it here
+    /// would answer every re-drive from the journal without ever re-running the
+    /// transition, and the exchange could never converge however often the
+    /// courier delivered it.
     pub async fn accept(
         &mut self,
         envelope: &AgentExchangeEnvelope,
@@ -1980,12 +2013,26 @@ where
             .apply(&mut state, envelope, now)
             .into_parts();
         let owed = propagate_exchange_telemetry(envelope.telemetry(), owed);
-        state.exchange_journal_mut().record_applied(
-            envelope.operation_id().clone(),
-            envelope.kind(),
-            result.clone(),
-            now,
-        );
+        // The unsettleable class is an inability to answer — an uncreated
+        // receiver, a payload this binary cannot decode, a kind it predates —
+        // never a decision, so re-running the transition on the next delivery
+        // repeats no durable effect. The classification is the participant's
+        // own, which is what makes the two sides of the exchange agree by
+        // construction: exactly the refusals the initiator keeps outstanding
+        // are the ones the receiver declines to memoize.
+        let settles = result.is_accepted()
+            || !matches!(
+                self.participant.check_settle(envelope, &result),
+                Err(AgentChoreographyError::UnsettleableRefusal { .. })
+            );
+        if settles {
+            state.exchange_journal_mut().record_applied(
+                envelope.operation_id().clone(),
+                envelope.kind(),
+                result.clone(),
+                now,
+            );
+        }
         // The result and whatever it now owes commit together, so a receiver can
         // never be durably committed to a decision whose onward exchange it
         // forgot to record.

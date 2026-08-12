@@ -113,7 +113,7 @@ use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
     AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
     AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
-    AgentExchangeState, AgentExchangeTransition,
+    AgentExchangeState, AgentExchangeTransition, AGENT_EXCHANGE_PENDING_CAPACITY,
 };
 use crate::definition::{
     AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
@@ -224,9 +224,14 @@ pub const AGENT_TASK_MAX_DEPENDENCY_DEPTH: usize = 32;
 ///
 /// Symmetric with [`AGENT_TASK_MAX_DEPENDENCIES`]: the reverse edges are
 /// bounded exactly like the forward edges, so neither side of the dependency
-/// graph can grow a task's materialized record without bound. The
-/// thirty-third registration is refused definitively; the refused dependent
-/// stays `Blocked` on the application-relay path.
+/// graph can grow a task's materialized record without bound. Entries are
+/// never pruned, so the ceiling counts every dependent that ever registered
+/// while the task was nonterminal, not the ones still live.
+///
+/// The thirty-third registration is refused definitively — and the refusal is
+/// an answer, not silence: the refused dependent resolves that forward edge
+/// *failed* and applies the policy the edge declared, because an upstream that
+/// holds no registry entry for it can never send it an outcome.
 pub const AGENT_TASK_MAX_DEPENDENTS: usize = 32;
 
 /// How many rejected human-submission operation ids the task remembers past
@@ -5572,7 +5577,7 @@ fn finalize_task_cancellation(
     }
     let reason = cancellation.reason.clone();
     terminate(state, operation_id, reason, now)?;
-    owed_child_reports(state, now)
+    owed_child_reports(state, now, 0)
 }
 
 /// Moves the task to a terminal status and records why.
@@ -5623,6 +5628,11 @@ fn terminate(
             now,
         );
     }
+    // No upstream outcome can move a terminal task, so the registrations its
+    // forward edges still owe are moot. They are withdrawn in this same
+    // compare-and-set, which is what leaves the journal room for the outcome
+    // notifications this terminal now owes its own dependents.
+    withdraw_moot_registrations(state);
     Ok(())
 }
 
@@ -6809,9 +6819,15 @@ fn owed_dependency_registrations(
 /// fields. The journal's initiation record guards the bounded window; the
 /// registry entry's `outcome_settled` marker quiesces the derivation past
 /// it.
+///
+/// At most `budget` notifications are derived per call, so a registry larger
+/// than the journal's free pending slots defers the remainder to a later pass
+/// rather than failing the terminal transition outright
+/// ([`owed_exchange_budget`]).
 fn owed_dependent_outcomes(
     state: &AgentTaskState,
     now: AgentTimestampMillis,
+    budget: usize,
 ) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let Some(task) = state.task.as_ref() else {
         return Ok(Vec::new());
@@ -6824,6 +6840,11 @@ fn owed_dependent_outcomes(
     };
     let mut owed = Vec::new();
     for record in task.dependents.values() {
+        if owed.len() >= budget {
+            // Out of journal headroom, not out of dependents: the rest are
+            // owed by a later pass. See [`owed_exchange_budget`].
+            break;
+        }
         if record.outcome_settled {
             continue;
         }
@@ -6866,19 +6887,84 @@ fn owed_dependent_outcomes(
     Ok(owed)
 }
 
+/// How many further exchanges this task may owe in one transition without
+/// overflowing the journal's bounded pending list, given the `reserved`
+/// envelopes the calling transition already owes.
+///
+/// Recording an owed exchange fails the *whole* transition on overflow rather
+/// than dropping the exchange, so a derivation that produces a batch — the
+/// outcome notifications a terminal task owes its dependents — has to fit
+/// itself to what is free, or a task with a full dependency graph could not
+/// terminalize at all. The dependent registry and the forward edges are each
+/// bounded by their own ceiling and share one pending list, and a terminal
+/// task's registrations are withdrawn before this is consulted
+/// ([`withdraw_moot_registrations`]), so in practice the budget binds only a
+/// task that owes an unusual amount of other work at the same moment.
+///
+/// Fitting is safe because the derivation is pure over durable state: the
+/// registry entry's `outcome_settled` marker survives the transition, so a
+/// notification that does not fit here is owed by the next settle pass
+/// instead. Deferral, never loss.
+fn owed_exchange_budget(state: &AgentTaskState, reserved: usize) -> usize {
+    AGENT_EXCHANGE_PENDING_CAPACITY
+        .saturating_sub(state.journal.outstanding_count())
+        .saturating_sub(reserved)
+}
+
+/// Withdraws the dependency registrations a task can no longer act on, and
+/// reports how many it dropped.
+///
+/// A registration exists to make an upstream owe this task an outcome
+/// notification. A terminal task consumes no outcome — [`owed_dependency_registrations`]
+/// already derives nothing for one — so an outstanding registration is dead
+/// weight holding a pending slot that this task's *own* notifications to its
+/// dependents need. Both sides of the graph are bounded by the same ceiling
+/// and the pending list is smaller than their sum, which is exactly the case
+/// this reclaims.
+fn withdraw_moot_registrations(state: &mut AgentTaskState) -> usize {
+    let Some(task) = state.task.as_ref() else {
+        return 0;
+    };
+    if !task.status.is_terminal() {
+        return 0;
+    }
+    let operations: Vec<AgentOperationId> = task
+        .dependencies
+        .values()
+        .filter_map(|edge| {
+            dependency_registration_operation_id(
+                state.scope.tenant(),
+                &edge.dependency,
+                state.scope.task(),
+            )
+            .ok()
+        })
+        .collect();
+    operations
+        .iter()
+        .filter(|operation| state.journal.withdraw(operation))
+        .count()
+}
+
 /// Every child report a terminal task owes right now: the epoch result to a
 /// wake controller, the delegation result to a delegating parent run, and
 /// the dependency outcomes its registered dependents wait on. One consult
 /// point, so every transition that can terminalize a task or close its
 /// ledger owes all three from the same compare-and-set.
+///
+/// `reserved` is how many envelopes the calling transition already owes; the
+/// dependent notifications fit themselves into what is left of the journal's
+/// pending list ([`owed_exchange_budget`]).
 fn owed_child_reports(
     state: &AgentTaskState,
     now: AgentTimestampMillis,
+    reserved: usize,
 ) -> AgentTaskResult<Vec<AgentExchangeEnvelope>> {
     let mut owed = Vec::new();
     owed.extend(owed_epoch_result(state, now)?);
     owed.extend(owed_delegation_result(state, now)?);
-    owed.extend(owed_dependent_outcomes(state, now)?);
+    let budget = owed_exchange_budget(state, reserved.saturating_add(owed.len()));
+    owed.extend(owed_dependent_outcomes(state, now, budget)?);
     Ok(owed)
 }
 
@@ -8687,7 +8773,7 @@ fn decide_assignment(
         // outstanding — and a delegated child's parent is parked awaiting
         // exactly this outcome: the reports the terminal task owes upward
         // are accurate now, and owed from this same compare-and-set.
-        return owed_child_reports(state, now);
+        return owed_child_reports(state, now, 0);
     }
 
     let (agent_definition_revision, agent_settings_revision) =
@@ -9378,7 +9464,7 @@ fn submit_human_result(
                         remaining_attempts: remaining,
                         digest,
                     };
-                    let owed = owed_child_reports(state, now)?;
+                    let owed = owed_child_reports(state, now, 0)?;
                     Ok((AgentTaskOutcomeExtras::submission(decision), owed))
                 }
                 ResultAcceptanceCore::Bounds(error) => Err(error),
@@ -9419,7 +9505,7 @@ fn submit_human_result(
                 remaining_attempts: committed.remaining,
                 digest,
             };
-            let owed = owed_child_reports(state, now)?;
+            let owed = owed_child_reports(state, now, 0)?;
             Ok((AgentTaskOutcomeExtras::submission(decision), owed))
         }
     }
@@ -9714,9 +9800,12 @@ fn apply_dependency_registration(
         ));
     }
     let Some(task) = state.task.as_ref() else {
-        // Retryable by classification: a racing create converges on the next
-        // re-drive, and a never-created upstream leaves the dependent
-        // durably `Blocked` — the documented stuck-dependency posture.
+        // Retryable by classification, and unmemoized because of it: the host
+        // does not record an unsettleable refusal in the applied log, so the
+        // next re-drive re-runs this arm rather than replaying the answer, and
+        // a racing create converges. A never-created upstream leaves the
+        // dependent durably `Blocked` — the documented stuck-dependency
+        // posture.
         return AgentExchangeTransition::new(refuse(
             state,
             "task-not-created",
@@ -9921,7 +10010,7 @@ fn apply_dependency_outcome(
             // The terminalization a cancelling edge may have finalized owes
             // its own child reports in this same compare-and-set — the
             // transitive-chain recursion point.
-            match owed_child_reports(state, now) {
+            match owed_child_reports(state, now, owed.len()) {
                 Ok(reports) => owed.extend(reports),
                 Err(error) => {
                     debug_assert!(false, "child-report construction failed: {error}");
@@ -9938,9 +10027,10 @@ fn apply_dependency_outcome(
 }
 
 /// Settles the upstream's answer to a dependency registration at the
-/// dependent: the edge's marker flips, and a receipt that carried an
-/// already-terminal upstream's outcome applies it through the same core the
-/// notification would.
+/// dependent: the edge's marker flips, and the answer resolves the edge when
+/// it decides it — a receipt carrying an already-terminal upstream's outcome,
+/// or a definitive refusal, which means no notification can ever arrive. Both
+/// resolve through the same core the notification would.
 fn settle_dependency_registration_exchange(
     state: &mut AgentTaskState,
     envelope: &AgentExchangeEnvelope,
@@ -9976,34 +10066,20 @@ fn settle_dependency_registration_exchange(
             .decode(AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE);
         if let Ok(receipt) = receipt {
             if let Some(outcome) = receipt.outcome {
-                let Ok(operation_id) = dependency_outcome_operation_id(
-                    state.scope.tenant(),
-                    &upstream,
-                    state.scope.task(),
-                ) else {
-                    return Vec::new();
-                };
-                match record_dependency_outcome(state, &operation_id, &upstream, outcome, now) {
-                    Ok(mut owed) => {
-                        match owed_child_reports(state, now) {
-                            Ok(reports) => owed.extend(reports),
-                            Err(error) => {
-                                debug_assert!(false, "child-report construction failed: {error}");
-                            }
-                        }
-                        return owed;
-                    }
-                    // The dependent turned terminal meanwhile, or the relay
-                    // resolved the edge first — either way nothing is owed
-                    // here, and the relay's record stands.
-                    Err(_) => return Vec::new(),
-                }
+                return apply_registration_outcome(state, &upstream, outcome, now);
             }
         }
         return Vec::new();
     }
-    // A refusal `check_settle` classified definitive: the dependent stays
-    // `Blocked`, resolvable only through the application relay.
+    // A refusal `check_settle` classified definitive: the upstream will never
+    // hold a registry entry for this dependent, so the notification the
+    // forward edge waits on can never be sent. The refusal is recorded, and
+    // then the edge resolves *failed* — through the same core an upstream
+    // failure takes, so the policy the edge declared decides what that means:
+    // cancellation under the default, evidence under `ContinueWithEvidence`.
+    // Leaving the edge unresolved instead would hold the dependent `Blocked`
+    // forever with no terminal status, no policy applied, and no signal beyond
+    // the history row below.
     let code = result
         .status()
         .rejection_code()
@@ -10021,7 +10097,44 @@ fn settle_dependency_registration_exchange(
         )
         .with_detail(code.clone())
     });
-    Vec::new()
+    apply_registration_outcome(state, &upstream, AgentTaskDependencyOutcome::Failed, now)
+}
+
+/// Resolves one forward edge from what its registration exchange returned —
+/// an already-terminal upstream's carried outcome, or the failure a
+/// definitively refused registration implies — and returns whatever the
+/// resolution now owes.
+///
+/// It runs the relay command's own core, so a registration-derived resolution
+/// and an application-relayed one are the same transition: the same conflict
+/// fence, the same cancellation *request* over a live run, the same history
+/// row, and the same durable counters the outcome metric is measured from.
+fn apply_registration_outcome(
+    state: &mut AgentTaskState,
+    upstream: &AgentTaskId,
+    outcome: AgentTaskDependencyOutcome,
+    now: AgentTimestampMillis,
+) -> Vec<AgentExchangeEnvelope> {
+    let Ok(operation_id) =
+        dependency_outcome_operation_id(state.scope.tenant(), upstream, state.scope.task())
+    else {
+        return Vec::new();
+    };
+    match record_dependency_outcome(state, &operation_id, upstream, outcome, now) {
+        Ok(mut owed) => {
+            match owed_child_reports(state, now, owed.len()) {
+                Ok(reports) => owed.extend(reports),
+                Err(error) => {
+                    debug_assert!(false, "child-report construction failed: {error}");
+                }
+            }
+            owed
+        }
+        // The dependent turned terminal meanwhile, or the relay resolved the
+        // edge first — either way nothing is owed here, and the record that
+        // already stands is the one that counts.
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Settles the dependent's answer to an outcome notification at the
@@ -10132,7 +10245,7 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 // the epoch and delegation reports self-gate on ledger
                 // closure, so a surviving rejection owes nothing.
                 let mut transition = AgentExchangeTransition::new(result);
-                match owed_child_reports(state, now) {
+                match owed_child_reports(state, now, 0) {
                     Ok(owed) => {
                         for envelope in owed {
                             transition = transition.owing(envelope);
@@ -10158,8 +10271,10 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                 // so the finalization commits here too; its own child
                 // reports deduplicate against the consult below.
                 let mut transition = AgentExchangeTransition::new(result);
+                let mut reserved = 0;
                 match finalize_task_cancellation(state, envelope.operation_id(), now) {
                     Ok(owed) => {
+                        reserved = owed.len();
                         for envelope in owed {
                             transition = transition.owing(envelope);
                         }
@@ -10168,7 +10283,7 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                         debug_assert!(false, "cancellation finalization failed: {error}");
                     }
                 }
-                match owed_child_reports(state, now) {
+                match owed_child_reports(state, now, reserved) {
                     Ok(owed) => {
                         for envelope in owed {
                             transition = transition.owing(envelope);
@@ -10302,11 +10417,14 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             AgentExchangeKind::DependencyRegistration if !result.is_accepted() => {
                 // A refused registration settles only under the upstream's
                 // definitive answers: forged, ceiling reached, or unable to
-                // bound the record. `task-not-created` deliberately stays
-                // outstanding — a racing create converges on the next
-                // re-drive, and a never-created upstream leaves the
-                // dependent durably `Blocked`, the documented
-                // stuck-dependency struggle signal.
+                // bound the record. Each means the upstream holds no registry
+                // entry and never will, so the dependent resolves the edge
+                // itself on settlement. `task-not-created` deliberately stays
+                // outstanding instead — the upstream may yet be created, and
+                // the receiver does not memoize this class of refusal, so a
+                // racing create converges on the next re-drive. A
+                // never-created upstream leaves the dependent durably
+                // `Blocked`, the documented stuck-dependency struggle signal.
                 match result.status().rejection_code() {
                     Some(
                         "dependency-registration-forged"
@@ -10882,7 +11000,7 @@ where
                             outcome,
                             now,
                         )?;
-                        owed.extend(owed_child_reports(state, now)?);
+                        owed.extend(owed_child_reports(state, now, owed.len())?);
                         Ok((operation_id, AgentTaskOutcomeExtras::NONE, owed))
                     })
                     .await?;
@@ -11587,6 +11705,11 @@ where
     /// crash between a terminal commit and the initiation lands here. The
     /// registry entry's `outcome_settled` marker quiesces the derivation
     /// past the journal's bounded window.
+    ///
+    /// It is also where a notification the terminal transition had no journal
+    /// headroom for is finally owed: the pass first withdraws the forward-edge
+    /// registrations the terminal task can no longer act on, which is what
+    /// frees the slots for it.
     async fn settle_dependent_notifications(
         &mut self,
         now: AgentTimestampMillis,
@@ -11615,12 +11738,19 @@ where
         let mut rejection = None;
         let committed = self
             .host
-            .initiate(now, |state| match owed_dependent_outcomes(state, now) {
-                Ok(owed) => Ok(owed),
-                Err(error) => {
-                    let carried = AgentChoreographyError::from(error.clone());
-                    rejection = Some(error);
-                    Err(carried)
+            .initiate(now, |state| {
+                // A task that terminalized under a binary predating the
+                // withdrawal — or one whose registrations were still owed when
+                // it terminalized — reclaims their slots here, before the
+                // budget is measured.
+                withdraw_moot_registrations(state);
+                match owed_dependent_outcomes(state, now, owed_exchange_budget(state, 0)) {
+                    Ok(owed) => Ok(owed),
+                    Err(error) => {
+                        let carried = AgentChoreographyError::from(error.clone());
+                        rejection = Some(error);
+                        Err(carried)
+                    }
                 }
             })
             .await;

@@ -18,7 +18,8 @@ use rakka_agent::{
     AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntityCommand,
     AgentTaskEntityStore, AgentTaskId, AgentTaskOwnership, AgentTaskScope, AgentTaskState,
     AgentTaskStatus, AGENT_DEPENDENCY_OUTCOME_PAYLOAD_TYPE,
-    AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE, AGENT_TASK_MAX_DEPENDENTS,
+    AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE, AGENT_TASK_MAX_DEPENDENCIES,
+    AGENT_TASK_MAX_DEPENDENTS,
 };
 use rakka_agent_workflow::AgentCorrelationId;
 use serde_json::json;
@@ -428,9 +429,216 @@ async fn forged_and_conflicting_dependency_exchanges_fail_closed() {
     assert_eq!(edge.outcome, Some(AgentTaskDependencyOutcome::Completed));
 }
 
-/// The thirty-third dependent is refused definitively; the refused
-/// dependent stays `Blocked` with the refusal in its history, resolvable
-/// only through the application relay.
+/// A dependent created before its upstream converges: the registration is
+/// refused `task-not-created`, which the upstream does *not* memoize, so the
+/// next re-drive re-runs the arm against the now-created task.
+#[tokio::test]
+async fn a_registration_racing_its_upstreams_creation_converges() {
+    let fx = fixture();
+    // The dependent goes first, so its registration lands at a task that does
+    // not exist yet.
+    fx.apply_task_command_at(
+        &task_scope(),
+        creation(
+            TASK,
+            true,
+            vec![AgentTaskDependencyDeclaration::new(
+                upstream_scope().task().clone(),
+            )],
+        ),
+    )
+    .await
+    .expect("the dependent creates");
+    for _round in 0..4 {
+        let _ = fx.settle_task_at(&task_scope()).await;
+    }
+    let dependent = state_at(&fx, &task_scope()).await;
+    assert!(
+        !dependent
+            .task()
+            .expect("the dependent exists")
+            .dependencies
+            .get(upstream_scope().task())
+            .expect("the edge stands")
+            .registration_settled,
+        "the refusal is retryable, so nothing settled"
+    );
+
+    // The upstream is created a moment later. Nothing re-declares the edge:
+    // the still-outstanding registration is simply re-driven.
+    fx.apply_task_command_at(&upstream_scope(), creation(UPSTREAM, true, Vec::new()))
+        .await
+        .expect("the upstream creates");
+    for _round in 0..4 {
+        let _ = fx.settle_task_at(&task_scope()).await;
+    }
+
+    let upstream = state_at(&fx, &upstream_scope()).await;
+    assert!(
+        upstream
+            .task()
+            .expect("the upstream exists")
+            .dependents
+            .contains_key(task_scope().task()),
+        "the re-drive registered the dependent"
+    );
+    let dependent = state_at(&fx, &task_scope()).await;
+    assert!(
+        dependent
+            .task()
+            .expect("the dependent exists")
+            .dependencies
+            .get(upstream_scope().task())
+            .expect("the edge stands")
+            .registration_settled
+    );
+    let progress = fx
+        .settle_task_at(&task_scope())
+        .await
+        .expect("the pass settles");
+    assert_eq!(progress.outstanding, 0, "the derivation quiesced");
+}
+
+/// A registration the upstream refuses definitively resolves the dependent's
+/// own edge: no registry entry exists, so no notification can ever arrive,
+/// and the edge's declared policy decides what that means rather than the
+/// dependent waiting on an answer that cannot come.
+#[tokio::test]
+async fn a_registration_refused_at_the_ceiling_resolves_the_dependents_edge() {
+    let fx = fixture();
+    fx.apply_task_command_at(&upstream_scope(), creation(UPSTREAM, true, Vec::new()))
+        .await
+        .expect("the upstream creates");
+    for index in 0..AGENT_TASK_MAX_DEPENDENTS {
+        let dependent = scope_for(&format!("filler-{index}"));
+        let registration = registration_envelope(
+            &fx,
+            &dependent,
+            AgentEntityAddress::Task(dependent.clone()),
+            upstream_scope().task(),
+        );
+        assert_eq!(
+            deliver_to_task(&fx, &upstream_scope(), &registration).await,
+            None,
+            "registration {index} records"
+        );
+    }
+
+    // A real dependent now declares the edge against the full registry.
+    fx.apply_task_command_at(
+        &task_scope(),
+        creation(
+            TASK,
+            true,
+            vec![AgentTaskDependencyDeclaration::new(
+                upstream_scope().task().clone(),
+            )],
+        ),
+    )
+    .await
+    .expect("the dependent creates");
+    for _round in 0..4 {
+        let _ = fx.settle_task_at(&task_scope()).await;
+    }
+
+    let dependent = state_at(&fx, &task_scope()).await;
+    let dependent_task = dependent.task().expect("the dependent exists");
+    let edge = dependent_task
+        .dependencies
+        .get(upstream_scope().task())
+        .expect("the edge stands");
+    assert!(edge.registration_settled);
+    assert_eq!(
+        edge.outcome,
+        Some(AgentTaskDependencyOutcome::Failed),
+        "an unregisterable edge resolves failed rather than hanging"
+    );
+    assert_eq!(
+        dependent_task.status,
+        AgentTaskStatus::Cancelled,
+        "the declared cancel-dependents policy applied"
+    );
+    let progress = fx
+        .settle_task_at(&task_scope())
+        .await
+        .expect("the pass settles");
+    assert_eq!(progress.outstanding, 0, "nothing is left owed");
+}
+
+/// A task whose forward edges and dependents both sit at their ceilings
+/// terminalizes and notifies every one of them: the moot registrations a
+/// terminal task can no longer act on are withdrawn, so the two bounded
+/// sides of the graph never contend for the journal's single pending list.
+#[tokio::test]
+async fn a_terminal_task_notifies_every_dependent_past_the_pending_bound() {
+    let fx = fixture();
+    let dependencies: Vec<AgentTaskDependencyDeclaration> = (0..AGENT_TASK_MAX_DEPENDENCIES)
+        .map(|index| {
+            AgentTaskDependencyDeclaration::new(
+                AgentTaskId::new(format!("upstream-{index}")).expect("the task id is valid"),
+            )
+        })
+        .collect();
+    fx.apply_task_command_at(&task_scope(), creation(TASK, true, dependencies))
+        .await
+        .expect("the task creates");
+    // None of the upstreams exist, so every registration is refused
+    // `task-not-created` and stays outstanding — the documented posture.
+    for _round in 0..4 {
+        let _ = fx.settle_task_at(&task_scope()).await;
+    }
+    for index in 0..AGENT_TASK_MAX_DEPENDENTS {
+        let dependent = scope_for(&format!("dependent-{index}"));
+        let registration = registration_envelope(
+            &fx,
+            &dependent,
+            AgentEntityAddress::Task(dependent.clone()),
+            task_scope().task(),
+        );
+        assert_eq!(
+            deliver_to_task(&fx, &task_scope(), &registration).await,
+            None,
+            "registration {index} records"
+        );
+    }
+
+    fx.apply_task_command_at(
+        &task_scope(),
+        AgentTaskEntityCommand::Cancel {
+            operation_id: AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Cancellation,
+                [TENANT, TASK, "operator"],
+            )
+            .expect("the operation id derives"),
+            reason: "abandoned".to_string(),
+        },
+    )
+    .await
+    .expect("a full dependency graph does not block terminalization");
+
+    let mut progress = None;
+    for _round in 0..8 {
+        progress = fx.settle_task_at(&task_scope()).await.ok();
+    }
+    assert_eq!(
+        progress.expect("the pass settles").outstanding,
+        0,
+        "every notification settled and no moot registration is left owed"
+    );
+    let task_state = state_at(&fx, &task_scope()).await;
+    let task = task_state.task().expect("the task exists");
+    assert_eq!(task.status, AgentTaskStatus::Cancelled);
+    assert_eq!(task.dependents.len(), AGENT_TASK_MAX_DEPENDENTS);
+    assert!(
+        task.dependents
+            .values()
+            .all(|record| record.outcome_settled),
+        "every registered dependent was notified"
+    );
+}
+
+/// The thirty-third dependent is refused definitively, and the refusal is
+/// recorded at the upstream with its exact code.
 #[tokio::test]
 async fn the_dependents_ceiling_refuses_the_thirty_third_registration() {
     let fx = fixture();
