@@ -205,10 +205,13 @@ where
     /// Records the agent domain's bounded counters through this recorder.
     ///
     /// The service builds its own entity stores rather than routing through
-    /// the sharded entities, so without this the domain counters those
-    /// stores emit — `rakka.agent.moderation.turns` above all — would stay
-    /// at zero for the wire, which is the only carrier the turn protocol
-    /// has.
+    /// the sharded entities, so a store built without it records through the
+    /// noop recorder and its counters stay at zero for the wire — which for
+    /// the human submission (`rakka.agent.human.results`) and the turn
+    /// protocol (`rakka.agent.moderation.turns`) is the only carrier they
+    /// have. Every store this service builds that accepts a recorder is
+    /// wired from here; forgetting one silences its counters with no other
+    /// symptom, so a new store site must be wired at the same time.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = metrics;
@@ -370,7 +373,8 @@ where
         let board_task = cluster.task.clone();
         let (scope, command) = agent_team_command(normalized, now)?;
         let mut store =
-            AgentTeamEntityStore::new(scope.clone(), self.teams.clone(), self.team_history.clone());
+            AgentTeamEntityStore::new(scope.clone(), self.teams.clone(), self.team_history.clone())
+                .with_metrics(self.metrics.clone());
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
             // A domain refusal is a decision the caller rebases on, not a
@@ -398,7 +402,8 @@ where
                         self.tasks.clone(),
                         self.agents.clone(),
                         self.history.clone(),
-                    );
+                    )
+                    .with_metrics(self.metrics.clone());
                     let _ = tasks.settle_side_effects(&self.router, now).await;
                 }
             }
@@ -991,7 +996,8 @@ where
             self.tasks.clone(),
             self.agents.clone(),
             self.history.clone(),
-        );
+        )
+        .with_metrics(self.metrics.clone());
         let reply = store.apply(command, &self.router, now).await?;
         match reply {
             AgentTaskEntityReply::Applied { .. } | AgentTaskEntityReply::Duplicate { .. } => {}
@@ -1035,7 +1041,8 @@ where
             self.tasks.clone(),
             self.agents.clone(),
             self.history.clone(),
-        );
+        )
+        .with_metrics(self.metrics.clone());
         store.recover(now).await?;
         let Some(snapshot) = store.snapshot()? else {
             return Ok(None);
@@ -1066,7 +1073,8 @@ where
             self.tasks.clone(),
             self.agents.clone(),
             self.history.clone(),
-        );
+        )
+        .with_metrics(self.metrics.clone());
         store.recover(now).await?;
         Ok(store.snapshot()?)
     }

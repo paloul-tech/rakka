@@ -36,9 +36,10 @@ use rakka_agent::{
     AgentTaskHistoryKind, AgentTaskHistoryStore, AgentTaskId, AgentTaskLimits, AgentTaskOwnership,
     AgentTaskResultCheck, AgentTaskResultRule, AgentTaskRuleId, AgentTaskScope, AgentTaskState,
     AgentTaskStatus, InMemoryAgentRunEffectSink, InMemoryAgentTaskHistoryStore,
-    InMemoryAgentTeamHistoryStore, RakkaAgentClient, TenantId,
+    InMemoryAgentTeamHistoryStore, RakkaAgentClient, TenantId, METRIC_AGENT_HUMAN_RESULTS,
 };
 use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
+use rakka_core::InMemoryMetricsRecorder;
 use rakka_persistence::InMemoryDurableStateStore;
 
 type TaskStore = CrashingStateStore<AgentTaskState>;
@@ -121,6 +122,7 @@ struct Fixture {
     history: InMemoryAgentTaskHistoryStore,
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
+    metrics: Arc<InMemoryMetricsRecorder>,
     service: Arc<Service>,
 }
 
@@ -137,6 +139,7 @@ impl Fixture {
         let effects = InMemoryAgentRunEffectSink::new();
         let clock = Arc::new(AtomicU64::new(1));
 
+        let metrics = Arc::new(InMemoryMetricsRecorder::new());
         let deferred = DeferredExchangeRouter::new();
         let task_transport = InProcessTaskEntityTransport::new(
             tasks.clone(),
@@ -177,7 +180,8 @@ impl Fixture {
                 authorizer,
             )
             .with_clock(Arc::new(TestClock(clock.clone())))
-            .with_default_tenant(TENANT),
+            .with_default_tenant(TENANT)
+            .with_metrics(metrics.clone()),
         );
 
         Self {
@@ -186,6 +190,7 @@ impl Fixture {
             history,
             router,
             clock,
+            metrics,
             service,
         }
     }
@@ -378,6 +383,13 @@ async fn an_authenticated_submission_completes_the_human_task() {
         1,
         "one acceptance, ever"
     );
+
+    // The wire is the only carrier a human submission has, so the decision
+    // counter has to be wired through the store the service builds — counted
+    // once for the decision, nothing for the duplicate.
+    let observations = fixture.metrics.snapshot();
+    let decisions = observations.observations_named(METRIC_AGENT_HUMAN_RESULTS);
+    assert_eq!(decisions.len(), 1, "one durable decision, one count");
 }
 
 /// The fail-closed matrix: every half-formed or misaddressed submission is
