@@ -20,12 +20,13 @@ use a2a_server::ServiceParams;
 use rakka_agent::AgentExchangeRouter;
 use rakka_agent::{
     load_agent_run_state, AgentConversationEntityReply, AgentConversationEntityStore,
-    AgentConversationHistoryStore, AgentConversationState, AgentEntityCommand, AgentEntityReply,
-    AgentEntityState, AgentEntityStore, AgentId, AgentOperationId, AgentOperationKind,
-    AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaPolicy, AgentScope,
-    AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskEntityStore, AgentTaskHistoryStore,
-    AgentTaskId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTeamEntityReply,
-    AgentTeamEntityStore, AgentTeamHistoryStore, AgentTeamState, TenantId,
+    AgentConversationHistoryStore, AgentConversationScope, AgentConversationState,
+    AgentEntityCommand, AgentEntityReply, AgentEntityState, AgentEntityStore, AgentId,
+    AgentOperationId, AgentOperationKind, AgentRunScope, AgentRunState, AgentRunStatus,
+    AgentSchemaPolicy, AgentScope, AgentTaskEntityCommand, AgentTaskEntityReply,
+    AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskId, AgentTaskScope, AgentTaskSnapshot,
+    AgentTaskState, AgentTeamEntityReply, AgentTeamEntityStore, AgentTeamHistoryStore,
+    AgentTeamScope, AgentTeamState, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
@@ -218,6 +219,45 @@ where
         self
     }
 
+    /// The task entity facade, wired.
+    ///
+    /// Every task store this service builds comes from here, and that is the
+    /// whole point of it existing. The service holds a recorder of its own,
+    /// and the store constructors default to the noop one, so a store built
+    /// directly records nothing and gives no other symptom — no error, no
+    /// log, just a counter that never leaves zero. Three slices in a row
+    /// shipped exactly that, each time by adding a `new` call *beside* the
+    /// wiring instead of through it. Going through an accessor leaves nothing
+    /// to forget: there is no second way to get a store.
+    fn task_store(&self, scope: AgentTaskScope) -> AgentTaskEntityStore<Tasks, Agents, History> {
+        AgentTaskEntityStore::new(
+            scope,
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        )
+        .with_metrics(self.metrics.clone())
+    }
+
+    /// The team entity facade, wired — see [`Self::task_store`].
+    fn team_store(&self, scope: AgentTeamScope) -> AgentTeamEntityStore<Teams, TeamHistory> {
+        AgentTeamEntityStore::new(scope, self.teams.clone(), self.team_history.clone())
+            .with_metrics(self.metrics.clone())
+    }
+
+    /// The conversation entity facade, wired — see [`Self::task_store`].
+    fn conversation_store(
+        &self,
+        scope: AgentConversationScope,
+    ) -> AgentConversationEntityStore<Conversations, ConversationHistory> {
+        AgentConversationEntityStore::new(
+            scope,
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        )
+        .with_metrics(self.metrics.clone())
+    }
+
     /// Uses an explicit time source.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn A2AAgentClock>) -> Self {
@@ -372,9 +412,7 @@ where
 
         let board_task = cluster.task.clone();
         let (scope, command) = agent_team_command(normalized, now)?;
-        let mut store =
-            AgentTeamEntityStore::new(scope.clone(), self.teams.clone(), self.team_history.clone())
-                .with_metrics(self.metrics.clone());
+        let mut store = self.team_store(scope.clone());
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
             // A domain refusal is a decision the caller rebases on, not a
@@ -397,13 +435,7 @@ where
         if let Some(task) = board_task {
             if let Ok(task) = AgentTaskId::new(task) {
                 if let Ok(task_scope) = AgentTaskScope::new(normalized.tenant.clone(), task) {
-                    let mut tasks = AgentTaskEntityStore::new(
-                        task_scope,
-                        self.tasks.clone(),
-                        self.agents.clone(),
-                        self.history.clone(),
-                    )
-                    .with_metrics(self.metrics.clone());
+                    let mut tasks = self.task_store(task_scope);
                     let _ = tasks.settle_side_effects(&self.router, now).await;
                 }
             }
@@ -479,12 +511,7 @@ where
         }
 
         let (scope, command) = agent_conversation_command(normalized, now)?;
-        let mut store = AgentConversationEntityStore::new(
-            scope,
-            self.conversations.clone(),
-            self.conversation_history.clone(),
-        )
-        .with_metrics(self.metrics.clone());
+        let mut store = self.conversation_store(scope);
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
             // A domain refusal is a decision the caller rebases on, not a
@@ -991,13 +1018,7 @@ where
         now: AgentTimestampMillis,
     ) -> RakkaAgentA2AResult<AgentTaskSnapshot> {
         let scope = AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())?;
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        )
-        .with_metrics(self.metrics.clone());
+        let mut store = self.task_store(scope);
         let reply = store.apply(command, &self.router, now).await?;
         match reply {
             AgentTaskEntityReply::Applied { .. } | AgentTaskEntityReply::Duplicate { .. } => {}
@@ -1036,13 +1057,7 @@ where
         let tenant = TenantId::new(tenant);
         let task = AgentTaskId::new(task_id)?;
         let scope = AgentTaskScope::new(tenant.clone(), task)?;
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        )
-        .with_metrics(self.metrics.clone());
+        let mut store = self.task_store(scope);
         store.recover(now).await?;
         let Some(snapshot) = store.snapshot()? else {
             return Ok(None);
@@ -1068,13 +1083,7 @@ where
         now: AgentTimestampMillis,
     ) -> RakkaAgentA2AResult<Option<AgentTaskSnapshot>> {
         let scope = AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())?;
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        )
-        .with_metrics(self.metrics.clone());
+        let mut store = self.task_store(scope);
         store.recover(now).await?;
         Ok(store.snapshot()?)
     }
