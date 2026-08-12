@@ -8,20 +8,23 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::{task_definition, task_scope, tenant, Fixture, TASK, TENANT};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
     dependency_outcome_operation_id, dependency_registration_operation_id, load_agent_task_state,
     AgentDependencyFailurePolicy, AgentDependencyOutcomeNotice, AgentDependencyRegistration,
     AgentEntityAddress, AgentExchangeEnvelope, AgentExchangeKind, AgentExchangePayload,
-    AgentOperationId, AgentSchemaPolicy, AgentTaskContent, AgentTaskCreation,
+    AgentExchangeState, AgentOperationId, AgentSchemaPolicy, AgentTaskContent, AgentTaskCreation,
     AgentTaskDependencyDeclaration, AgentTaskDependencyOutcome, AgentTaskEntityCommand,
     AgentTaskEntityStore, AgentTaskId, AgentTaskOwnership, AgentTaskScope, AgentTaskState,
     AgentTaskStatus, AGENT_DEPENDENCY_OUTCOME_PAYLOAD_TYPE,
     AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE, AGENT_TASK_MAX_DEPENDENCIES,
-    AGENT_TASK_MAX_DEPENDENTS,
+    AGENT_TASK_MAX_DEPENDENTS, METRIC_AGENT_EXCHANGE_UNSETTLEABLE,
 };
 use rakka_agent_workflow::AgentCorrelationId;
+use rakka_core::InMemoryMetricsRecorder;
 use serde_json::json;
 
 const UPSTREAM: &str = "human-upstream";
@@ -497,6 +500,75 @@ async fn a_registration_racing_its_upstreams_creation_converges() {
         .await
         .expect("the pass settles");
     assert_eq!(progress.outstanding, 0, "the derivation quiesced");
+}
+
+/// A permanently unanswerable exchange is *reported*, not swallowed. The pass
+/// still succeeds — one stuck envelope must never wedge the other exchanges an
+/// entity owes — but the caller can tell a durably wedged entity from a
+/// healthy one, and standing wedged stops costing a durable write once the
+/// refusal is recorded.
+#[tokio::test]
+async fn a_permanently_unanswerable_exchange_is_reported_not_swallowed() {
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ))
+    .with_metrics(metrics.clone());
+    // The upstream is never created, so the registration is answered
+    // `task-not-created` — the class `check_settle` leaves outstanding
+    // because only a future receiver could resolve it.
+    fx.apply_task_command_at(
+        &task_scope(),
+        creation(
+            TASK,
+            true,
+            vec![AgentTaskDependencyDeclaration::new(
+                upstream_scope().task().clone(),
+            )],
+        ),
+    )
+    .await
+    .expect("the dependent creates");
+
+    // The creation's own settle pass already met the wedge, so the loop is
+    // measured as a delta.
+    let before = metrics.snapshot();
+    let counted_before = before
+        .observations_named(METRIC_AGENT_EXCHANGE_UNSETTLEABLE)
+        .len();
+    assert_eq!(counted_before, 1, "the creation's own pass counted it once");
+
+    const ROUNDS: usize = 4;
+    for round in 0..ROUNDS {
+        let progress = fx
+            .settle_task_at(&task_scope())
+            .await
+            .expect("one unanswerable envelope does not fail the pass");
+        assert_eq!(progress.unsettleable, 1, "round {round}");
+        assert_eq!(progress.outstanding, 1, "round {round}");
+    }
+
+    let observations = metrics.snapshot();
+    assert_eq!(
+        observations
+            .observations_named(METRIC_AGENT_EXCHANGE_UNSETTLEABLE)
+            .len()
+            - counted_before,
+        ROUNDS,
+        "a standing wedge counts on every sweep, so it is alertable as a rate"
+    );
+
+    // The refusal is durably legible, and re-driving it costs nothing further:
+    // the attempt counter moved exactly once, not once per pass.
+    let state = state_at(&fx, &task_scope()).await;
+    let pending = state.exchange_journal().outstanding();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].last_failure_code(), Some("task-not-created"));
+    assert_eq!(
+        pending[0].attempts(),
+        1,
+        "an unchanged refusal writes nothing further"
+    );
 }
 
 /// A registration the upstream refuses definitively resolves the dependent's

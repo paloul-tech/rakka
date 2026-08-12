@@ -1265,7 +1265,13 @@ impl PendingExchange {
         &self.envelope
     }
 
-    /// How many delivery attempts have failed.
+    /// How many attempts recorded a failure.
+    ///
+    /// A repeated *unsettleable refusal* is recorded once, not once per pass:
+    /// the receiver keeps answering the same thing, and the exchange's durable
+    /// state has not moved, so re-recording it would cost a revision per settle
+    /// pass forever. A counter that stops climbing under a standing wedge is
+    /// the intended reading.
     #[must_use]
     pub const fn attempts(&self) -> u32 {
         self.attempts
@@ -1283,7 +1289,8 @@ impl PendingExchange {
         self.last_attempt_at
     }
 
-    /// Stable code of the last delivery failure.
+    /// Stable code of the last failure — a transport error, or the receiver's
+    /// refusal when it answered with one no re-drive can settle.
     #[must_use]
     pub fn last_failure_code(&self) -> Option<&str> {
         self.last_failure_code.as_deref()
@@ -1407,6 +1414,41 @@ impl AgentExchangeJournal {
         self.pending
             .retain(|pending| &pending.envelope.operation_id != operation_id);
         self.pending.len() != before
+    }
+
+    /// Records a refusal the initiator cannot settle, and reports whether
+    /// anything durable changed.
+    ///
+    /// This is not a delivery failure: the receiver *answered*, and the answer
+    /// is one no re-drive can settle until a different receiver answers — an
+    /// upstream that gets created, an owner upgraded past the kind. The courier
+    /// keeps re-delivering, because delivering is the only thing that discovers
+    /// that change; but re-recording an identical refusal every pass would burn
+    /// a durable revision forever on an exchange whose state has not moved, so
+    /// an unchanged code writes nothing and reports `false`.
+    ///
+    /// The recorded code is what makes a wedged exchange legible in durable
+    /// state, and the courier's report is what makes it legible to the caller.
+    pub fn record_unsettleable_refusal(
+        &mut self,
+        operation_id: &AgentOperationId,
+        code: &str,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| &pending.envelope.operation_id == operation_id)
+        else {
+            return false;
+        };
+        if pending.last_failure_code.as_deref() == Some(code) {
+            return false;
+        }
+        pending.attempts = pending.attempts.saturating_add(1);
+        pending.last_attempt_at = Some(now);
+        pending.last_failure_code = Some(code.to_string());
+        true
     }
 
     /// Records a failed delivery attempt.
@@ -2106,6 +2148,31 @@ where
         Ok(initiations)
     }
 
+    /// Records a refusal this entity cannot settle against one outstanding
+    /// exchange.
+    ///
+    /// The exchange stays outstanding, and a refusal identical to the one
+    /// already recorded writes nothing: a permanently unanswerable exchange
+    /// must not cost a durable revision on every settle pass for the rest of
+    /// the entity's life.
+    pub async fn record_unsettleable_refusal(
+        &mut self,
+        operation_id: &AgentOperationId,
+        code: &str,
+        now: AgentTimestampMillis,
+    ) -> AgentChoreographyResult<()> {
+        let record = self.recovered_record()?;
+        let mut state = record.state.clone();
+        if !state
+            .exchange_journal_mut()
+            .record_unsettleable_refusal(operation_id, code, now)
+        {
+            return Ok(());
+        }
+        self.persist(state, record.revision).await?;
+        Ok(())
+    }
+
     /// Records a failed delivery attempt against one outstanding exchange.
     ///
     /// The exchange stays outstanding: a transport failure is not evidence that
@@ -2226,8 +2293,22 @@ impl Display for AgentExchangeDeliveryError {
 
 impl Error for AgentExchangeDeliveryError {}
 
+/// One exchange whose reply its initiator cannot settle.
+///
+/// The receiver answered, and the answer is a refusal the participant
+/// classified as one only a *different* receiver could resolve. Both fields
+/// come from closed vocabularies, so the pair is safe to carry into a bounded
+/// metric label as well as into a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExchangeUnsettleable {
+    /// The exchange kind that was refused.
+    pub kind: AgentExchangeKind,
+    /// The receiver's stable refusal code.
+    pub code: String,
+}
+
 /// What one pass of the courier did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentExchangeDriveReport {
     /// Exchanges that were outstanding when the pass started.
     pub outstanding: usize,
@@ -2237,8 +2318,19 @@ pub struct AgentExchangeDriveReport {
     pub duplicate_replies: usize,
     /// Replies the entity had no record of owing.
     pub unknown_replies: usize,
-    /// Delivery attempts that failed and left their exchange outstanding.
+    /// Attempts that left their exchange outstanding — a transport failure, or
+    /// a refusal no re-drive can settle. The [`Self::unsettleable`] entries are
+    /// the second kind, counted here as well.
     pub failed: usize,
+    /// The refusals this pass could not settle, in the order it met them.
+    ///
+    /// Non-empty means the entity is durably wedged on an exchange the current
+    /// receiver cannot answer: the pass still succeeded, and every *other*
+    /// exchange the entity owes still moved, but these will not converge until
+    /// something outside this entity changes. A caller that reports a clean
+    /// pass without looking here cannot tell a wedged entity from a healthy
+    /// one.
+    pub unsettleable: Vec<AgentExchangeUnsettleable>,
 }
 
 /// Drives every exchange one entity owes, once.
@@ -2287,9 +2379,17 @@ where
                         // recorded, exactly as `AgentExchangeHost::settle`
                         // documents; erroring the pass instead would let one
                         // unanswerable envelope wedge every other exchange
-                        // this entity owes.
-                        host.record_delivery_failure(envelope.operation_id(), &code, now)
+                        // this entity owes. It is reported rather than
+                        // swallowed, because a pass that returns `Ok` and says
+                        // nothing makes a wedged entity look healthy — and an
+                        // unchanged code writes nothing durable, so standing
+                        // wedged is not also a standing cost.
+                        host.record_unsettleable_refusal(envelope.operation_id(), &code, now)
                             .await?;
+                        report.unsettleable.push(AgentExchangeUnsettleable {
+                            kind: envelope.kind(),
+                            code,
+                        });
                         report.failed += 1;
                     }
                     Err(error) => return Err(error),

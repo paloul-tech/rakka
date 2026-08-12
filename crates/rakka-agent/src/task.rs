@@ -135,9 +135,9 @@ use crate::identity::{
     AgentWakeId, TenantId, AGENT_IDENTITY_MAX_LENGTH,
 };
 use crate::observability::{
-    record_agent_domain_counter, METRIC_AGENT_DEPENDENCY_OUTCOMES, METRIC_AGENT_EPOCHS,
-    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
-    METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_WAKE_DISPOSITIONS,
+    record_agent_domain_counter, record_unsettleable_exchanges, METRIC_AGENT_DEPENDENCY_OUTCOMES,
+    METRIC_AGENT_EPOCHS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION,
+    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_WAKE_DISPOSITIONS,
 };
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
@@ -12059,11 +12059,13 @@ where
         let resolved_before = self.dependency_outcome_totals();
         let report = drive_pending_exchanges(&mut self.host, router, now).await?;
         self.record_dependency_outcomes(resolved_before);
+        record_unsettleable_exchanges(self.metrics.as_ref(), &report.unsettleable);
         Ok(AgentTaskProgress {
             assigned,
             history_flushed: flushed,
             settled: report.settled,
             failed: report.failed,
+            unsettleable: report.unsettleable.len(),
             outstanding: self.host.outstanding()?.len(),
             rewakes_parked,
         })
@@ -12575,6 +12577,11 @@ pub struct AgentTaskProgress {
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.
     pub failed: usize,
+    /// How many of those `failed` attempts were refusals no re-drive can
+    /// settle — the task is durably wedged on them until something outside it
+    /// changes, even though the pass itself succeeded.
+    #[serde(default)]
+    pub unsettleable: usize,
     /// How many exchanges the task still owes.
     pub outstanding: usize,
     /// How many controller-originated re-wakes it parked durably.

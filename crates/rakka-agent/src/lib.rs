@@ -130,10 +130,11 @@ pub use choreography::{
     AgentExchangeEnvelope, AgentExchangeHost, AgentExchangeInitiation, AgentExchangeJournal,
     AgentExchangeKind, AgentExchangeMessage, AgentExchangeParticipant, AgentExchangePayload,
     AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter, AgentExchangeSettlement,
-    AgentExchangeState, AgentExchangeStatus, AgentExchangeTransport, PendingExchange,
-    ShardedExchangeRoute, AGENT_EXCHANGE_CODEC_ID, AGENT_EXCHANGE_ENVELOPE_TYPE_ID,
-    AGENT_EXCHANGE_LOG_CAPACITY, AGENT_EXCHANGE_PAYLOAD_MAX_BYTES, AGENT_EXCHANGE_PENDING_CAPACITY,
-    AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION, AGENT_EXCHANGE_REPLY_TYPE_ID,
+    AgentExchangeState, AgentExchangeStatus, AgentExchangeTransport, AgentExchangeUnsettleable,
+    PendingExchange, ShardedExchangeRoute, AGENT_EXCHANGE_CODEC_ID,
+    AGENT_EXCHANGE_ENVELOPE_TYPE_ID, AGENT_EXCHANGE_LOG_CAPACITY, AGENT_EXCHANGE_PAYLOAD_MAX_BYTES,
+    AGENT_EXCHANGE_PENDING_CAPACITY, AGENT_EXCHANGE_REMOTE_SCHEMA_VERSION,
+    AGENT_EXCHANGE_REPLY_TYPE_ID,
 };
 pub use client::{
     AgentClientAgentStatus, AgentClientError, AgentClientFuture, AgentClientManagementCommand,
@@ -216,20 +217,21 @@ pub use model::{
     AGENT_TOOL_ARGUMENTS_MAX_BYTES,
 };
 pub use observability::{
-    record_agent_domain_counter, record_agent_domain_gauge, sanitize_agent_telemetry_context,
-    validate_agent_domain_metric_attributes, AgentDecisionDraft, AgentDecisionEvent,
-    AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, AgentDecisionWriteStatus,
-    AgentObservabilityError, AgentObservabilityFuture, AgentObservabilityResult,
-    InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
+    record_agent_domain_counter, record_agent_domain_gauge, record_unsettleable_exchanges,
+    sanitize_agent_telemetry_context, validate_agent_domain_metric_attributes, AgentDecisionDraft,
+    AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    AgentDecisionWriteStatus, AgentObservabilityError, AgentObservabilityFuture,
+    AgentObservabilityResult, InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
     AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
     METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
     METRIC_AGENT_DEPENDENCY_OUTCOMES, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION,
-    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS,
-    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
-    METRIC_AGENT_MODERATION_TURNS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
-    METRIC_AGENT_TEAM_OPERATIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
-    METRIC_AGENT_WAKE_DISPOSITIONS, METRIC_AGENT_WORKFLOW_RESULTS,
+    METRIC_AGENT_EXCHANGE_UNSETTLEABLE, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
+    METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
+    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODERATION_TURNS, METRIC_AGENT_RECOVERY_EVENTS,
+    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TEAM_OPERATIONS,
+    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
+    METRIC_AGENT_WORKFLOW_RESULTS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{

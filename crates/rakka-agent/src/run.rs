@@ -111,11 +111,12 @@ use crate::memory::{
 };
 use crate::model::AgentModelError;
 use crate::observability::{
-    record_agent_domain_counter, record_agent_domain_gauge, AgentDecisionDraft,
-    AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource, METRIC_AGENT_DECISIONS,
-    METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_EFFECT_OUTCOMES,
-    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    record_agent_domain_counter, record_agent_domain_gauge, record_unsettleable_exchanges,
+    AgentDecisionDraft, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
+    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_FAN_IN_RESOLUTIONS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
     METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WORKFLOW_RESULTS,
 };
 use crate::schema::{
@@ -6675,6 +6676,8 @@ where
             progress.decisions_flushed += decisions;
             progress.settled += report.settled;
             progress.failed += report.failed;
+            progress.unsettleable += report.unsettleable.len();
+            record_unsettleable_exchanges(self.metrics.as_ref(), &report.unsettleable);
 
             if advanced == 0
                 && cancels == 0
@@ -7323,6 +7326,8 @@ pub struct AgentRunProgress {
     pub settled: usize,
     /// How many delivery attempts failed, leaving their exchange outstanding.
     pub failed: usize,
+    /// How many of those were refusals no re-drive can settle.
+    pub unsettleable: usize,
     /// How many exchanges the run still owes.
     pub outstanding: usize,
 }
