@@ -130,6 +130,30 @@ where
         ServiceParams::new()
     }
 
+    /// The durable identity of a submission whose caller supplied none.
+    ///
+    /// Pure over what the submission *claims* — the task it completes, the
+    /// contract it declares, and the content itself — so a retry of the same
+    /// submission converges on the decision already recorded, and a corrected
+    /// resubmission carries a different identity without the caller having to
+    /// remember to change one. The entity behind this call is built entirely
+    /// around operation-id convergence; a wrapper that mints a fresh id per
+    /// call opts its callers out of that silently.
+    fn derived_submission_key(request: &rakka_agent::AgentClientTaskResultRequest) -> String {
+        let claim = serde_json::json!({
+            "task": request.task,
+            "definition": request.definition,
+            "definition-version": request.definition_version,
+            "result-schema": request.result_schema,
+            "result-schema-version": request.result_schema_version,
+            "result": request.result,
+        });
+        format!(
+            "derived-{}",
+            rakka_agent::AgentContentDigest::of_json(&claim).value
+        )
+    }
+
     fn principal_metadata(principal: &PrincipalRef) -> Value {
         let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
         if let Some(display) = &principal.display_name {
@@ -315,6 +339,89 @@ where
             // on the receiving side is its mirror. Invalid context injects
             // nothing rather than failing the send — telemetry is never a
             // correctness input.
+            if let Some(telemetry) = request.telemetry.as_ref() {
+                let mut carrier = rakka_agent_workflow::AgentAttributes::new();
+                if rakka_agent_workflow::inject_agent_trace_context(telemetry, &mut carrier).is_ok()
+                {
+                    for (key, value) in carrier {
+                        metadata.insert(key, Value::String(value));
+                    }
+                }
+            }
+            let send = SendMessageRequest {
+                message,
+                configuration: None,
+                metadata: Some(metadata.into_iter().collect()),
+                tenant: self.tenant.clone(),
+            };
+            let task = self
+                .service
+                .send_message(&Self::params(), &send)
+                .await
+                .map_err(client_error)?;
+            client_view(&task)
+        })
+    }
+
+    fn submit_task_result(
+        &self,
+        request: rakka_agent::AgentClientTaskResultRequest,
+    ) -> AgentClientFuture<'_, AgentClientTaskView> {
+        Box::pin(async move {
+            // Derived when the caller supplies none, and derived *before*
+            // anything moves. `Message::new` mints a fresh random id per
+            // call and the ingress falls back to it as the deduplication
+            // discriminator, so an unset key would make every retry a
+            // different durable submission — spending a rejection each time,
+            // and walking a task to `ResultRejectionsExhausted` over a
+            // submission its caller only ever made once.
+            let deduplication_key = request
+                .deduplication_key
+                .clone()
+                .unwrap_or_else(|| Self::derived_submission_key(&request));
+            let mut message = Message::new(
+                Role::User,
+                vec![Part {
+                    content: PartContent::Data(request.result),
+                    filename: None,
+                    media_type: Some("application/json".to_string()),
+                    metadata: None,
+                }],
+            );
+            message.task_id = Some(request.task);
+            message.context_id = request.context;
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(
+                META_DEDUPLICATION_KEY.to_string(),
+                Value::String(deduplication_key),
+            );
+            let mut binding = serde_json::Map::new();
+            binding.insert("definition".to_string(), Value::String(request.definition));
+            binding.insert(
+                "definition-version".to_string(),
+                Value::Number(request.definition_version.into()),
+            );
+            binding.insert(
+                "result-schema".to_string(),
+                Value::String(request.result_schema),
+            );
+            binding.insert(
+                "result-schema-version".to_string(),
+                Value::Number(request.result_schema_version.into()),
+            );
+            if let Some(digest) = request.evidence_digest {
+                binding.insert("evidence-digest".to_string(), Value::String(digest));
+            }
+            metadata.insert(
+                super::ingress::META_AGENT_RESULT.to_string(),
+                Value::Object(binding),
+            );
+            if let Some(principal) = request.principal.as_ref().or(self.principal.as_ref()) {
+                metadata.insert(
+                    META_PRINCIPAL_REF.to_string(),
+                    Self::principal_metadata(principal),
+                );
+            }
             if let Some(telemetry) = request.telemetry.as_ref() {
                 let mut carrier = rakka_agent_workflow::AgentAttributes::new();
                 if rakka_agent_workflow::inject_agent_trace_context(telemetry, &mut carrier).is_ok()

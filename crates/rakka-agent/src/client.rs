@@ -158,6 +158,54 @@ pub struct AgentClientTaskRequest {
     pub telemetry: Option<rakka_agent_workflow::AgentTelemetryContext>,
 }
 
+/// A typed-result submission completing a human-owned task
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md),
+/// [14.5](../../../docs/plans/rakka-agent/spec.md)).
+#[derive(Debug, Clone, Default)]
+pub struct AgentClientTaskResultRequest {
+    /// The task the submission completes.
+    pub task: String,
+    /// The typed result, validated by the task's deterministic rules.
+    pub result: Value,
+    /// The task-definition id the result claims to fulfill; a mismatch is a
+    /// committed rejection.
+    pub definition: String,
+    /// The claimed revision of that definition.
+    pub definition_version: u64,
+    /// The schema the result is expressed in.
+    pub result_schema: String,
+    /// The claimed revision of that schema.
+    pub result_schema_version: u64,
+    /// The claimed evidence digest, when the caller carries one. Advisory
+    /// for the deployment authorizer; the surface accepts no evidence
+    /// artifacts yet.
+    pub evidence_digest: Option<String>,
+    /// The conversation this submission belongs to, forwarded as the A2A
+    /// `context_id` exactly as [`AgentClientTaskRequest::context`] is. Left
+    /// unset, the surface correlates the task with itself, which silently
+    /// drops it from whatever conversation created it.
+    pub context: Option<String>,
+    /// Explicit durable deduplication key. A retry that reuses it converges
+    /// on the original decision — a recorded rejection included; a corrected
+    /// resubmission after a rejection must carry a new key.
+    ///
+    /// Left unset, the transport derives one from the submission's own
+    /// content, so an ordinary retry still converges: the durable identity of
+    /// a submission is what it says, not when it was sent. Deriving it is the
+    /// safe default precisely because the alternative — a fresh id per call —
+    /// spends a rejection per retry and can walk a task to
+    /// `ResultRejectionsExhausted` on a submission the caller only ever made
+    /// once. Set it explicitly when two submissions carrying identical
+    /// content must be told apart.
+    pub deduplication_key: Option<String>,
+    /// Authenticated principal submitting the result. Required by the
+    /// surface: a human-owned task completes only under an authenticated
+    /// human or service.
+    pub principal: Option<PrincipalRef>,
+    /// The caller's trace context, injected into the egress request.
+    pub telemetry: Option<rakka_agent_workflow::AgentTelemetryContext>,
+}
+
 /// The bounded public view of one task.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentClientTaskView {
@@ -292,6 +340,13 @@ pub trait AgentClientTransport: Send + Sync + 'static {
         request: AgentClientTaskRequest,
     ) -> AgentClientFuture<'_, AgentClientTaskView>;
 
+    /// Submits an authenticated typed result to a human-owned task
+    /// (specification 8.12).
+    fn submit_task_result(
+        &self,
+        request: AgentClientTaskResultRequest,
+    ) -> AgentClientFuture<'_, AgentClientTaskView>;
+
     /// Reads one task's public view, or `None` when it does not exist.
     fn task<'a>(&'a self, task: &'a str) -> AgentClientFuture<'a, Option<AgentClientTaskView>>;
 
@@ -350,6 +405,31 @@ impl<T: AgentClientTransport> RakkaAgentClient<T> {
         request: AgentClientTaskRequest,
     ) -> AgentClientResult<AgentClientTaskView> {
         self.transport.create_task(request).await
+    }
+
+    /// Submits an authenticated typed result to a human-owned task
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// An acceptance returns a terminal `Completed` view. A *committed
+    /// validation rejection* returns `Ok` too — the nonterminal
+    /// `InputRequired` view (or terminal `Failed`, when the rejection
+    /// exhausted the budget) carrying the rule code in the view's
+    /// `io.rakka.agent.last-rejection` metadata: the decision durably
+    /// committed, and an error reply would misreport it as "nothing
+    /// happened". A retry under the same deduplication key converges on the
+    /// original decision; a corrected resubmission must carry a new key.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`AgentClientError::Refused`] on the non-committing
+    /// refusals — an unknown task, an agent-owned target
+    /// (`task-not-human-owned`), a terminal or cancelling task — and with
+    /// transport failures.
+    pub async fn submit_task_result(
+        &self,
+        request: AgentClientTaskResultRequest,
+    ) -> AgentClientResult<AgentClientTaskView> {
+        self.transport.submit_task_result(request).await
     }
 
     /// Reads one task's public view.

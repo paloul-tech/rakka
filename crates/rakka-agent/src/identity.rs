@@ -905,6 +905,10 @@ pub enum AgentOperationKind {
     ResultProposal,
     /// A task's validation decision on a result proposal.
     ResultDecision,
+    /// An authenticated human or external service submitting a typed result
+    /// to a human-owned task
+    /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+    ResultSubmission,
     /// A parent-local escrow allocation debit.
     BudgetAllocation,
     /// A run-local dispatch-time budget reservation.
@@ -968,6 +972,12 @@ pub enum AgentOperationKind {
     LifecycleTerminate,
     /// A cancellation request or propagation step.
     Cancellation,
+    /// A dependent task registering itself with the upstream task it depends
+    /// on, so the upstream can notify it on terminalization.
+    DependencyRegistration,
+    /// An upstream task reporting its terminal outcome to one registered
+    /// dependent.
+    DependencyOutcome,
 }
 
 impl AgentOperationKind {
@@ -982,6 +992,7 @@ impl AgentOperationKind {
             Self::RunAcceptance => "run-acceptance",
             Self::ResultProposal => "result-proposal",
             Self::ResultDecision => "result-decision",
+            Self::ResultSubmission => "result-submission",
             Self::BudgetAllocation => "budget-allocation",
             Self::BudgetReservation => "budget-reservation",
             Self::BudgetSettlement => "budget-settlement",
@@ -1011,6 +1022,8 @@ impl AgentOperationKind {
             Self::LifecycleResume => "lifecycle-resume",
             Self::LifecycleTerminate => "lifecycle-terminate",
             Self::Cancellation => "cancellation",
+            Self::DependencyRegistration => "dependency-registration",
+            Self::DependencyOutcome => "dependency-outcome",
         }
     }
 }

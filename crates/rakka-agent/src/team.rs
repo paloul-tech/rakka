@@ -67,7 +67,9 @@ use crate::identity::{
     AgentGoalId, AgentId, AgentIdentityError, AgentOperationId, AgentTaskId, AgentTaskScope,
     AgentTeamClaimId, AgentTeamScope,
 };
-use crate::observability::{record_agent_domain_counter, METRIC_AGENT_TEAM_OPERATIONS};
+use crate::observability::{
+    record_agent_domain_counter, record_unsettleable_exchanges, METRIC_AGENT_TEAM_OPERATIONS,
+};
 use crate::schema::{
     AgentRecordKind, AgentSchemaError, AgentSchemaPolicy, VersionedAgentRecord,
     CURRENT_AGENT_TEAM_HISTORY_SCHEMA_VERSION, CURRENT_AGENT_TEAM_STATE_SCHEMA_VERSION,
@@ -1679,6 +1681,8 @@ pub struct AgentTeamProgress {
     pub settled: usize,
     /// Deliveries that failed and stay outstanding.
     pub failed: usize,
+    /// How many of those were refusals no re-drive can settle.
+    pub unsettleable: usize,
     /// Exchanges still outstanding after the drive.
     pub outstanding: usize,
 }
@@ -2081,11 +2085,13 @@ where
         let report = drive_pending_exchanges(&mut self.host, router, now).await?;
         // A drive settlement may have recorded history of its own.
         let flushed = flushed + self.flush_history(now).await?;
+        record_unsettleable_exchanges(self.metrics.as_ref(), &report.unsettleable);
         Ok(AgentTeamProgress {
             history_flushed: flushed,
             expiry_observed,
             settled: report.settled,
             failed: report.failed,
+            unsettleable: report.unsettleable.len(),
             outstanding: self.host.outstanding()?.len(),
         })
     }

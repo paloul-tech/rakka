@@ -20,12 +20,13 @@ use a2a_server::ServiceParams;
 use rakka_agent::AgentExchangeRouter;
 use rakka_agent::{
     load_agent_run_state, AgentConversationEntityReply, AgentConversationEntityStore,
-    AgentConversationHistoryStore, AgentConversationState, AgentEntityCommand, AgentEntityReply,
-    AgentEntityState, AgentEntityStore, AgentId, AgentOperationId, AgentOperationKind,
-    AgentRunScope, AgentRunState, AgentRunStatus, AgentSchemaPolicy, AgentScope,
-    AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskEntityStore, AgentTaskHistoryStore,
-    AgentTaskId, AgentTaskScope, AgentTaskSnapshot, AgentTaskState, AgentTeamEntityReply,
-    AgentTeamEntityStore, AgentTeamHistoryStore, AgentTeamState, TenantId,
+    AgentConversationHistoryStore, AgentConversationScope, AgentConversationState,
+    AgentEntityCommand, AgentEntityReply, AgentEntityState, AgentEntityStore, AgentId,
+    AgentOperationId, AgentOperationKind, AgentRunScope, AgentRunState, AgentRunStatus,
+    AgentSchemaPolicy, AgentScope, AgentTaskEntityCommand, AgentTaskEntityReply,
+    AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskId, AgentTaskScope, AgentTaskSnapshot,
+    AgentTaskState, AgentTeamEntityReply, AgentTeamEntityStore, AgentTeamHistoryStore,
+    AgentTeamScope, AgentTeamState, TenantId,
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
@@ -42,8 +43,9 @@ use super::catalog::A2AAgentCatalog;
 use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
     agent_conversation_command, agent_task_cancel_command, agent_task_create_command,
-    agent_task_handoff_command, agent_task_input, agent_team_command, normalize_agent_cancel,
-    normalize_agent_send, resolve_agent_target, resolve_handoff_target, NormalizedAgentCommand,
+    agent_task_handoff_command, agent_task_input, agent_task_result_command, agent_team_command,
+    normalize_agent_cancel, normalize_agent_send, resolve_agent_target, resolve_handoff_target,
+    NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -204,14 +206,56 @@ where
     /// Records the agent domain's bounded counters through this recorder.
     ///
     /// The service builds its own entity stores rather than routing through
-    /// the sharded entities, so without this the domain counters those
-    /// stores emit — `rakka.agent.moderation.turns` above all — would stay
-    /// at zero for the wire, which is the only carrier the turn protocol
-    /// has.
+    /// the sharded entities, so a store built without it records through the
+    /// noop recorder and its counters stay at zero for the wire — which for
+    /// the human submission (`rakka.agent.human.results`) and the turn
+    /// protocol (`rakka.agent.moderation.turns`) is the only carrier they
+    /// have. Every store this service builds that accepts a recorder is
+    /// wired from here; forgetting one silences its counters with no other
+    /// symptom, so a new store site must be wired at the same time.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// The task entity facade, wired.
+    ///
+    /// Every task store this service builds comes from here, and that is the
+    /// whole point of it existing. The service holds a recorder of its own,
+    /// and the store constructors default to the noop one, so a store built
+    /// directly records nothing and gives no other symptom — no error, no
+    /// log, just a counter that never leaves zero. Three slices in a row
+    /// shipped exactly that, each time by adding a `new` call *beside* the
+    /// wiring instead of through it. Going through an accessor leaves nothing
+    /// to forget: there is no second way to get a store.
+    fn task_store(&self, scope: AgentTaskScope) -> AgentTaskEntityStore<Tasks, Agents, History> {
+        AgentTaskEntityStore::new(
+            scope,
+            self.tasks.clone(),
+            self.agents.clone(),
+            self.history.clone(),
+        )
+        .with_metrics(self.metrics.clone())
+    }
+
+    /// The team entity facade, wired — see [`Self::task_store`].
+    fn team_store(&self, scope: AgentTeamScope) -> AgentTeamEntityStore<Teams, TeamHistory> {
+        AgentTeamEntityStore::new(scope, self.teams.clone(), self.team_history.clone())
+            .with_metrics(self.metrics.clone())
+    }
+
+    /// The conversation entity facade, wired — see [`Self::task_store`].
+    fn conversation_store(
+        &self,
+        scope: AgentConversationScope,
+    ) -> AgentConversationEntityStore<Conversations, ConversationHistory> {
+        AgentConversationEntityStore::new(
+            scope,
+            self.conversations.clone(),
+            self.conversation_history.clone(),
+        )
+        .with_metrics(self.metrics.clone())
     }
 
     /// Uses an explicit time source.
@@ -352,6 +396,7 @@ where
             principal: normalized.principal.as_ref(),
             handoff: None,
             conversation: None,
+            task_result: None,
             team: Some(crate::auth::A2ATeamClaim {
                 team: &cluster.team,
                 operation: cluster.operation.as_label(),
@@ -367,8 +412,7 @@ where
 
         let board_task = cluster.task.clone();
         let (scope, command) = agent_team_command(normalized, now)?;
-        let mut store =
-            AgentTeamEntityStore::new(scope.clone(), self.teams.clone(), self.team_history.clone());
+        let mut store = self.team_store(scope.clone());
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
             // A domain refusal is a decision the caller rebases on, not a
@@ -391,12 +435,7 @@ where
         if let Some(task) = board_task {
             if let Ok(task) = AgentTaskId::new(task) {
                 if let Ok(task_scope) = AgentTaskScope::new(normalized.tenant.clone(), task) {
-                    let mut tasks = AgentTaskEntityStore::new(
-                        task_scope,
-                        self.tasks.clone(),
-                        self.agents.clone(),
-                        self.history.clone(),
-                    );
+                    let mut tasks = self.task_store(task_scope);
                     let _ = tasks.settle_side_effects(&self.router, now).await;
                 }
             }
@@ -457,6 +496,7 @@ where
             principal: normalized.principal.as_ref(),
             handoff: None,
             team: None,
+            task_result: None,
             conversation: Some(crate::auth::A2AConversationClaim {
                 conversation: &cluster.conversation,
                 operation: cluster.operation.as_label(),
@@ -471,12 +511,7 @@ where
         }
 
         let (scope, command) = agent_conversation_command(normalized, now)?;
-        let mut store = AgentConversationEntityStore::new(
-            scope,
-            self.conversations.clone(),
-            self.conversation_history.clone(),
-        )
-        .with_metrics(self.metrics.clone());
+        let mut store = self.conversation_store(scope);
         let reply = match store.apply(command, &self.router, now).await {
             Ok(reply) => reply,
             // A domain refusal is a decision the caller rebases on, not a
@@ -546,6 +581,7 @@ where
             handoff: None,
             team: None,
             conversation: None,
+            task_result: None,
         };
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
@@ -710,9 +746,9 @@ where
             // A continuation carrying the handoff cluster is the same-task
             // transfer of specification 8.9: the deduplicated handoff command
             // records the transfer, and the inline assignment decision offers
-            // the target its generation in the same compare-and-set. Plain
-            // input delivery stays parked for its own slice, cleanly
-            // distinguished by the collaboration metadata.
+            // the target its generation in the same compare-and-set. A plain
+            // continuation is the typed-result submission of specification
+            // 8.12, cleanly distinguished by the collaboration metadata.
             if let Some(super::collaboration::AgentCollaborationEnvelope::Handoff(cluster)) =
                 normalized.collaboration.as_ref()
             {
@@ -732,6 +768,7 @@ where
                         source_generation: cluster.source_generation,
                         target_agent: &cluster.target_agent,
                     }),
+                    None,
                 )
                 .await?;
                 // The same catalog gate the creation path passes: the wire's
@@ -754,12 +791,82 @@ where
                 .await?;
                 return self.public_task(normalized, None).await;
             }
-            self.authorize(A2AOperation::SendMessage, normalized)
-                .await?;
-            return Err(RakkaAgentA2AError::Unsupported {
-                operation: "send-message",
-                reason: "input delivery to an existing agent task is not served yet",
-            });
+            // A plain continuation is the authenticated typed-result
+            // submission of specification 8.12 — the ingress door slice 1.12
+            // deferred. Ownership stays the entity's decision: the wire
+            // builds the deduplicated command for whatever task the send
+            // names, and an agent-owned target answers the stable
+            // `task-not-human-owned` refusal. The submission authorizes
+            // under its own operation class with the claimed contract bound
+            // in — never an undifferentiated send.
+            self.authorize_claimed(
+                A2AOperation::SubmitTaskResult,
+                normalized,
+                None,
+                Some(crate::auth::A2ATaskResultClaim {
+                    definition: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.definition.as_str()),
+                    definition_version: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.definition_version),
+                    result_schema: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.result_schema.as_str()),
+                    result_schema_version: normalized
+                        .result
+                        .as_ref()
+                        .map(|binding| binding.result_schema_version),
+                    evidence_digest: normalized
+                        .result
+                        .as_ref()
+                        .and_then(|binding| binding.evidence_digest.as_deref()),
+                }),
+            )
+            .await?;
+            let input = agent_task_input(&request.message)?;
+            let command =
+                agent_task_result_command(normalized, input, &request.message.message_id, now)?;
+            // A non-committing entity refusal — unknown task, agent-owned
+            // target, terminal or cancelling task, an unboundable record —
+            // is a decision the caller rebases on, never a transport
+            // failure; infrastructure faults stay errors.
+            let snapshot = match self.apply_task_command(normalized, command, now).await {
+                Ok(snapshot) => snapshot,
+                Err(RakkaAgentA2AError::Task(error))
+                    if matches!(
+                        error,
+                        rakka_agent::AgentTaskError::SubmissionRefused { .. }
+                            | rakka_agent::AgentTaskError::NotCreated { .. }
+                            | rakka_agent::AgentTaskError::Terminal { .. }
+                            | rakka_agent::AgentTaskError::MaterializedStateTooLarge { .. }
+                    ) =>
+                {
+                    return Err(RakkaAgentA2AError::Refused {
+                        code: error.code().to_string(),
+                        message: error.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            // A validation rejection is a committed durable decision, so it
+            // answers as the task view — never an error that claims nothing
+            // happened; the rule code rides the projection's rejection echo.
+            let run = self.current_run_status(normalized, &snapshot).await?;
+            project_agent_send(
+                self.projections.as_ref(),
+                &snapshot,
+                run,
+                normalized.tenant.as_str(),
+                &normalized.context_id,
+                &request.message,
+                now,
+            )
+            .await?;
+            return self.public_task(normalized, None).await;
         }
         self.authorize(A2AOperation::SendMessage, normalized)
             .await?;
@@ -911,12 +1018,7 @@ where
         now: AgentTimestampMillis,
     ) -> RakkaAgentA2AResult<AgentTaskSnapshot> {
         let scope = AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())?;
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        );
+        let mut store = self.task_store(scope);
         let reply = store.apply(command, &self.router, now).await?;
         match reply {
             AgentTaskEntityReply::Applied { .. } | AgentTaskEntityReply::Duplicate { .. } => {}
@@ -955,12 +1057,7 @@ where
         let tenant = TenantId::new(tenant);
         let task = AgentTaskId::new(task_id)?;
         let scope = AgentTaskScope::new(tenant.clone(), task)?;
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        );
+        let mut store = self.task_store(scope);
         store.recover(now).await?;
         let Some(snapshot) = store.snapshot()? else {
             return Ok(None);
@@ -986,12 +1083,7 @@ where
         now: AgentTimestampMillis,
     ) -> RakkaAgentA2AResult<Option<AgentTaskSnapshot>> {
         let scope = AgentTaskScope::new(normalized.tenant.clone(), normalized.task.clone())?;
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        );
+        let mut store = self.task_store(scope);
         store.recover(now).await?;
         Ok(store.snapshot()?)
     }
@@ -1036,16 +1128,19 @@ where
         operation: A2AOperation,
         normalized: &NormalizedAgentCommand,
     ) -> RakkaAgentA2AResult<()> {
-        self.authorize_claimed(operation, normalized, None).await
+        self.authorize_claimed(operation, normalized, None, None)
+            .await
     }
 
     /// Runs the deployment authorizer for one operation, binding the claimed
-    /// transfer into the request on a record-handoff check.
+    /// transfer into the request on a record-handoff check and the claimed
+    /// result contract on a submit-task-result check.
     async fn authorize_claimed(
         &self,
         operation: A2AOperation,
         normalized: &NormalizedAgentCommand,
         handoff: Option<crate::auth::A2AHandoffClaim<'_>>,
+        task_result: Option<crate::auth::A2ATaskResultClaim<'_>>,
     ) -> RakkaAgentA2AResult<()> {
         let request = A2AAuthorizationRequest {
             operation,
@@ -1055,6 +1150,7 @@ where
             handoff,
             team: None,
             conversation: None,
+            task_result,
         };
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),

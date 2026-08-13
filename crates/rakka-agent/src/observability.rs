@@ -713,6 +713,63 @@ pub const METRIC_AGENT_TEAM_OPERATIONS: &str = "rakka.agent.team.operations";
 /// that lands the model-visible moderation tool.
 pub const METRIC_AGENT_MODERATION_TURNS: &str = "rakka.agent.moderation.turns";
 
+/// Counter: authenticated human-result submissions decided at the task
+/// entity's door, labeled by bounded `outcome`
+/// (`accepted` / `rejected` / `exhausted`)
+/// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)). Counted
+/// as the difference of the task's durable result cells across the committed
+/// transition — the admitted-epoch idiom — so duplicates, durable echoes,
+/// and non-committing refusals record nothing.
+pub const METRIC_AGENT_HUMAN_RESULTS: &str = "rakka.agent.human.results";
+
+/// Counter: dependency outcomes durably applied at the dependent task's
+/// door, labeled by bounded `outcome` (`completed` / `failed` / `cancelled`)
+/// ([specification 9.2](../../../docs/plans/rakka-agent/spec.md)). Counted
+/// as the difference of the task's resolved-edge count across the committed
+/// transition, whichever path — registry exchange or application relay —
+/// resolved the edge; a replayed or conflicting delivery records nothing.
+pub const METRIC_AGENT_DEPENDENCY_OUTCOMES: &str = "rakka.agent.dependency.outcomes";
+
+/// Counter: exchange replies a settle pass could not settle, labeled by
+/// bounded `operation` (the [`crate::choreography::AgentExchangeKind`] label)
+/// and `error_code` (the receiver's stable refusal code)
+/// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The receiver *answered*; its answer is one no re-drive can settle until a
+/// different receiver answers — an upstream that gets created, an owner
+/// upgraded past the kind. The courier deliberately does not fail the pass
+/// over it, since one unanswerable envelope must not wedge every other
+/// exchange the entity owes, so this counter is what keeps a durably wedged
+/// entity distinguishable from a healthy one. It is emitted per pass, not per
+/// durable transition: a standing wedge counts on every sweep, which is what
+/// makes it alertable as a rate. The exchange that is stuck, and since when,
+/// are on the journal's own pending record.
+pub const METRIC_AGENT_EXCHANGE_UNSETTLEABLE: &str = "rakka.agent.exchange.unsettleable";
+
+/// Emits one [`METRIC_AGENT_EXCHANGE_UNSETTLEABLE`] count per refusal a settle
+/// pass could not settle.
+///
+/// Every entity that drives the courier calls this with its own pass report,
+/// so a durably wedged exchange is measured wherever it happens rather than
+/// only where someone remembered to look for it.
+pub fn record_unsettleable_exchanges(
+    metrics: &dyn MetricsRecorder,
+    unsettleable: &[crate::choreography::AgentExchangeUnsettleable],
+) {
+    for refusal in unsettleable {
+        record_agent_domain_counter(
+            metrics,
+            METRIC_AGENT_EXCHANGE_UNSETTLEABLE,
+            1,
+            &[
+                ("operation", refusal.kind.as_label()),
+                ("error_code", refusal.code.as_str()),
+            ],
+        )
+        .ok();
+    }
+}
+
 /// Label keys the agent domain adds to the substrate's bounded vocabulary.
 ///
 /// The metric-vocabulary boundary is by layer (slice 1.13 resolution): the

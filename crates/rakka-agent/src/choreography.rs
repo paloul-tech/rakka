@@ -73,9 +73,17 @@
 //! A receiver that rejects an exchange — a task's deterministic rules reject a
 //! proposed result — has made a *durable decision*. It is recorded in the
 //! journal, returned on replay like any other result, and settled by the
-//! initiator. Only a transport failure leaves an exchange outstanding. This is
-//! what makes "a lost rejection" impossible
+//! initiator. This is what makes "a lost rejection" impossible
 //! ([specification 18](../../../docs/plans/rakka-agent/spec.md) scenario 59).
+//!
+//! The one refusal that is *not* a decision is the one a participant's
+//! [`AgentExchangeParticipant::check_settle`] classifies unsettleable: an
+//! inability to answer at all — the receiving entity does not exist yet, the
+//! payload was written by a newer binary, the kind postdates this owner. Those
+//! leave the exchange outstanding on the initiator, and the receiver does not
+//! record them either, so the next re-drive re-runs the transition instead of
+//! replaying the inability. Alongside a transport failure, that is the only
+//! way an exchange stays owed.
 //!
 //! # Deduplication windows are bounded, so transitions are also fenced
 //!
@@ -654,11 +662,85 @@ pub enum AgentExchangeKind {
     /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
     ///   envelope stays outstanding until the binary upgrades.
     TeamClaimResult,
+    /// A dependent task registering itself with the upstream task it depends
+    /// on ([specification 9.2](../../../docs/plans/rakka-agent/spec.md):
+    /// dependencies are durable, bounded, and created with stable operation
+    /// ids). Initiated by the dependent in the same compare-and-set that
+    /// records the forward edge; the upstream records the reverse edge in its
+    /// bounded dependents registry, and the reply is its durable receipt —
+    /// which carries the terminal outcome directly when the upstream is
+    /// already terminal, so a late registration never waits for a
+    /// notification the upstream will not owe again.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the forward
+    ///   edge never committed; the declaring command replays and commits the
+    ///   identical edge and owed envelope under the same derived operation
+    ///   id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the dependents
+    ///   entry and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the upstream's
+    ///   recorded dependents entry is the durable echo — the arm accepts
+    ///   idempotently with no state change.
+    /// - **Upstream not yet created**: a retryable refusal that stays
+    ///   outstanding — a racing create converges on the next re-drive, and a
+    ///   never-created upstream leaves the dependent durably `Blocked`, the
+    ///   documented stuck-dependency struggle signal.
+    /// - **Forged sender or dependents ceiling**: a settled refusal the
+    ///   dependent's settle rule accepts as definitive; the dependent stays
+    ///   `Blocked` on the application relay path rather than re-driving
+    ///   forever.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades.
+    DependencyRegistration,
+    /// An upstream task reporting its terminal outcome to one registered
+    /// dependent ([specification 9.2](../../../docs/plans/rakka-agent/spec.md):
+    /// a task must not become eligible until its dependency rule is
+    /// satisfied; the default failed-dependency policy cancels dependents).
+    /// Initiated by the upstream once terminal — immediately at the terminal
+    /// commit, with no escrow gate, because the payload (status, terminal
+    /// reason, result digest) is absorbing the moment `terminate` commits —
+    /// and the reply is the dependent's durable application of the outcome
+    /// through the same core the `RecordDependencyOutcome` relay command
+    /// uses, so a failing edge takes the cancellation *request* path over a
+    /// live run, never a direct terminalization.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the terminal
+    ///   status committed; the settle pass re-derives the identical owed
+    ///   envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the resolved
+    ///   edge and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the resolved edge is
+    ///   the durable echo — the same outcome accepts idempotently with no
+    ///   state change, and a conflicting one fails closed as a conflict,
+    ///   never a correction.
+    /// - **Unknown edge, unknown task, conflicting outcome, or forged
+    ///   sender**: a settled refusal the upstream's settle rule accepts as
+    ///   definitive; the dependents entry's settled marker still flips, so
+    ///   the derivation quiesces.
+    /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
+    ///   envelope stays outstanding until the binary upgrades.
+    DependencyOutcome,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -673,6 +755,8 @@ impl AgentExchangeKind {
         Self::HandoffResult,
         Self::TeamClaim,
         Self::TeamClaimResult,
+        Self::DependencyRegistration,
+        Self::DependencyOutcome,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -693,6 +777,8 @@ impl AgentExchangeKind {
             Self::HandoffResult => "handoff-result",
             Self::TeamClaim => "team-claim",
             Self::TeamClaimResult => "team-claim-result",
+            Self::DependencyRegistration => "dependency-registration",
+            Self::DependencyOutcome => "dependency-outcome",
         }
     }
 }
@@ -1179,7 +1265,13 @@ impl PendingExchange {
         &self.envelope
     }
 
-    /// How many delivery attempts have failed.
+    /// How many attempts recorded a failure.
+    ///
+    /// A repeated *unsettleable refusal* is recorded once, not once per pass:
+    /// the receiver keeps answering the same thing, and the exchange's durable
+    /// state has not moved, so re-recording it would cost a revision per settle
+    /// pass forever. A counter that stops climbing under a standing wedge is
+    /// the intended reading.
     #[must_use]
     pub const fn attempts(&self) -> u32 {
         self.attempts
@@ -1197,7 +1289,8 @@ impl PendingExchange {
         self.last_attempt_at
     }
 
-    /// Stable code of the last delivery failure.
+    /// Stable code of the last failure — a transport error, or the receiver's
+    /// refusal when it answered with one no re-drive can settle.
     #[must_use]
     pub fn last_failure_code(&self) -> Option<&str> {
         self.last_failure_code.as_deref()
@@ -1304,6 +1397,58 @@ impl AgentExchangeJournal {
         self.pending
             .iter()
             .find(|pending| &pending.envelope.operation_id == operation_id)
+    }
+
+    /// Withdraws an exchange this entity owes but can no longer act on.
+    ///
+    /// The at-least-once promise covers exchanges whose result the initiator can
+    /// still consume. A terminal task's dependency registration is not one: no
+    /// upstream outcome could move it, and the derivation that owed it already
+    /// derives nothing for a terminal task — so the envelope only holds a
+    /// pending slot that the task's own terminal notifications need. Withdrawal
+    /// is by operation id and reports whether anything was owed; call it only
+    /// from a transition that can prove the exchange moot. Everything else
+    /// re-drives.
+    pub fn withdraw(&mut self, operation_id: &AgentOperationId) -> bool {
+        let before = self.pending.len();
+        self.pending
+            .retain(|pending| &pending.envelope.operation_id != operation_id);
+        self.pending.len() != before
+    }
+
+    /// Records a refusal the initiator cannot settle, and reports whether
+    /// anything durable changed.
+    ///
+    /// This is not a delivery failure: the receiver *answered*, and the answer
+    /// is one no re-drive can settle until a different receiver answers — an
+    /// upstream that gets created, an owner upgraded past the kind. The courier
+    /// keeps re-delivering, because delivering is the only thing that discovers
+    /// that change; but re-recording an identical refusal every pass would burn
+    /// a durable revision forever on an exchange whose state has not moved, so
+    /// an unchanged code writes nothing and reports `false`.
+    ///
+    /// The recorded code is what makes a wedged exchange legible in durable
+    /// state, and the courier's report is what makes it legible to the caller.
+    pub fn record_unsettleable_refusal(
+        &mut self,
+        operation_id: &AgentOperationId,
+        code: &str,
+        now: AgentTimestampMillis,
+    ) -> bool {
+        let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| &pending.envelope.operation_id == operation_id)
+        else {
+            return false;
+        };
+        if pending.last_failure_code.as_deref() == Some(code) {
+            return false;
+        }
+        pending.attempts = pending.attempts.saturating_add(1);
+        pending.last_attempt_at = Some(now);
+        pending.last_failure_code = Some(code.to_string());
+        true
     }
 
     /// Records a failed delivery attempt.
@@ -1873,6 +2018,14 @@ where
     /// logical result, no transition, no write. A new one transitions the
     /// participant and records its result in the same compare-and-set, so the
     /// result is durable before the reply leaves.
+    ///
+    /// One class of result is deliberately not recorded: a refusal this
+    /// participant's own [`AgentExchangeParticipant::check_settle`] classifies
+    /// unsettleable. Such a refusal is what the *initiator* treats as "not yet"
+    /// — it leaves the exchange outstanding for re-drive — so memoizing it here
+    /// would answer every re-drive from the journal without ever re-running the
+    /// transition, and the exchange could never converge however often the
+    /// courier delivered it.
     pub async fn accept(
         &mut self,
         envelope: &AgentExchangeEnvelope,
@@ -1902,12 +2055,26 @@ where
             .apply(&mut state, envelope, now)
             .into_parts();
         let owed = propagate_exchange_telemetry(envelope.telemetry(), owed);
-        state.exchange_journal_mut().record_applied(
-            envelope.operation_id().clone(),
-            envelope.kind(),
-            result.clone(),
-            now,
-        );
+        // The unsettleable class is an inability to answer — an uncreated
+        // receiver, a payload this binary cannot decode, a kind it predates —
+        // never a decision, so re-running the transition on the next delivery
+        // repeats no durable effect. The classification is the participant's
+        // own, which is what makes the two sides of the exchange agree by
+        // construction: exactly the refusals the initiator keeps outstanding
+        // are the ones the receiver declines to memoize.
+        let settles = result.is_accepted()
+            || !matches!(
+                self.participant.check_settle(envelope, &result),
+                Err(AgentChoreographyError::UnsettleableRefusal { .. })
+            );
+        if settles {
+            state.exchange_journal_mut().record_applied(
+                envelope.operation_id().clone(),
+                envelope.kind(),
+                result.clone(),
+                now,
+            );
+        }
         // The result and whatever it now owes commit together, so a receiver can
         // never be durably committed to a decision whose onward exchange it
         // forgot to record.
@@ -1979,6 +2146,31 @@ where
             initiations.push(state.exchange_journal_mut().initiate(envelope, now)?);
         }
         Ok(initiations)
+    }
+
+    /// Records a refusal this entity cannot settle against one outstanding
+    /// exchange.
+    ///
+    /// The exchange stays outstanding, and a refusal identical to the one
+    /// already recorded writes nothing: a permanently unanswerable exchange
+    /// must not cost a durable revision on every settle pass for the rest of
+    /// the entity's life.
+    pub async fn record_unsettleable_refusal(
+        &mut self,
+        operation_id: &AgentOperationId,
+        code: &str,
+        now: AgentTimestampMillis,
+    ) -> AgentChoreographyResult<()> {
+        let record = self.recovered_record()?;
+        let mut state = record.state.clone();
+        if !state
+            .exchange_journal_mut()
+            .record_unsettleable_refusal(operation_id, code, now)
+        {
+            return Ok(());
+        }
+        self.persist(state, record.revision).await?;
+        Ok(())
     }
 
     /// Records a failed delivery attempt against one outstanding exchange.
@@ -2101,8 +2293,22 @@ impl Display for AgentExchangeDeliveryError {
 
 impl Error for AgentExchangeDeliveryError {}
 
+/// One exchange whose reply its initiator cannot settle.
+///
+/// The receiver answered, and the answer is a refusal the participant
+/// classified as one only a *different* receiver could resolve. Both fields
+/// come from closed vocabularies, so the pair is safe to carry into a bounded
+/// metric label as well as into a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExchangeUnsettleable {
+    /// The exchange kind that was refused.
+    pub kind: AgentExchangeKind,
+    /// The receiver's stable refusal code.
+    pub code: String,
+}
+
 /// What one pass of the courier did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentExchangeDriveReport {
     /// Exchanges that were outstanding when the pass started.
     pub outstanding: usize,
@@ -2112,8 +2318,19 @@ pub struct AgentExchangeDriveReport {
     pub duplicate_replies: usize,
     /// Replies the entity had no record of owing.
     pub unknown_replies: usize,
-    /// Delivery attempts that failed and left their exchange outstanding.
+    /// Attempts that left their exchange outstanding — a transport failure, or
+    /// a refusal no re-drive can settle. The [`Self::unsettleable`] entries are
+    /// the second kind, counted here as well.
     pub failed: usize,
+    /// The refusals this pass could not settle, in the order it met them.
+    ///
+    /// Non-empty means the entity is durably wedged on an exchange the current
+    /// receiver cannot answer: the pass still succeeded, and every *other*
+    /// exchange the entity owes still moved, but these will not converge until
+    /// something outside this entity changes. A caller that reports a clean
+    /// pass without looking here cannot tell a wedged entity from a healthy
+    /// one.
+    pub unsettleable: Vec<AgentExchangeUnsettleable>,
 }
 
 /// Drives every exchange one entity owes, once.
@@ -2148,12 +2365,34 @@ where
                         actual: reply.operation_id().clone(),
                     });
                 }
-                match host.settle(&reply, now).await? {
-                    AgentExchangeSettlement::Settled { .. } => report.settled += 1,
-                    AgentExchangeSettlement::AlreadySettled { .. } => {
+                match host.settle(&reply, now).await {
+                    Ok(AgentExchangeSettlement::Settled { .. }) => report.settled += 1,
+                    Ok(AgentExchangeSettlement::AlreadySettled { .. }) => {
                         report.duplicate_replies += 1;
                     }
-                    AgentExchangeSettlement::Unknown => report.unknown_replies += 1,
+                    Ok(AgentExchangeSettlement::Unknown) => report.unknown_replies += 1,
+                    Err(AgentChoreographyError::UnsettleableRefusal { code, .. }) => {
+                        // The participant classified the refusal as one only
+                        // a future receiver can answer — an upstream not yet
+                        // created, a binary that predates the kind. The
+                        // exchange stays durably outstanding with the code
+                        // recorded, exactly as `AgentExchangeHost::settle`
+                        // documents; erroring the pass instead would let one
+                        // unanswerable envelope wedge every other exchange
+                        // this entity owes. It is reported rather than
+                        // swallowed, because a pass that returns `Ok` and says
+                        // nothing makes a wedged entity look healthy — and an
+                        // unchanged code writes nothing durable, so standing
+                        // wedged is not also a standing cost.
+                        host.record_unsettleable_refusal(envelope.operation_id(), &code, now)
+                            .await?;
+                        report.unsettleable.push(AgentExchangeUnsettleable {
+                            kind: envelope.kind(),
+                            code,
+                        });
+                        report.failed += 1;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             Err(error) => {

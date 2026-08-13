@@ -3663,7 +3663,101 @@ Spec: [8.12](spec.md#812-human-owned-tasks),
   ([spec 8.12](spec.md#812-human-owned-tasks)): exact-effect approval stays
   `AgentCheckpoint`-bound; a human task never substitutes.
 
+**Amended as implemented (2026-08-11):**
+
+- **The human result is an entity command on the `RecordWorkflowResult`
+  idiom, sharing the run path's validation cores.**
+  `AgentTaskEntityCommand::SubmitHumanResult` carries
+  `AgentHumanResultSubmission` (principal, claimed definition/version/schema,
+  bounded content, causation); `human_result_operation_id` is pure over
+  `(tenant, task, discriminator)` under the new
+  `AgentOperationKind::ResultSubmission`, so a retry converges on the
+  original decision — a recorded rejection included — and a corrected
+  resubmission is a new discriminator. `validate_proposal` became the
+  origin-neutral `validate_result(&AgentResultClaim)`;
+  `accept_result`/`reject_result` split into cores parameterized by origin,
+  the exchange wrappers byte-identical. The ladder answers durable echoes
+  before every guard, terminal included: the accepted result's
+  `proposal_id`, the materialized `last_rejection`, and a bounded
+  fingerprint ring (`AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY` = 32,
+  FNV fingerprints — full operation ids would not fit the 32 KiB record)
+  refusing older rejections `submission-already-rejected` so a replay never
+  re-spends the budget. Refusals are non-committing
+  (`AgentTaskError::SubmissionRefused`); exhaustion terminalizes by
+  `terminate` — no live run exists. `AgentAcceptedResult.run` became
+  `Option<AgentRunId>` + additive `principal` (user-approved);
+  `AgentTaskHistoryEntry` gained additive `principal`; the submission
+  decision rides `AgentTaskOutcome.submission` (bounded summary) via the
+  new `AgentTaskOutcomeExtras` closure plumbing, so duplicates echo it.
+- **The dependents registry is two exchange kinds over the existing
+  choreography.** `DependencyRegistration` (dependent→upstream, owed in the
+  same CAS as the forward edge from Create/DeclareDependency/the creation
+  exchange, plus the `settle_dependency_registrations` courier half that
+  also self-heals pre-registry edges); the upstream records
+  `AgentTask.dependents` (`AgentTaskDependentRecord`, cap
+  `AGENT_TASK_MAX_DEPENDENTS` = 32, `task-dependents-exhausted` beyond it —
+  the refused dependent stays Blocked on the relay path). An
+  already-terminal upstream answers the receipt with its outcome and
+  records nothing; the dependent's settle arm applies it through the
+  existing `record_dependency_outcome` core. `DependencyOutcome`
+  (upstream→each unsettled dependent) is folded into `owed_child_reports`
+  and fires **immediately at terminal commit with no escrow gate**
+  (user-approved: the payload is absorbing at `terminate`, unlike a
+  delegation report's consumption fields); the goal-budget and stagnation
+  terminals are backstopped by `settle_dependent_notifications`. The
+  `ResultProposal` exchange arm converted to the owing form so a run-path
+  acceptance/exhaustion owes dependent outcomes in its own CAS. Fencing:
+  initiator matched against the claimed dependent / the forward edge
+  (`dependency-registration-forged`, `dependency-outcome-forged`);
+  same-outcome idempotent, conflict fails closed; settled markers
+  (`registration_settled`, `outcome_settled`) quiesce the derivations past
+  the journal window. **`task-not-created` at registration is a
+  non-settling refusal** (user-approved): a racing create converges on
+  re-drive; a never-created upstream leaves the dependent durably Blocked —
+  the stuck-dependency struggle signal. Enabling that posture,
+  `drive_pending_exchanges` records an `UnsettleableRefusal` as a failed
+  attempt on the outstanding exchange instead of erroring the pass (the
+  task_entity assignments-exhausted test re-pinned to the new shape).
+- **The wire half replaced the slice 1.12 refusal in place.** A plain
+  `ContinueTask` send is the submission: `io.rakka.agent.result` carries
+  the declared contract as one `deny_unknown_fields` object, the principal
+  is required, and authorization runs under the new
+  `A2AOperation::SubmitTaskResult` with `A2ATaskResultClaim` bound in
+  (`authorize_claimed` gained the second claim parameter). A committed
+  rejection answers **`Ok(Task)`** (user-approved) with the rule code on
+  the projection's new rejection echo (`io.rakka.agent.rejections`,
+  `io.rakka.agent.last-rejection`, assembled in
+  `agent_metadata_from_snapshot` per the 5.1 metadata-half rule);
+  non-committing entity refusals map to `Refused` decisions at the
+  submission branch (the handoff-path `Err(Task(...))` wart not repeated).
+  New normalize guards: `delegation-send-names-task` (closing the
+  accidental fall-through), `result-submission-requires-task`,
+  `result-binding-conflicts-with-collaboration`; the operation-kind
+  fallback split by intent so a submission id can never alias a creation
+  id. The typed client gained `submit_task_result`
+  (`AgentClientTaskResultRequest`, required trait method). Metrics:
+  `rakka.agent.human.results` {outcome} and
+  `rakka.agent.dependency.outcomes` {outcome}, durable-diff counted.
+- Proof roster: `tests/human_owned_tasks.rs` (9: scenario 41 both halves —
+  completion unblocking a real dependent, exhaustion cancelling a live
+  dependent through the request path — op-id golden vectors, the refusal
+  ladder, past-window accepted/rejected replays, the owner-loss sweep,
+  metric assertions), `tests/dependency_registry.rs` (6: terminal-upstream
+  receipt, continue-with-evidence, the fencing matrix, the ceiling,
+  relay/exchange convergence, pre-registry self-heal),
+  tests/choreography.rs's ALL-driven failure windows over the two new
+  kinds, and rakka-a2a's `tests/human_task_surface.rs` (8: the four-part
+  surface shape + rejection echo, exhaustion, crash sweep, typed client).
+  Owed onward: 5.5 replays the dependency events; evidence artifacts on
+  the wire submission stay behind the deferred artifact strategy; the
+  agents-surface metric consumer for `A2AOperation::as_label` remains
+  absent.
+
 Done when: scenario 41 passes.
+**Done (2026-08-11):** scenario 41 passes end to end over the real
+entities (`tests/human_owned_tasks.rs`) and over the wire
+(`crates/rakka-a2a/tests/human_task_surface.rs`), with the owner-loss
+sweeps covering every task-store write of both flows.
 
 ### Slice 5.5 — Replayable coordination events
 
