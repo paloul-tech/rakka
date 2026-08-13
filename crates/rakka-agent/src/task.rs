@@ -1392,6 +1392,21 @@ impl AgentTaskLimits {
                 detail: "a task must tolerate at least one result rejection".to_string(),
             });
         }
+        if self.max_result_rejections as usize > AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY {
+            // The echo ring is what keeps a replayed rejection from spending
+            // the budget a second time, and it remembers a bounded number of
+            // submissions. A budget larger than the ring would let a replay
+            // evicted from it re-spend — so the budget is refused where it is
+            // declared, rather than the guard silently covering only part of
+            // what it claims to.
+            return Err(AgentTaskError::InvalidDefinition {
+                detail: format!(
+                    "a task may tolerate at most {AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY} \
+                     result rejections: that is how many rejected submissions the echo ring \
+                     remembers, and a budget past it could be spent twice by one replay"
+                ),
+            });
+        }
         if self.max_assignments == 0 {
             return Err(AgentTaskError::InvalidDefinition {
                 detail: "a task must permit at least one assignment".to_string(),
@@ -1636,6 +1651,29 @@ impl AgentTaskDefinition {
         }
         for rule in &self.result_rules {
             rule.check.validate()?;
+        }
+        if !self.is_agent_owned()
+            && self
+                .result_rules
+                .iter()
+                .any(|rule| matches!(rule.check, AgentTaskResultCheck::EvidenceRequired))
+        {
+            // A rule no submission can satisfy is worse than no rule: every
+            // attempt is a *committed* rejection, so the task walks its
+            // budget down to `ResultRejectionsExhausted` and takes its
+            // dependents with it. The human submission door carries no
+            // evidence — the A2A binding's evidence field is advisory and the
+            // surface accepts no artifacts until the artifact strategy lands
+            // — so the contradiction is refused where it is declared, at
+            // definition time, rather than discovered when someone's approval
+            // is silently spent. Lift this when evidence can travel to a
+            // human.
+            return Err(AgentTaskError::InvalidDefinition {
+                detail: "a human-owned task may not require evidence: no submission surface \
+                         carries evidence artifacts yet, so the rule could never be satisfied \
+                         and every attempt would spend the rejection budget"
+                    .to_string(),
+            });
         }
         self.limits.validate()
     }
@@ -2641,6 +2679,15 @@ pub struct AgentAcceptedResult {
     /// The run that proposed it, when a run did. A human-owned task's
     /// accepted result carries a principal instead; every record persisted
     /// before human submissions existed carries the run.
+    ///
+    /// Absent rather than `null` when there is no run, like every other
+    /// optional cell on this record: a serialized `null` for a field that
+    /// used to be a required `AgentRunId` is the shape an older binary
+    /// cannot decode, and one that is simply missing is at least the shape a
+    /// `serde(default)` could absorb. Nothing is deployed on the older shape,
+    /// so [`CURRENT_AGENT_TASK_STATE_SCHEMA_VERSION`] is deliberately not
+    /// bumped for it; a post-release change of this kind would need one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<AgentRunId>,
     /// The authenticated principal that submitted it, when a human or
     /// external service did ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
@@ -5197,8 +5244,14 @@ fn declare_dependency(
             registration_settled: false,
         },
     );
-    // A task that has become dependent again is no longer eligible.
-    if matches!(task.status, AgentTaskStatus::Created) {
+    // A task that has become dependent again is no longer eligible — and a
+    // human-owned one is demoted the same way, because `WaitingForInput` is
+    // exactly what the submission door reads as "the graph permits this now".
+    // `record_dependency_outcome` reopens the door when the edge resolves.
+    if matches!(
+        task.status,
+        AgentTaskStatus::Created | AgentTaskStatus::WaitingForInput
+    ) {
         task.status = AgentTaskStatus::Blocked;
     }
     // A late edge grows the admitted record, so it keeps the same growth
@@ -9285,13 +9338,74 @@ fn submission_fingerprint(operation_id: &AgentOperationId) -> String {
     AgentContentDigest::of_bytes(operation_id.as_str().as_bytes()).value
 }
 
+/// The decision a human submission's operation id already has on record, as a
+/// pure read over durable state — `None` when it has none and must be decided.
+///
+/// This is the whole echo ladder, lifted out of the transition so the entity
+/// can answer it *before* it takes any lock on the world: the accepted result
+/// and the latest rejection replay idempotently past the operation log's
+/// bounded window, and an older rejection is recognized from the bounded
+/// fingerprint ring. First-writer-wins — the replay's content is never
+/// re-read, so the probe needs only the operation id.
+///
+/// Answering it early is what keeps a durable decision reachable while the
+/// *history sink* — pure observability — is backed up. See the call in
+/// [`AgentTaskEntityStore::apply`].
+fn probe_human_submission_echo(
+    state: &AgentTaskState,
+    operation_id: &AgentOperationId,
+) -> Option<AgentTaskResult<AgentTaskSubmissionDecision>> {
+    let task = state.task.as_ref()?;
+    let remaining = task
+        .definition
+        .limits
+        .max_result_rejections
+        .saturating_sub(task.rejection_count);
+    if let Some(accepted) = task.accepted_result.as_deref() {
+        if accepted.proposal_id == *operation_id {
+            return Some(Ok(AgentTaskSubmissionDecision {
+                disposition: AgentTaskSubmissionDisposition::Accepted,
+                code: None,
+                feedback: String::new(),
+                remaining_attempts: remaining,
+                digest: accepted.digest.clone(),
+            }));
+        }
+    }
+    if let Some(last) = task.last_rejection.as_deref() {
+        if last.proposal_id == *operation_id {
+            return Some(Ok(AgentTaskSubmissionDecision {
+                disposition: AgentTaskSubmissionDisposition::Rejected,
+                code: Some(last.cause.reason.clone()),
+                feedback: bounded_detail(format!("{}: {}", last.cause.reason, last.cause.detail)),
+                remaining_attempts: remaining,
+                digest: last.digest.clone(),
+            }));
+        }
+    }
+    if task
+        .rejected_submissions
+        .contains(&submission_fingerprint(operation_id))
+    {
+        // An older rejection evicted from the materialized record: the
+        // decision stands, the budget is not re-spent, and the caller
+        // resubmits corrected content under a new discriminator.
+        return Some(Err(AgentTaskError::SubmissionRefused {
+            code: "submission-already-rejected",
+            message: "this submission was already rejected; a corrected resubmission \
+                      carries a new deduplication key"
+                .to_string(),
+        }));
+    }
+    None
+}
+
 /// Applies one authenticated human-result submission
 /// ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
 ///
 /// The ladder answers every durable echo *before* any guard, the terminal
-/// one included — the accepted result and the latest rejection replay
-/// idempotently past the operation log's bounded window — and every refusal
-/// is non-committing: a rejected transition never reaches the store, so a
+/// one included — see [`probe_human_submission_echo`] — and every refusal is
+/// non-committing: a rejected transition never reaches the store, so a
 /// corrected retry under the same operation id is still accepted.
 fn submit_human_result(
     state: &mut AgentTaskState,
@@ -9332,54 +9446,8 @@ fn submit_human_result(
     // The durable echoes, before every guard including the terminal one (the
     // handoff-provenance ordering): a past-window replay of a decided
     // submission converges on its recorded decision instead of refusing.
-    // First-writer-wins — the replay's content is never re-read.
-    if let Some(task) = state.task.as_ref() {
-        let remaining = task
-            .definition
-            .limits
-            .max_result_rejections
-            .saturating_sub(task.rejection_count);
-        if let Some(accepted) = task.accepted_result.as_deref() {
-            if accepted.proposal_id == *operation_id {
-                let decision = AgentTaskSubmissionDecision {
-                    disposition: AgentTaskSubmissionDisposition::Accepted,
-                    code: None,
-                    feedback: String::new(),
-                    remaining_attempts: remaining,
-                    digest: accepted.digest.clone(),
-                };
-                return Ok((AgentTaskOutcomeExtras::submission(decision), Vec::new()));
-            }
-        }
-        if let Some(last) = task.last_rejection.as_deref() {
-            if last.proposal_id == *operation_id {
-                let decision = AgentTaskSubmissionDecision {
-                    disposition: AgentTaskSubmissionDisposition::Rejected,
-                    code: Some(last.cause.reason.clone()),
-                    feedback: bounded_detail(format!(
-                        "{}: {}",
-                        last.cause.reason, last.cause.detail
-                    )),
-                    remaining_attempts: remaining,
-                    digest: last.digest.clone(),
-                };
-                return Ok((AgentTaskOutcomeExtras::submission(decision), Vec::new()));
-            }
-        }
-        if task
-            .rejected_submissions
-            .contains(&submission_fingerprint(operation_id))
-        {
-            // An older rejection evicted from the materialized record: the
-            // decision stands, the budget is not re-spent, and the caller
-            // resubmits corrected content under a new discriminator.
-            return Err(AgentTaskError::SubmissionRefused {
-                code: "submission-already-rejected",
-                message: "this submission was already rejected; a corrected resubmission \
-                          carries a new deduplication key"
-                    .to_string(),
-            });
-        }
+    if let Some(echo) = probe_human_submission_echo(state, operation_id) {
+        return echo.map(|decision| (AgentTaskOutcomeExtras::submission(decision), Vec::new()));
     }
 
     let Some(task) = state.task.as_ref() else {
@@ -9399,10 +9467,21 @@ fn submit_human_result(
             status: task.status,
         });
     }
-    if !matches!(task.status, AgentTaskStatus::WaitingForInput) {
-        // A human-owned task still blocked on dependencies cannot be
-        // completed early: the dependency graph is deterministic
+    if !task.dependencies_satisfied() {
+        // Status-independent, exactly as `awaits_assignment` re-tests it on
+        // the agent-owned path. The status is a projection of the graph, and
+        // a projection is the wrong thing to gate determinism on: any path
+        // that leaves a demoted status behind — a record persisted before a
+        // late declaration demoted it, a future transition that forgets to —
+        // would otherwise let a human complete a task whose declared inputs
+        // have not resolved
         // ([specification 8.12](../../../docs/plans/rakka-agent/spec.md)).
+        return Err(AgentTaskError::SubmissionRefused {
+            code: "task-dependencies-unresolved",
+            message: "the task's declared dependencies have not all resolved".to_string(),
+        });
+    }
+    if !matches!(task.status, AgentTaskStatus::WaitingForInput) {
         return Err(AgentTaskError::SubmissionRefused {
             code: "task-not-awaiting-input",
             message: format!("the task is {}, not waiting for input", task.status),
@@ -10925,6 +11004,29 @@ where
                 self.snapshot()?.map(Box::new),
             ));
         }
+
+        // The past-window submission echo is answered before every other
+        // guard, the history-headroom one included: it writes nothing at all,
+        // so a resubmission must converge on the decision already on record
+        // even while the history sink — pure observability — is unavailable.
+        // Refusing an idempotent convergence with `task-history-backlog`
+        // would tell a caller whose submission durably completed the task
+        // that nothing happened, and the correction it then sends under a
+        // fresh key is refused `task-terminal`. Same rule, same reason, as
+        // the conversation ledger's echo.
+        if let AgentTaskEntityCommand::SubmitHumanResult { operation_id, .. } = &command {
+            if let Some(echo) = probe_human_submission_echo(self.state()?, operation_id) {
+                return match echo {
+                    Ok(decision) => {
+                        let mut outcome = self.state()?.outcome();
+                        outcome.submission = Some(Box::new(decision));
+                        Ok(AgentTaskEntityReply::Duplicate { outcome })
+                    }
+                    Err(error) => Err(error),
+                };
+            }
+        }
+
         self.require_history_headroom(now).await?;
 
         // The agent's durable admission state is read *before* the transition, so

@@ -130,6 +130,30 @@ where
         ServiceParams::new()
     }
 
+    /// The durable identity of a submission whose caller supplied none.
+    ///
+    /// Pure over what the submission *claims* — the task it completes, the
+    /// contract it declares, and the content itself — so a retry of the same
+    /// submission converges on the decision already recorded, and a corrected
+    /// resubmission carries a different identity without the caller having to
+    /// remember to change one. The entity behind this call is built entirely
+    /// around operation-id convergence; a wrapper that mints a fresh id per
+    /// call opts its callers out of that silently.
+    fn derived_submission_key(request: &rakka_agent::AgentClientTaskResultRequest) -> String {
+        let claim = serde_json::json!({
+            "task": request.task,
+            "definition": request.definition,
+            "definition-version": request.definition_version,
+            "result-schema": request.result_schema,
+            "result-schema-version": request.result_schema_version,
+            "result": request.result,
+        });
+        format!(
+            "derived-{}",
+            rakka_agent::AgentContentDigest::of_json(&claim).value
+        )
+    }
+
     fn principal_metadata(principal: &PrincipalRef) -> Value {
         let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
         if let Some(display) = &principal.display_name {
@@ -344,6 +368,17 @@ where
         request: rakka_agent::AgentClientTaskResultRequest,
     ) -> AgentClientFuture<'_, AgentClientTaskView> {
         Box::pin(async move {
+            // Derived when the caller supplies none, and derived *before*
+            // anything moves. `Message::new` mints a fresh random id per
+            // call and the ingress falls back to it as the deduplication
+            // discriminator, so an unset key would make every retry a
+            // different durable submission — spending a rejection each time,
+            // and walking a task to `ResultRejectionsExhausted` over a
+            // submission its caller only ever made once.
+            let deduplication_key = request
+                .deduplication_key
+                .clone()
+                .unwrap_or_else(|| Self::derived_submission_key(&request));
             let mut message = Message::new(
                 Role::User,
                 vec![Part {
@@ -354,10 +389,12 @@ where
                 }],
             );
             message.task_id = Some(request.task);
+            message.context_id = request.context;
             let mut metadata = serde_json::Map::new();
-            if let Some(key) = request.deduplication_key {
-                metadata.insert(META_DEDUPLICATION_KEY.to_string(), Value::String(key));
-            }
+            metadata.insert(
+                META_DEDUPLICATION_KEY.to_string(),
+                Value::String(deduplication_key),
+            );
             let mut binding = serde_json::Map::new();
             binding.insert("definition".to_string(), Value::String(request.definition));
             binding.insert(

@@ -885,3 +885,77 @@ async fn the_typed_client_submits_through_the_same_durable_path() {
         other => panic!("the ownership refusal must surface: {other:?}"),
     }
 }
+
+/// The typed client is idempotent with no deduplication key set, and it
+/// forwards the conversation the submission belongs to.
+///
+/// The entity behind the client is built entirely around operation-id
+/// convergence. A wrapper that mints a fresh id per call opts its callers out
+/// of that silently: a retry after a lost reply becomes a *second* durable
+/// submission, spends a second rejection, and can walk a task to
+/// `ResultRejectionsExhausted` over a submission its caller only ever made
+/// once.
+#[tokio::test]
+async fn the_typed_client_converges_on_retry_without_an_explicit_key() {
+    let fixture = Fixture::new();
+    fixture.create_human_task().await;
+
+    let transport = A2AAgentClientTransport::new(fixture.service.clone())
+        .with_tenant(TENANT)
+        .with_principal(principal());
+    let client = RakkaAgentClient::new(transport);
+
+    // No `deduplication_key`, and a context to correlate the task with.
+    let request = AgentClientTaskResultRequest {
+        task: HUMAN_TASK.to_string(),
+        result: json!({ "answer": "" }),
+        definition: TASK_DEFINITION.to_string(),
+        definition_version: 1,
+        result_schema: "order-result".to_string(),
+        result_schema_version: 1,
+        context: Some("ctx-42".to_string()),
+        ..AgentClientTaskResultRequest::default()
+    };
+
+    let rejected = client
+        .submit_task_result(request.clone())
+        .await
+        .expect("a committed rejection answers Ok");
+    assert_eq!(rejected.state, AgentClientTaskState::InputRequired);
+    assert_eq!(
+        rejected.context, "ctx-42",
+        "the submission stays in the conversation it belongs to"
+    );
+
+    // The identical submission, sent again exactly as a retry would: it
+    // converges on the recorded decision instead of spending a second one.
+    for attempt in 0..3 {
+        let retry = client
+            .submit_task_result(request.clone())
+            .await
+            .expect("the retry converges");
+        assert_eq!(
+            retry.state,
+            AgentClientTaskState::InputRequired,
+            "{attempt}"
+        );
+        assert_eq!(retry.context, "ctx-42", "{attempt}");
+    }
+    assert_eq!(
+        fixture.snapshot().await.rejection_count,
+        1,
+        "four identical sends, one decision: the derived key is the submission's own identity"
+    );
+
+    // Corrected content is a different submission and gets its own decision,
+    // with no key for the caller to remember to change.
+    let corrected = client
+        .submit_task_result(AgentClientTaskResultRequest {
+            result: json!({ "answer": "approved" }),
+            ..request
+        })
+        .await
+        .expect("the corrected submission completes");
+    assert_eq!(corrected.state, AgentClientTaskState::Completed);
+    assert_eq!(corrected.context, "ctx-42");
+}

@@ -21,7 +21,8 @@ use rakka_agent::{
     AgentTaskContent, AgentTaskCreation, AgentTaskDependencyDeclaration,
     AgentTaskDependencyOutcome, AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskError,
     AgentTaskHistoryKind, AgentTaskHistoryStore, AgentTaskId, AgentTaskOwnership, AgentTaskScope,
-    AgentTaskStatus, AgentTaskSubmissionDisposition, METRIC_AGENT_HUMAN_RESULTS,
+    AgentTaskStatus, AgentTaskSubmissionDisposition, AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY,
+    METRIC_AGENT_HUMAN_RESULTS,
 };
 use rakka_agent_workflow::{AgentCausationId, AgentTimestampMillis};
 use rakka_core::InMemoryMetricsRecorder;
@@ -512,7 +513,11 @@ async fn the_submission_ladder_refuses_without_committing() {
         )
         .await
         .expect_err("a blocked task refuses");
-    assert_eq!(blocked.code(), "task-not-awaiting-input");
+    assert_eq!(
+        blocked.code(),
+        "task-dependencies-unresolved",
+        "the dependency gate is re-tested against the edges themselves, not the status          they project, so it names the real reason"
+    );
 
     // Unblock it, then refuse the malformed principals.
     fx.apply_task_command_at(
@@ -614,12 +619,14 @@ async fn a_replayed_rejection_never_spends_the_budget_twice() {
     let fx = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new(),
     ));
-    // A definition tolerating many rejections, so the ladder — not
-    // exhaustion — is what the test observes.
+    // The largest budget a definition may declare — which is exactly the
+    // echo ring's capacity, so every rejection inside the budget is covered
+    // by the ring — and far more than the two this test spends, so the
+    // ladder rather than exhaustion is what it observes.
     let definition = task_definition()
         .with_ownership(AgentTaskOwnership::Human)
         .with_limits(rakka_agent::AgentTaskLimits {
-            max_result_rejections: 40,
+            max_result_rejections: AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY as u32,
             ..task_definition().limits
         });
     fx.apply_task_command_at(
@@ -707,7 +714,17 @@ async fn a_replayed_rejection_never_spends_the_budget_twice() {
     }
 
     // Past-window replay of the LATEST rejection: echoed from the
-    // materialized record, budget untouched.
+    // materialized record, budget untouched — and answered with no
+    // transition at all.
+    //
+    // Writing nothing is the load-bearing part, not an optimization. The
+    // entity runs its history-headroom guard before any transition, so an
+    // echo answered *inside* one would be refused `task-history-backlog`
+    // while the history sink — pure observability — is backed up, telling a
+    // caller whose submission already decided the task that nothing
+    // happened. The echo is answered before that guard precisely because it
+    // needs nothing the guard protects.
+    let quiesced_at = human_state(&fx).await.updated_at();
     let echoed = fx
         .apply_task_command_at(
             &human_scope(),
@@ -715,6 +732,15 @@ async fn a_replayed_rejection_never_spends_the_budget_twice() {
         )
         .await
         .expect("the latest rejection echoes");
+    assert!(
+        matches!(echoed, AgentTaskEntityReply::Duplicate { .. }),
+        "a past-window echo answers from the record; it does not re-transition"
+    );
+    assert_eq!(
+        human_state(&fx).await.updated_at(),
+        quiesced_at,
+        "the echo wrote nothing at all"
+    );
     let decision = applied_submission(&echoed);
     assert_eq!(
         decision.disposition,
@@ -897,4 +923,152 @@ async fn a_cancel_requested_task_refuses_submissions() {
         AgentTaskError::Terminal { status } => assert_eq!(status, AgentTaskStatus::Cancelled),
         other => panic!("unexpected refusal: {other:?}"),
     }
+}
+
+/// A dependency declared *after* creation closes the submission door, and
+/// resolving it reopens it.
+///
+/// A human-owned task with no dependencies is born `WaitingForInput`, which
+/// is exactly what the submission door reads as "the graph permits this now".
+/// A late declaration has to close that door, and the door re-tests the edges
+/// themselves rather than trusting the status to have been demoted.
+#[tokio::test]
+async fn a_late_declared_dependency_closes_the_submission_door() {
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    create_human_task(&fx, Vec::new()).await;
+    assert_eq!(
+        human_state(&fx)
+            .await
+            .task()
+            .expect("the task exists")
+            .status,
+        AgentTaskStatus::WaitingForInput
+    );
+
+    let upstream = AgentTaskId::new("late-upstream").expect("the id is valid");
+    fx.apply_task_command_at(
+        &human_scope(),
+        AgentTaskEntityCommand::DeclareDependency {
+            operation_id: AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Command,
+                [TENANT, HUMAN_TASK, "late-declare"],
+            )
+            .expect("the operation id derives"),
+            declaration: Box::new(AgentTaskDependencyDeclaration::new(upstream.clone())),
+        },
+    )
+    .await
+    .expect("the late edge declares");
+
+    assert_eq!(
+        human_state(&fx)
+            .await
+            .task()
+            .expect("the task exists")
+            .status,
+        AgentTaskStatus::Blocked,
+        "the late edge demotes the human task exactly as it does an agent-owned one"
+    );
+    let refused = fx
+        .apply_task_command_at(
+            &human_scope(),
+            submit_command("too-early", json!({ "answer": "approved" })),
+        )
+        .await
+        .expect_err("the declared input has not resolved");
+    assert_eq!(refused.code(), "task-dependencies-unresolved");
+    assert!(
+        human_state(&fx)
+            .await
+            .task()
+            .expect("the task exists")
+            .accepted_result
+            .is_none(),
+        "the refusal committed nothing"
+    );
+
+    // Resolving the edge reopens the door.
+    fx.apply_task_command_at(
+        &human_scope(),
+        AgentTaskEntityCommand::RecordDependencyOutcome {
+            operation_id: AgentOperationId::new(
+                rakka_agent::AgentOperationKind::Command,
+                [TENANT, HUMAN_TASK, "late-resolve"],
+            )
+            .expect("the operation id derives"),
+            dependency: upstream,
+            outcome: AgentTaskDependencyOutcome::Completed,
+        },
+    )
+    .await
+    .expect("the edge resolves");
+    fx.apply_task_command_at(
+        &human_scope(),
+        submit_command("now-ok", json!({ "answer": "approved" })),
+    )
+    .await
+    .expect("the submission is admitted once its input exists");
+    assert_eq!(
+        human_state(&fx)
+            .await
+            .task()
+            .expect("the task exists")
+            .status,
+        AgentTaskStatus::Completed
+    );
+}
+
+/// Two definitions that could only ever fail are refused where they are
+/// declared, rather than discovered when a submission is spent against them.
+#[tokio::test]
+async fn an_unsatisfiable_definition_is_refused_at_declaration() {
+    // A rejection budget larger than the echo ring that guards it: the ring
+    // would evict a live rejection, and the replay would re-spend it.
+    let over_budget = task_definition()
+        .with_ownership(AgentTaskOwnership::Human)
+        .with_limits(rakka_agent::AgentTaskLimits {
+            max_result_rejections: AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY as u32 + 1,
+            ..task_definition().limits
+        });
+    let error = over_budget
+        .validate()
+        .expect_err("a budget past the echo ring is refused");
+    assert_eq!(error.code(), "invalid-task-definition");
+    assert!(
+        task_definition()
+            .with_ownership(AgentTaskOwnership::Human)
+            .with_limits(rakka_agent::AgentTaskLimits {
+                max_result_rejections: AGENT_TASK_REJECTED_SUBMISSION_ECHO_CAPACITY as u32,
+                ..task_definition().limits
+            })
+            .validate()
+            .is_ok(),
+        "a budget the ring fully covers stands"
+    );
+
+    // A human-owned task requiring evidence: no submission surface carries
+    // evidence artifacts, so every attempt would be a committed rejection
+    // walking the task to exhaustion — and taking its dependents with it.
+    let requires_evidence = task_definition()
+        .with_ownership(AgentTaskOwnership::Human)
+        .with_result_rule(rakka_agent::AgentTaskResultRule::new(
+            rakka_agent::AgentTaskRuleId::new("evidence").expect("the rule id is valid"),
+            rakka_agent::AgentTaskResultCheck::EvidenceRequired,
+        ));
+    let error = requires_evidence
+        .validate()
+        .expect_err("an unsatisfiable human rule is refused");
+    assert_eq!(error.code(), "invalid-task-definition");
+    assert!(
+        task_definition()
+            .with_result_rule(rakka_agent::AgentTaskResultRule::new(
+                rakka_agent::AgentTaskRuleId::new("evidence").expect("the rule id is valid"),
+                rakka_agent::AgentTaskResultCheck::EvidenceRequired,
+            ))
+            .validate()
+            .is_ok(),
+        "an agent-owned task may still require evidence: its run can carry artifacts"
+    );
 }

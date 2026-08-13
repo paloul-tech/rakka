@@ -180,9 +180,23 @@ pub struct AgentClientTaskResultRequest {
     /// for the deployment authorizer; the surface accepts no evidence
     /// artifacts yet.
     pub evidence_digest: Option<String>,
+    /// The conversation this submission belongs to, forwarded as the A2A
+    /// `context_id` exactly as [`AgentClientTaskRequest::context`] is. Left
+    /// unset, the surface correlates the task with itself, which silently
+    /// drops it from whatever conversation created it.
+    pub context: Option<String>,
     /// Explicit durable deduplication key. A retry that reuses it converges
     /// on the original decision — a recorded rejection included; a corrected
     /// resubmission after a rejection must carry a new key.
+    ///
+    /// Left unset, the transport derives one from the submission's own
+    /// content, so an ordinary retry still converges: the durable identity of
+    /// a submission is what it says, not when it was sent. Deriving it is the
+    /// safe default precisely because the alternative — a fresh id per call —
+    /// spends a rejection per retry and can walk a task to
+    /// `ResultRejectionsExhausted` on a submission the caller only ever made
+    /// once. Set it explicitly when two submissions carrying identical
+    /// content must be told apart.
     pub deduplication_key: Option<String>,
     /// Authenticated principal submitting the result. Required by the
     /// surface: a human-owned task completes only under an authenticated

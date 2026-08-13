@@ -705,6 +705,12 @@ pub fn agent_task_result_command(
             rakka_agent::AgentRevisionNumber::new(binding.result_schema_version),
         ),
         content: AgentTaskContent::inline(input)?,
+        // Structurally empty, and safe to be: a human-owned task definition
+        // may not declare `EvidenceRequired`, so no rule the entity evaluates
+        // can depend on what this surface cannot carry. The binding's
+        // `evidence_digest` stays advisory for the deployment authorizer.
+        // When the artifact strategy lands, this is where the artifacts
+        // arrive and that definition guard lifts together with it.
         evidence: Vec::new(),
         causation_id: rakka_agent_workflow::AgentCausationId::new(causation),
         submitted_at: now,
