@@ -2920,7 +2920,7 @@ pub struct AgentTaskHistoryEntry {
 }
 
 impl AgentTaskHistoryEntry {
-    fn new(
+    pub(crate) fn new(
         sequence: AgentTaskHistorySequence,
         kind: AgentTaskHistoryKind,
         operation_id: AgentOperationId,
@@ -3005,6 +3005,21 @@ impl AgentTaskHistoryCursor {
         }
     }
 
+    /// Repositions this cursor so `sequence` is the next entry it expects.
+    ///
+    /// The companion of [`AgentTaskError::HistoryWindowExpired`]: a reader
+    /// handed a retained floor resumes *at* it, keeping its page size. Sequences
+    /// start at [`AgentTaskHistorySequence::FIRST`], so a zero resumes from the
+    /// beginning.
+    #[must_use]
+    pub const fn resuming_at(mut self, sequence: AgentTaskHistorySequence) -> Self {
+        self.after = match sequence.get() {
+            0 => None,
+            value => Some(AgentTaskHistorySequence::new(value - 1)),
+        };
+        self
+    }
+
     /// Sets the page size, clamped to [`AGENT_TASK_HISTORY_MAX_PAGE_SIZE`].
     #[must_use]
     pub const fn with_limit(mut self, limit: usize) -> Self {
@@ -3083,6 +3098,14 @@ pub trait AgentTaskHistoryStore: Clone + Send + Sync + 'static {
     ) -> AgentTaskHistoryFuture<'a, ()>;
 
     /// Reads one bounded page.
+    ///
+    /// A backend that bounds its retention MUST answer a cursor preceding the
+    /// window it still holds with [`AgentTaskError::HistoryWindowExpired`], and
+    /// MUST return a page contiguous from the cursor, so a reader resynchronizes
+    /// from authoritative state instead of silently skipping entries
+    /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
+    /// [`crate::testkit::assert_task_history_store_contract`] is the harness
+    /// that proves it.
     fn read<'a>(
         &'a self,
         scope: &'a AgentTaskScope,
@@ -3094,13 +3117,28 @@ pub trait AgentTaskHistoryStore: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryAgentTaskHistoryStore {
     entries: Arc<Mutex<BTreeMap<String, BTreeMap<u64, AgentTaskHistoryEntry>>>>,
+    retention: Option<usize>,
 }
 
 impl InMemoryAgentTaskHistoryStore {
-    /// Creates an empty history.
+    /// Creates an empty history that retains everything appended to it.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bounds the history retained per task, evicting the oldest entries.
+    ///
+    /// Retention is off by default because this log is also the audit record
+    /// [specification 17.13](../../../docs/plans/rakka-agent/spec.md) requires,
+    /// and the entity refuses a transition rather than lose an entry. Enabling
+    /// it forfeits that audit obligation for whatever the window drops, in
+    /// exchange for a bounded log and the explicit expired-window answer a
+    /// replay cursor needs. A limit of zero is treated as one.
+    #[must_use]
+    pub fn with_retention(mut self, entries: usize) -> Self {
+        self.retention = Some(entries.max(1));
+        self
     }
 
     /// How many entries one task has.
@@ -3144,6 +3182,15 @@ impl AgentTaskHistoryStore for InMemoryAgentTaskHistoryStore {
                 }),
                 None => {
                     task.insert(entry.sequence.get(), entry.clone());
+                    if let Some(retention) = self.retention {
+                        while task.len() > retention {
+                            let oldest = *task
+                                .keys()
+                                .next()
+                                .expect("a history longer than its retention holds an entry");
+                            task.remove(&oldest);
+                        }
+                    }
                     Ok(())
                 }
             }
@@ -3167,7 +3214,22 @@ impl AgentTaskHistoryStore for InMemoryAgentTaskHistoryStore {
                 });
             };
 
-            let start = cursor.position().map_or(0, |after| after.get() + 1);
+            // The sequence the reader expects next: one past its cursor, or the
+            // very first entry when it is starting from the beginning.
+            let start = cursor
+                .position()
+                .map_or(AgentTaskHistorySequence::FIRST.get(), |after| {
+                    after.get() + 1
+                });
+            // If the oldest entry still retained is later than that, everything
+            // between was evicted and resuming here would skip it silently.
+            if let Some(oldest) = task.keys().next().copied() {
+                if start < oldest {
+                    return Err(AgentTaskError::HistoryWindowExpired {
+                        oldest_retained: Some(AgentTaskHistorySequence::new(oldest)),
+                    });
+                }
+            }
             let mut page: Vec<AgentTaskHistoryEntry> = task
                 .range(start..)
                 .map(|(_, entry)| entry.clone())
@@ -3182,6 +3244,19 @@ impl AgentTaskHistoryStore for InMemoryAgentTaskHistoryStore {
                     })
                 })
                 .flatten();
+
+            // History sequences are dense — the transition that consumes one
+            // pushes its entry in the same step — so a discontinuity inside the
+            // page the reader is about to cross means the window moved under it.
+            let mut expected = start;
+            for entry in &page {
+                if entry.sequence.get() != expected {
+                    return Err(AgentTaskError::HistoryWindowExpired {
+                        oldest_retained: Some(entry.sequence),
+                    });
+                }
+                expected = entry.sequence.get().saturating_add(1);
+            }
 
             Ok(AgentTaskHistoryPage {
                 entries: page,
@@ -13651,6 +13726,14 @@ pub enum AgentTaskError {
         /// The contested sequence.
         sequence: AgentTaskHistorySequence,
     },
+    /// The read cursor precedes the history the backend still retains, so
+    /// resuming from it would silently skip entries
+    /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)). The
+    /// reader resynchronizes from authoritative state and resumes at the floor.
+    HistoryWindowExpired {
+        /// Oldest sequence still retained, when the scope retains anything.
+        oldest_retained: Option<AgentTaskHistorySequence>,
+    },
     /// The task owes its history sink more entries than it may hold, so it
     /// cannot transition again until the sink accepts them.
     HistoryBacklog {
@@ -13740,6 +13823,7 @@ impl AgentTaskError {
             Self::ContentTooLarge { .. } => "task-content-too-large",
             Self::MaterializedStateTooLarge { .. } => "task-state-too-large",
             Self::HistoryConflict { .. } => "task-history-conflict",
+            Self::HistoryWindowExpired { .. } => "task-history-window-expired",
             Self::HistoryBacklog { .. } => "task-history-backlog",
             Self::AgentRead { .. } => "task-agent-read-failed",
             Self::DefinitionMismatch { .. } => "task-definition-mismatch",
@@ -13874,6 +13958,15 @@ impl Display for AgentTaskError {
                 f,
                 "history sequence {sequence} already holds a different entry"
             ),
+            Self::HistoryWindowExpired { oldest_retained } => match oldest_retained {
+                Some(oldest) => write!(
+                    f,
+                    "the history cursor precedes the retained window, which starts at sequence {oldest}; resynchronize from authoritative state"
+                ),
+                None => f.write_str(
+                    "the history cursor precedes the retained window, which holds nothing; resynchronize from authoritative state",
+                ),
+            },
             Self::HistoryBacklog { pending, maximum } => write!(
                 f,
                 "the task owes its history sink {pending} entries, the most it may hold is {maximum}, and it may not transition again until the sink accepts them"

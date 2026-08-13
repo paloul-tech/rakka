@@ -217,3 +217,103 @@ async fn the_decision_sequence_survives_any_owner_loss_exactly_once() {
     })
     .await;
 }
+
+/// A decision the outbox dropped is a *declared* gap, not a silent one
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md); scenario
+/// 45's read half).
+///
+/// The outbox is deliberately a ring that drops its oldest owed event rather
+/// than fail a transition over telemetry. But the dropped event has already
+/// consumed a sequence, so the sink receives a stream with a hole in the
+/// middle — and a reader paging across that hole would silently skip a
+/// decision while believing it had them all. The sink refuses at the
+/// discontinuity instead, naming where the stream resumes.
+#[tokio::test]
+async fn a_dropped_decision_is_a_declared_gap_not_a_silent_one() {
+    use rakka_agent::{AgentDecisionEventSink, AgentObservabilityError};
+
+    let sink = InMemoryAgentDecisionEventSink::new();
+    let scope = run_scope();
+
+    // The head of the stream is retained, the middle is not: exactly what a
+    // ring that drops its oldest *unflushed* event leaves behind once the
+    // earlier ones had already been flushed.
+    let events = decision_events_for(&scope, &[1, 2, 4]).await;
+    for event in &events {
+        sink.append(&scope, event)
+            .await
+            .expect("the sink accepts the append");
+    }
+
+    // Reading from the head walks straight into the hole.
+    let error = sink
+        .read(&scope, 0, 16)
+        .await
+        .expect_err("a page spanning a hole is refused, never short-paged");
+    match error {
+        AgentObservabilityError::ReplayWindowExpired { oldest_retained } => {
+            assert_eq!(
+                oldest_retained,
+                Some(4),
+                "the refusal names the sequence the stream resumes at"
+            );
+        }
+        other => panic!("a gap answers an expired window, got {other:?}"),
+    }
+
+    // A reader that has already seen the gap resumes past it cleanly.
+    let tail = sink
+        .read(&scope, 3, 16)
+        .await
+        .expect("resuming past the gap succeeds");
+    assert_eq!(
+        tail.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+        vec![4],
+        "past the gap the stream is contiguous again"
+    );
+
+    // And a contiguous prefix still reads normally: the guard fires on the
+    // discontinuity, not on every read.
+    let head = sink
+        .read(&scope, 0, 2)
+        .await
+        .expect("a page that stops before the gap succeeds");
+    assert_eq!(
+        head.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+/// Produces real decision events at the given sequences by driving a run and
+/// keeping only the ones asked for — so the records under test are the ones
+/// the loop actually emits, not hand-built shapes.
+async fn decision_events_for(
+    scope: &rakka_agent::AgentRunScope,
+    sequences: &[u64],
+) -> Vec<rakka_agent::AgentDecisionEvent> {
+    let sink = Arc::new(InMemoryAgentDecisionEventSink::new());
+    let dispatcher = ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new()
+            .with_turn_for(1, tool_calling_turn("lookup"))
+            .with_turn_for(2, proposing_turn("resolved")),
+    )
+    .with_tool_result(
+        "lookup",
+        AgentTaskContent::inline(serde_json::json!({ "found": true }))
+            .expect("the tool result is inline-bounded"),
+    );
+    let fx = Fixture::new(dispatcher).with_decision_events(sink.clone());
+    fx.instantiate_agent().await;
+    fx.create_task().await;
+    fx.pump().await.expect("the flow completes");
+
+    let produced = sink.events(scope);
+    assert!(
+        produced.len() >= sequences.iter().copied().max().unwrap_or(0) as usize,
+        "the driven run must produce at least the sequences under test: {produced:?}"
+    );
+    produced
+        .into_iter()
+        .filter(|event| sequences.contains(&event.sequence))
+        .collect()
+}

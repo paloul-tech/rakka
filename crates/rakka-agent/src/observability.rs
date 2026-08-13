@@ -425,6 +425,12 @@ pub trait AgentDecisionEventSink: Send + Sync + 'static {
     /// A cursor that predates the retained window fails with
     /// [`AgentObservabilityError::ReplayWindowExpired`] so a reader resyncs
     /// from authoritative state instead of silently missing events.
+    ///
+    /// An implementation MUST answer the same way for a gap the reader would
+    /// cross *inside* the returned page, not only for one at the head: the
+    /// run's outbox drops its oldest unflushed event after that event consumed
+    /// a sequence, so a hole can sit anywhere. The returned page must be
+    /// contiguous from `after + 1`.
     fn read<'a>(
         &'a self,
         scope: &'a AgentRunScope,
@@ -570,7 +576,7 @@ impl AgentDecisionEventSink for InMemoryAgentDecisionEventSink {
                     });
                 }
             }
-            Ok(retained
+            let page: Vec<AgentDecisionEvent> = retained
                 .map(|held| {
                     held.iter()
                         .filter(|event| event.sequence > after)
@@ -578,7 +584,24 @@ impl AgentDecisionEventSink for InMemoryAgentDecisionEventSink {
                         .cloned()
                         .collect()
                 })
-                .unwrap_or_default())
+                .unwrap_or_default();
+            // The head check above only catches an eviction at the front. The
+            // outbox is a ring that drops its oldest *unflushed* event after
+            // that event already consumed a sequence, so a hole can sit
+            // anywhere in the stream — and a page returned across one would
+            // silently skip it. Walk the page the caller is about to cross and
+            // refuse at the discontinuity instead, the rule the substrate's
+            // public event log already keeps.
+            let mut expected = after.saturating_add(1);
+            for event in &page {
+                if event.sequence != expected {
+                    return Err(AgentObservabilityError::ReplayWindowExpired {
+                        oldest_retained: Some(event.sequence),
+                    });
+                }
+                expected = event.sequence.saturating_add(1);
+            }
+            Ok(page)
         })
     }
 }

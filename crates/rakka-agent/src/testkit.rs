@@ -4007,6 +4007,387 @@ impl crate::retrieval::AgentPrivateMemoryRetriever for ScriptedPrivateMemoryRetr
     }
 }
 
+/// How much history a backend under test keeps.
+///
+/// The contract splits on it, because the two halves are different promises: an
+/// unbounded backend must never lose an entry, and a bounded one must *say* it
+/// lost them rather than answer a short page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRetention {
+    /// The backend keeps everything appended to it.
+    Unbounded,
+    /// The backend keeps at most this many entries per scope, evicting oldest.
+    Bounded(usize),
+}
+
+/// How many entries a conformance run appends.
+///
+/// Comfortably past the default page size, so paging is exercised for real
+/// rather than in one page that happens to hold everything.
+const HISTORY_CONTRACT_ENTRIES: u64 = 24;
+
+/// Page size the contract reads with: small enough that the log needs several.
+const HISTORY_CONTRACT_PAGE: usize = 5;
+
+fn history_contract_operation(sequence: u64) -> AgentOperationId {
+    // Segments cannot carry the scope separator, so the scope key itself is not
+    // one; the contract only needs distinct ids per sequence.
+    AgentOperationId::new(
+        crate::identity::AgentOperationKind::Command,
+        ["history-contract", &sequence.to_string()],
+    )
+    .expect("the harness derives a legal operation id")
+}
+
+/// Asserts one [`AgentTaskHistoryStore`] keeps the contract every backend owes
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The store must be empty for `scope`. The harness appends its own entries, so
+/// a backend in another crate can prove itself without reaching into this one's
+/// record constructors — the duplication that let the substrate's two projection
+/// backends drift apart.
+///
+/// What it proves: appends are idempotent on `(scope, sequence)` and a *different*
+/// entry at an occupied sequence fails closed; a cursor pages the whole log in
+/// order, once each, with no gap; and — under
+/// [`HistoryRetention::Bounded`] — a cursor preceding the retained window answers
+/// [`AgentTaskError::HistoryWindowExpired`] naming a floor the reader can
+/// actually resume from, rather than a short page it would mistake for the truth.
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_task_history_store_contract<Store>(
+    store: &Store,
+    scope: &AgentTaskScope,
+    retention: HistoryRetention,
+) where
+    Store: AgentTaskHistoryStore,
+{
+    use crate::task::{
+        AgentTaskHistoryCursor, AgentTaskHistoryEntry, AgentTaskHistoryKind,
+        AgentTaskHistorySequence, AgentTaskStatus,
+    };
+
+    let entry = |sequence: u64| {
+        AgentTaskHistoryEntry::new(
+            AgentTaskHistorySequence::new(sequence),
+            AgentTaskHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTaskStatus::Created,
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentTaskHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentTaskHistorySequence::FIRST.get());
+    conflicting.kind = AgentTaskHistoryKind::Terminated;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentTaskHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentTaskHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            assert!(
+                (kept as u64) < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept as u64 + 1;
+            match store
+                .read(scope, AgentTaskHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentTaskError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(
+                        oldest.get(),
+                        expected_floor,
+                        "the reported floor is the oldest entry actually retained"
+                    );
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentTaskHistoryCursor::start()
+        .resuming_at(AgentTaskHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+}
+
+/// Asserts one [`AgentTeamHistoryStore`] keeps the same contract.
+///
+/// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_team_history_store_contract<Store>(
+    store: &Store,
+    scope: &crate::identity::AgentTeamScope,
+    retention: HistoryRetention,
+) where
+    Store: crate::team::AgentTeamHistoryStore,
+{
+    use crate::team::{
+        AgentTeamError, AgentTeamHistoryCursor, AgentTeamHistoryEntry, AgentTeamHistoryKind,
+        AgentTeamHistorySequence,
+    };
+
+    let entry = |sequence: u64| {
+        AgentTeamHistoryEntry::new(
+            AgentTeamHistorySequence::new(sequence),
+            AgentTeamHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentTeamHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentTeamHistorySequence::FIRST.get());
+    conflicting.kind = AgentTeamHistoryKind::Disbanded;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentTeamHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentTeamHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            assert!(
+                (kept as u64) < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept as u64 + 1;
+            match store
+                .read(scope, AgentTeamHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentTeamError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(oldest.get(), expected_floor, "the reported floor is real");
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentTeamHistoryCursor::start()
+        .resuming_at(AgentTeamHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+}
+
+/// Asserts one [`AgentConversationHistoryStore`] keeps the same contract.
+///
+/// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// [`AgentConversationHistoryStore`]: crate::conversation::AgentConversationHistoryStore
+///
+/// # Panics
+///
+/// On any breach of that contract, naming what it observed.
+pub async fn assert_conversation_history_store_contract<Store>(
+    store: &Store,
+    scope: &crate::identity::AgentConversationScope,
+    retention: HistoryRetention,
+) where
+    Store: crate::conversation::AgentConversationHistoryStore,
+{
+    use crate::conversation::{
+        AgentConversationError, AgentConversationHistoryCursor, AgentConversationHistoryEntry,
+        AgentConversationHistoryKind, AgentConversationHistorySequence,
+    };
+
+    let entry = |sequence: u64| {
+        AgentConversationHistoryEntry::new(
+            AgentConversationHistorySequence::new(sequence),
+            AgentConversationHistoryKind::Created,
+            history_contract_operation(sequence),
+            AgentTimestampMillis::new(sequence),
+        )
+    };
+
+    let first = entry(AgentConversationHistorySequence::FIRST.get());
+    store
+        .append(scope, &first)
+        .await
+        .expect("the first append succeeds");
+    store
+        .append(scope, &first)
+        .await
+        .expect("re-driving an interrupted flush writes the same entry to the same slot");
+    let mut conflicting = entry(AgentConversationHistorySequence::FIRST.get());
+    conflicting.kind = AgentConversationHistoryKind::Ended;
+    store
+        .append(scope, &conflicting)
+        .await
+        .expect_err("a different entry at an occupied sequence fails closed");
+
+    for sequence in (AgentConversationHistorySequence::FIRST.get() + 1)..=HISTORY_CONTRACT_ENTRIES {
+        store
+            .append(scope, &entry(sequence))
+            .await
+            .expect("appends succeed in sequence order");
+    }
+
+    let floor = match retention {
+        HistoryRetention::Unbounded => AgentConversationHistorySequence::FIRST.get(),
+        HistoryRetention::Bounded(kept) => {
+            assert!(
+                (kept as u64) < HISTORY_CONTRACT_ENTRIES,
+                "a bounded contract run must append past the window to exercise it"
+            );
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept as u64 + 1;
+            match store
+                .read(scope, AgentConversationHistoryCursor::start())
+                .await
+                .expect_err("a cursor before the retained window is refused, never short-paged")
+            {
+                AgentConversationError::HistoryWindowExpired {
+                    oldest_retained: Some(oldest),
+                } => {
+                    assert_eq!(oldest.get(), expected_floor, "the reported floor is real");
+                    oldest.get()
+                }
+                other => panic!("an expired window names its floor, got {other:?}"),
+            }
+        }
+    };
+
+    let mut cursor = AgentConversationHistoryCursor::start()
+        .resuming_at(AgentConversationHistorySequence::new(floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        let page = store
+            .read(scope, cursor)
+            .await
+            .expect("the reported floor is a legal resume point");
+        pages += 1;
+        seen.extend(page.entries.iter().map(|held| held.sequence.get()));
+        match page.next {
+            Some(next) => cursor = next,
+            None => break,
+        }
+        assert!(pages < 64, "paging must terminate");
+    }
+
+    let expected: Vec<u64> = (floor..=HISTORY_CONTRACT_ENTRIES).collect();
+    assert_eq!(
+        seen, expected,
+        "the cursor pages the retained log in order, once each, with no gap"
+    );
+    // Only meaningful when the retained window is larger than a page; a
+    // tightly bounded store legitimately answers in one.
+    if expected.len() > HISTORY_CONTRACT_PAGE {
+        assert!(
+            pages > 1,
+            "a log longer than a page must need more than one to prove the cursor"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

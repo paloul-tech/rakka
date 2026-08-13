@@ -3288,7 +3288,9 @@ projection row (1.12). Debts explicitly parked here by earlier slices:
 input delivery to an existing task refuses pending 5.4 (slice 1.12), the
 dependents registry (4.6 → 5.4), the goal-view wire surface (4.7 → 5.5).
 Sequencing: 5.4 depends only on Phase 1 machinery and may run first or in
-parallel; 5.5 must trail 5.1-5.3, whose events it replays.
+parallel; 5.5 must trail 5.1-5.3, whose events it replays. Slice 5.5b was
+added 2026-08-13 to own the two terminal-notification exchanges 5.2 and 5.3
+had recorded against 5.5, which shipped as a read contract.
 
 ### Slice 5.1 — Capability model and handoff
 
@@ -3481,7 +3483,8 @@ in-slice decisions resolved as follows (scope decisions user-approved):
   release is a new durable operation; post-acceptance transfer defers to
   the handoff machinery. Terminal/foreign tasks close entries lazily
   through claim refusals (`Done` + code) — the task→team terminal
-  notification exchange stays owed to 5.5.
+  notification exchange stays owed to 5.5b (re-parked from 5.5 on
+  2026-08-13).
 - **Wire**: the team cluster is the third shape under
   `io.rakka.collaboration`, discriminated by its `team` field checked
   before `handoff` (`deny_unknown_fields` fails a two-discriminator
@@ -3514,7 +3517,8 @@ in-slice decisions resolved as follows (scope decisions user-approved):
   passivation), the team-operations metric assertion, and rakka-a2a's
   `tests/team_surface.rs` (4, scenario 42's wire half + fail-closed
   matrix + per-operation authorization). Owed onward: 5.5's replayable
-  team events, task→team terminal/handoff notifications, board rewake
+  team events (landed 2026-08-13), task→team terminal/handoff notifications
+  (5.5b), board rewake
   parking, goal/collaboration-view team dimensions, the team otel rows,
   the Postgres team-history backend, the model-visible team tool door
   (+ its reserved `AgentDecisionKind` label), and A2A-carried
@@ -3572,9 +3576,9 @@ in-slice decisions resolved as follows (scope decisions user-approved):
   the conversation (`conversation.rs`, `RakkaAgentConversation`, the
   fifth sharded entity under `AgentEntityClass::Conversation`) embeds
   the exchange host with a refuse-all participant and an empty journal
-  so 5.5's terminal-notification exchange is a code change, not a schema
-  migration. Task-side conversation provenance and the projection echo
-  ride 5.5 with it.
+  so the terminal-notification exchange is a code change, not a schema
+  migration. That exchange, the task-side conversation provenance, and the
+  projection echo were re-parked from 5.5 to 5.5b on 2026-08-13.
 - **Turn identity carries the body digest**: the operation id derives
   over (tenant, conversation, round, turn, participant, body digest)
   under the reserved `ConversationTurn` kind — a durable redelivery
@@ -3635,7 +3639,8 @@ in-slice decisions resolved as follows (scope decisions user-approved):
   auto-passivation), the moderation-turns metric assertion, and
   rakka-a2a's `tests/conversation_surface.rs` (4, scenario 43's wire
   half + fail-closed matrix + per-operation authorization). Owed
-  onward: 5.5's replayable turn events, the conversation-terminal →
+  onward: 5.5's replayable turn events (landed 2026-08-13), the
+  conversation-terminal →
   task notification, task-side conversation provenance + projection
   echo, goal/collaboration-view conversation dimensions, the moderation
   otel rows, the Postgres conversation-history backend, and the
@@ -3780,6 +3785,184 @@ Guidance: [Client, Events, and Testkit](technical-guidance.md#client-events-and-
   assembly core and `authorized_agent_goal_view` wrapper).
 
 Done when: scenario 45 passes.
+**Done (2026-08-13):** scenario 45 passes over the real logs
+(`tests/coordination_replay.rs`) and over the real service core
+(`crates/rakka-a2a/tests/coordination_surface.rs`), both halves: a cursor
+resuming across every scope class that keeps a log, and an exhausted window
+answering a floor the reader resumes from. Open decision 21 is resolved.
+
+**Amended as implemented (2026-08-13):**
+
+- **The coordination event log already existed; what was missing was the way
+  out.** Every coordination transition already writes an ordered, deduplicated
+  record — the task, team, and conversation history logs, and the run's
+  decision-event sink — each written *after* the compare-and-set that decided
+  it, on a sequence that transition consumed. So this slice adds **no second
+  write path, no new durable record, and no new outbox**: 17.13's "emitted only
+  after the durable transition" and "duplicate processing creates one logical
+  event" were already satisfied on the write side, and durable task/run state
+  stays the correctness source. `events.rs` is a *read* contract over the four
+  logs. Open decision 21 resolves accordingly: yes, replayable, with bounded
+  retention, a monotonic scoped cursor, and explicit resync.
+- **The scoped cursor is the entity address.**
+  `AgentCoordinationCursor` encodes `AgentEntityAddress::key()` + `:` +
+  sequence, so `task/acme/order-1:7` and `team/acme/support:3` are both legal
+  and the team and conversation scopes that could never fit
+  `<task-id>:<sequence>` now have one. Identity segments are validated free of
+  `/` but may contain `:`, so the sequence is taken from the *last* separator —
+  the suffix the encoder always appends. The substrate's public task cursor is
+  a documented compatibility commitment and is untouched; the two shapes
+  cross-reject (a bare `<task-id>:<seq>` has no class segment and fails closed).
+  **The fence is scope equality, not just tenant**: a bare address whose last
+  segment ends in digits is a syntactically valid cursor for a *different*
+  entity in the same tenant, so a cursor naming any scope other than the one
+  addressed is refused (`coordination-cursor-scope-mismatch`), the substrate
+  projection's own rule.
+- **Two answers, never a short page.** `AgentCoordinationReplay` is
+  `Page { events, next_cursor, complete_through, has_more, unrecoverable_losses }`
+  or `WindowExpired { oldest_retained, resume_from }`, and the expired arm names
+  a cursor the reader can actually resume from. `complete_through` closes the
+  matching ambiguity at the head: entries reach their log on the settle pass
+  *after* the transition, so an empty tail can mean "you are current" or "the
+  entity still owes its sink" — the team and conversation snapshots gained
+  `owed_history` beside their existing `history_entries` so a reader can tell.
+  The merged `AgentCoordinationEventKind` label is `<scope-class>/<source-label>`
+  because the source vocabularies are **not** disjoint: a task records
+  `team-claim-recorded` when it takes a board claim and a team records
+  `team-claim-recorded` when it makes one, and a label that merged them would
+  merge two different events at two sequences in two logs.
+- **Retention is an opt-in read window, and the contract lives on the trait.**
+  The three in-memory history stores gained `with_retention(n)` — *off* by
+  default, because these logs are also the audit record 17.13 requires and the
+  entity refuses a transition rather than lose an entry (`require_history_headroom`),
+  so enabling eviction forfeits that audit obligation for whatever the window
+  drops, and the builder says so. A read below the floor answers the new
+  `…HistoryWindowExpired { oldest_retained }` on each entity's error enum, and
+  the page is walked for contiguity so a hole the reader would *cross* is
+  refused too, not only one at the head. `testkit`'s
+  `assert_{task,team,conversation}_history_store_contract` is the conformance
+  harness, so the owed PostgreSQL backends inherit the contract instead of
+  reimplementing it — which is exactly how the substrate's two projection
+  backends came to duplicate the same check twice.
+- **Six defects had to be fixed for the contract to be real rather than
+  nominal**, all found by design review and verified in source before any
+  code changed. (1) `record_decision` dropped the lowest-sequence *unflushed*
+  event after it had already consumed a sequence, and the sink checked only the
+  head — so a reader paged silently across the hole; the sink now walks the page
+  it is about to hand over and refuses at the discontinuity, the rule the
+  substrate's public event log already kept. (2) The assemble-failure branch
+  counted a drop *without* consuming the sequence, making that loss undetectable
+  by any reader; it now consumes it, so the loss is a hole rather than a
+  silence. (3) `is_domain_refusal` on the team and conversation errors is
+  exclusionary, so a new variant becomes a "refusal" by default — the
+  window-expired read answer would have been returned to a caller as a rejected
+  *command* and counted against the entity's refusal metric; both now exclude it
+  and say why. (4) `RakkaAgentA2AError::code()` flattened every `Projection(_)`
+  to `"projection"`, so the existing `replay-window-expired` code never reached
+  the wire despite `TaskProjectionError::code` documenting those codes as a
+  compatibility commitment; it forwards now. (5) `A2AAuthorizationRequest` had
+  no constructor, so each new typed claim broke every literal site — it gained
+  `new(operation)` plus `with_*` setters and became `#[non_exhaustive]`, and the
+  five existing sites moved over. (6) The run scope is served by an
+  `Option<Arc<dyn AgentDecisionEventSink>>` builder rather than a ninth store
+  generic, and the three history stores are read from the fields the service
+  already holds — adding a store accessor would have broken
+  `tests/service_shape.rs`, which pins the wired-store construction sites.
+- **Deliberate deviations from the approved plan, both narrowing:**
+  `AgentTaskError` did *not* gain an `is_domain_refusal` — it has no
+  default-open classifier for a new variant to fall into, so the method would
+  have been unused public API rather than a fix. And
+  `RakkaAgentA2AError::code()` kept its `&'static str` signature: rather than
+  relax it, `AgentCoordinationReplayError` carries the *typed* source errors
+  (`Task`/`Team`/`Conversation`/`RunEvents`) instead of a stringly code, which
+  forwards their static codes and lets a caller match the underlying failure.
+  The sink's own backend code stays in the message under one stable
+  `coordination-run-events-failed`, which loses nothing semantically distinct
+  because the expired window is an answer rather than an error.
+- **Wire = two read operations as direct service methods** (the
+  `replay_task_events` precedent; the agents surface has no route binding at
+  all, deferred since 1.12, so the service core *is* the surface).
+  `A2AOperation::CoordinationEventRead` and `::GoalViewRead`, each with its own
+  typed claim (`A2ACoordinationClaim`, `A2AGoalViewClaim`) bound in before
+  anything is read. Neither borrows `normalize_agent_cancel`'s task-shaped
+  normalization — these reads name no task — so `resolve_agent_tenant` is the
+  new tenant-only helper. `authorized_agent_goal_view_bounded` is the clamped
+  entry point the wire needs: the unbounded wrapper fans out to
+  `AGENT_GOAL_VIEW_MAX_TASKS` whatever the caller asked. **A `GoalViewRead`
+  denial answers `Ok(None)`, not `Unauthorized`** — byte-identical to an absent
+  goal, to an unauthenticated caller, and to a goal that never existed, because
+  a distinguishable wire error would reopen exactly the existence oracle the
+  owner fence closed.
+- **Typed client**: `coordination_events(scope, cursor, limit)` and
+  `goal_view(goal, max_tasks)` as required `AgentClientTransport` methods
+  (breaking for external implementors, the 5.4 precedent), returning
+  `rakka-agent` domain types directly. The expired window travels as the
+  reply's own arm rather than an error, because a caller that must resynchronize
+  still needs to know *where* to resume. The reconnect cursor is the
+  subscription contract: there is no watcher for domain history and live push
+  stays out of scope.
+- **Six derived struggle signals, read-time only** (`AgentStruggleSignal`,
+  `AgentStruggleSignalKind`, `AgentStrugglePolicy` in `query.rs`): approaching
+  budgets, repeated iteration failure, repeated result rejection, stuck
+  dependencies, stalled team claims, moderation exhaustion. Pure over the
+  authoritative snapshots, deriving twice gives the same answer, thresholds are
+  deployment policy and never durable, and nothing they observe can mutate
+  correctness state. The stuck-dependency signal is gated on
+  `dependency_stall_millis` (default 15 minutes) against the task's
+  `updated_at`: an unsettled registration is *normally* one settle pass wide,
+  so an ungated derivation would report every freshly blocked task as stuck in
+  the window between its own commit and its settle.
+- **The two notification exchanges 5.2 and 5.3 parked here are re-parked
+  explicitly** (user-directed): they are write-path choreography, not event
+  replay, and leaving them implicitly owed to a slice that no longer covers them
+  is how a debt disappears. Slice 5.5b below owns them.
+- Proof roster: `tests/coordination_replay.rs` (7: the cursor resuming across
+  task, team, and conversation with no gap or repeat; the idempotent page,
+  including across a re-driven flush; the foreign-scope, cross-tenant, and
+  substrate-shaped cursor refusals; the agent scope refused rather than answered
+  empty; the store conformance harness bounded and unbounded across all three
+  logs; the reported floor resuming for real; the kind-label injectivity pin),
+  `tests/decision_events.rs`'s `a_dropped_decision_is_a_declared_gap_not_a_silent_one`
+  (which fails against the pre-slice sink — verified by reverting the walk), and
+  `rakka-a2a`'s `tests/coordination_surface.rs` (5: the scoped cursor paging over
+  the real service core, the tenant and scope fences, per-operation authorization
+  with the claim asserted inside the authorizer, the owner's positive read plus
+  the clamped budget and the four-way deny-is-absent equality against it, and
+  the two unserved scopes refused by name), plus two struggle-signal proofs in
+  `tests/operational_query.rs` (the stall threshold telling a young registration
+  from a stuck one, and a parked conversation reported without the projection
+  changing anything it observed). Owed onward:
+  the coordination-read metric consumer, the PostgreSQL history backends (now
+  covered by the harness), the goal view's team and conversation dimensions, and
+  live push.
+
+### Slice 5.5b — Terminal coordination notifications
+
+Spec: [8.10](spec.md#810-team-coordination), [8.11](spec.md#811-moderation),
+[14.2](spec.md#142-task-identity-and-projection).
+
+The two write-path debts slices 5.2 and 5.3 recorded against 5.5, re-parked
+here on 2026-08-13 because 5.5 became a read contract and 5.6 is acceptance
+only. Neither is implicitly owed any longer.
+
+- **Task → team terminal notification.** A terminal or foreign task currently
+  closes its board entry lazily, through a claim refusal (`Done` + code), so a
+  board can hold an entry for a task that ended minutes ago. The notification
+  exchange closes it eagerly.
+- **Conversation → task terminal notification**, plus the task-side
+  conversation provenance cell and the projection echo. Slice 5.3 pre-wired the
+  conversation entity with an exchange host, a refuse-all participant, and an
+  empty journal precisely so this is a code change rather than a schema
+  migration.
+- Both ride the established idioms: a new `AgentExchangeKind` with sender
+  fencing at both ends, a settled marker as the once-guard past the journal
+  window, an owed-derivation consult point, and the courier's
+  `UnsettleableRefusal` posture for a receiver that cannot yet answer. Each new
+  kind joins `AgentExchangeKind::ALL`, so `tests/choreography.rs`'s failure
+  windows cover it by construction.
+
+Done when: a terminal task closes its board entry without a claim attempt, and
+a terminated conversation is observable from its governing task.
 
 ### Slice 5.6 — M5 acceptance
 

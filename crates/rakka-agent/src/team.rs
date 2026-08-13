@@ -507,7 +507,7 @@ pub struct AgentTeamHistoryEntry {
 }
 
 impl AgentTeamHistoryEntry {
-    fn new(
+    pub(crate) fn new(
         sequence: AgentTeamHistorySequence,
         kind: AgentTeamHistoryKind,
         operation_id: AgentOperationId,
@@ -594,6 +594,21 @@ impl AgentTeamHistoryCursor {
         self
     }
 
+    /// Repositions this cursor so `sequence` is the next entry it expects.
+    ///
+    /// The companion of [`AgentTeamError::HistoryWindowExpired`]: a reader
+    /// handed a retained floor resumes *at* it, keeping its page size. Sequences
+    /// start at [`AgentTeamHistorySequence::FIRST`], so a zero resumes from the
+    /// beginning.
+    #[must_use]
+    pub const fn resuming_at(mut self, sequence: AgentTeamHistorySequence) -> Self {
+        self.after = match sequence.get() {
+            0 => None,
+            value => Some(AgentTeamHistorySequence::new(value - 1)),
+        };
+        self
+    }
+
     /// The sequence this page resumes after.
     #[must_use]
     pub const fn position(&self) -> Option<AgentTeamHistorySequence> {
@@ -655,6 +670,14 @@ pub trait AgentTeamHistoryStore: Clone + Send + Sync + 'static {
     ) -> AgentTeamHistoryFuture<'a, ()>;
 
     /// Reads one bounded page.
+    ///
+    /// A backend that bounds its retention MUST answer a cursor preceding the
+    /// window it still holds with [`AgentTeamError::HistoryWindowExpired`], and
+    /// MUST return a page contiguous from the cursor, so a reader resynchronizes
+    /// from authoritative state instead of silently skipping entries
+    /// ([specification 17.13](../../docs/plans/rakka-agent/spec.md)).
+    /// [`crate::testkit::assert_team_history_store_contract`] is the harness
+    /// that proves it.
     fn read<'a>(
         &'a self,
         scope: &'a AgentTeamScope,
@@ -668,13 +691,28 @@ pub trait AgentTeamHistoryStore: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryAgentTeamHistoryStore {
     entries: Arc<Mutex<BTreeMap<String, BTreeMap<u64, AgentTeamHistoryEntry>>>>,
+    retention: Option<usize>,
 }
 
 impl InMemoryAgentTeamHistoryStore {
-    /// Creates an empty history.
+    /// Creates an empty history that retains everything appended to it.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bounds the history retained per team, evicting the oldest entries.
+    ///
+    /// Retention is off by default because this log is also the audit record
+    /// [specification 17.13](../../docs/plans/rakka-agent/spec.md) requires, and
+    /// the entity refuses a transition rather than lose an entry. Enabling it
+    /// forfeits that audit obligation for whatever the window drops, in exchange
+    /// for a bounded log and the explicit expired-window answer a replay cursor
+    /// needs. A limit of zero is treated as one.
+    #[must_use]
+    pub fn with_retention(mut self, entries: usize) -> Self {
+        self.retention = Some(entries.max(1));
+        self
     }
 
     /// How many entries one team has.
@@ -717,6 +755,15 @@ impl AgentTeamHistoryStore for InMemoryAgentTeamHistoryStore {
                 }),
                 None => {
                     team.insert(entry.sequence.get(), entry.clone());
+                    if let Some(retention) = self.retention {
+                        while team.len() > retention {
+                            let oldest = *team
+                                .keys()
+                                .next()
+                                .expect("a history longer than its retention holds an entry");
+                            team.remove(&oldest);
+                        }
+                    }
                     Ok(())
                 }
             }
@@ -740,7 +787,22 @@ impl AgentTeamHistoryStore for InMemoryAgentTeamHistoryStore {
                 });
             };
 
-            let start = cursor.position().map_or(0, |after| after.get() + 1);
+            // The sequence the reader expects next: one past its cursor, or the
+            // very first entry when it is starting from the beginning. If the
+            // oldest entry still retained is later than that, everything between
+            // was evicted and resuming here would skip it silently.
+            let start = cursor
+                .position()
+                .map_or(AgentTeamHistorySequence::FIRST.get(), |after| {
+                    after.get() + 1
+                });
+            if let Some(oldest) = team.keys().next().copied() {
+                if start < oldest {
+                    return Err(AgentTeamError::HistoryWindowExpired {
+                        oldest_retained: Some(AgentTeamHistorySequence::new(oldest)),
+                    });
+                }
+            }
             let mut page: Vec<AgentTeamHistoryEntry> = team
                 .range(start..)
                 .map(|(_, entry)| entry.clone())
@@ -755,6 +817,20 @@ impl AgentTeamHistoryStore for InMemoryAgentTeamHistoryStore {
                     })
                 })
                 .flatten();
+
+            // History sequences are dense — the transition that consumes one
+            // pushes its entry in the same step — so a discontinuity inside the
+            // page the reader is about to cross means the window moved under it.
+            let mut expected = start;
+            for entry in &page {
+                if entry.sequence.get() != expected {
+                    return Err(AgentTeamError::HistoryWindowExpired {
+                        oldest_retained: Some(entry.sequence),
+                    });
+                }
+                expected = entry.sequence.get().saturating_add(1);
+            }
+
             Ok(AgentTeamHistoryPage {
                 entries: page,
                 next,
@@ -813,6 +889,13 @@ pub struct AgentTeamSnapshot {
     pub expires_at: Option<AgentTimestampMillis>,
     /// How many history entries the team has recorded.
     pub history_entries: u64,
+    /// History entries recorded but not yet flushed to the history sink.
+    ///
+    /// A replay reader at [`Self::history_entries`] is current only when this
+    /// is zero: an entity flushes what a transition owed on the settle pass
+    /// *after* it committed, so a log that answers "no more" may still be
+    /// waiting for a tail.
+    pub owed_history: usize,
     /// The time of the last accepted transition.
     pub updated_at: AgentTimestampMillis,
 }
@@ -986,6 +1069,7 @@ impl AgentTeamState {
             created_at: team.created_at,
             expires_at: team.expires_at,
             history_entries: self.next_history_sequence.get().saturating_sub(1),
+            owed_history: self.pending_history.len(),
             updated_at: self.updated_at,
         })
     }
@@ -3339,6 +3423,14 @@ pub enum AgentTeamError {
         /// The conflicting sequence.
         sequence: AgentTeamHistorySequence,
     },
+    /// The read cursor precedes the history the backend still retains, so
+    /// resuming from it would silently skip entries
+    /// ([specification 17.13](../../docs/plans/rakka-agent/spec.md)). The reader
+    /// resynchronizes from authoritative state and resumes at the floor.
+    HistoryWindowExpired {
+        /// Oldest sequence still retained, when the scope retains anything.
+        oldest_retained: Option<AgentTeamHistorySequence>,
+    },
     /// The history outbox cannot hold what the next transition may record.
     HistoryBacklog {
         /// Entries pending flush.
@@ -3386,6 +3478,7 @@ impl AgentTeamError {
             Self::MessageTooLarge { .. } => "team-message-too-large",
             Self::DisbandClaimPending { .. } => "team-disband-claim-pending",
             Self::HistoryConflict { .. } => "team-history-conflict",
+            Self::HistoryWindowExpired { .. } => "team-history-window-expired",
             Self::HistoryBacklog { .. } => "team-history-backlog",
             Self::StateBounds { .. } => "team-state-too-large",
         }
@@ -3393,12 +3486,22 @@ impl AgentTeamError {
 
     /// Whether this rejection is a domain refusal — a durable decision the
     /// caller rebases on (and a bounded metric records) — rather than a
-    /// transport, schema, or identity fault.
+    /// transport, schema, identity, or read-path fault.
+    ///
+    /// The list is exclusionary, so a variant added without a thought here
+    /// becomes a "refusal" by default: it would answer a caller as a rejected
+    /// *command* and count against the entity's refusal metric. Only decisions a
+    /// command reached belong on the true side —
+    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision.
     #[must_use]
     pub const fn is_domain_refusal(&self) -> bool {
         !matches!(
             self,
-            Self::Identity(_) | Self::Schema(_) | Self::Choreography(_) | Self::Coordination(_)
+            Self::Identity(_)
+                | Self::Schema(_)
+                | Self::Choreography(_)
+                | Self::Coordination(_)
+                | Self::HistoryWindowExpired { .. }
         )
     }
 }
@@ -3472,6 +3575,15 @@ impl Display for AgentTeamError {
                 f,
                 "a different history entry already occupies sequence {sequence}"
             ),
+            Self::HistoryWindowExpired { oldest_retained } => match oldest_retained {
+                Some(oldest) => write!(
+                    f,
+                    "the history cursor precedes the retained window, which starts at sequence {oldest}; resynchronize from authoritative state"
+                ),
+                None => f.write_str(
+                    "the history cursor precedes the retained window, which holds nothing; resynchronize from authoritative state",
+                ),
+            },
             Self::HistoryBacklog { pending, maximum } => write!(
                 f,
                 "the history outbox holds {pending} of {maximum} entries and cannot accept more"

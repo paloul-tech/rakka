@@ -464,6 +464,28 @@ pub fn normalize_agent_send(
     })
 }
 
+/// Resolves the canonical tenant for a read that names no task.
+///
+/// The scoped reads of specification 17.13 and 17.18 address an entity or a
+/// goal, not a task, so they cannot borrow `normalize_agent_cancel`'s
+/// task-shaped normalization — doing so would mint a cancellation operation id
+/// for a read and force a task id the caller never supplied.
+///
+/// # Errors
+///
+/// Fails when no tenant can be resolved from the request, the resolver, or the
+/// configured default.
+pub fn resolve_agent_tenant(
+    resolver: &dyn A2ATenantResolver,
+    default_tenant: Option<&str>,
+    params: &ServiceParams,
+    request_tenant: Option<&str>,
+) -> RakkaAgentA2AResult<TenantId> {
+    let (tenant, _source) = canonical_tenant(resolver, default_tenant, params, request_tenant)
+        .map_err(RakkaAgentA2AError::Mapping)?;
+    Ok(tenant)
+}
+
 /// Normalizes one `tasks/cancel` on the agents surface.
 ///
 /// # Errors

@@ -798,3 +798,209 @@ async fn the_task_snapshot_answers_the_continuous_checklist_while_passivated() {
     .expect("the point query answers")
     .is_none());
 }
+
+/// A blocked task whose dependency registration never settled is the documented
+/// stuck-dependency struggle signal
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)) — but only
+/// once it has stayed that way. A registration is normally outstanding for the
+/// length of one settle pass, so a threshold-free derivation would report every
+/// freshly blocked task as stuck the instant it committed.
+#[tokio::test]
+async fn a_stuck_dependency_reports_only_after_the_edge_has_actually_stalled() {
+    use rakka_agent::{
+        agent_task_operational_snapshot, agent_task_struggle_signals, AgentStrugglePolicy,
+        AgentStruggleSignalKind, AgentTaskDependencyDeclaration, AgentTaskEntityCommand,
+        AgentTaskStatus,
+    };
+
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    fx.instantiate_agent().await;
+
+    // Created *with* an upstream that does not exist, so the task is born
+    // blocked and its registration exchange stays outstanding forever — which
+    // is exactly the shape a never-created upstream leaves behind.
+    fx.apply_task_command(AgentTaskEntityCommand::Create {
+        operation_id: rakka_agent::AgentOperationId::new(
+            rakka_agent::AgentOperationKind::TaskCreation,
+            [tenant().as_str(), "ticket-1", "1"],
+        )
+        .expect("the operation id derives"),
+        creation: Box::new(rakka_agent::AgentTaskCreation {
+            definition: task_definition(),
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: Some(agent_id()),
+            team: None,
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: None,
+            parent: None,
+            dependencies: vec![AgentTaskDependencyDeclaration::new(
+                rakka_agent::AgentTaskId::new("never-created").expect("the task id is valid"),
+            )],
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        }),
+    })
+    .await
+    .expect("the dependent task creates");
+    let _ = fx.settle_task_at(&task_scope()).await;
+
+    let snapshot = agent_task_operational_snapshot(
+        &fx.tasks,
+        &task_scope(),
+        &AgentSchemaPolicy::default(),
+        fx.now(),
+    )
+    .await
+    .expect("the task snapshot reads")
+    .expect("the task exists");
+    assert_eq!(
+        snapshot.task.as_ref().expect("the task").status,
+        AgentTaskStatus::Blocked,
+        "the late edge demoted the task"
+    );
+
+    // Under the default threshold the edge is young, so nothing is reported —
+    // the signal is not just "an unsettled registration exists".
+    let quiet = agent_task_struggle_signals(&snapshot, &AgentStrugglePolicy::new());
+    assert!(
+        quiet.is_empty(),
+        "a registration younger than the stall threshold is not a struggle: {quiet:?}"
+    );
+
+    // With the threshold at zero — an operator who wants every outstanding edge
+    // — the same snapshot reports it, so the derivation reads the edge and not
+    // merely the clock.
+    let mut eager = AgentStrugglePolicy::new();
+    eager.dependency_stall_millis = 0;
+    let reported = agent_task_struggle_signals(&snapshot, &eager);
+    assert_eq!(
+        reported
+            .iter()
+            .map(|signal| signal.kind)
+            .collect::<Vec<_>>(),
+        vec![AgentStruggleSignalKind::StuckDependency],
+        "the stalled edge is the signal: {reported:?}"
+    );
+
+    // Deriving twice from the same snapshot gives the same answer: these are
+    // projections, and they observe nothing they could change.
+    assert_eq!(reported, agent_task_struggle_signals(&snapshot, &eager));
+}
+
+/// A moderated conversation parked at its round ceiling names no next speaker,
+/// so nothing can advance it but the moderator's early end — the moderation
+/// exhaustion signal. Like every struggle signal it is a read-time projection:
+/// the conversation stays `Active` and nothing about it changes.
+#[tokio::test]
+async fn moderation_exhaustion_reports_a_conversation_nothing_can_advance() {
+    use rakka_agent::{
+        agent_conversation_struggle_signals, AgentConversationCompletionRule,
+        AgentConversationCreation, AgentConversationEntityCommand, AgentConversationId,
+        AgentConversationMode, AgentConversationScope, AgentConversationStatus, AgentId,
+        AgentModerationPolicy, AgentRevisionNumber, AgentStrugglePolicy, AgentStruggleSignalKind,
+        AgentTaskId,
+    };
+
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    let conversation = AgentConversationId::new("panel").expect("the conversation id is valid");
+    let scope = AgentConversationScope::new(tenant(), conversation.clone()).expect("the scope");
+    let agent = |name: &str| AgentId::new(name).expect("the agent id is valid");
+
+    // One round, one turn: the ceiling is reached the moment that turn lands,
+    // and `ModeratorDecides` parks rather than completing.
+    let policy = AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
+        .with_max_rounds(1)
+        .with_max_turns_per_round(1);
+    fx.apply_conversation_command_at(
+        &scope,
+        AgentConversationEntityCommand::Create {
+            operation_id: rakka_agent::conversation_create_operation_id(&tenant(), &conversation)
+                .expect("the operation id derives"),
+            creation: Box::new(AgentConversationCreation {
+                moderator: agent("moderator"),
+                participants: vec![agent("p1")],
+                mode: AgentConversationMode::RoundRobin,
+                completion: AgentConversationCompletionRule::ModeratorDecides,
+                policy,
+                task: AgentTaskId::new("debate-task").expect("the task id is valid"),
+                tokens: None,
+                max_wall_clock_millis: None,
+                transcript_ref: None,
+            }),
+        },
+    )
+    .await
+    .expect("the conversation creates");
+
+    let opening = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the conversation snapshots");
+    assert!(
+        agent_conversation_struggle_signals(&opening, &AgentStrugglePolicy::new(), fx.now())
+            .is_empty(),
+        "a conversation with a live speaker is not exhausted"
+    );
+
+    fx.apply_conversation_command_at(
+        &scope,
+        AgentConversationEntityCommand::SubmitTurn {
+            operation_id: rakka_agent::conversation_turn_operation_id(
+                &tenant(),
+                &conversation,
+                0,
+                0,
+                &agent("p1"),
+                &rakka_agent::conversation_turn_content_digest("a position", None),
+            )
+            .expect("the operation id derives"),
+            submit: Box::new(rakka_agent::AgentConversationTurnSubmit {
+                round: 0,
+                turn: 0,
+                participant: agent("p1"),
+                body: "a position".to_string(),
+                direction: None,
+                usage: rakka_agent::AgentBudgetConsumption::zero(),
+            }),
+        },
+    )
+    .await
+    .expect("the only admissible turn records");
+
+    let parked = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(
+        parked.status,
+        AgentConversationStatus::Active,
+        "the ceiling parks the cursor; it does not terminalize"
+    );
+    assert!(
+        parked.current_speaker.is_none(),
+        "a parked cursor names no next speaker"
+    );
+
+    let signals =
+        agent_conversation_struggle_signals(&parked, &AgentStrugglePolicy::new(), fx.now());
+    assert_eq!(
+        signals.iter().map(|signal| signal.kind).collect::<Vec<_>>(),
+        vec![AgentStruggleSignalKind::ModerationExhaustion],
+        "a conversation nothing can advance is reported: {signals:?}"
+    );
+
+    // The projection changed nothing it observed.
+    let after = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(parked, after, "a struggle signal mutates nothing");
+}

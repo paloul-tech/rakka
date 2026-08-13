@@ -552,6 +552,12 @@ impl AgentLoopState {
     /// event and counts the drop, never failing the transition — telemetry is
     /// not a correctness input. A draft whose derived identity cannot be
     /// formed is dropped and counted the same way.
+    ///
+    /// Either way the sequence is *consumed*, so the loss leaves a hole a
+    /// replay can see. A drop that silently reused its sequence would hand the
+    /// sink a contiguous stream missing an event, which is precisely the
+    /// silent gap [specification 17.13](../../../docs/plans/rakka-agent/spec.md)
+    /// forbids a replay cursor to cross.
     pub(crate) fn record_decision(
         &mut self,
         scope: &AgentRunScope,
@@ -573,6 +579,7 @@ impl AgentLoopState {
             draft,
             now,
         ) else {
+            self.decision_sequence = sequence;
             self.decision_drops = self.decision_drops.saturating_add(1);
             return false;
         };

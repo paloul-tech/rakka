@@ -1849,6 +1849,50 @@ where
     .await
 }
 
+/// Assembles the goal view for its owner under a caller-supplied node budget.
+///
+/// The authorization contract is [`authorized_agent_goal_view`]'s, unchanged;
+/// what this adds is the clamp [`assemble_agent_goal_view_bounded`] already
+/// gave the unauthorized core. A boundary that accepts a page size from a
+/// caller needs it: without one, every authorized read fans out to
+/// [`AGENT_GOAL_VIEW_MAX_TASKS`] whatever the caller asked for, so a cheap
+/// question costs the same as an exhaustive one. `max_tasks` is clamped to
+/// `1..=AGENT_GOAL_VIEW_MAX_TASKS`, and a tree larger than the budget truncates
+/// with markers rather than refusing.
+///
+/// # Errors
+///
+/// As [`authorized_agent_goal_view`].
+#[allow(clippy::too_many_arguments)]
+pub async fn authorized_agent_goal_view_bounded<Tasks, Runs>(
+    tasks: &Tasks,
+    runs: &Runs,
+    tenant: &TenantId,
+    goal: &AgentGoalId,
+    principal: &PrincipalRef,
+    policy: &AgentSchemaPolicy,
+    claims: Option<&dyn AgentGoalClaimSource>,
+    max_tasks: usize,
+    observed_at: AgentTimestampMillis,
+) -> AgentGoalViewResult<Option<AgentGoalView>>
+where
+    Tasks: DurableStateStore<AgentTaskState>,
+    Runs: DurableStateStore<AgentRunState>,
+{
+    assemble_goal_view_gated(
+        tasks,
+        runs,
+        tenant,
+        goal,
+        policy,
+        claims,
+        Some(principal),
+        max_tasks.clamp(1, AGENT_GOAL_VIEW_MAX_TASKS),
+        observed_at,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn assemble_goal_view_gated<Tasks, Runs>(
     tasks: &Tasks,
@@ -1998,6 +2042,356 @@ struct GoalViewWaveNode {
     /// frontier keeps the exact order one-at-a-time processing produced.
     epochs: Vec<AgentTaskId>,
     run: Option<AgentRunScope>,
+}
+
+/// What a derived struggle signal reports
+/// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Every kind is a *projection*: it is recomputed from durable state on each
+/// read, holds nothing durable of its own, and MUST NOT be allowed to mutate
+/// correctness state. A signal saying an agent is stuck is a prompt for an
+/// operator, never a transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AgentStruggleSignalKind {
+    /// A conserved budget dimension is near its allocation.
+    BudgetApproachingExhaustion,
+    /// The loop has iterated well past the point of proposing a result.
+    RepeatedIterationFailure,
+    /// The task has spent much of its rejection budget.
+    RepeatedResultRejection,
+    /// A dependency edge is unresolved and nothing is driving it.
+    StuckDependency,
+    /// A board claim has held past its lease without activating.
+    StalledTeamClaim,
+    /// A moderated conversation can make no further turn.
+    ModerationExhaustion,
+}
+
+impl AgentStruggleSignalKind {
+    /// Stable kebab-case label.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::BudgetApproachingExhaustion => "budget-approaching-exhaustion",
+            Self::RepeatedIterationFailure => "repeated-iteration-failure",
+            Self::RepeatedResultRejection => "repeated-result-rejection",
+            Self::StuckDependency => "stuck-dependency",
+            Self::StalledTeamClaim => "stalled-team-claim",
+            Self::ModerationExhaustion => "moderation-exhaustion",
+        }
+    }
+}
+
+impl Display for AgentStruggleSignalKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
+    }
+}
+
+/// One derived struggle signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AgentStruggleSignal {
+    /// What is struggling.
+    pub kind: AgentStruggleSignalKind,
+    /// Bounded detail: the dimension, the counts, the stable code. Never
+    /// content, never a credential.
+    pub detail: String,
+    /// When the signal was derived.
+    pub observed_at: AgentTimestampMillis,
+}
+
+impl AgentStruggleSignal {
+    fn new(
+        kind: AgentStruggleSignalKind,
+        detail: impl Into<String>,
+        observed_at: AgentTimestampMillis,
+    ) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+            observed_at,
+        }
+    }
+}
+
+/// The thresholds a struggle derivation reads.
+///
+/// Deployment policy, never durable state: two operators may disagree about
+/// when a run is struggling without either of them changing what the run does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AgentStrugglePolicy {
+    /// Percentage of a conserved allocation past which the dimension is
+    /// reported as approaching exhaustion.
+    pub budget_warning_percent: u8,
+    /// Loop iterations a nonterminal run may take with no result proposal
+    /// standing before the loop is reported as failing to converge.
+    pub iteration_failure_threshold: u64,
+    /// Recorded result rejections past which a task is reported as struggling.
+    pub result_rejection_threshold: u32,
+    /// Milliseconds past a claim's lease before a pending claim is reported as
+    /// stalled.
+    pub team_claim_stall_millis: u64,
+    /// Milliseconds a blocked task may sit untouched with an unregistered
+    /// dependency before the edge is reported as stuck.
+    ///
+    /// A registration is normally outstanding for the length of one settle
+    /// pass, so a threshold of zero would report every freshly blocked task.
+    pub dependency_stall_millis: u64,
+}
+
+impl AgentStrugglePolicy {
+    /// The default thresholds.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            budget_warning_percent: 80,
+            iteration_failure_threshold: 8,
+            result_rejection_threshold: 2,
+            team_claim_stall_millis: 0,
+            dependency_stall_millis: 15 * 60 * 1_000,
+        }
+    }
+}
+
+impl Default for AgentStrugglePolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn approaching(consumed: u64, allocation: Option<u64>, percent: u8) -> bool {
+    let Some(allocation) = allocation.filter(|allocation| *allocation > 0) else {
+        return false;
+    };
+    // Integer arithmetic on the numerator so a 32-bit-ish allocation cannot
+    // overflow the comparison, and so the threshold is exact.
+    consumed.saturating_mul(100) >= allocation.saturating_mul(u64::from(percent))
+}
+
+fn push_budget_signals(
+    signals: &mut Vec<AgentStruggleSignal>,
+    consumed: &AgentBudgetConsumption,
+    allocation: &AgentBudgetAllocation,
+    policy: &AgentStrugglePolicy,
+    observed_at: AgentTimestampMillis,
+) {
+    for (dimension, spent, granted) in [
+        (
+            "loop_iterations",
+            consumed.loop_iterations,
+            allocation.loop_iterations,
+        ),
+        ("model_calls", consumed.model_calls, allocation.model_calls),
+        ("tool_calls", consumed.tool_calls, allocation.tool_calls),
+        ("effects", consumed.effects, allocation.effects),
+        (
+            "effect_attempts",
+            consumed.effect_attempts,
+            allocation.effect_attempts,
+        ),
+        ("tokens", consumed.tokens, allocation.tokens),
+        ("cost_micros", consumed.cost_micros, allocation.cost_micros),
+        ("descendants", consumed.descendants, allocation.descendants),
+    ] {
+        if approaching(spent, granted, policy.budget_warning_percent) {
+            let granted = granted.unwrap_or_default();
+            signals.push(AgentStruggleSignal::new(
+                AgentStruggleSignalKind::BudgetApproachingExhaustion,
+                format!("{dimension} {spent}/{granted}"),
+                observed_at,
+            ));
+        }
+    }
+}
+
+/// Derives the struggle signals one run's authoritative snapshot supports.
+///
+/// Pure over the snapshot: it reads nothing, writes nothing, and deriving twice
+/// from the same revision yields the same answer.
+#[must_use]
+pub fn agent_run_struggle_signals(
+    snapshot: &AgentOperationalSnapshot,
+    policy: &AgentStrugglePolicy,
+) -> Vec<AgentStruggleSignal> {
+    let mut signals = Vec::new();
+    let Some(run) = snapshot.run.as_ref() else {
+        return signals;
+    };
+    if run.status.is_terminal() {
+        return signals;
+    }
+    push_budget_signals(
+        &mut signals,
+        run.budget.consumption(),
+        run.budget.allocation(),
+        policy,
+        snapshot.observed_at,
+    );
+    // A run that has taken many turns without a proposal standing is either
+    // exploring or looping. The signal does not decide which; it says an
+    // operator should look.
+    if run.turn >= policy.iteration_failure_threshold
+        && !snapshot.has_pending_proposal
+        && run.accepted_result.is_none()
+    {
+        signals.push(AgentStruggleSignal::new(
+            AgentStruggleSignalKind::RepeatedIterationFailure,
+            format!("turn {} with no proposal standing", run.turn),
+            snapshot.observed_at,
+        ));
+    }
+    signals
+}
+
+/// Derives the struggle signals one task's authoritative snapshot supports.
+///
+/// Pure over the snapshot.
+#[must_use]
+pub fn agent_task_struggle_signals(
+    snapshot: &AgentTaskOperationalSnapshot,
+    policy: &AgentStrugglePolicy,
+) -> Vec<AgentStruggleSignal> {
+    let mut signals = Vec::new();
+    let Some(task) = snapshot.task.as_ref() else {
+        return signals;
+    };
+    if task.terminal_reason.is_some() {
+        return signals;
+    }
+    if task.rejection_count >= policy.result_rejection_threshold {
+        signals.push(AgentStruggleSignal::new(
+            AgentStruggleSignalKind::RepeatedResultRejection,
+            format!("{} rejections recorded", task.rejection_count),
+            snapshot.observed_at,
+        ));
+    }
+    // The stuck-dependency shape the dependents registry documented: an edge
+    // whose upstream never answered leaves the dependent durably blocked, with
+    // no terminal status and nothing driving it. The registry's own
+    // `registration_settled` marker is what distinguishes "waiting" from
+    // "waiting on nothing".
+    // An unsettled registration is *normally* a window of milliseconds: the
+    // declaring transition owes it and the very next settle pass drives it. It
+    // is only a struggle signal when it stays that way — which is what a
+    // never-created upstream looks like. Gating on how long the task has been
+    // untouched is what tells the two apart; without it, every freshly blocked
+    // task would report itself stuck between its own commit and settle.
+    let idle_for = snapshot
+        .observed_at
+        .as_millis()
+        .saturating_sub(task.updated_at.as_millis());
+    if matches!(task.status, AgentTaskStatus::Blocked) && idle_for >= policy.dependency_stall_millis
+    {
+        let unresolved = task
+            .dependencies
+            .iter()
+            .filter(|edge| edge.outcome.is_none() && !edge.registration_settled)
+            .count();
+        if unresolved > 0 {
+            signals.push(AgentStruggleSignal::new(
+                AgentStruggleSignalKind::StuckDependency,
+                format!("{unresolved} unregistered dependencies for {idle_for}ms"),
+                snapshot.observed_at,
+            ));
+        }
+    }
+    signals
+}
+
+/// Derives the struggle signals one team board supports.
+///
+/// Pure over the snapshot.
+#[must_use]
+pub fn agent_team_struggle_signals(
+    snapshot: &crate::team::AgentTeamSnapshot,
+    policy: &AgentStrugglePolicy,
+    observed_at: AgentTimestampMillis,
+) -> Vec<AgentStruggleSignal> {
+    let mut signals = Vec::new();
+    for entry in &snapshot.board {
+        // A claim that activated is not stalled — the lease bounds the *pending*
+        // window only, which is exactly the window a member can sit in without
+        // the board making progress.
+        if !matches!(
+            entry.status,
+            crate::team::AgentTeamBoardEntryStatus::Pending
+                | crate::team::AgentTeamBoardEntryStatus::Releasing
+        ) {
+            continue;
+        }
+        let Some(claim) = entry.claim.as_ref() else {
+            continue;
+        };
+        let stalled_at = claim
+            .lease_expires_at
+            .as_millis()
+            .saturating_add(policy.team_claim_stall_millis);
+        if observed_at.as_millis() >= stalled_at {
+            signals.push(AgentStruggleSignal::new(
+                AgentStruggleSignalKind::StalledTeamClaim,
+                format!("claim {} past its lease", claim.claim),
+                observed_at,
+            ));
+        }
+    }
+    signals
+}
+
+/// Derives the struggle signals one moderated conversation supports.
+///
+/// Pure over the snapshot.
+#[must_use]
+pub fn agent_conversation_struggle_signals(
+    snapshot: &crate::conversation::AgentConversationSnapshot,
+    policy: &AgentStrugglePolicy,
+    observed_at: AgentTimestampMillis,
+) -> Vec<AgentStruggleSignal> {
+    let mut signals = Vec::new();
+    if !matches!(
+        snapshot.status,
+        crate::conversation::AgentConversationStatus::Active
+    ) {
+        return signals;
+    }
+    // The parked cursor: the round ceiling is reached under a rule that only
+    // parks, so no participant owns a next turn and the early end is the sole
+    // exit. An operator watching the governing task sees a wait with no mover.
+    if snapshot.current_speaker.is_none() {
+        signals.push(AgentStruggleSignal::new(
+            AgentStruggleSignalKind::ModerationExhaustion,
+            format!("parked at round {} with no next speaker", snapshot.round),
+            observed_at,
+        ));
+    }
+    if approaching(
+        snapshot.budgets.consumed.tokens,
+        snapshot.budgets.tokens,
+        policy.budget_warning_percent,
+    ) {
+        signals.push(AgentStruggleSignal::new(
+            AgentStruggleSignalKind::BudgetApproachingExhaustion,
+            format!(
+                "tokens {}/{}",
+                snapshot.budgets.consumed.tokens,
+                snapshot.budgets.tokens.unwrap_or_default()
+            ),
+            observed_at,
+        ));
+    }
+    if let Some(deadline) = snapshot.budgets.deadline {
+        if observed_at.as_millis() >= deadline.as_millis() {
+            signals.push(AgentStruggleSignal::new(
+                AgentStruggleSignalKind::ModerationExhaustion,
+                "the creation-fixed deadline has passed".to_string(),
+                observed_at,
+            ));
+        }
+    }
+    signals
 }
 
 /// Records one omission, keeping the list a set: a task the traversal could
