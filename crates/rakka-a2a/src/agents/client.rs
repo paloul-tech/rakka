@@ -562,12 +562,15 @@ where
         Box::pin(async move {
             // The expired window travels as the reply's own arm, not as an
             // error: a caller that must resynchronize still learns exactly
-            // where to resume, which an error code cannot carry.
+            // where to resume, which an error code cannot carry. The
+            // transport's principal rides the read so a deployment authorizer
+            // can grant coordination history per-principal.
             self.service
                 .replay_coordination_events(
                     &Self::params(),
                     self.tenant.as_deref(),
                     scope,
+                    self.principal.as_ref(),
                     after_cursor,
                     limit,
                 )

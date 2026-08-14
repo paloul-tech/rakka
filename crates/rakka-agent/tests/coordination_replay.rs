@@ -204,7 +204,7 @@ async fn page_everything(fx: &Fixture, scope: &AgentEntityAddress) -> Vec<(u64, 
     let mut seen: Vec<(u64, String)> = Vec::new();
     for _ in 0..64 {
         let replay = sources
-            .replay(scope, cursor.as_deref(), 1)
+            .replay(&tenant(), scope, cursor.as_deref(), 1)
             .await
             .expect("the scope replays");
         let AgentCoordinationReplay::Page(page) = replay else {
@@ -259,13 +259,26 @@ async fn a_cursor_resumes_exactly_where_it_left_off_across_every_scope() {
     let team_events = page_everything(&fx, &team).await;
     let conversation_events = page_everything(&fx, &conversation).await;
 
-    for (scope, events) in [
-        ("task", &task_events),
-        ("team", &team_events),
-        ("conversation", &conversation_events),
+    // `expected` is anchored to what the store actually holds, never to how
+    // many events the cursor happened to deliver — an expectation derived
+    // from `observed.len()` would pass for any contiguous prefix, so a
+    // paging bug that stopped early would ship green claiming completeness.
+    for (scope, events, in_store) in [
+        ("task", &task_events, fx.history.len(&common::task_scope())),
+        ("team", &team_events, fx.team_history.len(&team_scope())),
+        (
+            "conversation",
+            &conversation_events,
+            fx.conversation_history.len(&conversation_scope()),
+        ),
     ] {
         let observed = sequences(events);
-        let expected: Vec<u64> = (1..=observed.len() as u64).collect();
+        assert_eq!(
+            observed.len(),
+            in_store,
+            "the cursor delivered every entry the {scope} store holds"
+        );
+        let expected: Vec<u64> = (1..=in_store as u64).collect();
         assert_eq!(
             observed, expected,
             "the {scope} log paged in order, once each, with no gap"
@@ -309,11 +322,11 @@ async fn a_replayed_page_is_identical_to_its_first_answer() {
     let sources = sources(&fx);
 
     let first = sources
-        .replay(&scope, None, 2)
+        .replay(&tenant(), &scope, None, 2)
         .await
         .expect("the first read succeeds");
     let again = sources
-        .replay(&scope, None, 2)
+        .replay(&tenant(), &scope, None, 2)
         .await
         .expect("the replayed read succeeds");
     assert_eq!(first, again, "the same cursor answers the same page");
@@ -323,7 +336,7 @@ async fn a_replayed_page_is_identical_to_its_first_answer() {
     // reader can observe.
     let _ = fx.settle_conversation_at(&conversation_scope()).await;
     let after_reflush = sources
-        .replay(&scope, None, 2)
+        .replay(&tenant(), &scope, None, 2)
         .await
         .expect("the read after a re-driven flush succeeds");
     assert_eq!(
@@ -349,7 +362,7 @@ async fn a_cursor_naming_another_scope_is_refused() {
     .expect("the scope");
     let foreign = AgentCoordinationCursor::new(AgentEntityAddress::Task(other_task), 1).encode();
     let error = sources
-        .replay(&scope, Some(&foreign), 8)
+        .replay(&tenant(), &scope, Some(&foreign), 8)
         .await
         .expect_err("a cursor naming another entity is refused");
     assert_eq!(error.code(), "coordination-cursor-scope-mismatch");
@@ -366,7 +379,7 @@ async fn a_cursor_naming_another_scope_is_refused() {
     )
     .encode();
     let error = sources
-        .replay(&scope, Some(&cross_tenant), 8)
+        .replay(&tenant(), &scope, Some(&cross_tenant), 8)
         .await
         .expect_err("a cursor naming another tenant is refused");
     assert_eq!(error.code(), "coordination-cursor-scope-mismatch");
@@ -375,10 +388,27 @@ async fn a_cursor_naming_another_scope_is_refused() {
     // no class segment, so it cannot be mistaken for a scoped one.
     let substrate_shaped = format!("{}:3", common::task_scope().task().as_str());
     let error = sources
-        .replay(&scope, Some(&substrate_shaped), 8)
+        .replay(&tenant(), &scope, Some(&substrate_shaped), 8)
         .await
         .expect_err("the substrate's cursor shape does not cross over");
     assert_eq!(error.code(), "coordination-cursor-malformed");
+}
+
+/// The tenant fence is the shared entry point's own, not each surface's: a
+/// scope key carries its own tenant, and a caller authenticated for another
+/// tenant is refused before any log is consulted — whichever surface forgot
+/// to pre-check.
+#[tokio::test]
+async fn a_scope_outside_the_authenticated_tenant_is_refused_by_the_entry_point() {
+    let fx = coordinated_world().await;
+    let scope = AgentEntityAddress::Task(common::task_scope());
+    let sources = sources(&fx);
+
+    let error = sources
+        .replay(&rakka_agent::TenantId::new("other-tenant"), &scope, None, 8)
+        .await
+        .expect_err("a foreign-tenant read is refused, never served");
+    assert_eq!(error.code(), "coordination-scope-foreign-tenant");
 }
 
 /// An agent entity records its lifecycle in settings revisions and audit, not
@@ -393,7 +423,7 @@ async fn a_scope_with_no_log_is_refused_rather_than_answered_empty() {
         AgentScope::new(tenant(), agent("assistant")).expect("the agent scope"),
     );
     let error = sources
-        .replay(&agent_scope, None, 8)
+        .replay(&tenant(), &agent_scope, None, 8)
         .await
         .expect_err("the agent scope keeps no replayable log");
     assert_eq!(error.code(), "coordination-scope-not-replayable");
@@ -402,7 +432,7 @@ async fn a_scope_with_no_log_is_refused_rather_than_answered_empty() {
     // keep a log, this deployment just did not wire one.
     let run_scope = AgentEntityAddress::Run(common::run_scope());
     let error = sources
-        .replay(&run_scope, None, 8)
+        .replay(&tenant(), &run_scope, None, 8)
         .await
         .expect_err("an unwired run scope is refused explicitly");
     assert_eq!(error.code(), "coordination-run-events-unavailable");
@@ -469,7 +499,7 @@ async fn the_reported_floor_is_a_cursor_the_reader_can_resume_from() {
     // A store that kept only the tail of what this conversation recorded.
     let trimmed = InMemoryAgentConversationHistoryStore::new().with_retention(1);
     let whole = sources(&fx)
-        .replay(&scope, None, 64)
+        .replay(&tenant(), &scope, None, 64)
         .await
         .expect("the untrimmed log reads");
     let AgentCoordinationReplay::Page(page) = whole else {
@@ -493,7 +523,7 @@ async fn the_reported_floor_is_a_cursor_the_reader_can_resume_from() {
     }
 
     let replay = sources
-        .replay(&scope, None, 8)
+        .replay(&tenant(), &scope, None, 8)
         .await
         .expect("the trimmed log answers");
     let AgentCoordinationReplay::WindowExpired {
@@ -512,7 +542,7 @@ async fn the_reported_floor_is_a_cursor_the_reader_can_resume_from() {
     );
 
     let resumed = sources
-        .replay(&scope, Some(&resume_from), 8)
+        .replay(&tenant(), &scope, Some(&resume_from), 8)
         .await
         .expect("the reported floor is a legal resume point");
     let AgentCoordinationReplay::Page(resumed) = resumed else {

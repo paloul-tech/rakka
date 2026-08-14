@@ -401,6 +401,31 @@ pub enum AgentDecisionWriteStatus {
     Duplicate,
 }
 
+/// One bounded page of retained decision events.
+///
+/// `has_more` is the sink's own explicit answer, never inferred from the page
+/// size: the read contract only promises *up to* `limit` events, so a page
+/// shorter than the limit proves nothing about what the sink still retains —
+/// a reader that guessed from the length would silently stop short of the
+/// retained tail.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct AgentDecisionEventPage {
+    /// The events, contiguous from the cursor, oldest first.
+    pub events: Vec<AgentDecisionEvent>,
+    /// Whether the sink retains more events past this page — cut by the
+    /// limit, or by a hole in the stream the next read will be refused at.
+    pub has_more: bool,
+}
+
+impl AgentDecisionEventPage {
+    /// A page holding `events`, with `has_more` as the sink's explicit answer.
+    #[must_use]
+    pub const fn new(events: Vec<AgentDecisionEvent>, has_more: bool) -> Self {
+        Self { events, has_more }
+    }
+}
+
 /// Where decision events go after the transition that decided them committed
 /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md)).
 ///
@@ -420,23 +445,31 @@ pub trait AgentDecisionEventSink: Send + Sync + 'static {
     ) -> AgentObservabilityFuture<'a, AgentDecisionWriteStatus>;
 
     /// Reads retained events with sequence strictly greater than `after`, in
-    /// sequence order, up to `limit`.
+    /// sequence order, up to `limit`, reporting explicitly whether more are
+    /// retained past the page.
     ///
-    /// A cursor that predates the retained window fails with
-    /// [`AgentObservabilityError::ReplayWindowExpired`] so a reader resyncs
-    /// from authoritative state instead of silently missing events.
+    /// The page MUST be contiguous from `after + 1`. The run's outbox drops
+    /// its oldest unflushed event after that event consumed a sequence, so a
+    /// hole can sit anywhere in the stream; an implementation MUST stop the
+    /// page *before* such a hole — reporting `has_more` so the reader comes
+    /// back — rather than page across it or discard the deliverable prefix,
+    /// whose depth must never depend on the reader's page size.
     ///
-    /// An implementation MUST answer the same way for a gap the reader would
-    /// cross *inside* the returned page, not only for one at the head: the
-    /// run's outbox drops its oldest unflushed event after that event consumed
-    /// a sequence, so a hole can sit anywhere. The returned page must be
-    /// contiguous from `after + 1`.
+    /// A read is refused with
+    /// [`AgentObservabilityError::ReplayWindowExpired`] — naming the first
+    /// retained sequence past the hole as the floor to resume from — exactly
+    /// when nothing contiguous can be delivered: the first retained event
+    /// past `after` is not `after + 1` (the hole sits at the read head), or
+    /// `after` lies beyond the newest retained sequence, a cursor this log
+    /// never issued that an empty page would silently vouch for. Either way
+    /// the reader resyncs from authoritative state instead of silently
+    /// missing events.
     fn read<'a>(
         &'a self,
         scope: &'a AgentRunScope,
         after: u64,
         limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<AgentDecisionEvent>>;
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage>;
 }
 
 /// Decision-event sink and read errors.
@@ -445,7 +478,8 @@ pub trait AgentDecisionEventSink: Send + Sync + 'static {
 pub enum AgentObservabilityError {
     /// The read cursor predates the retained window; resync from durable state.
     ReplayWindowExpired {
-        /// Oldest sequence still retained, if any event is.
+        /// The floor to resume from: the oldest sequence still retained at or
+        /// past the reader's position, when anything is retained there.
         oldest_retained: Option<u64>,
     },
     /// The sink rejected or failed the operation.
@@ -559,49 +593,55 @@ impl AgentDecisionEventSink for InMemoryAgentDecisionEventSink {
         scope: &'a AgentRunScope,
         after: u64,
         limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<AgentDecisionEvent>> {
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage> {
         Box::pin(async move {
             let events = self
                 .events
                 .lock()
                 .expect("the decision sink lock is not poisoned");
-            let retained = events.get(scope.key().as_str());
-            let oldest = retained.and_then(|held| held.first().map(|event| event.sequence));
-            if let Some(oldest) = oldest {
-                // A cursor of N promises the reader has seen sequence N; if the
-                // oldest retained is N+2 or later, something between was evicted.
-                if after.saturating_add(1) < oldest {
-                    return Err(AgentObservabilityError::ReplayWindowExpired {
-                        oldest_retained: Some(oldest),
-                    });
-                }
-            }
-            let page: Vec<AgentDecisionEvent> = retained
-                .map(|held| {
-                    held.iter()
-                        .filter(|event| event.sequence > after)
-                        .take(limit)
-                        .cloned()
-                        .collect()
-                })
+            let held = events
+                .get(scope.key().as_str())
+                .map(Vec::as_slice)
                 .unwrap_or_default();
-            // The head check above only catches an eviction at the front. The
-            // outbox is a ring that drops its oldest *unflushed* event after
-            // that event already consumed a sequence, so a hole can sit
-            // anywhere in the stream — and a page returned across one would
-            // silently skip it. Walk the page the caller is about to cross and
-            // refuse at the discontinuity instead, the rule the substrate's
-            // public event log already keeps.
+            // A cursor past the newest retained sequence is one this log never
+            // issued: an empty page would stamp "you are current" over
+            // sequences the reader has not seen, and once the log grows past
+            // the cursor the reader would resume across them silently.
+            let newest = held.last().map_or(0, |event| event.sequence);
+            if after > newest {
+                return Err(AgentObservabilityError::ReplayWindowExpired {
+                    oldest_retained: held.first().map(|event| event.sequence),
+                });
+            }
+            // The outbox is a ring that drops its oldest *unflushed* event
+            // after that event already consumed a sequence, so a hole can sit
+            // anywhere in the stream. The page is the contiguous prefix from
+            // the cursor: a hole at the read head is refused with the floor
+            // past it, and a hole further in truncates the page with
+            // `has_more` — the reader's next read starts at the hole and gets
+            // the refusal — so every retained event is deliverable whatever
+            // the reader's page size.
+            let mut page: Vec<AgentDecisionEvent> = Vec::new();
+            let mut has_more = false;
             let mut expected = after.saturating_add(1);
-            for event in &page {
+            for event in held.iter().filter(|event| event.sequence > after) {
                 if event.sequence != expected {
-                    return Err(AgentObservabilityError::ReplayWindowExpired {
-                        oldest_retained: Some(event.sequence),
-                    });
+                    if page.is_empty() {
+                        return Err(AgentObservabilityError::ReplayWindowExpired {
+                            oldest_retained: Some(event.sequence),
+                        });
+                    }
+                    has_more = true;
+                    break;
                 }
+                if page.len() == limit {
+                    has_more = true;
+                    break;
+                }
+                page.push(event.clone());
                 expected = event.sequence.saturating_add(1);
             }
-            Ok(page)
+            Ok(AgentDecisionEventPage::new(page, has_more))
         })
     }
 }

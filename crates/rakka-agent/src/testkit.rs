@@ -4049,10 +4049,14 @@ fn history_contract_operation(sequence: u64) -> AgentOperationId {
 ///
 /// What it proves: appends are idempotent on `(scope, sequence)` and a *different*
 /// entry at an occupied sequence fails closed; a cursor pages the whole log in
-/// order, once each, with no gap; and — under
+/// order, once each, with no gap; under
 /// [`HistoryRetention::Bounded`] — a cursor preceding the retained window answers
 /// [`AgentTaskError::HistoryWindowExpired`] naming a floor the reader can
-/// actually resume from, rather than a short page it would mistake for the truth.
+/// actually resume from, rather than a short page it would mistake for the truth;
+/// and a hole *inside* the log — the discontinuity a durable backend can grow
+/// through TTL or manual deletion — delivers the retained prefix whole, refuses
+/// the read that starts at the hole with the floor past it, and resumes cleanly
+/// from that floor.
 ///
 /// # Panics
 ///
@@ -4105,11 +4109,15 @@ pub async fn assert_task_history_store_contract<Store>(
     let floor = match retention {
         HistoryRetention::Unbounded => AgentTaskHistorySequence::FIRST.get(),
         HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
             assert!(
-                (kept as u64) < HISTORY_CONTRACT_ENTRIES,
+                kept < HISTORY_CONTRACT_ENTRIES,
                 "a bounded contract run must append past the window to exercise it"
             );
-            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept as u64 + 1;
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
             match store
                 .read(scope, AgentTaskHistoryCursor::start())
                 .await
@@ -4166,11 +4174,82 @@ pub async fn assert_task_history_store_contract<Store>(
             "a log longer than a page must need more than one to prove the cursor"
         );
     }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentTaskHistoryCursor::start()
+        .resuming_at(AgentTaskHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentTaskError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentTaskHistoryCursor::start()
+                .resuming_at(AgentTaskHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
 }
 
 /// Asserts one [`AgentTeamHistoryStore`] keeps the same contract.
 ///
 /// See [`assert_task_history_store_contract`] for what is proven and why.
+///
+/// [`AgentTeamHistoryStore`]: crate::team::AgentTeamHistoryStore
 ///
 /// # Panics
 ///
@@ -4222,11 +4301,15 @@ pub async fn assert_team_history_store_contract<Store>(
     let floor = match retention {
         HistoryRetention::Unbounded => AgentTeamHistorySequence::FIRST.get(),
         HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
             assert!(
-                (kept as u64) < HISTORY_CONTRACT_ENTRIES,
+                kept < HISTORY_CONTRACT_ENTRIES,
                 "a bounded contract run must append past the window to exercise it"
             );
-            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept as u64 + 1;
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
             match store
                 .read(scope, AgentTeamHistoryCursor::start())
                 .await
@@ -4254,6 +4337,10 @@ pub async fn assert_team_history_store_contract<Store>(
             .await
             .expect("the reported floor is a legal resume point");
         pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
         seen.extend(page.entries.iter().map(|held| held.sequence.get()));
         match page.next {
             Some(next) => cursor = next,
@@ -4275,6 +4362,75 @@ pub async fn assert_team_history_store_contract<Store>(
             "a log longer than a page must need more than one to prove the cursor"
         );
     }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentTeamHistoryCursor::start()
+        .resuming_at(AgentTeamHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentTeamError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentTeamHistoryCursor::start()
+                .resuming_at(AgentTeamHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
 }
 
 /// Asserts one [`AgentConversationHistoryStore`] keeps the same contract.
@@ -4333,11 +4489,15 @@ pub async fn assert_conversation_history_store_contract<Store>(
     let floor = match retention {
         HistoryRetention::Unbounded => AgentConversationHistorySequence::FIRST.get(),
         HistoryRetention::Bounded(kept) => {
+            // The store's documented zero-means-one clamp applies to the
+            // harness's own arithmetic too, so `Bounded(0)` proves the clamp
+            // instead of panicking on an off-by-one floor.
+            let kept = (kept as u64).max(1);
             assert!(
-                (kept as u64) < HISTORY_CONTRACT_ENTRIES,
+                kept < HISTORY_CONTRACT_ENTRIES,
                 "a bounded contract run must append past the window to exercise it"
             );
-            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept as u64 + 1;
+            let expected_floor = HISTORY_CONTRACT_ENTRIES - kept + 1;
             match store
                 .read(scope, AgentConversationHistoryCursor::start())
                 .await
@@ -4365,6 +4525,10 @@ pub async fn assert_conversation_history_store_contract<Store>(
             .await
             .expect("the reported floor is a legal resume point");
         pages += 1;
+        assert!(
+            page.entries.len() <= HISTORY_CONTRACT_PAGE,
+            "a page never exceeds the size the cursor asked for"
+        );
         seen.extend(page.entries.iter().map(|held| held.sequence.get()));
         match page.next {
             Some(next) => cursor = next,
@@ -4386,6 +4550,75 @@ pub async fn assert_conversation_history_store_contract<Store>(
             "a log longer than a page must need more than one to prove the cursor"
         );
     }
+
+    // A hole *inside* the log: an entry that never lands while a later one
+    // does — the shape a durable backend can grow through TTL or manual
+    // deletion, and the shape a reader must never be paged across silently.
+    // The retained prefix before the hole is delivered whole, the read that
+    // starts at the hole is refused naming the floor past it, and resuming at
+    // that floor delivers the tail.
+    let after_hole = HISTORY_CONTRACT_ENTRIES + 2;
+    store
+        .append(scope, &entry(after_hole))
+        .await
+        .expect("an append past an unfilled sequence succeeds");
+    // A bounded window evicts its oldest for the new entry, moving the floor.
+    let prefix_floor = match retention {
+        HistoryRetention::Unbounded => floor,
+        HistoryRetention::Bounded(_) => floor + 1,
+    };
+    let mut cursor = AgentConversationHistoryCursor::start()
+        .resuming_at(AgentConversationHistorySequence::new(prefix_floor))
+        .with_limit(HISTORY_CONTRACT_PAGE);
+    let mut prefix: Vec<u64> = Vec::new();
+    let mut probes = 0_usize;
+    let refusal = loop {
+        match store.read(scope, cursor).await {
+            Ok(page) => {
+                prefix.extend(page.entries.iter().map(|held| held.sequence.get()));
+                match page.next {
+                    Some(next) => cursor = next,
+                    None => panic!("a reader must be refused at the hole, not run off the end"),
+                }
+            }
+            Err(error) => break error,
+        }
+        probes += 1;
+        assert!(probes < 64, "paging toward the hole must terminate");
+    };
+    assert_eq!(
+        prefix,
+        (prefix_floor..=HISTORY_CONTRACT_ENTRIES).collect::<Vec<u64>>(),
+        "the retained prefix before the hole is delivered whole"
+    );
+    match refusal {
+        AgentConversationError::HistoryWindowExpired {
+            oldest_retained: Some(oldest),
+        } => assert_eq!(
+            oldest.get(),
+            after_hole,
+            "the refusal names the first entry past the hole"
+        ),
+        other => panic!("the read at the hole answers an expired window, got {other:?}"),
+    }
+    let tail = store
+        .read(
+            scope,
+            AgentConversationHistoryCursor::start()
+                .resuming_at(AgentConversationHistorySequence::new(after_hole))
+                .with_limit(HISTORY_CONTRACT_PAGE),
+        )
+        .await
+        .expect("the floor past the hole is a legal resume point");
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|held| held.sequence.get())
+            .collect::<Vec<u64>>(),
+        vec![after_hole],
+        "resuming past the hole delivers the tail"
+    );
+    assert!(tail.next.is_none(), "the tail is the end of the log");
 }
 
 #[cfg(test)]

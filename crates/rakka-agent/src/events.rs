@@ -53,7 +53,7 @@ use crate::conversation::{
 };
 use rakka_agent_workflow::AgentTimestampMillis;
 
-use crate::identity::{AgentId, AgentOperationId, AgentRunId, AgentRunScope, AgentTaskId};
+use crate::identity::{AgentGoalId, AgentId, AgentOperationId, AgentRunId, AgentTaskId, TenantId};
 use crate::observability::{
     AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentObservabilityError,
 };
@@ -77,7 +77,7 @@ pub const AGENT_COORDINATION_CURSOR_SEPARATOR: char = ':';
 /// Largest page a coordination replay will return, whatever the caller asks.
 pub const AGENT_COORDINATION_MAX_PAGE_SIZE: usize = 64;
 
-/// Default page size of a coordination replay.
+/// Default page size of a coordination replay: what a limit of zero asks for.
 pub const AGENT_COORDINATION_DEFAULT_PAGE_SIZE: usize = 16;
 
 /// Result of a scoped coordination replay.
@@ -106,6 +106,29 @@ pub enum AgentCoordinationReplayError {
         expected: Box<AgentEntityAddress>,
         /// The scope the cursor names.
         actual: Box<AgentEntityAddress>,
+    },
+    /// The scope names a tenant other than the caller's authenticated one.
+    ///
+    /// A scope key carries its own tenant, and reading one on the strength of
+    /// authentication for a different tenant would disclose that tenant's
+    /// coordination history. The fence is part of
+    /// [`AgentCoordinationSources::replay`] itself, so a surface serving the
+    /// replay cannot forget it. It reveals nothing: the caller supplied the
+    /// scope it is being refused for.
+    ForeignTenant {
+        /// The tenant the caller is authenticated as.
+        authenticated: TenantId,
+    },
+    /// The addressed entity has no durable record at all.
+    ///
+    /// Distinct from an empty log: a created entity that has not yet flushed
+    /// its first entry answers an honest empty page, while a scope that was
+    /// never created — a mistyped id, a cursor pasted where the scope belongs
+    /// — must not be vouched for with a page that reads as "this entity
+    /// recorded nothing".
+    ScopeUnknown {
+        /// The class of the addressed scope.
+        class: AgentEntityClass,
     },
     /// The addressed entity class keeps no replayable log.
     ///
@@ -148,6 +171,8 @@ impl AgentCoordinationReplayError {
         match self {
             Self::MalformedCursor { .. } => "coordination-cursor-malformed",
             Self::ScopeMismatch { .. } => "coordination-cursor-scope-mismatch",
+            Self::ForeignTenant { .. } => "coordination-scope-foreign-tenant",
+            Self::ScopeUnknown { .. } => "coordination-scope-unknown",
             Self::ScopeNotReplayable { .. } => "coordination-scope-not-replayable",
             Self::RunEventsUnavailable => "coordination-run-events-unavailable",
             Self::Task(error) => error.code(),
@@ -168,6 +193,13 @@ impl Display for AgentCoordinationReplayError {
                 f,
                 "the coordination cursor names scope {actual}, but the read addresses {expected}"
             ),
+            Self::ForeignTenant { authenticated } => write!(
+                f,
+                "the scope names a tenant other than the authenticated {authenticated}"
+            ),
+            Self::ScopeUnknown { class } => {
+                write!(f, "the addressed {class} entity has no durable record")
+            }
             Self::ScopeNotReplayable { class } => {
                 write!(f, "the {class} entity keeps no replayable coordination log")
             }
@@ -375,13 +407,15 @@ impl Display for AgentCoordinationEventKind {
 ///
 /// The four sources do not record the same things, and the projection says so
 /// rather than pretending otherwise. [`Self::status`] is a task fact and is
-/// absent elsewhere; a team claim id and a conversation reason arrive inside
+/// absent elsewhere; [`Self::goal`] is recorded only by the run's decision
+/// source; a team claim id and a conversation reason arrive inside
 /// [`Self::detail`], which is where the task side already puts a claim id. The
-/// decision event's revisions, selected tools, safety class, and trace context
-/// do not survive the merge at all — the three history logs carry no trace
-/// context, so a uniform correlation field would be uniformly empty for three
-/// scopes out of four. [`crate::query::assemble_agent_session_view`] is the
-/// run-scoped view that keeps them.
+/// decision event's loop phase, decision source, revisions, selected tools,
+/// safety class, and trace context do not survive the merge at all — the
+/// three history logs carry no trace context, so a uniform correlation field
+/// would be uniformly empty for three scopes out of four.
+/// [`crate::query::assemble_agent_session_view`] is the run-scoped view that
+/// keeps them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AgentCoordinationEvent {
@@ -404,6 +438,11 @@ pub struct AgentCoordinationEvent {
     pub task: Option<AgentTaskId>,
     /// The run involved, when one was.
     pub run: Option<AgentRunId>,
+    /// The goal the decision served, when its source recorded one. Only the
+    /// run's decision events carry a goal binding; the three history logs do
+    /// not record one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<AgentGoalId>,
     /// The task's status once the transition committed. A task fact; absent for
     /// every other scope.
     pub status: Option<AgentTaskStatus>,
@@ -442,6 +481,7 @@ impl AgentCoordinationEvent {
                 _ => None,
             },
             run: entry.run.clone(),
+            goal: None,
             status: Some(entry.status),
             digest: entry.digest.clone(),
             coordinate: entry
@@ -473,6 +513,7 @@ impl AgentCoordinationEvent {
             agent: entry.member.clone(),
             task: entry.task.clone(),
             run: None,
+            goal: None,
             status: None,
             digest: None,
             coordinate: None,
@@ -502,6 +543,7 @@ impl AgentCoordinationEvent {
             agent: entry.participant.clone(),
             task: None,
             run: None,
+            goal: None,
             status: None,
             digest: None,
             coordinate: entry.round.map(|round| AgentCoordinationCoordinate::Round {
@@ -532,6 +574,7 @@ impl AgentCoordinationEvent {
                 AgentEntityAddress::Run(run) => Some(run.run().clone()),
                 _ => None,
             },
+            goal: event.goal.clone(),
             status: None,
             digest: None,
             coordinate: Some(AgentCoordinationCoordinate::Turn(event.turn)),
@@ -588,7 +631,8 @@ pub enum AgentCoordinationReplay {
     WindowExpired {
         /// The scope read.
         scope: AgentEntityAddress,
-        /// Oldest sequence still retained, when the scope retains anything.
+        /// The floor to resume from: the oldest sequence still retained at or
+        /// past the reader's position, when anything is retained there.
         oldest_retained: Option<u64>,
         /// The cursor to resume from once the reader has resynchronized.
         resume_from: String,
@@ -645,7 +689,11 @@ fn resume_after(
 }
 
 fn clamp_limit(limit: usize) -> usize {
-    limit.clamp(1, AGENT_COORDINATION_MAX_PAGE_SIZE)
+    if limit == 0 {
+        AGENT_COORDINATION_DEFAULT_PAGE_SIZE
+    } else {
+        limit.min(AGENT_COORDINATION_MAX_PAGE_SIZE)
+    }
 }
 
 fn page_from(
@@ -834,36 +882,30 @@ pub async fn replay_run_coordination_events(
     };
     let after = resume_after(scope, cursor)?;
     let limit = clamp_limit(limit);
-    // Exactly the page, never one past it. The sink refuses a *gap inside what
-    // it returns*, so over-reading by one would turn a hole just beyond the
-    // page into an expired-window answer — and the reader would resynchronize
-    // past the contiguous events it could have had. A full page therefore
-    // reports more, which at worst costs one empty read at the end.
-    match read_run_page(sink, run_scope, after, limit).await {
+    // `has_more` is the sink's own explicit answer: the read contract only
+    // promises up to `limit` events, so inferring it from the page length
+    // would let a compliant short-paging sink strand the retained tail behind
+    // a "you are current".
+    match sink.read(run_scope, after, limit).await {
         Err(AgentObservabilityError::ReplayWindowExpired { oldest_retained }) => {
             Ok(AgentCoordinationReplay::expired(scope, oldest_retained))
         }
         Err(error) => Err(error.into()),
-        Ok(held) => {
-            let has_more = held.len() == limit;
-            let events = held
+        Ok(page) => {
+            let events = page
+                .events
                 .iter()
                 .map(|event| AgentCoordinationEvent::from_decision(scope, event))
                 .collect();
             Ok(AgentCoordinationReplay::Page(page_from(
-                scope, after, events, has_more, losses,
+                scope,
+                after,
+                events,
+                page.has_more,
+                losses,
             )))
         }
     }
-}
-
-async fn read_run_page(
-    sink: &dyn AgentDecisionEventSink,
-    scope: &AgentRunScope,
-    after: u64,
-    limit: usize,
-) -> Result<Vec<AgentDecisionEvent>, AgentObservabilityError> {
-    sink.read(scope, after, limit).await
 }
 
 /// Every durable log a scoped replay may reach.
@@ -913,20 +955,37 @@ where
         self
     }
 
-    /// Replays whichever log the scope addresses.
+    /// Replays whichever log the scope addresses, on behalf of the
+    /// authenticated tenant.
+    ///
+    /// The tenant fence lives here, in the one entry point every surface
+    /// shares, rather than in each surface's own handler: a scope key carries
+    /// its own tenant, and a surface that forgot to compare it against the
+    /// caller's authenticated one would disclose another tenant's
+    /// coordination history. A surface that wants to refuse earlier — before
+    /// consulting its authorizer — may still pre-check; this fence is what
+    /// makes forgetting impossible.
     ///
     /// # Errors
     ///
     /// As [`replay_task_coordination_events`], plus
+    /// [`AgentCoordinationReplayError::ForeignTenant`] for a scope naming a tenant
+    /// other than `authenticated`,
     /// [`AgentCoordinationReplayError::ScopeNotReplayable`] for a class that keeps no
-    /// log and [`AgentCoordinationReplayError::RunEventsUnavailable`] for a run scope
+    /// log, and [`AgentCoordinationReplayError::RunEventsUnavailable`] for a run scope
     /// with no sink wired.
     pub async fn replay(
         &self,
+        authenticated: &TenantId,
         scope: &AgentEntityAddress,
         cursor: Option<&str>,
         limit: usize,
     ) -> AgentCoordinationReplayResult<AgentCoordinationReplay> {
+        if scope.tenant() != authenticated {
+            return Err(AgentCoordinationReplayError::ForeignTenant {
+                authenticated: authenticated.clone(),
+            });
+        }
         match scope {
             AgentEntityAddress::Task(_) => {
                 replay_task_coordination_events(self.tasks, scope, cursor, limit).await

@@ -38,7 +38,7 @@ use rakka_agent_workflow::{
 use rakka_persistence::{DurableStateStore, Revision};
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption};
+use crate::budget::{AgentBudgetAllocation, AgentBudgetConsumption, AgentBudgetDimension};
 use crate::checkpoints::{AgentCheckpoint, AgentCheckpointKind, AgentCheckpointStatus};
 use crate::choreography::AgentExchangeState;
 use crate::definition::{
@@ -68,7 +68,8 @@ use crate::identity::{
 };
 use crate::loop_runtime::{AgentGoalEvaluationCell, AgentLoopPhase, AgentLoopState};
 use crate::observability::{
-    AgentDecisionEvent, AgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
+    AgentDecisionEvent, AgentDecisionEventSink, AgentObservabilityError,
+    AGENT_DECISION_EVENT_RETENTION,
 };
 use crate::run::{
     AgentRun, AgentRunError, AgentRunResult, AgentRunSettlementStatus, AgentRunSnapshot,
@@ -685,11 +686,15 @@ pub struct AgentOperationalSnapshot {
     /// operational answer is an observability surface and content stays in
     /// durable state and protected artifacts
     /// ([specification 17.14](../../../docs/plans/rakka-agent/spec.md)).
-    /// [`Self::has_pending_proposal`] carries the bounded fact an operator
-    /// needs.
+    /// [`Self::has_pending_proposal`] and [`Self::has_accepted_result`] carry
+    /// the bounded facts an operator needs.
     pub run: Option<AgentRunSnapshot>,
     /// Whether a result proposal is awaiting the task's decision.
     pub has_pending_proposal: bool,
+    /// Whether the task has accepted a result this run proposed. Captured
+    /// before redaction: the snapshot's own `accepted_result` is always
+    /// stripped, so a reader gating on it would gate on nothing.
+    pub has_accepted_result: bool,
     /// The bounded label of the wait the run is in, when it is waiting.
     pub wait_reason: Option<String>,
     /// The earliest durable checkpoint deadline that will wake the run, when
@@ -785,24 +790,26 @@ impl AgentOperationalSnapshot {
                 .is_waiting()
                 .then(|| run.status.as_label().to_string())
         });
-        // One snapshot, read once: capture the bounded pending-proposal fact
-        // before the content is redacted, rather than deriving the projection
-        // twice.
-        let (run_snapshot, has_pending_proposal) = match state.snapshot() {
+        // One snapshot, read once: capture the bounded pending-proposal and
+        // accepted-result facts before the content is redacted, rather than
+        // deriving the projection twice.
+        let (run_snapshot, has_pending_proposal, has_accepted_result) = match state.snapshot() {
             Some(mut snapshot) => {
                 let has_pending_proposal = snapshot.proposal.is_some();
+                let has_accepted_result = snapshot.accepted_result.is_some();
                 snapshot.proposal = None;
                 snapshot.accepted_result = None;
                 snapshot.feedback = None;
-                (Some(snapshot), has_pending_proposal)
+                (Some(snapshot), has_pending_proposal, has_accepted_result)
             }
-            None => (None, false),
+            None => (None, false, false),
         };
         Self {
             revision,
             observed_at,
             scope: state.scope().clone(),
             has_pending_proposal,
+            has_accepted_result,
             run: run_snapshot,
             wait_reason,
             next_wake,
@@ -1085,10 +1092,7 @@ where
 
     let (events, decisions_available) = match decisions {
         None => (Vec::new(), false),
-        Some(sink) => match sink.read(scope, 0, AGENT_DECISION_EVENT_RETENTION).await {
-            Ok(events) => (events, true),
-            Err(_) => (Vec::new(), false),
-        },
+        Some(sink) => read_retained_decisions(sink, scope).await,
     };
     let projected = events.iter().map(|event| event.sequence).max().unwrap_or(0);
     let decision_lag = snapshot.decision_cursor.saturating_sub(projected);
@@ -1100,6 +1104,56 @@ where
         decision_lag,
         trace_segments,
     }))
+}
+
+/// Reads everything the sink retains for one run, paging across retention
+/// holes.
+///
+/// A hole in the retained stream — the ring dropped an unflushed event, or an
+/// identity-formation failure consumed a sequence — answers
+/// [`AgentObservabilityError::ReplayWindowExpired`] at the hole, naming the
+/// floor past it. For the session view that is not an outage: the view resumes
+/// at the floor and keeps collecting, because "the sink retained `[1, 2, 4]`"
+/// must degrade to showing 1, 2, and 4 — never to a blank view claiming the
+/// sink is down. The loss itself stays visible through
+/// [`AgentOperationalSnapshot::decision_drops`] and
+/// [`AgentSessionView::decision_lag`]. Only a sink *fault* degrades the view
+/// to unavailable.
+async fn read_retained_decisions(
+    sink: &dyn AgentDecisionEventSink,
+    scope: &AgentRunScope,
+) -> (Vec<AgentDecisionEvent>, bool) {
+    let mut collected: Vec<AgentDecisionEvent> = Vec::new();
+    let mut after = 0_u64;
+    // Bounded defensively: a compliant sink retains at most
+    // `AGENT_DECISION_EVENT_RETENTION` events, and every pass below either
+    // collects at least one of them or jumps one hole between two of them.
+    for _ in 0..=(2 * AGENT_DECISION_EVENT_RETENTION) {
+        let remaining = AGENT_DECISION_EVENT_RETENTION.saturating_sub(collected.len());
+        if remaining == 0 {
+            break;
+        }
+        match sink.read(scope, after, remaining).await {
+            Ok(page) => {
+                let advanced = page.events.last().map(|event| event.sequence);
+                collected.extend(page.events);
+                match advanced {
+                    Some(sequence) if page.has_more && sequence > after => after = sequence,
+                    _ => break,
+                }
+            }
+            Err(AgentObservabilityError::ReplayWindowExpired { oldest_retained }) => {
+                match oldest_retained {
+                    // Resuming *at* the floor means positioning after the one
+                    // before it; anything else would loop in place.
+                    Some(oldest) if oldest.saturating_sub(1) > after => after = oldest - 1,
+                    _ => break,
+                }
+            }
+            Err(_) => return (Vec::new(), false),
+        }
+    }
+    (collected, true)
 }
 
 fn collect_segment(
@@ -2179,29 +2233,18 @@ fn push_budget_signals(
     policy: &AgentStrugglePolicy,
     observed_at: AgentTimestampMillis,
 ) {
-    for (dimension, spent, granted) in [
-        (
-            "loop_iterations",
-            consumed.loop_iterations,
-            allocation.loop_iterations,
-        ),
-        ("model_calls", consumed.model_calls, allocation.model_calls),
-        ("tool_calls", consumed.tool_calls, allocation.tool_calls),
-        ("effects", consumed.effects, allocation.effects),
-        (
-            "effect_attempts",
-            consumed.effect_attempts,
-            allocation.effect_attempts,
-        ),
-        ("tokens", consumed.tokens, allocation.tokens),
-        ("cost_micros", consumed.cost_micros, allocation.cost_micros),
-        ("descendants", consumed.descendants, allocation.descendants),
-    ] {
+    // The conserved set itself, not a hand-rolled copy: a dimension added to
+    // `CONSERVED` is charged everywhere the ledger iterates it, and it must be
+    // watched here the same day. The labels are the stable `as_label`
+    // vocabulary every other surface — exhaustion reasons, metrics — speaks.
+    for dimension in AgentBudgetDimension::CONSERVED {
+        let spent = consumed.get(dimension);
+        let granted = allocation.get(dimension);
         if approaching(spent, granted, policy.budget_warning_percent) {
             let granted = granted.unwrap_or_default();
             signals.push(AgentStruggleSignal::new(
                 AgentStruggleSignalKind::BudgetApproachingExhaustion,
-                format!("{dimension} {spent}/{granted}"),
+                format!("{} {spent}/{granted}", dimension.as_label()),
                 observed_at,
             ));
         }
@@ -2233,10 +2276,12 @@ pub fn agent_run_struggle_signals(
     );
     // A run that has taken many turns without a proposal standing is either
     // exploring or looping. The signal does not decide which; it says an
-    // operator should look.
+    // operator should look. The accepted-result gate reads the snapshot's
+    // captured fact, never `run.accepted_result` — derivation redacts that
+    // field unconditionally, so a guard on it would never suppress anything.
     if run.turn >= policy.iteration_failure_threshold
         && !snapshot.has_pending_proposal
-        && run.accepted_result.is_none()
+        && !snapshot.has_accepted_result
     {
         signals.push(AgentStruggleSignal::new(
             AgentStruggleSignalKind::RepeatedIterationFailure,

@@ -912,14 +912,18 @@ pub trait AgentConversationHistoryStore: Clone + Send + Sync + 'static {
         entry: &'a AgentConversationHistoryEntry,
     ) -> AgentConversationHistoryFuture<'a, ()>;
 
-    /// Reads one bounded page.
+    /// Reads one bounded page, contiguous from the cursor.
     ///
-    /// A backend that bounds its retention MUST answer a cursor preceding the
-    /// window it still holds with
-    /// [`AgentConversationError::HistoryWindowExpired`], and MUST return a page
-    /// contiguous from the cursor, so a reader resynchronizes from
-    /// authoritative state instead of silently skipping entries
-    /// ([specification 17.13](../../docs/plans/rakka-agent/spec.md)).
+    /// A backend MUST fail a read with
+    /// [`AgentConversationError::HistoryWindowExpired`] — naming the oldest
+    /// entry the reader can actually resume from — whenever answering would
+    /// otherwise vouch for entries the reader has not seen: a cursor
+    /// preceding the retained window, a discontinuity at the read head, or a
+    /// cursor past the newest retained entry, which this log never issued. A
+    /// discontinuity *inside* the page truncates it before the hole with a
+    /// `next` cursor instead, so the retained prefix is delivered whole and
+    /// the next read is refused at the hole. See
+    /// [`crate::task::AgentTaskHistoryStore::read`] for the full contract;
     /// [`crate::testkit::assert_conversation_history_store_contract`] is the
     /// harness that proves it.
     fn read<'a>(
@@ -936,7 +940,18 @@ pub trait AgentConversationHistoryStore: Clone + Send + Sync + 'static {
 /// history's precedent.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryAgentConversationHistoryStore {
-    entries: Arc<Mutex<BTreeMap<String, BTreeMap<u64, AgentConversationHistoryEntry>>>>,
+    inner: Arc<Mutex<InMemoryConversationHistoryInner>>,
+}
+
+/// The shared state behind every clone of one in-memory conversation history.
+///
+/// Retention lives *inside* the shared state, beside the log it bounds: the
+/// store is `Clone` by contract, and a bound that lived per-handle would let a
+/// clone taken before `with_retention` keep appending to the same shared log
+/// unbounded — the retention contract silently failing to hold.
+#[derive(Debug, Default)]
+struct InMemoryConversationHistoryInner {
+    entries: BTreeMap<String, BTreeMap<u64, AgentConversationHistoryEntry>>,
     retention: Option<usize>,
 }
 
@@ -955,19 +970,25 @@ impl InMemoryAgentConversationHistoryStore {
     /// the entity refuses a transition rather than lose an entry. Enabling it
     /// forfeits that audit obligation for whatever the window drops, in exchange
     /// for a bounded log and the explicit expired-window answer a replay cursor
-    /// needs. A limit of zero is treated as one.
+    /// needs. A limit of zero is treated as one. The bound is shared state:
+    /// clones share the log, so they share its retention, whichever handle set
+    /// it.
     #[must_use]
-    pub fn with_retention(mut self, entries: usize) -> Self {
-        self.retention = Some(entries.max(1));
+    pub fn with_retention(self, entries: usize) -> Self {
+        self.inner
+            .lock()
+            .expect("the conversation history should not be poisoned")
+            .retention = Some(entries.max(1));
         self
     }
 
     /// How many entries one conversation has.
     #[must_use]
     pub fn len(&self, scope: &AgentConversationScope) -> usize {
-        self.entries
+        self.inner
             .lock()
             .expect("the conversation history should not be poisoned")
+            .entries
             .get(&scope.key())
             .map_or(0, BTreeMap::len)
     }
@@ -990,11 +1011,12 @@ impl AgentConversationHistoryStore for InMemoryAgentConversationHistoryStore {
         entry: &'a AgentConversationHistoryEntry,
     ) -> AgentConversationHistoryFuture<'a, ()> {
         Box::pin(async move {
-            let mut entries = self
-                .entries
+            let mut inner = self
+                .inner
                 .lock()
                 .expect("the conversation history should not be poisoned");
-            let conversation = entries.entry(scope.key()).or_default();
+            let retention = inner.retention;
+            let conversation = inner.entries.entry(scope.key()).or_default();
             match conversation.get(&entry.sequence.get()) {
                 Some(existing) if existing == entry => Ok(()),
                 Some(_) => Err(AgentConversationError::HistoryConflict {
@@ -1002,7 +1024,7 @@ impl AgentConversationHistoryStore for InMemoryAgentConversationHistoryStore {
                 }),
                 None => {
                     conversation.insert(entry.sequence.get(), entry.clone());
-                    if let Some(retention) = self.retention {
+                    if let Some(retention) = retention {
                         while conversation.len() > retention {
                             let oldest = *conversation
                                 .keys()
@@ -1023,11 +1045,20 @@ impl AgentConversationHistoryStore for InMemoryAgentConversationHistoryStore {
         cursor: AgentConversationHistoryCursor,
     ) -> AgentConversationHistoryFuture<'a, AgentConversationHistoryPage> {
         Box::pin(async move {
-            let entries = self
-                .entries
+            let inner = self
+                .inner
                 .lock()
                 .expect("the conversation history should not be poisoned");
-            let Some(conversation) = entries.get(&scope.key()) else {
+            let Some(conversation) = inner.entries.get(&scope.key()) else {
+                // A positioned cursor into a scope with no log at all is a
+                // cursor this store never issued; an empty page would vouch
+                // for entries the reader believes it has seen. Only the
+                // start-of-log read is honestly empty here.
+                if cursor.position().is_some_and(|after| after.get() > 0) {
+                    return Err(AgentConversationError::HistoryWindowExpired {
+                        oldest_retained: None,
+                    });
+                }
                 return Ok(AgentConversationHistoryPage {
                     entries: Vec::new(),
                     next: None,
@@ -1035,49 +1066,60 @@ impl AgentConversationHistoryStore for InMemoryAgentConversationHistoryStore {
             };
 
             // The sequence the reader expects next: one past its cursor, or the
-            // very first entry when it is starting from the beginning. If the
-            // oldest entry still retained is later than that, everything between
-            // was evicted and resuming here would skip it silently.
+            // very first entry when it is starting from the beginning.
             let start = cursor
                 .position()
                 .map_or(AgentConversationHistorySequence::FIRST.get(), |after| {
-                    after.get() + 1
+                    after.get().saturating_add(1)
                 });
-            if let Some(oldest) = conversation.keys().next().copied() {
-                if start < oldest {
+            // A cursor past the newest retained entry was never issued by this
+            // log: an empty page would stamp "you are current" over sequences
+            // the reader has not seen, and once the log grows past the cursor
+            // the reader would resume across them silently.
+            let newest = conversation.keys().next_back().copied().unwrap_or_default();
+            if start > newest.saturating_add(1) {
+                return Err(AgentConversationError::HistoryWindowExpired {
+                    oldest_retained: conversation
+                        .keys()
+                        .next()
+                        .copied()
+                        .map(AgentConversationHistorySequence::new),
+                });
+            }
+            // History sequences are dense — the transition that consumes one
+            // pushes its entry in the same step — so a missing entry means the
+            // window moved (or a durable backend lost it). A hole at the read
+            // head is refused with the floor past it; a hole further in
+            // truncates the page instead, so the retained prefix is delivered
+            // whole whatever the reader's page size, and the *next* read
+            // starts at the hole and gets the refusal.
+            if let Some((&first, _)) = conversation.range(start..).next() {
+                if first != start {
                     return Err(AgentConversationError::HistoryWindowExpired {
-                        oldest_retained: Some(AgentConversationHistorySequence::new(oldest)),
+                        oldest_retained: Some(AgentConversationHistorySequence::new(first)),
                     });
                 }
             }
-            let mut page: Vec<AgentConversationHistoryEntry> = conversation
-                .range(start..)
-                .map(|(_, entry)| entry.clone())
-                .take(cursor.limit() + 1)
-                .collect();
-
-            let next = (page.len() > cursor.limit())
+            let mut page: Vec<AgentConversationHistoryEntry> = Vec::new();
+            let mut expected = start;
+            for (&sequence, entry) in conversation.range(start..) {
+                if sequence != expected || page.len() == cursor.limit() {
+                    break;
+                }
+                page.push(entry.clone());
+                expected = sequence.saturating_add(1);
+            }
+            let next = conversation
+                .range(expected..)
+                .next()
+                .is_some()
                 .then(|| {
-                    page.pop();
                     page.last().map(|entry| {
                         AgentConversationHistoryCursor::after(entry.sequence)
                             .with_limit(cursor.limit())
                     })
                 })
                 .flatten();
-
-            // History sequences are dense — the transition that consumes one
-            // pushes its entry in the same step — so a discontinuity inside the
-            // page the reader is about to cross means the window moved under it.
-            let mut expected = start;
-            for entry in &page {
-                if entry.sequence.get() != expected {
-                    return Err(AgentConversationError::HistoryWindowExpired {
-                        oldest_retained: Some(entry.sequence),
-                    });
-                }
-                expected = entry.sequence.get().saturating_add(1);
-            }
 
             Ok(AgentConversationHistoryPage {
                 entries: page,
@@ -3186,7 +3228,8 @@ pub enum AgentConversationError {
     /// ([specification 17.13](../../docs/plans/rakka-agent/spec.md)). The reader
     /// resynchronizes from authoritative state and resumes at the floor.
     HistoryWindowExpired {
-        /// Oldest sequence still retained, when the scope retains anything.
+        /// The floor to resume from: the oldest sequence still retained at or
+        /// past the reader's position, when anything is retained there.
         oldest_retained: Option<AgentConversationHistorySequence>,
     },
     /// The history outbox cannot hold what the next transition may record.

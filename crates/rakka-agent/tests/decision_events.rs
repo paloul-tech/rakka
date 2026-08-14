@@ -226,8 +226,11 @@ async fn the_decision_sequence_survives_any_owner_loss_exactly_once() {
 /// than fail a transition over telemetry. But the dropped event has already
 /// consumed a sequence, so the sink receives a stream with a hole in the
 /// middle — and a reader paging across that hole would silently skip a
-/// decision while believing it had them all. The sink refuses at the
-/// discontinuity instead, naming where the stream resumes.
+/// decision while believing it had them all. The sink delivers the retained
+/// prefix before the hole — whole, whatever the reader's page size — and
+/// refuses the read that *starts* at the hole, naming where the stream
+/// resumes. Every retained event is deliverable; only the hole itself is a
+/// declared loss.
 #[tokio::test]
 async fn a_dropped_decision_is_a_declared_gap_not_a_silent_one() {
     use rakka_agent::{AgentDecisionEventSink, AgentObservabilityError};
@@ -245,11 +248,31 @@ async fn a_dropped_decision_is_a_declared_gap_not_a_silent_one() {
             .expect("the sink accepts the append");
     }
 
-    // Reading from the head walks straight into the hole.
-    let error = sink
+    // Reading from the head delivers the contiguous prefix before the hole,
+    // and says more is retained past it — never a page across the hole.
+    let head = sink
         .read(&scope, 0, 16)
         .await
-        .expect_err("a page spanning a hole is refused, never short-paged");
+        .expect("the prefix before the hole is deliverable");
+    assert_eq!(
+        head.events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "the page stops before the hole instead of spanning it"
+    );
+    assert!(
+        head.has_more,
+        "the retained tail past the hole is announced, not stranded"
+    );
+
+    // The read that starts at the hole is the one that is refused, naming the
+    // floor the stream resumes at.
+    let error = sink
+        .read(&scope, 2, 16)
+        .await
+        .expect_err("a read starting at the hole is refused, never short-paged");
     match error {
         AgentObservabilityError::ReplayWindowExpired { oldest_retained } => {
             assert_eq!(
@@ -261,27 +284,43 @@ async fn a_dropped_decision_is_a_declared_gap_not_a_silent_one() {
         other => panic!("a gap answers an expired window, got {other:?}"),
     }
 
-    // A reader that has already seen the gap resumes past it cleanly.
+    // A reader that has been told the floor resumes past the gap cleanly.
     let tail = sink
         .read(&scope, 3, 16)
         .await
         .expect("resuming past the gap succeeds");
     assert_eq!(
-        tail.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+        tail.events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
         vec![4],
         "past the gap the stream is contiguous again"
     );
+    assert!(!tail.has_more, "the tail is the end of the retained stream");
 
-    // And a contiguous prefix still reads normally: the guard fires on the
-    // discontinuity, not on every read.
-    let head = sink
+    // A cursor past the newest retained sequence was never issued by this
+    // sink: it is refused rather than answered with an empty page that would
+    // turn into a silent skip once the stream grows past it.
+    sink.read(&scope, 40, 16)
+        .await
+        .expect_err("a cursor past the retained stream fails closed");
+
+    // How much history a reader gets must not depend on its page size: a
+    // two-event page reads the same prefix the sixteen-event page did.
+    let sized = sink
         .read(&scope, 0, 2)
         .await
         .expect("a page that stops before the gap succeeds");
     assert_eq!(
-        head.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+        sized
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
         vec![1, 2]
     );
+    assert!(sized.has_more);
 }
 
 /// Produces real decision events at the given sequences by driving a run and

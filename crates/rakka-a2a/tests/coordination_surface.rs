@@ -113,6 +113,14 @@ fn owner() -> rakka_agent_workflow::PrincipalRef {
     }
 }
 
+fn auditor() -> rakka_agent_workflow::PrincipalRef {
+    rakka_agent_workflow::PrincipalRef {
+        principal_type: "user".to_string(),
+        principal_id: "auditor".to_string(),
+        display_name: None,
+    }
+}
+
 fn goal_spec() -> rakka_agent::AgentGoalSpec {
     rakka_agent::AgentGoalSpec {
         owner: owner(),
@@ -323,7 +331,7 @@ async fn a_scoped_cursor_pages_one_entitys_history_over_the_service() {
 
     let replay = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &scope, None, 1)
+        .replay_coordination_events(&params(), Some(TENANT), &scope, None, None, 1)
         .await
         .expect("the scope replays");
     let AgentCoordinationReplay::Page(first) = replay else {
@@ -336,7 +344,7 @@ async fn a_scoped_cursor_pages_one_entitys_history_over_the_service() {
 
     let replay = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &scope, Some(&cursor), 16)
+        .replay_coordination_events(&params(), Some(TENANT), &scope, None, Some(&cursor), 16)
         .await
         .expect("the cursor resumes");
     let AgentCoordinationReplay::Page(rest) = replay else {
@@ -379,7 +387,7 @@ async fn a_scope_from_another_tenant_is_refused() {
     .key();
     let error = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &foreign, None, 8)
+        .replay_coordination_events(&params(), Some(TENANT), &foreign, None, None, 8)
         .await
         .expect_err("a scope outside the authenticated tenant is refused");
     assert!(
@@ -400,7 +408,7 @@ async fn a_scope_from_another_tenant_is_refused() {
     .encode();
     let error = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &scope, Some(&other), 8)
+        .replay_coordination_events(&params(), Some(TENANT), &scope, None, Some(&other), 8)
         .await
         .expect_err("a cursor naming another entity is refused");
     assert_eq!(error.code(), "coordination-cursor-scope-mismatch");
@@ -408,15 +416,17 @@ async fn a_scope_from_another_tenant_is_refused() {
     // And a malformed scope fails closed rather than being guessed at.
     let error = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), "not-a-scope", None, 8)
+        .replay_coordination_events(&params(), Some(TENANT), "not-a-scope", None, None, 8)
         .await
         .expect_err("a scope that is not one is refused");
     assert_eq!(error.code(), "coordination-cursor-malformed");
 }
 
-/// The replay is its own operation class, with the addressed scope bound into
-/// the check before any log is read — and a denial leaves the caller with
-/// nothing.
+/// The replay is its own operation class, with the addressed scope — and the
+/// authenticated principal, without which a deployment could not grant the
+/// read to an operator while withholding it from every other caller in the
+/// tenant — bound into the check before any log is read. A denial leaves the
+/// caller with nothing.
 #[tokio::test]
 async fn a_coordination_read_authorizes_under_its_own_operation_class() {
     struct DenyCoordinationReads;
@@ -436,6 +446,10 @@ async fn a_coordination_read_authorizes_under_its_own_operation_class() {
                     assert_eq!(claim.scope_class, "task");
                     assert_eq!(claim.scope, task_address().key());
                     assert_eq!(request.tenant, Some(TENANT));
+                    let principal = request
+                        .principal
+                        .expect("the authenticated principal rides the request");
+                    assert_eq!(principal.principal_id, "auditor");
                     A2AAuthorizationDecision::Deny
                 }
                 _ => A2AAuthorizationDecision::Allow,
@@ -448,7 +462,14 @@ async fn a_coordination_read_authorizes_under_its_own_operation_class() {
 
     let error = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &task_address().key(), None, 8)
+        .replay_coordination_events(
+            &params(),
+            Some(TENANT),
+            &task_address().key(),
+            Some(&auditor()),
+            None,
+            8,
+        )
         .await
         .expect_err("the denied read fails closed");
     assert!(matches!(error, RakkaAgentA2AError::Unauthorized));
@@ -459,7 +480,14 @@ async fn a_coordination_read_authorizes_under_its_own_operation_class() {
     permissive.coordinated_world().await;
     permissive
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &task_address().key(), None, 8)
+        .replay_coordination_events(
+            &params(),
+            Some(TENANT),
+            &task_address().key(),
+            Some(&auditor()),
+            None,
+            8,
+        )
         .await
         .expect("the same read is served when the class is permitted");
 }
@@ -527,15 +555,46 @@ async fn a_denied_goal_view_is_indistinguishable_from_an_absent_one() {
         "the wire assembled a real view, not an empty shell"
     );
 
-    // The caller-supplied budget is clamped and honored, so a cheap question
-    // does not cost an exhaustive traversal.
-    let bounded = permitted
+    // The caller's traversal budget rides the authorization claim and reaches
+    // the domain call. With this one-task world the truncation itself would be
+    // unprovable here — `tasks.len() == 1` holds whether the budget is honored
+    // or ignored — so the wire test pins the pass-through, and the domain test
+    // `the_node_budget_truncates_with_an_explicit_marker` (goal_view.rs)
+    // proves the clamp against a real multi-task tree.
+    struct CaptureGoalViewBudget(std::sync::Mutex<Option<Option<usize>>>);
+
+    #[async_trait]
+    impl A2AAuthorizer for CaptureGoalViewBudget {
+        async fn authorize(
+            &self,
+            request: &A2AAuthorizationRequest<'_>,
+        ) -> A2AAuthorizationDecision {
+            if matches!(request.operation, A2AOperation::GoalViewRead) {
+                let claim = request
+                    .goal_view
+                    .as_ref()
+                    .expect("the goal claim rides the request");
+                *self.0.lock().expect("the capture lock is not poisoned") = Some(claim.max_tasks);
+            }
+            A2AAuthorizationDecision::Allow
+        }
+    }
+
+    let capture = Arc::new(CaptureGoalViewBudget(std::sync::Mutex::new(None)));
+    let capturing = Fixture::with_authorizer(capture.clone());
+    capturing.coordinated_world().await;
+    let bounded = capturing
         .service
         .agent_goal_view(&params(), Some(TENANT), TASK, Some(&owner()), Some(1))
         .await
         .expect("the bounded read succeeds")
         .expect("the owner sees it");
     assert_eq!(bounded.tasks.len(), 1);
+    assert_eq!(
+        *capture.0.lock().expect("the capture lock is not poisoned"),
+        Some(Some(1)),
+        "the caller's budget rides the authorization claim on its way to the traversal"
+    );
 
     let absent_answer = permitted
         .service
@@ -569,6 +628,58 @@ async fn a_denied_goal_view_is_indistinguishable_from_an_absent_one() {
     assert_eq!(denied_answer.is_none(), unknown_answer.is_none());
 }
 
+/// A scope that was never created answers `coordination-scope-unknown`, never
+/// an empty page. The sharpest way to hit it is the API's own footgun: a
+/// coordination *cursor* pasted where the scope belongs parses as a different,
+/// nonexistent entity — identity segments may legally contain `:` — and an
+/// empty page would claim that phantom entity "recorded nothing".
+#[tokio::test]
+async fn a_never_created_scope_is_refused_rather_than_answered_empty() {
+    let fixture = Fixture::new();
+    fixture.coordinated_world().await;
+
+    // The cursor the service itself hands out for the real task, supplied as
+    // the scope: it parses as task "ticket-1:7", which does not exist.
+    let pasted_cursor = AgentCoordinationCursor::new(task_address(), 7).encode();
+    let error = fixture
+        .service
+        .replay_coordination_events(&params(), Some(TENANT), &pasted_cursor, None, None, 8)
+        .await
+        .expect_err("a cursor pasted as the scope names a phantom entity");
+    assert_eq!(error.code(), "coordination-scope-unknown");
+
+    // A plainly mistyped id inside the caller's own tenant fails the same way.
+    let mistyped = AgentEntityAddress::Task(
+        AgentTaskScope::new(
+            tenant(),
+            AgentTaskId::new("no-such-ticket").expect("the task id"),
+        )
+        .expect("the scope"),
+    )
+    .key();
+    let error = fixture
+        .service
+        .replay_coordination_events(&params(), Some(TENANT), &mistyped, None, None, 8)
+        .await
+        .expect_err("a never-created scope is refused");
+    assert_eq!(error.code(), "coordination-scope-unknown");
+
+    // The real scope still answers, so the refusals above are about absence,
+    // not a broken world.
+    fixture
+        .service
+        .replay_coordination_events(
+            &params(),
+            Some(TENANT),
+            &task_address().key(),
+            None,
+            None,
+            8,
+        )
+        .await
+        .expect("the created scope replays");
+}
+
 /// A run scope is refused explicitly when no decision-event sink is wired, and
 /// the agent scope is refused because it keeps no sequenced log at all. Neither
 /// is answered with an empty page, which would claim nothing had happened.
@@ -588,7 +699,7 @@ async fn an_unserved_scope_is_refused_by_name() {
     .key();
     let error = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &run, None, 8)
+        .replay_coordination_events(&params(), Some(TENANT), &run, None, None, 8)
         .await
         .expect_err("an unwired run scope is refused");
     assert_eq!(error.code(), "coordination-run-events-unavailable");
@@ -598,7 +709,7 @@ async fn an_unserved_scope_is_refused_by_name() {
             .key();
     let error = fixture
         .service
-        .replay_coordination_events(&params(), Some(TENANT), &agent, None, 8)
+        .replay_coordination_events(&params(), Some(TENANT), &agent, None, None, 8)
         .await
         .expect_err("the agent scope keeps no replayable log");
     assert_eq!(error.code(), "coordination-scope-not-replayable");

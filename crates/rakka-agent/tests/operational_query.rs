@@ -102,7 +102,7 @@ impl AgentDecisionEventSink for UnavailableSink {
         _scope: &'a rakka_agent::AgentRunScope,
         _after: u64,
         _limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<rakka_agent::AgentDecisionEvent>> {
+    ) -> AgentObservabilityFuture<'a, rakka_agent::AgentDecisionEventPage> {
         Box::pin(async {
             Err(AgentObservabilityError::Sink {
                 code: "unavailable".to_string(),
@@ -488,6 +488,47 @@ async fn the_session_view_joins_decisions_and_reports_its_own_lag() {
         "all four decisions are unprojected"
     );
     assert_eq!(degraded.snapshot, view.snapshot);
+
+    // A hole in the retained stream — the ring dropped an unflushed event —
+    // is not an outage: the view shows every decision the sink still retains,
+    // resuming past the declared gap, and only the missing one is absent.
+    // Blanking the whole view would turn one dropped record into "the sink is
+    // down" on every read for the rest of the run's life.
+    let holed = Arc::new(InMemoryAgentDecisionEventSink::new());
+    for event in sink
+        .events(&run_scope())
+        .iter()
+        .filter(|event| event.sequence != 3)
+    {
+        holed
+            .append(&run_scope(), event)
+            .await
+            .expect("the holed sink accepts the append");
+    }
+    let gapped = assemble_agent_session_view(
+        &fx.runs,
+        &run_scope(),
+        &AgentSchemaPolicy::default(),
+        Some(holed.as_ref()),
+        AgentTimestampMillis::new(9_999),
+    )
+    .await
+    .expect("the view assembles")
+    .expect("the run exists");
+    assert!(
+        gapped.decisions_available,
+        "a retention hole is a declared loss, not a sink outage"
+    );
+    assert_eq!(
+        gapped
+            .decisions
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 4],
+        "every retained decision is shown; only the hole is absent"
+    );
+    assert_eq!(gapped.snapshot, view.snapshot);
 }
 
 fn cancel_operation_id(label: &str) -> rakka_agent::AgentOperationId {

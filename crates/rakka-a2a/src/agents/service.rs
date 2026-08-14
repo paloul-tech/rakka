@@ -1031,7 +1031,9 @@ where
     /// `run/<tenant>/<agent>/<id>`. Two fences run before any log is read — the
     /// scope's own tenant must be the authenticated one, and the deployment
     /// authorizer sees the addressed scope bound into its own
-    /// [`A2AOperation::CoordinationEventRead`] class, never an undifferentiated
+    /// [`A2AOperation::CoordinationEventRead`] class — with the authenticated
+    /// principal, so a deployment can grant the read to an operator without
+    /// granting it to every caller in the tenant — never an undifferentiated
     /// read.
     ///
     /// An exhausted retention window is an *answer*, not an error: the reply's
@@ -1041,13 +1043,16 @@ where
     /// # Errors
     ///
     /// Fails when the tenant cannot be resolved, the scope does not parse or
-    /// names another tenant, the authorizer denies, the class keeps no log, or a
-    /// backing log faults.
+    /// names another tenant, the authorizer denies, the class keeps no log, the
+    /// addressed entity was never created (`coordination-scope-unknown` — an
+    /// empty page would read as "this entity recorded nothing"), or a backing
+    /// log faults.
     pub async fn replay_coordination_events(
         &self,
         params: &ServiceParams,
         request_tenant: Option<&str>,
         scope: &str,
+        principal: Option<&PrincipalRef>,
         after_cursor: Option<&str>,
         limit: usize,
     ) -> RakkaAgentA2AResult<AgentCoordinationReplay> {
@@ -1066,12 +1071,15 @@ where
         // authenticated caller read any tenant's coordination history by
         // spelling the key, so the authenticated tenant is the only one that
         // counts. This answers before the authorizer runs and reveals nothing:
-        // the caller supplied the tenant it is being refused for.
+        // the caller supplied the tenant it is being refused for. The shared
+        // replay entry point fences the same pair again, so a surface that
+        // skipped this pre-check would still be refused there.
         if address.tenant() != &tenant {
             return Err(RakkaAgentA2AError::Unauthorized);
         }
         let authorization = A2AAuthorizationRequest::new(A2AOperation::CoordinationEventRead)
             .with_tenant(tenant.as_str())
+            .with_principal(principal)
             .with_coordination(crate::auth::A2ACoordinationClaim {
                 scope_class: address.class().as_label(),
                 scope,
@@ -1081,10 +1089,6 @@ where
             A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
         }
 
-        // The durable drop count lives on the run record, not in the sink: the
-        // sink cannot know what the outbox dropped before it arrived. Reading it
-        // here is what lets a caller tell "resynchronize and you will have
-        // everything" from "these decisions are gone".
         let mut sources = AgentCoordinationSources::new(
             &self.history,
             &self.team_history,
@@ -1094,20 +1098,76 @@ where
             sources = sources.with_run_events(sink.as_ref());
         }
         if let AgentEntityAddress::Run(run_scope) = &address {
-            let losses = rakka_agent::agent_operational_snapshot(
+            // The unwired refusal comes first, before any durable read: an
+            // unwired deployment must answer its one stable code whatever the
+            // run store's health, and must not pay a snapshot derivation for
+            // an answer that discards it.
+            if self.decision_events.is_none() {
+                return Err(AgentCoordinationReplayError::RunEventsUnavailable.into());
+            }
+            // The durable drop count lives on the run record, not in the
+            // sink: the sink cannot know what the outbox dropped before it
+            // arrived. Reading it here is what lets a caller tell
+            // "resynchronize and you will have everything" from "these
+            // decisions are gone" — and the same read answers whether the run
+            // exists at all.
+            let snapshot = rakka_agent::agent_operational_snapshot(
                 &self.runs,
                 run_scope,
                 &AgentSchemaPolicy::default(),
                 self.clock.now(),
             )
-            .await?
-            .map_or(0, |snapshot| snapshot.decision_drops);
-            sources = sources.with_run_losses(losses);
+            .await?;
+            let Some(snapshot) = snapshot else {
+                return Err(AgentCoordinationReplayError::ScopeUnknown {
+                    class: address.class(),
+                }
+                .into());
+            };
+            sources = sources.with_run_losses(snapshot.decision_drops);
         }
-        sources
-            .replay(&address, after_cursor, limit)
-            .await
-            .map_err(Into::into)
+        let replay = sources
+            .replay(&tenant, &address, after_cursor, limit)
+            .await?;
+        // An empty first page is only vouched for when the entity exists: a
+        // scope that was never created — a mistyped id, a cursor pasted where
+        // the scope belongs, which parses as a *different* entity — must not
+        // read as "this entity recorded nothing". A created entity whose
+        // first entry is still owed answers the honest empty page.
+        if let AgentCoordinationReplay::Page(page) = &replay {
+            if page.events.is_empty() && page.complete_through == 0 && !page.has_more {
+                let now = self.clock.now();
+                let exists = match &address {
+                    AgentEntityAddress::Task(scope) => {
+                        let mut store = self.task_store(scope.clone());
+                        store.recover(now).await?;
+                        store.snapshot()?.is_some()
+                    }
+                    AgentEntityAddress::Team(scope) => {
+                        let mut store = self.team_store(scope.clone());
+                        store.recover(now).await?;
+                        store.snapshot()?.is_some()
+                    }
+                    AgentEntityAddress::Conversation(scope) => {
+                        let mut store = self.conversation_store(scope.clone());
+                        store.recover(now).await?;
+                        store.snapshot()?.is_some()
+                    }
+                    // The run's record was already loaded above, and the agent
+                    // class was refused as unreplayable before any page; a
+                    // class this build does not know was answered by the
+                    // domain replay itself.
+                    _ => true,
+                };
+                if !exists {
+                    return Err(AgentCoordinationReplayError::ScopeUnknown {
+                        class: address.class(),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(replay)
     }
 
     /// Assembles the authorized goal view
