@@ -20,14 +20,14 @@ use rakka_agent::AgentRevisionNumber;
 use rakka_agent::{
     agent_entity_type_key, agent_run_entity_type_key, agent_task_entity_type_key,
     init_agent_entity_sharding, init_agent_run_entity_sharding, init_agent_task_entity_sharding,
-    AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionWriteStatus, AgentEffectSpec,
-    AgentEntityAuthority, AgentEntityClass, AgentEntityRegistration, AgentEntityShardingSettings,
-    AgentEntityState, AgentExchangeRouter, AgentObservabilityError, AgentObservabilityFuture,
-    AgentRunEntityMessage, AgentRunEntityRegistration, AgentRunEntityShardingSettings,
-    AgentRunMemory, AgentRunScope, AgentRunState, AgentSchemaId, AgentSchemaRef,
-    AgentTaskEntityMessage, AgentTaskEntityRegistration, AgentTaskEntityShardingSettings,
-    AgentTaskState, AgentToolAuthority, AgentToolBinding, AgentToolDeclaration,
-    AgentToolDescriptor, AgentToolId, AgentToolKind, AgentToolRegistry,
+    AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink, AgentDecisionWriteStatus,
+    AgentEffectSpec, AgentEntityAuthority, AgentEntityClass, AgentEntityRegistration,
+    AgentEntityShardingSettings, AgentEntityState, AgentExchangeRouter, AgentObservabilityError,
+    AgentObservabilityFuture, AgentRunEntityMessage, AgentRunEntityRegistration,
+    AgentRunEntityShardingSettings, AgentRunMemory, AgentRunScope, AgentRunState, AgentSchemaId,
+    AgentSchemaRef, AgentTaskEntityMessage, AgentTaskEntityRegistration,
+    AgentTaskEntityShardingSettings, AgentTaskState, AgentToolAuthority, AgentToolBinding,
+    AgentToolDeclaration, AgentToolDescriptor, AgentToolId, AgentToolKind, AgentToolRegistry,
     InMemoryAgentTaskHistoryStore, InMemoryContextSnapshotStore, InMemorySessionMemoryStore,
     WorkflowAgentRunEffectSink,
 };
@@ -95,7 +95,7 @@ impl AgentDecisionEventSink for UnavailableDecisionSink {
         _scope: &'a AgentRunScope,
         _after: u64,
         _limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<AgentDecisionEvent>> {
+    ) -> AgentObservabilityFuture<'a, AgentDecisionEventPage> {
         Box::pin(async {
             Err(AgentObservabilityError::Sink {
                 code: "unavailable".to_string(),

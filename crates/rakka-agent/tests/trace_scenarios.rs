@@ -313,7 +313,7 @@ impl AgentDecisionEventSink for UnavailableSink {
         _scope: &'a rakka_agent::AgentRunScope,
         _after: u64,
         _limit: usize,
-    ) -> AgentObservabilityFuture<'a, Vec<rakka_agent::AgentDecisionEvent>> {
+    ) -> AgentObservabilityFuture<'a, rakka_agent::AgentDecisionEventPage> {
         Box::pin(async {
             Err(AgentObservabilityError::Sink {
                 code: "unavailable".to_string(),

@@ -15,8 +15,9 @@ use a2a_server::ServiceParams;
 use rakka_agent::{
     AgentClientAgentStatus, AgentClientError, AgentClientFuture, AgentClientManagementCommand,
     AgentClientManagementResponse, AgentClientTaskEvent, AgentClientTaskRequest,
-    AgentClientTaskState, AgentClientTaskView, AgentClientTransport, AgentEntityState,
-    AgentRunState, AgentTaskHistoryStore, AgentTaskId, AgentTaskState,
+    AgentClientTaskState, AgentClientTaskView, AgentClientTransport, AgentCoordinationReplay,
+    AgentEntityState, AgentGoalView, AgentRunState, AgentTaskHistoryStore, AgentTaskId,
+    AgentTaskState,
 };
 use rakka_agent_workflow::PrincipalRef;
 use rakka_persistence::DurableStateStore;
@@ -549,6 +550,51 @@ where
                     occurred_at: event.occurred_at,
                 })
                 .collect())
+        })
+    }
+
+    fn coordination_events<'a>(
+        &'a self,
+        scope: &'a str,
+        after_cursor: Option<&'a str>,
+        limit: usize,
+    ) -> AgentClientFuture<'a, AgentCoordinationReplay> {
+        Box::pin(async move {
+            // The expired window travels as the reply's own arm, not as an
+            // error: a caller that must resynchronize still learns exactly
+            // where to resume, which an error code cannot carry. The
+            // transport's principal rides the read so a deployment authorizer
+            // can grant coordination history per-principal.
+            self.service
+                .replay_coordination_events(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    scope,
+                    self.principal.as_ref(),
+                    after_cursor,
+                    limit,
+                )
+                .await
+                .map_err(client_error)
+        })
+    }
+
+    fn goal_view<'a>(
+        &'a self,
+        goal: &'a str,
+        max_tasks: Option<usize>,
+    ) -> AgentClientFuture<'a, Option<AgentGoalView>> {
+        Box::pin(async move {
+            self.service
+                .agent_goal_view(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    goal,
+                    self.principal.as_ref(),
+                    max_tasks,
+                )
+                .await
+                .map_err(client_error)
         })
     }
 }

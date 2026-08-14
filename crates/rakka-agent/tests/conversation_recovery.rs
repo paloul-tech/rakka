@@ -305,13 +305,30 @@ async fn a_loss_between_the_commit_and_the_history_flush_re_flushes_the_same_slo
         .settle_side_effects(&fx.router, fx.now())
         .await
         .expect("a second settle owes nothing");
-    let page = rakka_agent::AgentConversationHistoryStore::read(
+    // This sink only ever saw what the degraded store owed it — the creation
+    // was flushed to the fixture's own sink before the outage — so it holds a
+    // *partial* window, and a reader starting from the beginning is told so
+    // rather than handed a log quietly missing its first entry.
+    let floor = match rakka_agent::AgentConversationHistoryStore::read(
         &history,
         &conversation_scope(),
         rakka_agent::AgentConversationHistoryCursor::start(),
     )
     .await
-    .expect("the history reads");
+    {
+        Err(rakka_agent::AgentConversationError::HistoryWindowExpired {
+            oldest_retained: Some(floor),
+        }) => floor,
+        other => panic!("a partial window answers its floor, not a short page: {other:?}"),
+    };
+
+    let page = rakka_agent::AgentConversationHistoryStore::read(
+        &history,
+        &conversation_scope(),
+        rakka_agent::AgentConversationHistoryCursor::start().resuming_at(floor),
+    )
+    .await
+    .expect("the history reads from the floor it reported");
     let sequences: Vec<u64> = page
         .entries
         .iter()
@@ -325,8 +342,6 @@ async fn a_loss_between_the_commit_and_the_history_flush_re_flushes_the_same_slo
         unique.len(),
         "each sequence occupied exactly once: {sequences:?}"
     );
-    // This sink only ever saw what the degraded store owed it — the
-    // creation was flushed to the fixture's own sink before the outage.
     assert!(
         page.entries
             .iter()

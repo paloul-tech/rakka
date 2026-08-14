@@ -576,16 +576,10 @@ impl RakkaA2ARequestHandler {
         task_id: Option<&str>,
         principal: Option<&PrincipalRef>,
     ) -> Result<(), RakkaA2AHandlerError> {
-        let request = A2AAuthorizationRequest {
-            operation,
-            tenant,
-            task_id,
-            principal,
-            handoff: None,
-            team: None,
-            conversation: None,
-            task_result: None,
-        };
+        let mut request = A2AAuthorizationRequest::new(operation)
+            .with_optional_task_id(task_id)
+            .with_principal(principal);
+        request.tenant = tenant;
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),
             A2AAuthorizationDecision::Deny => Err(RakkaA2AHandlerError::NotAuthorized {

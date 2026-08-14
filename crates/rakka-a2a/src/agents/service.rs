@@ -21,14 +21,16 @@ use rakka_agent::AgentExchangeRouter;
 use rakka_agent::{
     load_agent_run_state, AgentConversationEntityReply, AgentConversationEntityStore,
     AgentConversationHistoryStore, AgentConversationScope, AgentConversationState,
-    AgentEntityCommand, AgentEntityReply, AgentEntityState, AgentEntityStore, AgentId,
+    AgentCoordinationReplay, AgentCoordinationReplayError, AgentCoordinationSources,
+    AgentDecisionEventSink, AgentEntityAddress, AgentEntityCommand, AgentEntityReply,
+    AgentEntityState, AgentEntityStore, AgentGoalClaimSource, AgentGoalId, AgentGoalView, AgentId,
     AgentOperationId, AgentOperationKind, AgentRunScope, AgentRunState, AgentRunStatus,
     AgentSchemaPolicy, AgentScope, AgentTaskEntityCommand, AgentTaskEntityReply,
     AgentTaskEntityStore, AgentTaskHistoryStore, AgentTaskId, AgentTaskScope, AgentTaskSnapshot,
     AgentTaskState, AgentTeamEntityReply, AgentTeamEntityStore, AgentTeamHistoryStore,
-    AgentTeamScope, AgentTeamState, TenantId,
+    AgentTeamScope, AgentTeamState, TenantId, AGENT_GOAL_VIEW_MAX_TASKS,
 };
-use rakka_agent_workflow::AgentTimestampMillis;
+use rakka_agent_workflow::{AgentTimestampMillis, PrincipalRef};
 use rakka_core::{MetricsRecorder, NoopMetricsRecorder};
 use rakka_persistence::DurableStateStore;
 
@@ -44,8 +46,8 @@ use super::error::{RakkaAgentA2AError, RakkaAgentA2AResult};
 use super::ingress::{
     agent_conversation_command, agent_task_cancel_command, agent_task_create_command,
     agent_task_handoff_command, agent_task_input, agent_task_result_command, agent_team_command,
-    normalize_agent_cancel, normalize_agent_send, resolve_agent_target, resolve_handoff_target,
-    NormalizedAgentCommand,
+    normalize_agent_cancel, normalize_agent_send, resolve_agent_target, resolve_agent_tenant,
+    resolve_handoff_target, NormalizedAgentCommand,
 };
 use super::management::{
     is_management_message, management_provenance, management_response_message,
@@ -140,6 +142,8 @@ pub struct RakkaAgentA2AService<
     clock: Arc<dyn A2AAgentClock>,
     default_tenant: Option<String>,
     metrics: Arc<dyn MetricsRecorder>,
+    decision_events: Option<Arc<dyn AgentDecisionEventSink>>,
+    goal_claims: Option<Arc<dyn AgentGoalClaimSource>>,
 }
 
 impl<Tasks, Agents, History, Runs, Teams, TeamHistory, Conversations, ConversationHistory>
@@ -200,6 +204,8 @@ where
             clock: Arc::new(SystemA2AAgentClock),
             default_tenant: None,
             metrics: Arc::new(NoopMetricsRecorder),
+            decision_events: None,
+            goal_claims: None,
         }
     }
 
@@ -269,6 +275,31 @@ where
     #[must_use]
     pub fn with_default_tenant(mut self, tenant: impl Into<String>) -> Self {
         self.default_tenant = Some(tenant.into());
+        self
+    }
+
+    /// Serves the run scope of [`Self::replay_coordination_events`] from this
+    /// decision-event sink.
+    ///
+    /// A trait object rather than a generic: the sink is the deployment's, not
+    /// the entity's, and a ninth store parameter would be paid for by every
+    /// wiring that never replays a run. Left unwired, a run scope is refused
+    /// explicitly — never answered with an empty page, which would claim the
+    /// run decided nothing.
+    #[must_use]
+    pub fn with_decision_events(mut self, sink: Arc<dyn AgentDecisionEventSink>) -> Self {
+        self.decision_events = Some(sink);
+        self
+    }
+
+    /// Joins shared-knowledge claims into [`Self::agent_goal_view`].
+    ///
+    /// Left unwired, the view answers `claims_available: false` with no error
+    /// code — the honest "nothing asked" that the degraded-source answer is
+    /// deliberately distinct from.
+    #[must_use]
+    pub fn with_goal_claim_source(mut self, claims: Arc<dyn AgentGoalClaimSource>) -> Self {
+        self.goal_claims = Some(claims);
         self
     }
 
@@ -389,22 +420,17 @@ where
         // boundary: the deployment authorizer sees `TeamCommand` with the
         // cluster's claimed verb, member, task, and target bound into the
         // request — never an undifferentiated send.
-        let authorization = A2AAuthorizationRequest {
-            operation: A2AOperation::TeamCommand,
-            tenant: Some(normalized.tenant.as_str()),
-            task_id: cluster.task.as_deref(),
-            principal: normalized.principal.as_ref(),
-            handoff: None,
-            conversation: None,
-            task_result: None,
-            team: Some(crate::auth::A2ATeamClaim {
+        let authorization = A2AAuthorizationRequest::new(A2AOperation::TeamCommand)
+            .with_tenant(normalized.tenant.as_str())
+            .with_optional_task_id(cluster.task.as_deref())
+            .with_principal(normalized.principal.as_ref())
+            .with_team(crate::auth::A2ATeamClaim {
                 team: &cluster.team,
                 operation: cluster.operation.as_label(),
                 member: cluster.member.as_deref(),
                 task: cluster.task.as_deref(),
                 target_member: cluster.target_member.as_deref(),
-            }),
-        };
+            });
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
             A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
@@ -489,22 +515,16 @@ where
         // boundary: the deployment authorizer sees `ConversationCommand`
         // with the cluster's claimed verb, speaker, and coordinate bound
         // into the request — never an undifferentiated send.
-        let authorization = A2AAuthorizationRequest {
-            operation: A2AOperation::ConversationCommand,
-            tenant: Some(normalized.tenant.as_str()),
-            task_id: None,
-            principal: normalized.principal.as_ref(),
-            handoff: None,
-            team: None,
-            task_result: None,
-            conversation: Some(crate::auth::A2AConversationClaim {
+        let authorization = A2AAuthorizationRequest::new(A2AOperation::ConversationCommand)
+            .with_tenant(normalized.tenant.as_str())
+            .with_principal(normalized.principal.as_ref())
+            .with_conversation(crate::auth::A2AConversationClaim {
                 conversation: &cluster.conversation,
                 operation: cluster.operation.as_label(),
                 participant: cluster.participant.as_deref(),
                 round: cluster.round,
                 turn: cluster.turn,
-            }),
-        };
+            });
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
             A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
@@ -573,16 +593,9 @@ where
         } else {
             A2AOperation::AgentManagementRead
         };
-        let authorization = A2AAuthorizationRequest {
-            operation,
-            tenant: Some(tenant.as_str()),
-            task_id: None,
-            principal: principal.as_ref(),
-            handoff: None,
-            team: None,
-            conversation: None,
-            task_result: None,
-        };
+        let authorization = A2AAuthorizationRequest::new(operation)
+            .with_tenant(tenant.as_str())
+            .with_principal(principal.as_ref());
         match self.authorizer.authorize(&authorization).await {
             A2AAuthorizationDecision::Allow => {}
             A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
@@ -1009,6 +1022,223 @@ where
             .map_err(Into::into)
     }
 
+    /// Replays one coordination scope's durable event log
+    /// ([specification 17.13](../../../docs/plans/rakka-agent/spec.md);
+    /// scenario 45).
+    ///
+    /// `scope` is an `AgentEntityAddress` key: `task/<tenant>/<id>`,
+    /// `team/<tenant>/<id>`, `conversation/<tenant>/<id>`, or
+    /// `run/<tenant>/<agent>/<id>`. Two fences run before any log is read — the
+    /// scope's own tenant must be the authenticated one, and the deployment
+    /// authorizer sees the addressed scope bound into its own
+    /// [`A2AOperation::CoordinationEventRead`] class — with the authenticated
+    /// principal, so a deployment can grant the read to an operator without
+    /// granting it to every caller in the tenant — never an undifferentiated
+    /// read.
+    ///
+    /// An exhausted retention window is an *answer*, not an error: the reply's
+    /// `WindowExpired` arm names the cursor to resume from once the caller has
+    /// resynchronized from authoritative state.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tenant cannot be resolved, the scope does not parse or
+    /// names another tenant, the authorizer denies, the class keeps no log, the
+    /// addressed entity was never created (`coordination-scope-unknown` — an
+    /// empty page would read as "this entity recorded nothing"), or a backing
+    /// log faults.
+    pub async fn replay_coordination_events(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+        scope: &str,
+        principal: Option<&PrincipalRef>,
+        after_cursor: Option<&str>,
+        limit: usize,
+    ) -> RakkaAgentA2AResult<AgentCoordinationReplay> {
+        let tenant = resolve_agent_tenant(
+            self.tenant_resolver.as_ref(),
+            self.default_tenant.as_deref(),
+            params,
+            request_tenant,
+        )?;
+        let address = AgentEntityAddress::parse(scope).map_err(|_| {
+            RakkaAgentA2AError::Coordination(AgentCoordinationReplayError::MalformedCursor {
+                cursor: scope.to_string(),
+            })
+        })?;
+        // A scope key carries its own tenant. Trusting it would let an
+        // authenticated caller read any tenant's coordination history by
+        // spelling the key, so the authenticated tenant is the only one that
+        // counts. This answers before the authorizer runs and reveals nothing:
+        // the caller supplied the tenant it is being refused for. The shared
+        // replay entry point fences the same pair again, so a surface that
+        // skipped this pre-check would still be refused there.
+        if address.tenant() != &tenant {
+            return Err(RakkaAgentA2AError::Unauthorized);
+        }
+        let authorization = A2AAuthorizationRequest::new(A2AOperation::CoordinationEventRead)
+            .with_tenant(tenant.as_str())
+            .with_principal(principal)
+            .with_coordination(crate::auth::A2ACoordinationClaim {
+                scope_class: address.class().as_label(),
+                scope,
+            });
+        match self.authorizer.authorize(&authorization).await {
+            A2AAuthorizationDecision::Allow => {}
+            A2AAuthorizationDecision::Deny => return Err(RakkaAgentA2AError::Unauthorized),
+        }
+
+        let mut sources = AgentCoordinationSources::new(
+            &self.history,
+            &self.team_history,
+            &self.conversation_history,
+        );
+        if let Some(sink) = self.decision_events.as_ref() {
+            sources = sources.with_run_events(sink.as_ref());
+        }
+        if let AgentEntityAddress::Run(run_scope) = &address {
+            // The unwired refusal comes first, before any durable read: an
+            // unwired deployment must answer its one stable code whatever the
+            // run store's health, and must not pay a snapshot derivation for
+            // an answer that discards it.
+            if self.decision_events.is_none() {
+                return Err(AgentCoordinationReplayError::RunEventsUnavailable.into());
+            }
+            // The durable drop count lives on the run record, not in the
+            // sink: the sink cannot know what the outbox dropped before it
+            // arrived. Reading it here is what lets a caller tell
+            // "resynchronize and you will have everything" from "these
+            // decisions are gone" — and the same read answers whether the run
+            // exists at all.
+            let snapshot = rakka_agent::agent_operational_snapshot(
+                &self.runs,
+                run_scope,
+                &AgentSchemaPolicy::default(),
+                self.clock.now(),
+            )
+            .await?;
+            let Some(snapshot) = snapshot else {
+                return Err(AgentCoordinationReplayError::ScopeUnknown {
+                    class: address.class(),
+                }
+                .into());
+            };
+            sources = sources.with_run_losses(snapshot.decision_drops);
+        }
+        let replay = sources
+            .replay(&tenant, &address, after_cursor, limit)
+            .await?;
+        // A no-history answer is only vouched for when the entity exists: a
+        // scope that was never created — a mistyped id, a cursor pasted where
+        // the scope belongs, which parses as a *different* entity — must not
+        // read as either "this entity recorded nothing" or "its history is no
+        // longer retained". A created entity still receives the honest empty
+        // page or window-expired response.
+        let needs_existence_check = match &replay {
+            AgentCoordinationReplay::Page(page) => {
+                page.events.is_empty() && page.complete_through == 0 && !page.has_more
+            }
+            AgentCoordinationReplay::WindowExpired {
+                oldest_retained: None,
+                ..
+            } => true,
+            _ => false,
+        };
+        if needs_existence_check {
+            let now = self.clock.now();
+            let exists = match &address {
+                AgentEntityAddress::Task(scope) => {
+                    let mut store = self.task_store(scope.clone());
+                    store.recover(now).await?;
+                    store.snapshot()?.is_some()
+                }
+                AgentEntityAddress::Team(scope) => {
+                    let mut store = self.team_store(scope.clone());
+                    store.recover(now).await?;
+                    store.snapshot()?.is_some()
+                }
+                AgentEntityAddress::Conversation(scope) => {
+                    let mut store = self.conversation_store(scope.clone());
+                    store.recover(now).await?;
+                    store.snapshot()?.is_some()
+                }
+                // The run's record was already loaded above, and the agent
+                // class was refused as unreplayable before any page; a class
+                // this build does not know was answered by domain replay.
+                _ => true,
+            };
+            if !exists {
+                return Err(AgentCoordinationReplayError::ScopeUnknown {
+                    class: address.class(),
+                }
+                .into());
+            }
+        }
+        Ok(replay)
+    }
+
+    /// Assembles the authorized goal view
+    /// ([specification 17.18](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// `None` means the caller may not see it *or* it does not exist, and the
+    /// two are byte-identical on purpose: the domain closed that existence
+    /// oracle at the owner fence, and re-opening it at the wire would undo the
+    /// work. A caller with no authenticated principal therefore gets `None` too,
+    /// never an error naming the goal.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tenant cannot be resolved or a durable record the
+    /// traversal reached is unreadable under the schema policy. Neither absence
+    /// nor denial is a failure.
+    pub async fn agent_goal_view(
+        &self,
+        params: &ServiceParams,
+        request_tenant: Option<&str>,
+        goal: &str,
+        principal: Option<&PrincipalRef>,
+        max_tasks: Option<usize>,
+    ) -> RakkaAgentA2AResult<Option<AgentGoalView>> {
+        let tenant = resolve_agent_tenant(
+            self.tenant_resolver.as_ref(),
+            self.default_tenant.as_deref(),
+            params,
+            request_tenant,
+        )?;
+        let authorization = A2AAuthorizationRequest::new(A2AOperation::GoalViewRead)
+            .with_tenant(tenant.as_str())
+            .with_principal(principal)
+            .with_goal_view(crate::auth::A2AGoalViewClaim { goal, max_tasks });
+        // A denial answers absent, not `Unauthorized`: the deny-is-absent
+        // contract is the whole reason a non-owner cannot probe for a goal's
+        // existence, and a distinguishable wire error would hand back exactly
+        // that probe.
+        if matches!(
+            self.authorizer.authorize(&authorization).await,
+            A2AAuthorizationDecision::Deny
+        ) {
+            return Ok(None);
+        }
+        let Some(principal) = principal else {
+            return Ok(None);
+        };
+        let goal = AgentGoalId::new(goal)?;
+        rakka_agent::authorized_agent_goal_view_bounded(
+            &self.tasks,
+            &self.runs,
+            &tenant,
+            &goal,
+            principal,
+            &AgentSchemaPolicy::default(),
+            self.goal_claims.as_deref(),
+            max_tasks.unwrap_or(AGENT_GOAL_VIEW_MAX_TASKS),
+            self.clock.now(),
+        )
+        .await
+        .map_err(Into::into)
+    }
+
     /// Applies one deduplicated command through the task entity facade and
     /// returns the resulting authoritative snapshot.
     async fn apply_task_command(
@@ -1142,16 +1372,12 @@ where
         handoff: Option<crate::auth::A2AHandoffClaim<'_>>,
         task_result: Option<crate::auth::A2ATaskResultClaim<'_>>,
     ) -> RakkaAgentA2AResult<()> {
-        let request = A2AAuthorizationRequest {
-            operation,
-            tenant: Some(normalized.tenant.as_str()),
-            task_id: Some(normalized.task.as_str()),
-            principal: normalized.principal.as_ref(),
-            handoff,
-            team: None,
-            conversation: None,
-            task_result,
-        };
+        let mut request = A2AAuthorizationRequest::new(operation)
+            .with_tenant(normalized.tenant.as_str())
+            .with_task_id(normalized.task.as_str())
+            .with_principal(normalized.principal.as_ref());
+        request.handoff = handoff;
+        request.task_result = task_result;
         match self.authorizer.authorize(&request).await {
             A2AAuthorizationDecision::Allow => Ok(()),
             A2AAuthorizationDecision::Deny => Err(RakkaAgentA2AError::Unauthorized),

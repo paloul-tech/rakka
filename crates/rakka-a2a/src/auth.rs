@@ -68,6 +68,27 @@ pub enum A2AOperation {
     AgentManagementWrite,
     /// Agent-management extension read (describe).
     AgentManagementRead,
+    /// A scoped replay of one entity's durable coordination event log
+    /// (specification 17.13; scenario 45).
+    ///
+    /// Its own operation class because a coordination log names who assigned,
+    /// claimed, handed off, and spoke — a strictly wider read than the public
+    /// task projection [`Self::GetTask`] serves, and one a deployment may want
+    /// to grant to operators without granting it to every task caller. The
+    /// request carries the addressed scope as
+    /// [`A2AAuthorizationRequest::coordination`], so the authorizer binds the
+    /// caller to the entity whose history it is about to read.
+    CoordinationEventRead,
+    /// A read of the authorized goal projection (specification 17.18).
+    ///
+    /// Distinct from [`Self::GetTask`] because the view spans a whole goal
+    /// tree — every contributing task and run, the delegation graph, budgets,
+    /// and the terminal decision — so a caller permitted one task is not
+    /// thereby permitted the tree it belongs to. The request carries the goal
+    /// as [`A2AAuthorizationRequest::goal_view`]. A denial must be answered
+    /// exactly as a missing goal is, or the domain's deny-is-absent contract
+    /// reopens as an existence oracle at the wire.
+    GoalViewRead,
 }
 
 impl A2AOperation {
@@ -89,6 +110,8 @@ impl A2AOperation {
             Self::ExtendedAgentCard => "extended-agent-card",
             Self::AgentManagementWrite => "agent-management-write",
             Self::AgentManagementRead => "agent-management-read",
+            Self::CoordinationEventRead => "coordination-event-read",
+            Self::GoalViewRead => "goal-view-read",
         }
     }
 }
@@ -184,8 +207,43 @@ pub struct A2ATaskResultClaim<'a> {
     pub evidence_digest: Option<&'a str>,
 }
 
+/// The scope claim riding one [`A2AOperation::CoordinationEventRead`] check.
+///
+/// The claim is the *addressed* scope, surfaced before any log is read, so the
+/// deployment authorizer can bind the authenticated caller to the entity whose
+/// coordination history it is asking for. The replay itself then fences the
+/// caller's cursor against this same scope, which gates consistency but never
+/// identity.
+#[derive(Debug, Clone, Copy)]
+pub struct A2ACoordinationClaim<'a> {
+    /// The entity class addressed: `task`, `run`, `team`, or `conversation`.
+    pub scope_class: &'a str,
+    /// The full scope key, as supplied.
+    pub scope: &'a str,
+}
+
+/// The goal claim riding one [`A2AOperation::GoalViewRead`] check.
+///
+/// A denial here must be indistinguishable from a goal that does not exist, so
+/// the check tells the authorizer which goal is asked for without letting the
+/// answer tell the caller whether it is there.
+#[derive(Debug, Clone, Copy)]
+pub struct A2AGoalViewClaim<'a> {
+    /// The goal the view is asked for.
+    pub goal: &'a str,
+    /// The traversal budget the caller asked for, when it named one.
+    pub max_tasks: Option<usize>,
+}
+
 /// One authorization check.
+///
+/// Construct through [`Self::new`] and the `with_*` setters rather than a struct
+/// literal: every operation class that needs a typed claim adds a field, and a
+/// literal makes each addition a breaking change at every call site — which is
+/// how the claim list grew to six without any of them being optional in
+/// practice.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct A2AAuthorizationRequest<'a> {
     /// Operation being attempted.
     pub operation: A2AOperation,
@@ -205,6 +263,99 @@ pub struct A2AAuthorizationRequest<'a> {
     /// The claimed result contract, on [`A2AOperation::SubmitTaskResult`]
     /// checks.
     pub task_result: Option<A2ATaskResultClaim<'a>>,
+    /// The addressed scope, on [`A2AOperation::CoordinationEventRead`] checks.
+    pub coordination: Option<A2ACoordinationClaim<'a>>,
+    /// The addressed goal, on [`A2AOperation::GoalViewRead`] checks.
+    pub goal_view: Option<A2AGoalViewClaim<'a>>,
+}
+
+impl<'a> A2AAuthorizationRequest<'a> {
+    /// A check for `operation`, carrying no tenant, principal, or claim yet.
+    #[must_use]
+    pub const fn new(operation: A2AOperation) -> Self {
+        Self {
+            operation,
+            tenant: None,
+            task_id: None,
+            principal: None,
+            handoff: None,
+            team: None,
+            conversation: None,
+            task_result: None,
+            coordination: None,
+            goal_view: None,
+        }
+    }
+
+    /// Sets the canonical tenant.
+    #[must_use]
+    pub const fn with_tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+
+    /// Sets the target task id.
+    #[must_use]
+    pub const fn with_task_id(mut self, task_id: &'a str) -> Self {
+        self.task_id = Some(task_id);
+        self
+    }
+
+    /// Sets the target task id when the caller has one.
+    #[must_use]
+    pub const fn with_optional_task_id(mut self, task_id: Option<&'a str>) -> Self {
+        self.task_id = task_id;
+        self
+    }
+
+    /// Sets the authenticated principal when the request supplied one.
+    #[must_use]
+    pub const fn with_principal(mut self, principal: Option<&'a PrincipalRef>) -> Self {
+        self.principal = principal;
+        self
+    }
+
+    /// Binds the claimed transfer.
+    #[must_use]
+    pub const fn with_handoff(mut self, handoff: A2AHandoffClaim<'a>) -> Self {
+        self.handoff = Some(handoff);
+        self
+    }
+
+    /// Binds the claimed team command.
+    #[must_use]
+    pub const fn with_team(mut self, team: A2ATeamClaim<'a>) -> Self {
+        self.team = Some(team);
+        self
+    }
+
+    /// Binds the claimed conversation command.
+    #[must_use]
+    pub const fn with_conversation(mut self, conversation: A2AConversationClaim<'a>) -> Self {
+        self.conversation = Some(conversation);
+        self
+    }
+
+    /// Binds the claimed result contract.
+    #[must_use]
+    pub const fn with_task_result(mut self, task_result: A2ATaskResultClaim<'a>) -> Self {
+        self.task_result = Some(task_result);
+        self
+    }
+
+    /// Binds the addressed coordination scope.
+    #[must_use]
+    pub const fn with_coordination(mut self, coordination: A2ACoordinationClaim<'a>) -> Self {
+        self.coordination = Some(coordination);
+        self
+    }
+
+    /// Binds the addressed goal.
+    #[must_use]
+    pub const fn with_goal_view(mut self, goal_view: A2AGoalViewClaim<'a>) -> Self {
+        self.goal_view = Some(goal_view);
+        self
+    }
 }
 
 /// Authorization decision.

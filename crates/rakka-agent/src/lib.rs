@@ -65,6 +65,7 @@ pub mod delegation;
 pub mod dispatch;
 pub mod effect;
 pub mod evaluation;
+pub mod events;
 pub mod fan_in;
 pub mod goal;
 pub mod guardrails;
@@ -180,6 +181,14 @@ pub use evaluation::{
     AGENT_GOAL_EVALUATION_DEFAULT_MAX_ATTEMPTS, AGENT_GOAL_EVALUATION_HUMAN_DECISION_CLASS,
     AGENT_GOAL_EVALUATION_MAX_EVIDENCE,
 };
+pub use events::{
+    replay_conversation_coordination_events, replay_run_coordination_events,
+    replay_task_coordination_events, replay_team_coordination_events, AgentCoordinationCoordinate,
+    AgentCoordinationCursor, AgentCoordinationEvent, AgentCoordinationEventKind,
+    AgentCoordinationPage, AgentCoordinationReplay, AgentCoordinationReplayError,
+    AgentCoordinationReplayResult, AgentCoordinationSources, AGENT_COORDINATION_CURSOR_SEPARATOR,
+    AGENT_COORDINATION_DEFAULT_PAGE_SIZE, AGENT_COORDINATION_MAX_PAGE_SIZE,
+};
 pub use guardrails::{
     AgentGuardrail, AgentGuardrailBoundary, AgentGuardrailChain, AgentGuardrailContext,
     AgentGuardrailDecision, AgentGuardrailDisposition, AgentGuardrailError, AgentGuardrailOutcome,
@@ -219,19 +228,19 @@ pub use model::{
 pub use observability::{
     record_agent_domain_counter, record_agent_domain_gauge, record_unsettleable_exchanges,
     sanitize_agent_telemetry_context, validate_agent_domain_metric_attributes, AgentDecisionDraft,
-    AgentDecisionEvent, AgentDecisionEventSink, AgentDecisionKind, AgentDecisionSource,
-    AgentDecisionWriteStatus, AgentObservabilityError, AgentObservabilityFuture,
-    AgentObservabilityResult, InMemoryAgentDecisionEventSink, AGENT_DECISION_EVENT_RETENTION,
-    AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS, AGENT_TELEMETRY_MAX_SPAN_LINKS,
-    METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS, METRIC_AGENT_DELEGATION_RESULTS,
-    METRIC_AGENT_DEPENDENCY_OUTCOMES, METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS,
-    METRIC_AGENT_EXCHANGE_UNSETTLEABLE, METRIC_AGENT_FAN_IN_RESOLUTIONS,
-    METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION, METRIC_AGENT_GOAL_STATUS,
-    METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS, METRIC_AGENT_MEMORY_INGRESS_OUTCOMES,
-    METRIC_AGENT_MEMORY_RETRIEVALS, METRIC_AGENT_MODERATION_TURNS, METRIC_AGENT_RECOVERY_EVENTS,
-    METRIC_AGENT_RUN_TRANSITIONS, METRIC_AGENT_TEAM_OPERATIONS,
-    METRIC_AGENT_TELEMETRY_FLUSH_FAILURES, METRIC_AGENT_WAKE_DISPOSITIONS,
-    METRIC_AGENT_WORKFLOW_RESULTS,
+    AgentDecisionEvent, AgentDecisionEventPage, AgentDecisionEventSink, AgentDecisionKind,
+    AgentDecisionSource, AgentDecisionWriteStatus, AgentObservabilityError,
+    AgentObservabilityFuture, AgentObservabilityResult, InMemoryAgentDecisionEventSink,
+    AGENT_DECISION_EVENT_RETENTION, AGENT_DECISION_REASON_MAX_LENGTH, AGENT_METRIC_FIELDS,
+    AGENT_TELEMETRY_MAX_SPAN_LINKS, METRIC_AGENT_DECISIONS, METRIC_AGENT_DECISION_DROPS,
+    METRIC_AGENT_DELEGATION_RESULTS, METRIC_AGENT_DEPENDENCY_OUTCOMES,
+    METRIC_AGENT_EFFECT_OUTCOMES, METRIC_AGENT_EPOCHS, METRIC_AGENT_EXCHANGE_UNSETTLEABLE,
+    METRIC_AGENT_FAN_IN_RESOLUTIONS, METRIC_AGENT_GOAL_LIFECYCLE, METRIC_AGENT_GOAL_STAGNATION,
+    METRIC_AGENT_GOAL_STATUS, METRIC_AGENT_HANDOFF_RESULTS, METRIC_AGENT_HUMAN_RESULTS,
+    METRIC_AGENT_MEMORY_INGRESS_OUTCOMES, METRIC_AGENT_MEMORY_RETRIEVALS,
+    METRIC_AGENT_MODERATION_TURNS, METRIC_AGENT_RECOVERY_EVENTS, METRIC_AGENT_RUN_TRANSITIONS,
+    METRIC_AGENT_TEAM_OPERATIONS, METRIC_AGENT_TELEMETRY_FLUSH_FAILURES,
+    METRIC_AGENT_WAKE_DISPOSITIONS, METRIC_AGENT_WORKFLOW_RESULTS,
 };
 #[cfg(feature = "otel")]
 pub use otel::{
@@ -244,18 +253,20 @@ pub use otel::{
     ATTR_RAKKA_AGENT_DELEGATION_ID, ATTR_RAKKA_AGENT_GOAL_ID, ATTR_RAKKA_AGENT_TASK_ID,
 };
 pub use query::{
-    agent_goal_view_omission_code, agent_operational_snapshot, agent_task_operational_snapshot,
-    assemble_agent_goal_view, assemble_agent_goal_view_bounded, assemble_agent_session_view,
-    authorized_agent_goal_view, next_pending_wake_for_task, AgentCancellationProgress,
-    AgentCheckpointView, AgentGoalAssignmentView, AgentGoalBudgetView, AgentGoalClaimAppendView,
-    AgentGoalClaimFuture, AgentGoalClaimRef, AgentGoalClaimSource, AgentGoalClaimSourceError,
-    AgentGoalContractView, AgentGoalDelegationEdgeView, AgentGoalEvaluationView,
-    AgentGoalFanInView, AgentGoalHandoffView, AgentGoalRunNode, AgentGoalTaskHandoffView,
-    AgentGoalTaskNode, AgentGoalView, AgentGoalViewError, AgentGoalViewOmission,
-    AgentGoalViewResult, AgentGoalWorkflowInvocationView, AgentOperationalSnapshot,
-    AgentPendingEffectView, AgentRunCollaborationView, AgentSessionSegmentSource,
-    AgentSessionTraceSegment, AgentSessionView, AgentTaskOperationalSnapshot,
-    AGENT_GOAL_VIEW_MAX_CLAIMS, AGENT_GOAL_VIEW_MAX_TASKS,
+    agent_conversation_struggle_signals, agent_goal_view_omission_code, agent_operational_snapshot,
+    agent_run_struggle_signals, agent_task_operational_snapshot, agent_task_struggle_signals,
+    agent_team_struggle_signals, assemble_agent_goal_view, assemble_agent_goal_view_bounded,
+    assemble_agent_session_view, authorized_agent_goal_view, authorized_agent_goal_view_bounded,
+    next_pending_wake_for_task, AgentCancellationProgress, AgentCheckpointView,
+    AgentGoalAssignmentView, AgentGoalBudgetView, AgentGoalClaimAppendView, AgentGoalClaimFuture,
+    AgentGoalClaimRef, AgentGoalClaimSource, AgentGoalClaimSourceError, AgentGoalContractView,
+    AgentGoalDelegationEdgeView, AgentGoalEvaluationView, AgentGoalFanInView, AgentGoalHandoffView,
+    AgentGoalRunNode, AgentGoalTaskHandoffView, AgentGoalTaskNode, AgentGoalView,
+    AgentGoalViewError, AgentGoalViewOmission, AgentGoalViewResult,
+    AgentGoalWorkflowInvocationView, AgentOperationalSnapshot, AgentPendingEffectView,
+    AgentRunCollaborationView, AgentSessionSegmentSource, AgentSessionTraceSegment,
+    AgentSessionView, AgentStrugglePolicy, AgentStruggleSignal, AgentStruggleSignalKind,
+    AgentTaskOperationalSnapshot, AGENT_GOAL_VIEW_MAX_CLAIMS, AGENT_GOAL_VIEW_MAX_TASKS,
 };
 pub use retrieval::{
     assemble_context, derive_retrieval_query, embed_memory_vector, memory_embedding_text,
