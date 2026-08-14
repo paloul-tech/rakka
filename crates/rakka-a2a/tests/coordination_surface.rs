@@ -649,19 +649,37 @@ async fn a_never_created_scope_is_refused_rather_than_answered_empty() {
     assert_eq!(error.code(), "coordination-scope-unknown");
 
     // A plainly mistyped id inside the caller's own tenant fails the same way.
-    let mistyped = AgentEntityAddress::Task(
+    let mistyped_address = AgentEntityAddress::Task(
         AgentTaskScope::new(
             tenant(),
             AgentTaskId::new("no-such-ticket").expect("the task id"),
         )
         .expect("the scope"),
-    )
-    .key();
+    );
+    let mistyped = mistyped_address.key();
     let error = fixture
         .service
         .replay_coordination_events(&params(), Some(TENANT), &mistyped, None, None, 8)
         .await
         .expect_err("a never-created scope is refused");
+    assert_eq!(error.code(), "coordination-scope-unknown");
+
+    // A cursor that matches the phantom scope must not turn absence into an
+    // expired replay window merely because the underlying log retains no
+    // entries for that scope.
+    let positioned_cursor = AgentCoordinationCursor::new(mistyped_address, 7).encode();
+    let error = fixture
+        .service
+        .replay_coordination_events(
+            &params(),
+            Some(TENANT),
+            &mistyped,
+            None,
+            Some(&positioned_cursor),
+            8,
+        )
+        .await
+        .expect_err("a positioned cursor cannot make a phantom scope look expired");
     assert_eq!(error.code(), "coordination-scope-unknown");
 
     // The real scope still answers, so the refusals above are about absence,

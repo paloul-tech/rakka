@@ -1129,42 +1129,50 @@ where
         let replay = sources
             .replay(&tenant, &address, after_cursor, limit)
             .await?;
-        // An empty first page is only vouched for when the entity exists: a
+        // A no-history answer is only vouched for when the entity exists: a
         // scope that was never created — a mistyped id, a cursor pasted where
         // the scope belongs, which parses as a *different* entity — must not
-        // read as "this entity recorded nothing". A created entity whose
-        // first entry is still owed answers the honest empty page.
-        if let AgentCoordinationReplay::Page(page) = &replay {
-            if page.events.is_empty() && page.complete_through == 0 && !page.has_more {
-                let now = self.clock.now();
-                let exists = match &address {
-                    AgentEntityAddress::Task(scope) => {
-                        let mut store = self.task_store(scope.clone());
-                        store.recover(now).await?;
-                        store.snapshot()?.is_some()
-                    }
-                    AgentEntityAddress::Team(scope) => {
-                        let mut store = self.team_store(scope.clone());
-                        store.recover(now).await?;
-                        store.snapshot()?.is_some()
-                    }
-                    AgentEntityAddress::Conversation(scope) => {
-                        let mut store = self.conversation_store(scope.clone());
-                        store.recover(now).await?;
-                        store.snapshot()?.is_some()
-                    }
-                    // The run's record was already loaded above, and the agent
-                    // class was refused as unreplayable before any page; a
-                    // class this build does not know was answered by the
-                    // domain replay itself.
-                    _ => true,
-                };
-                if !exists {
-                    return Err(AgentCoordinationReplayError::ScopeUnknown {
-                        class: address.class(),
-                    }
-                    .into());
+        // read as either "this entity recorded nothing" or "its history is no
+        // longer retained". A created entity still receives the honest empty
+        // page or window-expired response.
+        let needs_existence_check = match &replay {
+            AgentCoordinationReplay::Page(page) => {
+                page.events.is_empty() && page.complete_through == 0 && !page.has_more
+            }
+            AgentCoordinationReplay::WindowExpired {
+                oldest_retained: None,
+                ..
+            } => true,
+            _ => false,
+        };
+        if needs_existence_check {
+            let now = self.clock.now();
+            let exists = match &address {
+                AgentEntityAddress::Task(scope) => {
+                    let mut store = self.task_store(scope.clone());
+                    store.recover(now).await?;
+                    store.snapshot()?.is_some()
                 }
+                AgentEntityAddress::Team(scope) => {
+                    let mut store = self.team_store(scope.clone());
+                    store.recover(now).await?;
+                    store.snapshot()?.is_some()
+                }
+                AgentEntityAddress::Conversation(scope) => {
+                    let mut store = self.conversation_store(scope.clone());
+                    store.recover(now).await?;
+                    store.snapshot()?.is_some()
+                }
+                // The run's record was already loaded above, and the agent
+                // class was refused as unreplayable before any page; a class
+                // this build does not know was answered by domain replay.
+                _ => true,
+            };
+            if !exists {
+                return Err(AgentCoordinationReplayError::ScopeUnknown {
+                    class: address.class(),
+                }
+                .into());
             }
         }
         Ok(replay)
