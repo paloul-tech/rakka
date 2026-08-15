@@ -574,11 +574,18 @@ pub struct AgentConversationTerminalNotice {
 /// a code in this list settles the notice *and* memoizes at the receiver; a
 /// code outside it stays outstanding *and* re-runs the receiving arm on the
 /// next drive. A missing or closed team cannot be waited out (the board is
-/// gone or frozen as history), and a forged verdict never changes on replay.
+/// gone or frozen as history), and a verdict the payload itself fails —
+/// forged, or reporting a task that has not ended — never changes on replay:
+/// the courier re-delivers the *stored* envelope rather than re-deriving it,
+/// so the same bytes answer the same way for as long as they exist.
 pub(crate) fn team_terminal_notice_refusal_settles(code: &str) -> bool {
     matches!(
         code,
-        "team-not-found" | "team-terminal-notice-forged" | "team-expired" | "team-disbanded"
+        "team-not-found"
+            | "team-terminal-notice-forged"
+            | "team-terminal-notice-not-terminal"
+            | "team-expired"
+            | "team-disbanded"
     )
 }
 

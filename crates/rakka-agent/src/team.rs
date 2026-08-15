@@ -1479,15 +1479,20 @@ fn apply_claim_result(
 /// entry closes eagerly instead of lingering until a member's claim attempt
 /// is refused ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
 ///
-/// The close bumps the entry's claim epoch — it is a board decision — and
-/// that bump is load-bearing: every stale in-flight board reply settles
-/// into the epoch guard as a no-op afterwards, including the release arm
-/// that would otherwise rewrite a `Done` entry `Active`. Deliberately no
-/// active-team gate, the [`apply_claim_result`] posture: the board is data,
-/// and an expired team's entry still deserves closing. A missing or
-/// already-`Done` entry accepts idempotently with no board write — the
-/// `Done` entry is the durable echo past the journal's bounded window, and
-/// a task never posted here has nothing to close.
+/// Two payload fences guard an irreversible decision: the notice must be
+/// initiated by the task it names, *and* it must report that task as ended.
+/// The first proves who sent it, never that the sender is terminal.
+///
+/// The close bumps the entry's claim epoch — it is a board decision — so
+/// every stale in-flight board reply settles into the epoch guard as a
+/// no-op afterwards. That is defense in depth rather than the only defense:
+/// [`settle_claim_action`] refuses to touch a `Done` entry at all, which is
+/// what also covers the lazy close, since it closes at the entry's current
+/// epoch. Deliberately no active-team gate, the [`apply_claim_result`]
+/// posture: the board is data, and an expired team's entry still deserves
+/// closing. A missing or already-`Done` entry accepts idempotently with no
+/// board write — the `Done` entry is the durable echo past the journal's
+/// bounded window, and a task never posted here has nothing to close.
 fn apply_team_terminal(
     state: &mut AgentTeamState,
     envelope: &AgentExchangeEnvelope,
@@ -1527,6 +1532,25 @@ fn apply_team_terminal(
                 "a terminal notice must be initiated by the task it reports".to_string(),
             )
         }
+    }
+    // ...and it must actually report an ended task. The fence above proves
+    // *who* sent the notice, never that the sender is terminal, and the two
+    // are not the same claim: a task's own entity is the only legitimate
+    // sender either way. The close is irreversible — the entry goes `Done`,
+    // any standing claim is dropped, and nothing can reopen it — so a notice
+    // populated non-terminally (a rolling-upgrade peer, a re-derivation on a
+    // new terminal path that forgets the status, an envelope minted before a
+    // state rewind) would evict a working member from live work for good.
+    // The payload already carries the fact, so the check is structural.
+    if !notice.status.is_terminal() {
+        return refuse_terminal(
+            "team-terminal-notice-not-terminal",
+            format!(
+                "a terminal notice must report an ended task, but {} is {}",
+                notice.task.task(),
+                notice.status
+            ),
+        );
     }
     if state.team.is_none() {
         return refuse_terminal(
@@ -3833,10 +3857,11 @@ impl From<AgentTeamError> for AgentChoreographyError {
 }
 
 #[cfg(test)]
-mod claim_settle_guard_tests {
+mod board_guard_tests {
     use super::*;
     use crate::coordination::{team_claim_id_for, AgentTeamClaimAction, AgentTeamClaimCommand};
     use crate::identity::{AgentOperationKind, AgentTeamId, AgentTeamScope, TenantId};
+    use crate::task::AgentTaskStatus;
 
     const TEAM: &str = "support";
     const LEADER: &str = "lead";
@@ -3929,6 +3954,78 @@ mod claim_settle_guard_tests {
             .board
             .get(&task())
             .expect("the entry exists")
+    }
+
+    /// The terminal-notice envelope a task drives onto its governing board,
+    /// carrying whatever status the caller wants to test the fence with.
+    fn terminal_notice_envelope(status: AgentTaskStatus) -> AgentExchangeEnvelope {
+        let task_scope =
+            AgentTaskScope::new(scope().tenant().clone(), task()).expect("the task scope is valid");
+        let notice = crate::coordination::AgentTeamTerminalNotice {
+            task: task_scope.clone(),
+            status,
+            terminal_reason: "completed".to_string(),
+        };
+        AgentExchangeEnvelope::new(
+            op("terminal-notice"),
+            AgentExchangeKind::TeamTerminalNotice,
+            // The sender fence is satisfied: the task's own entity sends it.
+            AgentEntityAddress::Task(task_scope),
+            AgentEntityAddress::Team(scope()),
+            AgentExchangePayload::encode(
+                crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+                &notice,
+            )
+            .expect("the payload encodes"),
+            AgentCorrelationId::new("terminal-notice"),
+            ts(5),
+        )
+        .expect("the envelope builds")
+    }
+
+    #[test]
+    fn a_terminal_notice_that_reports_a_live_task_closes_nothing() {
+        // The sender fence proves *who* sent the notice, never that the
+        // sender is terminal — the task's own entity is the legitimate
+        // sender either way, so a notice populated non-terminally clears
+        // the fence trivially. The close is irreversible, so it must not:
+        // the working member's standing claim would be dropped and the
+        // entry could never be reopened.
+        let mut state = releasing_board();
+        let live = state.clone();
+
+        let refusal = apply_team_terminal(
+            &mut state,
+            &terminal_notice_envelope(AgentTaskStatus::InProgress),
+            ts(6),
+        );
+        assert_eq!(
+            refusal.status().rejection_code(),
+            Some("team-terminal-notice-not-terminal"),
+            "the payload fails on its own face"
+        );
+        assert_eq!(state, live, "and the board is untouched");
+        assert!(
+            crate::coordination::team_terminal_notice_refusal_settles(
+                "team-terminal-notice-not-terminal"
+            ),
+            "definitive at both ends: the courier re-delivers the stored \
+             envelope rather than re-deriving it, so the same bytes answer \
+             the same way forever"
+        );
+
+        // The same board closes for a notice that reports what it must.
+        let closed = apply_team_terminal(
+            &mut state,
+            &terminal_notice_envelope(AgentTaskStatus::Completed),
+            ts(7),
+        );
+        assert!(closed.is_accepted(), "the well-formed notice lands");
+        assert_eq!(entry(&state).status, AgentTeamBoardEntryStatus::Done);
+        assert!(
+            entry(&state).claim.is_none(),
+            "the standing claim is cleared"
+        );
     }
 
     /// The reply envelope for a claim action the board decided at `epoch`.

@@ -3975,6 +3975,17 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   included — the echo is observational and a refresh is not absorbing the
   way terminality is, so it needs its own idempotence design. It is
   re-parked explicitly below, no longer implicitly owed.
+- **The eager close stands behind two payload fences.** The notice must be
+  initiated by the task it names *and* report that task as ended. Code
+  review found the second missing: `AgentTeamTerminalNotice.status` was
+  decoded and never read, so the irreversible close rested on a fence that
+  proves *who* sent the notice — and a task's own entity is the legitimate
+  sender whatever the payload says. A non-terminally populated notice
+  therefore cleared it trivially and evicted a working member from live
+  work permanently. `team-terminal-notice-not-terminal` joins the shared
+  classifier as definitive: the courier re-delivers the stored envelope
+  rather than re-deriving it, so a payload failing on its own face answers
+  the same way for as long as it exists.
 - **`Done` is absorbing under `settle_claim_action`, by its own guard.**
   The eager close bumps the entry's claim epoch, which design review found
   load-bearing because the `(Release, "team-claim-already-owned")` settle

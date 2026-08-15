@@ -11004,9 +11004,10 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             }
             AgentExchangeKind::TeamTerminalNotice if !result.is_accepted() => {
                 // A refused terminal notice settles only under the team's
-                // definitive answers — no team, a closed team, or a forged
-                // verdict — through the one classifier both ends of the
-                // exchange share. Every other refusal, including an
+                // definitive answers — no team, a closed team, or a payload
+                // the board rejects on its face (forged, or reporting a task
+                // that has not ended) — through the one classifier both ends
+                // of the exchange share. Every other refusal, including an
                 // `unsupported-exchange` from an owner that predates the
                 // kind, leaves the exchange outstanding for re-drive (the
                 // rolling-upgrade rule).
