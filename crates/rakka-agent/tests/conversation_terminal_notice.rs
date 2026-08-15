@@ -277,6 +277,75 @@ async fn a_moderator_ended_conversation_reports_its_own_reason() {
 }
 
 #[tokio::test]
+async fn the_command_path_alone_couriers_the_early_end_it_just_committed() {
+    // The sharded entity's `Command` arm calls `apply` and nothing else: it
+    // never sends itself a `Settle`, a terminal conversation accepts no
+    // further command, and it runs no timer of its own. So the flipping
+    // command's own call is the last drive the notice will ever get — an
+    // application that ends a conversation through
+    // `init_agent_conversation_entity_sharding` and never sweeps must still
+    // leave its governing task able to see it. No settle pass below.
+    let fx = world(AgentConversationCompletionRule::ModeratorDecides, None).await;
+    fx.apply_conversation_command_at(&conversation_scope(), end_command(CONVERSATION, 0))
+        .await
+        .expect("the early end applies");
+
+    let conversation = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(conversation.status, AgentConversationStatus::Ended);
+    assert!(
+        conversation.terminal_notice_settled,
+        "the flipping command couriered its own notice"
+    );
+
+    let task = fx.task_snapshot().await;
+    assert_eq!(task.conversations, 1);
+    let cell = task.conversation.expect("the provenance cell stands");
+    assert_eq!(cell.conversation.as_str(), CONVERSATION);
+    assert_eq!(
+        cell.terminal_reason,
+        AgentConversationTerminalReason::ModeratorEnded
+    );
+}
+
+#[tokio::test]
+async fn the_command_path_alone_couriers_the_completion_flip() {
+    // The same courier hop on the other command-driven terminal flip: the
+    // turn that completes the last round. Again, no settle pass.
+    let fx = world(AgentConversationCompletionRule::AllRounds, None).await;
+    fx.apply_conversation_command_at(
+        &conversation_scope(),
+        submit(CONVERSATION, 0, 0, "p1", "opening"),
+    )
+    .await
+    .expect("the opening turn records");
+    fx.apply_conversation_command_at(
+        &conversation_scope(),
+        submit(CONVERSATION, 0, 1, "p2", "closing"),
+    )
+    .await
+    .expect("the completing turn records");
+
+    assert!(
+        fx.conversation_snapshot_at(&conversation_scope())
+            .await
+            .expect("the conversation snapshots")
+            .terminal_notice_settled
+    );
+    let cell = fx
+        .task_snapshot()
+        .await
+        .conversation
+        .expect("the provenance cell stands");
+    assert_eq!(
+        cell.terminal_reason,
+        AgentConversationTerminalReason::RoundsComplete
+    );
+}
+
+#[tokio::test]
 async fn an_expired_conversation_reports_through_the_lazy_flip() {
     // The expiry flip commits in the settle pass's own compare-and-set; the
     // notice rides that same commit and delivers in the same pass.

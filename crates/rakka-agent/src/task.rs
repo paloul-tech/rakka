@@ -10508,6 +10508,11 @@ fn apply_conversation_terminal(
     // the assignment, result, and terminal reason. Once the task is
     // terminal that growth already happened, so the record only needs to
     // fit the bound itself.
+    //
+    // That asymmetry is what makes a bounds refusal here *transient*, and
+    // `conversation_terminal_notice_refusal_settles` depends on it: the
+    // refusal is neither settled at the conversation nor memoized here, so
+    // the notice waits out the window this task is about to close.
     let reserve = if task.status.is_terminal() {
         0
     } else {
@@ -11022,10 +11027,12 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             AgentExchangeKind::ConversationTerminalNotice if !result.is_accepted() => {
                 // The receiver half of the shared classifier: the task is
                 // this exchange's receiver, and the host memoizes only the
-                // refusals classified definitive here — so `task-not-created`
-                // is never memoized and a notice racing the task's creation
-                // re-runs the arm on the next drive instead of replaying the
-                // miss for the whole applied window.
+                // refusals classified definitive here. Both of this arm's
+                // *not yet* answers therefore re-run on the next drive
+                // instead of replaying the miss for the whole applied
+                // window — a notice racing the task's creation, and one
+                // refused on the bound, which this task's own terminal flip
+                // relaxes by dropping the growth reserve to zero.
                 match result.status().rejection_code() {
                     Some(code)
                         if crate::coordination::conversation_terminal_notice_refusal_settles(
@@ -14673,16 +14680,94 @@ mod team_claim_bounds_tests {
 
     #[test]
     fn a_conversation_notice_refused_for_bounds_persists_no_partial_mutation() {
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        // Inflate the record to one byte under its cap, so the recorded cell
+        // itself must push it over.
+        inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - 1);
+        let envelope = conversation_notice(&tenant, &task_id, &scope, "design-review");
+
+        let before = state.clone();
+        let result =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            result.result().status().rejection_code(),
+            Some("task-state-too-large"),
+            "the oversized record refuses the notice"
+        );
+        assert_eq!(
+            state, before,
+            "a bounds refusal persists no partial mutation: the conversation \
+             treats this refusal as proof nothing was recorded"
+        );
+    }
+
+    #[test]
+    fn a_conversation_notice_refused_on_the_reserve_converges_once_the_task_terminalizes() {
+        // The receiver's own bound is what moves: a pre-terminal task is
+        // charged the growth headroom its remaining lifecycle needs, and a
+        // terminal one is charged nothing, so a record inside the reserve
+        // window refuses the cell now and admits the byte-identical cell
+        // once the task ends. That is why the shared classifier leaves
+        // `task-state-too-large` outstanding — settling on it would quiesce
+        // both ends over a refusal the receiver is about to stop making, and
+        // the provenance would be lost for good.
+        const SLACK: usize = 3 * 1024;
+        const {
+            assert!(
+                SLACK < AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
+                "the record must sit inside the reserve window and still under the cap"
+            );
+        }
+
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - SLACK);
+        let envelope = conversation_notice(&tenant, &task_id, &scope, "design-review");
+
+        let pre_terminal = state.clone();
+        let refused =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            refused.result().status().rejection_code(),
+            Some("task-state-too-large"),
+            "a live task is charged the growth reserve its own lifecycle needs"
+        );
+        assert_eq!(state, pre_terminal, "the refusal recorded nothing");
+        assert!(
+            !crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-state-too-large"
+            ),
+            "so the notice stays outstanding at the conversation, and the \
+             receiver never memoizes it, instead of both ends quiescing"
+        );
+
+        // The task terminalizes. The growth the reserve was held for has
+        // happened, the reserve drops to zero, and the same cell fits.
+        state.task.as_mut().expect("the task exists").status = AgentTaskStatus::Completed;
+        let accepted =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(3));
+        assert!(
+            accepted.result().is_accepted(),
+            "the terminal task admits the very cell it just refused"
+        );
+        let task = state.task.as_ref().expect("the task exists");
+        assert_eq!(
+            task.conversation
+                .as_deref()
+                .expect("the provenance cell stands")
+                .conversation
+                .as_str(),
+            "design-review"
+        );
+        assert_eq!(task.conversations, 1);
+    }
+
+    /// One created, board-governed task and the coordinates its conversation
+    /// notices are addressed with.
+    fn board_task_world() -> (TenantId, AgentTaskId, AgentTaskScope, AgentTaskState) {
         let tenant = TenantId::new("acme");
         let task_id = AgentTaskId::new("board-task").expect("the task id is valid");
         let scope =
             AgentTaskScope::new(tenant.clone(), task_id.clone()).expect("the scope is valid");
-        let conversation_scope = crate::identity::AgentConversationScope::new(
-            tenant.clone(),
-            crate::identity::AgentConversationId::new("design-review")
-                .expect("the conversation id is valid"),
-        )
-        .expect("the conversation scope is valid");
 
         let mut state = AgentTaskState::uncreated(scope.clone(), AgentTimestampMillis::new(1));
         let create_op = AgentOperationId::new(
@@ -14708,7 +14793,7 @@ mod team_claim_bounds_tests {
             input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
                 .expect("the input is inline-bounded"),
             assignee: None,
-            team: Some(crate::identity::AgentTeamId::new("support-team").expect("the id is valid")),
+            team: Some(AgentTeamId::new("support-team").expect("the id is valid")),
             goal: None,
             goal_mode: Default::default(),
             goal_spec: None,
@@ -14726,20 +14811,39 @@ mod team_claim_bounds_tests {
             AgentTimestampMillis::new(1),
         )
         .expect("the board task creates");
+        (tenant, task_id, scope, state)
+    }
 
-        // Inflate the record to one byte under its cap, so the recorded cell
-        // itself must push it over.
-        {
-            let task = state.task.as_mut().expect("the task exists");
-            let size = task.materialized_size_bytes();
-            let previous = task.definition.description.len();
-            task.definition.description =
-                "x".repeat(AGENT_TASK_MATERIALIZED_MAX_BYTES - 1 - size + previous);
-        }
+    /// Pads the task's description until its materialized record measures
+    /// exactly `bytes`, so a bound check lands where the test needs it.
+    fn inflate_record_to(state: &mut AgentTaskState, bytes: usize) {
+        let task = state.task.as_mut().expect("the task exists");
+        let size = task.materialized_size_bytes();
+        let previous = task.definition.description.len();
+        task.definition.description = "x".repeat(bytes - size + previous);
+        assert_eq!(
+            task.materialized_size_bytes(),
+            bytes,
+            "the padding lands on the byte the test asked for"
+        );
+    }
 
+    /// The terminal-notice envelope one conversation drives onto the task.
+    fn conversation_notice(
+        tenant: &TenantId,
+        task_id: &AgentTaskId,
+        task: &AgentTaskScope,
+        conversation: &str,
+    ) -> AgentExchangeEnvelope {
+        let conversation_scope = crate::identity::AgentConversationScope::new(
+            tenant.clone(),
+            crate::identity::AgentConversationId::new(conversation)
+                .expect("the conversation id is valid"),
+        )
+        .expect("the conversation scope is valid");
         let notice = crate::coordination::AgentConversationTerminalNotice {
             conversation: conversation_scope.clone(),
-            task: task_id,
+            task: task_id.clone(),
             status: crate::conversation::AgentConversationStatus::Ended,
             terminal_reason: crate::conversation::AgentConversationTerminalReason::RoundsComplete,
             round: 1,
@@ -14747,15 +14851,15 @@ mod team_claim_bounds_tests {
             ended_at: AgentTimestampMillis::new(2),
         };
         let operation = crate::coordination::conversation_terminal_notice_operation_id(
-            &tenant,
+            tenant,
             conversation_scope.conversation(),
         )
         .expect("the operation derives");
-        let envelope = AgentExchangeEnvelope::new(
+        AgentExchangeEnvelope::new(
             operation.clone(),
             AgentExchangeKind::ConversationTerminalNotice,
             AgentEntityAddress::Conversation(conversation_scope),
-            AgentEntityAddress::Task(scope),
+            AgentEntityAddress::Task(task.clone()),
             AgentExchangePayload::encode(
                 crate::coordination::AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE,
                 &notice,
@@ -14764,21 +14868,7 @@ mod team_claim_bounds_tests {
             AgentCorrelationId::new(operation.as_str()),
             AgentTimestampMillis::new(2),
         )
-        .expect("the envelope builds");
-
-        let before = state.clone();
-        let result =
-            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
-        assert_eq!(
-            result.result().status().rejection_code(),
-            Some("task-state-too-large"),
-            "the oversized record refuses the notice"
-        );
-        assert_eq!(
-            state, before,
-            "a bounds refusal persists no partial mutation: the conversation \
-             treats this definitive refusal as proof nothing was recorded"
-        );
+        .expect("the envelope builds")
     }
 }
 

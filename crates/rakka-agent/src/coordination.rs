@@ -586,18 +586,23 @@ pub(crate) fn team_terminal_notice_refusal_settles(code: &str) -> bool {
 /// notice at its initiating conversation.
 ///
 /// The same two-ended classifier discipline as
-/// [`team_terminal_notice_refusal_settles`]. `task-not-created` is
-/// deliberately absent — the dependency-registration posture — so a notice
-/// racing its task's creation stays outstanding and converges on a later
-/// re-drive instead of memoizing the miss. A task record too full to grow is
-/// definitive: the provenance cell will never fit, and the terminated
-/// conversation stays observable through its own entity and the replay
-/// surface.
+/// [`team_terminal_notice_refusal_settles`], and only a forged verdict
+/// qualifies — the one answer that cannot change on a later re-drive.
+///
+/// Two refusals are deliberately absent, both for the same reason: the task
+/// is not saying *never*, it is saying *not yet*. `task-not-created` is the
+/// dependency-registration posture — a notice racing its task's creation
+/// converges on a re-drive instead of memoizing the miss. A record too full
+/// to grow the provenance cell is the sharper case, because the receiver's
+/// own bound is what moves: it charges a pre-terminal task the
+/// [`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`] headroom that
+/// task's remaining lifecycle still needs, and a terminal task nothing at
+/// all, so the very cell that will not fit today fits once the task
+/// terminalizes. Settling on it would quiesce both ends over a refusal the
+/// receiver is about to stop making, and the provenance would be lost for
+/// good.
 pub(crate) fn conversation_terminal_notice_refusal_settles(code: &str) -> bool {
-    matches!(
-        code,
-        "conversation-terminal-notice-forged" | "task-state-too-large"
-    )
+    matches!(code, "conversation-terminal-notice-forged")
 }
 
 /// One coordination capability descriptor: the policy payload behind one

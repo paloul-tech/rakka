@@ -1285,10 +1285,10 @@ struct AgentConversationOperationLogEntry {
 ///
 /// The materialized conversation, the history it owes its sink, the
 /// operations it has resolved, and the exchange journal — all in one
-/// compare-and-set. The journal is empty this slice — the conversation
-/// initiates no exchange — but pre-wired so the terminal-notification
-/// exchange of the replayable-events slice is a code change, not a schema
-/// migration.
+/// compare-and-set. The journal carries the terminal notice the conversation
+/// initiates onto its governing task: the flip and the envelope it owes
+/// commit together, which is what makes the notice survive a crash between
+/// the two.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentConversationState {
     schema_version: StateSchemaVersion,
@@ -1518,8 +1518,9 @@ impl VersionedAgentRecord for AgentConversationState {
 ///
 /// It supplies bounded, pure transitions and nothing else; the choreography
 /// substrate owns durability, deduplication, re-drive, and routing. The
-/// conversation receives and initiates no exchange this slice, so every
-/// delivered kind is refused and the settle hooks are inert.
+/// conversation is an initiator only — it owes its governing task the
+/// terminal notice and settles the answer, while every *delivered* kind is
+/// refused, since nothing in the fabric addresses a conversation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AgentConversationParticipant;
 
@@ -1563,12 +1564,13 @@ impl AgentExchangeParticipant for AgentConversationParticipant {
         match envelope.kind() {
             AgentExchangeKind::ConversationTerminalNotice if !result.is_accepted() => {
                 // A refused terminal notice settles only under the task's
-                // definitive answers — a forged verdict, or a record too
-                // full to ever grow the provenance cell — through the one
-                // classifier both ends of the exchange share.
-                // `task-not-created` stays outstanding, the
-                // dependency-registration posture, so a notice racing its
-                // task's creation converges on a later re-drive.
+                // one definitive answer — a forged verdict — through the
+                // classifier both ends of the exchange share. Every other
+                // refusal stays outstanding for a later re-drive: a notice
+                // racing its task's creation (`task-not-created`, the
+                // dependency-registration posture), and a record too full to
+                // grow the cell right now, which the receiver stops charging
+                // growth headroom for once that task itself terminalizes.
                 match result.status().rejection_code() {
                     Some(code) if conversation_terminal_notice_refusal_settles(code) => Ok(()),
                     code => Err(AgentChoreographyError::UnsettleableRefusal {
@@ -1948,8 +1950,9 @@ where
         Ok(self.state()?.snapshot())
     }
 
-    /// Applies one command, then settles what it made possible locally: the
-    /// history the transition owes.
+    /// Applies one command, then settles what it made possible: the history
+    /// the transition owes, and — best-effort — the courier hop for the
+    /// terminal notice a terminal flip owes its governing task.
     ///
     /// # Errors
     ///
@@ -2023,14 +2026,35 @@ where
             }
             Err(_) => {}
         }
-        // The conversation owes no exchanges this slice; the router rides
-        // along only so callers hold the same surface everywhere.
-        let _ = router;
         // A rejected transition flushed nothing and, after a persistence
         // fence, holds no recovered cache — flushing here would mask the
         // rejection with a recovery error.
         if reply.is_ok() {
             self.flush_history(now).await?;
+            // The courier hop for the terminal notice a terminal flip owes
+            // its governing task in the very compare-and-set that flips it.
+            // A terminal conversation accepts no further command and runs no
+            // timer of its own, so for a command-only caller — the sharded
+            // entity's `Command` arm, which never sends itself a `Settle` —
+            // this is the last drive that notice would ever get, and without
+            // it the task stays permanently blind to a conversation that
+            // ended.
+            //
+            // Best-effort by construction: the owed envelope is durable in
+            // the journal, so convergence never depends on this call
+            // *completing* the delivery — a later settle pass, the
+            // application's sweep, or recovery re-drives it — and a
+            // transport fault must never mask the decision the caller just
+            // committed.
+            //
+            // Only a committed transition drives, and that is load-bearing
+            // rather than incidental: the pass observes the deadline, and
+            // the deadline's durable flip belongs to the settle pass, never
+            // to a command's own refusal. A committed transition cannot
+            // smuggle that flip in, because every mutating one passes
+            // `require_active` at this same `now` — so a conversation that
+            // reached `Ok` here is one `observe_expiry` will not expire.
+            let _ = self.settle_side_effects(router, now).await;
         }
         reply
     }
@@ -2091,9 +2115,9 @@ where
 
     /// Accepts one delivered exchange and makes local progress only.
     ///
-    /// The conversation refuses every exchange kind this slice; accepting
-    /// still records the refusal through the host so a replayed delivery
-    /// answers identically.
+    /// Nothing in the fabric addresses a conversation, so every delivered
+    /// kind is refused; accepting still records the refusal through the host
+    /// so a replayed delivery answers identically.
     pub async fn accept(
         &mut self,
         envelope: &AgentExchangeEnvelope,
@@ -2103,6 +2127,9 @@ where
         self.ensure_recovered(now).await?;
         self.require_history_headroom(now).await?;
         let reply = self.host.accept(envelope, now).await?;
+        // A refusal owes nothing onward, so this path drives no courier; the
+        // router rides along so callers hold one surface across the entity's
+        // three arms.
         let _ = router;
         self.flush_history(now).await?;
         Ok(reply)

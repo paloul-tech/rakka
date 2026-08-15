@@ -4015,17 +4015,29 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   settle-pass consult as crash backstop and pre-slice back-fill. The 5.3
   pre-wiring held: the exchange host, refuse-all participant, and journal
   needed no schema change. Delivery is pumped by whatever drives the
-  conversation's settle pass (the A2A surface after every conversation
-  operation, the application sweep, recovery) — stated in the kind's doc
-  and in the rewritten `rakka-a2a` service comment that previously said
-  "no courier hop this slice".
+  conversation's settle pass — including the conversation store's own
+  `apply`, which couriers best-effort after the command that flipped it,
+  because the sharded entity's `Command` arm sends itself no `Settle`, a
+  terminal conversation accepts no further command, and it runs no timer:
+  the flipping command is the last drive the notice would otherwise get.
+  Beyond it, the A2A surface after every conversation operation, the
+  application sweep, and recovery — stated in the kind's doc and in the
+  rewritten `rakka-a2a` service comment that previously said "no courier
+  hop this slice".
 - **One shared refusal classifier per kind** (`coordination.rs`), used by
   the initiator's settle rule *and* the receiver's memoization gate — the
-  5.4 two-sides-agree-by-construction rule made literal. `task-not-created`
-  stays outstanding and unmemoized (the dependency-registration posture);
-  `team-not-found`/expired/disbanded/forged and `task-state-too-large` are
-  definitive and flip the markers, so a notice to a team that never
-  existed settles rather than re-driving forever.
+  5.4 two-sides-agree-by-construction rule made literal. On the team side
+  `team-not-found`/expired/disbanded/forged are definitive and flip the
+  markers, so a notice to a team that never existed settles rather than
+  re-driving forever. On the conversation side only `forged` is: both
+  `task-not-created` (the dependency-registration posture) and
+  `task-state-too-large` stay outstanding and unmemoized, because neither
+  is the task saying *never*. The bound is the sharper case — the receiver
+  charges a pre-terminal task the `AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`
+  headroom its own lifecycle still needs and a terminal task nothing, so
+  the very cell refused today fits once the task ends; settling on it
+  would quiesce both ends over a refusal the receiver is about to stop
+  making.
 - **Wire**: no new A2A operations — the exchanges are in-fabric. The task
   projection's `io.rakka.collaboration` echo gained the conversation
   cluster (`conversation`, `conversation-status`, `conversation-reason`,
