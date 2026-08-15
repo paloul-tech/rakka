@@ -736,11 +736,100 @@ pub enum AgentExchangeKind {
     /// - **Pre-slice receiver**: answers `unsupported-exchange` and the
     ///   envelope stays outstanding until the binary upgrades.
     DependencyOutcome,
+    /// A terminal task closing its entry on the governing team's board
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md): a
+    /// board must not hold a live-looking entry for a task that already
+    /// ended; before this exchange the entry closed only lazily, through a
+    /// member's refused claim attempt). Initiated by the task once terminal
+    /// — from the same compare-and-set as the terminal commit through the
+    /// child-report consult point, with the settle pass as the re-deriving
+    /// backstop and no escrow gate, because the payload (status, terminal
+    /// reason) is absorbing the moment `terminate` commits. The receiving
+    /// board marks the entry `Done`, clears any standing claim, and bumps
+    /// the entry's claim epoch so every stale in-flight board decision
+    /// settles into the epoch guard as a no-op.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the terminal
+    ///   status committed; the settle pass re-derives the identical owed
+    ///   envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives the same envelope.
+    /// - **Receiver loss after acceptance, before the reply**: the closed
+    ///   entry and the journal record committed in one compare-and-set; the
+    ///   re-driven envelope is answered from the applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the `Done` entry
+    ///   under its bumped epoch is the durable echo — the arm accepts
+    ///   idempotently with no board write. An entry evicted or re-posted
+    ///   after eviction is likewise answered without a write; a re-posted
+    ///   entry closes lazily through a claim refusal exactly as before this
+    ///   exchange existed.
+    /// - **Missing team or forged sender**: a settled refusal the task's
+    ///   settle rule accepts as definitive; the task's notice marker still
+    ///   flips, so the derivation quiesces.
+    /// - **Pre-slice receiver**: an older binary fails to decode the kind
+    ///   itself, which is a delivery failure — the envelope stays
+    ///   outstanding, never a settled refusal — and a same-binary receiver
+    ///   without the arm answers `unsupported-exchange`, which the settle
+    ///   rule keeps outstanding until the binary upgrades.
+    TeamTerminalNotice,
+    /// A terminated conversation reporting itself to its governing task
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md): the
+    /// conversation names the task whose assignee moderates it; this notice
+    /// is what makes the terminated conversation observable from that task).
+    /// Initiated by the conversation in the same compare-and-set as each
+    /// terminal flip — rounds-complete, moderator early end, and the lazy
+    /// expiry sweep — with the settle pass as the re-deriving backstop. The
+    /// receiving task records the bounded conversation provenance cell; the
+    /// payload is identity and coordinates only, never transcript content.
+    ///
+    /// The conversation has no autonomous timer: its courier runs only in
+    /// its own settle pass, driven by the A2A surface after every
+    /// conversation operation, by the application's settle sweep, or by
+    /// recovery followed by either. A crash between the terminal
+    /// compare-and-set and delivery therefore defers the notice to the next
+    /// drive; it never loses it.
+    ///
+    /// Failure windows ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)),
+    /// each converging under replay:
+    ///
+    /// - **Initiator loss before the owing compare-and-set**: the terminal
+    ///   flip never committed; the flipping transition replays and owes the
+    ///   identical envelope under the same derived operation id.
+    /// - **Initiator loss after initiation, before delivery**: the journal
+    ///   holds the initiation; the courier re-drives on the next settle
+    ///   pass.
+    /// - **Receiver loss after acceptance, before the reply**: the recorded
+    ///   provenance cell and the journal record committed in one
+    ///   compare-and-set; the re-driven envelope is answered from the
+    ///   applied log.
+    /// - **Reply loss / duplicate delivery inside the window**: re-drive,
+    ///   deduplicate, original receipt.
+    /// - **Duplicate delivery past the bounded window**: the recorded cell
+    ///   is the durable echo — a matching conversation accepts idempotently
+    ///   with no state change.
+    /// - **Task not yet created**: a retryable refusal that stays
+    ///   outstanding — the dependency-registration posture — so a racing
+    ///   creation converges on a later re-drive.
+    /// - **Forged sender or a task record too full to grow**: a settled
+    ///   refusal the conversation's settle rule accepts as definitive; the
+    ///   conversation's notice marker still flips, so the derivation
+    ///   quiesces.
+    /// - **Pre-slice receiver**: an older binary fails to decode the kind
+    ///   itself, which is a delivery failure — the envelope stays
+    ///   outstanding, never a settled refusal — and a same-binary receiver
+    ///   without the arm answers `unsupported-exchange`, which the settle
+    ///   rule keeps outstanding until the binary upgrades.
+    ConversationTerminalNotice,
 }
 
 impl AgentExchangeKind {
     /// Every exchange this phase implements.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Creation,
         Self::Assignment,
         Self::ResultProposal,
@@ -757,6 +846,8 @@ impl AgentExchangeKind {
         Self::TeamClaimResult,
         Self::DependencyRegistration,
         Self::DependencyOutcome,
+        Self::TeamTerminalNotice,
+        Self::ConversationTerminalNotice,
     ];
 
     /// Stable kebab-case label for errors, logs, and bounded metric labels.
@@ -779,6 +870,8 @@ impl AgentExchangeKind {
             Self::TeamClaimResult => "team-claim-result",
             Self::DependencyRegistration => "dependency-registration",
             Self::DependencyOutcome => "dependency-outcome",
+            Self::TeamTerminalNotice => "team-terminal-notice",
+            Self::ConversationTerminalNotice => "conversation-terminal-notice",
         }
     }
 }

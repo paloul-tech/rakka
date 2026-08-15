@@ -56,7 +56,7 @@ use crate::identity::{
     AgentTeamClaimId, AgentTeamScope, TenantId,
 };
 use crate::model::AgentToolCallId;
-use crate::task::{AgentAssignmentGeneration, AgentContentDigest};
+use crate::task::{AgentAssignmentGeneration, AgentContentDigest, AgentTaskStatus};
 
 /// Result type for coordination construction and validation.
 pub type AgentCoordinationResult<T> = Result<T, AgentCoordinationError>;
@@ -473,6 +473,131 @@ pub struct AgentTeamClaimResultNotice {
     pub epoch: u64,
     /// How it resolved.
     pub outcome: AgentTeamClaimOutcome,
+}
+
+/// Derives the stable operation id of the one terminal notice a task ever
+/// owes its governing team's board.
+///
+/// Pure over `(tenant, team, task)`: terminality is absorbing — a task
+/// terminalizes at most once, under one immutable governing team — so one
+/// logical notice exists per task, ever, and every re-derivation after any
+/// loss owes the identical operation
+/// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+pub fn team_terminal_notice_operation_id(
+    tenant: &TenantId,
+    team: &crate::identity::AgentTeamId,
+    task: &AgentTaskId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::TeamOperation,
+        [
+            tenant.as_str(),
+            team.as_str(),
+            task.as_str(),
+            "terminal-notice",
+        ],
+    )
+}
+
+/// Derives the stable operation id of the one terminal notice a conversation
+/// ever owes its governing task.
+///
+/// Pure over `(tenant, conversation)`: the terminal flip is absorbing —
+/// rounds-complete, moderator-ended, or expired, first writer wins — so one
+/// logical notice exists per conversation, ever, and every re-derivation
+/// after any loss owes the identical operation.
+pub fn conversation_terminal_notice_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [tenant.as_str(), conversation.as_str(), "terminal-notice"],
+    )
+}
+
+/// Payload type of the terminal-notice exchange a task drives onto its
+/// governing team's board.
+pub const AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE: &str = "rakka.agent.TeamTerminalNotice";
+
+/// Payload type of the terminal-notice exchange a conversation drives onto
+/// its governing task.
+pub const AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE: &str =
+    "rakka.agent.ConversationTerminalNotice";
+
+/// The notice payload of one
+/// [`crate::choreography::AgentExchangeKind::TeamTerminalNotice`] exchange
+/// (task → governing team).
+///
+/// Identities and stable codes only — the board closes the entry and echoes
+/// the reason; it never mirrors result content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTeamTerminalNotice {
+    /// The terminal task closing its board entry.
+    pub task: AgentTaskScope,
+    /// The task's terminal status.
+    pub status: AgentTaskStatus,
+    /// The terminal reason's stable code
+    /// ([`crate::task::AgentTaskTerminalReason::code`]).
+    pub terminal_reason: String,
+}
+
+/// The notice payload of one
+/// [`crate::choreography::AgentExchangeKind::ConversationTerminalNotice`]
+/// exchange (conversation → governing task).
+///
+/// Identity and coordinates only — never transcript bodies; the transcript
+/// stays behind the conversation's own authorized surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConversationTerminalNotice {
+    /// The terminated conversation reporting itself.
+    pub conversation: crate::identity::AgentConversationScope,
+    /// The governing task the conversation was created against.
+    pub task: AgentTaskId,
+    /// The conversation's terminal status.
+    pub status: crate::conversation::AgentConversationStatus,
+    /// Why it terminated.
+    pub terminal_reason: crate::conversation::AgentConversationTerminalReason,
+    /// The round the conversation ended in.
+    pub round: u64,
+    /// How many turns were recorded over the conversation's life.
+    pub turns_recorded: u64,
+    /// When the terminal flip committed.
+    pub ended_at: AgentTimestampMillis,
+}
+
+/// Whether one refusal code definitively settles a team terminal notice at
+/// its initiating task.
+///
+/// One classifier for both ends of the exchange — the task's settle rule and
+/// the team's memoization gate — so the two sides agree by construction:
+/// a code in this list settles the notice *and* memoizes at the receiver; a
+/// code outside it stays outstanding *and* re-runs the receiving arm on the
+/// next drive. A missing or closed team cannot be waited out (the board is
+/// gone or frozen as history), and a forged verdict never changes on replay.
+pub(crate) fn team_terminal_notice_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "team-not-found" | "team-terminal-notice-forged" | "team-expired" | "team-disbanded"
+    )
+}
+
+/// Whether one refusal code definitively settles a conversation terminal
+/// notice at its initiating conversation.
+///
+/// The same two-ended classifier discipline as
+/// [`team_terminal_notice_refusal_settles`]. `task-not-created` is
+/// deliberately absent — the dependency-registration posture — so a notice
+/// racing its task's creation stays outstanding and converges on a later
+/// re-drive instead of memoizing the miss. A task record too full to grow is
+/// definitive: the provenance cell will never fit, and the terminated
+/// conversation stays observable through its own entity and the replay
+/// surface.
+pub(crate) fn conversation_terminal_notice_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "conversation-terminal-notice-forged" | "task-state-too-large"
+    )
 }
 
 /// One coordination capability descriptor: the policy payload behind one

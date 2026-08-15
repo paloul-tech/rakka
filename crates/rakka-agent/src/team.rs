@@ -125,6 +125,9 @@ pub const AGENT_TEAM_HISTORY_MAX_PAGE_SIZE: usize = 64;
 /// Payload type of the bounded receipt a team returns for a claim result.
 pub const AGENT_TEAM_CLAIM_RESULT_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.TeamClaimResultReceipt";
 
+/// Payload type of the bounded receipt a team returns for a terminal notice.
+pub const AGENT_TEAM_TERMINAL_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.TeamTerminalReceipt";
+
 const DEFAULT_AGENT_TEAM_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
 fn bounded_detail(detail: impl Into<String>) -> String {
@@ -443,6 +446,10 @@ pub enum AgentTeamHistoryKind {
     /// A claim resolved — activated, refused, released, superseded, or
     /// closed by a terminal echo.
     ClaimSettled,
+    /// A board entry closed eagerly by its task's terminal notice
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md));
+    /// the detail carries the task's terminal-reason code.
+    TaskClosed,
     /// A pending claim transferred to another member.
     TransferRecorded,
     /// A mediated message was appended to the ring.
@@ -465,6 +472,7 @@ impl AgentTeamHistoryKind {
             Self::ClaimRecorded => "team-claim-recorded",
             Self::ClaimReleaseRequested => "team-claim-release-requested",
             Self::ClaimSettled => "team-claim-settled",
+            Self::TaskClosed => "team-task-closed",
             Self::TransferRecorded => "team-transfer-recorded",
             Self::MessageAppended => "team-message-appended",
             Self::Disbanded => "team-disbanded",
@@ -1215,6 +1223,7 @@ impl AgentExchangeParticipant for AgentTeamParticipant {
     ) -> AgentExchangeTransition {
         let result = match envelope.kind() {
             AgentExchangeKind::TeamClaimResult => apply_claim_result(state, envelope, now),
+            AgentExchangeKind::TeamTerminalNotice => apply_team_terminal(state, envelope, now),
             kind => refuse(
                 "unsupported-exchange",
                 format!("a team entity does not receive a {kind} exchange"),
@@ -1253,6 +1262,24 @@ impl AgentExchangeParticipant for AgentTeamParticipant {
                     ) => Ok(()),
                     code => Err(AgentChoreographyError::UnsettleableRefusal {
                         kind: AgentExchangeKind::TeamClaim,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            AgentExchangeKind::TeamTerminalNotice if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the host
+                // memoizes only the refusals classified definitive here, so
+                // an undecodable payload stays unmemoized and re-runs the
+                // arm once the binary can decode it (the rolling-upgrade
+                // rule).
+                match result.status().rejection_code() {
+                    Some(code)
+                        if crate::coordination::team_terminal_notice_refusal_settles(code) =>
+                    {
+                        Ok(())
+                    }
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::TeamTerminalNotice,
                         code: code.unwrap_or_default().to_string(),
                     }),
                 }
@@ -1446,6 +1473,100 @@ fn apply_claim_result(
     }
     // A refused superseded claim is absorbed without touching the entry.
     accepted()
+}
+
+/// Applies one delivered terminal notice: the task ended, and its board
+/// entry closes eagerly instead of lingering until a member's claim attempt
+/// is refused ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The close bumps the entry's claim epoch — it is a board decision — and
+/// that bump is load-bearing: every stale in-flight board reply settles
+/// into the epoch guard as a no-op afterwards, including the release arm
+/// that would otherwise rewrite a `Done` entry `Active`. Deliberately no
+/// active-team gate, the [`apply_claim_result`] posture: the board is data,
+/// and an expired team's entry still deserves closing. A missing or
+/// already-`Done` entry accepts idempotently with no board write — the
+/// `Done` entry is the durable echo past the journal's bounded window, and
+/// a task never posted here has nothing to close.
+fn apply_team_terminal(
+    state: &mut AgentTeamState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let refuse_terminal = |code: &str, message: String| {
+        AgentExchangeResult::rejected(
+            code,
+            message,
+            AgentExchangePayload::empty(AGENT_TEAM_TERMINAL_RECEIPT_PAYLOAD_TYPE),
+        )
+    };
+    let accepted_terminal = || {
+        AgentExchangeResult::accepted(AgentExchangePayload::empty(
+            AGENT_TEAM_TERMINAL_RECEIPT_PAYLOAD_TYPE,
+        ))
+    };
+    let notice: crate::coordination::AgentTeamTerminalNotice = match envelope
+        .payload()
+        .decode(crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE)
+    {
+        // Non-settling by the shared classifier, so a newer binary's payload
+        // converges after a rolling upgrade instead of being refused for
+        // good.
+        Ok(notice) => notice,
+        Err(error) => {
+            return refuse_terminal("team-terminal-notice-undecodable", error.to_string())
+        }
+    };
+    // The initiator must be the task the notice names: a notice about task T
+    // sent by anything but T's entity is forged, however well formed.
+    match envelope.initiator() {
+        AgentEntityAddress::Task(scope) if scope == &notice.task => {}
+        _ => {
+            return refuse_terminal(
+                "team-terminal-notice-forged",
+                "a terminal notice must be initiated by the task it reports".to_string(),
+            )
+        }
+    }
+    if state.team.is_none() {
+        return refuse_terminal(
+            "team-not-found",
+            "no team exists under this scope".to_string(),
+        );
+    }
+    let operation_id = envelope.operation_id().clone();
+    let task_id = notice.task.task().clone();
+    let team = state.team.as_mut().expect("checked above");
+    let Some(entry) = team.board.get_mut(&task_id) else {
+        // Never posted here, or already evicted under ceiling pressure:
+        // nothing to close, and the answer must be idempotent — a replay
+        // after eviction converges on the same acceptance.
+        return accepted_terminal();
+    };
+    if entry.status == AgentTeamBoardEntryStatus::Done {
+        // The durable echo past the journal window — closed by an earlier
+        // delivery of this notice or by a lazy claim refusal.
+        return accepted_terminal();
+    }
+    let detail = bounded_detail(notice.terminal_reason);
+    let member = entry.claim.as_ref().map(|claim| claim.member.clone());
+    entry.status = AgentTeamBoardEntryStatus::Done;
+    entry.claim_epoch = entry.claim_epoch.saturating_add(1);
+    entry.claim = None;
+    entry.last_code = Some(detail.clone());
+    state.record_history(|sequence| {
+        let mut history = AgentTeamHistoryEntry::new(
+            sequence,
+            AgentTeamHistoryKind::TaskClosed,
+            operation_id,
+            now,
+        )
+        .with_task(task_id)
+        .with_detail(detail);
+        history.member = member;
+        history
+    });
+    accepted_terminal()
 }
 
 /// Settles the reply of one claim action the team initiated.
@@ -2189,6 +2310,15 @@ where
             if let Some(outcome) = outcome {
                 self.count_operation("claim", outcome);
             }
+        }
+        if envelope.kind() == AgentExchangeKind::TeamTerminalNotice
+            && !reply.is_replayed()
+            && reply.result().is_accepted()
+        {
+            // Counted once per fresh application, replays never; an
+            // idempotent no-entry acceptance counts too — the operation is
+            // the notice's application, not the entry mutation.
+            self.count_operation("close", "applied");
         }
         let _ = router;
         self.flush_history(now).await?;

@@ -117,6 +117,19 @@ async fn an_unclaimed_board_task_expires_at_its_horizon() {
         "the terminal reason names the unclaimed expiry, got {:?}",
         task.terminal_reason
     );
+
+    // The expiry is a terminal like any other, so the eager notice went out
+    // to the governing team — which never existed here. `team-not-found` is
+    // a definitive refusal: the notice settles instead of re-driving
+    // forever against a board that will never answer.
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let task = fx.task_snapshot().await;
+    assert!(
+        task.team_terminal_notice_settled,
+        "a missing team settles the notice definitively"
+    );
 }
 
 #[tokio::test]

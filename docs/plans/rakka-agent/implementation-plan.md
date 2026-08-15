@@ -3517,8 +3517,9 @@ in-slice decisions resolved as follows (scope decisions user-approved):
   passivation), the team-operations metric assertion, and rakka-a2a's
   `tests/team_surface.rs` (4, scenario 42's wire half + fail-closed
   matrix + per-operation authorization). Owed onward: 5.5's replayable
-  team events (landed 2026-08-13), task→team terminal/handoff notifications
-  (5.5b), board rewake
+  team events (landed 2026-08-13), the task→team terminal notification
+  (landed 2026-08-14 in 5.5b; the handoff-refresh of the board owner echo
+  was user-scoped out of 5.5b and stays owed), board rewake
   parking, goal/collaboration-view team dimensions, the team otel rows,
   the Postgres team-history backend, the model-visible team tool door
   (+ its reserved `AgentDecisionKind` label), and A2A-carried
@@ -3640,9 +3641,9 @@ in-slice decisions resolved as follows (scope decisions user-approved):
   rakka-a2a's `tests/conversation_surface.rs` (4, scenario 43's wire
   half + fail-closed matrix + per-operation authorization). Owed
   onward: 5.5's replayable turn events (landed 2026-08-13), the
-  conversation-terminal →
-  task notification, task-side conversation provenance + projection
-  echo, goal/collaboration-view conversation dimensions, the moderation
+  conversation-terminal → task notification with the task-side
+  conversation provenance and projection echo (landed 2026-08-14 in
+  5.5b), goal/collaboration-view conversation dimensions, the moderation
   otel rows, the Postgres conversation-history backend, and the
   model-visible moderation tool door (+ its reserved
   `AgentDecisionKind` label and `mode` metric label).
@@ -3963,6 +3964,100 @@ only. Neither is implicitly owed any longer.
 
 Done when: a terminal task closes its board entry without a claim attempt, and
 a terminated conversation is observable from its governing task.
+
+**Amended as implemented (2026-08-14).** Landed as specified — two new
+exchange kinds (`TeamTerminalNotice`, `ConversationTerminalNotice`;
+`AgentExchangeKind::ALL` is 18) riding the established idioms whole — with
+the in-slice decisions resolved as follows (scope decisions user-approved):
+
+- **Terminal-only** (user-approved): the handoff-refresh of the board's
+  owner echo that slice 5.2's owed list bundled into this entry is *not*
+  included — the echo is observational and a refresh is not absorbing the
+  way terminality is, so it needs its own idempotence design. It is
+  re-parked explicitly below, no longer implicitly owed.
+- **The eager close bumps the entry's claim epoch** — load-bearing, found
+  in design review: the `(Release, "team-claim-already-owned")` settle arm
+  restores an entry `Active` with no `claim_is_current` guard, and only the
+  epoch guard absorbs it once the close moved the entry on; without the
+  bump that interleaving resurrected a `Done` entry. Pinned by a test
+  verified to fail with the bump removed. A missing or already-`Done`
+  entry accepts idempotently with no board write; no `require_active` gate
+  (the board is data — an expired team's entry still closes); a re-posted
+  entry after eviction closes lazily exactly as before.
+- **The task→team notice rides `owed_child_reports`** (the one terminal
+  consult point, counted into the exchange budget) plus a settle-pass twin
+  covering the terminals that never consult it — goal exhaustion,
+  stagnation, human-path rejection exhaustion — and deliberately
+  back-filling pre-slice terminal tasks, whose unset marker closes their
+  stale board entries once. Operation id pure over `(tenant, team, task)`;
+  the payload carries status + terminal-reason code, echoed on
+  `last_code`.
+- **An already-terminal task still records the conversation provenance
+  cell** (user-approved): the cell is observational provenance, not new
+  work, and the common race is the conversation completing beside the
+  task's own result acceptance — a deliberate, documented deviation from
+  `apply_dependency_outcome`'s no-mutation-at-terminal posture. The
+  recording keeps validate-then-mutate literal (both fields restored on a
+  bounds refusal, the `record_team_claim` pin duplicated for it) and a
+  pre-terminal record passes the growth reserve so the cell can never eat
+  the room the task's own lifecycle still needs.
+- **Latest-only cell + history chain** (user-approved):
+  `AgentTask::conversation` (`AgentTaskConversation` — identity, terminal
+  status/reason, round/turn coordinates, `ended_at`; never transcript
+  content) + a `conversations` lifetime counter, the handoff/team-claim
+  precedent; the chain is `conversation-terminal-recorded` history. The
+  latest-only past-window hazard (a duplicate replayed past the applied
+  window after a second conversation overwrote the cell re-records) is
+  documented on the type with the bounded-map alternative named.
+- **The conversation owes the notice in all three terminal CAS's** — the
+  `transition()` wrapper covers rounds-complete and the early end in one
+  owing point, `observe_expiry` owes in its own flip — plus the
+  settle-pass consult as crash backstop and pre-slice back-fill. The 5.3
+  pre-wiring held: the exchange host, refuse-all participant, and journal
+  needed no schema change. Delivery is pumped by whatever drives the
+  conversation's settle pass (the A2A surface after every conversation
+  operation, the application sweep, recovery) — stated in the kind's doc
+  and in the rewritten `rakka-a2a` service comment that previously said
+  "no courier hop this slice".
+- **One shared refusal classifier per kind** (`coordination.rs`), used by
+  the initiator's settle rule *and* the receiver's memoization gate — the
+  5.4 two-sides-agree-by-construction rule made literal. `task-not-created`
+  stays outstanding and unmemoized (the dependency-registration posture);
+  `team-not-found`/expired/disbanded/forged and `task-state-too-large` are
+  definitive and flip the markers, so a notice to a team that never
+  existed settles rather than re-driving forever.
+- **Wire**: no new A2A operations — the exchanges are in-fabric. The task
+  projection's `io.rakka.collaboration` echo gained the conversation
+  cluster (`conversation`, `conversation-status`, `conversation-reason`,
+  `conversation-rounds`, `conversation-turns`) beside the
+  delegation/handoff/team echoes, healed by `sync_agent_status` on read
+  and write paths. Audit: new history kinds `team-task-closed` and
+  `conversation-terminal-recorded`, flowing into the 5.5 replay surface
+  under scope-qualified labels; metric: `rakka.agent.team.operations`
+  {`close`, `applied`} once per fresh application at the accept boundary.
+  Both snapshots expose their settled markers.
+- Proof roster: `tests/team_terminal_notice.rs` (8: the Active entry
+  closing without a claim attempt — the done-when — the unclaimed close,
+  the never-posted idempotent no-op, the epoch regression pin, marker
+  quiescence, the committed-but-unsent window under an injected lost
+  delivery, and self-covering crash sweeps over every team- and task-store
+  write of the terminal flow), `tests/conversation_terminal_notice.rs` (9:
+  all three terminal flips recording the cell, the already-terminal task
+  still recording, the racing-creation notice outstanding then converging,
+  the second conversation overwriting the cell with the chain in history,
+  quiescence, and crash sweeps over both stores), the missing-team
+  definitive settle in `tests/task_unclaimed_expiry.rs`, the
+  bounds-restore pin beside `record_team_claim`'s, the `close` counter in
+  `tests/agent_metrics.rs`, the label pins in `tests/coordination_replay.rs`,
+  both kinds in `tests/choreography.rs`'s failure windows by construction,
+  and `rakka-a2a`'s `tests/conversation_surface.rs` end-to-end echo test
+  over the public surface. Owed onward (explicitly, per this slice's own
+  rule): the handoff-refresh of the board owner echo; board rewake parking
+  (the team-side wake-timer affordance — the eager close runs on the
+  task's clock and does not need it); the goal/collaboration-view team and
+  conversation dimensions; the Postgres team/conversation history
+  backends; the team and moderation otel span rows; the model-visible
+  team/moderation tool doors.
 
 ### Slice 5.6 — M5 acceptance
 

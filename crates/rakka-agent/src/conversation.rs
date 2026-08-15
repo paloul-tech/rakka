@@ -34,10 +34,14 @@
 //! derived owner, so a roster participant may speak but never terminalize.
 //!
 //! The entity embeds the exchange host for uniform routing and recovery,
-//! but initiates no exchange this slice: the conversation-terminal
-//! notification to the governing task is owed to the replayable
-//! coordination events slice. Idle conversations passivate — the protocol
-//! is data, not a resident coordinator.
+//! and initiates exactly one exchange: the terminal notice to the governing
+//! task ([`crate::choreography::AgentExchangeKind::ConversationTerminalNotice`]),
+//! owed in the same compare-and-set as each terminal flip and re-derived by
+//! the settle pass until it settles. The conversation has no autonomous
+//! timer, so delivery rides whatever drives its settle pass — the A2A
+//! surface after every conversation operation, the application's settle
+//! sweep, or recovery followed by either. Idle conversations passivate —
+//! the protocol is data, not a resident coordinator.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -47,7 +51,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rakka_agent_workflow::{AgentTimestampMillis, StateSchemaVersion};
+use rakka_agent_workflow::{AgentCorrelationId, AgentTimestampMillis, StateSchemaVersion};
 use rakka_core::{
     actor_future, Actor, ActorAction, ActorContext, ActorFuture, ActorOptions, MetricsRecorder,
     NoopMetricsRecorder, ReplyTo,
@@ -63,18 +67,20 @@ use serde::{Deserialize, Serialize};
 use crate::budget::{AgentBudgetConsumption, AgentBudgetDimension, AgentBudgetExhaustion};
 use crate::choreography::{
     drive_pending_exchanges, AgentChoreographyError, AgentEntityAddress, AgentExchangeEnvelope,
-    AgentExchangeHost, AgentExchangeJournal, AgentExchangeParticipant, AgentExchangePayload,
-    AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter, AgentExchangeState,
-    AgentExchangeTransition,
+    AgentExchangeHost, AgentExchangeJournal, AgentExchangeKind, AgentExchangeParticipant,
+    AgentExchangePayload, AgentExchangeReply, AgentExchangeResult, AgentExchangeRouter,
+    AgentExchangeState, AgentExchangeTransition,
 };
 use crate::coordination::{
-    conversation_expiry_operation_id, conversation_turn_content_digest, AgentCoordinationError,
-    AgentModerationPolicy,
+    conversation_expiry_operation_id, conversation_terminal_notice_operation_id,
+    conversation_terminal_notice_refusal_settles, conversation_turn_content_digest,
+    AgentConversationTerminalNotice, AgentCoordinationError, AgentModerationPolicy,
+    AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE,
 };
 use crate::definition::{AgentRevisionNumber, AgentRevisionProvenance};
 use crate::identity::{
     AgentConversationId, AgentConversationScope, AgentId, AgentIdentityError, AgentOperationId,
-    AgentTaskId,
+    AgentTaskId, AgentTaskScope,
 };
 use crate::observability::{
     record_agent_domain_counter, record_unsettleable_exchanges, METRIC_AGENT_MODERATION_TURNS,
@@ -197,6 +203,14 @@ fn bounded_detail(detail: impl Into<String>) -> String {
         );
     }
     detail
+}
+
+/// The `skip_serializing_if` predicate of the terminal-notice marker: an
+/// unsettled record serializes byte-identically to one persisted before the
+/// field existed.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Lifecycle of one conversation.
@@ -468,6 +482,14 @@ pub struct AgentConversation {
     /// When the conversation reached its terminal status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<AgentTimestampMillis>,
+    /// Whether the terminal notice to the governing task has settled: the
+    /// durable once-guard past the journal's bounded deduplication window.
+    /// Records persisted before this field load with it unset — so a
+    /// pre-slice conversation that is already terminal owes the notice once
+    /// on its next settle pass, deliberately: that is the back-fill making
+    /// it observable from its task.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terminal_notice_settled: bool,
 }
 
 impl AgentConversation {
@@ -1196,6 +1218,10 @@ pub struct AgentConversationSnapshot {
     pub created_at: AgentTimestampMillis,
     /// When the conversation reached its terminal status.
     pub ended_at: Option<AgentTimestampMillis>,
+    /// Whether the terminal notice to the governing task has settled.
+    /// Snapshots persisted before this field load with it unset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terminal_notice_settled: bool,
     /// How many history entries the conversation has recorded.
     pub history_entries: u64,
     /// History entries recorded but not yet flushed to the history sink.
@@ -1408,6 +1434,7 @@ impl AgentConversationState {
             budgets: conversation.budgets.clone(),
             created_at: conversation.created_at,
             ended_at: conversation.ended_at,
+            terminal_notice_settled: conversation.terminal_notice_settled,
             history_entries: self.next_history_sequence.get().saturating_sub(1),
             owed_history: self.pending_history.len(),
             updated_at: self.updated_at,
@@ -1530,19 +1557,44 @@ impl AgentExchangeParticipant for AgentConversationParticipant {
 
     fn check_settle(
         &self,
-        _envelope: &AgentExchangeEnvelope,
-        _result: &AgentExchangeResult,
+        envelope: &AgentExchangeEnvelope,
+        result: &AgentExchangeResult,
     ) -> Result<(), AgentChoreographyError> {
-        Ok(())
+        match envelope.kind() {
+            AgentExchangeKind::ConversationTerminalNotice if !result.is_accepted() => {
+                // A refused terminal notice settles only under the task's
+                // definitive answers — a forged verdict, or a record too
+                // full to ever grow the provenance cell — through the one
+                // classifier both ends of the exchange share.
+                // `task-not-created` stays outstanding, the
+                // dependency-registration posture, so a notice racing its
+                // task's creation converges on a later re-drive.
+                match result.status().rejection_code() {
+                    Some(code) if conversation_terminal_notice_refusal_settles(code) => Ok(()),
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::ConversationTerminalNotice,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     fn settle(
         &self,
-        _state: &mut Self::State,
-        _envelope: &AgentExchangeEnvelope,
+        state: &mut Self::State,
+        envelope: &AgentExchangeEnvelope,
         _result: &AgentExchangeResult,
-        _now: AgentTimestampMillis,
+        now: AgentTimestampMillis,
     ) -> Vec<AgentExchangeEnvelope> {
+        if envelope.kind() == AgentExchangeKind::ConversationTerminalNotice {
+            // The task answered — the provenance cell recorded, echoed, or
+            // refused under a definitive code. The marker settles either
+            // way: the durable once-guard that quiesces the owed derivation
+            // past the journal's bounded window.
+            settle_terminal_notice_exchange(state, envelope, now);
+        }
         Vec::new()
     }
 }
@@ -1558,6 +1610,82 @@ fn refuse(code: &str, message: String) -> AgentExchangeResult {
         message,
         AgentExchangePayload::empty(AGENT_CONVERSATION_RECEIPT_PAYLOAD_TYPE),
     )
+}
+
+/// The terminal notice the conversation owes its governing task, when it
+/// owes one now ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per conversation — the terminal flip is absorbing —
+/// and re-derived by every settle pass until the exchange settles: the
+/// journal's initiation record is the once-guard inside its bounded window,
+/// and the conversation's `terminal_notice_settled` marker is the durable
+/// once-guard past it. This is what makes a terminated conversation
+/// observable from its governing task.
+fn owed_terminal_notice(
+    state: &AgentConversationState,
+    now: AgentTimestampMillis,
+) -> AgentConversationResult<Option<AgentExchangeEnvelope>> {
+    let Some(conversation) = state.conversation.as_ref() else {
+        return Ok(None);
+    };
+    if !conversation.status.is_terminal() || conversation.terminal_notice_settled {
+        return Ok(None);
+    }
+    let operation_id = conversation_terminal_notice_operation_id(
+        state.scope.tenant(),
+        state.scope.conversation(),
+    )?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let Some(terminal_reason) = conversation.terminal_reason else {
+        // A terminal status always recorded its reason; absent one there is
+        // nothing coherent to report.
+        return Ok(None);
+    };
+    let notice = AgentConversationTerminalNotice {
+        conversation: state.scope.clone(),
+        task: conversation.task.clone(),
+        status: conversation.status,
+        terminal_reason,
+        round: conversation.round,
+        turns_recorded: conversation.turns().len() as u64,
+        ended_at: conversation.ended_at.unwrap_or(now),
+    };
+    let payload =
+        AgentExchangePayload::encode(AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE, &notice)?;
+    let target = AgentTaskScope::new(state.scope.tenant().clone(), notice.task.clone())?;
+    Ok(Some(AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        AgentExchangeKind::ConversationTerminalNotice,
+        AgentEntityAddress::Conversation(state.scope.clone()),
+        AgentEntityAddress::Task(target),
+        payload,
+        AgentCorrelationId::new(operation_id.as_str()),
+        now,
+    )?))
+}
+
+/// Marks the terminal notice settled on the conversation: the durable
+/// once-guard past the journal's bounded deduplication window.
+fn settle_terminal_notice_exchange(
+    state: &mut AgentConversationState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed =
+        conversation_terminal_notice_operation_id(state.scope.tenant(), state.scope.conversation())
+            .ok();
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let Some(conversation) = state.conversation.as_mut() else {
+        return;
+    };
+    if conversation.status.is_terminal() && !conversation.terminal_notice_settled {
+        conversation.terminal_notice_settled = true;
+        state.updated_at = now;
+    }
 }
 
 /// One durable, deduplicated command over a conversation entity.
@@ -1980,8 +2108,9 @@ where
         Ok(reply)
     }
 
-    /// Observes a passed deadline, flushes owed history, and drives the
-    /// exchanges the conversation owes (none this slice).
+    /// Observes a passed deadline, re-owes an unsettled terminal notice,
+    /// flushes owed history, and drives the exchanges the conversation
+    /// owes.
     ///
     /// Safe to call at any time and from any node: every step reads what it
     /// needs from durable state.
@@ -1993,6 +2122,7 @@ where
         self.ensure_recovered(now).await?;
         self.require_history_headroom(now).await?;
         let expiry_observed = self.observe_expiry(now).await?;
+        self.settle_terminal_notice(now).await?;
         let flushed = self.flush_history(now).await?;
         let report = drive_pending_exchanges(&mut self.host, router, now).await?;
         // A drive settlement may have recorded history of its own.
@@ -2006,6 +2136,54 @@ where
             unsettleable: report.unsettleable.len(),
             outstanding: self.host.outstanding()?.len(),
         })
+    }
+
+    /// Re-owes the terminal notice a terminal conversation still owes its
+    /// governing task ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The courier half of the notice: the terminal transition owed it in
+    /// its own compare-and-set, but a crash between that commit and the
+    /// initiation — or a conversation that terminalized before the exchange
+    /// existed — must not leave the task blind. The derivation is pure over
+    /// durable state, the journal's initiation record guards the bounded
+    /// window, and the `terminal_notice_settled` marker quiesces it past
+    /// that window; a healthy sweep burns no revision.
+    async fn settle_terminal_notice(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentConversationResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            state.conversation().is_some_and(|conversation| {
+                conversation.status.is_terminal()
+                    && !conversation.terminal_notice_settled
+                    && conversation_terminal_notice_operation_id(
+                        state.scope.tenant(),
+                        state.scope.conversation(),
+                    )
+                    .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+            })
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_terminal_notice(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
     }
 
     /// Durably flips an active conversation whose deadline has passed.
@@ -2045,7 +2223,11 @@ where
                     .with_detail("expired")
                 });
                 state.updated_at = now;
-                Ok(Vec::new())
+                // The expiry flip is a terminal transition like any other:
+                // the notice to the governing task commits with it.
+                owed_terminal_notice(state, now)
+                    .map(|owed| owed.into_iter().collect())
+                    .map_err(AgentChoreographyError::from)
             })
             .await?;
         self.count_operation("expire", "applied");
@@ -2119,7 +2301,20 @@ where
                     Ok(())
                 };
                 match step(state) {
-                    Ok(()) => Ok(Vec::new()),
+                    // A transition that terminalized the conversation owes
+                    // the governing task its notice in this same
+                    // compare-and-set; a non-terminal transition derives
+                    // nothing. Strict propagation: a construction failure
+                    // rejects the command whole, and the retry converges
+                    // under the same operation id.
+                    Ok(()) => match owed_terminal_notice(state, now) {
+                        Ok(owed) => Ok(owed.into_iter().collect()),
+                        Err(error) => {
+                            let carried = AgentChoreographyError::from(error.clone());
+                            rejection = Some(error);
+                            Err(carried)
+                        }
+                    },
                     Err(error) => {
                         let carried = AgentChoreographyError::from(error.clone());
                         rejection = Some(error);
@@ -2348,6 +2543,7 @@ fn create_conversation(
         },
         created_at: now,
         ended_at: None,
+        terminal_notice_settled: false,
     };
     state.conversation = Some(conversation);
     state.check_bounds()?;

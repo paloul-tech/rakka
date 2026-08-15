@@ -56,8 +56,9 @@ fn agent_metadata_from_snapshot(
     }
     // The bounded collaboration echo: enough for observability and the
     // delegating or handing-off sender's identity check, never the whole
-    // envelope. The two clusters merge under the one key — a delegated task
-    // that was later handed off echoes both.
+    // envelope. The clusters merge under the one key — a delegated task
+    // that was later handed off echoes both, and a governed conversation's
+    // terminal echo rides beside them.
     let mut collaboration = serde_json::Map::new();
     if let Some(provenance) = snapshot.delegation.as_deref() {
         if let Value::Object(echo) = super::collaboration::collaboration_echo(provenance) {
@@ -71,6 +72,11 @@ fn agent_metadata_from_snapshot(
     }
     if let Some(claim) = snapshot.team_claim.as_deref() {
         if let Value::Object(echo) = super::collaboration::team_echo(claim) {
+            collaboration.extend(echo);
+        }
+    }
+    if let Some(cell) = snapshot.conversation.as_deref() {
+        if let Value::Object(echo) = super::collaboration::conversation_echo(cell) {
             collaboration.extend(echo);
         }
     }

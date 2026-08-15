@@ -542,10 +542,13 @@ where
             },
             Err(error) => return Err(error.into()),
         };
-        // One best-effort settle pass flushes the history the decision owed.
-        // The conversation initiates no exchange this slice, so there is no
-        // courier hop to any other entity — convergence never depends on
-        // this call.
+        // One best-effort settle pass flushes the history the decision owed
+        // and is the courier hop for the terminal notice a terminal flip
+        // owes the governing task. Best-effort is safe because convergence
+        // never depends on this call *completing* the delivery: the notice
+        // stays in the durable journal, and any later drive of the
+        // conversation's settle pass — this surface's next operation, the
+        // application's settle sweep, or recovery — re-drives it.
         let _ = store.settle_side_effects(&self.router, now).await;
         Ok(conversation_response_message(
             &request.message.message_id,

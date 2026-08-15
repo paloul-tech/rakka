@@ -879,3 +879,19 @@ pub fn team_echo(claim: &rakka_agent::AgentTaskTeamClaim) -> Value {
             .map(rakka_agent::AgentAssignmentGeneration::get),
     })
 }
+
+/// The bounded conversation echo the public task projection carries: the
+/// latest terminated conversation's identity, terminal status and reason,
+/// and its round/turn coordinates — identity and coordinates only, never
+/// transcript content
+/// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
+#[must_use]
+pub fn conversation_echo(cell: &rakka_agent::AgentTaskConversation) -> Value {
+    serde_json::json!({
+        "conversation": cell.conversation.as_str(),
+        "conversation-status": cell.status.as_label(),
+        "conversation-reason": cell.terminal_reason.code(),
+        "conversation-rounds": cell.round,
+        "conversation-turns": cell.turns,
+    })
+}

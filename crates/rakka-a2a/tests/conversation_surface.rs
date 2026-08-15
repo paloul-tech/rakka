@@ -929,3 +929,123 @@ async fn the_wire_records_the_moderation_counter() {
         "the refused turn counted: {observed:?}"
     );
 }
+
+/// The terminated conversation is observable from its governing task's
+/// public projection: the terminal notice records the task-side provenance
+/// cell, and the metadata-synced path echoes it under
+/// `io.rakka.collaboration` on the read path — which heals a projection
+/// written before the conversation ended.
+#[tokio::test]
+async fn a_terminated_conversation_echoes_on_its_governing_tasks_projection() {
+    let fixture = Fixture::new();
+    fixture.instantiate(&agent(MEMBER_A)).await;
+
+    // The governing task is created through the public surface, so the
+    // projection this test reads is the one production serves — and it is
+    // projected *before* the conversation ends, which is exactly the stale
+    // record the read-path heal exists for.
+    let mut plain = Message::new(
+        Role::User,
+        vec![Part {
+            content: PartContent::Data(json!({ "ticket": 1 })),
+            filename: None,
+            media_type: Some("application/json".to_string()),
+            metadata: None,
+        }],
+    );
+    plain.message_id = "governing-task".to_string();
+    let response = fixture
+        .service
+        .send(&params(), &send_request(plain))
+        .await
+        .expect("the task send is served");
+    let a2a::SendMessageResponse::Task(created) = response else {
+        panic!("a plain send answers a task");
+    };
+    let task_id = created.id.clone();
+
+    // The conversation names that task — trusted application wiring — and
+    // the moderator ends it over the wire.
+    let mut store = AgentConversationEntityStore::new(
+        conversation_scope(),
+        fixture.conversations.clone(),
+        fixture.conversation_history.clone(),
+    );
+    let now = fixture.now();
+    store.recover(now).await.expect("the conversation recovers");
+    store
+        .apply(
+            AgentConversationEntityCommand::Create {
+                operation_id: rakka_agent::conversation_create_operation_id(
+                    &tenant(),
+                    &AgentConversationId::new(CONVERSATION).expect("the conversation id is valid"),
+                )
+                .expect("the operation id derives"),
+                creation: Box::new(AgentConversationCreation {
+                    moderator: agent(MODERATOR),
+                    participants: vec![agent(MEMBER_A), agent(MEMBER_B)],
+                    mode: AgentConversationMode::RoundRobin,
+                    completion: AgentConversationCompletionRule::ModeratorDecides,
+                    policy: AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+                    task: rakka_agent::AgentTaskId::new(&task_id).expect("the task id is valid"),
+                    tokens: Some(500),
+                    max_wall_clock_millis: None,
+                    transcript_ref: None,
+                }),
+            },
+            &fixture.router,
+            fixture.now(),
+        )
+        .await
+        .expect("the conversation creates");
+
+    let mut end = conversation_message("end-governed", end_cluster(MODERATOR, 0, "consensus"));
+    end.metadata
+        .as_mut()
+        .expect("the message carries metadata")
+        .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+    let response = fixture
+        .service
+        .send(&params(), &send_request(end))
+        .await
+        .expect("the end is served");
+    assert!(
+        response_payload(&response).get("Applied").is_some(),
+        "the end applies"
+    );
+
+    // The read path serves — and heals — the echo beside the task's status.
+    let task = fixture
+        .service
+        .get_task(&params(), Some(TENANT), &task_id, None)
+        .await
+        .expect("the task reads");
+    let collaboration = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(META_COLLABORATION))
+        .expect("the collaboration echo rides the projection");
+    assert_eq!(
+        collaboration.get("conversation").and_then(Value::as_str),
+        Some(CONVERSATION)
+    );
+    assert_eq!(
+        collaboration
+            .get("conversation-status")
+            .and_then(Value::as_str),
+        Some("ended")
+    );
+    assert_eq!(
+        collaboration
+            .get("conversation-reason")
+            .and_then(Value::as_str),
+        Some("moderator-ended")
+    );
+    assert_eq!(
+        collaboration
+            .get("conversation-rounds")
+            .and_then(Value::as_u64),
+        Some(0),
+        "the coordinates ride the echo"
+    );
+}
