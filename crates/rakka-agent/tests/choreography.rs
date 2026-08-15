@@ -570,6 +570,73 @@ async fn a_delivery_failure_leaves_the_exchange_outstanding() {
 }
 
 #[tokio::test]
+async fn a_structurally_undeliverable_envelope_costs_one_revision_not_one_per_sweep() {
+    // `exchange-no-route` is the delivery failure whose answer never moves:
+    // for as long as the deployment hosts no route for the target class,
+    // every sweep gets the identical error, and nothing classifies a delivery
+    // failure the way the settle rules classify a refusal, so no ceiling ever
+    // ends it. A terminal task naming a governing team in a deployment that
+    // wires no `Team` route owes its terminal notice exactly this way.
+    //
+    // The exchange must stay outstanding — a route can appear on the next
+    // deploy, and delivering is the only thing that discovers it — so the
+    // cost has to be bounded some other way: an unchanged failure code
+    // persists nothing, the `record_unsettleable_refusal` rule.
+    let fx = Fixture::new();
+    let mut initiator = fx.host(run_address()).await;
+
+    let envelope = fx.envelope(AgentExchangeKind::Creation, "creation");
+    let operation_id = envelope.operation_id().clone();
+    initiate(&mut initiator, envelope, fx.now()).await;
+
+    // A router with no routes at all: the target class is simply unhosted.
+    let unrouted = rakka_agent::AgentExchangeRouter::new();
+    let mut revisions = Vec::new();
+    const SWEEPS: usize = 5;
+    for sweep in 0..SWEEPS {
+        let report = drive_pending_exchanges(&mut initiator, &unrouted, fx.now())
+            .await
+            .expect("one undeliverable envelope does not fail the pass");
+        assert_eq!(report.failed, 1, "sweep {sweep}");
+        assert_eq!(report.settled, 0, "sweep {sweep}");
+        revisions.push(revision_of(&fx, run_address()).await);
+    }
+
+    // Legible: the code is on the record and every sweep counts the failure,
+    // so a standing wedge is alertable as a rate.
+    let pending = initiator
+        .state()
+        .expect("recovered")
+        .journal()
+        .pending_exchange(&operation_id)
+        .expect("the exchange is still outstanding")
+        .clone();
+    assert_eq!(pending.last_failure_code(), Some("exchange-no-route"));
+    assert_eq!(
+        pending.attempts(),
+        1,
+        "an unchanged delivery failure writes nothing further"
+    );
+
+    // And free: only the first sweep moved the durable revision.
+    assert!(
+        revisions.windows(2).all(|pair| pair[0] == pair[1]),
+        "standing undeliverable is not also a standing write: {revisions:?}"
+    );
+}
+
+/// The durable revision one participant's record currently stands at.
+async fn revision_of(fx: &Fixture, address: AgentEntityAddress) -> rakka_persistence::Revision {
+    use rakka_persistence::DurableStateStore;
+
+    DurableStateStore::load(&fx.store, &address.persistence_id())
+        .await
+        .expect("the record loads")
+        .expect("the participant has durable state")
+        .revision
+}
+
+#[tokio::test]
 async fn a_replay_older_than_the_deduplication_window_is_refused_by_the_domain_fence() {
     // Durable state is bounded, so the journal's deduplication ring is bounded
     // too. A replay that has aged out of it reaches the participant's `apply` —

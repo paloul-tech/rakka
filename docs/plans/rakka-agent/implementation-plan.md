@@ -3975,15 +3975,26 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   included — the echo is observational and a refresh is not absorbing the
   way terminality is, so it needs its own idempotence design. It is
   re-parked explicitly below, no longer implicitly owed.
-- **The eager close bumps the entry's claim epoch** — load-bearing, found
-  in design review: the `(Release, "team-claim-already-owned")` settle arm
-  restores an entry `Active` with no `claim_is_current` guard, and only the
-  epoch guard absorbs it once the close moved the entry on; without the
-  bump that interleaving resurrected a `Done` entry. Pinned by a test
-  verified to fail with the bump removed. A missing or already-`Done`
-  entry accepts idempotently with no board write; no `require_active` gate
-  (the board is data — an expired team's entry still closes); a re-posted
-  entry after eviction closes lazily exactly as before.
+- **`Done` is absorbing under `settle_claim_action`, by its own guard.**
+  The eager close bumps the entry's claim epoch, which design review found
+  load-bearing because the `(Release, "team-claim-already-owned")` settle
+  arm restored an entry `Active` with none of the `claim_is_current` guard
+  its five siblings carry. Code review then found the other half: the
+  *lazy* close — the `team-claim-task-terminal` / `-task-unknown` /
+  `-wrong-team` arm — closes at the entry's **current** epoch, so the epoch
+  guard could not absorb a second reply for that same decision, and a
+  `Done` entry could be rewritten `Active` around a claim no task ever
+  accepted. `Done` has no way back (eviction only removes closed entries;
+  claim, release, and transfer all refuse one), and the terminal notice is
+  owed exactly once, so the entry would be wedged for the board's
+  lifetime. Both halves are now structural: an explicit terminal guard
+  after the epoch guard, and the missing currency check on the arm that
+  lacked it — after which the epoch bump is defense in depth rather than
+  the only defense. Pinned by two unit tests, each verified to fail with
+  its own guard removed. A missing or already-`Done` entry accepts
+  idempotently with no board write; no `require_active` gate (the board is
+  data — an expired team's entry still closes); a re-posted entry after
+  eviction closes lazily exactly as before.
 - **The task→team notice rides `owed_child_reports`** (the one terminal
   consult point, counted into the exchange budget) plus a settle-pass twin
   covering the terminals that never consult it — goal exhaustion,

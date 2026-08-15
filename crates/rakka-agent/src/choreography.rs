@@ -1544,13 +1544,31 @@ impl AgentExchangeJournal {
         true
     }
 
-    /// Records a failed delivery attempt.
+    /// Records a failed delivery attempt, and reports whether anything durable
+    /// changed.
     ///
     /// The exchange stays outstanding. A delivery failure is never evidence that
     /// the receiver did not apply it
     /// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)), so the
     /// only safe response is to re-drive the same operation id and let the
     /// receiver deduplicate.
+    ///
+    /// An unchanged code writes nothing and reports `false`, the
+    /// [`Self::record_unsettleable_refusal`] rule for the same reason: the
+    /// courier must keep re-driving, because delivering is the only thing that
+    /// discovers the transport has recovered, but re-recording an identical
+    /// failure every pass would burn a durable revision forever on an exchange
+    /// whose state has not moved.
+    ///
+    /// A *structurally* undeliverable envelope is what makes this load-bearing
+    /// rather than an optimization. `exchange-no-route` answers identically on
+    /// every pass for as long as the deployment does not host the target
+    /// class — a task that names a governing team in a deployment wiring no
+    /// [`AgentEntityClass::Team`] route owes its terminal notice forever — and
+    /// nothing classifies a delivery error, so no ceiling ends it. The code
+    /// stays durably legible on the pending entry and the courier's report
+    /// counts the failure on every sweep, so standing undeliverable stays
+    /// alertable as a rate without also being a standing write.
     pub fn record_delivery_failure(
         &mut self,
         operation_id: &AgentOperationId,
@@ -1564,9 +1582,13 @@ impl AgentExchangeJournal {
         else {
             return false;
         };
+        let code = code.into();
+        if pending.last_failure_code.as_deref() == Some(code.as_str()) {
+            return false;
+        }
         pending.attempts = pending.attempts.saturating_add(1);
         pending.last_attempt_at = Some(now);
-        pending.last_failure_code = Some(code.into());
+        pending.last_failure_code = Some(code);
         true
     }
 
@@ -2269,7 +2291,9 @@ where
     /// Records a failed delivery attempt against one outstanding exchange.
     ///
     /// The exchange stays outstanding: a transport failure is not evidence that
-    /// the receiver did not apply it.
+    /// the receiver did not apply it. A failure whose code has not moved
+    /// persists nothing, so a standing undeliverable envelope costs one
+    /// revision rather than one per sweep.
     pub async fn record_delivery_failure(
         &mut self,
         operation_id: &AgentOperationId,

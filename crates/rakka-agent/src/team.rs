@@ -1597,6 +1597,21 @@ fn settle_claim_action(
     if entry.claim_epoch != command.epoch {
         return;
     }
+    // `Done` is absorbing, and no settle consequence may reopen it: eviction
+    // is the only thing that removes a closed entry, and `claim_entry`,
+    // `release_entry`, and `transfer_entry` all refuse one — so an entry
+    // wrongly reopened here can never be closed again, because the terminal
+    // notice that would close it is owed exactly once.
+    //
+    // The epoch guard above is not enough on its own. The eager close bumps
+    // the epoch, but the *lazy* close — the `team-claim-task-terminal` arm
+    // below — closes the entry at its current epoch, so a second definitive
+    // reply for that same epoch matches, and the arms that restore an entry
+    // `Active` or `Open` would rewrite a closed entry around a claim no task
+    // ever accepted.
+    if entry.status == AgentTeamBoardEntryStatus::Done {
+        return;
+    }
 
     if result.is_accepted() {
         match command.action {
@@ -1653,8 +1668,16 @@ fn settle_claim_action(
             (AgentTeamBoardEntryStatus::Active, true)
         }
         // Our own claimant's assignment accepted while the release was in
-        // flight; the claim stands and the entry is owned.
+        // flight; the claim stands and the entry is owned. Guarded on that
+        // claim still being the entry's current one, exactly as the five
+        // sibling arms are: this arm keeps the claim rather than clearing
+        // it, so against a board that has already moved to a newer claim it
+        // would mark *that* claim's entry owned on the strength of an
+        // acceptance belonging to the previous one.
         (AgentTeamClaimAction::Release, "team-claim-already-owned") => {
+            if !claim_is_current {
+                return;
+            }
             (AgentTeamBoardEntryStatus::Active, false)
         }
         // The generation is offered and undecided: the release restores to
@@ -3806,5 +3829,241 @@ impl From<AgentTeamError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_settle_guard_tests {
+    use super::*;
+    use crate::coordination::{team_claim_id_for, AgentTeamClaimAction, AgentTeamClaimCommand};
+    use crate::identity::{AgentOperationKind, AgentTeamId, AgentTeamScope, TenantId};
+
+    const TEAM: &str = "support";
+    const LEADER: &str = "lead";
+    const MEMBER: &str = "worker-a";
+    const TASK: &str = "ticket-1";
+
+    fn ts(at: u64) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(at)
+    }
+
+    fn scope() -> AgentTeamScope {
+        AgentTeamScope::new(
+            TenantId::new("acme"),
+            AgentTeamId::new(TEAM).expect("the team id is valid"),
+        )
+        .expect("the team scope is valid")
+    }
+
+    fn member(name: &str) -> AgentId {
+        AgentId::new(name).expect("the member id is valid")
+    }
+
+    fn task() -> AgentTaskId {
+        AgentTaskId::new(TASK).expect("the task id is valid")
+    }
+
+    fn op(label: &str) -> AgentOperationId {
+        AgentOperationId::new(AgentOperationKind::TeamOperation, ["acme", TEAM, label])
+            .expect("the operation id derives")
+    }
+
+    /// A created team with one member and one posted, claimed, releasing
+    /// board entry — the shape a definitive claim reply settles.
+    fn releasing_board() -> AgentTeamState {
+        let mut state = AgentTeamState::uncreated(scope(), ts(1));
+        let mut members: BTreeMap<AgentId, BTreeSet<AgentCapabilityId>> = BTreeMap::new();
+        members.insert(member(MEMBER), BTreeSet::new());
+        create_team(
+            &mut state,
+            &op("create"),
+            AgentTeamCreation {
+                leader: member(LEADER),
+                root_goal: AgentGoalId::new("quarterly-support").expect("the goal id is valid"),
+                policy: AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+                members,
+            },
+            ts(1),
+        )
+        .expect("the team creates");
+        post_task(&mut state, &op("post"), task(), member(LEADER), ts(2)).expect("the task posts");
+        let epoch = board_epoch(&state);
+        claim_entry(
+            &mut state,
+            &op("claim"),
+            task(),
+            member(MEMBER),
+            epoch,
+            ts(3),
+        )
+        .expect("the entry claims");
+        let epoch = board_epoch(&state);
+        release_entry(
+            &mut state,
+            &op("release"),
+            task(),
+            &member(MEMBER),
+            epoch,
+            ts(4),
+        )
+        .expect("the entry releases");
+        state
+    }
+
+    fn board_epoch(state: &AgentTeamState) -> u64 {
+        state
+            .team
+            .as_ref()
+            .expect("the team exists")
+            .board
+            .get(&task())
+            .expect("the entry exists")
+            .claim_epoch
+    }
+
+    fn entry(state: &AgentTeamState) -> &AgentTeamBoardEntry {
+        state
+            .team
+            .as_ref()
+            .expect("the team exists")
+            .board
+            .get(&task())
+            .expect("the entry exists")
+    }
+
+    /// The reply envelope for a claim action the board decided at `epoch`.
+    fn reply_envelope(
+        state: &AgentTeamState,
+        action: AgentTeamClaimAction,
+        epoch: u64,
+    ) -> AgentExchangeEnvelope {
+        let command = AgentTeamClaimCommand {
+            team: scope(),
+            // The claim the entry actually stands for — the same one the
+            // deciding transition minted and sent.
+            claim: entry(state)
+                .claim
+                .as_ref()
+                .expect("the entry holds its claim")
+                .claim
+                .clone(),
+            task: task(),
+            epoch,
+            action,
+            policy_revision: state
+                .team
+                .as_ref()
+                .expect("the team exists")
+                .policy
+                .revision,
+            lease_expires_at: ts(100),
+        };
+        AgentExchangeEnvelope::new(
+            op("reply"),
+            AgentExchangeKind::TeamClaim,
+            AgentEntityAddress::Team(scope()),
+            AgentEntityAddress::Task(
+                AgentTaskScope::new(scope().tenant().clone(), task()).expect("the scope is valid"),
+            ),
+            AgentExchangePayload::encode(AGENT_TEAM_CLAIM_PAYLOAD_TYPE, &command)
+                .expect("the payload encodes"),
+            AgentCorrelationId::new("reply"),
+            ts(5),
+        )
+        .expect("the envelope builds")
+    }
+
+    #[test]
+    fn a_lazily_closed_entry_absorbs_a_later_definitive_reply() {
+        // The lazy close — the arm a claim attempt against an already-terminal
+        // task takes — closes the entry at its *current* epoch, unlike the
+        // eager terminal notice, which bumps. So the epoch guard cannot
+        // absorb a second reply for that same decision, and without the
+        // terminal guard the restoring arms would rewrite a closed entry
+        // around a claim no task ever accepted. `Done` has no way back:
+        // eviction is the only thing that removes a closed entry, and
+        // `claim_entry`, `release_entry`, and `transfer_entry` all refuse
+        // one, so the entry would be wedged for the board's lifetime.
+        let mut state = releasing_board();
+        let epoch = board_epoch(&state);
+        let envelope = reply_envelope(&state, AgentTeamClaimAction::Release, epoch);
+
+        settle_claim_action(
+            &mut state,
+            &envelope,
+            &refuse(
+                "team-claim-task-terminal",
+                "the task already ended".to_string(),
+            ),
+            ts(6),
+        );
+        assert_eq!(
+            entry(&state).status,
+            AgentTeamBoardEntryStatus::Done,
+            "the lazy close lands"
+        );
+        assert_eq!(
+            board_epoch(&state),
+            epoch,
+            "and it closes at the epoch it found — this is what the guard has to cover"
+        );
+
+        let closed = state.clone();
+        settle_claim_action(
+            &mut state,
+            &envelope,
+            &refuse(
+                "team-claim-already-owned",
+                "the assignment accepted first".to_string(),
+            ),
+            ts(7),
+        );
+        assert_eq!(
+            state, closed,
+            "a closed entry absorbs every later settle consequence, whole"
+        );
+    }
+
+    #[test]
+    fn a_release_already_owned_reply_never_speaks_for_a_superseded_claim() {
+        // The one restoring arm that kept the entry's claim rather than
+        // clearing it was also the one arm without the currency guard its
+        // five siblings carry. Against a board that has moved to a newer
+        // claim it would mark *that* claim's entry owned on the strength of
+        // an acceptance belonging to the previous one.
+        let mut state = releasing_board();
+        let epoch = board_epoch(&state);
+        let envelope = reply_envelope(&state, AgentTeamClaimAction::Release, epoch);
+
+        // The board moves on: the entry now stands for a different claim at
+        // the same epoch, which the derived ids alone cannot rule out.
+        let superseding = team_claim_id_for(&scope(), &task(), &member(LEADER), epoch)
+            .expect("the claim id derives");
+        state
+            .team
+            .as_mut()
+            .expect("the team exists")
+            .board
+            .get_mut(&task())
+            .expect("the entry exists")
+            .claim
+            .as_mut()
+            .expect("the releasing entry still holds its claim")
+            .claim = superseding;
+
+        let before = state.clone();
+        settle_claim_action(
+            &mut state,
+            &envelope,
+            &refuse(
+                "team-claim-already-owned",
+                "the assignment accepted first".to_string(),
+            ),
+            ts(6),
+        );
+        assert_eq!(
+            state, before,
+            "the settle speaks for the claim it named, and that claim is gone"
+        );
     }
 }
