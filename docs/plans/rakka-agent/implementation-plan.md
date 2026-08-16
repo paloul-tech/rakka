@@ -3975,6 +3975,16 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   included — the echo is observational and a refresh is not absorbing the
   way terminality is, so it needs its own idempotence design. It is
   re-parked explicitly below, no longer implicitly owed.
+- **The provenance cell is not a task transition.** Recording it leaves
+  `AgentTaskState::updated_at` alone, because that field means the time of
+  the last accepted transition *of this task* and is the sole clock the
+  board-governed unclaimed horizon runs on. Code review found the cell
+  advancing it, which let any conversation naming a never-claimed task
+  postpone its expiry — and a task keeps no registry of the conversations
+  it governs, so it cannot tell a legitimate one from a series minted to
+  keep it alive. The record still changes and still persists; it simply
+  does not claim to be a transition, and any later echo about another
+  entity must follow the same rule.
 - **The eager close stands behind two payload fences.** The notice must be
   initiated by the task it names *and* report that task as ended. Code
   review found the second missing: `AgentTeamTerminalNotice.status` was

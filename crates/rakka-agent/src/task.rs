@@ -4492,6 +4492,13 @@ impl AgentTaskState {
     }
 
     /// The time of the last accepted transition.
+    ///
+    /// A transition of *this task* — its status, assignment, result, goal,
+    /// or ledger. A record it keeps about another entity, such as the
+    /// conversation provenance cell, changes the record without advancing
+    /// this clock, because the unclaimed-expiry horizon runs on it and must
+    /// measure how long the task has waited rather than how recently
+    /// anything touched it.
     #[must_use]
     pub const fn updated_at(&self) -> AgentTimestampMillis {
         self.updated_at
@@ -6291,6 +6298,11 @@ fn check_assignment_free(task: &AgentTask, inflight_code: &'static str) -> Agent
 /// expired before any claim would otherwise park the task — and lock its
 /// delegated escrow — silently forever. The wait re-arms from the task's
 /// last transition, so a refused claim's reopened window starts fresh.
+///
+/// `updated_at` is that clock, which is why a record the task keeps about
+/// *another* entity must not advance it: this horizon would otherwise be
+/// extendable by anything that can write to the task, including a peer the
+/// task has no way to vet.
 fn task_unclaimed_expired(
     task: &AgentTask,
     updated_at: AgentTimestampMillis,
@@ -10551,7 +10563,21 @@ fn apply_conversation_terminal(
         .map_or(AgentTaskStatus::Created, |task| task.status);
     let reason = notice.terminal_reason.code();
     let operation_id = envelope.operation_id().clone();
-    state.updated_at = now;
+    // `state.updated_at` is deliberately *not* advanced. It means the time of
+    // the last accepted transition, and recording what some other entity did
+    // is not one — the task's status, assignment, result, and goal are all
+    // exactly where they were. The distinction is load-bearing rather than
+    // pedantic, because that clock is the sole input to the board-governed
+    // unclaimed horizon (`task_unclaimed_expired`), which re-arms from the
+    // task's last transition so a refused claim's reopened window starts
+    // fresh. Advancing it here would let a conversation postpone an unrelated
+    // task's expiry — and since a task keeps no registry of the conversations
+    // it governs, it cannot tell one that legitimately names it from a series
+    // minted to keep it alive, so a never-claimed task and its delegated
+    // escrow could be parked indefinitely by exactly the wait this horizon
+    // exists to bound. The record still changes and still persists; it simply
+    // does not claim to be a transition. Any later echo about another entity
+    // must do the same.
     state.record_history(|sequence| {
         AgentTaskHistoryEntry::new(
             sequence,
