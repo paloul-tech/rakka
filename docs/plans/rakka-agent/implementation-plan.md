@@ -4038,9 +4038,18 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   status/reason, round/turn coordinates, `ended_at`; never transcript
   content) + a `conversations` lifetime counter, the handoff/team-claim
   precedent; the chain is `conversation-terminal-recorded` history. The
-  latest-only past-window hazard (a duplicate replayed past the applied
-  window after a second conversation overwrote the cell re-records) is
-  documented on the type with the bounded-map alternative named.
+  cell's `ended_at` is **strictly monotonic**, and the counter rides that
+  guard because it counts notices recorded: code review found the
+  latest-only past-window hazard was not merely a re-record but a
+  *regression* — a duplicate replayed past the applied window after a
+  second conversation overwrote the cell took the cell back and
+  re-incremented, and `get_task` then healed the public echo to the older
+  conversation on every read. What remains is the opposite direction, and
+  it is documented on the type with the bounded-map alternative named: an
+  older conversation whose first delivery arrives after a newer one is
+  accepted without being materialized, absent from the cell it could never
+  have won and from the count, still readable through its own entity and
+  the replay surface.
 - **The conversation owes the notice in all three terminal CAS's** — the
   `transition()` wrapper covers rounds-complete and the early end in one
   owing point, `observe_expiry` owes in its own flip — plus the

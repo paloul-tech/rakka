@@ -2540,12 +2540,20 @@ impl AgentTaskTeamClaimStatus {
 /// exactly as superseded handoffs and team claims are — and the cell is the
 /// deduplication echo past the journal's bounded window for a redelivered
 /// notice about the *same* conversation. Identity and coordinates only,
-/// never transcript content. Known latest-only hazard, accepted with the
-/// same eyes-open posture as [`AgentTaskHandoff`]: a duplicate notice
-/// replayed past the applied window *after a different conversation
-/// overwrote the cell* re-records — bounded, observational-only harm; a
-/// bounded per-conversation map is the alternative if a future slice needs
-/// the exact echo.
+/// never transcript content.
+///
+/// [`Self::ended_at`] is strictly monotonic on this cell: a notice from a
+/// different conversation takes it only by being newer, so a replay that
+/// aged out of the applied window cannot regress the projected latest or
+/// re-count itself after another conversation has recorded. What the
+/// latest-only shape still costs is the other direction, accepted with the
+/// same eyes-open posture as [`AgentTaskHandoff`]: an older conversation
+/// whose *first* delivery arrives after a newer one is accepted without
+/// being materialized, so it appears in neither the cell nor the count —
+/// bounded, observational-only, and still fully readable through its own
+/// conversation entity and the coordination replay surface. A bounded
+/// per-conversation map is the alternative if a future slice needs every
+/// exact echo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTaskConversation {
     /// The terminated conversation.
@@ -4116,8 +4124,10 @@ pub struct AgentTask {
     /// Records persisted before this field load without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<Box<AgentTaskConversation>>,
-    /// How many conversation-terminal notices the task has recorded over
-    /// its lifetime.
+    /// How many conversation-terminal notices the task has *recorded* over
+    /// its lifetime — one per notice that took the cell. A redelivery, and a
+    /// notice older than the cell already standing, are both accepted
+    /// without recording, so neither counts.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub conversations: u32,
     /// The most recent assignment refusal.
@@ -4758,8 +4768,10 @@ pub struct AgentTaskSnapshot {
     /// Snapshots persisted before this field load without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<Box<AgentTaskConversation>>,
-    /// How many conversation-terminal notices the task has recorded over
-    /// its lifetime.
+    /// How many conversation-terminal notices the task has *recorded* over
+    /// its lifetime — one per notice that took the cell. A redelivery, and a
+    /// notice older than the cell already standing, are both accepted
+    /// without recording, so neither counts.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub conversations: u32,
     /// Its current assignment.
@@ -10515,6 +10527,35 @@ fn apply_conversation_terminal(
         // carries a different resolution.
         return AgentExchangeTransition::new(receipt());
     }
+    // A *different* conversation only takes the cell by being newer than the
+    // one already in it. The cell is latest-only, and `ended_at` — stamped by
+    // the conversation's owner when its terminal flip committed — is the only
+    // ordering the task has, so making it strictly monotonic is what makes
+    // "latest" mean latest rather than last-delivered.
+    //
+    // Without this, an older conversation's notice re-driven after its
+    // operation rolled out of the bounded applied ring — its reply lost, and
+    // 64 exchanges later on a task with dependents and board traffic — would
+    // overwrite a newer conversation's cell and re-increment the lifetime
+    // counter. `get_task` would then echo the older conversation's status,
+    // reason, rounds, and turns, and `agent_metadata_from_snapshot` would
+    // heal the projection to that wrong value on every read.
+    //
+    // The counter rides the same guard because it counts notices *recorded*,
+    // and a notice this arm declines to record is not one. What that costs is
+    // narrow and observational: a genuinely out-of-order first delivery of an
+    // older conversation is accepted without being materialized, so it is
+    // absent from the cell it could never have won and from the count. It
+    // stays observable through its own conversation entity and the
+    // coordination replay surface. Ties keep the cell they found, so a
+    // re-drive can never disturb a settled one.
+    if task
+        .conversation
+        .as_deref()
+        .is_some_and(|cell| notice.ended_at.as_millis() <= cell.ended_at.as_millis())
+    {
+        return AgentExchangeTransition::new(receipt());
+    }
     // A pre-terminal record keeps the growth headroom the task's own
     // lifecycle still needs — the cell must never eat the room reserved for
     // the assignment, result, and terminal reason. Once the task is
@@ -14711,7 +14752,13 @@ mod team_claim_bounds_tests {
         // Inflate the record to one byte under its cap, so the recorded cell
         // itself must push it over.
         inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - 1);
-        let envelope = conversation_notice(&tenant, &task_id, &scope, "design-review");
+        let envelope = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(2),
+        );
 
         let before = state.clone();
         let result =
@@ -14748,7 +14795,13 @@ mod team_claim_bounds_tests {
 
         let (tenant, task_id, scope, mut state) = board_task_world();
         inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - SLACK);
-        let envelope = conversation_notice(&tenant, &task_id, &scope, "design-review");
+        let envelope = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(2),
+        );
 
         let pre_terminal = state.clone();
         let refused =
@@ -14786,6 +14839,65 @@ mod team_claim_bounds_tests {
             "design-review"
         );
         assert_eq!(task.conversations, 1);
+    }
+
+    #[test]
+    fn a_stale_notice_never_regresses_the_latest_conversation_cell() {
+        // The cell is latest-only and `ended_at` is the only ordering the
+        // task has, so it must be monotonic. An older conversation's notice
+        // re-driven after its operation aged out of the bounded applied ring
+        // — its reply lost, 64 exchanges ago on a task with dependents and
+        // board traffic — must not take the cell back from a newer
+        // conversation or re-count itself. `get_task` reassembles the public
+        // echo from this cell on every read, so a regression heals the
+        // projection to the wrong conversation for as long as the task lives.
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        let early = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(10),
+        );
+        let late = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "retro",
+            AgentTimestampMillis::new(20),
+        );
+
+        for (envelope, at) in [(&early, 11), (&late, 21)] {
+            assert!(
+                apply_conversation_terminal(&mut state, envelope, AgentTimestampMillis::new(at))
+                    .result()
+                    .is_accepted(),
+                "both conversations record in order"
+            );
+        }
+        let task = state.task.as_ref().expect("the task exists");
+        assert_eq!(
+            task.conversation
+                .as_deref()
+                .expect("the cell stands")
+                .conversation
+                .as_str(),
+            "retro"
+        );
+        assert_eq!(task.conversations, 2);
+
+        // The older conversation re-drives past the applied window.
+        let settled = state.clone();
+        let replayed =
+            apply_conversation_terminal(&mut state, &early, AgentTimestampMillis::new(30));
+        assert!(
+            replayed.result().is_accepted(),
+            "a stale notice still settles — it simply records nothing"
+        );
+        assert_eq!(
+            state, settled,
+            "the cell and the counter stay exactly where the newer notice left them"
+        );
     }
 
     /// One created, board-governed task and the coordinates its conversation
@@ -14861,6 +14973,7 @@ mod team_claim_bounds_tests {
         task_id: &AgentTaskId,
         task: &AgentTaskScope,
         conversation: &str,
+        ended_at: AgentTimestampMillis,
     ) -> AgentExchangeEnvelope {
         let conversation_scope = crate::identity::AgentConversationScope::new(
             tenant.clone(),
@@ -14875,7 +14988,7 @@ mod team_claim_bounds_tests {
             terminal_reason: crate::conversation::AgentConversationTerminalReason::RoundsComplete,
             round: 1,
             turns_recorded: 2,
-            ended_at: AgentTimestampMillis::new(2),
+            ended_at,
         };
         let operation = crate::coordination::conversation_terminal_notice_operation_id(
             tenant,
