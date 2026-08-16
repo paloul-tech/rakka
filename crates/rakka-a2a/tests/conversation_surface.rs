@@ -1025,9 +1025,15 @@ async fn a_terminated_conversation_echoes_on_its_governing_tasks_projection() {
         .as_ref()
         .and_then(|metadata| metadata.get(META_COLLABORATION))
         .expect("the collaboration echo rides the projection");
+    // `conversation-id`, not the bare `conversation`: that name is the
+    // inbound cluster discriminator, and the echo must never trip it.
     assert_eq!(
-        collaboration.get("conversation").and_then(Value::as_str),
+        collaboration.get("conversation-id").and_then(Value::as_str),
         Some(CONVERSATION)
+    );
+    assert!(
+        collaboration.get("conversation").is_none(),
+        "the echo keeps clear of the inbound discriminator"
     );
     assert_eq!(
         collaboration

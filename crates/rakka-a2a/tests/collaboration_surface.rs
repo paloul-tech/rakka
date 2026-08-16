@@ -872,6 +872,60 @@ async fn half_formed_collaboration_engagements_fail_closed() {
     }
 }
 
+/// A task's own collaboration *echo*, round-tripped onto a send, is refused
+/// for what it is rather than classified into whichever cluster it happens
+/// to trip.
+///
+/// `io.rakka.collaboration` is one public key carrying two directions — the
+/// inbound command envelope and the outbound projection echo — and
+/// `team_echo` and `handoff_echo` key their identity on the very cluster
+/// names the inbound parser discriminates on. Both are shipped surface, so
+/// the parser gates on the `schema` every command declares and no echo does.
+/// Otherwise the refusal a relay got back depended on the task's
+/// collaboration history: add a terminated conversation to a handed-off task
+/// and the same bytes changed branches.
+#[tokio::test]
+async fn a_projection_echo_replayed_as_a_command_is_refused_for_what_it_is() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture
+        .instantiate(&specialist(), "translator-v1", SPECIALIST_DEFINITION)
+        .await;
+
+    // The echo object `sync_agent_status` assembles for a task that was
+    // handed off, took a board claim, and governed a conversation that
+    // ended — every cluster discriminator present at once, no `schema`.
+    let echo = json!({
+        "handoff": "handoff-1",
+        "handoff-status": "accepted",
+        "handoff-target": "specialist",
+        "team": "support",
+        "team-claim": "team-claim-1",
+        "team-claim-status": "accepted",
+        "conversation-id": "standup",
+        "conversation-status": "ended",
+        "conversation-reason": "rounds-complete",
+        "conversation-rounds": 1,
+        "conversation-turns": 2,
+    });
+    let mut replayed = collaboration_message("echo-replay", "echo-replay");
+    if let Some(metadata) = replayed.metadata.as_mut() {
+        metadata.insert(META_COLLABORATION.to_string(), echo);
+    }
+
+    let error = fixture
+        .service
+        .send_message(&params(), &send_request(replayed))
+        .await
+        .expect_err("an echo is not a command");
+    match error {
+        RakkaAgentA2AError::Unsupported { reason, .. } => assert!(
+            reason.contains("declares no schema version"),
+            "the refusal names the real defect, not a cluster it tripped: {reason}"
+        ),
+        other => panic!("an echo replay should fail closed as unsupported, not {other}"),
+    }
+}
+
 /// Forged parent bindings fail closed at the creation door: a depth that
 /// does not agree with the presented lineage, and a parent run in a foreign
 /// tenant, are both refused before anything durable records them — the
