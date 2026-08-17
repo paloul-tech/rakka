@@ -558,8 +558,16 @@ pub struct AgentConversationTerminalNotice {
     pub status: crate::conversation::AgentConversationStatus,
     /// Why it terminated.
     pub terminal_reason: crate::conversation::AgentConversationTerminalReason,
-    /// The round the conversation ended in.
-    pub round: u64,
+    /// How many rounds *completed* before it ended.
+    ///
+    /// [`crate::conversation::AgentConversation::round`] is a next-expected
+    /// cursor on a live conversation, and it advances exactly once per
+    /// closed round, so on a terminated one the same number is the count of
+    /// rounds that finished. Named for the reading that holds here: as an
+    /// index it would be wrong under `RoundsComplete`, which closes the
+    /// final round before flipping and so leaves the cursor one past the
+    /// last round that ran.
+    pub rounds_completed: u64,
     /// How many turns were recorded over the conversation's life.
     pub turns_recorded: u64,
     /// When the terminal flip committed.
@@ -573,11 +581,33 @@ pub struct AgentConversationTerminalNotice {
 /// the team's memoization gate — so the two sides agree by construction:
 /// a code in this list settles the notice *and* memoizes at the receiver; a
 /// code outside it stays outstanding *and* re-runs the receiving arm on the
-/// next drive. A missing or closed team cannot be waited out (the board is
-/// gone or frozen as history), and a verdict the payload itself fails —
-/// forged, or reporting a task that has not ended — never changes on replay:
-/// the courier re-delivers the *stored* envelope rather than re-deriving it,
-/// so the same bytes answer the same way for as long as they exist.
+/// next drive. A closed team is frozen as history, and a verdict the payload
+/// itself fails — forged, or reporting a task that has not ended — never
+/// changes on replay: the courier re-delivers the *stored* envelope rather
+/// than re-deriving it, so the same bytes answer the same way for as long as
+/// they exist.
+///
+/// `team-not-found` settles here, and the deliberate divergence from
+/// [`conversation_terminal_notice_refusal_settles`] — which leaves the
+/// analogous `task-not-created` outstanding — is the part worth writing
+/// down, because the codes look symmetric and the entities are not.
+///
+/// A conversation is created *against* an existing task, so a notice
+/// arriving before that task exists is an ordering race inside one flow and
+/// waiting it out converges. A team is trusted application wiring, created
+/// ahead of the tasks that name it and never by a peer or a model, so a task
+/// naming a team that does not exist is a wiring mistake rather than a race
+/// — the wrong id, or a team never stood up. Waiting that out would trade a
+/// bounded, already-surfaced mistake (`max_unclaimed_millis` expires such a
+/// task through the cancellation machinery whole) for an exchange owed
+/// forever, whose every re-drive costs the receiver a durable write.
+///
+/// What settling costs, stated so the trade is visible: if that team is
+/// created *later* and the terminal task is posted to its board, the board
+/// holds an `Open` entry for work that already ended, and it closes the old
+/// lazy way — through a member's claim attempt refused
+/// `team-claim-task-terminal`. That is the pre-slice behavior, not a new
+/// hazard, and it needs a board post that no longer has any reason to happen.
 pub(crate) fn team_terminal_notice_refusal_settles(code: &str) -> bool {
     matches!(
         code,

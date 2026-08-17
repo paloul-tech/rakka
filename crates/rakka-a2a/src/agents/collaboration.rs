@@ -928,7 +928,7 @@ pub fn conversation_echo(cell: &rakka_agent::AgentTaskConversation) -> Value {
         "conversation-id": cell.conversation.as_str(),
         "conversation-status": cell.status.as_label(),
         "conversation-reason": cell.terminal_reason.code(),
-        "conversation-rounds": cell.round,
+        "conversation-rounds": cell.rounds_completed,
         "conversation-turns": cell.turns,
     })
 }

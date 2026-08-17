@@ -303,11 +303,15 @@ async fn a_notice_for_a_task_never_posted_settles_without_a_board_write() {
 
 #[tokio::test]
 async fn a_stale_release_reply_after_the_eager_close_is_absorbed() {
-    // The epoch-bump regression pin. The release settle arm for
-    // `team-claim-already-owned` restores an entry Active without checking
-    // the claim's currency; only the epoch guard absorbs it once the close
-    // moved the entry on. Without the bump this interleaving resurrected a
-    // Done entry as a live-looking Active one.
+    // The closed-entry regression pin. `settle_claim_action`'s
+    // `(Release, "team-claim-already-owned")` arm restores an entry Active,
+    // so a reply arriving after the eager close would resurrect a `Done`
+    // entry as a live-looking one — permanently, since claim, release, and
+    // transfer all refuse a closed entry and the terminal notice is owed
+    // once. Two guards cover it now: `Done` is absorbing under
+    // `settle_claim_action`, and the close bumps the epoch. The interleaving
+    // is what this test builds; every precondition it needs is asserted,
+    // because each one silently unbuilds it.
     let fx = world(true).await;
 
     // The claim records at the task — entry Pending, the assignment offer
@@ -332,6 +336,13 @@ async fn a_stale_release_reply_after_the_eager_close_is_absorbed() {
     )
     .await
     .expect("the release records");
+    let releasing = entry(&fx).await.expect("the entry stands");
+    assert_eq!(
+        releasing.status,
+        AgentTeamBoardEntryStatus::Releasing,
+        "the release decision committed, so its exchange is owed and undriven \
+         — the interleaving this pin needs"
+    );
 
     // The offer accepts, the task terminalizes, and its notice lands —
     // the entry closes under a bumped epoch while the release is still in
@@ -357,19 +368,54 @@ async fn a_stale_release_reply_after_the_eager_close_is_absorbed() {
     }
     let closed = entry(&fx).await.expect("the board holds the entry");
     assert_eq!(closed.status, AgentTeamBoardEntryStatus::Done);
+    // The claim reached the task and was *accepted* — the precondition the
+    // arm under test needs. Had it resolved through `resolve_team_claim_refusal`
+    // instead, `release_team_claim` would take its settled-claim early `Ok`,
+    // the team's accepted-Release branch would require `Releasing` and find
+    // `Done`, and both assertions below would pass against a guard that had
+    // been deleted.
+    assert!(
+        matches!(
+            fx.task_snapshot()
+                .await
+                .team_claim
+                .as_deref()
+                .map(|claim| &claim.status),
+            Some(rakka_agent::AgentTaskTeamClaimStatus::Accepted)
+        ),
+        "the release answers `team-claim-already-owned`, the one arm the \
+         guards below cover"
+    );
 
-    // Now the release's stale reply settles — and changes nothing.
+    // Now the release's stale reply is delivered and settles — and changes
+    // nothing. The pass must actually settle it: a reply that never arrived
+    // would leave every assertion below trivially true.
+    let mut settled = 0;
     for _round in 0..3 {
-        let _ = fx.settle_team_at(&team_scope()).await;
+        if let Ok(progress) = fx.settle_team_at(&team_scope()).await {
+            settled += progress.settled;
+        }
         let _ = fx.settle_task_at(&task_scope()).await;
     }
+    assert!(
+        settled >= 1,
+        "the outstanding release exchange really did drain onto the closed entry"
+    );
     let after = entry(&fx).await.expect("the board holds the entry");
     assert_eq!(
         after.status,
         AgentTeamBoardEntryStatus::Done,
-        "the stale release reply is absorbed by the epoch guard"
+        "and `settle_claim_action` declines to touch a closed entry at all"
     );
     assert!(after.claim.is_none());
+    assert_eq!(
+        after.claim_epoch, closed.claim_epoch,
+        "nothing ran: not even the arm's `last_code` write"
+    );
+    assert_eq!(
+        after.last_code, closed.last_code,
+        "the entry still carries the terminal reason the close echoed"
+    );
 }
 
 #[tokio::test]

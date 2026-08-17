@@ -3985,6 +3985,23 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   keep it alive. The record still changes and still persists; it simply
   does not claim to be a transition, and any later echo about another
   entity must follow the same rule.
+- **The round coordinate is a count, and named one.** `rounds_completed`
+  on both the notice and the task cell. `AgentConversation::round` is a
+  next-expected cursor that advances once per closed round, so on a
+  terminated conversation it counts the rounds that finished — but both
+  projections documented it as "the round it ended in", which is wrong
+  under `RoundsComplete`, the one flip that closes its final round before
+  ending. The value never changed; the name and the docs did, and the
+  public `conversation-rounds` echo already read as a count.
+- **The `team-not-found` / `task-not-created` divergence is documented**
+  on the classifier rather than left to look like an oversight: a
+  conversation is created against an existing task, so an early notice is
+  a race that waiting resolves; a team is trusted wiring created ahead of
+  the tasks naming it, so a task naming a missing one is a mistake the
+  unclaimed horizon already surfaces, and waiting would trade it for an
+  exchange owed forever. The cost of settling — a later-created team
+  holding an `Open` entry that closes the old lazy way — is named beside
+  it.
 - **Every growth point checks its bound, including the close.** The
   terminal close writes the reason code onto the entry, and
   `terminal_reason` is a free-form wire string capped only at
@@ -4115,7 +4132,9 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   Both snapshots expose their settled markers.
 - Proof roster: `tests/team_terminal_notice.rs` (8: the Active entry
   closing without a claim attempt — the done-when — the unclaimed close,
-  the never-posted idempotent no-op, the epoch regression pin, marker
+  the never-posted idempotent no-op, the closed-entry regression pin
+  (every precondition of its interleaving asserted, and failing only with
+  all three guards removed), marker
   quiescence, the committed-but-unsent window under an injected lost
   delivery, and self-covering crash sweeps over every team- and task-store
   write of the terminal flow), `tests/conversation_terminal_notice.rs` (9:

@@ -2562,8 +2562,11 @@ pub struct AgentTaskConversation {
     pub status: crate::conversation::AgentConversationStatus,
     /// Why it terminated.
     pub terminal_reason: crate::conversation::AgentConversationTerminalReason,
-    /// The round it ended in.
-    pub round: u64,
+    /// How many rounds *completed* before it ended — what the public
+    /// `conversation-rounds` echo carries, and a count rather than the
+    /// round index it was once documented as. See
+    /// [`crate::coordination::AgentConversationTerminalNotice::rounds_completed`].
+    pub rounds_completed: u64,
     /// How many turns it recorded over its life.
     pub turns: u64,
     /// When its terminal flip committed, by the conversation's owner clock.
@@ -10575,7 +10578,7 @@ fn apply_conversation_terminal(
         conversation: conversation.clone(),
         status: notice.status,
         terminal_reason: notice.terminal_reason,
-        round: notice.round,
+        rounds_completed: notice.rounds_completed,
         turns: notice.turns_recorded,
         ended_at: notice.ended_at,
         recorded_at: now,
@@ -15062,7 +15065,7 @@ mod team_claim_bounds_tests {
             task: task_id.clone(),
             status: crate::conversation::AgentConversationStatus::Ended,
             terminal_reason: crate::conversation::AgentConversationTerminalReason::RoundsComplete,
-            round: 1,
+            rounds_completed: 1,
             turns_recorded: 2,
             ended_at,
         };

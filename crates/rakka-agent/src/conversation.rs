@@ -1650,7 +1650,7 @@ fn owed_terminal_notice(
         task: conversation.task.clone(),
         status: conversation.status,
         terminal_reason,
-        round: conversation.round,
+        rounds_completed: conversation.round,
         turns_recorded: conversation.turns().len() as u64,
         ended_at: conversation.ended_at.unwrap_or(now),
     };
