@@ -11,10 +11,12 @@ use common::{task_scope, tenant, Fixture, TENANT};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::AgentRevisionNumber;
 use rakka_agent::{
-    AgentAssignmentStatus, AgentGoalId, AgentId, AgentOperationId, AgentOperationKind, AgentScope,
-    AgentTaskContent, AgentTaskCreation, AgentTaskEntityCommand, AgentTaskStatus,
-    AgentTaskTerminalReason, AgentTeamCreation, AgentTeamEntityCommand, AgentTeamId,
-    AgentTeamPolicy, AgentTeamScope, AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS,
+    AgentAssignmentStatus, AgentConversationCompletionRule, AgentConversationCreation,
+    AgentConversationEntityCommand, AgentConversationId, AgentConversationMode,
+    AgentConversationScope, AgentGoalId, AgentId, AgentModerationPolicy, AgentOperationId,
+    AgentOperationKind, AgentScope, AgentTaskContent, AgentTaskCreation, AgentTaskEntityCommand,
+    AgentTaskStatus, AgentTaskTerminalReason, AgentTeamCreation, AgentTeamEntityCommand,
+    AgentTeamId, AgentTeamPolicy, AgentTeamScope, AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
@@ -79,6 +81,129 @@ async fn create_board_task(fx: &Fixture) {
     .expect("the board task creates");
 }
 
+/// Ends a conversation this task governs, and drains the terminal notice
+/// onto the task — the provenance cell, recorded mid-wait.
+async fn govern_a_conversation_that_ends(fx: &Fixture, conversation: &str) {
+    let scope = AgentConversationScope::new(
+        tenant(),
+        AgentConversationId::new(conversation).expect("the conversation id is valid"),
+    )
+    .expect("the conversation scope is valid");
+    let moderator = member("moderator");
+    fx.apply_conversation_command_at(
+        &scope,
+        AgentConversationEntityCommand::Create {
+            operation_id: rakka_agent::conversation_create_operation_id(
+                &tenant(),
+                scope.conversation(),
+            )
+            .expect("the operation id derives"),
+            creation: Box::new(AgentConversationCreation {
+                moderator: moderator.clone(),
+                participants: vec![member("p1"), member("p2")],
+                mode: AgentConversationMode::RoundRobin,
+                completion: AgentConversationCompletionRule::ModeratorDecides,
+                policy: AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).with_max_rounds(1),
+                task: task_scope().task().clone(),
+                tokens: Some(1_000),
+                max_wall_clock_millis: None,
+                transcript_ref: None,
+            }),
+        },
+    )
+    .await
+    .expect("the conversation creates");
+
+    fx.apply_conversation_command_at(
+        &scope,
+        AgentConversationEntityCommand::EndEarly {
+            operation_id: rakka_agent::conversation_end_operation_id(
+                &tenant(),
+                scope.conversation(),
+                0,
+                "resolved",
+            )
+            .expect("the operation id derives"),
+            moderator,
+            expected_round: 0,
+            reason: "resolved".to_string(),
+            provenance: Box::new(rakka_agent::AgentRevisionProvenance {
+                principal: rakka_agent_workflow::PrincipalRef {
+                    principal_type: "user".to_string(),
+                    principal_id: "operator-7".to_string(),
+                    display_name: None,
+                },
+                accepted_at: rakka_agent_workflow::AgentTimestampMillis::new(1),
+                causation_id: rakka_agent_workflow::AgentCausationId::new("cause-1"),
+                audit_ref: rakka_agent_workflow::AgentAuditEventId::new("audit-1"),
+            }),
+        },
+    )
+    .await
+    .expect("the early end applies");
+    let _ = fx.settle_conversation_at(&scope).await;
+}
+
+#[tokio::test]
+async fn a_governed_conversations_end_does_not_postpone_the_unclaimed_horizon() {
+    // The provenance cell records what *another* entity did; it is not a
+    // transition of this task, so it must not re-arm the wait. If it did, the
+    // horizon would be extendable by anything that can write to the task —
+    // and a task keeps no registry of the conversations naming it, so it
+    // cannot tell one that legitimately governs it from a series minted to
+    // keep it alive. A never-claimed task and its delegated escrow could then
+    // be parked forever past exactly the wait this horizon exists to bound.
+    let fx = fixture();
+    create_board_task(&fx).await;
+
+    // Two conversations end deep inside the horizon, the second at its very
+    // edge — under the old clock either one alone would have restarted it.
+    fx.clock.store(
+        AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS / 2,
+        Ordering::SeqCst,
+    );
+    govern_a_conversation_that_ends(&fx, "standup").await;
+    fx.clock.store(
+        AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS - 10_000,
+        Ordering::SeqCst,
+    );
+    govern_a_conversation_that_ends(&fx, "retro").await;
+
+    let task = fx.task_snapshot().await;
+    assert_eq!(task.conversations, 2, "both cells recorded");
+    assert!(
+        !task.status.is_terminal(),
+        "still inside the horizon, still waiting: {:?} / {:?}",
+        task.status,
+        task.terminal_reason
+    );
+
+    // And the horizon still lands where the definition put it, measured from
+    // the task's own last transition rather than from the last notice.
+    fx.clock.store(
+        AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS + 1_000,
+        Ordering::SeqCst,
+    );
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let task = fx.task_snapshot().await;
+    assert_eq!(
+        task.status,
+        AgentTaskStatus::Cancelled,
+        "the wait is bounded by the definition, not by who last wrote to it"
+    );
+    assert!(
+        matches!(
+            task.terminal_reason,
+            Some(AgentTaskTerminalReason::CancellationRequested { ref reason })
+                if reason == "unclaimed-expired"
+        ),
+        "got {:?}",
+        task.terminal_reason
+    );
+}
+
 #[tokio::test]
 async fn an_unclaimed_board_task_expires_at_its_horizon() {
     let fx = fixture();
@@ -116,6 +241,19 @@ async fn an_unclaimed_board_task_expires_at_its_horizon() {
         ),
         "the terminal reason names the unclaimed expiry, got {:?}",
         task.terminal_reason
+    );
+
+    // The expiry is a terminal like any other, so the eager notice went out
+    // to the governing team — which never existed here. `team-not-found` is
+    // a definitive refusal: the notice settles instead of re-driving
+    // forever against a board that will never answer.
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let task = fx.task_snapshot().await;
+    assert!(
+        task.team_terminal_notice_settled,
+        "a missing team settles the notice definitively"
     );
 }
 

@@ -586,4 +586,17 @@ fn the_kind_vocabulary_is_injective_across_the_scopes_that_share_a_label() {
     ];
     let labels: BTreeSet<String> = created.iter().map(|kind| kind.as_label()).collect();
     assert_eq!(labels.len(), created.len(), "labels: {labels:?}");
+
+    // The terminal-notice rows both sides of slice 5.5b record stay
+    // scope-qualified too, so a replay reader tells the task's provenance
+    // row from the board's close row.
+    assert_eq!(
+        AgentCoordinationEventKind::Task(AgentTaskHistoryKind::ConversationTerminalRecorded)
+            .as_label(),
+        "task/conversation-terminal-recorded"
+    );
+    assert_eq!(
+        AgentCoordinationEventKind::Team(AgentTeamHistoryKind::TaskClosed).as_label(),
+        "team/team-task-closed"
+    );
 }

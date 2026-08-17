@@ -56,7 +56,7 @@ use crate::identity::{
     AgentTeamClaimId, AgentTeamScope, TenantId,
 };
 use crate::model::AgentToolCallId;
-use crate::task::{AgentAssignmentGeneration, AgentContentDigest};
+use crate::task::{AgentAssignmentGeneration, AgentContentDigest, AgentTaskStatus};
 
 /// Result type for coordination construction and validation.
 pub type AgentCoordinationResult<T> = Result<T, AgentCoordinationError>;
@@ -473,6 +473,185 @@ pub struct AgentTeamClaimResultNotice {
     pub epoch: u64,
     /// How it resolved.
     pub outcome: AgentTeamClaimOutcome,
+}
+
+/// Derives the stable operation id of the one terminal notice a task ever
+/// owes its governing team's board.
+///
+/// Pure over `(tenant, team, task)`: terminality is absorbing — a task
+/// terminalizes at most once, under one immutable governing team — so one
+/// logical notice exists per task, ever, and every re-derivation after any
+/// loss owes the identical operation
+/// ([specification 9.8](../../../docs/plans/rakka-agent/spec.md)).
+pub fn team_terminal_notice_operation_id(
+    tenant: &TenantId,
+    team: &crate::identity::AgentTeamId,
+    task: &AgentTaskId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::TeamOperation,
+        [
+            tenant.as_str(),
+            team.as_str(),
+            task.as_str(),
+            "terminal-notice",
+        ],
+    )
+}
+
+/// Derives the stable operation id of the one terminal notice a conversation
+/// ever owes its governing task.
+///
+/// Pure over `(tenant, conversation)`: the terminal flip is absorbing —
+/// rounds-complete, moderator-ended, or expired, first writer wins — so one
+/// logical notice exists per conversation, ever, and every re-derivation
+/// after any loss owes the identical operation.
+pub fn conversation_terminal_notice_operation_id(
+    tenant: &TenantId,
+    conversation: &AgentConversationId,
+) -> Result<AgentOperationId, AgentIdentityError> {
+    AgentOperationId::new(
+        AgentOperationKind::ConversationOperation,
+        [tenant.as_str(), conversation.as_str(), "terminal-notice"],
+    )
+}
+
+/// Payload type of the terminal-notice exchange a task drives onto its
+/// governing team's board.
+pub const AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE: &str = "rakka.agent.TeamTerminalNotice";
+
+/// Payload type of the terminal-notice exchange a conversation drives onto
+/// its governing task.
+pub const AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE: &str =
+    "rakka.agent.ConversationTerminalNotice";
+
+/// The notice payload of one
+/// [`crate::choreography::AgentExchangeKind::TeamTerminalNotice`] exchange
+/// (task → governing team).
+///
+/// Identities and stable codes only — the board closes the entry and echoes
+/// the reason; it never mirrors result content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTeamTerminalNotice {
+    /// The terminal task closing its board entry.
+    pub task: AgentTaskScope,
+    /// The task's terminal status.
+    pub status: AgentTaskStatus,
+    /// The terminal reason's stable code
+    /// ([`crate::task::AgentTaskTerminalReason::code`]).
+    pub terminal_reason: String,
+}
+
+/// The notice payload of one
+/// [`crate::choreography::AgentExchangeKind::ConversationTerminalNotice`]
+/// exchange (conversation → governing task).
+///
+/// Identity and coordinates only — never transcript bodies; the transcript
+/// stays behind the conversation's own authorized surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConversationTerminalNotice {
+    /// The terminated conversation reporting itself.
+    pub conversation: crate::identity::AgentConversationScope,
+    /// The governing task the conversation was created against.
+    pub task: AgentTaskId,
+    /// The conversation's terminal status.
+    pub status: crate::conversation::AgentConversationStatus,
+    /// Why it terminated.
+    pub terminal_reason: crate::conversation::AgentConversationTerminalReason,
+    /// How many rounds *completed* before it ended.
+    ///
+    /// [`crate::conversation::AgentConversation::round`] is a next-expected
+    /// cursor on a live conversation, and it advances exactly once per
+    /// closed round, so on a terminated one the same number is the count of
+    /// rounds that finished. Named for the reading that holds here: as an
+    /// index it would be wrong under `RoundsComplete`, which closes the
+    /// final round before flipping and so leaves the cursor one past the
+    /// last round that ran.
+    pub rounds_completed: u64,
+    /// How many turns were recorded over the conversation's life.
+    pub turns_recorded: u64,
+    /// When the terminal flip committed.
+    pub ended_at: AgentTimestampMillis,
+}
+
+/// Whether one refusal code definitively settles a team terminal notice at
+/// its initiating task.
+///
+/// One classifier for both ends of the exchange — the task's settle rule and
+/// the team's memoization gate — so the two sides agree by construction:
+/// a code in this list settles the notice *and* memoizes at the receiver; a
+/// code outside it stays outstanding *and* re-runs the receiving arm on the
+/// next drive. A closed team is frozen as history, and a verdict the payload
+/// itself fails — forged, or reporting a task that has not ended — never
+/// changes on replay: the courier re-delivers the *stored* envelope rather
+/// than re-deriving it, so the same bytes answer the same way for as long as
+/// they exist.
+///
+/// `team-not-found` settles here, and the deliberate divergence from
+/// [`conversation_terminal_notice_refusal_settles`] — which leaves the
+/// analogous `task-not-created` outstanding — is the part worth writing
+/// down, because the codes look symmetric and the entities are not.
+///
+/// A conversation is created *against* an existing task, so a notice
+/// arriving before that task exists is an ordering race inside one flow and
+/// waiting it out converges. A team is trusted application wiring, created
+/// ahead of the tasks that name it and never by a peer or a model, so a task
+/// naming a team that does not exist is a wiring mistake rather than a race
+/// — the wrong id, or a team never stood up. Waiting that out would trade a
+/// bounded, already-surfaced mistake (`max_unclaimed_millis` expires such a
+/// task through the cancellation machinery whole) for an exchange owed
+/// forever, whose every re-drive costs the receiver a durable write.
+///
+/// What settling costs, stated so the trade is visible: if that team is
+/// created *later* and the terminal task is posted to its board, the board
+/// holds an `Open` entry for work that already ended, and it closes the old
+/// lazy way — through a member's claim attempt refused
+/// `team-claim-task-terminal`. That is the pre-slice behavior, not a new
+/// hazard, and it needs a board post that no longer has any reason to happen.
+pub(crate) fn team_terminal_notice_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "team-not-found"
+            | "team-terminal-notice-forged"
+            | "team-terminal-notice-not-terminal"
+            | "team-expired"
+            | "team-disbanded"
+    )
+}
+
+/// Whether one refusal code definitively settles a conversation terminal
+/// notice at its initiating conversation.
+///
+/// The same two-ended classifier discipline as
+/// [`team_terminal_notice_refusal_settles`], and only a forged verdict
+/// qualifies — the one answer that cannot change on a later re-drive.
+///
+/// Two refusals are deliberately absent, both for the same reason: the task
+/// is not saying *never*, it is saying *not yet*. `task-not-created` is the
+/// dependency-registration posture — a notice racing its task's creation
+/// converges on a re-drive instead of memoizing the miss. A record too full
+/// to grow the provenance cell is the sharper case, because the receiver's
+/// own bound is what moves: it charges a pre-terminal task the
+/// [`crate::task::AGENT_TASK_STATE_GROWTH_RESERVE_BYTES`] headroom that
+/// task's remaining lifecycle still needs, and a terminal task nothing at
+/// all, so the very cell that will not fit today fits once the task
+/// terminalizes. Settling on it would quiesce both ends over a refusal the
+/// receiver is about to stop making, and the provenance would be lost for
+/// good.
+///
+/// `task-dependency-limit-exceeded` is the *other* exit of that same bound
+/// check, and it classifies the opposite way. The task's dependency map only
+/// ever grows, and recording a conversation cell does not touch it, so a
+/// record already over its ceiling refuses this notice identically forever —
+/// leaving it outstanding would re-run the receiving arm, and its durable
+/// write, on every settle pass for the life of both entities. A bound this
+/// exchange can never satisfy is a definitive answer even though a bound it
+/// merely has to wait out is not.
+pub(crate) fn conversation_terminal_notice_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "conversation-terminal-notice-forged" | "task-dependency-limit-exceeded"
+    )
 }
 
 /// One coordination capability descriptor: the policy payload behind one

@@ -376,9 +376,9 @@ impl AgentExchangeParticipant for ChoreographyProbe {
             AgentExchangeKind::BudgetSettlement => apply_ledger(state, envelope, -1),
             // An epoch result, a goal evaluation, a delegation result, a
             // cancellation request, a handoff resolution, a team-board
-            // exchange, or a dependency edge is a durable transition but not
-            // a balance movement: the probe records the application without
-            // crediting.
+            // exchange, a dependency edge, or a terminal notice is a durable
+            // transition but not a balance movement: the probe records the
+            // application without crediting.
             AgentExchangeKind::EpochResult
             | AgentExchangeKind::GoalEvaluation
             | AgentExchangeKind::DelegationResult
@@ -388,7 +388,9 @@ impl AgentExchangeParticipant for ChoreographyProbe {
             | AgentExchangeKind::TeamClaim
             | AgentExchangeKind::TeamClaimResult
             | AgentExchangeKind::DependencyRegistration
-            | AgentExchangeKind::DependencyOutcome => apply_ledger(state, envelope, 0),
+            | AgentExchangeKind::DependencyOutcome
+            | AgentExchangeKind::TeamTerminalNotice
+            | AgentExchangeKind::ConversationTerminalNotice => apply_ledger(state, envelope, 0),
         };
 
         // Every applied exchange is a transition, whether it accepted or

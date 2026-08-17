@@ -728,6 +728,126 @@ async fn team_operations_count_once_under_bounded_labels() {
     );
 }
 
+/// A task's terminal notice closing its board entry counts `close`/`applied`
+/// once at the team's accept boundary, and a replayed delivery — answered
+/// from the applied log — counts nothing
+/// ([specification 8.10 and 17.12](../../../docs/plans/rakka-agent/spec.md)).
+#[tokio::test]
+async fn a_terminal_notice_close_counts_once() {
+    use rakka_agent::{
+        team_terminal_notice_operation_id, AgentGoalId, AgentRevisionNumber, AgentTeamCreation,
+        AgentTeamEntityCommand, AgentTeamId, AgentTeamPolicy, AgentTeamScope,
+        AgentTeamTerminalNotice, AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+        METRIC_AGENT_TEAM_OPERATIONS,
+    };
+
+    let metrics = Arc::new(InMemoryMetricsRecorder::new());
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ))
+    .with_metrics(metrics.clone());
+
+    let scope = AgentTeamScope::new(
+        tenant(),
+        AgentTeamId::new("metrics-team").expect("the team id is valid"),
+    )
+    .expect("the team scope is valid");
+    let op = |discriminator: &str| {
+        AgentOperationId::new(
+            AgentOperationKind::TeamOperation,
+            [TENANT, "metrics-team", discriminator],
+        )
+        .expect("the operation id derives")
+    };
+    let mut members: std::collections::BTreeMap<
+        rakka_agent::AgentId,
+        std::collections::BTreeSet<rakka_agent::AgentCapabilityId>,
+    > = Default::default();
+    members.insert(agent_id(), Default::default());
+    fx.apply_team_command_at(
+        &scope,
+        AgentTeamEntityCommand::Create {
+            operation_id: op("create"),
+            creation: Box::new(AgentTeamCreation {
+                leader: agent_id(),
+                root_goal: AgentGoalId::new("metrics-goal").expect("the goal id is valid"),
+                policy: AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+                members,
+            }),
+        },
+    )
+    .await
+    .expect("the team creates");
+    fx.apply_team_command_at(
+        &scope,
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post"),
+            task: task_scope().task().clone(),
+            posted_by: agent_id(),
+        },
+    )
+    .await
+    .expect("the post applies");
+
+    let notice = AgentTeamTerminalNotice {
+        task: task_scope(),
+        status: AgentTaskStatus::Cancelled,
+        terminal_reason: "cancellation-requested".to_string(),
+    };
+    let operation = team_terminal_notice_operation_id(&tenant(), scope.team(), task_scope().task())
+        .expect("the operation id derives");
+    let envelope = AgentExchangeEnvelope::new(
+        operation.clone(),
+        AgentExchangeKind::TeamTerminalNotice,
+        AgentEntityAddress::Task(task_scope()),
+        AgentEntityAddress::Team(scope.clone()),
+        AgentExchangePayload::encode(AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE, &notice)
+            .expect("the payload encodes"),
+        AgentCorrelationId::new(operation.as_str()),
+        fx.now(),
+    )
+    .expect("the envelope builds");
+
+    let mut team = rakka_agent::AgentTeamEntityStore::new(
+        scope.clone(),
+        fx.teams.clone(),
+        fx.team_history.clone(),
+    )
+    .with_metrics(metrics.clone());
+    team.recover(fx.now()).await.expect("the team recovers");
+    team.accept(&envelope, &fx.router, fx.now())
+        .await
+        .expect("the notice applies");
+    // The replay answers from the applied log and counts nothing.
+    team.accept(&envelope, &fx.router, fx.now())
+        .await
+        .expect("the replay answers");
+
+    let snapshot = metrics.snapshot();
+    for observation in snapshot.observations_named(METRIC_AGENT_TEAM_OPERATIONS) {
+        assert_eq!(observation.kind(), MetricKind::Counter);
+        let attributes: Vec<(&str, &str)> = observation
+            .attributes()
+            .iter()
+            .map(|attribute| (attribute.key(), attribute.value()))
+            .collect();
+        validate_agent_domain_metric_attributes(&attributes)
+            .expect("every team-operation label is bounded");
+    }
+    let labels = labels_of(&snapshot, METRIC_AGENT_TEAM_OPERATIONS);
+    let closes = labels
+        .iter()
+        .filter(|label| {
+            label.contains(&("operation".to_string(), "close".to_string()))
+                && label.contains(&("outcome".to_string(), "applied".to_string()))
+        })
+        .count();
+    assert_eq!(
+        closes, 1,
+        "one close per durable application, none for the replay"
+    );
+}
+
 /// Moderation turn operations count once per durable decision under bounded
 /// `operation`/`outcome` labels, a duplicate — or a past-window ledger echo
 /// — counts nothing, and every observation still passes the bounded guard

@@ -761,6 +761,30 @@ pub fn parse_collaboration_envelope(
             reason: "a collaboration send must carry the io.rakka.collaboration metadata object",
         });
     };
+    // `io.rakka.collaboration` carries two directions: this inbound command
+    // envelope, and the bounded echo the task projection writes back out.
+    // Every cluster shape below requires `schema`; no echo carries one. So
+    // the version declaration is checked *before* the discriminators, and
+    // that ordering is what keeps this surface from classifying an echo as a
+    // command: `team_echo` and `handoff_echo` key their identity on the bare
+    // cluster names discriminated on here, and both are shipped
+    // compatibility surface that cannot be renamed. Without this gate, a
+    // client or relay that round-tripped a task's collaboration object onto
+    // a send was refused under whichever cluster its echoes happened to trip
+    // first — so the answer it got depended on that task's collaboration
+    // history rather than on what it sent, and a task that both handed off
+    // and governed a conversation changed branches. Refused either way; the
+    // point is that the refusal now names the real defect.
+    let declares_schema = payload
+        .as_object()
+        .is_some_and(|object| object.contains_key("schema"));
+    if !declares_schema {
+        return Err(RakkaAgentA2AError::Unsupported {
+            operation: "agent-collaboration",
+            reason: "the collaboration metadata object declares no schema version; a task \
+                     projection's collaboration echo is not a collaboration command",
+        });
+    }
     // The conversation cluster discriminates first, then the team cluster,
     // then the handoff cluster: each shape's `deny_unknown_fields` makes a
     // payload carrying more than one discriminator fail the send whole
@@ -877,5 +901,34 @@ pub fn team_echo(claim: &rakka_agent::AgentTaskTeamClaim) -> Value {
         "team-claim-generation": claim
             .target_generation
             .map(rakka_agent::AgentAssignmentGeneration::get),
+    })
+}
+
+/// The bounded conversation echo the public task projection carries: the
+/// latest terminated conversation's identity, terminal status and reason,
+/// and its round/turn coordinates — identity and coordinates only, never
+/// transcript content
+/// ([specification 8.11](../../../../docs/plans/rakka-agent/spec.md)).
+///
+/// The identity key is `conversation-id`, **not** the bare `conversation`
+/// its delegation, handoff, and team siblings use, and that is deliberate:
+/// `io.rakka.collaboration` is one key carrying two directions, the outbound
+/// projection echo and the inbound command envelope, and
+/// [`parse_collaboration_envelope`] discriminates the inbound clusters on
+/// exactly those bare names. An echo keyed `conversation` would sit ahead of
+/// `team` and `handoff` in that order, so a task's own echo object decided
+/// which cluster a round-tripped send was read as. The two older echoes
+/// cannot be renamed — they are shipped compatibility surface — so the
+/// parser gates on the `schema` no echo carries; this key keeps the newest
+/// echo out of the collision to begin with. Any echo added later must do
+/// the same.
+#[must_use]
+pub fn conversation_echo(cell: &rakka_agent::AgentTaskConversation) -> Value {
+    serde_json::json!({
+        "conversation-id": cell.conversation.as_str(),
+        "conversation-status": cell.status.as_label(),
+        "conversation-reason": cell.terminal_reason.code(),
+        "conversation-rounds": cell.rounds_completed,
+        "conversation-turns": cell.turns,
     })
 }

@@ -759,8 +759,10 @@ pub const METRIC_AGENT_FAN_IN_RESOLUTIONS: &str = "rakka.agent.fan_in.resolution
 pub const METRIC_AGENT_WORKFLOW_RESULTS: &str = "rakka.agent.workflow.results";
 
 /// Counter: team board and lifecycle operations committed at the team
-/// entity's door, labeled by bounded `operation` (the command's closed label)
-/// and `outcome` (`applied` / `refused` / `activated` / `reopened`)
+/// entity's door, labeled by bounded `operation` (the command's closed
+/// label, plus the out-of-band `expire` for the lazy expiry flip and
+/// `close` for a task's terminal notice closing its board entry) and
+/// `outcome` (`applied` / `refused` / `activated` / `reopened`)
 /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)). A
 /// duplicate command answered from the operation log records nothing, so a
 /// replay never double-counts.

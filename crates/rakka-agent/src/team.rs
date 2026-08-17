@@ -125,6 +125,9 @@ pub const AGENT_TEAM_HISTORY_MAX_PAGE_SIZE: usize = 64;
 /// Payload type of the bounded receipt a team returns for a claim result.
 pub const AGENT_TEAM_CLAIM_RESULT_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.TeamClaimResultReceipt";
 
+/// Payload type of the bounded receipt a team returns for a terminal notice.
+pub const AGENT_TEAM_TERMINAL_RECEIPT_PAYLOAD_TYPE: &str = "rakka.agent.TeamTerminalReceipt";
+
 const DEFAULT_AGENT_TEAM_PASSIVATION_BUFFER_DURATION: Duration = Duration::from_millis(25);
 
 fn bounded_detail(detail: impl Into<String>) -> String {
@@ -443,6 +446,10 @@ pub enum AgentTeamHistoryKind {
     /// A claim resolved — activated, refused, released, superseded, or
     /// closed by a terminal echo.
     ClaimSettled,
+    /// A board entry closed eagerly by its task's terminal notice
+    /// ([specification 8.10](../../../docs/plans/rakka-agent/spec.md));
+    /// the detail carries the task's terminal-reason code.
+    TaskClosed,
     /// A pending claim transferred to another member.
     TransferRecorded,
     /// A mediated message was appended to the ring.
@@ -465,6 +472,7 @@ impl AgentTeamHistoryKind {
             Self::ClaimRecorded => "team-claim-recorded",
             Self::ClaimReleaseRequested => "team-claim-release-requested",
             Self::ClaimSettled => "team-claim-settled",
+            Self::TaskClosed => "team-task-closed",
             Self::TransferRecorded => "team-transfer-recorded",
             Self::MessageAppended => "team-message-appended",
             Self::Disbanded => "team-disbanded",
@@ -1215,6 +1223,7 @@ impl AgentExchangeParticipant for AgentTeamParticipant {
     ) -> AgentExchangeTransition {
         let result = match envelope.kind() {
             AgentExchangeKind::TeamClaimResult => apply_claim_result(state, envelope, now),
+            AgentExchangeKind::TeamTerminalNotice => apply_team_terminal(state, envelope, now),
             kind => refuse(
                 "unsupported-exchange",
                 format!("a team entity does not receive a {kind} exchange"),
@@ -1253,6 +1262,24 @@ impl AgentExchangeParticipant for AgentTeamParticipant {
                     ) => Ok(()),
                     code => Err(AgentChoreographyError::UnsettleableRefusal {
                         kind: AgentExchangeKind::TeamClaim,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            AgentExchangeKind::TeamTerminalNotice if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the host
+                // memoizes only the refusals classified definitive here, so
+                // an undecodable payload stays unmemoized and re-runs the
+                // arm once the binary can decode it (the rolling-upgrade
+                // rule).
+                match result.status().rejection_code() {
+                    Some(code)
+                        if crate::coordination::team_terminal_notice_refusal_settles(code) =>
+                    {
+                        Ok(())
+                    }
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::TeamTerminalNotice,
                         code: code.unwrap_or_default().to_string(),
                     }),
                 }
@@ -1448,6 +1475,143 @@ fn apply_claim_result(
     accepted()
 }
 
+/// Applies one delivered terminal notice: the task ended, and its board
+/// entry closes eagerly instead of lingering until a member's claim attempt
+/// is refused ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Two payload fences guard an irreversible decision: the notice must be
+/// initiated by the task it names, *and* it must report that task as ended.
+/// The first proves who sent it, never that the sender is terminal.
+///
+/// The close bumps the entry's claim epoch — it is a board decision — so
+/// every stale in-flight board reply settles into the epoch guard as a
+/// no-op afterwards. That is defense in depth rather than the only defense:
+/// [`settle_claim_action`] refuses to touch a `Done` entry at all, which is
+/// what also covers the lazy close, since it closes at the entry's current
+/// epoch. Deliberately no active-team gate, the [`apply_claim_result`]
+/// posture: the board is data, and an expired team's entry still deserves
+/// closing. A missing or already-`Done` entry accepts idempotently with no
+/// board write — the `Done` entry is the durable echo past the journal's
+/// bounded window, and a task never posted here has nothing to close.
+fn apply_team_terminal(
+    state: &mut AgentTeamState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeResult {
+    let refuse_terminal = |code: &str, message: String| {
+        AgentExchangeResult::rejected(
+            code,
+            message,
+            AgentExchangePayload::empty(AGENT_TEAM_TERMINAL_RECEIPT_PAYLOAD_TYPE),
+        )
+    };
+    let accepted_terminal = || {
+        AgentExchangeResult::accepted(AgentExchangePayload::empty(
+            AGENT_TEAM_TERMINAL_RECEIPT_PAYLOAD_TYPE,
+        ))
+    };
+    let notice: crate::coordination::AgentTeamTerminalNotice = match envelope
+        .payload()
+        .decode(crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE)
+    {
+        // Non-settling by the shared classifier, so a newer binary's payload
+        // converges after a rolling upgrade instead of being refused for
+        // good.
+        Ok(notice) => notice,
+        Err(error) => {
+            return refuse_terminal("team-terminal-notice-undecodable", error.to_string())
+        }
+    };
+    // The initiator must be the task the notice names: a notice about task T
+    // sent by anything but T's entity is forged, however well formed.
+    match envelope.initiator() {
+        AgentEntityAddress::Task(scope) if scope == &notice.task => {}
+        _ => {
+            return refuse_terminal(
+                "team-terminal-notice-forged",
+                "a terminal notice must be initiated by the task it reports".to_string(),
+            )
+        }
+    }
+    // ...and it must actually report an ended task. The fence above proves
+    // *who* sent the notice, never that the sender is terminal, and the two
+    // are not the same claim: a task's own entity is the only legitimate
+    // sender either way. The close is irreversible — the entry goes `Done`,
+    // any standing claim is dropped, and nothing can reopen it — so a notice
+    // populated non-terminally (a rolling-upgrade peer, a re-derivation on a
+    // new terminal path that forgets the status, an envelope minted before a
+    // state rewind) would evict a working member from live work for good.
+    // The payload already carries the fact, so the check is structural.
+    if !notice.status.is_terminal() {
+        return refuse_terminal(
+            "team-terminal-notice-not-terminal",
+            format!(
+                "a terminal notice must report an ended task, but {} is {}",
+                notice.task.task(),
+                notice.status
+            ),
+        );
+    }
+    if state.team.is_none() {
+        return refuse_terminal(
+            "team-not-found",
+            "no team exists under this scope".to_string(),
+        );
+    }
+    let operation_id = envelope.operation_id().clone();
+    let task_id = notice.task.task().clone();
+    let team = state.team.as_mut().expect("checked above");
+    let Some(entry) = team.board.get_mut(&task_id) else {
+        // Never posted here, or already evicted under ceiling pressure:
+        // nothing to close, and the answer must be idempotent — a replay
+        // after eviction converges on the same acceptance.
+        return accepted_terminal();
+    };
+    if entry.status == AgentTeamBoardEntryStatus::Done {
+        // The durable echo past the journal window — closed by an earlier
+        // delivery of this notice or by a lazy claim refusal.
+        return accepted_terminal();
+    }
+    let detail = bounded_detail(notice.terminal_reason);
+    let member = entry.claim.as_ref().map(|claim| claim.member.clone());
+    let previous = entry.clone();
+    entry.status = AgentTeamBoardEntryStatus::Done;
+    entry.claim_epoch = entry.claim_epoch.saturating_add(1);
+    entry.claim = None;
+    entry.last_code = Some(detail.clone());
+    // The close usually *shrinks* the entry — a dropped claim costs more
+    // bytes than the code echo adds — but not when it closes an entry no
+    // claim ever named, and `terminal_reason` arrives as a free-form wire
+    // string bounded only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. Thirty-two
+    // entries closed that way carry up to sixteen kilobytes against an
+    // effective cap of twenty-eight, so this is a growth point and must be
+    // bounded like every other: `post_task` checks, and so does this.
+    //
+    // Unchecked, the overflow surfaced somewhere else entirely — the next
+    // `post_task`, `add_member`, or any transition that *does* check — and
+    // wedged the board there, with the bytes that caused it already durable.
+    // Validate-then-mutate is literal here for the same reason it is at
+    // `record_team_claim`: the accept path persists state even under a
+    // refusal, so a refusal must leave the board exactly as it found it.
+    if let Err(error) = team.check_bounds() {
+        team.board.insert(task_id, previous);
+        return refuse_terminal(error.code(), error.to_string());
+    }
+    state.record_history(|sequence| {
+        let mut history = AgentTeamHistoryEntry::new(
+            sequence,
+            AgentTeamHistoryKind::TaskClosed,
+            operation_id,
+            now,
+        )
+        .with_task(task_id)
+        .with_detail(detail);
+        history.member = member;
+        history
+    });
+    accepted_terminal()
+}
+
 /// Settles the reply of one claim action the team initiated.
 fn settle_claim_action(
     state: &mut AgentTeamState,
@@ -1474,6 +1638,21 @@ fn settle_claim_action(
     // Only the reply of the entry's *current* decision settles it; a reply
     // to a superseded epoch is absorbed — the board already moved on.
     if entry.claim_epoch != command.epoch {
+        return;
+    }
+    // `Done` is absorbing, and no settle consequence may reopen it: eviction
+    // is the only thing that removes a closed entry, and `claim_entry`,
+    // `release_entry`, and `transfer_entry` all refuse one — so an entry
+    // wrongly reopened here can never be closed again, because the terminal
+    // notice that would close it is owed exactly once.
+    //
+    // The epoch guard above is not enough on its own. The eager close bumps
+    // the epoch, but the *lazy* close — the `team-claim-task-terminal` arm
+    // below — closes the entry at its current epoch, so a second definitive
+    // reply for that same epoch matches, and the arms that restore an entry
+    // `Active` or `Open` would rewrite a closed entry around a claim no task
+    // ever accepted.
+    if entry.status == AgentTeamBoardEntryStatus::Done {
         return;
     }
 
@@ -1532,8 +1711,16 @@ fn settle_claim_action(
             (AgentTeamBoardEntryStatus::Active, true)
         }
         // Our own claimant's assignment accepted while the release was in
-        // flight; the claim stands and the entry is owned.
+        // flight; the claim stands and the entry is owned. Guarded on that
+        // claim still being the entry's current one, exactly as the five
+        // sibling arms are: this arm keeps the claim rather than clearing
+        // it, so against a board that has already moved to a newer claim it
+        // would mark *that* claim's entry owned on the strength of an
+        // acceptance belonging to the previous one.
         (AgentTeamClaimAction::Release, "team-claim-already-owned") => {
+            if !claim_is_current {
+                return;
+            }
             (AgentTeamBoardEntryStatus::Active, false)
         }
         // The generation is offered and undecided: the release restores to
@@ -2189,6 +2376,15 @@ where
             if let Some(outcome) = outcome {
                 self.count_operation("claim", outcome);
             }
+        }
+        if envelope.kind() == AgentExchangeKind::TeamTerminalNotice
+            && !reply.is_replayed()
+            && reply.result().is_accepted()
+        {
+            // Counted once per fresh application, replays never; an
+            // idempotent no-entry acceptance counts too — the operation is
+            // the notice's application, not the entry mutation.
+            self.count_operation("close", "applied");
         }
         let _ = router;
         self.flush_history(now).await?;
@@ -3676,5 +3872,414 @@ impl From<AgentTeamError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod board_guard_tests {
+    use super::*;
+    use crate::coordination::{team_claim_id_for, AgentTeamClaimAction, AgentTeamClaimCommand};
+    use crate::identity::{AgentOperationKind, AgentTeamId, AgentTeamScope, TenantId};
+    use crate::task::AgentTaskStatus;
+
+    const TEAM: &str = "support";
+    const LEADER: &str = "lead";
+    const MEMBER: &str = "worker-a";
+    const TASK: &str = "ticket-1";
+
+    fn ts(at: u64) -> AgentTimestampMillis {
+        AgentTimestampMillis::new(at)
+    }
+
+    fn scope() -> AgentTeamScope {
+        AgentTeamScope::new(
+            TenantId::new("acme"),
+            AgentTeamId::new(TEAM).expect("the team id is valid"),
+        )
+        .expect("the team scope is valid")
+    }
+
+    fn member(name: &str) -> AgentId {
+        AgentId::new(name).expect("the member id is valid")
+    }
+
+    fn task() -> AgentTaskId {
+        AgentTaskId::new(TASK).expect("the task id is valid")
+    }
+
+    fn op(label: &str) -> AgentOperationId {
+        AgentOperationId::new(AgentOperationKind::TeamOperation, ["acme", TEAM, label])
+            .expect("the operation id derives")
+    }
+
+    /// A created team with one member and one posted, claimed, releasing
+    /// board entry — the shape a definitive claim reply settles.
+    fn releasing_board() -> AgentTeamState {
+        let mut state = AgentTeamState::uncreated(scope(), ts(1));
+        let mut members: BTreeMap<AgentId, BTreeSet<AgentCapabilityId>> = BTreeMap::new();
+        members.insert(member(MEMBER), BTreeSet::new());
+        create_team(
+            &mut state,
+            &op("create"),
+            AgentTeamCreation {
+                leader: member(LEADER),
+                root_goal: AgentGoalId::new("quarterly-support").expect("the goal id is valid"),
+                policy: AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+                members,
+            },
+            ts(1),
+        )
+        .expect("the team creates");
+        post_task(&mut state, &op("post"), task(), member(LEADER), ts(2)).expect("the task posts");
+        let epoch = board_epoch(&state);
+        claim_entry(
+            &mut state,
+            &op("claim"),
+            task(),
+            member(MEMBER),
+            epoch,
+            ts(3),
+        )
+        .expect("the entry claims");
+        let epoch = board_epoch(&state);
+        release_entry(
+            &mut state,
+            &op("release"),
+            task(),
+            &member(MEMBER),
+            epoch,
+            ts(4),
+        )
+        .expect("the entry releases");
+        state
+    }
+
+    fn board_epoch(state: &AgentTeamState) -> u64 {
+        state
+            .team
+            .as_ref()
+            .expect("the team exists")
+            .board
+            .get(&task())
+            .expect("the entry exists")
+            .claim_epoch
+    }
+
+    fn entry(state: &AgentTeamState) -> &AgentTeamBoardEntry {
+        state
+            .team
+            .as_ref()
+            .expect("the team exists")
+            .board
+            .get(&task())
+            .expect("the entry exists")
+    }
+
+    /// The terminal-notice envelope a task drives onto its governing board,
+    /// carrying whatever status the caller wants to test the fence with.
+    fn terminal_notice_envelope(status: AgentTaskStatus) -> AgentExchangeEnvelope {
+        let task_scope =
+            AgentTaskScope::new(scope().tenant().clone(), task()).expect("the task scope is valid");
+        let notice = crate::coordination::AgentTeamTerminalNotice {
+            task: task_scope.clone(),
+            status,
+            terminal_reason: "completed".to_string(),
+        };
+        AgentExchangeEnvelope::new(
+            op("terminal-notice"),
+            AgentExchangeKind::TeamTerminalNotice,
+            // The sender fence is satisfied: the task's own entity sends it.
+            AgentEntityAddress::Task(task_scope),
+            AgentEntityAddress::Team(scope()),
+            AgentExchangePayload::encode(
+                crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+                &notice,
+            )
+            .expect("the payload encodes"),
+            AgentCorrelationId::new("terminal-notice"),
+            ts(5),
+        )
+        .expect("the envelope builds")
+    }
+
+    /// The same envelope for an arbitrary board task, carrying an arbitrary
+    /// reason string — the wire field is free-form, whatever the legitimate
+    /// initiator chooses to put in it.
+    fn terminal_notice_for(task: &AgentTaskId, reason: &str) -> AgentExchangeEnvelope {
+        let task_scope = AgentTaskScope::new(scope().tenant().clone(), task.clone())
+            .expect("the task scope is valid");
+        let notice = crate::coordination::AgentTeamTerminalNotice {
+            task: task_scope.clone(),
+            status: AgentTaskStatus::Completed,
+            terminal_reason: reason.to_string(),
+        };
+        AgentExchangeEnvelope::new(
+            op("terminal-notice"),
+            AgentExchangeKind::TeamTerminalNotice,
+            AgentEntityAddress::Task(task_scope),
+            AgentEntityAddress::Team(scope()),
+            AgentExchangePayload::encode(
+                crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+                &notice,
+            )
+            .expect("the payload encodes"),
+            AgentCorrelationId::new("terminal-notice"),
+            ts(5),
+        )
+        .expect("the envelope builds")
+    }
+
+    /// Pads one board entry's `last_code` until the team record measures
+    /// exactly `bytes`, so a bound check lands where the test needs it.
+    fn inflate_team_to(state: &mut AgentTeamState, filler: &AgentTaskId, bytes: usize) {
+        let team = state.team.as_mut().expect("the team exists");
+        team.board
+            .get_mut(filler)
+            .expect("the filler entry exists")
+            .last_code = Some(String::new());
+        let size = serde_json::to_vec(&*team)
+            .map(|json| json.len())
+            .unwrap_or(0);
+        team.board
+            .get_mut(filler)
+            .expect("the filler entry exists")
+            .last_code = Some("x".repeat(bytes - size));
+        assert_eq!(
+            serde_json::to_vec(&*team)
+                .map(|json| json.len())
+                .unwrap_or(0),
+            bytes,
+            "the padding lands on the byte the test asked for"
+        );
+    }
+
+    #[test]
+    fn a_close_that_would_overflow_the_board_refuses_and_writes_nothing() {
+        // The close usually shrinks an entry, but not one no claim ever
+        // named, and `terminal_reason` is a free-form wire string bounded
+        // only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. That makes this a growth
+        // point, and every other growth point on this record checks its
+        // bound. Unchecked, the overflow committed here and surfaced at the
+        // next `post_task` or `add_member` — wedging the board somewhere
+        // else entirely, with the bytes that caused it already durable.
+        let mut state = releasing_board();
+        let closing = AgentTaskId::new("ticket-2").expect("the task id is valid");
+        post_task(
+            &mut state,
+            &op("post-2"),
+            closing.clone(),
+            member(LEADER),
+            ts(5),
+        )
+        .expect("the second task posts");
+
+        // Fill the record to one byte under its effective cap, so the code
+        // echo alone must push it over. The entry being closed holds no
+        // claim, so nothing is freed to pay for it.
+        let effective = AGENT_TEAM_MATERIALIZED_MAX_BYTES - AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES;
+        inflate_team_to(&mut state, &task(), effective - 1);
+
+        let full = state.clone();
+        let refusal = apply_team_terminal(
+            &mut state,
+            &terminal_notice_for(&closing, &"r".repeat(AGENT_TEAM_DETAIL_MAX_LENGTH)),
+            ts(6),
+        );
+        assert_eq!(
+            refusal.status().rejection_code(),
+            Some("team-state-too-large"),
+            "the close refuses rather than committing an over-large record"
+        );
+        assert_eq!(
+            state, full,
+            "validate-then-mutate is literal: the accept path persists even \
+             under a refusal, so the board is exactly as it was"
+        );
+        assert!(
+            !crate::coordination::team_terminal_notice_refusal_settles("team-state-too-large"),
+            "and it stays outstanding — the board's own eviction of finished \
+             entries is what lets a re-drive converge"
+        );
+    }
+
+    #[test]
+    fn a_terminal_notice_that_reports_a_live_task_closes_nothing() {
+        // The sender fence proves *who* sent the notice, never that the
+        // sender is terminal — the task's own entity is the legitimate
+        // sender either way, so a notice populated non-terminally clears
+        // the fence trivially. The close is irreversible, so it must not:
+        // the working member's standing claim would be dropped and the
+        // entry could never be reopened.
+        let mut state = releasing_board();
+        let live = state.clone();
+
+        let refusal = apply_team_terminal(
+            &mut state,
+            &terminal_notice_envelope(AgentTaskStatus::InProgress),
+            ts(6),
+        );
+        assert_eq!(
+            refusal.status().rejection_code(),
+            Some("team-terminal-notice-not-terminal"),
+            "the payload fails on its own face"
+        );
+        assert_eq!(state, live, "and the board is untouched");
+        assert!(
+            crate::coordination::team_terminal_notice_refusal_settles(
+                "team-terminal-notice-not-terminal"
+            ),
+            "definitive at both ends: the courier re-delivers the stored \
+             envelope rather than re-deriving it, so the same bytes answer \
+             the same way forever"
+        );
+
+        // The same board closes for a notice that reports what it must.
+        let closed = apply_team_terminal(
+            &mut state,
+            &terminal_notice_envelope(AgentTaskStatus::Completed),
+            ts(7),
+        );
+        assert!(closed.is_accepted(), "the well-formed notice lands");
+        assert_eq!(entry(&state).status, AgentTeamBoardEntryStatus::Done);
+        assert!(
+            entry(&state).claim.is_none(),
+            "the standing claim is cleared"
+        );
+    }
+
+    /// The reply envelope for a claim action the board decided at `epoch`.
+    fn reply_envelope(
+        state: &AgentTeamState,
+        action: AgentTeamClaimAction,
+        epoch: u64,
+    ) -> AgentExchangeEnvelope {
+        let command = AgentTeamClaimCommand {
+            team: scope(),
+            // The claim the entry actually stands for — the same one the
+            // deciding transition minted and sent.
+            claim: entry(state)
+                .claim
+                .as_ref()
+                .expect("the entry holds its claim")
+                .claim
+                .clone(),
+            task: task(),
+            epoch,
+            action,
+            policy_revision: state
+                .team
+                .as_ref()
+                .expect("the team exists")
+                .policy
+                .revision,
+            lease_expires_at: ts(100),
+        };
+        AgentExchangeEnvelope::new(
+            op("reply"),
+            AgentExchangeKind::TeamClaim,
+            AgentEntityAddress::Team(scope()),
+            AgentEntityAddress::Task(
+                AgentTaskScope::new(scope().tenant().clone(), task()).expect("the scope is valid"),
+            ),
+            AgentExchangePayload::encode(AGENT_TEAM_CLAIM_PAYLOAD_TYPE, &command)
+                .expect("the payload encodes"),
+            AgentCorrelationId::new("reply"),
+            ts(5),
+        )
+        .expect("the envelope builds")
+    }
+
+    #[test]
+    fn a_lazily_closed_entry_absorbs_a_later_definitive_reply() {
+        // The lazy close — the arm a claim attempt against an already-terminal
+        // task takes — closes the entry at its *current* epoch, unlike the
+        // eager terminal notice, which bumps. So the epoch guard cannot
+        // absorb a second reply for that same decision, and without the
+        // terminal guard the restoring arms would rewrite a closed entry
+        // around a claim no task ever accepted. `Done` has no way back:
+        // eviction is the only thing that removes a closed entry, and
+        // `claim_entry`, `release_entry`, and `transfer_entry` all refuse
+        // one, so the entry would be wedged for the board's lifetime.
+        let mut state = releasing_board();
+        let epoch = board_epoch(&state);
+        let envelope = reply_envelope(&state, AgentTeamClaimAction::Release, epoch);
+
+        settle_claim_action(
+            &mut state,
+            &envelope,
+            &refuse(
+                "team-claim-task-terminal",
+                "the task already ended".to_string(),
+            ),
+            ts(6),
+        );
+        assert_eq!(
+            entry(&state).status,
+            AgentTeamBoardEntryStatus::Done,
+            "the lazy close lands"
+        );
+        assert_eq!(
+            board_epoch(&state),
+            epoch,
+            "and it closes at the epoch it found — this is what the guard has to cover"
+        );
+
+        let closed = state.clone();
+        settle_claim_action(
+            &mut state,
+            &envelope,
+            &refuse(
+                "team-claim-already-owned",
+                "the assignment accepted first".to_string(),
+            ),
+            ts(7),
+        );
+        assert_eq!(
+            state, closed,
+            "a closed entry absorbs every later settle consequence, whole"
+        );
+    }
+
+    #[test]
+    fn a_release_already_owned_reply_never_speaks_for_a_superseded_claim() {
+        // The one restoring arm that kept the entry's claim rather than
+        // clearing it was also the one arm without the currency guard its
+        // five siblings carry. Against a board that has moved to a newer
+        // claim it would mark *that* claim's entry owned on the strength of
+        // an acceptance belonging to the previous one.
+        let mut state = releasing_board();
+        let epoch = board_epoch(&state);
+        let envelope = reply_envelope(&state, AgentTeamClaimAction::Release, epoch);
+
+        // The board moves on: the entry now stands for a different claim at
+        // the same epoch, which the derived ids alone cannot rule out.
+        let superseding = team_claim_id_for(&scope(), &task(), &member(LEADER), epoch)
+            .expect("the claim id derives");
+        state
+            .team
+            .as_mut()
+            .expect("the team exists")
+            .board
+            .get_mut(&task())
+            .expect("the entry exists")
+            .claim
+            .as_mut()
+            .expect("the releasing entry still holds its claim")
+            .claim = superseding;
+
+        let before = state.clone();
+        settle_claim_action(
+            &mut state,
+            &envelope,
+            &refuse(
+                "team-claim-already-owned",
+                "the assignment accepted first".to_string(),
+            ),
+            ts(6),
+        );
+        assert_eq!(
+            state, before,
+            "the settle speaks for the claim it named, and that claim is gone"
+        );
     }
 }

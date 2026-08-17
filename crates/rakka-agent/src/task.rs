@@ -340,6 +340,11 @@ pub const AGENT_DEPENDENCY_OUTCOME_PAYLOAD_TYPE: &str = "rakka.agent.DependencyO
 pub const AGENT_DEPENDENCY_OUTCOME_RECEIPT_PAYLOAD_TYPE: &str =
     "rakka.agent.DependencyOutcomeReceipt";
 
+/// Payload type of the governing task's receipt replying to a
+/// [`AgentExchangeKind::ConversationTerminalNotice`].
+pub const AGENT_CONVERSATION_TERMINAL_RECEIPT_PAYLOAD_TYPE: &str =
+    "rakka.agent.ConversationTerminalReceipt";
+
 /// Payload type of an [`AgentRunAssignment`] exchange command.
 pub const AGENT_RUN_ASSIGNMENT_PAYLOAD_TYPE: &str = "rakka.agent.RunAssignment";
 
@@ -2527,6 +2532,49 @@ impl AgentTaskTeamClaimStatus {
     }
 }
 
+/// The task's *latest* terminated conversation: the bounded materialized
+/// provenance one conversation-terminal notice records
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Only the latest conversation is materialized — the chain is history,
+/// exactly as superseded handoffs and team claims are — and the cell is the
+/// deduplication echo past the journal's bounded window for a redelivered
+/// notice about the *same* conversation. Identity and coordinates only,
+/// never transcript content.
+///
+/// [`Self::ended_at`] is strictly monotonic on this cell: a notice from a
+/// different conversation takes it only by being newer, so a replay that
+/// aged out of the applied window cannot regress the projected latest or
+/// re-count itself after another conversation has recorded. What the
+/// latest-only shape still costs is the other direction, accepted with the
+/// same eyes-open posture as [`AgentTaskHandoff`]: an older conversation
+/// whose *first* delivery arrives after a newer one is accepted without
+/// being materialized, so it appears in neither the cell nor the count —
+/// bounded, observational-only, and still fully readable through its own
+/// conversation entity and the coordination replay surface. A bounded
+/// per-conversation map is the alternative if a future slice needs every
+/// exact echo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskConversation {
+    /// The terminated conversation.
+    pub conversation: crate::identity::AgentConversationId,
+    /// Its terminal status.
+    pub status: crate::conversation::AgentConversationStatus,
+    /// Why it terminated.
+    pub terminal_reason: crate::conversation::AgentConversationTerminalReason,
+    /// How many rounds *completed* before it ended — what the public
+    /// `conversation-rounds` echo carries, and a count rather than the
+    /// round index it was once documented as. See
+    /// [`crate::coordination::AgentConversationTerminalNotice::rounds_completed`].
+    pub rounds_completed: u64,
+    /// How many turns it recorded over its life.
+    pub turns: u64,
+    /// When its terminal flip committed, by the conversation's owner clock.
+    pub ended_at: AgentTimestampMillis,
+    /// When this task recorded the notice.
+    pub recorded_at: AgentTimestampMillis,
+}
+
 /// Why an assignment decision refused an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2775,6 +2823,12 @@ pub enum AgentTaskHistoryKind {
     /// the refusal code and the assignee cleared back to the board-pending
     /// posture.
     TeamClaimRefused,
+    /// A governed conversation reported its terminal flip; the detail
+    /// carries the conversation id and its terminal-reason code
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)). The
+    /// materialized cell holds only the latest conversation — this chain is
+    /// the full record.
+    ConversationTerminalRecorded,
     /// A run proposed a typed result.
     ResultProposed,
     /// A proposal passed every deterministic rule.
@@ -2850,6 +2904,7 @@ impl AgentTaskHistoryKind {
             Self::TeamClaimRecorded => "team-claim-recorded",
             Self::TeamClaimAccepted => "team-claim-accepted",
             Self::TeamClaimRefused => "team-claim-refused",
+            Self::ConversationTerminalRecorded => "conversation-terminal-recorded",
             Self::ResultProposed => "result-proposed",
             Self::ResultAccepted => "result-accepted",
             Self::ResultRejected => "result-rejected",
@@ -4058,6 +4113,26 @@ pub struct AgentTask {
     /// with the fence at zero.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub team_claim_fence: u64,
+    /// Whether the terminal notice to the governing team's board has
+    /// settled: the durable once-guard past the journal's bounded
+    /// deduplication window. Records persisted before this field load with
+    /// it unset — so a pre-slice task that is already terminal owes the
+    /// notice once on its next settle pass, deliberately: that is what
+    /// closes a board entry left stale from before the exchange existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub team_terminal_notice_settled: bool,
+    /// The latest terminated conversation governed by this task, when one
+    /// has reported itself; the chain is history
+    /// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    /// Records persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Box<AgentTaskConversation>>,
+    /// How many conversation-terminal notices the task has *recorded* over
+    /// its lifetime — one per notice that took the cell. A redelivery, and a
+    /// notice older than the cell already standing, are both accepted
+    /// without recording, so neither counts.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub conversations: u32,
     /// The most recent assignment refusal.
     pub last_refusal: Option<AgentAssignmentRefusal>,
     /// The accepted typed result.
@@ -4430,6 +4505,13 @@ impl AgentTaskState {
     }
 
     /// The time of the last accepted transition.
+    ///
+    /// A transition of *this task* — its status, assignment, result, goal,
+    /// or ledger. A record it keeps about another entity, such as the
+    /// conversation provenance cell, changes the record without advancing
+    /// this clock, because the unclaimed-expiry horizon runs on it and must
+    /// measure how long the task has waited rather than how recently
+    /// anything touched it.
     #[must_use]
     pub const fn updated_at(&self) -> AgentTimestampMillis {
         self.updated_at
@@ -4490,6 +4572,9 @@ impl AgentTaskState {
             team: task.team.clone(),
             team_claim: task.team_claim.clone(),
             team_claims: task.team_claims,
+            team_terminal_notice_settled: task.team_terminal_notice_settled,
+            conversation: task.conversation.clone(),
+            conversations: task.conversations,
             assignment: task.assignment.clone(),
             assignment_generation: task.assignment_generation,
             dependencies: task.dependencies.values().cloned().collect(),
@@ -4677,6 +4762,21 @@ pub struct AgentTaskSnapshot {
     /// How many board claims the task has recorded over its lifetime.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub team_claims: u32,
+    /// Whether the terminal notice to the governing team's board has
+    /// settled. Snapshots persisted before this field load with it unset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub team_terminal_notice_settled: bool,
+    /// The latest terminated conversation governed by this task, when one
+    /// has reported itself ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)).
+    /// Snapshots persisted before this field load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Box<AgentTaskConversation>>,
+    /// How many conversation-terminal notices the task has *recorded* over
+    /// its lifetime — one per notice that took the cell. A redelivery, and a
+    /// notice older than the cell already standing, are both accepted
+    /// without recording, so neither counts.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub conversations: u32,
     /// Its current assignment.
     pub assignment: Option<AgentTaskAssignment>,
     /// The highest assignment generation it has decided.
@@ -5252,6 +5352,9 @@ fn create_task(
         team_claim: None,
         team_claims: 0,
         team_claim_fence: 0,
+        team_terminal_notice_settled: false,
+        conversation: None,
+        conversations: 0,
         last_refusal: None,
         accepted_result: None,
         rejection_count: 0,
@@ -6210,6 +6313,11 @@ fn check_assignment_free(task: &AgentTask, inflight_code: &'static str) -> Agent
 /// expired before any claim would otherwise park the task — and lock its
 /// delegated escrow — silently forever. The wait re-arms from the task's
 /// last transition, so a refused claim's reopened window starts fresh.
+///
+/// `updated_at` is that clock, which is why a record the task keeps about
+/// *another* entity must not advance it: this horizon would otherwise be
+/// extendable by anything that can write to the task, including a peer the
+/// task has no way to vet.
 fn task_unclaimed_expired(
     task: &AgentTask,
     updated_at: AgentTimestampMillis,
@@ -6693,6 +6801,104 @@ fn settle_team_claim_result_exchange(
     }
 }
 
+/// The terminal notice the task owes its governing team's board, when it
+/// owes one now ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+///
+/// Owed exactly once per task — terminality is absorbing and the governing
+/// team is immutable creation provenance — and re-derived by every settle
+/// pass until the exchange settles: the journal's initiation record is the
+/// once-guard inside its bounded window, and the task's
+/// `team_terminal_notice_settled` marker is the durable once-guard past it.
+/// This is what closes the board entry eagerly; before it, a terminal
+/// task's entry closed only through a member's refused claim attempt.
+fn owed_team_terminal_notice(
+    state: &AgentTaskState,
+    now: AgentTimestampMillis,
+) -> AgentTaskResult<Option<AgentExchangeEnvelope>> {
+    let Some(task) = state.task.as_ref() else {
+        return Ok(None);
+    };
+    let Some(team) = task.team.as_ref() else {
+        return Ok(None);
+    };
+    if !task.status.is_terminal() || task.team_terminal_notice_settled {
+        return Ok(None);
+    }
+    let operation_id = crate::coordination::team_terminal_notice_operation_id(
+        state.scope.tenant(),
+        team,
+        state.scope.task(),
+    )?;
+    if state.journal.has_initiated(&operation_id) {
+        return Ok(None);
+    }
+    let notice = crate::coordination::AgentTeamTerminalNotice {
+        task: state.scope.clone(),
+        status: task.status,
+        terminal_reason: task
+            .terminal_reason
+            .as_ref()
+            .map(AgentTaskTerminalReason::code)
+            .unwrap_or("terminal")
+            .to_string(),
+    };
+    let payload = AgentExchangePayload::encode(
+        crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+        &notice,
+    )?;
+    Ok(Some(
+        AgentExchangeEnvelope::new(
+            operation_id.clone(),
+            AgentExchangeKind::TeamTerminalNotice,
+            AgentEntityAddress::Task(state.scope.clone()),
+            AgentEntityAddress::Team(crate::identity::AgentTeamScope::new(
+                state.scope.tenant().clone(),
+                team.clone(),
+            )?),
+            payload,
+            AgentCorrelationId::new(operation_id.as_str()),
+            now,
+        )?
+        .with_telemetry(task.telemetry.clone()),
+    ))
+}
+
+/// Marks the team terminal notice settled on the task: the durable
+/// once-guard past the journal's bounded deduplication window.
+///
+/// The marker settles only when the settled envelope's operation id is the
+/// one the task currently derives — the same discipline as the claim-result
+/// marker, kept even though `(team, task)` is immutable, so the guard never
+/// depends on that immutability holding elsewhere.
+fn settle_team_terminal_notice_exchange(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) {
+    let owed = state.task().and_then(|task| {
+        let team = task.team.as_ref()?;
+        crate::coordination::team_terminal_notice_operation_id(
+            state.scope.tenant(),
+            team,
+            state.scope.task(),
+        )
+        .ok()
+    });
+    if owed.as_ref() != Some(envelope.operation_id()) {
+        return;
+    }
+    let mut settled = false;
+    if let Ok(task) = state.task_mut() {
+        if task.status.is_terminal() && !task.team_terminal_notice_settled {
+            task.team_terminal_notice_settled = true;
+            settled = true;
+        }
+    }
+    if settled {
+        state.updated_at = now;
+    }
+}
+
 /// The continuous root control task a wake command must address, or the
 /// refusal it answers instead.
 ///
@@ -7127,10 +7333,11 @@ fn withdraw_moot_registrations(state: &mut AgentTaskState) -> usize {
 }
 
 /// Every child report a terminal task owes right now: the epoch result to a
-/// wake controller, the delegation result to a delegating parent run, and
-/// the dependency outcomes its registered dependents wait on. One consult
-/// point, so every transition that can terminalize a task or close its
-/// ledger owes all three from the same compare-and-set.
+/// wake controller, the delegation result to a delegating parent run, the
+/// terminal notice to its governing team's board, and the dependency
+/// outcomes its registered dependents wait on. One consult point, so every
+/// transition that can terminalize a task or close its ledger owes all of
+/// them from the same compare-and-set.
 ///
 /// `reserved` is how many envelopes the calling transition already owes; the
 /// dependent notifications fit themselves into what is left of the journal's
@@ -7143,6 +7350,7 @@ fn owed_child_reports(
     let mut owed = Vec::new();
     owed.extend(owed_epoch_result(state, now)?);
     owed.extend(owed_delegation_result(state, now)?);
+    owed.extend(owed_team_terminal_notice(state, now)?);
     let budget = owed_exchange_budget(state, reserved.saturating_add(owed.len()));
     owed.extend(owed_dependent_outcomes(state, now, budget)?);
     Ok(owed)
@@ -10232,6 +10440,210 @@ fn apply_dependency_outcome(
     }
 }
 
+/// Applies a conversation's terminal notice to its governing task
+/// ([specification 8.11](../../../docs/plans/rakka-agent/spec.md)): records
+/// the bounded conversation provenance cell, which is what makes the
+/// terminated conversation observable from the task.
+///
+/// The cell is observational provenance, never new work, so — deliberately
+/// unlike a dependency outcome — an already-terminal task still records it:
+/// the common race is the conversation's completion landing beside the
+/// task's own result acceptance, and skipping the record there would lose
+/// exactly the observability this exchange exists to provide.
+fn apply_conversation_terminal(
+    state: &mut AgentTaskState,
+    envelope: &AgentExchangeEnvelope,
+    now: AgentTimestampMillis,
+) -> AgentExchangeTransition {
+    let notice: crate::coordination::AgentConversationTerminalNotice = match envelope
+        .payload()
+        .decode(crate::coordination::AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE)
+    {
+        Ok(notice) => notice,
+        Err(error) => {
+            // Non-settling, so a newer binary's payload converges after a
+            // rolling upgrade instead of being refused for good.
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "conversation-terminal-notice-undecodable",
+                error.to_string(),
+            ));
+        }
+    };
+    let sender = match envelope.initiator() {
+        AgentEntityAddress::Conversation(scope) => scope,
+        other => {
+            return AgentExchangeTransition::new(refuse(
+                state,
+                "conversation-terminal-notice-forged",
+                format!("a conversation terminal notice cannot originate from {other}"),
+            ))
+        }
+    };
+    if *sender != notice.conversation || sender.tenant() != state.scope.tenant() {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "conversation-terminal-notice-forged",
+            format!(
+                "the notice claims conversation {}, sent by {}",
+                notice.conversation.conversation(),
+                sender.conversation()
+            ),
+        ));
+    }
+    if notice.task != *state.scope.task() {
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "conversation-terminal-notice-forged",
+            format!(
+                "the notice names governing task {}, but this task is {}",
+                notice.task,
+                state.scope.task()
+            ),
+        ));
+    }
+    let Some(task) = state.task.as_ref() else {
+        // Retryable by classification, and unmemoized because of it — the
+        // dependency-registration posture: a notice racing its task's
+        // creation converges on a later re-drive instead of memoizing the
+        // miss.
+        return AgentExchangeTransition::new(refuse(
+            state,
+            "task-not-created",
+            "the governing task does not exist yet".to_string(),
+        ));
+    };
+    let receipt = || {
+        AgentExchangeResult::accepted(AgentExchangePayload::empty(
+            AGENT_CONVERSATION_TERMINAL_RECEIPT_PAYLOAD_TYPE,
+        ))
+    };
+    let conversation = notice.conversation.conversation().clone();
+    if task
+        .conversation
+        .as_deref()
+        .is_some_and(|cell| cell.conversation == conversation)
+    {
+        // The durable echo past the journal window: a replay about the same
+        // conversation finds the cell recorded and accepts idempotently. A
+        // conversation terminalizes at most once, so a same-id notice never
+        // carries a different resolution.
+        return AgentExchangeTransition::new(receipt());
+    }
+    // A *different* conversation only takes the cell by being newer than the
+    // one already in it. The cell is latest-only, and `ended_at` — stamped by
+    // the conversation's owner when its terminal flip committed — is the only
+    // ordering the task has, so making it strictly monotonic is what makes
+    // "latest" mean latest rather than last-delivered.
+    //
+    // Without this, an older conversation's notice re-driven after its
+    // operation rolled out of the bounded applied ring — its reply lost, and
+    // 64 exchanges later on a task with dependents and board traffic — would
+    // overwrite a newer conversation's cell and re-increment the lifetime
+    // counter. `get_task` would then echo the older conversation's status,
+    // reason, rounds, and turns, and `agent_metadata_from_snapshot` would
+    // heal the projection to that wrong value on every read.
+    //
+    // The counter rides the same guard because it counts notices *recorded*,
+    // and a notice this arm declines to record is not one. What that costs is
+    // narrow and observational: a genuinely out-of-order first delivery of an
+    // older conversation is accepted without being materialized, so it is
+    // absent from the cell it could never have won and from the count. It
+    // stays observable through its own conversation entity and the
+    // coordination replay surface. Ties keep the cell they found, so a
+    // re-drive can never disturb a settled one.
+    if task
+        .conversation
+        .as_deref()
+        .is_some_and(|cell| notice.ended_at.as_millis() <= cell.ended_at.as_millis())
+    {
+        return AgentExchangeTransition::new(receipt());
+    }
+    // A pre-terminal record keeps the growth headroom the task's own
+    // lifecycle still needs — the cell must never eat the room reserved for
+    // the assignment, result, and terminal reason. Once the task is
+    // terminal that growth already happened, so the record only needs to
+    // fit the bound itself.
+    //
+    // That asymmetry is what makes a bounds refusal here *transient*, and
+    // `conversation_terminal_notice_refusal_settles` depends on it: the
+    // refusal is neither settled at the conversation nor memoized here, so
+    // the notice waits out the window this task is about to close.
+    let reserve = if task.status.is_terminal() {
+        0
+    } else {
+        AGENT_TASK_STATE_GROWTH_RESERVE_BYTES
+    };
+    let recorded = AgentTaskConversation {
+        conversation: conversation.clone(),
+        status: notice.status,
+        terminal_reason: notice.terminal_reason,
+        rounds_completed: notice.rounds_completed,
+        turns: notice.turns_recorded,
+        ended_at: notice.ended_at,
+        recorded_at: now,
+    };
+    let bounded = {
+        let task = state.task.as_mut().expect("the task exists on this path");
+        let previous_cell = task.conversation.replace(Box::new(recorded));
+        let previous_count = task.conversations;
+        task.conversations = previous_count.saturating_add(1);
+        task.check_bounds(reserve).map_err(|error| {
+            // Validate-then-mutate must be literal: the accept path persists
+            // state even under a refusal, and the conversation treats this
+            // refusal as proof nothing was recorded.
+            //
+            // `check_bounds` has two exits and they classify opposite ways,
+            // so the code is forwarded as the shared classifier's input
+            // rather than as a single "too big" answer. The size bound is
+            // transient (the reserve above relaxes when the task
+            // terminalizes); the dependency ceiling is not, because the map
+            // only grows and this arm never touches it — an unclassified
+            // forever-refusal would re-run this write on every settle pass
+            // for the life of both entities.
+            (error, previous_cell, previous_count)
+        })
+    };
+    if let Err((error, previous_cell, previous_count)) = bounded {
+        let task = state.task.as_mut().expect("the task exists on this path");
+        task.conversation = previous_cell;
+        task.conversations = previous_count;
+        return AgentExchangeTransition::new(refuse(state, error.code(), error.to_string()));
+    }
+    let status = state
+        .task
+        .as_ref()
+        .map_or(AgentTaskStatus::Created, |task| task.status);
+    let reason = notice.terminal_reason.code();
+    let operation_id = envelope.operation_id().clone();
+    // `state.updated_at` is deliberately *not* advanced. It means the time of
+    // the last accepted transition, and recording what some other entity did
+    // is not one — the task's status, assignment, result, and goal are all
+    // exactly where they were. The distinction is load-bearing rather than
+    // pedantic, because that clock is the sole input to the board-governed
+    // unclaimed horizon (`task_unclaimed_expired`), which re-arms from the
+    // task's last transition so a refused claim's reopened window starts
+    // fresh. Advancing it here would let a conversation postpone an unrelated
+    // task's expiry — and since a task keeps no registry of the conversations
+    // it governs, it cannot tell one that legitimately names it from a series
+    // minted to keep it alive, so a never-claimed task and its delegated
+    // escrow could be parked indefinitely by exactly the wait this horizon
+    // exists to bound. The record still changes and still persists; it simply
+    // does not claim to be a transition. Any later echo about another entity
+    // must do the same.
+    state.record_history(|sequence| {
+        AgentTaskHistoryEntry::new(
+            sequence,
+            AgentTaskHistoryKind::ConversationTerminalRecorded,
+            operation_id.clone(),
+            status,
+            now,
+        )
+        .with_detail(format!("{conversation} {reason}"))
+    });
+    AgentExchangeTransition::new(receipt())
+}
+
 /// Settles the upstream's answer to a dependency registration at the
 /// dependent: the edge's marker flips, and the answer resolves the edge when
 /// it decides it — a receipt carrying an already-terminal upstream's outcome,
@@ -10521,6 +10933,9 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             AgentExchangeKind::DependencyOutcome => {
                 return apply_dependency_outcome(state, envelope, now)
             }
+            AgentExchangeKind::ConversationTerminalNotice => {
+                return apply_conversation_terminal(state, envelope, now)
+            }
             AgentExchangeKind::TeamClaim => apply_team_claim(state, envelope, now),
             kind => refuse(
                 state,
@@ -10666,6 +11081,54 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                     ),
                 }
             }
+            AgentExchangeKind::TeamTerminalNotice if !result.is_accepted() => {
+                // A refused terminal notice settles only under the team's
+                // definitive answers — no team, a closed team, or a payload
+                // the board rejects on its face (forged, or reporting a task
+                // that has not ended) — through the one classifier both ends
+                // of the exchange share. Every other refusal, including an
+                // `unsupported-exchange` from an owner that predates the
+                // kind, leaves the exchange outstanding for re-drive (the
+                // rolling-upgrade rule).
+                match result.status().rejection_code() {
+                    Some(code)
+                        if crate::coordination::team_terminal_notice_refusal_settles(code) =>
+                    {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::TeamTerminalNotice,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
+            AgentExchangeKind::ConversationTerminalNotice if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the task is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. Both of this arm's
+                // *not yet* answers therefore re-run on the next drive
+                // instead of replaying the miss for the whole applied
+                // window — a notice racing the task's creation, and one
+                // refused on the bound, which this task's own terminal flip
+                // relaxes by dropping the growth reserve to zero.
+                match result.status().rejection_code() {
+                    Some(code)
+                        if crate::coordination::conversation_terminal_notice_refusal_settles(
+                            code,
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    code => Err(
+                        crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::ConversationTerminalNotice,
+                            code: code.unwrap_or_default().to_string(),
+                        },
+                    ),
+                }
+            }
             _ => Ok(()),
         }
     }
@@ -10692,6 +11155,14 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
             // under a definitive code. The marker settles on the claim
             // provenance exactly as the handoff marker does.
             settle_team_claim_result_exchange(state, envelope, now);
+        }
+        if envelope.kind() == AgentExchangeKind::TeamTerminalNotice {
+            // The team answered — the entry closed, was already closed or
+            // gone, or the notice refused under a definitive code. The
+            // task's marker settles either way: the durable once-guard that
+            // quiesces the owed derivation past the journal's bounded
+            // window.
+            settle_team_terminal_notice_exchange(state, envelope, now);
         }
         if envelope.kind() == AgentExchangeKind::DependencyRegistration {
             // The upstream answered — recorded, answered with its terminal
@@ -11756,6 +12227,7 @@ where
         self.settle_requested_cancellation(now).await?;
         self.settle_handoff_resolution(now).await?;
         self.settle_team_claim_resolution(now).await?;
+        self.settle_team_terminal_notice(now).await?;
         self.settle_dependency_registrations(now).await?;
         self.settle_dependent_notifications(now).await?;
         self.decide_assignment(now).await?;
@@ -11850,6 +12322,59 @@ where
         let committed = self
             .host
             .initiate(now, |state| match owed_team_claim_result(state, now) {
+                Ok(owed) => Ok(owed.into_iter().collect()),
+                Err(error) => {
+                    let carried = AgentChoreographyError::from(error.clone());
+                    rejection = Some(error);
+                    Err(carried)
+                }
+            })
+            .await;
+        if let Some(rejection) = rejection {
+            return Err(rejection);
+        }
+        committed?;
+        Ok(())
+    }
+
+    /// Re-owes the terminal notice a terminal board-governed task still owes
+    /// its team ([specification 8.10](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The `settle_team_claim_resolution` twin, and the sole owing point for
+    /// the terminal transitions that never consult the child reports — goal
+    /// budget exhaustion, stagnation, and the human path's exhausted
+    /// rejections — as well as the back-fill for a task that terminalized
+    /// before this exchange existed. The derivation is pure over durable
+    /// state, the journal's initiation record guards the bounded window,
+    /// and the task's `team_terminal_notice_settled` marker quiesces it
+    /// past that window.
+    async fn settle_team_terminal_notice(
+        &mut self,
+        now: AgentTimestampMillis,
+    ) -> AgentTaskResult<()> {
+        let would_advance = {
+            let state = self.state()?;
+            match state.task() {
+                None => false,
+                Some(task) => task.team.as_ref().is_some_and(|team| {
+                    task.status.is_terminal()
+                        && !task.team_terminal_notice_settled
+                        && crate::coordination::team_terminal_notice_operation_id(
+                            state.scope.tenant(),
+                            team,
+                            state.scope.task(),
+                        )
+                        .is_ok_and(|operation| !state.journal.has_initiated(&operation))
+                }),
+            }
+        };
+        if !would_advance {
+            return Ok(());
+        }
+        let mut rejection = None;
+        let committed = self
+            .host
+            .initiate(now, |state| match owed_team_terminal_notice(state, now) {
                 Ok(owed) => Ok(owed.into_iter().collect()),
                 Err(error) => {
                     let carried = AgentChoreographyError::from(error.clone());
@@ -12280,6 +12805,7 @@ where
         self.settle_requested_cancellation(now).await?;
         self.settle_handoff_resolution(now).await?;
         self.settle_team_claim_resolution(now).await?;
+        self.settle_team_terminal_notice(now).await?;
         self.settle_dependency_registrations(now).await?;
         self.settle_dependent_notifications(now).await?;
         let assigned = self.decide_assignment(now).await?;
@@ -14230,6 +14756,338 @@ mod team_claim_bounds_tests {
             "a bounds refusal persists no partial mutation: the board treats \
              a definitive refusal as proof no claim was recorded"
         );
+    }
+
+    #[test]
+    fn a_conversation_notice_refused_for_bounds_persists_no_partial_mutation() {
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        // Inflate the record to one byte under its cap, so the recorded cell
+        // itself must push it over.
+        inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - 1);
+        let envelope = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(2),
+        );
+
+        let before = state.clone();
+        let result =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            result.result().status().rejection_code(),
+            Some("task-state-too-large"),
+            "the oversized record refuses the notice"
+        );
+        assert_eq!(
+            state, before,
+            "a bounds refusal persists no partial mutation: the conversation \
+             treats this refusal as proof nothing was recorded"
+        );
+    }
+
+    #[test]
+    fn a_conversation_notice_refused_on_the_reserve_converges_once_the_task_terminalizes() {
+        // The receiver's own bound is what moves: a pre-terminal task is
+        // charged the growth headroom its remaining lifecycle needs, and a
+        // terminal one is charged nothing, so a record inside the reserve
+        // window refuses the cell now and admits the byte-identical cell
+        // once the task ends. That is why the shared classifier leaves
+        // `task-state-too-large` outstanding — settling on it would quiesce
+        // both ends over a refusal the receiver is about to stop making, and
+        // the provenance would be lost for good.
+        const SLACK: usize = 3 * 1024;
+        const {
+            assert!(
+                SLACK < AGENT_TASK_STATE_GROWTH_RESERVE_BYTES,
+                "the record must sit inside the reserve window and still under the cap"
+            );
+        }
+
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        inflate_record_to(&mut state, AGENT_TASK_MATERIALIZED_MAX_BYTES - SLACK);
+        let envelope = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(2),
+        );
+
+        let pre_terminal = state.clone();
+        let refused =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(2));
+        assert_eq!(
+            refused.result().status().rejection_code(),
+            Some("task-state-too-large"),
+            "a live task is charged the growth reserve its own lifecycle needs"
+        );
+        assert_eq!(state, pre_terminal, "the refusal recorded nothing");
+        assert!(
+            !crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-state-too-large"
+            ),
+            "so the notice stays outstanding at the conversation, and the \
+             receiver never memoizes it, instead of both ends quiescing"
+        );
+
+        // The task terminalizes. The growth the reserve was held for has
+        // happened, the reserve drops to zero, and the same cell fits.
+        state.task.as_mut().expect("the task exists").status = AgentTaskStatus::Completed;
+        let accepted =
+            apply_conversation_terminal(&mut state, &envelope, AgentTimestampMillis::new(3));
+        assert!(
+            accepted.result().is_accepted(),
+            "the terminal task admits the very cell it just refused"
+        );
+        let task = state.task.as_ref().expect("the task exists");
+        assert_eq!(
+            task.conversation
+                .as_deref()
+                .expect("the provenance cell stands")
+                .conversation
+                .as_str(),
+            "design-review"
+        );
+        assert_eq!(task.conversations, 1);
+    }
+
+    #[test]
+    fn a_stale_notice_never_regresses_the_latest_conversation_cell() {
+        // The cell is latest-only and `ended_at` is the only ordering the
+        // task has, so it must be monotonic. An older conversation's notice
+        // re-driven after its operation aged out of the bounded applied ring
+        // — its reply lost, 64 exchanges ago on a task with dependents and
+        // board traffic — must not take the cell back from a newer
+        // conversation or re-count itself. `get_task` reassembles the public
+        // echo from this cell on every read, so a regression heals the
+        // projection to the wrong conversation for as long as the task lives.
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        let early = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "design-review",
+            AgentTimestampMillis::new(10),
+        );
+        let late = conversation_notice(
+            &tenant,
+            &task_id,
+            &scope,
+            "retro",
+            AgentTimestampMillis::new(20),
+        );
+
+        for (envelope, at) in [(&early, 11), (&late, 21)] {
+            assert!(
+                apply_conversation_terminal(&mut state, envelope, AgentTimestampMillis::new(at))
+                    .result()
+                    .is_accepted(),
+                "both conversations record in order"
+            );
+        }
+        let task = state.task.as_ref().expect("the task exists");
+        assert_eq!(
+            task.conversation
+                .as_deref()
+                .expect("the cell stands")
+                .conversation
+                .as_str(),
+            "retro"
+        );
+        assert_eq!(task.conversations, 2);
+
+        // The older conversation re-drives past the applied window.
+        let settled = state.clone();
+        let replayed =
+            apply_conversation_terminal(&mut state, &early, AgentTimestampMillis::new(30));
+        assert!(
+            replayed.result().is_accepted(),
+            "a stale notice still settles — it simply records nothing"
+        );
+        assert_eq!(
+            state, settled,
+            "the cell and the counter stay exactly where the newer notice left them"
+        );
+    }
+
+    #[test]
+    fn a_notice_refused_on_the_dependency_ceiling_settles_definitively() {
+        // `check_bounds` has two exits and they classify opposite ways. The
+        // size bound relaxes when the task terminalizes, so it waits. The
+        // dependency ceiling never does: the map only grows, and recording a
+        // conversation cell does not touch it, so this refusal is identical
+        // forever. Left unclassified it would re-run this arm — and the
+        // durable write the accept path makes even under a refusal — on
+        // every settle pass for the life of both entities.
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        // A definition refresh that lowered the ceiling under a record
+        // already holding a dependency; the record itself is well within its
+        // size bound.
+        {
+            let task = state.task.as_mut().expect("the task exists");
+            let upstream = AgentTaskId::new("upstream").expect("the task id is valid");
+            task.dependencies.insert(
+                upstream.clone(),
+                AgentTaskDependency {
+                    dependency: upstream,
+                    policy: AgentDependencyFailurePolicy::default(),
+                    outcome: None,
+                    declared_by: AgentOperationId::new(
+                        AgentOperationKind::TaskCreation,
+                        ["acme", "board-task", "1"],
+                    )
+                    .expect("the operation id derives"),
+                    declared_at: AgentTimestampMillis::new(1),
+                    registration_settled: false,
+                },
+            );
+            task.definition.limits.max_dependencies = 0;
+        }
+
+        let before = state.clone();
+        let refusal = apply_conversation_terminal(
+            &mut state,
+            &conversation_notice(
+                &tenant,
+                &task_id,
+                &scope,
+                "design-review",
+                AgentTimestampMillis::new(2),
+            ),
+            AgentTimestampMillis::new(3),
+        );
+        assert_eq!(
+            refusal.result().status().rejection_code(),
+            Some("task-dependency-limit-exceeded"),
+            "the other bound exit answers under its own code"
+        );
+        assert_eq!(state, before, "and records nothing");
+        assert!(
+            crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-dependency-limit-exceeded"
+            ),
+            "a bound this exchange can never satisfy is definitive, unlike \
+             the size bound it merely has to wait out"
+        );
+        assert!(
+            !crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-state-too-large"
+            ),
+            "the two exits of one check must not classify the same way"
+        );
+    }
+
+    /// One created, board-governed task and the coordinates its conversation
+    /// notices are addressed with.
+    fn board_task_world() -> (TenantId, AgentTaskId, AgentTaskScope, AgentTaskState) {
+        let tenant = TenantId::new("acme");
+        let task_id = AgentTaskId::new("board-task").expect("the task id is valid");
+        let scope =
+            AgentTaskScope::new(tenant.clone(), task_id.clone()).expect("the scope is valid");
+
+        let mut state = AgentTaskState::uncreated(scope.clone(), AgentTimestampMillis::new(1));
+        let create_op = AgentOperationId::new(
+            AgentOperationKind::TaskCreation,
+            ["acme", "board-task", "1"],
+        )
+        .expect("the operation id derives");
+        let definition = AgentTaskDefinition::new(
+            AgentTaskDefinitionId::new("triage").expect("the definition id is valid"),
+            "Triage one ticket.",
+            AgentSchemaRef::new(
+                AgentSchemaId::new("in").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+            AgentSchemaRef::new(
+                AgentSchemaId::new("out").expect("the schema id is valid"),
+                AgentRevisionNumber::INITIAL,
+            ),
+        )
+        .expect("the definition is valid");
+        let creation = AgentTaskCreation {
+            definition,
+            input: AgentTaskContent::inline(serde_json::json!({ "ticket": 1 }))
+                .expect("the input is inline-bounded"),
+            assignee: None,
+            team: Some(AgentTeamId::new("support-team").expect("the id is valid")),
+            goal: None,
+            goal_mode: Default::default(),
+            goal_spec: None,
+            parent: None,
+            dependencies: Vec::new(),
+            escrow: None,
+            wake: None,
+            delegation: None,
+            telemetry: Default::default(),
+        };
+        create_task(
+            &mut state,
+            &create_op,
+            creation,
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the board task creates");
+        (tenant, task_id, scope, state)
+    }
+
+    /// Pads the task's description until its materialized record measures
+    /// exactly `bytes`, so a bound check lands where the test needs it.
+    fn inflate_record_to(state: &mut AgentTaskState, bytes: usize) {
+        let task = state.task.as_mut().expect("the task exists");
+        let size = task.materialized_size_bytes();
+        let previous = task.definition.description.len();
+        task.definition.description = "x".repeat(bytes - size + previous);
+        assert_eq!(
+            task.materialized_size_bytes(),
+            bytes,
+            "the padding lands on the byte the test asked for"
+        );
+    }
+
+    /// The terminal-notice envelope one conversation drives onto the task.
+    fn conversation_notice(
+        tenant: &TenantId,
+        task_id: &AgentTaskId,
+        task: &AgentTaskScope,
+        conversation: &str,
+        ended_at: AgentTimestampMillis,
+    ) -> AgentExchangeEnvelope {
+        let conversation_scope = crate::identity::AgentConversationScope::new(
+            tenant.clone(),
+            crate::identity::AgentConversationId::new(conversation)
+                .expect("the conversation id is valid"),
+        )
+        .expect("the conversation scope is valid");
+        let notice = crate::coordination::AgentConversationTerminalNotice {
+            conversation: conversation_scope.clone(),
+            task: task_id.clone(),
+            status: crate::conversation::AgentConversationStatus::Ended,
+            terminal_reason: crate::conversation::AgentConversationTerminalReason::RoundsComplete,
+            rounds_completed: 1,
+            turns_recorded: 2,
+            ended_at,
+        };
+        let operation = crate::coordination::conversation_terminal_notice_operation_id(
+            tenant,
+            conversation_scope.conversation(),
+        )
+        .expect("the operation derives");
+        AgentExchangeEnvelope::new(
+            operation.clone(),
+            AgentExchangeKind::ConversationTerminalNotice,
+            AgentEntityAddress::Conversation(conversation_scope),
+            AgentEntityAddress::Task(task.clone()),
+            AgentExchangePayload::encode(
+                crate::coordination::AGENT_CONVERSATION_TERMINAL_NOTICE_PAYLOAD_TYPE,
+                &notice,
+            )
+            .expect("the payload encodes"),
+            AgentCorrelationId::new(operation.as_str()),
+            AgentTimestampMillis::new(2),
+        )
+        .expect("the envelope builds")
     }
 }
 
