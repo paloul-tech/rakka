@@ -1574,10 +1574,29 @@ fn apply_team_terminal(
     }
     let detail = bounded_detail(notice.terminal_reason);
     let member = entry.claim.as_ref().map(|claim| claim.member.clone());
+    let previous = entry.clone();
     entry.status = AgentTeamBoardEntryStatus::Done;
     entry.claim_epoch = entry.claim_epoch.saturating_add(1);
     entry.claim = None;
     entry.last_code = Some(detail.clone());
+    // The close usually *shrinks* the entry — a dropped claim costs more
+    // bytes than the code echo adds — but not when it closes an entry no
+    // claim ever named, and `terminal_reason` arrives as a free-form wire
+    // string bounded only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. Thirty-two
+    // entries closed that way carry up to sixteen kilobytes against an
+    // effective cap of twenty-eight, so this is a growth point and must be
+    // bounded like every other: `post_task` checks, and so does this.
+    //
+    // Unchecked, the overflow surfaced somewhere else entirely — the next
+    // `post_task`, `add_member`, or any transition that *does* check — and
+    // wedged the board there, with the bytes that caused it already durable.
+    // Validate-then-mutate is literal here for the same reason it is at
+    // `record_team_claim`: the accept path persists state even under a
+    // refusal, so a refusal must leave the board exactly as it found it.
+    if let Err(error) = team.check_bounds() {
+        team.board.insert(task_id, previous);
+        return refuse_terminal(error.code(), error.to_string());
+    }
     state.record_history(|sequence| {
         let mut history = AgentTeamHistoryEntry::new(
             sequence,
@@ -3981,6 +4000,106 @@ mod board_guard_tests {
             ts(5),
         )
         .expect("the envelope builds")
+    }
+
+    /// The same envelope for an arbitrary board task, carrying an arbitrary
+    /// reason string — the wire field is free-form, whatever the legitimate
+    /// initiator chooses to put in it.
+    fn terminal_notice_for(task: &AgentTaskId, reason: &str) -> AgentExchangeEnvelope {
+        let task_scope = AgentTaskScope::new(scope().tenant().clone(), task.clone())
+            .expect("the task scope is valid");
+        let notice = crate::coordination::AgentTeamTerminalNotice {
+            task: task_scope.clone(),
+            status: AgentTaskStatus::Completed,
+            terminal_reason: reason.to_string(),
+        };
+        AgentExchangeEnvelope::new(
+            op("terminal-notice"),
+            AgentExchangeKind::TeamTerminalNotice,
+            AgentEntityAddress::Task(task_scope),
+            AgentEntityAddress::Team(scope()),
+            AgentExchangePayload::encode(
+                crate::coordination::AGENT_TEAM_TERMINAL_NOTICE_PAYLOAD_TYPE,
+                &notice,
+            )
+            .expect("the payload encodes"),
+            AgentCorrelationId::new("terminal-notice"),
+            ts(5),
+        )
+        .expect("the envelope builds")
+    }
+
+    /// Pads one board entry's `last_code` until the team record measures
+    /// exactly `bytes`, so a bound check lands where the test needs it.
+    fn inflate_team_to(state: &mut AgentTeamState, filler: &AgentTaskId, bytes: usize) {
+        let team = state.team.as_mut().expect("the team exists");
+        team.board
+            .get_mut(filler)
+            .expect("the filler entry exists")
+            .last_code = Some(String::new());
+        let size = serde_json::to_vec(&*team)
+            .map(|json| json.len())
+            .unwrap_or(0);
+        team.board
+            .get_mut(filler)
+            .expect("the filler entry exists")
+            .last_code = Some("x".repeat(bytes - size));
+        assert_eq!(
+            serde_json::to_vec(&*team)
+                .map(|json| json.len())
+                .unwrap_or(0),
+            bytes,
+            "the padding lands on the byte the test asked for"
+        );
+    }
+
+    #[test]
+    fn a_close_that_would_overflow_the_board_refuses_and_writes_nothing() {
+        // The close usually shrinks an entry, but not one no claim ever
+        // named, and `terminal_reason` is a free-form wire string bounded
+        // only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. That makes this a growth
+        // point, and every other growth point on this record checks its
+        // bound. Unchecked, the overflow committed here and surfaced at the
+        // next `post_task` or `add_member` — wedging the board somewhere
+        // else entirely, with the bytes that caused it already durable.
+        let mut state = releasing_board();
+        let closing = AgentTaskId::new("ticket-2").expect("the task id is valid");
+        post_task(
+            &mut state,
+            &op("post-2"),
+            closing.clone(),
+            member(LEADER),
+            ts(5),
+        )
+        .expect("the second task posts");
+
+        // Fill the record to one byte under its effective cap, so the code
+        // echo alone must push it over. The entry being closed holds no
+        // claim, so nothing is freed to pay for it.
+        let effective = AGENT_TEAM_MATERIALIZED_MAX_BYTES - AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES;
+        inflate_team_to(&mut state, &task(), effective - 1);
+
+        let full = state.clone();
+        let refusal = apply_team_terminal(
+            &mut state,
+            &terminal_notice_for(&closing, &"r".repeat(AGENT_TEAM_DETAIL_MAX_LENGTH)),
+            ts(6),
+        );
+        assert_eq!(
+            refusal.status().rejection_code(),
+            Some("team-state-too-large"),
+            "the close refuses rather than committing an over-large record"
+        );
+        assert_eq!(
+            state, full,
+            "validate-then-mutate is literal: the accept path persists even \
+             under a refusal, so the board is exactly as it was"
+        );
+        assert!(
+            !crate::coordination::team_terminal_notice_refusal_settles("team-state-too-large"),
+            "and it stays outstanding — the board's own eviction of finished \
+             entries is what lets a re-drive converge"
+        );
     }
 
     #[test]

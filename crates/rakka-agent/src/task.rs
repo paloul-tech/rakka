@@ -10589,6 +10589,15 @@ fn apply_conversation_terminal(
             // Validate-then-mutate must be literal: the accept path persists
             // state even under a refusal, and the conversation treats this
             // refusal as proof nothing was recorded.
+            //
+            // `check_bounds` has two exits and they classify opposite ways,
+            // so the code is forwarded as the shared classifier's input
+            // rather than as a single "too big" answer. The size bound is
+            // transient (the reserve above relaxes when the task
+            // terminalizes); the dependency ceiling is not, because the map
+            // only grows and this arm never touches it — an unclassified
+            // forever-refusal would re-run this write on every settle pass
+            // for the life of both entities.
             (error, previous_cell, previous_count)
         })
     };
@@ -14897,6 +14906,73 @@ mod team_claim_bounds_tests {
         assert_eq!(
             state, settled,
             "the cell and the counter stay exactly where the newer notice left them"
+        );
+    }
+
+    #[test]
+    fn a_notice_refused_on_the_dependency_ceiling_settles_definitively() {
+        // `check_bounds` has two exits and they classify opposite ways. The
+        // size bound relaxes when the task terminalizes, so it waits. The
+        // dependency ceiling never does: the map only grows, and recording a
+        // conversation cell does not touch it, so this refusal is identical
+        // forever. Left unclassified it would re-run this arm — and the
+        // durable write the accept path makes even under a refusal — on
+        // every settle pass for the life of both entities.
+        let (tenant, task_id, scope, mut state) = board_task_world();
+        // A definition refresh that lowered the ceiling under a record
+        // already holding a dependency; the record itself is well within its
+        // size bound.
+        {
+            let task = state.task.as_mut().expect("the task exists");
+            let upstream = AgentTaskId::new("upstream").expect("the task id is valid");
+            task.dependencies.insert(
+                upstream.clone(),
+                AgentTaskDependency {
+                    dependency: upstream,
+                    policy: AgentDependencyFailurePolicy::default(),
+                    outcome: None,
+                    declared_by: AgentOperationId::new(
+                        AgentOperationKind::TaskCreation,
+                        ["acme", "board-task", "1"],
+                    )
+                    .expect("the operation id derives"),
+                    declared_at: AgentTimestampMillis::new(1),
+                    registration_settled: false,
+                },
+            );
+            task.definition.limits.max_dependencies = 0;
+        }
+
+        let before = state.clone();
+        let refusal = apply_conversation_terminal(
+            &mut state,
+            &conversation_notice(
+                &tenant,
+                &task_id,
+                &scope,
+                "design-review",
+                AgentTimestampMillis::new(2),
+            ),
+            AgentTimestampMillis::new(3),
+        );
+        assert_eq!(
+            refusal.result().status().rejection_code(),
+            Some("task-dependency-limit-exceeded"),
+            "the other bound exit answers under its own code"
+        );
+        assert_eq!(state, before, "and records nothing");
+        assert!(
+            crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-dependency-limit-exceeded"
+            ),
+            "a bound this exchange can never satisfy is definitive, unlike \
+             the size bound it merely has to wait out"
+        );
+        assert!(
+            !crate::coordination::conversation_terminal_notice_refusal_settles(
+                "task-state-too-large"
+            ),
+            "the two exits of one check must not classify the same way"
         );
     }
 

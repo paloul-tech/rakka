@@ -608,8 +608,20 @@ pub(crate) fn team_terminal_notice_refusal_settles(code: &str) -> bool {
 /// terminalizes. Settling on it would quiesce both ends over a refusal the
 /// receiver is about to stop making, and the provenance would be lost for
 /// good.
+///
+/// `task-dependency-limit-exceeded` is the *other* exit of that same bound
+/// check, and it classifies the opposite way. The task's dependency map only
+/// ever grows, and recording a conversation cell does not touch it, so a
+/// record already over its ceiling refuses this notice identically forever —
+/// leaving it outstanding would re-run the receiving arm, and its durable
+/// write, on every settle pass for the life of both entities. A bound this
+/// exchange can never satisfy is a definitive answer even though a bound it
+/// merely has to wait out is not.
 pub(crate) fn conversation_terminal_notice_refusal_settles(code: &str) -> bool {
-    matches!(code, "conversation-terminal-notice-forged")
+    matches!(
+        code,
+        "conversation-terminal-notice-forged" | "task-dependency-limit-exceeded"
+    )
 }
 
 /// One coordination capability descriptor: the policy payload behind one

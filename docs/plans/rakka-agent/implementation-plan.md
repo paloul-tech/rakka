@@ -3985,6 +3985,30 @@ the in-slice decisions resolved as follows (scope decisions user-approved):
   keep it alive. The record still changes and still persists; it simply
   does not claim to be a transition, and any later echo about another
   entity must follow the same rule.
+- **Every growth point checks its bound, including the close.** The
+  terminal close writes the reason code onto the entry, and
+  `terminal_reason` is a free-form wire string capped only at
+  `AGENT_TEAM_DETAIL_MAX_LENGTH` — so an entry no claim ever named grows,
+  and thirty-two of them carry up to sixteen kilobytes against an
+  effective cap of twenty-eight. Code review found this the one growth
+  point that skipped `check_bounds`, which meant its overflow committed
+  and surfaced at the next `post_task` or `add_member`. Validate-then-
+  mutate is now literal here, the `record_team_claim` discipline, and the
+  refusal stays outstanding because board eviction is what lets a re-drive
+  converge.
+- **The two `check_bounds` exits classify opposite ways** at the task's
+  conversation arm. The size bound waits (the growth reserve relaxes when
+  the task terminalizes); `task-dependency-limit-exceeded` is definitive,
+  because the dependency map only grows and this arm never touches it, so
+  an unclassified forever-refusal would re-run the receiving arm's durable
+  write on every settle pass for the life of both entities.
+- **The settle precheck asks the derivation, not a copy of it.** The
+  conversation's owed-notice precheck restated `owed_terminal_notice`'s
+  bail-outs by hand and missed the reason-less terminal record; since
+  `initiate` persists even for an empty owed vector, that wrote
+  byte-identical state on every pass forever. It now calls the derivation,
+  so the two cannot drift, and the derivation's error surfaces before the
+  revision it would otherwise have cost.
 - **The eager close stands behind two payload fences.** The notice must be
   initiated by the task it names *and* report that task as ended. Code
   review found the second missing: `AgentTeamTerminalNotice.status` was

@@ -2179,19 +2179,21 @@ where
         &mut self,
         now: AgentTimestampMillis,
     ) -> AgentConversationResult<()> {
-        let would_advance = {
-            let state = self.state()?;
-            state.conversation().is_some_and(|conversation| {
-                conversation.status.is_terminal()
-                    && !conversation.terminal_notice_settled
-                    && conversation_terminal_notice_operation_id(
-                        state.scope.tenant(),
-                        state.scope.conversation(),
-                    )
-                    .is_ok_and(|operation| !state.journal.has_initiated(&operation))
-            })
-        };
-        if !would_advance {
+        // The precheck asks the *derivation* whether a pass would advance
+        // anything, rather than re-stating its bail-outs. A hand-mirrored
+        // predicate has to be kept in agreement with `owed_terminal_notice`
+        // by hand, and it was not: it reproduced four of the five bail-outs
+        // and missed the reason-less terminal record, so a `status: Ended`
+        // row with no reason — `terminal_reason` is `pub` and
+        // `serde(default)`, so a hand-repaired or application-written record
+        // deserializes into exactly that — made this permanently true. Since
+        // `AgentExchangeHost::initiate` persists even when the owed vector
+        // comes back empty, every settle pass, including the one the A2A
+        // surface fires after every conversation operation, then wrote
+        // byte-identical state forever. One predicate cannot drift from
+        // itself. Its error surfaces here too, ahead of the revision the
+        // committed derivation would otherwise have burnt discovering it.
+        if owed_terminal_notice(self.state()?, now)?.is_none() {
             return Ok(());
         }
         let mut rejection = None;
@@ -3687,5 +3689,120 @@ impl From<AgentConversationError> for AgentChoreographyError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod owed_notice_tests {
+    use super::*;
+    use crate::identity::{AgentOperationKind, TenantId};
+
+    fn scope() -> AgentConversationScope {
+        AgentConversationScope::new(
+            TenantId::new("acme"),
+            AgentConversationId::new("panel").expect("the conversation id is valid"),
+        )
+        .expect("the conversation scope is valid")
+    }
+
+    /// A terminal conversation record carrying the given reason.
+    fn ended(terminal_reason: Option<AgentConversationTerminalReason>) -> AgentConversationState {
+        let mut state = AgentConversationState::uncreated(scope(), AgentTimestampMillis::new(1));
+        create_conversation(
+            &mut state,
+            &AgentOperationId::new(
+                AgentOperationKind::ConversationOperation,
+                ["acme", "panel", "create"],
+            )
+            .expect("the operation id derives"),
+            AgentConversationCreation {
+                moderator: AgentId::new("moderator").expect("the agent id is valid"),
+                participants: vec![AgentId::new("p1").expect("the agent id is valid")],
+                mode: AgentConversationMode::RoundRobin,
+                completion: AgentConversationCompletionRule::ModeratorDecides,
+                policy: AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+                task: AgentTaskId::new("ticket-1").expect("the task id is valid"),
+                tokens: None,
+                max_wall_clock_millis: None,
+                transcript_ref: None,
+            },
+            AgentTimestampMillis::new(1),
+        )
+        .expect("the conversation creates");
+        let conversation = state.conversation.as_mut().expect("it was just created");
+        conversation.status = AgentConversationStatus::Ended;
+        conversation.terminal_reason = terminal_reason;
+        conversation.ended_at = Some(AgentTimestampMillis::new(2));
+        state
+    }
+
+    #[test]
+    fn a_terminal_record_with_no_reason_owes_nothing() {
+        // The fifth bail-out, and the one a hand-mirrored precheck missed.
+        // `terminal_reason` is `pub` and `serde(default)`, so a record with
+        // `status: Ended` and no reason deserializes cleanly — a hand-repaired
+        // row, an application write, or a future terminal flip that forgets
+        // the paired assignment. There is nothing coherent to report, so the
+        // derivation owes nothing; a precheck that disagreed made
+        // `settle_terminal_notice` write byte-identical state on every pass
+        // forever, because `initiate` persists even for an empty owed vector.
+        // `settle_terminal_notice` now asks this function instead of
+        // restating it, so the two cannot drift.
+        let owed = owed_terminal_notice(&ended(None), AgentTimestampMillis::new(3))
+            .expect("the derivation runs");
+        assert!(owed.is_none(), "a reason-less terminal record owes nothing");
+
+        let owed = owed_terminal_notice(
+            &ended(Some(AgentConversationTerminalReason::ModeratorEnded)),
+            AgentTimestampMillis::new(3),
+        )
+        .expect("the derivation runs");
+        assert!(
+            owed.is_some(),
+            "and the same record with its reason owes the notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reason_less_terminal_record_burns_no_revision_on_any_sweep() {
+        // The property the precheck exists to hold, measured rather than
+        // argued: `AgentExchangeHost::initiate` persists even when the owed
+        // vector comes back empty, so a precheck that disagreed with the
+        // derivation wrote byte-identical state on every pass forever — and
+        // the A2A surface fires one after *every* conversation operation.
+        use rakka_persistence::{DurableStateStore, InMemoryDurableStateStore, Revision};
+
+        let store = InMemoryDurableStateStore::<AgentConversationState>::new();
+        let persistence_id = scope().persistence_id();
+        let planted = store
+            .compare_and_set(&persistence_id, Revision::INITIAL, ended(None))
+            .await
+            .expect("the record plants");
+
+        let mut entity = AgentConversationEntityStore::new(
+            scope(),
+            store.clone(),
+            InMemoryAgentConversationHistoryStore::new(),
+        );
+        entity
+            .recover(AgentTimestampMillis::new(3))
+            .await
+            .expect("the entity recovers");
+        for pass in 0..3 {
+            entity
+                .settle_terminal_notice(AgentTimestampMillis::new(4 + pass))
+                .await
+                .expect("the settle pass runs");
+        }
+
+        let after = store
+            .load(&persistence_id)
+            .await
+            .expect("the record loads")
+            .expect("the record is there");
+        assert_eq!(
+            after.revision, planted.revision,
+            "a record that owes nothing is written by nothing"
+        );
     }
 }
