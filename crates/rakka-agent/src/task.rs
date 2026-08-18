@@ -116,8 +116,8 @@ use crate::choreography::{
     AgentExchangeState, AgentExchangeTransition, AGENT_EXCHANGE_PENDING_CAPACITY,
 };
 use crate::definition::{
-    AgentBudgetCeilings, AgentCapabilityId, AgentOperationClass, AgentPolicyRefs,
-    AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
+    AgentBudgetCeilings, AgentCapabilityId, AgentCoordinationCapabilityKind, AgentOperationClass,
+    AgentPolicyRefs, AgentRevisionNumber, AgentRevisionProvenance, AgentTaskDefinitionId,
 };
 use crate::evaluation::{
     AgentGoalEvaluationRecord, AgentGoalStagnationAction, AgentGoalStagnationPolicy,
@@ -3865,6 +3865,16 @@ pub struct AgentAssignmentReadiness {
     /// Whether the agent's definition envelope declares every skill the task
     /// requires.
     pub declares_required_skills: bool,
+    /// Whether the agent's definition envelope grants
+    /// [`AgentCoordinationCapabilityKind::Team`] — the authority a board claim
+    /// spends ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// It is carried rather than folded into [`Self::refusal`] because it
+    /// bounds exactly one path: a claim-driven assignment. A member may be
+    /// perfectly authorized for a task it is assigned directly and still not be
+    /// authorized to *claim* it off a shared board, so the generic decision must
+    /// not consult this.
+    pub permits_team_coordination: bool,
     /// Why the agent's autonomy admission does not admit this work, when it
     /// does not ([specification 7.4](../../../docs/plans/rakka-agent/spec.md)).
     ///
@@ -3912,6 +3922,9 @@ impl AgentAssignmentReadiness {
                     .values()
                     .any(|tool| tool.capabilities.contains(skill))
             }),
+            permits_team_coordination: envelope
+                .coordination_capabilities
+                .contains(&AgentCoordinationCapabilityKind::Team),
             admission_refusal: definition
                 .operation_class
                 .is_unattended()
@@ -3951,6 +3964,7 @@ impl AgentAssignmentReadiness {
             permits_task_definition: false,
             permits_operation_class: false,
             declares_required_skills: false,
+            permits_team_coordination: false,
             admission_refusal: Some(AgentAdmissionRefusal::Missing),
         }
     }
@@ -9136,6 +9150,25 @@ fn decide_assignment(
         return Ok(refuse_assignment(state, readiness, reason, detail, now)?
             .into_iter()
             .collect());
+    }
+
+    // The board claim's own authority door
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)): a claim
+    // spends the `Team` coordination capability, so a member whose *definition*
+    // never granted it may not buy an assignment generation off a shared board
+    // — however the board's membership was wired. Membership is trusted
+    // application data and deliberately not an authority source of its own; the
+    // envelope is, and this is the door it is read at, the same door the task
+    // definition and operation class are read at.
+    //
+    // It is checked only for a claim. A direct assignment of the same task to
+    // the same agent is untouched, because it spends no coordination capability.
+    if team_claim_pending && !readiness.permits_team_coordination {
+        // Definitive by construction: no re-drive can produce a different
+        // answer while the definition stands, so the claim resolves — reopening
+        // the entry for a member that *is* authorized — instead of parking the
+        // task in a refusal loop.
+        return resolve_team_claim_refusal(state, "team-coordination-unauthorized", now);
     }
 
     if task.assignments >= task.definition.limits.max_assignments {

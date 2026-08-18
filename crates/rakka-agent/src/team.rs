@@ -2554,7 +2554,14 @@ where
     }
 
     async fn ensure_recovered(&mut self, now: AgentTimestampMillis) -> AgentTeamResult<()> {
-        if !self.recovered {
+        // The host drops its cached record when a compare-and-set loses, and a
+        // board has two writers by construction — the resident sharded entity
+        // and the A2A service's own store, which is how every wire claim
+        // reaches it. Asking the host rather than trusting this facade's flag
+        // is what keeps a lost race from wedging the entity `NotRecovered` for
+        // the rest of its residency; the task, run, and conversation stores
+        // hold the same rule.
+        if !self.recovered || self.host.state().is_err() {
             self.recover(now).await?;
         }
         Ok(())

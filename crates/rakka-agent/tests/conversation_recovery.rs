@@ -69,6 +69,8 @@ async fn world() -> Fixture {
     let fx = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new(),
     ));
+    fx.instantiate_conversation_participants(&["moderator", "p1", "p2"])
+        .await;
     fx.apply_conversation_command_at(
         &conversation_scope(),
         AgentConversationEntityCommand::Create {
@@ -260,6 +262,7 @@ async fn a_loss_between_the_commit_and_the_history_flush_re_flushes_the_same_slo
     let mut store = rakka_agent::AgentConversationEntityStore::new(
         conversation_scope(),
         fx.conversations.clone(),
+        fx.agents.clone(),
         history.clone(),
     );
 
@@ -280,6 +283,7 @@ async fn a_loss_between_the_commit_and_the_history_flush_re_flushes_the_same_slo
     let mut recovered = rakka_agent::AgentConversationEntityStore::new(
         conversation_scope(),
         fx.conversations.clone(),
+        fx.agents.clone(),
         history.clone(),
     );
     recovered
@@ -407,6 +411,7 @@ async fn a_resident_store_that_loses_a_compare_and_set_recovers_and_keeps_servin
     let mut resident = rakka_agent::AgentConversationEntityStore::new(
         conversation_scope(),
         fx.conversations.clone(),
+        fx.agents.clone(),
         fx.conversation_history.clone(),
     );
     resident

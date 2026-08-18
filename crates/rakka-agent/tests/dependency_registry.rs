@@ -870,3 +870,184 @@ async fn a_pre_registry_edge_registers_on_the_settle_pass() {
         .expect("the pass settles");
     assert_eq!(progress.outstanding, 0, "the derivation quiesced");
 }
+
+/// A world with the whole registry round trip ahead of it: a human-owned
+/// upstream and one dependent that declared its edge at creation.
+async fn registry_world() -> Fixture {
+    let fx = fixture();
+    fx.apply_task_command_at(&upstream_scope(), creation(UPSTREAM, true, Vec::new()))
+        .await
+        .expect("the upstream creates");
+    fx.apply_task_command_at(
+        &task_scope(),
+        creation(
+            TASK,
+            true,
+            vec![AgentTaskDependencyDeclaration::new(
+                upstream_scope().task().clone(),
+            )],
+        ),
+    )
+    .await
+    .expect("the dependent creates");
+    fx
+}
+
+/// Drives both legs to quiescence, tolerating an injected loss: the forward
+/// registration reaches the upstream, the upstream terminalizes, and the
+/// outcome notification comes back. Errors are swallowed because a crashed
+/// owner is supposed to fail here; convergence is asserted from durable state
+/// afterwards.
+async fn drive_registry(fx: &Fixture) {
+    for _round in 0..4 {
+        let _ = fx.settle_task_at(&task_scope()).await;
+        let _ = fx.settle_task_at(&upstream_scope()).await;
+    }
+    let _ = fx
+        .apply_task_command_at(
+            &upstream_scope(),
+            AgentTaskEntityCommand::Cancel {
+                operation_id: AgentOperationId::new(
+                    rakka_agent::AgentOperationKind::Cancellation,
+                    [TENANT, UPSTREAM, "operator"],
+                )
+                .expect("the operation id derives"),
+                reason: "abandoned".to_string(),
+            },
+        )
+        .await;
+    for _round in 0..8 {
+        let _ = fx.settle_task_at(&upstream_scope()).await;
+        let _ = fx.settle_task_at(&task_scope()).await;
+    }
+}
+
+/// The convergence property of both registry legs, from durable state alone.
+///
+/// The two `settled` markers are the once-guards that quiesce the derivations
+/// past the journal's bounded window, so a re-driving owner must land on
+/// exactly one edge, one registration, and one outcome — never a second
+/// dependent record, and never a dependent left blocked on an upstream that
+/// already ended.
+async fn assert_registry_converged(fx: &Fixture, context: &str) {
+    let upstream_state = state_at(fx, &upstream_scope()).await;
+    let upstream = upstream_state.task().expect("the upstream exists");
+    assert_eq!(
+        upstream.status,
+        AgentTaskStatus::Cancelled,
+        "{context}: the upstream reached its terminal"
+    );
+    assert_eq!(
+        upstream.dependents.len(),
+        1,
+        "{context}: exactly one dependent record, however often the edge re-registered"
+    );
+    let record = upstream
+        .dependents
+        .get(task_scope().task())
+        .unwrap_or_else(|| panic!("{context}: the registered dependent is the one that asked"));
+    assert!(
+        record.outcome_settled,
+        "{context}: the upstream owes its dependent nothing further"
+    );
+
+    let dependent_state = state_at(fx, &task_scope()).await;
+    let dependent = dependent_state.task().expect("the dependent exists");
+    assert_eq!(
+        dependent.dependencies.len(),
+        1,
+        "{context}: exactly one dependency edge"
+    );
+    let edge = dependent
+        .dependencies
+        .get(upstream_scope().task())
+        .unwrap_or_else(|| panic!("{context}: the declared edge stands"));
+    assert!(
+        edge.registration_settled,
+        "{context}: the forward edge registered exactly once"
+    );
+    assert!(
+        edge.outcome.is_some(),
+        "{context}: the dependent learned its upstream's outcome rather than blocking forever"
+    );
+
+    let progress = fx
+        .settle_task_at(&task_scope())
+        .await
+        .expect("the dependent's pass settles");
+    assert_eq!(
+        progress.outstanding, 0,
+        "{context}: the dependent's derivations quiesced"
+    );
+    let progress = fx
+        .settle_task_at(&upstream_scope())
+        .await
+        .expect("the upstream's pass settles");
+    assert_eq!(
+        progress.outstanding, 0,
+        "{context}: the upstream's derivations quiesced"
+    );
+}
+
+/// The durable writes one crash-free registry round trip attempts, so the
+/// sweep below covers every real write rather than a guess.
+async fn reference_writes() -> usize {
+    let fx = registry_world().await;
+    fx.tasks.reset_writes();
+    drive_registry(&fx).await;
+    assert_registry_converged(&fx, "the crash-free reference").await;
+    fx.tasks.writes()
+}
+
+#[tokio::test]
+async fn both_registry_legs_converge_across_every_task_store_crash_point() {
+    // Slice 5.6's fault-injection half of the 5.4 registry
+    // ([specification 15 and 18](../../../docs/plans/rakka-agent/spec.md)).
+    // Both tasks share one store, so one armed store covers the forward
+    // registration, the upstream's terminal commit, and the outcome
+    // notification — every compare-and-set the registry introduced.
+    let writes = reference_writes().await;
+    assert!(
+        writes >= 4,
+        "the round trip writes the task store at least four times \
+         (registration owed, registration recorded, terminal commit, outcome settled), \
+         saw {writes}"
+    );
+
+    for point in 1..=writes {
+        for window in [
+            rakka_agent::testkit::CrashPoint::BeforeWrite,
+            rakka_agent::testkit::CrashPoint::AfterWrite,
+        ] {
+            let fx = registry_world().await;
+            fx.tasks.reset_writes();
+            fx.tasks.crash_at(point, window);
+            drive_registry(&fx).await;
+            fx.tasks.assert_crash_fired(point, window);
+            fx.tasks.survive();
+
+            // A new owner, with nothing but the durable record.
+            drive_registry(&fx).await;
+            assert_registry_converged(&fx, &format!("crash at write {point} ({window:?})")).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn both_registry_exchanges_survive_every_delivery_fault() {
+    // The fifteenth and sixteenth exchanges' own failure windows, at the real
+    // entity rather than through the synthetic choreography probe. Each leg is
+    // re-derived by every settle pass and guarded past the journal window by
+    // its own settled marker, so a lost envelope, a lost reply, and a doubled
+    // delivery must all land on one edge and one notification.
+    for fault in [
+        rakka_agent::testkit::ExchangeFault::LoseEnvelope,
+        rakka_agent::testkit::ExchangeFault::LoseReply,
+        rakka_agent::testkit::ExchangeFault::DeliverTwice,
+    ] {
+        let fx = registry_world().await;
+        fx.task_transport.inject(fault);
+        drive_registry(&fx).await;
+        assert_registry_converged(&fx, &format!("{fault:?}")).await;
+    }
+}

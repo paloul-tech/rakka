@@ -31,10 +31,20 @@ const CONVERSATION: &str = "design-review";
 const MODERATOR: &str = "moderator";
 const TASK: &str = "review-task";
 
-fn fixture() -> Fixture {
-    Fixture::new(ScriptedDispatcher::with_adapter(
+/// The fixture with this file's whole cast instantiated as
+/// moderation-capable agents: the roster admits a speaker to *this*
+/// conversation, its definition admits it to moderated work at all, and the
+/// turn door reads both.
+async fn fixture() -> Fixture {
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new(),
-    ))
+    ));
+    fx.instantiate_conversation_participants(&[
+        MODERATOR, "alpha", "beta", "gamma", "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8",
+        "p9",
+    ])
+    .await;
+    fx
 }
 
 fn conversation_scope() -> AgentConversationScope {
@@ -146,7 +156,7 @@ fn end_command_by(
 }
 
 async fn created_fixture(creation: AgentConversationCreation) -> Fixture {
-    let fx = fixture();
+    let fx = fixture().await;
     let reply = fx
         .apply_conversation_command_at(&conversation_scope(), create_command(creation))
         .await
@@ -197,6 +207,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     let policy = || AgentModerationPolicy::new(AgentRevisionNumber::INITIAL);
 
     let empty = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(policy(), &[])),
@@ -206,6 +217,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     assert_eq!(empty.code(), "conversation-participants-invalid");
 
     let repeated = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(policy(), &["alpha", "alpha"])),
@@ -215,6 +227,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     assert_eq!(repeated.code(), "conversation-participants-invalid");
 
     let over_cap = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(
@@ -229,6 +242,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     // A round-robin round is one turn per roster member: a roster longer
     // than the turn ceiling could never complete a round.
     let unroundable = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(
@@ -243,6 +257,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     let mut oversized_ref = creation(policy(), &["alpha"]);
     oversized_ref.transcript_ref = Some("r".repeat(300));
     let oversized = fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(oversized_ref))
         .await
         .expect_err("an oversized transcript reference refuses");
@@ -366,6 +381,7 @@ async fn the_creation_arithmetic_upper_bounds_what_the_state_guard_measures() {
     let mut degraded = rakka_agent::AgentConversationEntityStore::new(
         conversation_scope(),
         fx.conversations.clone(),
+        fx.agents.clone(),
         UnavailableHistory,
     );
     for _ in 0..64 {
@@ -656,7 +672,7 @@ async fn a_creation_replayed_with_different_content_refuses_rather_than_echoing(
     // converge; different record, refuse. A content-blind id would answer a
     // second creation `Duplicate` with the outcome of a conversation it does
     // not describe.
-    let fx = fixture();
+    let fx = fixture().await;
     let first = creation(
         AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
         &["alpha", "beta"],
@@ -735,6 +751,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
         &["alpha", "beta"],
     );
     let refused = fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(unreachable))
         .await
         .expect_err("a configuration with no terminal state refuses");
@@ -746,6 +763,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
         &["alpha", "beta"],
     );
     fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(with_end))
         .await
         .expect("the early end is a road to terminal");
@@ -757,6 +775,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
     );
     with_deadline.max_wall_clock_millis = Some(60_000);
     fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(with_deadline))
         .await
         .expect("a deadline is a road to terminal");
@@ -769,6 +788,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
     );
     all_rounds.completion = AgentConversationCompletionRule::AllRounds;
     fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(all_rounds))
         .await
         .expect("completing every round is a road to terminal");

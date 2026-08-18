@@ -276,6 +276,79 @@ async fn a_definition_that_widens_after_admission_stops_unattended_work() {
 }
 
 #[tokio::test]
+async fn a_definition_that_adds_a_coordination_capability_stops_unattended_work() {
+    // The same derivation, with coordination as the widened dimension
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md), the M5
+    // checklist's setup-cannot-widen bullet). Coordination capabilities are
+    // the authority behind a handoff, a board claim, and a moderated turn, so
+    // an agent quietly granting itself one after being admitted without it is
+    // exactly the widening admission exists to catch — and it is caught by the
+    // same re-derivation, with no coordination-specific machinery.
+    let fx = Fixture::new(ScriptedDispatcher::new().with_turn(proposing_turn("resolved")));
+    let envelope = instantiate_admittable_agent(&fx).await;
+
+    let decision = AutonomyAdmissionDecision::new(
+        [AgentOperationClass::BoundedAsync].into_iter().collect(),
+        AgentRevisionNumber::INITIAL,
+        AgentRevisionNumber::INITIAL,
+        envelope.clone(),
+        AgentAdmissionEvaluator::Service("risk-policy-service".to_string()),
+        every_requirement(),
+        provenance(2).accepted_at,
+    )
+    .expect("a complete admission");
+    admit(&fx, decision).await;
+
+    let mut widened = envelope;
+    widened
+        .coordination_capabilities
+        .insert(rakka_agent::AgentCoordinationCapabilityKind::Team);
+    let mut definition = AgentDefinition::new(
+        AgentDefinitionId::new("unattended-v1").expect("definition id should be valid"),
+        "Resolves tickets unattended, and now claims them off a board too.",
+        widened,
+    )
+    .expect("the agent definition should be valid");
+    definition.policies = AgentPolicyRefs {
+        approval: Some(policy("approval-v1")),
+        authorization: Some(policy("authorization-v1")),
+        escalation: Some(policy("escalation-v1")),
+        guardrail: None,
+        retention: None,
+    };
+    let mut agent = AgentEntityStore::new(agent_scope(), fx.agents.clone());
+    agent.recover().await.expect("the agent should recover");
+    agent
+        .apply(AgentEntityCommand::PublishDefinition {
+            operation_id: AgentOperationId::for_agent(
+                AgentOperationKind::DefinitionUpdate,
+                &agent_scope(),
+                "2",
+            )
+            .expect("operation id should be derivable"),
+            definition: Box::new(definition),
+            provenance: Box::new(provenance(3)),
+        })
+        .await
+        .expect("the widening definition publishes");
+
+    fx.create_task_with(unattended_task()).await;
+    fx.pump().await.expect("the widened assignment is refused");
+
+    assert!(
+        fx.run_snapshot().await.is_none(),
+        "an agent that granted itself a coordination capability the admission never covered \
+         stops unattended work"
+    );
+    let refusal = fx
+        .task_snapshot()
+        .await
+        .last_refusal
+        .expect("a refusal is recorded");
+    assert_eq!(refusal.reason, AgentAssignmentRefusalReason::NotAdmitted);
+}
+
+#[tokio::test]
 async fn a_retraction_returns_the_agent_to_the_fail_closed_default() {
     // `Retract` end to end: an admitted agent runs unattended work; a
     // retraction returns it to the fail-closed default, indistinguishable from

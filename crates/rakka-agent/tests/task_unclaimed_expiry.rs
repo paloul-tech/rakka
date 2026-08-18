@@ -260,7 +260,7 @@ async fn an_unclaimed_board_task_expires_at_its_horizon() {
 #[tokio::test]
 async fn a_recorded_claim_holds_the_unclaimed_horizon_open() {
     let fx = fixture();
-    fx.instantiate_agent_at(
+    fx.instantiate_team_member_at(
         AgentScope::new(tenant(), member(MEMBER)).expect("the member scope is valid"),
     )
     .await;

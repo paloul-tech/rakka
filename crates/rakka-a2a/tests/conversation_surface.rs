@@ -167,6 +167,7 @@ impl Fixture {
         );
         let conversation_transport = InProcessConversationEntityTransport::new(
             conversations.clone(),
+            agents.clone(),
             conversation_history.clone(),
             deferred.as_router(),
             clock.clone(),
@@ -224,6 +225,11 @@ impl Fixture {
         envelope
             .task_definitions
             .insert(AgentTaskDefinitionId::new(TASK_DEFINITION).expect("the definition id"));
+        // The turn door reads this: a roster admits a speaker to one
+        // conversation, its definition admits it to moderated work at all.
+        envelope
+            .coordination_capabilities
+            .insert(rakka_agent::AgentCoordinationCapabilityKind::Moderation);
         let definition = AgentDefinition::new(
             AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
             "One moderated participant.",
@@ -253,9 +259,13 @@ impl Fixture {
     /// roster and budgets — trusted application wiring, exactly as
     /// production creates it. The wire carries no create operation.
     async fn conversation_world(&self) {
+        for participant in [MODERATOR, MEMBER_A, MEMBER_B] {
+            self.instantiate(&agent(participant)).await;
+        }
         let mut store = AgentConversationEntityStore::new(
             conversation_scope(),
             self.conversations.clone(),
+            self.agents.clone(),
             self.conversation_history.clone(),
         );
         let now = self.now();
@@ -291,9 +301,13 @@ impl Fixture {
     /// The same world, moderator-directed: the mode whose turns carry the
     /// wire's `designate` / `close-round` spellings.
     async fn moderator_directed_world(&self) {
+        for participant in [MODERATOR, MEMBER_A, MEMBER_B] {
+            self.instantiate(&agent(participant)).await;
+        }
         let mut store = AgentConversationEntityStore::new(
             conversation_scope(),
             self.conversations.clone(),
+            self.agents.clone(),
             self.conversation_history.clone(),
         );
         let now = self.now();
@@ -330,6 +344,7 @@ impl Fixture {
         let mut store = AgentConversationEntityStore::new(
             conversation_scope(),
             self.conversations.clone(),
+            self.agents.clone(),
             self.conversation_history.clone(),
         );
         let now = self.now();
@@ -969,6 +984,7 @@ async fn a_terminated_conversation_echoes_on_its_governing_tasks_projection() {
     let mut store = AgentConversationEntityStore::new(
         conversation_scope(),
         fixture.conversations.clone(),
+        fixture.agents.clone(),
         fixture.conversation_history.clone(),
     );
     let now = fixture.now();

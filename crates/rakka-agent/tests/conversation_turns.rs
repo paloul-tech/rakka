@@ -19,7 +19,7 @@ use rakka_agent::{
     AgentConversationEntityCommand, AgentConversationEntityReply, AgentConversationId,
     AgentConversationMode, AgentConversationScope, AgentConversationStatus,
     AgentConversationTerminalReason, AgentConversationTurnSubmit, AgentId, AgentModerationPolicy,
-    AgentRevisionNumber, AgentTaskId,
+    AgentRevisionNumber, AgentScope, AgentTaskId,
 };
 
 const CONVERSATION: &str = "panel-debate";
@@ -104,6 +104,11 @@ async fn created(
     participants: &[&str],
 ) -> Fixture {
     let fx = fixture();
+    // The roster admits these speakers here; their definitions are what admit
+    // them to moderated work at all, and the turn door reads both.
+    let mut roster = vec![MODERATOR];
+    roster.extend_from_slice(participants);
+    fx.instantiate_conversation_participants(&roster).await;
     let reply = fx
         .apply_conversation_command_at(
             &conversation_scope(),
@@ -192,6 +197,93 @@ async fn only_the_current_participant_may_submit() {
         .expect("the conversation snapshots");
     assert!(snapshot.turns.is_empty(), "a refusal records nothing");
     assert_eq!(snapshot.turn_in_round, 0);
+}
+
+#[tokio::test]
+async fn a_speaker_without_the_moderation_capability_is_refused_at_the_turn_door() {
+    // The M5 setup-cannot-widen bullet at the conversation's own door
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)). The
+    // roster and the envelope answer different questions, and both must say
+    // yes: `p1` here is the roster's current speaker, at the right coordinate,
+    // inside every budget — and its definition never granted `Moderation`.
+    let fx = created(
+        AgentConversationMode::RoundRobin,
+        AgentConversationCompletionRule::ModeratorDecides,
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["p1", "p2"],
+    )
+    .await;
+
+    // Republish `p1` without the capability, leaving everything else — its
+    // task definitions, its lifecycle, the roster — exactly as it was. A
+    // republish rather than a different fixture on purpose: the door must
+    // re-derive against the definition *now in force*, so an agent that was
+    // authorized when the conversation was created and is not any more stops
+    // speaking, without the conversation having had to notice the update.
+    let scope = AgentScope::new(tenant(), AgentId::new("p1").expect("the agent id is valid"))
+        .expect("the agent scope is valid");
+    let mut narrowed = rakka_agent::AgentAuthorityEnvelope::empty();
+    narrowed
+        .task_definitions
+        .insert(common::task_definition_id());
+    let definition = rakka_agent::AgentDefinition::new(
+        rakka_agent::AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+        "Resolves customer support tickets end to end.",
+        narrowed,
+    )
+    .expect("the agent definition is valid");
+    let mut entity = rakka_agent::AgentEntityStore::new(scope.clone(), fx.agents.clone());
+    entity.recover().await.expect("the agent recovers");
+    entity
+        .apply(rakka_agent::AgentEntityCommand::PublishDefinition {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::DefinitionUpdate,
+                &scope,
+                "2",
+            )
+            .expect("the operation id derives"),
+            definition: Box::new(definition),
+            provenance: Box::new(common::provenance(2)),
+        })
+        .await
+        .expect("the narrowing definition publishes");
+
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit(0, 0, "p1", "speaking without authority", None),
+        )
+        .await
+        .expect_err("the turn door refuses a speaker its definition never admitted");
+    assert_eq!(refused.code(), "conversation-moderation-unauthorized");
+
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert!(snapshot.turns.is_empty(), "a refusal records nothing");
+    assert_eq!(snapshot.turn_in_round, 0, "and moves no cursor");
+    assert_eq!(
+        snapshot.current_speaker,
+        Some(agent("p1")),
+        "the roster is unchanged: the refusal is about authority, not membership"
+    );
+
+    // An agent with no durable record at all is refused the same way, because
+    // no record means no definition means no grant.
+    let ghosted = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            submit(0, 0, "intruder", "hello", None),
+        )
+        .await
+        .expect_err("a non-participant still refuses on the roster first");
+    assert_eq!(
+        ghosted.code(),
+        "conversation-not-participant",
+        "the roster answers before the envelope: an outsider is not told whether it could have \
+         spoken had it been admitted"
+    );
 }
 
 #[tokio::test]
@@ -436,6 +528,7 @@ async fn a_redelivered_turn_converges_while_the_history_sink_is_down() {
     let mut degraded = rakka_agent::AgentConversationEntityStore::new(
         conversation_scope(),
         fx.conversations.clone(),
+        fx.agents.clone(),
         UnavailableHistory,
     );
     for round in 9..16u64 {

@@ -220,6 +220,11 @@ impl Fixture {
         envelope
             .task_definitions
             .insert(AgentTaskDefinitionId::new(TASK_DEFINITION).expect("the definition id"));
+        // The claim's assignment door reads this: board membership is trusted
+        // wiring, and the envelope is the authority a claim spends.
+        envelope
+            .coordination_capabilities
+            .insert(rakka_agent::AgentCoordinationCapabilityKind::Team);
         let definition = AgentDefinition::new(
             AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
             "One collaborating team member.",

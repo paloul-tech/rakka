@@ -134,6 +134,9 @@ async fn moderation_recovers_the_protocol_across_passivation_without_duplicating
         ScriptedDispatcher::new(),
         None,
     );
+    world
+        .instantiate_conversation_participants(&[MODERATOR, "p1", "p2", "p3"])
+        .await;
     let scope = conversation_scope("design-review");
 
     // Trusted wiring creates the conversation; two turns land with reported
@@ -244,6 +247,9 @@ async fn a_stored_designation_survives_passivation() {
         ScriptedDispatcher::new(),
         None,
     );
+    world
+        .instantiate_conversation_participants(&[MODERATOR, "p1", "p2", "p3"])
+        .await;
     let scope = conversation_scope("interview");
 
     let reply = apply(
@@ -326,6 +332,9 @@ async fn an_idle_conversation_passivates_on_its_own() {
         ScriptedDispatcher::new(),
         None,
     );
+    world
+        .instantiate_conversation_participants(&[MODERATOR, "p1", "p2", "p3"])
+        .await;
     let scope = conversation_scope("idle-review");
     let reply = apply(
         &world,

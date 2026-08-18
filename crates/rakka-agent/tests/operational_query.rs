@@ -954,6 +954,10 @@ async fn moderation_exhaustion_reports_a_conversation_nothing_can_advance() {
     let conversation = AgentConversationId::new("panel").expect("the conversation id is valid");
     let scope = AgentConversationScope::new(tenant(), conversation.clone()).expect("the scope");
     let agent = |name: &str| AgentId::new(name).expect("the agent id is valid");
+    // The turn door reads the speaker's definition, so the roster's members
+    // are instantiated with the `Moderation` capability their turns spend.
+    fx.instantiate_conversation_participants(&["moderator", "p1"])
+        .await;
 
     // One round, one turn: the ceiling is reached the moment that turn lands,
     // and `ModeratorDecides` parks rather than completing.

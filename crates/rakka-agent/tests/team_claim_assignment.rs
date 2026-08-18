@@ -123,7 +123,7 @@ async fn post_board_task(fx: &Fixture) {
 /// The claim world: team, board task, and both members instantiated.
 async fn claimable_world(fx: &Fixture) {
     for name in [MEMBER_A, MEMBER_B] {
-        fx.instantiate_agent_at(
+        fx.instantiate_team_member_at(
             AgentScope::new(tenant(), member(name)).expect("the member scope is valid"),
         )
         .await;
@@ -473,11 +473,85 @@ async fn a_refused_claim_resolves_through_the_result_and_reopens_the_board() {
 }
 
 #[tokio::test]
+async fn a_member_without_the_team_capability_is_refused_at_the_assignment_door() {
+    // The M5 setup-cannot-widen bullet, with coordination as the dimension
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)). Board
+    // membership is trusted application wiring and never an authority source
+    // of its own: this claimant is a fully instantiated, perfectly healthy
+    // agent, admitted to the task definition and on the roster — everything
+    // the pre-5.6 checks looked at — and its *definition* simply never granted
+    // the `Team` coordination capability a board claim spends.
+    let fx = fixture();
+    let scope = AgentScope::new(tenant(), member(MEMBER_A)).expect("the member scope is valid");
+    // Instantiated with the plain envelope: task definition yes, coordination
+    // capabilities none.
+    fx.instantiate_agent_at(scope.clone()).await;
+    create_team(&fx).await;
+    create_board_task(&fx).await;
+    post_board_task(&fx).await;
+
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-uncapable"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the claim applies at the board");
+
+    settle_claim_round_trip(&fx).await;
+
+    let task = fx.task_snapshot().await;
+    assert!(
+        task.assignment.is_none(),
+        "no generation was bought without the capability"
+    );
+    assert_eq!(
+        task.assignment_generation,
+        AgentAssignmentGeneration::default(),
+        "and none was minted, so the ledger is untouched"
+    );
+    let claim = task.team_claim.expect("the claim provenance stands");
+    assert!(matches!(
+        claim.status,
+        AgentTaskTeamClaimStatus::Refused { .. }
+    ));
+    assert!(claim.result_settled, "the refusal reached the board");
+
+    // The single-attempt rule: the entry reopens for a member that *is*
+    // authorized rather than parking the task in a refusal loop.
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Open);
+    assert!(entry.claim.is_none());
+    assert_eq!(
+        entry.last_code.as_deref(),
+        Some("team-coordination-unauthorized"),
+        "the board carries the refusal code the members rebase on"
+    );
+
+    // The same agent, same task, assigned directly, is untouched: a direct
+    // assignment spends no coordination capability, so the door is a door on
+    // the claim and not a second admission check.
+    let readiness_task = fx.task_snapshot().await;
+    assert!(
+        readiness_task.last_refusal.is_none(),
+        "the claim's refusal is the claim's, not a standing refusal against the agent"
+    );
+}
+
+#[tokio::test]
 async fn an_expired_lease_steal_supersedes_the_pending_claim_before_acceptance() {
     let fx = fixture();
     // Member A never instantiated: its claim can never accept, so the steal
     // window is real. Member B is ready.
-    fx.instantiate_agent_at(
+    fx.instantiate_team_member_at(
         AgentScope::new(tenant(), member(MEMBER_B)).expect("the member scope is valid"),
     )
     .await;
@@ -704,7 +778,7 @@ async fn a_release_racing_the_offer_restores_and_the_acceptance_stands() {
 #[tokio::test]
 async fn a_claim_against_a_missing_or_foreign_task_closes_the_entry() {
     let fx = fixture();
-    fx.instantiate_agent_at(
+    fx.instantiate_team_member_at(
         AgentScope::new(tenant(), member(MEMBER_A)).expect("the member scope is valid"),
     )
     .await;

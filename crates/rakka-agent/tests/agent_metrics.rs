@@ -873,6 +873,10 @@ async fn moderation_turns_count_once_under_bounded_labels() {
     let scope = AgentConversationScope::new(tenant(), conversation.clone())
         .expect("the conversation scope is valid");
     let participant = rakka_agent::AgentId::new("speaker").expect("the participant id is valid");
+    // The turn door reads the speaker's definition, so the roster's members
+    // are instantiated with the `Moderation` capability their turns spend.
+    fx.instantiate_conversation_participants(&[common::AGENT, "speaker"])
+        .await;
     let create = AgentConversationEntityCommand::Create {
         operation_id: rakka_agent::conversation_create_operation_id(&tenant(), &conversation)
             .expect("the operation id derives"),

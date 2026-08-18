@@ -80,7 +80,7 @@ use crate::coordination::{
 use crate::definition::{AgentRevisionNumber, AgentRevisionProvenance};
 use crate::identity::{
     AgentConversationId, AgentConversationScope, AgentId, AgentIdentityError, AgentOperationId,
-    AgentTaskId, AgentTaskScope,
+    AgentScope, AgentTaskId, AgentTaskScope,
 };
 use crate::observability::{
     record_agent_domain_counter, record_unsettleable_exchanges, METRIC_AGENT_MODERATION_TURNS,
@@ -1850,22 +1850,30 @@ pub enum AgentConversationEntityMessage {
 ///
 /// Every decision lives here; the actor is a routing and recovery shell
 /// over it, so the entity can passivate after any message.
-pub struct AgentConversationEntityStore<Store, History>
+pub struct AgentConversationEntityStore<Store, Agents, History>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
     scope: AgentConversationScope,
     host: AgentExchangeHost<AgentConversationParticipant, Store>,
+    /// The agents' durable records, read — never asked — to decide whether a
+    /// speaker's definition grants moderated participation. It is the same
+    /// read path the assignment decision uses, for the same reason: a popular
+    /// agent must not become a serialization bottleneck for conversations it
+    /// merely takes turns in.
+    agents: Agents,
     history: History,
     policy: AgentSchemaPolicy,
     metrics: Arc<dyn MetricsRecorder>,
     recovered: bool,
 }
 
-impl<Store, History> Debug for AgentConversationEntityStore<Store, History>
+impl<Store, Agents, History> Debug for AgentConversationEntityStore<Store, Agents, History>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -1877,14 +1885,20 @@ where
     }
 }
 
-impl<Store, History> AgentConversationEntityStore<Store, History>
+impl<Store, Agents, History> AgentConversationEntityStore<Store, Agents, History>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
     /// Creates a durable facade for one conversation scope.
     #[must_use]
-    pub fn new(scope: AgentConversationScope, store: Store, history: History) -> Self {
+    pub fn new(
+        scope: AgentConversationScope,
+        store: Store,
+        agents: Agents,
+        history: History,
+    ) -> Self {
         let host = AgentExchangeHost::new(
             AgentEntityAddress::Conversation(scope.clone()),
             AgentConversationParticipant,
@@ -1893,6 +1907,7 @@ where
         Self {
             scope,
             host,
+            agents,
             history,
             policy: AgentSchemaPolicy::default(),
             metrics: Arc::new(NoopMetricsRecorder),
@@ -2011,9 +2026,24 @@ where
             }
         }
 
+        // The moderation authority door
+        // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)). It is
+        // read here rather than inside the transition because the answer lives
+        // in *another* entity's durable record, and it is read strictly after
+        // the ledger echo above: a turn already recorded converges on its
+        // recorded outcome even if the speaker's definition has narrowed since,
+        // because re-judging a committed turn would make recovery depend on a
+        // record the turn never consulted.
+        let moderation = if let AgentConversationEntityCommand::SubmitTurn { submit, .. } = &command
+        {
+            Some(self.permits_moderation(&submit.participant).await?)
+        } else {
+            None
+        };
+
         self.require_history_headroom(now).await?;
 
-        let reply = self.apply_transition(command, now).await;
+        let reply = self.apply_transition(command, moderation, now).await;
         match &reply {
             // A duplicate — the past-window ledger echo — made no durable
             // decision and counts nothing, so a replay never double-counts.
@@ -2059,9 +2089,35 @@ where
         reply
     }
 
+    /// Whether `participant`'s durable definition grants
+    /// [`crate::definition::AgentCoordinationCapabilityKind::Moderation`].
+    ///
+    /// An agent with no durable record has no definition and therefore no
+    /// grant, so it answers `false` — the roster admitting it is not
+    /// permission.
+    async fn permits_moderation(&self, participant: &AgentId) -> AgentConversationResult<bool> {
+        let scope = AgentScope::new(self.scope.tenant().clone(), participant.clone())?;
+        let state = crate::agent::load_agent_entity_state(&self.agents, &scope, &self.policy)
+            .await
+            .map_err(
+                |error| AgentConversationError::ParticipantRecordUnreadable {
+                    participant: participant.clone(),
+                    code: error.code().to_string(),
+                },
+            )?;
+        Ok(state.is_some_and(|state| {
+            state
+                .definition()
+                .envelope()
+                .coordination_capabilities
+                .contains(&crate::definition::AgentCoordinationCapabilityKind::Moderation)
+        }))
+    }
+
     async fn apply_transition(
         &mut self,
         command: AgentConversationEntityCommand,
+        moderation: Option<bool>,
         now: AgentTimestampMillis,
     ) -> AgentConversationResult<AgentConversationEntityReply> {
         match command {
@@ -2083,8 +2139,13 @@ where
                 // The ledger echo already answered in `apply`, ahead of
                 // every other guard; `record_turn` re-probes so the pure
                 // transition stays self-contained for a direct caller.
+                //
+                // `moderation` is `None` only if this arm were reached without
+                // the facade's read above; fail closed on that rather than
+                // admitting an unchecked turn.
+                let permits_moderation = moderation.unwrap_or(false);
                 self.transition(now, move |state| {
-                    record_turn(state, &operation_id, &submit, now)?;
+                    record_turn(state, &operation_id, &submit, permits_moderation, now)?;
                     Ok(operation_id)
                 })
                 .await
@@ -2616,6 +2677,7 @@ fn record_turn(
     state: &mut AgentConversationState,
     operation_id: &AgentOperationId,
     submit: &AgentConversationTurnSubmit,
+    permits_moderation: bool,
     now: AgentTimestampMillis,
 ) -> AgentConversationResult<()> {
     // The facade answers the ledger echo before initiating this transition;
@@ -2628,6 +2690,15 @@ fn record_turn(
     let conversation = state.conversation_mut()?;
     if !conversation.is_authorized(&submit.participant) {
         return Err(AgentConversationError::NotParticipant {
+            participant: submit.participant.clone(),
+        });
+    }
+    // Beside the roster check, because it answers the other half of the same
+    // question — the roster admits this speaker *here*, the envelope admits it
+    // to moderated work *at all* — and like the roster check it depends on who
+    // asks, so both precede the coordinate and ceiling fences, which do not.
+    if !permits_moderation {
+        return Err(AgentConversationError::ModerationNotAuthorized {
             participant: submit.participant.clone(),
         });
     }
@@ -2933,19 +3004,21 @@ fn end_early(
 
 /// The sharded conversation entity actor: a routing and recovery shell over
 /// [`AgentConversationEntityStore`].
-pub struct AgentConversationEntity<Store, History>
+pub struct AgentConversationEntity<Store, Agents, History>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
-    entity: Result<AgentConversationEntityStore<Store, History>, AgentIdentityError>,
+    entity: Result<AgentConversationEntityStore<Store, Agents, History>, AgentIdentityError>,
     router: AgentExchangeRouter,
     clock: AgentConversationClock,
 }
 
-impl<Store, History> AgentConversationEntity<Store, History>
+impl<Store, Agents, History> AgentConversationEntity<Store, Agents, History>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
     /// Creates an entity for one sharded entity id.
@@ -2953,13 +3026,15 @@ where
     pub fn new(
         entity_id: &EntityId,
         store: Store,
+        agents: Agents,
         history: History,
         router: AgentExchangeRouter,
         clock: AgentConversationClock,
         policy: AgentSchemaPolicy,
     ) -> Self {
         let entity = AgentConversationScope::from_entity_id(entity_id).map(|scope| {
-            AgentConversationEntityStore::new(scope, store, history).with_schema_policy(policy)
+            AgentConversationEntityStore::new(scope, store, agents, history)
+                .with_schema_policy(policy)
         });
         Self {
             entity,
@@ -2978,16 +3053,18 @@ where
 
     fn store(
         &mut self,
-    ) -> Result<&mut AgentConversationEntityStore<Store, History>, AgentConversationError> {
+    ) -> Result<&mut AgentConversationEntityStore<Store, Agents, History>, AgentConversationError>
+    {
         self.entity
             .as_mut()
             .map_err(|error| AgentConversationError::Identity(error.clone()))
     }
 }
 
-impl<Store, History> Actor for AgentConversationEntity<Store, History>
+impl<Store, Agents, History> Actor for AgentConversationEntity<Store, Agents, History>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
     type Msg = AgentConversationEntityMessage;
@@ -3189,18 +3266,22 @@ pub fn agent_conversation_entity_persistence_id(scope: &AgentConversationScope) 
 }
 
 /// Initializes node-local sharded conversation entities.
-pub fn init_agent_conversation_entity_sharding<Store, History>(
+pub fn init_agent_conversation_entity_sharding<Store, Agents, History>(
     sharding: &ClusterSharding,
     store: Store,
+    agents: Agents,
     history: History,
     router: AgentExchangeRouter,
     settings: AgentConversationEntityShardingSettings,
 ) -> ClusterShardingResult<AgentConversationEntityRegistration>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
-    sharding.init(agent_conversation_entity(store, history, router, &settings))
+    sharding.init(agent_conversation_entity(
+        store, agents, history, router, &settings,
+    ))
 }
 
 /// Initializes sharded conversation entities that a non-owning node can
@@ -3209,19 +3290,21 @@ where
 /// The remote ask surface is the [`AgentExchangeEnvelope`], exactly as for
 /// the task, run, and team entities; the application registers the exchange
 /// codecs through [`crate::choreography::register_agent_exchange_codecs`].
-pub fn init_agent_conversation_entity_remote_sharding<Store, History>(
+pub fn init_agent_conversation_entity_remote_sharding<Store, Agents, History>(
     sharding: &ClusterSharding,
     runtime: &mut ClusterNodeRuntime,
     store: Store,
+    agents: Agents,
     history: History,
     router: AgentExchangeRouter,
     settings: AgentConversationEntityShardingSettings,
 ) -> ClusterNodeRuntimeResult<AgentConversationEntityRegistration>
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
-    let entity = agent_conversation_entity(store, history, router, &settings);
+    let entity = agent_conversation_entity(store, agents, history, router, &settings);
     sharding.init_remote_with_ask(
         runtime,
         entity,
@@ -3234,24 +3317,28 @@ where
     )
 }
 
-// The conversation entity is generic over its two stores, so the entity
+// The conversation entity is generic over its three stores, so the entity
 // type it builds is unavoidably wide.
 #[allow(clippy::type_complexity)]
-fn agent_conversation_entity<Store, History>(
+fn agent_conversation_entity<Store, Agents, History>(
     store: Store,
+    agents: Agents,
     history: History,
     router: AgentExchangeRouter,
     settings: &AgentConversationEntityShardingSettings,
 ) -> Entity<
     AgentConversationEntityMessage,
-    AgentConversationEntity<Store, History>,
-    impl Fn(EntityContext<AgentConversationEntityMessage>) -> AgentConversationEntity<Store, History>
+    AgentConversationEntity<Store, Agents, History>,
+    impl Fn(
+            EntityContext<AgentConversationEntityMessage>,
+        ) -> AgentConversationEntity<Store, Agents, History>
         + Send
         + Sync
         + 'static,
 >
 where
     Store: DurableStateStore<AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: AgentConversationHistoryStore,
 {
     let schema_policy = settings.schema_policy;
@@ -3261,6 +3348,7 @@ where
         AgentConversationEntity::new(
             context.entity_id(),
             store.clone(),
+            agents.clone(),
             history.clone(),
             router.clone(),
             clock.clone(),
@@ -3361,6 +3449,33 @@ pub enum AgentConversationError {
     NotParticipant {
         /// The claimed speaker.
         participant: AgentId,
+    },
+    /// The claimed speaker's agent definition does not grant
+    /// [`crate::definition::AgentCoordinationCapabilityKind::Moderation`]
+    /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    ///
+    /// The roster and the envelope answer different questions. The roster says
+    /// this conversation admits the speaker; the envelope says the speaker's
+    /// *definition* admits moderated participation at all. A roster is trusted
+    /// application wiring and never an authority source of its own, so an agent
+    /// with no durable state — and therefore no definition — is refused here
+    /// too.
+    ModerationNotAuthorized {
+        /// The claimed speaker.
+        participant: AgentId,
+    },
+    /// The claimed speaker's durable agent record could not be read, so its
+    /// definition could not be consulted.
+    ///
+    /// Distinct from [`Self::ModerationNotAuthorized`] on purpose: that answer
+    /// is definitive while the definition stands, this one is a read that may
+    /// succeed on the next attempt — a record written by a newer binary during
+    /// a rolling upgrade, say — so a caller may retry it.
+    ParticipantRecordUnreadable {
+        /// The claimed speaker.
+        participant: AgentId,
+        /// The stable code the agent-record read failed with.
+        code: String,
     },
     /// The claimed coordinate is ahead of the cursor.
     TurnOutOfOrder {
@@ -3490,6 +3605,10 @@ impl AgentConversationError {
             Self::TranscriptRefInvalid { .. } => "conversation-transcript-ref-invalid",
             Self::PolicyTooLarge { .. } => "conversation-policy-too-large",
             Self::NotParticipant { .. } => "conversation-not-participant",
+            Self::ModerationNotAuthorized { .. } => "conversation-moderation-unauthorized",
+            Self::ParticipantRecordUnreadable { .. } => {
+                "conversation-participant-record-unreadable"
+            }
             Self::TurnOutOfOrder { .. } => "conversation-turn-out-of-order",
             Self::TurnNotOwner { .. } => "conversation-not-your-turn",
             Self::TurnContentMismatch => "conversation-turn-content-mismatch",
@@ -3565,6 +3684,14 @@ impl Display for AgentConversationError {
             Self::NotParticipant { participant } => write!(
                 f,
                 "{participant} is neither the moderator nor a roster participant"
+            ),
+            Self::ModerationNotAuthorized { participant } => write!(
+                f,
+                "{participant}'s definition does not grant the moderation coordination capability"
+            ),
+            Self::ParticipantRecordUnreadable { participant, code } => write!(
+                f,
+                "{participant}'s durable agent record could not be read: {code}"
             ),
             Self::TurnOutOfOrder {
                 expected_round,
@@ -3782,6 +3909,7 @@ mod owed_notice_tests {
         let mut entity = AgentConversationEntityStore::new(
             scope(),
             store.clone(),
+            InMemoryDurableStateStore::<crate::agent::AgentEntityState>::new(),
             InMemoryAgentConversationHistoryStore::new(),
         );
         entity
