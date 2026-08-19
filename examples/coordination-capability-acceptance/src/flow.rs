@@ -296,19 +296,13 @@ async fn task_command(
 
 /// Settles the board.
 ///
-/// Every settle passivates first, so the pass runs on an entity
-/// re-materialized from the durable record — each call is already a restart.
-/// That is not decoration here: a wire command reaches the board through the
-/// A2A service's *own* store handle, so a long-lived resident actor would
-/// otherwise decide what it owes from a cache the service has already
-/// overwritten, and an entity that believes it owes nothing never writes,
-/// never conflicts, and so never re-reads.
+/// No passivation ritual: a wire command reaches the board through the A2A
+/// service's *own* store handle, and the team entity's settle pass
+/// re-materializes from the durable record before deciding what it owes —
+/// so the sweep on a long-lived resident actor observes the service's
+/// writes. Driving it through the resident, stale cache and all, is the
+/// point.
 async fn settle_team(world: &World) {
-    let _ = rakka_agent::passivate_agent_team_entity(
-        &world.sharding,
-        world.team_registration.key(),
-        &team_scope(),
-    );
     let entity = registered_agent_team_entity_ref(&world.team_registration, &team_scope());
     let _ = entity
         .ask(

@@ -1253,3 +1253,66 @@ async fn a_pre_slice_policy_decodes_with_defaults_and_the_identity_pins_hold() {
          3723686f2b03ee546b9980be44391adac55c617054f848eb8669f1343083f83d"
     );
 }
+
+#[tokio::test]
+async fn an_early_end_from_a_moderator_without_the_moderation_capability_refuses() {
+    // The early end is the one terminalizing operation a caller can reach,
+    // and it is wire-reachable through the A2A `end` verb — so it passes the
+    // same authority door as the turn
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)). The
+    // moderator here is the conversation's durable moderator, at the right
+    // round, under a policy that permits the early end; only its envelope
+    // changed. Without the door, an agent refused every turn — the designate
+    // and close-round that ride `SubmitTurn` included — could still
+    // unilaterally terminalize the conversation and unblock the governing
+    // task's review gate.
+    let policy = AgentModerationPolicy::new(AgentRevisionNumber::INITIAL);
+    let fx = created_fixture(creation(policy, &["alpha", "beta"])).await;
+
+    // Republish the moderator without the capability, leaving its task
+    // definitions, its lifecycle, and the conversation's record untouched:
+    // the door re-derives against the definition now in force.
+    let scope =
+        rakka_agent::AgentScope::new(tenant(), agent(MODERATOR)).expect("the agent scope is valid");
+    let mut narrowed = rakka_agent::AgentAuthorityEnvelope::empty();
+    narrowed
+        .task_definitions
+        .insert(common::task_definition_id());
+    let definition = rakka_agent::AgentDefinition::new(
+        rakka_agent::AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+        "Resolves customer support tickets end to end.",
+        narrowed,
+    )
+    .expect("the agent definition is valid");
+    let mut entity = rakka_agent::AgentEntityStore::new(scope.clone(), fx.agents.clone());
+    entity.recover().await.expect("the agent recovers");
+    entity
+        .apply(rakka_agent::AgentEntityCommand::PublishDefinition {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::DefinitionUpdate,
+                &scope,
+                "2",
+            )
+            .expect("the operation id derives"),
+            definition: Box::new(definition),
+            provenance: Box::new(provenance(2)),
+        })
+        .await
+        .expect("the narrowing definition publishes");
+
+    let refused = fx
+        .apply_conversation_command_at(&conversation_scope(), end_command(0, "calling it"))
+        .await
+        .expect_err("the end door refuses a moderator its definition no longer admits");
+    assert_eq!(refused.code(), "conversation-moderation-unauthorized");
+
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(
+        snapshot.status,
+        AgentConversationStatus::Active,
+        "the refusal terminalized nothing"
+    );
+}

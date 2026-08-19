@@ -2394,14 +2394,25 @@ where
     /// Observes a passed expiry horizon, flushes owed history, and drives
     /// the exchanges the team owes.
     ///
-    /// Safe to call at any time and from any node: every step reads what it
-    /// needs from durable state.
+    /// Safe to call at any time and from any node: the pass re-materializes
+    /// the durable record first, so every step reads what it needs from
+    /// durable state — not from this facade's cache.
     pub async fn settle_side_effects(
         &mut self,
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTeamResult<AgentTeamProgress> {
-        self.ensure_recovered(now).await?;
+        // Re-materialized unconditionally, not merely healed: a board has
+        // two writers by construction, and a wire claim reaches it through
+        // the A2A service's *own* store handle. The command path survives a
+        // stale cache because its compare-and-set loses, drops the record,
+        // and the retry re-reads — but a sweep that decides it owes nothing
+        // from a stale cache performs zero writes, never conflicts, and so
+        // would never re-read, leaving the claim's owed decision stalled on
+        // an otherwise idle board until an unrelated command happened to
+        // lose a race. The durable-outbox re-drive guarantee is only as
+        // good as this read.
+        self.recover(now).await?;
         self.require_history_headroom(now).await?;
         let expiry_observed = self.observe_expiry(now).await?;
         let flushed = self.flush_history(now).await?;

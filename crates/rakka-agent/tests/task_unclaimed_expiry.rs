@@ -90,6 +90,10 @@ async fn govern_a_conversation_that_ends(fx: &Fixture, conversation: &str) {
     )
     .expect("the conversation scope is valid");
     let moderator = member("moderator");
+    // The early end passes the moderation envelope door like every turn, so
+    // the moderator needs a durable definition granting `Moderation`.
+    fx.instantiate_conversation_participants(&["moderator"])
+        .await;
     fx.apply_conversation_command_at(
         &scope,
         AgentConversationEntityCommand::Create {

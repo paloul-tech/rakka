@@ -2026,22 +2026,60 @@ where
             }
         }
 
+        // The conversation's own admission guards answer first. They are
+        // definitive from the local record alone and write nothing, so a
+        // caller a local guard refuses learns its definitive answer — an
+        // ended conversation says `conversation-ended`, an outsider hears
+        // `conversation-not-participant` — even while the agents store or
+        // the history sink is unavailable, and a command no local guard
+        // admits never pays the cross-entity moderation read below. Nothing
+        // is decided here that the commit does not re-check: the transition
+        // re-runs the same derivation inside its compare-and-set.
+        let admission = match &command {
+            AgentConversationEntityCommand::SubmitTurn { submit, .. } => {
+                admit_turn(self.state()?, submit, now).map(|_speaker| ())
+            }
+            AgentConversationEntityCommand::EndEarly {
+                moderator,
+                expected_round,
+                reason,
+                ..
+            } => admit_end_early(self.state()?, moderator, *expected_round, reason, now),
+            _ => Ok(()),
+        };
+        if let Err(error) = admission {
+            if error.is_domain_refusal() {
+                self.count_operation(operation, "refused");
+            }
+            return Err(error);
+        }
+
+        self.require_history_headroom(now).await?;
+
         // The moderation authority door
         // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)). It is
         // read here rather than inside the transition because the answer lives
-        // in *another* entity's durable record, and it is read strictly after
-        // the ledger echo above: a turn already recorded converges on its
-        // recorded outcome even if the speaker's definition has narrowed since,
-        // because re-judging a committed turn would make recovery depend on a
-        // record the turn never consulted.
-        let moderation = if let AgentConversationEntityCommand::SubmitTurn { submit, .. } = &command
-        {
-            Some(self.permits_moderation(&submit.participant).await?)
-        } else {
-            None
+        // in *another* entity's durable record, and it is read strictly last:
+        // after the ledger echo above, because a turn already recorded
+        // converges on its recorded outcome even if the speaker's definition
+        // has narrowed since (re-judging a committed turn would make recovery
+        // depend on a record the turn never consulted) — and after the local
+        // admission guards and the headroom gate, so a command they refuse is
+        // answered from the conversation's own record alone, without paying
+        // this read or inheriting the agents store's availability. The early
+        // end passes the same door as the turn: the moderator fence says the
+        // conversation's record names this agent, the envelope says the agent
+        // may moderate at all, and the one terminalizing operation a caller
+        // can reach must not stay open to an agent every turn refuses.
+        let moderation = match &command {
+            AgentConversationEntityCommand::SubmitTurn { submit, .. } => {
+                Some(self.permits_moderation(&submit.participant).await?)
+            }
+            AgentConversationEntityCommand::EndEarly { moderator, .. } => {
+                Some(self.permits_moderation(moderator).await?)
+            }
+            _ => None,
         };
-
-        self.require_history_headroom(now).await?;
 
         let reply = self.apply_transition(command, moderation, now).await;
         match &reply {
@@ -2089,12 +2127,18 @@ where
         reply
     }
 
-    /// Whether `participant`'s durable definition grants
+    /// Whether `participant`'s durable record currently admits it to
+    /// moderated work: its lifecycle status permits dispatch and its
+    /// definition grants
     /// [`crate::definition::AgentCoordinationCapabilityKind::Moderation`].
     ///
     /// An agent with no durable record has no definition and therefore no
     /// grant, so it answers `false` — the roster admitting it is not
-    /// permission.
+    /// permission. A `Suspended` or `Terminated` agent answers `false` the
+    /// same way: the door reads the agent's *current* authority, and a
+    /// status that permits no dispatch permits no moderated turn either —
+    /// the rule every sibling envelope door (assignment readiness, tool
+    /// dispatch) already holds.
     async fn permits_moderation(&self, participant: &AgentId) -> AgentConversationResult<bool> {
         let scope = AgentScope::new(self.scope.tenant().clone(), participant.clone())?;
         let state = crate::agent::load_agent_entity_state(&self.agents, &scope, &self.policy)
@@ -2106,11 +2150,12 @@ where
                 },
             )?;
         Ok(state.is_some_and(|state| {
-            state
-                .definition()
-                .envelope()
-                .coordination_capabilities
-                .contains(&crate::definition::AgentCoordinationCapabilityKind::Moderation)
+            state.status().permits_dispatch()
+                && state
+                    .definition()
+                    .envelope()
+                    .coordination_capabilities
+                    .contains(&crate::definition::AgentCoordinationCapabilityKind::Moderation)
         }))
     }
 
@@ -2157,12 +2202,17 @@ where
                 reason,
                 provenance,
             } => {
+                // As with the turn arm: `moderation` is `None` only if this
+                // arm were reached without the facade's read above; fail
+                // closed on that rather than admitting an unchecked end.
+                let permits_moderation = moderation.unwrap_or(false);
                 self.transition(now, move |state| {
                     end_early(
                         state,
                         &operation_id,
                         &moderator,
                         expected_round,
+                        permits_moderation,
                         &provenance,
                         reason,
                         now,
@@ -2673,32 +2723,29 @@ fn close_round(conversation: &mut AgentConversation, now: AgentTimestampMillis) 
     false
 }
 
-fn record_turn(
-    state: &mut AgentConversationState,
-    operation_id: &AgentOperationId,
+/// Every turn guard the conversation answers from its own durable record —
+/// the terminal fence, roster membership, the coordinate and ceiling
+/// fences, the owner fence, the direction rules, and the size, usage, and
+/// budget bounds — in exactly the order the transition refuses them.
+///
+/// Pure over the current record, and run twice on purpose. The facade runs
+/// it before paying the cross-entity moderation read, so a turn some local
+/// guard refuses gets its definitive answer without that read — during an
+/// agents-store outage a turn to an ended conversation still answers
+/// `conversation-ended`, never a retryable read fault — and a turn no
+/// guard admits never costs the durable load. [`record_turn`] runs it
+/// again inside the compare-and-set, so the pure transition stays
+/// self-contained for a direct caller.
+///
+/// Returns the ledger speaker slot the admitted turn records.
+fn admit_turn(
+    state: &AgentConversationState,
     submit: &AgentConversationTurnSubmit,
-    permits_moderation: bool,
     now: AgentTimestampMillis,
-) -> AgentConversationResult<()> {
-    // The facade answers the ledger echo before initiating this transition;
-    // re-probing keeps the pure transition self-contained for any caller
-    // that reaches it directly.
-    if let Some(echo) = probe_turn_echo(state, submit) {
-        return echo;
-    }
-    state.require_active(now)?;
-    let conversation = state.conversation_mut()?;
+) -> AgentConversationResult<AgentConversationSpeaker> {
+    let conversation = state.require_active(now)?;
     if !conversation.is_authorized(&submit.participant) {
         return Err(AgentConversationError::NotParticipant {
-            participant: submit.participant.clone(),
-        });
-    }
-    // Beside the roster check, because it answers the other half of the same
-    // question — the roster admits this speaker *here*, the envelope admits it
-    // to moderated work *at all* — and like the roster check it depends on who
-    // asks, so both precede the coordinate and ceiling fences, which do not.
-    if !permits_moderation {
-        return Err(AgentConversationError::ModerationNotAuthorized {
             participant: submit.participant.clone(),
         });
     }
@@ -2720,22 +2767,15 @@ fn record_turn(
             maximum: max_rounds,
         });
     }
-    // The turns-per-round ceiling is a ceiling on *records*, so it is
-    // checked for every turn, not only the moderator's designating one —
-    // enforcing it on one branch let a round record one more turn than the
-    // policy declared, billing a turn the operator did not admit and
-    // eroding the ledger reserve the creation arithmetic holds. Like the
-    // round ceiling above, it refuses before the owner fence: the answer
-    // does not depend on who asks.
-    // The turns-per-round ceiling stated directly: it bounds *records*, so
-    // it is checked for every turn rather than only the moderator's
-    // designating one, which is what let a round record one turn more than
-    // the policy declared — billing a turn the operator never admitted and
-    // eroding the per-round ledger reserve the creation arithmetic holds.
-    // The designation look-ahead below is what normally keeps a round
-    // inside this bound; this is the bound itself, and like the round
-    // ceiling above it refuses before the owner fence, because the answer
-    // does not depend on who asks.
+    // The turns-per-round ceiling bounds *records*, so it is checked for
+    // every turn rather than only the moderator's designating one — which
+    // is what let a round record one turn more than the policy declared,
+    // billing a turn the operator never admitted and eroding the per-round
+    // ledger reserve the creation arithmetic holds. The designation
+    // look-ahead below is what normally keeps a round inside this bound;
+    // this is the bound itself, and like the round ceiling above it refuses
+    // before the owner fence, because the answer does not depend on who
+    // asks.
     let max_turns = conversation.policy.effective_max_turns_per_round();
     if conversation.turn_in_round >= max_turns {
         return Err(AgentConversationError::TurnsExhausted { maximum: max_turns });
@@ -2828,6 +2868,37 @@ fn record_turn(
             ));
         }
     }
+    Ok(speaker)
+}
+
+fn record_turn(
+    state: &mut AgentConversationState,
+    operation_id: &AgentOperationId,
+    submit: &AgentConversationTurnSubmit,
+    permits_moderation: bool,
+    now: AgentTimestampMillis,
+) -> AgentConversationResult<()> {
+    // The facade answers the ledger echo before initiating this transition;
+    // re-probing keeps the pure transition self-contained for any caller
+    // that reaches it directly.
+    if let Some(echo) = probe_turn_echo(state, submit) {
+        return echo;
+    }
+    let speaker = admit_turn(state, submit, now)?;
+    // The moderation door
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)): the
+    // roster admits this speaker *here*, the envelope admits it to moderated
+    // work *at all*, and both must say yes. It is the one guard whose answer
+    // lives in another entity's durable record, so it comes strictly after
+    // every guard the conversation can answer from its own — which is what
+    // lets the facade refuse locally without paying the read that produced
+    // this flag.
+    if !permits_moderation {
+        return Err(AgentConversationError::ModerationNotAuthorized {
+            participant: submit.participant.clone(),
+        });
+    }
+    let conversation = state.conversation_mut()?;
 
     // Every guard passed: the ledger append, the ring append, the usage
     // record, and the cursor advance commit as one.
@@ -2933,17 +3004,22 @@ fn record_turn(
     state.check_bounds()
 }
 
-fn end_early(
-    state: &mut AgentConversationState,
-    operation_id: &AgentOperationId,
+/// Every early-end guard the conversation answers from its own durable
+/// record — the terminal fence, the reason bound, the policy grant, the
+/// moderator identity fence, and the round epoch — in exactly the order
+/// the transition refuses them.
+///
+/// Pure over the current record, and run twice for the same reason as
+/// [`admit_turn`]: by the facade before the cross-entity moderation read,
+/// and by [`end_early`] inside the compare-and-set.
+fn admit_end_early(
+    state: &AgentConversationState,
     moderator: &AgentId,
     expected_round: u64,
-    provenance: &AgentRevisionProvenance,
-    reason: String,
+    reason: &str,
     now: AgentTimestampMillis,
 ) -> AgentConversationResult<()> {
-    state.require_active(now)?;
-    let conversation = state.conversation_mut()?;
+    let conversation = state.require_active(now)?;
     // The reason is caller-supplied free text riding a durable append, so
     // it is bounded like every other caller-supplied field — at the ceiling
     // the constant has always advertised, rather than being silently
@@ -2976,6 +3052,34 @@ fn end_early(
             actual: conversation.round,
         });
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn end_early(
+    state: &mut AgentConversationState,
+    operation_id: &AgentOperationId,
+    moderator: &AgentId,
+    expected_round: u64,
+    permits_moderation: bool,
+    provenance: &AgentRevisionProvenance,
+    reason: String,
+    now: AgentTimestampMillis,
+) -> AgentConversationResult<()> {
+    admit_end_early(state, moderator, expected_round, &reason, now)?;
+    // The moderation door guards the early end exactly as it guards the
+    // turn ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
+    // The identity fence above says the conversation's record names this
+    // agent as its moderator; the envelope says the agent may moderate at
+    // all — and the one terminalizing operation a caller can reach must not
+    // stay open to an agent whose retracted grant already refuses every
+    // designate and close-round it could ride `SubmitTurn` for.
+    if !permits_moderation {
+        return Err(AgentConversationError::ModerationNotAuthorized {
+            participant: moderator.clone(),
+        });
+    }
+    let conversation = state.conversation_mut()?;
     conversation.status = AgentConversationStatus::Ended;
     conversation.terminal_reason = Some(AgentConversationTerminalReason::ModeratorEnded);
     conversation.ended_at = Some(now);
@@ -3450,8 +3554,10 @@ pub enum AgentConversationError {
         /// The claimed speaker.
         participant: AgentId,
     },
-    /// The claimed speaker's agent definition does not grant
-    /// [`crate::definition::AgentCoordinationCapabilityKind::Moderation`]
+    /// The claimed speaker's durable agent record does not currently admit it
+    /// to moderated work: its definition does not grant
+    /// [`crate::definition::AgentCoordinationCapabilityKind::Moderation`], or
+    /// its lifecycle status no longer permits dispatch
     /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
     ///
     /// The roster and the envelope answer different questions. The roster says
@@ -3459,7 +3565,8 @@ pub enum AgentConversationError {
     /// *definition* admits moderated participation at all. A roster is trusted
     /// application wiring and never an authority source of its own, so an agent
     /// with no durable state — and therefore no definition — is refused here
-    /// too.
+    /// too, and so is a `Suspended` or `Terminated` agent: a status that
+    /// permits no dispatch permits no moderated turn.
     ModerationNotAuthorized {
         /// The claimed speaker.
         participant: AgentId,
@@ -3641,7 +3748,11 @@ impl AgentConversationError {
     /// becomes a "refusal" by default: it would answer a caller as a rejected
     /// *command* and count against the entity's refusal metric. Only decisions a
     /// command reached belong on the true side —
-    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision.
+    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision, and
+    /// [`Self::ParticipantRecordUnreadable`] is a read *fault* the very next
+    /// attempt may serve (its own contract says the caller may retry it), so
+    /// answering it as a definitive wire rejection would make a well-behaved
+    /// caller abandon a turn an agents-store blip refused.
     #[must_use]
     pub const fn is_domain_refusal(&self) -> bool {
         !matches!(
@@ -3650,6 +3761,7 @@ impl AgentConversationError {
                 | Self::Schema(_)
                 | Self::Choreography(_)
                 | Self::Coordination(_)
+                | Self::ParticipantRecordUnreadable { .. }
                 | Self::HistoryWindowExpired { .. }
         )
     }
@@ -3687,7 +3799,8 @@ impl Display for AgentConversationError {
             ),
             Self::ModerationNotAuthorized { participant } => write!(
                 f,
-                "{participant}'s definition does not grant the moderation coordination capability"
+                "{participant} is not an active agent whose definition grants the moderation \
+                 coordination capability"
             ),
             Self::ParticipantRecordUnreadable { participant, code } => write!(
                 f,

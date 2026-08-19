@@ -11,6 +11,9 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use common::{tenant, Fixture};
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::{
@@ -20,6 +23,9 @@ use rakka_agent::{
     AgentConversationMode, AgentConversationScope, AgentConversationStatus,
     AgentConversationTerminalReason, AgentConversationTurnSubmit, AgentId, AgentModerationPolicy,
     AgentRevisionNumber, AgentScope, AgentTaskId,
+};
+use rakka_persistence::{
+    DurableError, DurableStateStore, PersistenceId, Revision, StateRecord, StoreFuture,
 };
 
 const CONVERSATION: &str = "panel-debate";
@@ -284,6 +290,279 @@ async fn a_speaker_without_the_moderation_capability_is_refused_at_the_turn_door
         "the roster answers before the envelope: an outsider is not told whether it could have \
          spoken had it been admitted"
     );
+}
+
+#[tokio::test]
+async fn a_suspended_speaker_is_refused_at_the_turn_door() {
+    // Lifecycle is part of the authority the door reads
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)) — the
+    // rule every sibling envelope door already holds: suspension withdraws
+    // assignments, board claims, and effect dispatch immediately, and the
+    // moderated turn must not be the one surface that keeps listening.
+    // `p1` here is the roster's current speaker, at the right coordinate,
+    // with its `Moderation` grant intact — only its lifecycle changed.
+    let fx = created(
+        AgentConversationMode::RoundRobin,
+        AgentConversationCompletionRule::ModeratorDecides,
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["p1", "p2"],
+    )
+    .await;
+
+    let scope = AgentScope::new(tenant(), agent("p1")).expect("the agent scope is valid");
+    let mut entity = rakka_agent::AgentEntityStore::new(scope.clone(), fx.agents.clone());
+    entity.recover().await.expect("the agent recovers");
+    entity
+        .apply(rakka_agent::AgentEntityCommand::Suspend {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::LifecycleCommand,
+                &scope,
+                "suspend-1",
+            )
+            .expect("the operation id derives"),
+            expected_lifecycle_revision: AgentRevisionNumber::INITIAL,
+            provenance: Box::new(common::provenance(2)),
+        })
+        .await
+        .expect("the suspension applies");
+
+    let refused = fx
+        .apply_conversation_command_at(&conversation_scope(), submit(0, 0, "p1", "position", None))
+        .await
+        .expect_err("the turn door refuses a suspended speaker");
+    assert_eq!(refused.code(), "conversation-moderation-unauthorized");
+
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert!(snapshot.turns.is_empty(), "a refusal records nothing");
+
+    // Resuming restores exactly what suspension withdrew: the same turn —
+    // same operation id, same digest — now lands, because a rejected
+    // transition left no trace to collide with.
+    let mut entity = rakka_agent::AgentEntityStore::new(scope.clone(), fx.agents.clone());
+    entity.recover().await.expect("the agent recovers");
+    entity
+        .apply(rakka_agent::AgentEntityCommand::Resume {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::LifecycleCommand,
+                &scope,
+                "resume-1",
+            )
+            .expect("the operation id derives"),
+            expected_lifecycle_revision: AgentRevisionNumber::new(2),
+            provenance: Box::new(common::provenance(3)),
+        })
+        .await
+        .expect("the resume applies");
+    let reply = fx
+        .apply_conversation_command_at(&conversation_scope(), submit(0, 0, "p1", "position", None))
+        .await
+        .expect("the resumed speaker's turn lands");
+    assert!(matches!(
+        reply,
+        AgentConversationEntityReply::Applied { .. }
+    ));
+}
+
+/// The fixture's agents store behind an outage switch: reads fail while the
+/// switch is thrown, writes pass through untouched. The moderation door's
+/// cross-entity load is the conversation's only read of this store.
+#[derive(Clone)]
+struct OutageAgents {
+    inner: common::AgentStore,
+    down: Arc<AtomicBool>,
+}
+
+impl DurableStateStore<rakka_agent::AgentEntityState> for OutageAgents {
+    fn backend_name(&self) -> &'static str {
+        "outage-agents"
+    }
+
+    fn load<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+    ) -> StoreFuture<'a, Option<StateRecord<rakka_agent::AgentEntityState>>> {
+        if self.down.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(DurableError::store(
+                    "outage-agents",
+                    "the agents store is unreachable",
+                ))
+            });
+        }
+        self.inner.load(persistence_id)
+    }
+
+    fn compare_and_set<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        expected_revision: Revision,
+        state: rakka_agent::AgentEntityState,
+    ) -> StoreFuture<'a, StateRecord<rakka_agent::AgentEntityState>> {
+        self.inner
+            .compare_and_set(persistence_id, expected_revision, state)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        persistence_id: &'a PersistenceId,
+        expected_revision: Revision,
+    ) -> StoreFuture<'a, Revision> {
+        self.inner.delete(persistence_id, expected_revision)
+    }
+}
+
+fn outage_resident(
+    fx: &Fixture,
+    down: &Arc<AtomicBool>,
+) -> rakka_agent::AgentConversationEntityStore<
+    common::ConversationStore,
+    OutageAgents,
+    rakka_agent::InMemoryAgentConversationHistoryStore,
+> {
+    rakka_agent::AgentConversationEntityStore::new(
+        conversation_scope(),
+        fx.conversations.clone(),
+        OutageAgents {
+            inner: fx.agents.clone(),
+            down: down.clone(),
+        },
+        fx.conversation_history.clone(),
+    )
+}
+
+#[tokio::test]
+async fn an_agents_store_read_fault_answers_as_a_retryable_error_not_a_wire_refusal() {
+    // The moderation door's cross-entity load failing is a read fault the
+    // very next attempt may serve — the variant's own contract says the
+    // caller may retry it. A domain refusal it is not: the A2A surface maps
+    // refusals to a definitive wire `Rejected`, and a conforming caller
+    // abandons a rejected turn — which, before the classification fix,
+    // abandoned a turn an agents-store blip refused and the next attempt
+    // would have landed.
+    let fx = created(
+        AgentConversationMode::RoundRobin,
+        AgentConversationCompletionRule::ModeratorDecides,
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["p1", "p2"],
+    )
+    .await;
+    let down = Arc::new(AtomicBool::new(true));
+    let mut resident = outage_resident(&fx, &down);
+    resident
+        .recover(fx.now())
+        .await
+        .expect("the conversation loads");
+
+    // Every local guard admits this turn — right speaker, right coordinate
+    // — so it reaches the read, and the outage surfaces as the fault.
+    let fault = resident
+        .apply(submit(0, 0, "p1", "opening", None), &fx.router, fx.now())
+        .await
+        .expect_err("the read fault surfaces");
+    assert_eq!(fault.code(), "conversation-participant-record-unreadable");
+    assert!(
+        !fault.is_domain_refusal(),
+        "a read fault is retryable infrastructure, never a decision: {fault}"
+    );
+
+    // The very next attempt after the store heals lands the same turn — the
+    // retry the classification exists to keep possible.
+    down.store(false, Ordering::SeqCst);
+    let reply = resident
+        .apply(submit(0, 0, "p1", "opening", None), &fx.router, fx.now())
+        .await
+        .expect("the healed retry lands");
+    assert!(matches!(
+        reply,
+        AgentConversationEntityReply::Applied { .. }
+    ));
+}
+
+#[tokio::test]
+async fn local_guards_answer_definitively_while_the_agents_store_is_down() {
+    // The conversation's own guards precede the cross-entity moderation
+    // read, so a turn a local guard refuses gets its definitive answer from
+    // the conversation's own record alone — and never pays the durable
+    // load. Before the reorder, every refusal below surfaced as the
+    // retryable `conversation-participant-record-unreadable`, and a
+    // well-behaved caller retried forever against turns that can never
+    // land.
+    let fx = created(
+        AgentConversationMode::RoundRobin,
+        AgentConversationCompletionRule::ModeratorDecides,
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["p1", "p2"],
+    )
+    .await;
+    let down = Arc::new(AtomicBool::new(true));
+    let mut resident = outage_resident(&fx, &down);
+    resident
+        .recover(fx.now())
+        .await
+        .expect("the conversation loads");
+
+    let stranger = resident
+        .apply(
+            submit(0, 0, "intruder", "hello", None),
+            &fx.router,
+            fx.now(),
+        )
+        .await
+        .expect_err("a non-participant refuses from the roster alone");
+    assert_eq!(stranger.code(), "conversation-not-participant");
+
+    let wrong_owner = resident
+        .apply(submit(0, 0, "p2", "cutting in", None), &fx.router, fx.now())
+        .await
+        .expect_err("the owner fence refuses from the cursor alone");
+    assert_eq!(wrong_owner.code(), "conversation-not-your-turn");
+
+    let early = resident
+        .apply(submit(1, 0, "p1", "previewing", None), &fx.router, fx.now())
+        .await
+        .expect_err("the coordinate fence refuses from the cursor alone");
+    assert_eq!(early.code(), "conversation-turn-out-of-order");
+
+    // The moderator ends the conversation through the healthy fixture path,
+    // and a fresh resident materialized after the end — agents store still
+    // down — answers the terminal fence, not the read fault.
+    let ended = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            AgentConversationEntityCommand::EndEarly {
+                operation_id: rakka_agent::conversation_end_operation_id(
+                    &tenant(),
+                    &AgentConversationId::new(CONVERSATION).expect("the conversation id is valid"),
+                    0,
+                    "wrapped",
+                )
+                .expect("the operation id derives"),
+                moderator: agent(MODERATOR),
+                expected_round: 0,
+                reason: "wrapped".to_string(),
+                provenance: Box::new(common::provenance(9)),
+            },
+        )
+        .await
+        .expect("the moderator ends the conversation");
+    assert!(matches!(
+        ended,
+        AgentConversationEntityReply::Applied { .. }
+    ));
+
+    let mut resident = outage_resident(&fx, &down);
+    resident
+        .recover(fx.now())
+        .await
+        .expect("the ended conversation loads");
+    let terminal = resident
+        .apply(submit(0, 0, "p1", "opening", None), &fx.router, fx.now())
+        .await
+        .expect_err("the terminal fence refuses from the conversation's own record");
+    assert_eq!(terminal.code(), "conversation-ended");
 }
 
 #[tokio::test]

@@ -954,6 +954,9 @@ async fn the_wire_records_the_moderation_counter() {
 async fn a_terminated_conversation_echoes_on_its_governing_tasks_projection() {
     let fixture = Fixture::new();
     fixture.instantiate(&agent(MEMBER_A)).await;
+    // The early end passes the moderation envelope door like every turn, so
+    // the moderator needs a durable definition granting `Moderation`.
+    fixture.instantiate(&agent(MODERATOR)).await;
 
     // The governing task is created through the public surface, so the
     // projection this test reads is the one production serves — and it is

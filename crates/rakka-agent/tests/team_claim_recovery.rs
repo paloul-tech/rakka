@@ -256,3 +256,60 @@ async fn a_loss_in_the_committed_but_unsent_window_re_drives_the_same_claim() {
     // and the round trip converges.
     assert_converged(&fx).await;
 }
+
+#[tokio::test]
+async fn a_wire_claim_committed_past_a_resident_board_is_driven_by_its_next_settle_sweep() {
+    // A board has two writers by construction — the resident sharded entity,
+    // which holds one store for its whole residency, and the A2A service,
+    // which builds its own store on any node and is how every wire claim
+    // arrives. The service normally couriers its own write; if it dies
+    // first, the durable-outbox guarantee falls to the board's settle
+    // sweeps. A resident that decides it owes nothing from a stale cache
+    // performs zero writes, never conflicts, and so never re-reads — before
+    // the settle pass re-materialized, this sweep no-opped forever on an
+    // otherwise idle board and the claim's owed decision stalled until an
+    // unrelated command happened to lose a compare-and-set.
+    let fx = world().await;
+
+    // The resident board materializes and goes idle holding a clean cache.
+    let mut resident = rakka_agent::AgentTeamEntityStore::new(
+        team_scope(),
+        fx.teams.clone(),
+        fx.team_history.clone(),
+    );
+    resident
+        .recover(fx.now())
+        .await
+        .expect("the resident loads");
+
+    // The other writer — the A2A service's own store handle — commits the
+    // claim and dies before driving its courier.
+    let reply = fx
+        .apply_team_command_at(&team_scope(), claim_command())
+        .await
+        .expect("the wire claim commits");
+    assert!(matches!(
+        reply,
+        rakka_agent::AgentTeamEntityReply::Applied { .. }
+    ));
+
+    // The resident's own settle sweep — no passivation, no lost race, no
+    // mutating command in between — must observe the wire-committed claim
+    // and drive its owed decision exchange to the task.
+    let progress = resident
+        .settle_side_effects(&fx.router, fx.now())
+        .await
+        .expect("the resident sweep settles");
+    assert!(
+        progress.settled >= 1,
+        "the sweep drove the claim its cache never saw: {progress:?}"
+    );
+
+    // The same resident keeps sweeping the round trip to convergence — the
+    // claim result the task owes back lands on it the same way.
+    for _round in 0..6 {
+        let _ = fx.settle_task_at(&task_scope()).await;
+        let _ = resident.settle_side_effects(&fx.router, fx.now()).await;
+    }
+    assert_converged(&fx).await;
+}
