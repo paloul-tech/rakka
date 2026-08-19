@@ -7,7 +7,7 @@
 //! plain: arming a store the walk never crashes would only obscure which
 //! window a failure came from.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -123,6 +123,32 @@ impl A2AAgentClock for TickClock {
     }
 }
 
+/// Counts every ask of the real handoff send executor.
+///
+/// The transcript's "one transfer" is a *convergence* claim; the honest
+/// attempt count — once into the injected owner loss, once to completion —
+/// is measured here, at the executor itself, the same way
+/// `tests/handoff_recovery.rs` measures it. Counting delivery passes
+/// instead would miss the ask that died inside the crash window and would
+/// count passes that delivered non-handoff results.
+struct CountingHandoffSends {
+    inner: Arc<dyn rakka_agent::AgentA2aHandoffSendExecutor>,
+    asked: Arc<AtomicUsize>,
+}
+
+impl rakka_agent::AgentA2aHandoffSendExecutor for CountingHandoffSends {
+    fn execute<'a>(
+        &'a self,
+        scope: &'a rakka_agent::AgentRunScope,
+        intent: &'a rakka_agent::AgentRunEffect,
+        handoff: &'a rakka_agent::AgentHandoffRecord,
+        credential: Option<&'a rakka_agent_workflow::AgentEphemeralCredential>,
+    ) -> rakka_agent::AgentDispatchFuture<'a, rakka_agent::AgentA2aHandoffFinding> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        self.inner.execute(scope, intent, handoff, credential)
+    }
+}
+
 /// A schema reference at its initial revision.
 #[must_use]
 pub fn schema(id: &str) -> AgentSchemaRef {
@@ -225,8 +251,12 @@ pub struct World {
     pub probe: KillSwitchProbe,
     /// The deployment's tool registry.
     pub registry: AgentToolRegistry,
-    /// The bounded metrics recorder wired into the sharded runs.
+    /// The bounded metrics recorder, wired into every sharded entity type
+    /// and the A2A service — the no-leak sweep sweeps what they recorded.
     pub metrics: Arc<InMemoryMetricsRecorder>,
+    /// How many times the handoff send executor was ever asked, counted at
+    /// the executor itself.
+    pub handoff_sends: Arc<AtomicUsize>,
     /// The session-memory backend — the private memory a handoff must not
     /// carry across.
     pub session: Arc<InMemorySessionMemoryStore>,
@@ -264,9 +294,14 @@ impl World {
         let conversations = CrashingStateStore::<AgentConversationState>::new();
         // Deliberately bounded: the milestone's replay bullet has two arms,
         // and the retention-gap arm is only demonstrable against a log that
-        // really did drop its oldest entries. The bound is generous enough
-        // that the walk's own paging still reads a long contiguous prefix.
-        let history = InMemoryAgentTaskHistoryStore::new().with_retention(16);
+        // really did drop its oldest entries. The bound sits well below what
+        // the walk writes to the flagship task's log — the walk asserts the
+        // gap actually opened, so a bound the walk stops outgrowing fails
+        // loudly instead of silently demoting line 15 to a claim about
+        // nothing (16 was exactly that: the walk never exceeded it, and the
+        // WindowExpired arm never ran) — while staying generous enough that
+        // the paging still reads a contiguous retained prefix.
+        let history = InMemoryAgentTaskHistoryStore::new().with_retention(8);
         let team_history = InMemoryAgentTeamHistoryStore::new();
         let conversation_history = InMemoryAgentConversationHistoryStore::new();
         let workflow_store = InMemoryDurableStateStore::<WorkflowState>::new();
@@ -307,7 +342,8 @@ impl World {
             history.clone(),
             deferred.as_router(),
             AgentTaskEntityShardingSettings::new(agent_task_entity_type_key())
-                .with_clock(entity_clock.clone()),
+                .with_clock(entity_clock.clone())
+                .with_metrics(metrics.clone()),
         )
         .expect("task entity sharding initializes");
         // The sharded factory is the production driver of every run, so the
@@ -332,7 +368,8 @@ impl World {
             team_history.clone(),
             deferred.as_router(),
             AgentTeamEntityShardingSettings::new(agent_team_entity_type_key())
-                .with_clock(entity_clock.clone()),
+                .with_clock(entity_clock.clone())
+                .with_metrics(metrics.clone()),
         )
         .expect("team entity sharding initializes");
         // The conversation entity reads the agents' durable records to decide
@@ -346,7 +383,8 @@ impl World {
             conversation_history.clone(),
             deferred.as_router(),
             AgentConversationEntityShardingSettings::new(agent_conversation_entity_type_key())
-                .with_clock(entity_clock),
+                .with_clock(entity_clock)
+                .with_metrics(metrics.clone()),
         )
         .expect("conversation entity sharding initializes");
 
@@ -423,7 +461,8 @@ impl World {
                 Arc::new(AllowAllAuthorizer),
             )
             .with_clock(Arc::new(TickClock(clock.clone())))
-            .with_default_tenant(TENANT),
+            .with_default_tenant(TENANT)
+            .with_metrics(metrics.clone()),
         );
 
         Self {
@@ -445,6 +484,7 @@ impl World {
             probe: KillSwitchProbe::new(),
             registry,
             metrics,
+            handoff_sends: Arc::new(AtomicUsize::new(0)),
             session,
             snapshots,
             router,
@@ -500,9 +540,10 @@ impl World {
         .with_fleet_settings(AgentDispatcherFleetSettings::new(16, LEASE_MS))
         .with_probe(Arc::new(self.probe.clone()))
         .with_reconciler(Arc::new(ScriptedReconciler::new()))
-        .with_a2a_handoff_executor(Arc::new(A2AAgentHandoffSendExecutor::new(
-            self.service.clone(),
-        )))
+        .with_a2a_handoff_executor(Arc::new(CountingHandoffSends {
+            inner: Arc::new(A2AAgentHandoffSendExecutor::new(self.service.clone())),
+            asked: self.handoff_sends.clone(),
+        }))
     }
 
     /// The next deterministic tick.

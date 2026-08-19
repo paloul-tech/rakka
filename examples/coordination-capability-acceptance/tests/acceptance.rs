@@ -64,14 +64,18 @@ async fn the_transcript_is_exactly_the_documented_one() {
         "the source terminalized, and only after the target's acceptance"
     );
     assert_eq!(
-        report.transfers_attempted, 1,
-        "one transfer, however many times the flow re-drove"
+        report.transfers_attempted, 2,
+        "the executor was asked into the injected loss and asked again to completion — counted \
+         at the executor itself, converging on one accepted transfer"
     );
     assert_eq!(report.human_results_accepted, 1);
-    assert!(report.dependent_unblocked);
+    assert!(
+        report.dependent_unblocked,
+        "the edge resolved and the dependent's decision graph reads satisfied again"
+    );
     assert!(
         report.checkpoint_gated_effect,
-        "the consequential tool is checkpoint-bound by declaration"
+        "the consequential effect parked on a real bound checkpoint the human result left open"
     );
     assert_eq!(
         report.effect_invocations, 0,

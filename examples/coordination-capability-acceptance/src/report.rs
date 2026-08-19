@@ -22,14 +22,18 @@ pub struct AcceptanceReport {
     pub source_status: String,
     /// The agent that owns the task after the handoff.
     pub owner_after_handoff: String,
-    /// How many transfers the handoff send executor was ever asked for.
+    /// How many transfers the handoff send executor was ever asked for,
+    /// counted at the executor itself: once into the injected owner loss,
+    /// once by the re-drive that completed.
     pub transfers_attempted: usize,
     /// How many times the human-owned upstream accepted a result.
     pub human_results_accepted: usize,
-    /// Whether the dependent was unblocked by the human result.
+    /// Whether the human result resolved the dependent's edge *and* flipped
+    /// its decision graph back to satisfied.
     pub dependent_unblocked: bool,
-    /// Whether a checkpoint — not the human result — gated the consequential
-    /// effect.
+    /// Whether the consequential effect parked on a real bound checkpoint
+    /// that the human result left open — the registry declares the gate and
+    /// the run's durable state holds it.
     pub checkpoint_gated_effect: bool,
     /// How many times the non-idempotent effect actually ran.
     pub effect_invocations: usize,
@@ -55,14 +59,14 @@ pub struct AcceptanceReport {
 /// proven the line's facts, and `tests/acceptance.rs` pins the README's
 /// quoted block to it — the transcript has exactly one source.
 pub const EXPECTED_TRANSCRIPT: &[&str] = &[
-    "ok  1/16 five sharded entity types over real ClusterSharding: three agents, one team, and one board task posted deliberately unassigned",
+    "ok  1/16 five sharded entity types over real ClusterSharding: four agents, one team, and two board tasks posted deliberately unassigned",
     "ok  2/16 two members claimed concurrently through rakka-a2a: one owner admitted at generation 1, the loser's stale-epoch command failed closed",
     "ok  3/16 TEAM ENVELOPE: a member whose definition never granted Team was refused team-coordination-unauthorized and its board entry reopened",
     "ok  4/16 the board waited with nothing resident: 0 resident entities, and the claim activated across the passivation",
     "ok  5/16 the owner's model turn transferred the SAME AgentTaskId: the handoff record and its A2aSendCall committed in one compare-and-set, fencing the source",
     "ok  6/16 HandedOff recorded strictly after the target's durable acceptance: one task id, one new generation, and no session or private memory travelled",
     "ok  7/16 HANDOFF POD LOSS: the task store died mid-transfer; recovery re-derived the HandoffResult and converged on one transfer",
-    "ok  8/16 the target's run declared a human-owned approval upstream and blocked: the dependency edge registered with the upstream in the declaring transition",
+    "ok  8/16 a human-owned approval was declared upstream of the ticket: the dependency edge registered with the upstream in the declaring transition, and the dependent's decision graph read unsatisfied",
     "ok  9/16 an authenticated human result completed the upstream through rakka-a2a and unblocked the dependent; a replayed submission echoed the original",
     "ok 10/16 CHECKPOINT BOUNDARY: the consequential effect still parked on a bound AgentCheckpoint — the human result resolved no checkpoint and invoked nothing",
     "ok 11/16 the moderated conversation ran its bounded rounds in order; the dense turn ledger absorbed a replayed turn without recording a second",

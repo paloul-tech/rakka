@@ -103,6 +103,35 @@ pub fn run_scope() -> AgentRunScope {
     AgentRunScope::new(tenant(), agent_id(), run).expect("run scope should be valid")
 }
 
+/// The `Instantiate` operation id for one scope, derived from the envelope
+/// it applies.
+///
+/// Derived, never fixed: the agent entity answers a repeated `Instantiate`
+/// under the *same* operation id as `Duplicate`-Ok without applying the new
+/// envelope, while a different id refuses `AlreadyInstantiated`. A fixed
+/// discriminator made every fixture helper's id identical, so a capability
+/// helper called after a plain instantiate on the same scope silently
+/// granted nothing while its `.expect` passed — and the test then asserted
+/// against the guard it believed it had armed. Deriving the discriminator
+/// from the envelope keeps same-envelope replays idempotent and makes a
+/// differing-envelope re-instantiate fail loudly at the fixture.
+pub fn instantiate_operation_id(
+    scope: &AgentScope,
+    envelope: &AgentAuthorityEnvelope,
+) -> AgentOperationId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(envelope)
+        .expect("the envelope serializes")
+        .hash(&mut hasher);
+    AgentOperationId::for_agent(
+        AgentOperationKind::DefinitionUpdate,
+        scope,
+        format!("{:016x}", hasher.finish()),
+    )
+    .expect("operation id should be derivable")
+}
+
 pub fn task_definition_id() -> AgentTaskDefinitionId {
     AgentTaskDefinitionId::new(TASK_DEFINITION).expect("task definition id should be valid")
 }
@@ -1032,11 +1061,17 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
     }
 
     /// Instantiates an agent at an explicit scope under an explicit envelope.
+    ///
+    /// The operation id derives from the envelope (see
+    /// [`instantiate_operation_id`]), so re-instantiating the same scope
+    /// under a *different* envelope refuses `AlreadyInstantiated` loudly
+    /// instead of answering `Duplicate`-Ok and silently granting nothing.
     pub async fn instantiate_agent_with_envelope_at(
         &self,
         scope: AgentScope,
         envelope: AgentAuthorityEnvelope,
     ) {
+        let operation_id = instantiate_operation_id(&scope, &envelope);
         let definition = AgentDefinition::new(
             AgentDefinitionId::new("support-v1").expect("definition id should be valid"),
             "Resolves customer support tickets end to end.",
@@ -1048,12 +1083,7 @@ impl<A: AgentModelAdapter, S: AgentRunEffectSink> Fixture<A, S> {
         agent.recover().await.expect("the agent should recover");
         agent
             .apply(AgentEntityCommand::Instantiate {
-                operation_id: AgentOperationId::for_agent(
-                    AgentOperationKind::DefinitionUpdate,
-                    &scope,
-                    "1",
-                )
-                .expect("operation id should be derivable"),
+                operation_id,
                 definition: Box::new(definition),
                 settings: Box::new(AgentSettings::default()),
                 provenance: Box::new(provenance(1)),
@@ -1884,6 +1914,11 @@ impl ShardedWorld {
             envelope
                 .coordination_capabilities
                 .insert(rakka_agent::AgentCoordinationCapabilityKind::Moderation);
+            // Envelope-derived operation id, for the reason
+            // `instantiate_operation_id` gives: a mixed-helper
+            // re-instantiate must fail loudly, never silently grant
+            // nothing.
+            let operation_id = instantiate_operation_id(&scope, &envelope);
             let definition = AgentDefinition::new(
                 AgentDefinitionId::new("support-v1").expect("the definition id should be valid"),
                 "Resolves customer support tickets end to end.",
@@ -1894,12 +1929,7 @@ impl ShardedWorld {
             agent.recover().await.expect("the agent should recover");
             agent
                 .apply(AgentEntityCommand::Instantiate {
-                    operation_id: AgentOperationId::for_agent(
-                        AgentOperationKind::DefinitionUpdate,
-                        &scope,
-                        "1",
-                    )
-                    .expect("operation id should be derivable"),
+                    operation_id,
                     definition: Box::new(definition),
                     settings: Box::new(AgentSettings::default()),
                     provenance: Box::new(provenance(1)),

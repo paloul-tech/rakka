@@ -1,10 +1,11 @@
 //! The acceptance walk: every bullet of the coordination-capability
 //! milestone, in one continuous story over the wired world.
 //!
-//! One `AgentTaskId` is posted to a team board, claimed, handed off,
-//! blocked on a human-owned approval, reviewed in a moderated conversation,
-//! and finally closed — surviving an owner death inside the handoff and
-//! inside the conversation, and replayable from a cursor afterwards.
+//! One `AgentTaskId` is posted to a team board, claimed, handed off, gated
+//! by a human-owned approval upstream and by the checkpoint that parks the
+//! consequential refund, reviewed in a moderated conversation, and finally
+//! closed — surviving an owner death inside the handoff and inside the
+//! conversation, and replayable from a cursor afterwards.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,20 +44,27 @@ use crate::wiring::{
 pub const PROBE_TASK: &str = "ticket-4712";
 
 /// The content sentinels the walk plants in the model's hidden reasoning, the
-/// human result's content, and a moderated turn's body.
+/// human result's content, a moderated turn's body, and the handoff reason.
 ///
 /// Each is real content that really enters the system and is legitimately at
 /// home *somewhere*: hidden reasoning in session memory, a typed result on the
 /// task that accepted it, a turn body in the conversation's own bounded ring
-/// ([specification 8.11](../../docs/plans/rakka-agent/spec.md)). What the
-/// milestone requires is that none of it crosses onto a *coordination*
-/// surface — the shared board, the replayable coordination events, or the
-/// metrics — which is what the sweep measures. The scripts plant from this
-/// same array, so a sentinel cannot drift away from its sweep.
-pub const CONTENT_SENTINELS: [&str; 3] = [
+/// ([specification 8.11](../../docs/plans/rakka-agent/spec.md)), and the
+/// model-supplied handoff reason in the run's handoff cell and the task's
+/// handoff provenance — the one model-derived string the transfer routes
+/// *toward* coordination machinery, which is exactly why it carries a
+/// sentinel: a regression copying it onto the board echo or a replay page is
+/// what the sweep exists to catch. What the milestone requires is that none
+/// of it crosses onto a *coordination* surface — the shared board, the
+/// replayable coordination events, or the metrics — which is what the sweep
+/// measures. The scripts plant from this same array, so a sentinel cannot
+/// drift away from its sweep, and each sentinel has a positive control
+/// proving it really entered its home record.
+pub const CONTENT_SENTINELS: [&str; 4] = [
     "SECRET-HIDDEN-REASONING",
     "SECRET-APPROVAL-MEMO",
     "SECRET-REVIEW-TRANSCRIPT",
+    "SECRET-HANDOFF-RATIONALE",
 ];
 
 // ---------------------------------------------------------------------------
@@ -488,9 +496,14 @@ fn response_payload(response: &a2a::SendMessageResponse) -> Value {
 // Act helpers
 // ---------------------------------------------------------------------------
 
-/// The triager's one scripted turn: transfer the ticket to billing. The
-/// reason carries a planted sentinel, so the no-leak sweep is measuring a
-/// surface that really did see private content.
+/// The triager's one scripted turn: transfer the ticket to billing.
+///
+/// The hidden reasoning carries one sentinel (its home is session memory),
+/// and the handoff *reason* carries another: the reason is the model-derived
+/// string that travels into the handoff record, the task's handoff
+/// provenance, and the A2A offer — the field a regression would copy onto a
+/// coordination surface — so the sweep must be measuring it, not the turn
+/// text that never leaves the run. Beat 6 holds its positive control.
 fn handoff_turn() -> rakka_agent::AgentModelTurn {
     rakka_agent::AgentModelTurn::new(rakka_agent::CURRENT_AGENT_LOOP_ADAPTER_VERSION)
         .with_text(CONTENT_SENTINELS[0])
@@ -498,7 +511,24 @@ fn handoff_turn() -> rakka_agent::AgentModelTurn {
             rakka_agent::AgentToolCallRequest::new(
                 rakka_agent::AgentToolCallId::new("transfer-1").expect("the call id is valid"),
                 AgentToolId::new(HANDOFF_TOOL).expect("the tool id is valid"),
-                json!({ "skill": SKILL, "reason": "needs billing authority" }),
+                json!({ "skill": SKILL, "reason": CONTENT_SENTINELS[3] }),
+            )
+            .expect("the tool call is bounded"),
+        )
+}
+
+/// The specialist's one scripted turn: issue the refund it now has human
+/// approval for. The tool is checkpoint-bound by the deployment's registry,
+/// so this proposal parks on an `AgentCheckpoint` rather than dispatching —
+/// which is what makes beat 10's boundary claim a fact about real state.
+fn refund_turn() -> rakka_agent::AgentModelTurn {
+    rakka_agent::AgentModelTurn::new(rakka_agent::CURRENT_AGENT_LOOP_ADAPTER_VERSION)
+        .with_text("issuing the approved refund")
+        .with_tool_call(
+            rakka_agent::AgentToolCallRequest::new(
+                rakka_agent::AgentToolCallId::new("refund-1").expect("the call id is valid"),
+                AgentToolId::new(REFUND_TOOL).expect("the tool id is valid"),
+                json!({ "ticket": TASK, "amount": 42 }),
             )
             .expect("the tool call is bounded"),
         )
@@ -557,22 +587,21 @@ async fn outstanding_send(world: &World, scope: &AgentRunScope) -> bool {
     })
 }
 
-/// Drives the transfer to quiescence and reports how many sends the executor
-/// was ever asked for. Errors are swallowed: a crashed owner is supposed to
-/// fail here, and convergence is asserted from durable state afterwards.
+/// Drives the transfer to quiescence. Errors are swallowed: a crashed owner
+/// is supposed to fail here, and convergence is asserted from durable state
+/// afterwards. How many times the send executor was asked is measured at the
+/// executor itself (`World::handoff_sends`), never inferred from delivery
+/// passes — a pass that delivered any run-entity result is not a transfer
+/// attempt, and the ask that died inside the crash window delivered nothing.
 async fn drive_transfer(
     world: &World,
     source_run: &AgentRunScope,
     adapter: &DeterministicModelAdapter,
-) -> usize {
-    let mut attempts = 0;
+) {
     for _ in 0..24 {
         settle_task(world, &task_scope(TASK)).await;
         settle_run(world, source_run).await;
-        let pass = world.pipeline(adapter.clone()).pump_run(source_run).await;
-        if let Ok(pass) = pass {
-            attempts += usize::from(pass.delivered > 0);
-        }
+        let _ = world.pipeline(adapter.clone()).pump_run(source_run).await;
     }
     // The courier's remaining legs: the target's acceptance settles on the
     // task, and the settle pass re-derives and delivers the owed handoff
@@ -582,7 +611,6 @@ async fn drive_transfer(
         settle_task(world, &task_scope(TASK)).await;
         settle_run(world, source_run).await;
     }
-    attempts
 }
 
 fn human_result_message(dedup: &str, answer: Value) -> Message {
@@ -862,17 +890,39 @@ async fn replay_everything(world: &World) -> (usize, bool) {
     ];
 
     let mut total = 0;
+    let mut task_log_expired = false;
     for scope in &scopes {
         // Page from the start, following the cursor: no gap and no repeat.
+        // The task log is deliberately bounded, so its *first* read lands in
+        // the retention gap and answers `WindowExpired` — exactly where a
+        // production resynchronizer meets it — and the walk resumes at the
+        // reported floor. The team and conversation logs are unbounded and
+        // must page from their beginning.
         let mut cursor: Option<String> = None;
         let mut seen: Vec<String> = Vec::new();
+        let mut first = true;
         loop {
             let replay = sources
                 .replay(&tenant(), scope, cursor.as_deref(), 4)
                 .await
                 .expect("the scope replays");
+            if let Some(floor) = expired_floor(&replay) {
+                assert!(
+                    first,
+                    "only the first read may land in the retention gap: {replay:?}"
+                );
+                assert!(
+                    matches!(scope, rakka_agent::AgentEntityAddress::Task(_)),
+                    "only the deliberately bounded task log may expire: {replay:?}"
+                );
+                task_log_expired = true;
+                cursor = Some(floor);
+                first = false;
+                continue;
+            }
+            first = false;
             let Some(page) = replay.page() else {
-                panic!("a live scope pages rather than expiring: {replay:?}");
+                panic!("a replay answers a page or an expiry: {replay:?}");
             };
             for event in &page.events {
                 let key = format!("{scope:?}#{}", event.cursor);
@@ -887,6 +937,10 @@ async fn replay_everything(world: &World) -> (usize, bool) {
             assert!(cursor.is_some(), "a page with more carries its next cursor");
         }
     }
+    assert!(
+        task_log_expired,
+        "the walk outgrew the task log's retention bound, so the gap arm really ran"
+    );
 
     // The retention-gap arm: a cursor before the retained floor answers
     // `WindowExpired` with the floor, and resuming from it pages for real.
@@ -895,19 +949,25 @@ async fn replay_everything(world: &World) -> (usize, bool) {
         rakka_agent::AgentCoordinationCursor::new(task_address.clone(), 0).encode();
     let expired = sources
         .replay(&tenant(), &task_address, Some(&from_the_beginning), 4)
-        .await;
-    let resumed = match expired {
-        Ok(replay) => match expired_floor(&replay) {
-            Some(floor) => sources
-                .replay(&tenant(), &task_address, Some(&floor), 4)
-                .await
-                .is_ok_and(|answer| answer.page().is_some()),
-            // Nothing was truncated, so the same read simply pages: the
-            // contract's other arm, and equally correct.
-            None => replay.page().is_some(),
-        },
-        Err(_) => false,
-    };
+        .await
+        .expect("the retention-gap probe replays");
+    // Pinned to the arm, never tolerated either way: the task history's
+    // retention bound is deliberately smaller than what the walk writes, so
+    // a from-the-beginning cursor MUST land in the retention gap. A probe
+    // that quietly paged would mean the walk had stopped outgrowing the
+    // bound and line 15's WindowExpired demonstration had silently stopped
+    // running — the same under-coverage `assert_crash_fired` exists to
+    // prevent.
+    let floor = expired_floor(&expired).unwrap_or_else(|| {
+        panic!(
+            "the from-the-beginning probe must answer WindowExpired; the walk no longer \
+             outgrows the task log's retention bound: {expired:?}"
+        )
+    });
+    let resumed = sources
+        .replay(&tenant(), &task_address, Some(&floor), 4)
+        .await
+        .is_ok_and(|answer| answer.page().is_some());
     (total, resumed)
 }
 
@@ -933,8 +993,22 @@ async fn queried_surfaces(world: &World) -> Vec<String> {
         rakka_agent::AgentEntityAddress::Team(team_scope()),
         rakka_agent::AgentEntityAddress::Conversation(conversation_scope()),
     ] {
-        if let Ok(replay) = sources.replay(&tenant(), &scope, None, 64).await {
+        // The bounded task log's first read answers `WindowExpired`; the
+        // sweep must sweep the *retained* events too, so it resumes at the
+        // reported floor and sweeps both answers.
+        let mut cursor: Option<String> = None;
+        for _ in 0..2 {
+            let Ok(replay) = sources
+                .replay(&tenant(), &scope, cursor.as_deref(), 64)
+                .await
+            else {
+                break;
+            };
             surfaces.push(format!("{replay:?}"));
+            match expired_floor(&replay) {
+                Some(floor) => cursor = Some(floor),
+                None => break,
+            }
         }
     }
     surfaces.push(format!("{:?}", world.metrics));
@@ -1225,12 +1299,24 @@ pub async fn run_acceptance() -> AcceptanceReport {
     world.tasks.survive();
 
     // A new owner, with nothing but the durable record.
-    let transfers_attempted = drive_transfer(&world, &source_run, &triager_adapter).await;
+    drive_transfer(&world, &source_run, &triager_adapter).await;
+    // Measured at the executor itself: the send was asked for twice — once
+    // by the pump that died inside the injected loss, once by the re-drive
+    // that completed — and converged on one accepted transfer. The parallel
+    // sweep in `rakka-agent/tests/handoff_recovery.rs` measures the same
+    // property the same way.
+    let transfers_attempted = world
+        .handoff_sends
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        transfers_attempted, 2,
+        "the executor was asked into the loss, and asked again to completion"
+    );
     lines[6] = EXPECTED_TRANSCRIPT[6].to_string();
 
-    // 6/16 — the transfer's own facts, whichever way the loss above resolved
-    // it. The identity is preserved, the source terminalized only after the
-    // target's durable acceptance, and no session namespace travelled.
+    // 6/16 — the transfer's own facts. The identity is preserved, the source
+    // terminalized only after the target's durable acceptance, and no
+    // session namespace travelled.
     let task = task_state(&world, &task_scope(TASK)).await;
     let task = task.task().expect("the task exists");
     assert_eq!(
@@ -1250,32 +1336,43 @@ pub async fn run_acceptance() -> AcceptanceReport {
     );
     let generations =
         u32::try_from(task.assignment_generation.get()).expect("the walk's generations fit");
-    if owner_after_handoff == SPECIALIST {
-        assert_eq!(generations, 2, "exactly one new generation");
-        let provenance = task.handoff.as_deref().expect("the provenance survives");
-        assert_eq!(
-            provenance.status,
-            rakka_agent::AgentTaskHandoffStatus::Accepted
-        );
-        assert!(
-            provenance.result_settled,
-            "the result exchange settled, which is what let the source terminalize"
-        );
-        assert_eq!(
-            source_status, "handed-off",
-            "HandedOff is recorded strictly after the target's acceptance"
-        );
-        assert_eq!(
-            provenance.source_assignment.agent.as_str(),
-            TRIAGER,
-            "the stashed source survives for the goal view to join"
-        );
-    } else {
-        assert_eq!(
-            owner_after_handoff, TRIAGER,
-            "an untransferred task is owned by its source, not by nobody"
-        );
-    }
+    // Asserted unconditionally: the single BeforeWrite loss above is a
+    // retryable delivery failure, and the re-drive deterministically
+    // completes the transfer — the arm the pinned transcript requires. The
+    // restored ending is legal for a transfer in general (a definitive
+    // refusal, a spent retry budget), and the two-arm convergence property
+    // is swept where both arms genuinely occur, in
+    // `rakka-agent/tests/handoff_recovery.rs`. A tolerant either-arm branch
+    // here was dead code whose own following session asserts would have
+    // panicked on the arm it tolerated.
+    assert_eq!(owner_after_handoff, SPECIALIST, "the transfer completed");
+    assert_eq!(generations, 2, "exactly one new generation");
+    let provenance = task.handoff.as_deref().expect("the provenance survives");
+    assert_eq!(
+        provenance.status,
+        rakka_agent::AgentTaskHandoffStatus::Accepted
+    );
+    assert!(
+        provenance.result_settled,
+        "the result exchange settled, which is what let the source terminalize"
+    );
+    assert_eq!(
+        source_status, "handed-off",
+        "HandedOff is recorded strictly after the target's acceptance"
+    );
+    assert_eq!(
+        provenance.source_assignment.agent.as_str(),
+        TRIAGER,
+        "the stashed source survives for the goal view to join"
+    );
+    // The reason sentinel's positive control: the model-derived string
+    // really is sitting in the task's own handoff provenance — the
+    // surface-adjacent record it belongs in — so the sweep's silence about
+    // the board, the replay pages, and the metrics is evidence, not vacancy.
+    assert_eq!(
+        provenance.reason, CONTENT_SENTINELS[3],
+        "the handoff reason reached the task's provenance"
+    );
     // The target's session namespace is its own: nothing the source wrote is
     // addressable under the target's run.
     let target_run = AgentRunScope::new(
@@ -1311,8 +1408,9 @@ pub async fn run_acceptance() -> AcceptanceReport {
     );
     lines[5] = EXPECTED_TRANSCRIPT[5].to_string();
 
-    // 8/16 — the specialist blocks on a human-owned approval: the dependency
-    // edge registers with the upstream in the declaring transition.
+    // 8/16 — a human-owned approval is declared upstream of the ticket: the
+    // edge registers with the upstream in the declaring transition, and the
+    // dependent's decision graph reads unsatisfied until it resolves.
     let approval = task_scope(APPROVAL_TASK);
     let created = task_command(
         &world,
@@ -1378,7 +1476,61 @@ pub async fn run_acceptance() -> AcceptanceReport {
             .contains_key(dependent.task()),
         "the forward edge registered with the upstream"
     );
+    // The graph half of the claim, from the dependent's own record: the
+    // declared edge is unresolved, so every decision door that consults
+    // `dependencies_satisfied` reads false. An in-flight assignment
+    // deliberately keeps working — a dependency can resolve while a run is
+    // mid-flight, and demoting live work would strand it — so what the edge
+    // gates is the task's *next* decision, and the durable `Blocked`
+    // posture belongs to tasks that are assignable when the edge lands
+    // (`rakka-agent/tests/human_owned_tasks.rs` pins that arm).
+    let dependent_state = task_state(&world, &dependent).await;
+    assert!(
+        !dependent_state
+            .task()
+            .expect("the dependent exists")
+            .dependencies_satisfied(),
+        "the unresolved human-owned edge gates the dependent's decision graph"
+    );
     lines[7] = EXPECTED_TRANSCRIPT[7].to_string();
+
+    // The specialist proposes the refund while the approval is pending. The
+    // tool is checkpoint-bound by the deployment's registry, so the
+    // consequential effect parks on a bound `AgentCheckpoint` — real durable
+    // state, created *before* the human result, which is what beat 10
+    // measures its boundary against — and invokes nothing.
+    let refund_adapter = DeterministicModelAdapter::new().with_turn(refund_turn());
+    for _ in 0..12 {
+        settle_task(&world, &task_scope(TASK)).await;
+        settle_run(&world, &target_run).await;
+        let _ = world
+            .pipeline(refund_adapter.clone())
+            .pump_run(&target_run)
+            .await;
+        if run_state(&world, &target_run)
+            .await
+            .loop_state()
+            .is_some_and(|loop_state| !loop_state.open_checkpoints().is_empty())
+        {
+            break;
+        }
+    }
+    let parked = run_state(&world, &target_run).await;
+    assert_eq!(
+        parked.status(),
+        Some(rakka_agent::AgentRunStatus::WaitingForApproval),
+        "the checkpoint-bound proposal parks the run for approval"
+    );
+    let open_before_result = parked
+        .loop_state()
+        .expect("the target loop exists")
+        .open_checkpoints()
+        .to_vec();
+    assert_eq!(
+        open_before_result.len(),
+        1,
+        "exactly one checkpoint gates the refund"
+    );
 
     // 9/16 — the authenticated human result completes the upstream over the
     // real A2A surface and unblocks the dependent; a replay echoes it.
@@ -1424,30 +1576,58 @@ pub async fn run_acceptance() -> AcceptanceReport {
     let human_results_accepted = usize::from(upstream.accepted_result.is_some());
     assert_eq!(human_results_accepted, 1, "exactly one accepted result");
     let dependent_state = task_state(&world, &dependent).await;
-    let edge = dependent_state
-        .task()
-        .expect("the dependent exists")
+    let dependent_task = dependent_state.task().expect("the dependent exists");
+    let edge = dependent_task
         .dependencies
         .get(approval.task())
         .expect("the edge stands")
         .clone();
-    let dependent_unblocked = edge.outcome.is_some();
+    // Unblocked means the graph flipped, not merely that a field appeared:
+    // the edge carries its upstream's outcome AND the dependent's decision
+    // graph — false at beat 8 — reads satisfied again, which is the fact
+    // every decision door consults.
+    let dependent_unblocked = edge.outcome.is_some() && dependent_task.dependencies_satisfied();
     assert!(
         dependent_unblocked,
-        "the dependent learned its upstream's outcome rather than blocking forever"
+        "the dependent learned its upstream's outcome and its decision graph reads satisfied"
     );
     lines[8] = EXPECTED_TRANSCRIPT[8].to_string();
 
-    // 10/16 — the checkpoint boundary: the human result resolved no
-    // checkpoint, and the consequential effect has still invoked nothing.
-    let checkpoint_gated_effect = world
+    // 10/16 — the checkpoint boundary, measured on real state: the effect
+    // parked on its checkpoint *before* the human result, and the result
+    // completed the upstream without touching it — the same checkpoint is
+    // still open, the run is still parked, and the tool has never run
+    // (`rakka-agent/tests/human_owned_tasks.rs` pins the same boundary at
+    // the unit level).
+    let declared_gate = world
         .registry
         .binding(&AgentToolId::new(REFUND_TOOL).expect("the tool id is valid"))
         .is_some_and(rakka_agent::AgentToolBinding::checkpoint_required);
     assert!(
-        checkpoint_gated_effect,
+        declared_gate,
         "the consequential tool is checkpoint-bound by declaration"
     );
+    let after_result = run_state(&world, &target_run).await;
+    let open_after_result = after_result
+        .loop_state()
+        .expect("the target loop exists")
+        .open_checkpoints()
+        .to_vec();
+    assert_eq!(
+        open_after_result.len(),
+        1,
+        "the human result resolved no checkpoint: the gate is still closed"
+    );
+    assert_eq!(
+        open_after_result[0].checkpoint_id, open_before_result[0].checkpoint_id,
+        "the very checkpoint that parked before the result is the one still open"
+    );
+    assert_eq!(
+        after_result.status(),
+        Some(rakka_agent::AgentRunStatus::WaitingForApproval),
+        "the run is still parked on the effect gate"
+    );
+    let checkpoint_gated_effect = declared_gate && open_after_result.len() == 1;
     let effect_invocations = world.tools.invocation_count(REFUND_TOOL);
     assert_eq!(
         effect_invocations, 0,
