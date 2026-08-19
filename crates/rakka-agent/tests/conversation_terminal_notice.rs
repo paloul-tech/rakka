@@ -142,6 +142,8 @@ async fn world(
         DeterministicModelAdapter::new(),
     ));
     fx.instantiate_agent().await;
+    fx.instantiate_conversation_participants(&["moderator", "p1", "p2"])
+        .await;
     fx.create_task().await;
     fx.apply_conversation_command_at(
         &conversation_scope(),
@@ -423,6 +425,10 @@ async fn a_notice_racing_its_tasks_creation_stays_outstanding_then_converges() {
     let fx = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new(),
     ));
+    // The speakers, but deliberately not the task: this test's whole point is
+    // a conversation that terminalizes before its governing task exists.
+    fx.instantiate_conversation_participants(&["moderator", "p1", "p2"])
+        .await;
     fx.apply_conversation_command_at(
         &conversation_scope(),
         create_command(

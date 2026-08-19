@@ -66,7 +66,7 @@ async fn world(post: bool) -> Fixture {
     let fx = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new(),
     ));
-    fx.instantiate_agent_at(
+    fx.instantiate_team_member_at(
         AgentScope::new(tenant(), member()).expect("the member scope is valid"),
     )
     .await;

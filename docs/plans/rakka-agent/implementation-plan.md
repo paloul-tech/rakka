@@ -4173,6 +4173,85 @@ Spec: [Coordination Capability Milestone](spec.md#coordination-capability-milest
 Done when: the checklist is demonstrated and all M5 scenarios pass under
 fault injection.
 
+**Amended as implemented (2026-08-17):**
+
+- **Two of the seven checklist bullets did not hold, and the walk could not
+  honestly print them until they did.** The `CoordinationCapability` envelope
+  dimension had been subset-checked since 1.2, but only `Delegation` and
+  `Handoff` were ever consulted at a runtime door (`delegation.rs`,
+  `tools.rs`, `run.rs`); `Team` and `Moderation` were declared and never
+  read, so a board claim and a moderated turn rested on their roster alone.
+  Both doors now exist and both read the agent's durable definition rather
+  than asking its entity — the assignment decision's own read path, for its
+  own reason. The team door is one field on `AgentAssignmentReadiness`
+  (`permits_team_coordination`) applied in `decide_assignment` *only* where
+  `team_claim_pending` already is, so a direct assignment spends no
+  coordination capability and is untouched; the refusal
+  (`team-coordination-unauthorized`) routes through
+  `resolve_team_claim_refusal`, keeping the single-attempt posture — the
+  entry reopens for a member that may, rather than parking the task. The
+  moderation door cost `AgentConversationEntityStore` a third generic (the
+  agents store, symmetric with `AgentTaskEntityStore`) and no new generic on
+  `RakkaAgentA2AService`, which already carried one and now forwards it. The
+  dense-ledger echo still answers first: a committed turn converges on its
+  recorded outcome even under a since-narrowed definition, because re-judging
+  it would make recovery depend on a record the turn never consulted. An
+  unreadable speaker record is separately retryable
+  (`conversation-participant-record-unreadable`), never a definitive refusal.
+- **The walk found one defect in shipped code.** `AgentTeamEntityStore::ensure_recovered`
+  trusted its own flag rather than asking the host whether it still held the
+  authoritative record — the rule the task, run, and conversation stores all
+  carry, missed only here. A board has two writers by construction (the
+  resident sharded entity and the A2A service's own store, which is how every
+  wire claim reaches it), so the loser of one compare-and-set answered
+  `exchange-not-recovered` for the rest of its residency. This example is the
+  first deployment-shaped consumer to drive a board through both paths.
+- **The scope fence held, and the two families it names are swept.** Slice 5.1
+  had swept only the run store's committed-but-unsent fence window; the
+  task-side resolution machine and the whole dependents registry had no crash
+  injection. `tests/handoff_recovery.rs` sweeps both stores across the full
+  transfer and asserts the *convergence property* rather than one outcome —
+  a transfer has two correct endings, which one a window produces depends on
+  whether the offer had committed, and the sweep asserts it reached one of
+  them whole with the send attempted once either way, plus that it covered
+  both arms. `tests/dependency_registry.rs` gained the matching sweep over
+  the declaration, the upstream edge, and the two settled markers, and the
+  `ExchangeFault` triple now covers `HandoffResult`, `DependencyRegistration`,
+  and `DependencyOutcome` at the real entity rather than the synthetic probe.
+- **The milestone's done-when is `examples/coordination-capability-acceptance`**:
+  a 16-line transcript pinned three ways, one continuous story over all five
+  sharded entity types and the real in-process A2A core — board post, atomic
+  wire claim with the loser failing closed, zero-resident wait, same-task
+  transfer committed in one CAS and terminalized only after durable
+  acceptance with the two runs' memory namespaces proven disjoint, an owner
+  death injected inside the transfer, a human-owned approval unblocking its
+  dependent over the wire, a moderated conversation absorbing a replayed turn
+  and surviving an owner death mid-round, and the terminal task closing its
+  board entry with the claim epoch bumped. Two beats are the envelope bullet
+  and both are refusals. The consequential effect stays checkpoint-parked and
+  uninvoked throughout. The task history is deliberately bounded so the
+  replay bullet demonstrates both arms. Deployment facts the walk enforced:
+  every settle and read re-materializes from the durable record (an entity
+  sharing its store with a second writer that believes it owes nothing never
+  writes, never conflicts, and so never re-reads), and the sentinel sweep
+  covers what content must not *cross onto* — board, replay pages, metrics —
+  while a turn body in the conversation's own ring and a typed result on its
+  task are the contract working.
+- Proof roster: `examples/coordination-capability-acceptance` (2 tests: the
+  README-to-const pin and the walk plus its typed facts),
+  `tests/handoff_recovery.rs` (3), the registry sweeps and fault triple in
+  `tests/dependency_registry.rs` (2 added), the live envelope refusals in
+  `tests/team_claim_assignment.rs` and `tests/conversation_turns.rs`, the
+  coordination-widening admission proof in `tests/autonomy_admission.rs`, and
+  the missing positive control plus per-kind coverage in
+  `tests/definition_setup_envelope.rs`. Owed onward: the handoff-refresh of
+  the board owner echo; board rewake parking; the goal/collaboration-view
+  team and conversation dimensions; the PostgreSQL team and conversation
+  history backends; the team and moderation otel span rows; the model-visible
+  team and moderation tool doors; and `DeterministicModelAdapter`
+  conditioning on prior messages and tool results rather than turn number
+  alone. The 4.4/4.6 crash-sweep debt stays in Phase 6.1.
+
 ---
 
 ## Phase 6 — Production Fault, Security, and Telemetry Validation

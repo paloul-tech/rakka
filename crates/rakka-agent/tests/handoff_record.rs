@@ -14,26 +14,25 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{
     goal_spec_draft, goal_spec_with_handoff, goal_task_creation_command, handoff_config,
     handoff_target_run_scope, handoff_target_scope, handoff_tool_id, run_scope, task_definition,
-    Fixture, HANDOFF_SKILL, HANDOFF_TARGET,
+    ApplyingHandoffExecutor, Fixture, HANDOFF_SKILL, HANDOFF_TARGET,
 };
 use rakka_agent::testkit::{DeterministicModelAdapter, ScriptedDispatcher};
 use rakka_agent::SessionMemoryStore;
 use rakka_agent::{
     handoff_id_for, AgentA2aHandoffFinding, AgentA2aHandoffSendExecutor, AgentAssignmentGeneration,
-    AgentAssignmentStatus, AgentDispatchFuture, AgentExchangeRouter, AgentHandoffRecord,
-    AgentHandoffStatus, AgentLoopPhase, AgentModelTurn, AgentOperationId, AgentOperationKind,
+    AgentAssignmentStatus, AgentDispatchFuture, AgentHandoffRecord, AgentHandoffStatus,
+    AgentLoopPhase, AgentModelTurn, AgentOperationId, AgentOperationKind,
     AgentRunCollaborationView, AgentRunEffect, AgentRunEffectKind, AgentRunScope, AgentRunStatus,
     AgentTaskContent, AgentTaskEntityCommand, AgentTaskEntityReply, AgentTaskEntityStore,
-    AgentTaskHandoffRequest, AgentTaskHandoffStatus, AgentTaskScope, AgentTaskStatus,
-    AgentToolCallId, AgentToolCallRequest, CURRENT_AGENT_LOOP_ADAPTER_VERSION,
+    AgentTaskHandoffStatus, AgentTaskScope, AgentTaskStatus, AgentToolCallId, AgentToolCallRequest,
+    CURRENT_AGENT_LOOP_ADAPTER_VERSION,
 };
-use rakka_agent_workflow::{AgentEphemeralCredential, AgentTimestampMillis};
+use rakka_agent_workflow::AgentEphemeralCredential;
 use serde_json::json;
 
 fn handoff_turn(arguments: serde_json::Value) -> AgentModelTurn {
@@ -100,136 +99,6 @@ impl AgentA2aHandoffSendExecutor for StubHandoffExecutor {
             .push(handoff.clone());
         let finding = self.finding.clone();
         Box::pin(async move { Ok(finding) })
-    }
-}
-
-/// The in-fixture twin of the A2A handoff ingress: builds the deduplicated
-/// `RecordHandoff` command from the record — exactly the claims the wire
-/// cluster carries — and applies it to the task entity over the fixture's
-/// durable stores. The exchanges the transfer owes stay in the journal for
-/// the courier (`pump`) to drive, exactly as production drains an outbox.
-struct ApplyingHandoffExecutor {
-    tasks: common::TaskStore,
-    agents: common::AgentStore,
-    history: rakka_agent::InMemoryAgentTaskHistoryStore,
-    rewake: Arc<dyn rakka_agent::AgentWakeRewakeParker>,
-    clock: Arc<AtomicU64>,
-    seen: Mutex<Vec<AgentHandoffRecord>>,
-}
-
-impl ApplyingHandoffExecutor {
-    fn over(fixture: &Fixture) -> Arc<Self> {
-        Arc::new(Self {
-            tasks: fixture.tasks.clone(),
-            agents: fixture.agents.clone(),
-            history: fixture.history.clone(),
-            rewake: fixture.rewake_parker.clone(),
-            clock: fixture.clock.clone(),
-            seen: Mutex::new(Vec::new()),
-        })
-    }
-
-    fn request_for(record: &AgentHandoffRecord) -> AgentTaskHandoffRequest {
-        AgentTaskHandoffRequest {
-            handoff: record.handoff.clone(),
-            source_agent: record.source_run.agent().clone(),
-            source_run: record.source_run.run().clone(),
-            source_generation: record.source_generation,
-            target: record.resolved.agent.clone(),
-            target_task_definition: record.resolved.task_definition.clone(),
-            result_schema: record.resolved.result_schema.clone(),
-            reason: record.reason.clone(),
-            policy_revision: record.policy_revision,
-            context: record.context.clone(),
-            knowledge_spaces: record.resolved.knowledge_spaces.clone(),
-        }
-    }
-
-    async fn apply(&self, record: &AgentHandoffRecord) -> AgentA2aHandoffFinding {
-        let scope = AgentTaskScope::new(record.source_run.tenant().clone(), record.task.clone())
-            .expect("the task scope is valid");
-        let operation_id = AgentOperationId::new(
-            AgentOperationKind::Handoff,
-            [
-                record.source_run.tenant().as_str(),
-                record.task.as_str(),
-                record.deduplication_key.as_str(),
-            ],
-        )
-        .expect("the operation id derives");
-        let mut store = AgentTaskEntityStore::new(
-            scope,
-            self.tasks.clone(),
-            self.agents.clone(),
-            self.history.clone(),
-        )
-        .with_wake_timers(self.rewake.clone());
-        let now = AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst));
-        if let Err(error) = store.recover(now).await {
-            return AgentA2aHandoffFinding::Refused {
-                code: error.code().to_string(),
-                message: error.to_string(),
-            };
-        }
-        // The owed exchanges deliberately stay journaled: the executor
-        // returns a receipt, and the courier drains the choreography later —
-        // never synchronously from inside the send.
-        let router = AgentExchangeRouter::new();
-        let reply = store
-            .apply(
-                AgentTaskEntityCommand::RecordHandoff {
-                    operation_id,
-                    request: Box::new(Self::request_for(record)),
-                },
-                &router,
-                AgentTimestampMillis::new(self.clock.fetch_add(1, Ordering::SeqCst)),
-            )
-            .await;
-        let echo = store.snapshot().ok().flatten().and_then(|snapshot| {
-            snapshot
-                .handoff
-                .filter(|handoff| handoff.handoff == record.handoff)
-                .map(|handoff| handoff.target_generation)
-        });
-        match reply {
-            Ok(AgentTaskEntityReply::Applied { .. } | AgentTaskEntityReply::Duplicate { .. }) => {
-                AgentA2aHandoffFinding::Recorded {
-                    target_generation: echo.flatten(),
-                    peer_status: "working".to_string(),
-                }
-            }
-            Ok(other) => AgentA2aHandoffFinding::Refused {
-                code: "unexpected-reply".to_string(),
-                message: format!("unexpected entity reply {other:?}"),
-            },
-            // The probe posture: an error after the durable commit still
-            // echoes the recorded transfer; only an unrecorded transfer is a
-            // definitive refusal.
-            Err(_) if echo.is_some() => AgentA2aHandoffFinding::Recorded {
-                target_generation: echo.flatten(),
-                peer_status: "working".to_string(),
-            },
-            Err(error) => AgentA2aHandoffFinding::Refused {
-                code: error.code().to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-}
-
-impl AgentA2aHandoffSendExecutor for ApplyingHandoffExecutor {
-    fn execute<'a>(
-        &'a self,
-        _scope: &'a AgentRunScope,
-        _intent: &'a AgentRunEffect,
-        handoff: &'a AgentHandoffRecord,
-        _credential: Option<&'a AgentEphemeralCredential>,
-    ) -> AgentDispatchFuture<'a, AgentA2aHandoffFinding> {
-        self.seen
-            .lock()
-            .expect("the record log should not be poisoned")
-            .push(handoff.clone());
-        Box::pin(async move { Ok(self.apply(handoff).await) })
     }
 }
 

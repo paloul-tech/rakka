@@ -31,10 +31,20 @@ const CONVERSATION: &str = "design-review";
 const MODERATOR: &str = "moderator";
 const TASK: &str = "review-task";
 
-fn fixture() -> Fixture {
-    Fixture::new(ScriptedDispatcher::with_adapter(
+/// The fixture with this file's whole cast instantiated as
+/// moderation-capable agents: the roster admits a speaker to *this*
+/// conversation, its definition admits it to moderated work at all, and the
+/// turn door reads both.
+async fn fixture() -> Fixture {
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
         DeterministicModelAdapter::new(),
-    ))
+    ));
+    fx.instantiate_conversation_participants(&[
+        MODERATOR, "alpha", "beta", "gamma", "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8",
+        "p9",
+    ])
+    .await;
+    fx
 }
 
 fn conversation_scope() -> AgentConversationScope {
@@ -146,7 +156,7 @@ fn end_command_by(
 }
 
 async fn created_fixture(creation: AgentConversationCreation) -> Fixture {
-    let fx = fixture();
+    let fx = fixture().await;
     let reply = fx
         .apply_conversation_command_at(&conversation_scope(), create_command(creation))
         .await
@@ -197,6 +207,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     let policy = || AgentModerationPolicy::new(AgentRevisionNumber::INITIAL);
 
     let empty = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(policy(), &[])),
@@ -206,6 +217,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     assert_eq!(empty.code(), "conversation-participants-invalid");
 
     let repeated = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(policy(), &["alpha", "alpha"])),
@@ -215,6 +227,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     assert_eq!(repeated.code(), "conversation-participants-invalid");
 
     let over_cap = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(
@@ -229,6 +242,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     // A round-robin round is one turn per roster member: a roster longer
     // than the turn ceiling could never complete a round.
     let unroundable = fixture()
+        .await
         .apply_conversation_command_at(
             &conversation_scope(),
             create_command(creation(
@@ -243,6 +257,7 @@ async fn an_invalid_roster_or_transcript_reference_refuses_at_creation() {
     let mut oversized_ref = creation(policy(), &["alpha"]);
     oversized_ref.transcript_ref = Some("r".repeat(300));
     let oversized = fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(oversized_ref))
         .await
         .expect_err("an oversized transcript reference refuses");
@@ -366,6 +381,7 @@ async fn the_creation_arithmetic_upper_bounds_what_the_state_guard_measures() {
     let mut degraded = rakka_agent::AgentConversationEntityStore::new(
         conversation_scope(),
         fx.conversations.clone(),
+        fx.agents.clone(),
         UnavailableHistory,
     );
     for _ in 0..64 {
@@ -656,7 +672,7 @@ async fn a_creation_replayed_with_different_content_refuses_rather_than_echoing(
     // converge; different record, refuse. A content-blind id would answer a
     // second creation `Duplicate` with the outcome of a conversation it does
     // not describe.
-    let fx = fixture();
+    let fx = fixture().await;
     let first = creation(
         AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
         &["alpha", "beta"],
@@ -735,6 +751,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
         &["alpha", "beta"],
     );
     let refused = fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(unreachable))
         .await
         .expect_err("a configuration with no terminal state refuses");
@@ -746,6 +763,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
         &["alpha", "beta"],
     );
     fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(with_end))
         .await
         .expect("the early end is a road to terminal");
@@ -757,6 +775,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
     );
     with_deadline.max_wall_clock_millis = Some(60_000);
     fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(with_deadline))
         .await
         .expect("a deadline is a road to terminal");
@@ -769,6 +788,7 @@ async fn a_configuration_with_no_reachable_terminal_state_refuses_at_creation() 
     );
     all_rounds.completion = AgentConversationCompletionRule::AllRounds;
     fixture()
+        .await
         .apply_conversation_command_at(&conversation_scope(), create_command(all_rounds))
         .await
         .expect("completing every round is a road to terminal");
@@ -1231,5 +1251,68 @@ async fn a_pre_slice_policy_decodes_with_defaults_and_the_identity_pins_hold() {
         directed("next", designate("beta")).as_str(),
         "conversation-turn/acme/design-review/0/0/moderator/\
          3723686f2b03ee546b9980be44391adac55c617054f848eb8669f1343083f83d"
+    );
+}
+
+#[tokio::test]
+async fn an_early_end_from_a_moderator_without_the_moderation_capability_refuses() {
+    // The early end is the one terminalizing operation a caller can reach,
+    // and it is wire-reachable through the A2A `end` verb — so it passes the
+    // same authority door as the turn
+    // ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)). The
+    // moderator here is the conversation's durable moderator, at the right
+    // round, under a policy that permits the early end; only its envelope
+    // changed. Without the door, an agent refused every turn — the designate
+    // and close-round that ride `SubmitTurn` included — could still
+    // unilaterally terminalize the conversation and unblock the governing
+    // task's review gate.
+    let policy = AgentModerationPolicy::new(AgentRevisionNumber::INITIAL);
+    let fx = created_fixture(creation(policy, &["alpha", "beta"])).await;
+
+    // Republish the moderator without the capability, leaving its task
+    // definitions, its lifecycle, and the conversation's record untouched:
+    // the door re-derives against the definition now in force.
+    let scope =
+        rakka_agent::AgentScope::new(tenant(), agent(MODERATOR)).expect("the agent scope is valid");
+    let mut narrowed = rakka_agent::AgentAuthorityEnvelope::empty();
+    narrowed
+        .task_definitions
+        .insert(common::task_definition_id());
+    let definition = rakka_agent::AgentDefinition::new(
+        rakka_agent::AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
+        "Resolves customer support tickets end to end.",
+        narrowed,
+    )
+    .expect("the agent definition is valid");
+    let mut entity = rakka_agent::AgentEntityStore::new(scope.clone(), fx.agents.clone());
+    entity.recover().await.expect("the agent recovers");
+    entity
+        .apply(rakka_agent::AgentEntityCommand::PublishDefinition {
+            operation_id: rakka_agent::AgentOperationId::for_agent(
+                rakka_agent::AgentOperationKind::DefinitionUpdate,
+                &scope,
+                "2",
+            )
+            .expect("the operation id derives"),
+            definition: Box::new(definition),
+            provenance: Box::new(provenance(2)),
+        })
+        .await
+        .expect("the narrowing definition publishes");
+
+    let refused = fx
+        .apply_conversation_command_at(&conversation_scope(), end_command(0, "calling it"))
+        .await
+        .expect_err("the end door refuses a moderator its definition no longer admits");
+    assert_eq!(refused.code(), "conversation-moderation-unauthorized");
+
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(
+        snapshot.status,
+        AgentConversationStatus::Active,
+        "the refusal terminalized nothing"
     );
 }

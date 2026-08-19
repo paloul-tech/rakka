@@ -90,6 +90,10 @@ async fn govern_a_conversation_that_ends(fx: &Fixture, conversation: &str) {
     )
     .expect("the conversation scope is valid");
     let moderator = member("moderator");
+    // The early end passes the moderation envelope door like every turn, so
+    // the moderator needs a durable definition granting `Moderation`.
+    fx.instantiate_conversation_participants(&["moderator"])
+        .await;
     fx.apply_conversation_command_at(
         &scope,
         AgentConversationEntityCommand::Create {
@@ -260,7 +264,7 @@ async fn an_unclaimed_board_task_expires_at_its_horizon() {
 #[tokio::test]
 async fn a_recorded_claim_holds_the_unclaimed_horizon_open() {
     let fx = fixture();
-    fx.instantiate_agent_at(
+    fx.instantiate_team_member_at(
         AgentScope::new(tenant(), member(MEMBER)).expect("the member scope is valid"),
     )
     .await;

@@ -134,11 +134,16 @@ async fn the_board_survives_passivation_and_the_claim_activates_across_it() {
         None,
     );
 
-    // The member agent, instantiated on the real sharded entity.
+    // The member agent, instantiated on the real sharded entity. Its envelope
+    // grants the `Team` coordination capability, which is what the claim's
+    // assignment door reads: board membership alone buys no authority.
     let mut envelope = AgentAuthorityEnvelope::empty();
     envelope
         .task_definitions
         .insert(AgentTaskDefinitionId::new("resolve-ticket").expect("the definition id is valid"));
+    envelope
+        .coordination_capabilities
+        .insert(rakka_agent::AgentCoordinationCapabilityKind::Team);
     let definition = AgentDefinition::new(
         AgentDefinitionId::new("support-v1").expect("the definition id is valid"),
         "Resolves customer support tickets end to end.",

@@ -1185,12 +1185,14 @@ fn team_delivery_error(error: crate::team::AgentTeamError) -> AgentExchangeDeliv
 /// delivery re-materializes the entity from durable state alone, so it
 /// exercises the passivate-anytime contract, and the same [`ExchangeFault`]
 /// queue injects the failure windows.
-pub struct InProcessConversationEntityTransport<Store, History>
+pub struct InProcessConversationEntityTransport<Store, Agents, History>
 where
     Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: crate::conversation::AgentConversationHistoryStore,
 {
     store: Store,
+    agents: Agents,
     history: History,
     router: AgentExchangeRouter,
     clock: Arc<AtomicU64>,
@@ -1198,14 +1200,16 @@ where
     acceptances: Arc<AtomicUsize>,
 }
 
-impl<Store, History> Clone for InProcessConversationEntityTransport<Store, History>
+impl<Store, Agents, History> Clone for InProcessConversationEntityTransport<Store, Agents, History>
 where
     Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: crate::conversation::AgentConversationHistoryStore,
 {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            agents: self.agents.clone(),
             history: self.history.clone(),
             router: self.router.clone(),
             clock: self.clock.clone(),
@@ -1215,9 +1219,10 @@ where
     }
 }
 
-impl<Store, History> InProcessConversationEntityTransport<Store, History>
+impl<Store, Agents, History> InProcessConversationEntityTransport<Store, Agents, History>
 where
     Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: crate::conversation::AgentConversationHistoryStore,
 {
     /// Creates a transport that delivers to conversation entities in one
@@ -1225,12 +1230,14 @@ where
     #[must_use]
     pub fn new(
         store: Store,
+        agents: Agents,
         history: History,
         router: AgentExchangeRouter,
         clock: Arc<AtomicU64>,
     ) -> Self {
         Self {
             store,
+            agents,
             history,
             router,
             clock,
@@ -1266,9 +1273,11 @@ where
     }
 }
 
-impl<Store, History> AgentExchangeTransport for InProcessConversationEntityTransport<Store, History>
+impl<Store, Agents, History> AgentExchangeTransport
+    for InProcessConversationEntityTransport<Store, Agents, History>
 where
     Store: DurableStateStore<crate::conversation::AgentConversationState>,
+    Agents: DurableStateStore<crate::agent::AgentEntityState>,
     History: crate::conversation::AgentConversationHistoryStore,
 {
     fn deliver<'a>(
@@ -1295,6 +1304,7 @@ where
             let mut entity = crate::conversation::AgentConversationEntityStore::new(
                 scope,
                 self.store.clone(),
+                self.agents.clone(),
                 self.history.clone(),
             );
 

@@ -255,10 +255,11 @@ where
     fn conversation_store(
         &self,
         scope: AgentConversationScope,
-    ) -> AgentConversationEntityStore<Conversations, ConversationHistory> {
+    ) -> AgentConversationEntityStore<Conversations, Agents, ConversationHistory> {
         AgentConversationEntityStore::new(
             scope,
             self.conversations.clone(),
+            self.agents.clone(),
             self.conversation_history.clone(),
         )
         .with_metrics(self.metrics.clone())

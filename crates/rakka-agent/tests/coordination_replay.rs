@@ -137,6 +137,10 @@ fn turn(round: u64, index: u32, participant: &str, body: &str) -> AgentConversat
 async fn coordinated_world() -> Fixture {
     let fx = fixture();
     fx.instantiate_agent().await;
+    // The turn door reads each speaker's definition, so the roster's members
+    // are instantiated with the `Moderation` capability their turns spend.
+    fx.instantiate_conversation_participants(&["moderator", "p1", "p2"])
+        .await;
     fx.create_task().await;
 
     let reply = fx
