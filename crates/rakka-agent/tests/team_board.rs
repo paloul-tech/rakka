@@ -577,3 +577,31 @@ async fn done_entries_are_evicted_before_the_ceiling_refuses_a_post() {
         .expect_err("a full board of live work still refuses");
     assert_eq!(refused.code(), "team-board-exhausted");
 }
+
+/// The history sink's faults are infrastructure, never board decisions: a
+/// full outbox drains on the courier's next flush, and a sink write race can
+/// surface *after* the transition committed. Classified as domain refusals
+/// they answered the wire as a definitive `Rejected` — making a well-behaved
+/// caller abandon a claim the next drive would admit, and reporting an
+/// applied command as refused.
+#[test]
+fn history_faults_classify_as_infrastructure_not_refusals() {
+    let backlog = rakka_agent::AgentTeamError::HistoryBacklog {
+        pending: 32,
+        maximum: 32,
+    };
+    assert_eq!(backlog.code(), "team-history-backlog");
+    assert!(
+        !backlog.is_domain_refusal(),
+        "a full history outbox is retryable infrastructure: {backlog}"
+    );
+    let conflict = rakka_agent::AgentTeamError::HistoryConflict {
+        sequence: rakka_agent::AgentTeamHistorySequence::FIRST,
+    };
+    assert_eq!(conflict.code(), "team-history-conflict");
+    assert!(
+        !conflict.is_domain_refusal(),
+        "a sink write race is retryable infrastructure — it can even follow \
+         a committed transition: {conflict}"
+    );
+}

@@ -3841,7 +3841,13 @@ impl AgentTeamError {
     /// becomes a "refusal" by default: it would answer a caller as a rejected
     /// *command* and count against the entity's refusal metric. Only decisions a
     /// command reached belong on the true side —
-    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision.
+    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision, and
+    /// the history sink's faults are infrastructure: [`Self::HistoryBacklog`]
+    /// is a full outbox the courier's next flush drains, and
+    /// [`Self::HistoryConflict`] a sink write race that can surface *after*
+    /// the transition committed — answering either as a definitive wire
+    /// rejection would make a well-behaved caller abandon a command the next
+    /// drive would admit, or believe an applied one was refused.
     #[must_use]
     pub const fn is_domain_refusal(&self) -> bool {
         !matches!(
@@ -3851,6 +3857,8 @@ impl AgentTeamError {
                 | Self::Choreography(_)
                 | Self::Coordination(_)
                 | Self::HistoryWindowExpired { .. }
+                | Self::HistoryBacklog { .. }
+                | Self::HistoryConflict { .. }
         )
     }
 }

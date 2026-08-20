@@ -3748,11 +3748,17 @@ impl AgentConversationError {
     /// becomes a "refusal" by default: it would answer a caller as a rejected
     /// *command* and count against the entity's refusal metric. Only decisions a
     /// command reached belong on the true side —
-    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision, and
+    /// [`Self::HistoryWindowExpired`] is a read answer, never a decision;
     /// [`Self::ParticipantRecordUnreadable`] is a read *fault* the very next
     /// attempt may serve (its own contract says the caller may retry it), so
     /// answering it as a definitive wire rejection would make a well-behaved
-    /// caller abandon a turn an agents-store blip refused.
+    /// caller abandon a turn an agents-store blip refused; and the history
+    /// sink's faults are infrastructure the same way —
+    /// [`Self::HistoryBacklog`] is a full outbox the courier's next flush
+    /// drains, and [`Self::HistoryConflict`] a sink write race that can
+    /// surface *after* the transition committed, so answering either as a
+    /// definitive rejection would abandon a turn the next drive would admit,
+    /// or report an applied command as refused.
     #[must_use]
     pub const fn is_domain_refusal(&self) -> bool {
         !matches!(
@@ -3763,6 +3769,8 @@ impl AgentConversationError {
                 | Self::Coordination(_)
                 | Self::ParticipantRecordUnreadable { .. }
                 | Self::HistoryWindowExpired { .. }
+                | Self::HistoryBacklog { .. }
+                | Self::HistoryConflict { .. }
         )
     }
 }

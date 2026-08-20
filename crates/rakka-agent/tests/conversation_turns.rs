@@ -846,8 +846,9 @@ async fn a_redelivered_turn_converges_while_the_history_sink_is_down() {
         .await
         .expect_err("a new turn refuses while the sink is down");
     assert!(
-        !fresh.is_domain_refusal() || fresh.code() == "conversation-history-backlog",
-        "the refusal is the history outbox, not a protocol decision: {fresh}"
+        !fresh.is_domain_refusal(),
+        "the refusal is infrastructure — the failing sink, or the history \
+         outbox it backs up — never a protocol decision: {fresh}"
     );
     let after = fx
         .conversation_snapshot_at(&conversation_scope())
@@ -1266,4 +1267,31 @@ async fn rounds_complete_ends_or_exhausts_by_completion_rule() {
         .await
         .expect_err("the parked cursor refuses further turns");
     assert_eq!(exhausted.code(), "conversation-rounds-exhausted");
+}
+
+/// The history sink's faults are infrastructure, never protocol decisions —
+/// the `conversation-participant-record-unreadable` posture: a full outbox
+/// drains on the courier's next flush, and a sink write race can surface
+/// *after* the transition committed, so neither may answer the wire as a
+/// definitive rejection the caller rebases on.
+#[test]
+fn history_faults_classify_as_infrastructure_not_refusals() {
+    let backlog = rakka_agent::AgentConversationError::HistoryBacklog {
+        pending: 32,
+        maximum: 32,
+    };
+    assert_eq!(backlog.code(), "conversation-history-backlog");
+    assert!(
+        !backlog.is_domain_refusal(),
+        "a full history outbox is retryable infrastructure: {backlog}"
+    );
+    let conflict = rakka_agent::AgentConversationError::HistoryConflict {
+        sequence: rakka_agent::AgentConversationHistorySequence::FIRST,
+    };
+    assert_eq!(conflict.code(), "conversation-history-conflict");
+    assert!(
+        !conflict.is_domain_refusal(),
+        "a sink write race is retryable infrastructure — it can even follow \
+         a committed transition: {conflict}"
+    );
 }
