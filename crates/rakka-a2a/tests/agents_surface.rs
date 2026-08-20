@@ -844,6 +844,57 @@ async fn cancellation_projects_the_authoritative_condition() {
     }
 }
 
+/// A metadata refresh keeps the projection's stored identity. `tasks/get`
+/// and `tasks/cancel` normalize with a `context_id` *derived from the task
+/// id* — they carry no context of their own — so a refresh their sync path
+/// triggers must re-snapshot under the context the task was created with,
+/// never the caller's derived default.
+#[tokio::test]
+async fn a_metadata_refresh_preserves_the_created_context() {
+    let fixture = Fixture::new(ScriptedDispatcher::new());
+    fixture.instantiate_agent().await;
+
+    let mut message = task_message("msg-context");
+    message.context_id = Some("conv-42".to_string());
+    let created = fixture
+        .service
+        .send_message(&params(), &send_request(&message))
+        .await
+        .expect("the send should be accepted");
+    assert_eq!(created.context_id, "conv-42");
+    let task_id = created.id.clone();
+
+    // The cancellation changes the authoritative condition, so its sync pass
+    // refreshes the projection's metadata — normalized under the task-id
+    // context default.
+    let cancelled = fixture
+        .service
+        .cancel_task(
+            &params(),
+            &a2a::CancelTaskRequest {
+                id: task_id.clone(),
+                metadata: None,
+                tenant: Some(TENANT.to_string()),
+            },
+        )
+        .await
+        .expect("the cancel should be accepted");
+    assert_eq!(
+        cancelled.context_id, "conv-42",
+        "the refresh keeps the created context"
+    );
+
+    // The read path derives the same default; the projection still answers
+    // the created context, and the refreshed condition metadata rode the
+    // refresh rather than being lost with it.
+    let read = fixture
+        .service
+        .get_task(&params(), Some(TENANT), &task_id, None)
+        .await
+        .expect("the task should read");
+    assert_eq!(read.context_id, "conv-42");
+}
+
 /// Scenario 1 under the owner-kill sweep: kill the run's owner, then the
 /// task's owner, at every durable write of the A2A accept -> assign -> run ->
 /// complete flow, on both sides of the compare-and-set — then let the ingress

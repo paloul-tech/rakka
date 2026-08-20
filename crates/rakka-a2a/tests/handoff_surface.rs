@@ -956,3 +956,190 @@ async fn an_ambiguous_send_stays_retryable_until_the_transfer_records() {
         "the re-driven send converges, got {finding:?}"
     );
 }
+
+/// A deduplicated replay whose answer echoes a *later* transfer is not a
+/// conflict: an `Ok` answer proves this handoff's command durably committed,
+/// and the latest-only provenance cell admits a successor only past a
+/// settled predecessor — so "no transfer was recorded" is provably false.
+/// The executor answers `Recorded` from the task's durable state instead of
+/// failing the source's cell, and the handoff-result exchange still carries
+/// the hop's actual resolution to the source.
+#[tokio::test]
+async fn a_superseded_replay_still_answers_recorded() {
+    let fixture = Fixture::new(DeterministicModelAdapter::new());
+    fixture.instantiate(&source()).await;
+    fixture.instantiate(&target()).await;
+    fixture.create_task().await;
+    // Drive the source's acceptance, exactly as the wire test does.
+    for _ in 0..4 {
+        let now = fixture.now();
+        let mut task = AgentTaskEntityStore::new(
+            fixture.task_scope(),
+            fixture.tasks.clone(),
+            fixture.agents.clone(),
+            fixture.history.clone(),
+        );
+        task.recover(now).await.expect("the task recovers");
+        let _ = task
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await;
+    }
+
+    // The first transfer, through the executor exactly as the source run's
+    // effect would carry it.
+    let scope = fixture.run_scope(&source(), 1);
+    let handoff = handoff_id_for(&scope, 7, 0).expect("the handoff id derives");
+    let record = AgentHandoffRecord {
+        handoff: handoff.clone(),
+        goal: None,
+        task: AgentTaskId::new(TASK).expect("the task id is valid"),
+        source_run: scope.clone(),
+        source_generation: AgentAssignmentGeneration::new(1),
+        requested_skill: AgentCapabilityId::new(HANDOFF_SKILL).expect("the skill id is valid"),
+        resolved: AgentDelegationTarget::new(
+            target(),
+            AgentTaskDefinitionId::new(TASK_DEFINITION).expect("the definition id is valid"),
+        ),
+        reason: "needs billing authority".to_string(),
+        policy_revision: AgentRevisionNumber::INITIAL,
+        definition_revision: AgentRevisionNumber::INITIAL,
+        settings_revision: AgentRevisionNumber::INITIAL,
+        context: Vec::new(),
+        a2a_message_id: handoff.as_str().to_string(),
+        deduplication_key: handoff.as_str().to_string(),
+        turn: 7,
+        slot: 0,
+        effect: AgentEffectId::new("effect-1"),
+        call_id: AgentToolCallId::new("call-1").expect("the call id is valid"),
+        telemetry: Default::default(),
+        created_at: AgentTimestampMillis::new(1),
+    };
+    let request: AgentRunEffectRequest =
+        serde_json::from_value(json!({ "a2a-handoff": { "handoff": record } }))
+            .expect("the request round-trips");
+    let spec = AgentEffectPolicies::default().spec_for(&request).clone();
+    let intent = AgentRunEffect::new(
+        &scope,
+        7,
+        0,
+        request,
+        &spec,
+        AgentRevisionNumber::INITIAL,
+        AgentTimestampMillis::new(1),
+    )
+    .expect("the intent builds");
+    let executor = A2AAgentHandoffSendExecutor::new(fixture.service.clone());
+    let first = executor
+        .execute(&scope, &intent, &record, None)
+        .await
+        .expect("the transfer records");
+    assert!(
+        matches!(first, AgentA2aHandoffFinding::Recorded { .. }),
+        "the first send records, got {first:?}"
+    );
+
+    // The target's generation-2 assignment accepts through the settle
+    // passes, settling the first hop — the precondition for a successor.
+    for _ in 0..6 {
+        let now = fixture.now();
+        let mut task = AgentTaskEntityStore::new(
+            fixture.task_scope(),
+            fixture.tasks.clone(),
+            fixture.agents.clone(),
+            fixture.history.clone(),
+        );
+        task.recover(now).await.expect("the task recovers");
+        let _ = task
+            .settle_side_effects(&fixture.router, fixture.now())
+            .await;
+    }
+    let mut task = AgentTaskEntityStore::new(
+        fixture.task_scope(),
+        fixture.tasks.clone(),
+        fixture.agents.clone(),
+        fixture.history.clone(),
+    );
+    task.recover(fixture.now())
+        .await
+        .expect("the task recovers");
+    let snapshot = task
+        .snapshot()
+        .expect("the snapshot reads")
+        .expect("the task exists");
+    let held = snapshot.handoff.as_deref().expect("the first hop rides");
+    assert_eq!(held.handoff, handoff);
+    assert_eq!(held.status, AgentTaskHandoffStatus::Accepted);
+    drop(task);
+
+    // The new owner hands the same task back: the second transfer replaces
+    // the latest-only cell while the first hop's result may still be owed.
+    let second = handoff_id_for(&fixture.run_scope(&target(), 2), 3, 0)
+        .expect("the handoff id derives")
+        .into_string();
+    let mut back = Message::new(
+        Role::User,
+        vec![Part {
+            content: PartContent::Data(json!({ "handoff": second })),
+            filename: None,
+            media_type: Some("application/json".to_string()),
+            metadata: None,
+        }],
+    );
+    back.message_id = second.clone();
+    back.task_id = Some(TASK.to_string());
+    back.extensions = Some(vec![AGENT_COLLABORATION_EXTENSION_URI.to_string()]);
+    back.metadata = Some(
+        [
+            (
+                META_DEDUPLICATION_KEY.to_string(),
+                Value::String(second.clone()),
+            ),
+            (META_AGENT_ID.to_string(), Value::String(SOURCE.to_string())),
+            (
+                META_TASK_DEFINITION.to_string(),
+                Value::String(TASK_DEFINITION.to_string()),
+            ),
+            (
+                META_COLLABORATION.to_string(),
+                json!({
+                    "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+                    "handoff": second,
+                    "source-agent": TARGET,
+                    "source-run": format!("{TASK}-gen-2"),
+                    "source-generation": 2,
+                    "target-agent": SOURCE,
+                    "target-task-definition": TASK_DEFINITION,
+                    "reason": "sending the ticket back to support",
+                    "policy-revision": 1,
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    fixture
+        .service
+        .send_message(&params(), &send_request(back))
+        .await
+        .expect("the second transfer records");
+
+    // The first hop's deduplicated replay answers with the current view,
+    // which echoes the successor — yet the first hop was durably recorded
+    // and settled. The executor must answer `Recorded` from the durable
+    // cell, never a conflict that resumes the source with a false
+    // "no transfer was recorded".
+    let replay = executor
+        .execute(&scope, &intent, &record, None)
+        .await
+        .expect("the replay answers");
+    assert!(
+        matches!(
+            &replay,
+            AgentA2aHandoffFinding::Recorded {
+                target_generation: None,
+                ..
+            }
+        ),
+        "a superseded hop still answers recorded, got {replay:?}"
+    );
+}

@@ -546,10 +546,12 @@ pub enum AgentA2aHandoffFinding {
 /// effect's idempotent attempt bound; a finding is definitive. On an
 /// ambiguous transport loss the implementation probes the task's durable
 /// state before giving up: a recorded provenance echoing this handoff id
-/// proves delivery, its absence proves the transfer was never recorded, and
-/// only a probe that cannot answer either way leaves the attempt ambiguous —
-/// the run then parks for a reconciliation decision rather than resuming
-/// beside a live transfer. An absent executor fails closed at `invoke`.
+/// proves delivery, while its *absence* stays retryable — a read cannot
+/// prove the ambiguously failed write will never land — so only a durable
+/// record held under a foreign, unresolved identity answers definitively in
+/// the negative. A retry budget that spends out without an answer parks the
+/// run for a reconciliation decision rather than resuming it beside a
+/// possibly-live transfer. An absent executor fails closed at `invoke`.
 pub trait AgentA2aHandoffSendExecutor: Send + Sync {
     /// Performs the send and returns its bounded finding.
     fn execute<'a>(

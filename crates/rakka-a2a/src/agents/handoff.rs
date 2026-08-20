@@ -240,6 +240,76 @@ where
             _ => Ok(None),
         }
     }
+
+    /// Answers a send whose `Ok` reply did not echo this handoff.
+    ///
+    /// Reaching here means the service durably committed the deduplicated
+    /// handoff command: `record_handoff` refuses without mutating — so an
+    /// unrecorded transfer surfaces as an error, never a task view — and the
+    /// journal's deduplication answers only for an operation that committed.
+    /// "No transfer was recorded" is therefore the one reading that is
+    /// provably false, and the probe's conflict must not be borrowed for it.
+    /// The task's durable state disambiguates instead: a cell naming this
+    /// handoff is the recorded transfer, its public echo merely lagging; a
+    /// cell naming a *different* transfer means this hop was recorded,
+    /// settled, and replaced — the pending guard admits a successor only
+    /// past a settled predecessor — which is still `Recorded`, never proof
+    /// the target accepted, with the resolution reaching the source through
+    /// the task's handoff-result exchange exactly as for an unsuperseded
+    /// hop. Only a state that contradicts the commitment — no durable task,
+    /// an empty cell — leaves the attempt retryable, because resuming the
+    /// source beside a transfer whose record cannot be read yet is the
+    /// ambiguity the specification forbids.
+    async fn finding_for_committed_send(
+        &self,
+        record: &AgentHandoffRecord,
+    ) -> Result<AgentA2aHandoffFinding, AgentDispatchError> {
+        let view = self
+            .service
+            .authoritative_task_view(record.source_run.tenant().as_str(), record.task.as_str())
+            .await;
+        let (snapshot, run) = match view {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                return Err(AgentDispatchError::Invocation {
+                    code: "handoff-not-echoed",
+                    message: format!(
+                        "the accepted send's task {} has no durable state to answer from; \
+                         the deduplicated send re-drives",
+                        record.task
+                    ),
+                })
+            }
+            Err(error) => {
+                return Err(AgentDispatchError::Invocation {
+                    code: error.code(),
+                    message: error.to_string(),
+                })
+            }
+        };
+        let peer_status = peer_status_label(&agent_task_state(AgentTaskCondition {
+            task: snapshot.status,
+            run,
+        }));
+        match snapshot.handoff.as_deref() {
+            Some(held) if held.handoff == record.handoff => Ok(AgentA2aHandoffFinding::Recorded {
+                target_generation: held.target_generation,
+                peer_status: peer_status.to_string(),
+            }),
+            Some(_) => Ok(AgentA2aHandoffFinding::Recorded {
+                target_generation: None,
+                peer_status: peer_status.to_string(),
+            }),
+            None => Err(AgentDispatchError::Invocation {
+                code: "handoff-not-echoed",
+                message: format!(
+                    "the answering task {} holds no handoff record though the send committed; \
+                     the deduplicated send re-drives",
+                    record.task
+                ),
+            }),
+        }
+    }
 }
 
 /// The stable kebab-case label of one peer task state, for the handoff
@@ -386,28 +456,15 @@ where
                 Err(error) => return finding_for_error(error),
             };
             // The identity check behind the deduplication key: the answering
-            // task must echo *this* handoff.
+            // task must echo *this* handoff. A mismatched or missing echo is
+            // never a definitive conflict here: the `Ok` answer proves the
+            // deduplicated command committed, so the latest-only cell has
+            // moved past this settled hop — a deduplicated replay answering
+            // with the current view — or the public echo lags the commit.
+            // The task's authoritative durable state answers, not the echo.
             match handoff_echo_id(&task) {
                 Some(echoed) if echoed == handoff.handoff.as_str() => {}
-                Some(_) => {
-                    return Ok(AgentA2aHandoffFinding::Conflict {
-                        code: "handoff-conflict".to_string(),
-                        message: format!(
-                            "the answering task {} echoes a transfer this handoff's identity \
-                             does not own",
-                            task.id
-                        ),
-                    });
-                }
-                None => {
-                    return Ok(AgentA2aHandoffFinding::Conflict {
-                        code: "handoff-not-echoed".to_string(),
-                        message: format!(
-                            "the answering task {} does not echo handoff {}",
-                            task.id, handoff.handoff
-                        ),
-                    });
-                }
+                _ => return self.finding_for_committed_send(handoff).await,
             }
             let target_generation = task
                 .metadata
