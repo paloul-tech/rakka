@@ -313,6 +313,19 @@ pub struct AgentTeam {
     pub lifecycle_revision: AgentRevisionNumber,
     members: BTreeMap<AgentId, AgentTeamMember>,
     board: BTreeMap<AgentTaskId, AgentTeamBoardEntry>,
+    /// The highest claim epoch any evicted `Done` entry ever reached. A
+    /// re-posted task's fresh entry starts here rather than at zero, so a
+    /// re-claim after eviction can never re-derive an evicted incarnation's
+    /// content-derived claim identity — whose exchange operation id the
+    /// task's journal may still remember, and would answer with that
+    /// incarnation's memoized refusal instead of re-running arbitration.
+    /// Team-wide rather than per-task because per-task floors would grow
+    /// without bound — the very growth eviction exists to prevent; a fresh
+    /// entry starting above zero is harmless, since every epoch guard
+    /// compares equality and every claim identity hashes the epoch. Records
+    /// persisted before this field load with the floor at zero.
+    #[serde(default)]
+    evicted_claim_epoch_floor: u64,
     messages: VecDeque<AgentTeamMessage>,
     /// Messages the bounded ring has dropped, oldest first.
     pub messages_dropped: u64,
@@ -2637,6 +2650,7 @@ fn create_team(
         lifecycle_revision: AgentRevisionNumber::INITIAL,
         members,
         board: BTreeMap::new(),
+        evicted_claim_epoch_floor: 0,
         messages: VecDeque::new(),
         messages_dropped: 0,
         next_message_sequence: 1,
@@ -2776,7 +2790,18 @@ fn post_task(
         // ceiling pressure they are evicted, lazily like every board expiry,
         // so a long-lived board can never be exhausted by its own finished
         // work. A re-post after eviction simply re-arbitrates at the task,
-        // which refuses terminal work and closes the fresh entry again.
+        // which refuses terminal work and closes the fresh entry again —
+        // *re*-arbitrates, which is why the evicted entries' epochs are
+        // folded into the floor first: a fresh entry restarting at zero
+        // would let a re-claim re-mint the evicted incarnation's claim
+        // identity, and the task's journal would answer that operation with
+        // the old memoized refusal instead of arbitrating at all.
+        for entry in team.board.values() {
+            if entry.status == AgentTeamBoardEntryStatus::Done {
+                team.evicted_claim_epoch_floor =
+                    team.evicted_claim_epoch_floor.max(entry.claim_epoch);
+            }
+        }
         team.board
             .retain(|_, entry| entry.status != AgentTeamBoardEntryStatus::Done);
     }
@@ -2789,7 +2814,11 @@ fn post_task(
             task: task.clone(),
             posted_by: posted_by.clone(),
             posted_at: now,
-            claim_epoch: 0,
+            // Above every epoch an evicted incarnation reached, never zero:
+            // the first claim mints `floor + 1`, so its derived identity —
+            // and the exchange operation id the task deduplicates on — is
+            // fresh even for a (task, member) pair the board has seen before.
+            claim_epoch: team.evicted_claim_epoch_floor,
             status: AgentTeamBoardEntryStatus::Open,
             claim: None,
             last_code: None,

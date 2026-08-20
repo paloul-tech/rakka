@@ -1220,3 +1220,171 @@ async fn pre_team_records_serialize_byte_identically() {
     assert_eq!(policy.claim_lease_ms, 300_000);
     assert!(policy.tool.is_none());
 }
+
+/// A re-posted task must not resurrect an evicted incarnation's claim
+/// identity. The claim id hashes `(team, task, member, epoch)` and doubles
+/// as the exchange's deduplication key, so an entry whose epoch restarted at
+/// zero after Done-eviction would let a same-member re-claim re-derive the
+/// exact operation the task's journal already answered — and the journal
+/// replays the old definitive refusal instead of re-running arbitration,
+/// closing the fresh entry over a task that is now genuinely claimable.
+/// The board therefore seeds a re-posted entry above every epoch an evicted
+/// entry ever reached.
+#[tokio::test]
+async fn a_repost_after_eviction_cannot_replay_a_prior_incarnations_refusal() {
+    let fx = fixture();
+    fx.instantiate_team_member_at(
+        AgentScope::new(tenant(), member(MEMBER_A)).expect("the member scope is valid"),
+    )
+    .await;
+    // A one-entry board makes eviction immediate: every post of new work
+    // evicts whatever finished before it.
+    let mut members: BTreeMap<AgentId, BTreeSet<rakka_agent::AgentCapabilityId>> = BTreeMap::new();
+    members.insert(member(MEMBER_A), BTreeSet::new());
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Create {
+            operation_id: op("create"),
+            creation: Box::new(AgentTeamCreation {
+                leader: member(LEADER),
+                root_goal: AgentGoalId::new("quarterly-support").expect("the goal id is valid"),
+                policy: AgentTeamPolicy::new(AgentRevisionNumber::INITIAL)
+                    .with_max_board_entries(1),
+                members,
+            }),
+        },
+    )
+    .await
+    .expect("the team creates");
+
+    // Incarnation one: the board task is claimed before its task entity
+    // exists. The uncreated task refuses `team-claim-task-unknown`
+    // definitively, the task's journal memoizes that answer under the
+    // claim's derived operation id, and the entry closes Done at epoch 1.
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post-early"),
+            task: task_scope().task().clone(),
+            posted_by: member(MEMBER_A),
+        },
+    )
+    .await
+    .expect("the early post applies");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-early"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: 0,
+        },
+    )
+    .await
+    .expect("the early claim applies at the board");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Done);
+    assert_eq!(entry.last_code.as_deref(), Some("team-claim-task-unknown"));
+
+    // The task now really exists under this board's governance.
+    create_board_task(&fx).await;
+
+    // Unrelated finished work cycles the one slot, evicting the Done entry —
+    // the incarnation boundary this test is about.
+    let cycler = rakka_agent::AgentTaskId::new("cycler").expect("the task id is valid");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post-cycler"),
+            task: cycler.clone(),
+            posted_by: member(MEMBER_A),
+        },
+    )
+    .await
+    .expect("the cycler post evicts the Done entry");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let cycler_entry = team
+        .board
+        .iter()
+        .find(|entry| entry.task == cycler)
+        .expect("the cycler entry stands");
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-cycler"),
+            task: cycler.clone(),
+            member: member(MEMBER_A),
+            expected_epoch: cycler_entry.claim_epoch,
+        },
+    )
+    .await
+    .expect("the cycler claim applies at the board");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+    fx.settle_team_at(&team_scope())
+        .await
+        .expect("team settles");
+
+    // Incarnation two: the re-post evicts the cycler and the re-claim must
+    // arbitrate at the task — which now accepts — rather than being answered
+    // by incarnation one's memoized refusal.
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::PostTask {
+            operation_id: op("post-again"),
+            task: task_scope().task().clone(),
+            posted_by: member(MEMBER_A),
+        },
+    )
+    .await
+    .expect("the re-post applies");
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Open);
+    fx.apply_team_command_at(
+        &team_scope(),
+        AgentTeamEntityCommand::Claim {
+            operation_id: op("claim-again"),
+            task: task_scope().task().clone(),
+            member: member(MEMBER_A),
+            expected_epoch: entry.claim_epoch,
+        },
+    )
+    .await
+    .expect("the re-claim applies at the board");
+    settle_claim_round_trip(&fx).await;
+
+    let task = fx.task_snapshot().await;
+    let assignment = task.assignment.expect("the re-claim wins an assignment");
+    assert_eq!(assignment.agent, member(MEMBER_A));
+    assert_eq!(assignment.status, AgentAssignmentStatus::Accepted);
+    let team = fx
+        .team_snapshot_at(&team_scope())
+        .await
+        .expect("the team snapshots");
+    let entry = board_entry(&team);
+    assert_eq!(
+        entry.status,
+        AgentTeamBoardEntryStatus::Active,
+        "the fresh claim identity reached arbitration; a replayed refusal \
+         would have closed the entry Done with the stale code, got {:?}",
+        entry.last_code
+    );
+}
