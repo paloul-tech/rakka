@@ -237,16 +237,28 @@ fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, A
             code: "collaboration-version-unsupported".to_string(),
             message: reason.to_string(),
         }),
-        RakkaAgentA2AError::Task(error) => match &error {
-            AgentTaskError::Persistence(_) => Err(AgentDispatchError::Invocation {
-                code: error.code(),
-                message: error.to_string(),
-            }),
-            _ => Ok(AgentA2aSendFinding::Refused {
-                code: error.code().to_string(),
-                message: error.to_string(),
-            }),
-        },
+        // The same ambiguity rule as the handoff executor's: a store failure
+        // may have struck *after* the child's durable creation committed —
+        // the entity applies commit-before-settle, and the facade surfaces a
+        // settle-pass write failure through the choreography host — so
+        // settling it as a definitive refusal would strand a durably created
+        // child while the parent records the delegation as refused. The
+        // retryable error keeps the deduplicated send re-driving, and the
+        // `AlreadyCreated` echo-disambiguation converges it on the child it
+        // already owns.
+        RakkaAgentA2AError::Task(error) => {
+            if super::handoff::task_error_is_ambiguous(&error) {
+                Err(AgentDispatchError::Invocation {
+                    code: error.code(),
+                    message: error.to_string(),
+                })
+            } else {
+                Ok(AgentA2aSendFinding::Refused {
+                    code: error.code().to_string(),
+                    message: error.to_string(),
+                })
+            }
+        }
         RakkaAgentA2AError::Entity(_)
         | RakkaAgentA2AError::Run(_)
         | RakkaAgentA2AError::Projection(_) => Err(AgentDispatchError::Invocation {
@@ -368,5 +380,31 @@ where
                 peer_status: peer_status_label(&task.status.state).to_string(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store failure surfaced through the choreography host is the
+    /// post-commit half of the entity's commit-before-settle ordering: the
+    /// child's creation may already be durable when the settle pass's write
+    /// fails, so the classification must stay a retryable attempt — a
+    /// definitive refusal would strand the created child while the parent
+    /// records the delegation as refused, and the deduplicated re-send's
+    /// `AlreadyCreated` echo-disambiguation would never run.
+    #[test]
+    fn a_choreography_persistence_failure_stays_retryable() {
+        let error = RakkaAgentA2AError::Task(AgentTaskError::Choreography(Box::new(
+            rakka_agent::AgentChoreographyError::Persistence(
+                rakka_persistence::DurableError::store("memory", "write failed after the commit"),
+            ),
+        )));
+        let finding = finding_for_error(error);
+        assert!(
+            matches!(finding, Err(AgentDispatchError::Invocation { .. })),
+            "a post-commit store failure is ambiguous, got {finding:?}"
+        );
     }
 }

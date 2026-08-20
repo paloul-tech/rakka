@@ -484,8 +484,10 @@ where
 /// Whether a task-entity error leaves the send's outcome unknown: a store
 /// failure that may have struck around the durable commit, whichever layer
 /// wrapped it — the entity facade surfaces a write failure through the
-/// choreography host, not only as a bare persistence error.
-fn task_error_is_ambiguous(error: &AgentTaskError) -> bool {
+/// choreography host, not only as a bare persistence error. Shared with the
+/// delegation executor, whose sends commit through the same entity facade
+/// and must classify the same store failures as retryable.
+pub(super) fn task_error_is_ambiguous(error: &AgentTaskError) -> bool {
     match error {
         AgentTaskError::Persistence(_) => true,
         AgentTaskError::Choreography(inner) => matches!(
