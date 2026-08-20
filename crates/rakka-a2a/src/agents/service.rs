@@ -579,6 +579,26 @@ where
         let metadata =
             merged_metadata(request.metadata.as_ref(), request.message.metadata.as_ref())
                 .map_err(RakkaAgentA2AError::Mapping)?;
+        // A management message cannot also engage the collaboration
+        // extension. `send` dispatches on the management tag before the
+        // collaboration envelope ever parses, so without this gate a message
+        // declaring both would execute the management command while the
+        // state-mutating team, conversation, or handoff cluster was silently
+        // dropped — letting the sender believe its engagement was recorded,
+        // the exact failure the reserved-key-without-declaration refusal
+        // exists to prevent. Either half of the engagement — the declared
+        // extension or the reserved metadata key — conflicts, and the double
+        // engagement is refused whole at every entry point that can execute
+        // the management command.
+        if super::collaboration::is_collaboration_message(&request.message)
+            || metadata.contains_key(super::collaboration::META_COLLABORATION)
+        {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-management",
+                reason: "a management message cannot engage the collaboration extension; the \
+                         collaboration cluster would be silently dropped",
+            });
+        }
         let (tenant, _source) = canonical_tenant(
             self.tenant_resolver.as_ref(),
             self.default_tenant.as_deref(),

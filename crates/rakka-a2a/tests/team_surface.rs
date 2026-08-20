@@ -12,8 +12,10 @@ use std::sync::Arc;
 use a2a::{Message, Part, PartContent, Role, SendMessageRequest};
 use async_trait::async_trait;
 use rakka_a2a::agents::{
-    A2AAgentTarget, A2AStaticAgentCatalog, RakkaAgentA2AError, RakkaAgentA2AService,
-    AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION, META_COLLABORATION,
+    management_request_message, A2AAgentTarget, A2AStaticAgentCatalog, AgentManagementCommand,
+    AgentManagementRequest, RakkaAgentA2AError, RakkaAgentA2AService,
+    AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION,
+    AGENT_MANAGEMENT_SCHEMA_VERSION, META_COLLABORATION,
 };
 use rakka_a2a::auth::{
     A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, A2AOperation,
@@ -614,6 +616,28 @@ async fn wire_level_team_sends_fail_closed() {
         .expect_err("a claim without an epoch expectation fails closed");
     assert!(matches!(error, RakkaAgentA2AError::Mapping(_)));
 
+    // A present-but-blank directed target fails closed like every other
+    // blank field — it must not silently widen to the broadcast spelling
+    // `to: None`, which would deliver the message to every member and skip
+    // the directed target's roster validation.
+    let blank_target = json!({
+        "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+        "team": TEAM,
+        "operation": "message",
+        "member": MEMBER_A,
+        "target-member": "  ",
+        "body": "who owns this ticket?",
+    });
+    let error = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message("blank-target", blank_target)),
+        )
+        .await
+        .expect_err("a blank directed target fails closed");
+    assert!(matches!(error, RakkaAgentA2AError::Mapping(_)));
+
     // A membership change without an authenticated principal fails closed.
     let join = json!({
         "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
@@ -742,4 +766,136 @@ async fn a_plain_client_send_is_untouched_by_the_team_surface() {
         matches!(response, a2a::SendMessageResponse::Task(_)),
         "a plain send stays a typed task creation"
     );
+}
+
+/// Opposing verbs never share an operation identity: a caller that keys its
+/// membership commands with one stable deduplication key gets each verb's
+/// own durable decision, never another verb's memoized outcome. Without the
+/// verb segment in the derived operation id, the Leave below answered the
+/// Join's `Applied` as a success-shaped `Duplicate` and the member never
+/// left the roster.
+#[tokio::test]
+async fn opposing_verbs_never_share_an_operation_identity() {
+    let fixture = Fixture::new();
+    fixture.board_world().await;
+
+    let authed = |cluster: Value| {
+        let mut message = team_message("member-newcomer", cluster);
+        message
+            .metadata
+            .as_mut()
+            .expect("the metadata exists")
+            .insert(META_PRINCIPAL_REF.to_string(), json!("user:operator-7"));
+        message
+    };
+
+    // The join commits under the caller's stable per-member key.
+    let join = authed(json!({
+        "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+        "team": TEAM,
+        "operation": "join",
+        "member": "newcomer",
+        "expected-lifecycle-revision": 1,
+    }));
+    let response = fixture
+        .service
+        .send(&params(), &send_request(join))
+        .await
+        .expect("the join is served");
+    let payload = response_payload(&response);
+    assert!(
+        payload.get("Applied").is_some(),
+        "the join applies: {payload}"
+    );
+    let team = fixture.team_snapshot().await;
+    assert!(
+        team.members.contains_key(&member("newcomer")),
+        "the roster holds the newcomer"
+    );
+
+    // The leave reuses the same deduplication key: an opposing verb, its own
+    // operation — never the join's memoized outcome.
+    let leave = authed(json!({
+        "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+        "team": TEAM,
+        "operation": "leave",
+        "member": "newcomer",
+        "expected-lifecycle-revision": 2,
+    }));
+    let response = fixture
+        .service
+        .send(&params(), &send_request(leave))
+        .await
+        .expect("the leave is served");
+    let payload = response_payload(&response);
+    assert!(
+        payload.get("Applied").is_some(),
+        "the leave applies rather than answering the join's memo: {payload}"
+    );
+    let team = fixture.team_snapshot().await;
+    assert!(
+        !team.members.contains_key(&member("newcomer")),
+        "the member actually left the roster"
+    );
+}
+
+/// A message that declares the management extension and engages the
+/// collaboration extension is refused whole: dispatching it as a management
+/// command would execute that command while silently dropping the
+/// state-mutating team cluster — the caller would believe its claim was
+/// placed while the board entry sat unclaimed.
+#[tokio::test]
+async fn a_management_message_cannot_carry_a_collaboration_cluster() {
+    let fixture = Fixture::new();
+    fixture.board_world().await;
+    fixture.instantiate(&member(MEMBER_A)).await;
+
+    // A well-formed management describe that *also* declares the
+    // collaboration extension and carries a team claim cluster.
+    let request = AgentManagementRequest {
+        schema: AGENT_MANAGEMENT_SCHEMA_VERSION,
+        command: AgentManagementCommand::Describe {
+            agent: MEMBER_A.to_string(),
+        },
+    };
+    let mut message = management_request_message(&request);
+    message.message_id = "dual-engaged".to_string();
+    message
+        .extensions
+        .get_or_insert_with(Vec::new)
+        .push(AGENT_COLLABORATION_EXTENSION_URI.to_string());
+    message.metadata = Some(
+        [
+            (META_DEDUPLICATION_KEY.to_string(), json!("dual-engaged")),
+            (META_COLLABORATION.to_string(), claim_cluster(MEMBER_A, 0)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let error = fixture
+        .service
+        .send(&params(), &send_request(message))
+        .await
+        .expect_err("the double engagement fails closed");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Unsupported {
+                operation: "agent-management",
+                ..
+            }
+        ),
+        "the refusal names the double engagement, got {error:?}"
+    );
+
+    // Nothing durable happened on the board: the claim was refused with the
+    // send, never silently dropped behind a management answer.
+    let team = fixture.team_snapshot().await;
+    let entry = team
+        .board
+        .iter()
+        .find(|entry| &entry.task == task_scope().task())
+        .expect("the board holds the task");
+    assert_eq!(entry.status, AgentTeamBoardEntryStatus::Open);
+    assert_eq!(entry.claim_epoch, 0, "nothing durable happened");
 }

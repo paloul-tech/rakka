@@ -271,10 +271,22 @@ pub fn normalize_agent_send(
             // The team command deduplicates under the team's own scope, not
             // the synthesized placeholder task id, so two retries of one
             // board decision converge on one durable operation at the team
-            // entity's inbox.
+            // entity's inbox. The verb label is part of the identity: the
+            // kinds above are operation *classes* shared by opposing verbs,
+            // and the team's operation log answers by id alone — without the
+            // verb segment, a caller that keys its commands with a stable
+            // per-member or per-task deduplication key would have its Leave
+            // answered with the Join's memoized outcome, or its Release
+            // absorbed by the prior Claim's, a success-shaped reply for a
+            // decision the board never made.
             let operation_id = AgentOperationId::new(
                 kind,
-                [tenant.as_str(), team.as_str(), discriminator.as_str()],
+                [
+                    tenant.as_str(),
+                    team.as_str(),
+                    cluster.operation.as_label(),
+                    discriminator.as_str(),
+                ],
             )?;
             return Ok(NormalizedAgentCommand {
                 tenant,
@@ -876,12 +888,18 @@ pub fn agent_team_command(
         AgentTeamWireOperation::Message => AgentTeamEntityCommand::AppendMessage {
             operation_id,
             from: member_id(&cluster.member, "io.rakka.collaboration.member")?,
-            to: cluster
-                .target_member
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(rakka_agent::AgentId::new)
-                .transpose()?,
+            // An absent target is the broadcast spelling; a *present* one is
+            // a directed message, and a blank value fails closed like every
+            // other blank field here instead of silently widening to the
+            // broadcast — the authorizer was shown the raw directed claim,
+            // and what was authorized and what executes must not diverge.
+            to: match cluster.target_member.as_deref() {
+                None => None,
+                Some(_) => Some(member_id(
+                    &cluster.target_member,
+                    "io.rakka.collaboration.target-member",
+                )?),
+            },
             body: required(&cluster.body, "io.rakka.collaboration.body")?,
         },
         AgentTeamWireOperation::Join => {
