@@ -97,11 +97,30 @@ pub fn system_team_clock() -> AgentTeamClock {
 /// The default sharded entity type of team entities.
 pub const DEFAULT_AGENT_TEAM_ENTITY_TYPE: &str = "RakkaAgentTeam";
 
-/// Maximum serialized bytes of one team's materialized state.
-pub const AGENT_TEAM_MATERIALIZED_MAX_BYTES: usize = 32 * 1024;
+/// Maximum serialized bytes of one team's *persisted state* — the whole
+/// [`AgentTeamState`], not just the materialized team inside it.
+///
+/// The bound covers what the compare-and-set actually writes: the team, the
+/// bounded operation log, the pending history outbox, and the exchange
+/// journal. An earlier 32 KiB figure measured only the team — leaving every
+/// sibling collection growing under no bound at all — and could never have
+/// held a full board of claimed, code-carrying entries beside a full
+/// operation log, whose outcomes echo whole board entries.
+///
+/// Sized so the worst case the hard caps admit provably fits under the
+/// *effective* bound (this figure minus the growth reserve): the overflow
+/// wedge — a record too large for the very transitions that could shrink it,
+/// since `post_task`, the one path that evicts finished entries, refuses at
+/// the same rail — is then impossible by construction rather than merely
+/// refused, and every in-flight check stays a defensive guard. The
+/// arithmetic is pinned by a test beside the transitions it protects.
+pub const AGENT_TEAM_MATERIALIZED_MAX_BYTES: usize = 256 * 1024;
 
-/// Bytes held back from the materialized bound so a settle transition never
-/// finds the record too large to write.
+/// Bytes held back from the materialized bound so a transition that must
+/// always fit never finds the record too large to write: commands check the
+/// bound *minus* this reserve, while the eager terminal close — owed exactly
+/// once, its bounds refusal non-settling — checks the full bound and spends
+/// the reserve when it must.
 pub const AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES: usize = 4 * 1024;
 
 /// Bounded window of resolved operations a team remembers for deduplication.
@@ -368,18 +387,6 @@ impl AgentTeam {
     pub fn is_expired_at(&self, now: AgentTimestampMillis) -> bool {
         self.expires_at
             .is_some_and(|expires| now.as_millis() >= expires.as_millis())
-    }
-
-    fn check_bounds(&self) -> AgentTeamResult<()> {
-        let bytes = serde_json::to_vec(self)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
-        let maximum =
-            AGENT_TEAM_MATERIALIZED_MAX_BYTES.saturating_sub(AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES);
-        if bytes > maximum {
-            return Err(AgentTeamError::StateBounds { bytes, maximum });
-        }
-        Ok(())
     }
 }
 
@@ -1085,6 +1092,45 @@ impl AgentTeamState {
         AGENT_TEAM_PENDING_HISTORY_CAPACITY.saturating_sub(self.pending_history.len())
     }
 
+    /// Refuses a state that would exceed its persisted bound.
+    ///
+    /// Measured over the whole record the compare-and-set writes — the team
+    /// *and* the operation log, the pending history outbox, and the exchange
+    /// journal beside it. Measuring only the team would leave the three
+    /// bounded collections growing under no bound at all, and it is the
+    /// whole record a durable store's per-value limit applies to.
+    ///
+    /// This stays a defensive guard: the hard caps' worst case provably fits
+    /// under this effective bound (the arithmetic is pinned by a test), so a
+    /// record that trips it holds bytes no admitted policy could have put
+    /// there.
+    fn check_bounds(&self) -> AgentTeamResult<()> {
+        self.check_bytes(
+            AGENT_TEAM_MATERIALIZED_MAX_BYTES.saturating_sub(AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES),
+        )
+    }
+
+    /// [`Self::check_bounds`] against the absolute bound, for the one
+    /// transition that must always fit: the eager terminal close is owed
+    /// exactly once and its bounds refusal is non-settling, so refusing it
+    /// at the commands' effective rail would re-drive it forever against a
+    /// record nothing can shrink — `post_task`, the one path that evicts
+    /// finished entries, refuses at that same rail. The growth reserve is
+    /// exactly the headroom this check spends.
+    fn check_bounds_within_reserve(&self) -> AgentTeamResult<()> {
+        self.check_bytes(AGENT_TEAM_MATERIALIZED_MAX_BYTES)
+    }
+
+    fn check_bytes(&self, maximum: usize) -> AgentTeamResult<()> {
+        let bytes = serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if bytes > maximum {
+            return Err(AgentTeamError::StateBounds { bytes, maximum });
+        }
+        Ok(())
+    }
+
     /// The compact outcome describing the current state.
     #[must_use]
     pub fn outcome(&self) -> AgentTeamOutcome {
@@ -1595,19 +1641,24 @@ fn apply_team_terminal(
     // The close usually *shrinks* the entry — a dropped claim costs more
     // bytes than the code echo adds — but not when it closes an entry no
     // claim ever named, and `terminal_reason` arrives as a free-form wire
-    // string bounded only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. Thirty-two
-    // entries closed that way carry up to sixteen kilobytes against an
-    // effective cap of twenty-eight, so this is a growth point and must be
-    // bounded like every other: `post_task` checks, and so does this.
+    // string bounded only by `AGENT_TEAM_DETAIL_MAX_LENGTH`: a growth point,
+    // so it is bounded like every other. Against the *absolute* bound,
+    // though, never the commands' effective rail: the close is owed exactly
+    // once, its bounds refusal is non-settling, and `post_task` — the one
+    // path that evicts finished entries — refuses at the effective rail, so
+    // a close refused there would re-drive forever against a record nothing
+    // can shrink. The growth reserve is exactly the headroom held back for
+    // it, and the per-entry worst case (a full code echo on every entry) is
+    // already charged by the bound's pinned arithmetic — this check is the
+    // defense against a record no admitted policy could have produced.
     //
-    // Unchecked, the overflow surfaced somewhere else entirely — the next
-    // `post_task`, `add_member`, or any transition that *does* check — and
-    // wedged the board there, with the bytes that caused it already durable.
     // Validate-then-mutate is literal here for the same reason it is at
     // `record_team_claim`: the accept path persists state even under a
     // refusal, so a refusal must leave the board exactly as it found it.
-    if let Err(error) = team.check_bounds() {
-        team.board.insert(task_id, previous);
+    if let Err(error) = state.check_bounds_within_reserve() {
+        if let Some(team) = state.team.as_mut() {
+            team.board.insert(task_id, previous);
+        }
         return refuse_terminal(error.code(), error.to_string());
     }
     state.record_history(|sequence| {
@@ -2657,8 +2708,8 @@ fn create_team(
         created_at: now,
         expires_at,
     };
-    team.check_bounds()?;
     state.team = Some(team);
+    state.check_bounds()?;
     let leader = creation.leader;
     let operation = operation_id.clone();
     state.record_history(|sequence| {
@@ -2703,7 +2754,7 @@ fn add_member(
             revision,
         },
     );
-    team.check_bounds()?;
+    state.check_bounds()?;
     let operation = operation_id.clone();
     let principal = provenance.principal.principal_id.clone();
     state.record_history(|sequence| {
@@ -2824,7 +2875,7 @@ fn post_task(
             last_code: None,
         },
     );
-    team.check_bounds()?;
+    state.check_bounds()?;
     let operation = operation_id.clone();
     state.record_history(|sequence| {
         AgentTeamHistoryEntry::new(sequence, AgentTeamHistoryKind::TaskPosted, operation, now)
@@ -2951,6 +3002,10 @@ fn claim_entry(
         lease_ms,
         now,
     )?;
+    // The minted claim grows the entry — the derived id, the claimant, the
+    // echoes to come — so the command rides the effective rail like every
+    // other growth point on this record.
+    state.check_bounds()?;
     let claim = command.claim.clone();
     let exchange_operation = team_claim_operation_id(state.scope.tenant(), &claim)?;
     let envelope = owed_claim_exchange(state, exchange_operation, &command, now)?;
@@ -3017,6 +3072,10 @@ fn release_entry(
     let epoch = entry.claim_epoch + 1;
     entry.claim_epoch = epoch;
     entry.status = AgentTeamBoardEntryStatus::Releasing;
+    // Commands ride the effective rail, however small this one's growth:
+    // the settle that answers it writes a code echo the reserve must still
+    // be able to pay for.
+    state.check_bounds()?;
 
     let command = AgentTeamClaimCommand {
         team: scope,
@@ -3107,6 +3166,8 @@ fn transfer_entry(
         lease_ms,
         now,
     )?;
+    // The same growth as a fresh claim, the same rail.
+    state.check_bounds()?;
     let claim = command.claim.clone();
     let exchange_operation = team_claim_operation_id(state.scope.tenant(), &claim)?;
     let envelope = owed_claim_exchange(state, exchange_operation, &command, now)?;
@@ -3165,7 +3226,7 @@ fn append_message(
         team.messages.pop_front();
         team.messages_dropped += 1;
     }
-    team.check_bounds()?;
+    state.check_bounds()?;
     let operation = operation_id.clone();
     state.record_history(|sequence_number| {
         let mut entry = AgentTeamHistoryEntry::new(
@@ -3729,7 +3790,8 @@ pub enum AgentTeamError {
     StateBounds {
         /// The serialized size.
         bytes: usize,
-        /// The effective maximum.
+        /// The bound in force for the refusing transition: the effective
+        /// rail for commands, the absolute one for the terminal close.
         maximum: usize,
     },
 }
@@ -4076,23 +4138,29 @@ mod board_guard_tests {
         .expect("the envelope builds")
     }
 
-    /// Pads one board entry's `last_code` until the team record measures
-    /// exactly `bytes`, so a bound check lands where the test needs it.
-    fn inflate_team_to(state: &mut AgentTeamState, filler: &AgentTaskId, bytes: usize) {
+    /// Pads one board entry's `last_code` until the whole persisted record —
+    /// the [`AgentTeamState`], exactly what the compare-and-set writes —
+    /// measures exactly `bytes`, so a bound check lands where the test
+    /// needs it.
+    fn inflate_state_to(state: &mut AgentTeamState, filler: &AgentTaskId, bytes: usize) {
         let team = state.team.as_mut().expect("the team exists");
         team.board
             .get_mut(filler)
             .expect("the filler entry exists")
             .last_code = Some(String::new());
-        let size = serde_json::to_vec(&*team)
+        let size = serde_json::to_vec(&*state)
             .map(|json| json.len())
             .unwrap_or(0);
-        team.board
+        state
+            .team
+            .as_mut()
+            .expect("the team exists")
+            .board
             .get_mut(filler)
             .expect("the filler entry exists")
             .last_code = Some("x".repeat(bytes - size));
         assert_eq!(
-            serde_json::to_vec(&*team)
+            serde_json::to_vec(&*state)
                 .map(|json| json.len())
                 .unwrap_or(0),
             bytes,
@@ -4100,15 +4168,49 @@ mod board_guard_tests {
         );
     }
 
+    /// A created team with one member and two posted, open board entries:
+    /// the main one and a filler whose `last_code` the inflation helper
+    /// pads.
+    fn open_board_with_filler() -> (AgentTeamState, AgentTaskId) {
+        let mut state = AgentTeamState::uncreated(scope(), ts(0));
+        let mut members: std::collections::BTreeMap<
+            AgentId,
+            std::collections::BTreeSet<crate::AgentCapabilityId>,
+        > = std::collections::BTreeMap::new();
+        members.insert(member(MEMBER), Default::default());
+        create_team(
+            &mut state,
+            &op("create"),
+            AgentTeamCreation {
+                leader: member(LEADER),
+                root_goal: AgentGoalId::new("quarterly-support").expect("the goal id is valid"),
+                policy: AgentTeamPolicy::new(AgentRevisionNumber::INITIAL),
+                members,
+            },
+            ts(1),
+        )
+        .expect("the team creates");
+        post_task(&mut state, &op("post"), task(), member(LEADER), ts(2)).expect("the task posts");
+        let filler = AgentTaskId::new("ticket-filler").expect("the task id is valid");
+        post_task(
+            &mut state,
+            &op("post-filler"),
+            filler.clone(),
+            member(LEADER),
+            ts(3),
+        )
+        .expect("the filler posts");
+        (state, filler)
+    }
+
     #[test]
-    fn a_close_that_would_overflow_the_board_refuses_and_writes_nothing() {
+    fn a_close_that_would_overflow_the_record_refuses_and_writes_nothing() {
         // The close usually shrinks an entry, but not one no claim ever
         // named, and `terminal_reason` is a free-form wire string bounded
-        // only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. That makes this a growth
-        // point, and every other growth point on this record checks its
-        // bound. Unchecked, the overflow committed here and surfaced at the
-        // next `post_task` or `add_member` — wedging the board somewhere
-        // else entirely, with the bytes that caused it already durable.
+        // only by `AGENT_TEAM_DETAIL_MAX_LENGTH`. The close checks the
+        // *absolute* bound — the growth reserve is exactly its headroom —
+        // so only a record that could not be written at all is refused,
+        // and the refusal stays non-settling for the re-drive.
         let mut state = releasing_board();
         let closing = AgentTaskId::new("ticket-2").expect("the task id is valid");
         post_task(
@@ -4120,11 +4222,10 @@ mod board_guard_tests {
         )
         .expect("the second task posts");
 
-        // Fill the record to one byte under its effective cap, so the code
+        // Fill the record to one byte under the absolute bound, so the code
         // echo alone must push it over. The entry being closed holds no
         // claim, so nothing is freed to pay for it.
-        let effective = AGENT_TEAM_MATERIALIZED_MAX_BYTES - AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES;
-        inflate_team_to(&mut state, &task(), effective - 1);
+        inflate_state_to(&mut state, &task(), AGENT_TEAM_MATERIALIZED_MAX_BYTES - 1);
 
         let full = state.clone();
         let refusal = apply_team_terminal(
@@ -4135,7 +4236,7 @@ mod board_guard_tests {
         assert_eq!(
             refusal.status().rejection_code(),
             Some("team-state-too-large"),
-            "the close refuses rather than committing an over-large record"
+            "the close refuses rather than committing an unwritable record"
         );
         assert_eq!(
             state, full,
@@ -4144,8 +4245,124 @@ mod board_guard_tests {
         );
         assert!(
             !crate::coordination::team_terminal_notice_refusal_settles("team-state-too-large"),
-            "and it stays outstanding — the board's own eviction of finished \
-             entries is what lets a re-drive converge"
+            "and it stays outstanding rather than settling a lost close"
+        );
+    }
+
+    #[test]
+    fn a_close_inside_the_growth_reserve_still_commits() {
+        // The eager close is owed exactly once and its bounds refusal is
+        // non-settling, so a close refused at the *effective* bound — the
+        // rail the commands check — would re-drive forever against a record
+        // nothing can shrink: `post_task`, the one path that evicts finished
+        // entries, refuses at that same rail. The reserve is held back so a
+        // must-converge transition never finds the record too large to
+        // write; a close that lands inside it therefore commits.
+        let mut state = releasing_board();
+        let closing = AgentTaskId::new("ticket-2").expect("the task id is valid");
+        post_task(
+            &mut state,
+            &op("post-2"),
+            closing.clone(),
+            member(LEADER),
+            ts(5),
+        )
+        .expect("the second task posts");
+        let effective = AGENT_TEAM_MATERIALIZED_MAX_BYTES - AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES;
+        inflate_state_to(&mut state, &task(), effective - 1);
+
+        let accepted = apply_team_terminal(
+            &mut state,
+            &terminal_notice_for(&closing, &"r".repeat(AGENT_TEAM_DETAIL_MAX_LENGTH)),
+            ts(6),
+        );
+        assert!(
+            accepted.is_accepted(),
+            "the reserve pays for the close, got {accepted:?}"
+        );
+        let entry = state
+            .team
+            .as_ref()
+            .expect("the team exists")
+            .board
+            .get(&closing)
+            .expect("the closed entry stands");
+        assert_eq!(entry.status, AgentTeamBoardEntryStatus::Done);
+    }
+
+    #[test]
+    fn a_claim_that_would_overflow_the_record_refuses() {
+        // A recorded claim grows the entry — the minted claim record, the
+        // derived id, the echoes to come — and rides the effective rail
+        // like every command: `release_entry` and `transfer_entry` mint
+        // through the same shape and check the same bound. Unchecked, claim
+        // traffic pushed the record past the cap with the overflow already
+        // durable, and every later checked transition refused over bytes it
+        // never added.
+        let (mut state, filler) = open_board_with_filler();
+        let effective = AGENT_TEAM_MATERIALIZED_MAX_BYTES - AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES;
+        inflate_state_to(&mut state, &filler, effective - 1);
+
+        let epoch = board_epoch(&state);
+        let refused = claim_entry(
+            &mut state,
+            &op("claim-big"),
+            task(),
+            member(MEMBER),
+            epoch,
+            ts(4),
+        )
+        .expect_err("a claim past the effective bound refuses");
+        assert_eq!(
+            refused.code(),
+            "team-state-too-large",
+            "the claim is bounds-checked like every other command"
+        );
+    }
+
+    #[test]
+    fn the_hard_cap_worst_case_fits_under_the_effective_bound() {
+        // The overflow wedge — a record too large for the very transitions
+        // that could shrink it — must be impossible by construction, not
+        // merely refused: every bounded collection in the persisted record
+        // is charged its worst case here, and the sum must fit under the
+        // effective bound so every in-flight check stays a defensive guard.
+        // The reserves are deliberately generous per entry.
+        //
+        // A board entry: two identity strings, the minted claim (derived id,
+        // member, timestamps, both echoes), a full 512-byte `last_code`, and
+        // the JSON envelope around them.
+        const BOARD_ENTRY_RESERVE: usize = 1536;
+        // A member: the identity key, capability scopes from trusted setup,
+        // the join timestamp and revision.
+        const MEMBER_RESERVE: usize = 512;
+        // A ring message beside its bounded body: sequence, sender,
+        // recipient, timestamp, envelope.
+        const MESSAGE_RECORD_RESERVE: usize = 128;
+        // An operation-log entry: the operation id and the full outcome it
+        // echoes — which embeds a whole board entry for board operations.
+        const OPERATION_LOG_ENTRY_RESERVE: usize = 2048;
+        // A pending history entry: ids, member, claim, and a full 512-byte
+        // detail.
+        const HISTORY_ENTRY_RESERVE: usize = 1024;
+        // Everything outside the bounded collections: the scope, the
+        // policy, the status and counters, and the exchange journal's
+        // bounded windows of small claim commands and receipts.
+        const FIXED_OVERHEAD: usize = 8 * 1024;
+
+        let worst = crate::coordination::AGENT_TEAM_MAX_BOARD_ENTRIES as usize
+            * BOARD_ENTRY_RESERVE
+            + crate::coordination::AGENT_TEAM_MAX_MEMBERS as usize * MEMBER_RESERVE
+            + crate::coordination::AGENT_TEAM_MAX_MESSAGES as usize
+                * (crate::coordination::AGENT_TEAM_MESSAGE_MAX_BYTES + MESSAGE_RECORD_RESERVE)
+            + AGENT_TEAM_OPERATION_LOG_CAPACITY * OPERATION_LOG_ENTRY_RESERVE
+            + AGENT_TEAM_PENDING_HISTORY_CAPACITY * HISTORY_ENTRY_RESERVE
+            + FIXED_OVERHEAD;
+        let effective = AGENT_TEAM_MATERIALIZED_MAX_BYTES - AGENT_TEAM_STATE_GROWTH_RESERVE_BYTES;
+        assert!(
+            worst <= effective,
+            "the hard-cap worst case ({worst} bytes) must fit under the \
+             effective bound ({effective} bytes)"
         );
     }
 
