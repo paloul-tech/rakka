@@ -208,6 +208,114 @@ async fn a_governed_conversations_end_does_not_postpone_the_unclaimed_horizon() 
     );
 }
 
+/// Registers one peer dependent's forward edge on the board task, exactly as
+/// the dependent's own settle pass would deliver it.
+async fn register_dependent(fx: &Fixture, dependent: &str) {
+    let dependent_scope = rakka_agent::AgentTaskScope::new(
+        tenant(),
+        rakka_agent::AgentTaskId::new(dependent).expect("the task id is valid"),
+    )
+    .expect("the scope is valid");
+    let operation_id = rakka_agent::dependency_registration_operation_id(
+        &tenant(),
+        task_scope().task(),
+        dependent_scope.task(),
+    )
+    .expect("the operation id derives");
+    let payload = rakka_agent::AgentExchangePayload::encode(
+        rakka_agent::AGENT_DEPENDENCY_REGISTRATION_PAYLOAD_TYPE,
+        &rakka_agent::AgentDependencyRegistration {
+            dependent: dependent_scope.clone(),
+            upstream: task_scope().task().clone(),
+            policy: rakka_agent::AgentDependencyFailurePolicy::CancelDependents,
+        },
+    )
+    .expect("the payload encodes");
+    let envelope = rakka_agent::AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        rakka_agent::AgentExchangeKind::DependencyRegistration,
+        rakka_agent::AgentEntityAddress::Task(dependent_scope),
+        rakka_agent::AgentEntityAddress::Task(task_scope()),
+        payload,
+        rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+        fx.now(),
+    )
+    .expect("the envelope is valid");
+    let mut task = rakka_agent::AgentTaskEntityStore::new(
+        task_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    let reply = task
+        .accept(&envelope, &fx.router, fx.now())
+        .await
+        .expect("the delivery succeeds");
+    assert!(
+        reply.result().is_accepted(),
+        "the registration records: {:?}",
+        reply.result().status()
+    );
+}
+
+/// A peer's dependency registration recorded mid-wait must not postpone the
+/// unclaimed horizon: `updated_at` measures how long the task has waited,
+/// not how recently anything touched it, and each of up to
+/// `AGENT_TASK_MAX_DEPENDENTS` registrations could otherwise re-arm the
+/// horizon — parking a never-claimed task and its delegated escrow far past
+/// the bound by exactly the peers with an interest in its output.
+#[tokio::test]
+async fn a_dependents_registration_does_not_postpone_the_unclaimed_horizon() {
+    let fx = fixture();
+    create_board_task(&fx).await;
+
+    // Two dependents register deep inside the horizon, the second at its
+    // very edge — under a bumping clock either one alone would restart it.
+    fx.clock.store(
+        AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS / 2,
+        Ordering::SeqCst,
+    );
+    register_dependent(&fx, "peer-1").await;
+    fx.clock.store(
+        AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS - 10_000,
+        Ordering::SeqCst,
+    );
+    register_dependent(&fx, "peer-2").await;
+
+    let task = fx.task_snapshot().await;
+    assert!(
+        !task.status.is_terminal(),
+        "still inside the horizon, still waiting: {:?} / {:?}",
+        task.status,
+        task.terminal_reason
+    );
+
+    // The horizon still lands where the definition put it, measured from the
+    // task's own last transition rather than from the last peer write.
+    fx.clock.store(
+        AGENT_TASK_DEFAULT_MAX_UNCLAIMED_MILLIS + 1_000,
+        Ordering::SeqCst,
+    );
+    fx.settle_task_at(&task_scope())
+        .await
+        .expect("task settles");
+    let task = fx.task_snapshot().await;
+    assert_eq!(
+        task.status,
+        AgentTaskStatus::Cancelled,
+        "the wait is bounded by the definition, not by who last registered against it"
+    );
+    assert!(
+        matches!(
+            task.terminal_reason,
+            Some(AgentTaskTerminalReason::CancellationRequested { ref reason })
+                if reason == "unclaimed-expired"
+        ),
+        "got {:?}",
+        task.terminal_reason
+    );
+}
+
 #[tokio::test]
 async fn an_unclaimed_board_task_expires_at_its_horizon() {
     let fx = fixture();

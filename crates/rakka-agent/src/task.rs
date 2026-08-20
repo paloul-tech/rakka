@@ -5239,6 +5239,19 @@ fn create_task(
     if agent_owned && creation.assignee.is_none() && creation.team.is_none() {
         return Err(AgentTaskError::MissingAssignee);
     }
+    if !agent_owned && creation.team.is_some() {
+        // The board exists to decide which *agent* serves a task: a claim
+        // records an assignee and mints toward an assignment generation,
+        // neither of which a human-owned task has. Admitting the pairing
+        // would strand every claim `Initiated` forever — the assignment
+        // decision requires agent ownership, so no claim ever resolves, no
+        // claim result is ever owed back to the board, and the unclaimed
+        // horizon requires `Created`, so the wait never expires either.
+        // Refused at the door, where the caller can still drop the binding;
+        // `record_team_claim` guards the same invariant for a record
+        // persisted before this door existed.
+        return Err(AgentTaskError::TeamNotAgentOwned);
+    }
     if agent_owned && state.scope.task().as_str().len() > AGENT_TASK_ASSIGNABLE_ID_MAX_LENGTH {
         // Every assignment derives a run id from this id plus a generation
         // suffix; an id the suffix would push past the identity bound is
@@ -6457,6 +6470,26 @@ fn record_team_claim(
         return Err(AgentTaskError::TeamClaimRefused {
             code: "team-claim-wrong-team",
             message: "the task is not governed by this team's board".to_string(),
+        });
+    }
+    if !task.definition.is_agent_owned() {
+        // The record-level half of the door `create_task` now closes (the
+        // human-owned + team pairing is refused at creation): a claim
+        // accepted here would latch `Initiated` forever, because the
+        // assignment decision requires agent ownership and so never runs,
+        // no claim result is ever owed back to the board, and the unclaimed
+        // horizon requires `Created` — all while durably falsifying
+        // `assignee` on a task a human answers. Deliberately refused under
+        // the *registered* wrong-team code rather than a fresh one: the
+        // team's `check_settle` enumerates the claim codes it may settle,
+        // so a code deployed boards do not know would leave the claim
+        // exchange re-driving forever, while `team-claim-wrong-team`
+        // already closes the board entry `Done` — exactly right for a task
+        // no board can ever assign. The message carries the true reason.
+        return Err(AgentTaskError::TeamClaimRefused {
+            code: "team-claim-wrong-team",
+            message: "the task is human-owned; a board claim can only assign an agent-owned task"
+                .to_string(),
         });
     }
     if command.epoch <= task.team_claim_fence {
@@ -10336,7 +10369,17 @@ fn apply_dependency_registration(
         .as_ref()
         .map_or(AgentTaskStatus::Created, |task| task.status);
     let operation_id = envelope.operation_id().clone();
-    state.updated_at = now;
+    // `state.updated_at` is deliberately *not* advanced, for the same
+    // load-bearing reason the conversation-terminal record below leaves it
+    // alone: recording what a *peer* did is not a transition of this task —
+    // its status, assignment, result, and goal are exactly where they were —
+    // and that clock is the sole input to the board-governed unclaimed
+    // horizon (`task_unclaimed_expired`). Advancing it here would let each
+    // of up to [`AGENT_TASK_MAX_DEPENDENTS`] registrations re-arm the
+    // horizon, so a never-claimed task and its delegated escrow could be
+    // parked far past the bound by exactly the peers with an interest in
+    // keeping it alive. The registry entry still changes and still
+    // persists; it simply does not claim to be a transition.
     state.record_history(|sequence| {
         AgentTaskHistoryEntry::new(
             sequence,
@@ -10682,6 +10725,13 @@ fn apply_conversation_terminal(
 /// it decides it — a receipt carrying an already-terminal upstream's outcome,
 /// or a definitive refusal, which means no notification can ever arrive. Both
 /// resolve through the same core the notification would.
+///
+/// An accepted receipt is decoded *before* the marker flips: the marker
+/// quiesces both re-derivation sites, so settling first and reading second
+/// would drop an undecodable receipt's carried outcome — the only answer a
+/// moot registration ever gets — with nothing left to arrive. `check_settle`
+/// already keeps such a reply outstanding, so the early return here is the
+/// same decision enforced where the settle actually reads.
 fn settle_dependency_registration_exchange(
     state: &mut AgentTaskState,
     envelope: &AgentExchangeEnvelope,
@@ -10708,20 +10758,32 @@ fn settle_dependency_registration_exchange(
         if edge.registration_settled {
             return Vec::new();
         }
-        edge.registration_settled = true;
     }
-    state.updated_at = now;
+    let settle_marker = |state: &mut AgentTaskState| {
+        if let Ok(task) = state.task_mut() {
+            if let Some(edge) = task.dependencies.get_mut(&upstream) {
+                edge.registration_settled = true;
+            }
+        }
+        state.updated_at = now;
+    };
     if result.is_accepted() {
         let receipt: Result<AgentDependencyRegistrationReceipt, _> = result
             .payload()
             .decode(AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE);
-        if let Ok(receipt) = receipt {
-            if let Some(outcome) = receipt.outcome {
-                return apply_registration_outcome(state, &upstream, outcome, now);
-            }
+        let Ok(receipt) = receipt else {
+            // Unreadable: the exchange stays unsettled — and the marker
+            // unset — so the re-drive fetches a fresh receipt once a binary
+            // that can read it is asking.
+            return Vec::new();
+        };
+        settle_marker(state);
+        if let Some(outcome) = receipt.outcome {
+            return apply_registration_outcome(state, &upstream, outcome, now);
         }
         return Vec::new();
     }
+    settle_marker(state);
     // A refusal `check_settle` classified definitive: the upstream will never
     // hold a registry entry for this dependent, so the notification the
     // forward edge waits on can never be sent. The refusal is recorded, and
@@ -11068,23 +11130,66 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
                     ),
                 }
             }
+            AgentExchangeKind::DependencyRegistration if result.is_accepted() => {
+                // An accepted receipt settles the edge's registration marker
+                // and may carry an already-terminal upstream's outcome — the
+                // only answer a moot registration will ever get, because the
+                // upstream records no registry entry for it and so owes no
+                // notification. A receipt this binary cannot decode (a newer
+                // peer's payload mid rolling upgrade, or the upstream's
+                // encode-failure fallback, whose empty bytes never decode)
+                // must therefore leave the exchange outstanding instead of
+                // settling into a durable guess that strands the dependent
+                // `Blocked` with nothing left to arrive: the upstream
+                // answers the re-drive idempotently from its registry echo
+                // or its terminal-answer path, and a binary that can read
+                // the receipt settles it — the same fail-closed rule this
+                // hook applies to a refusal payload it cannot interpret.
+                result
+                    .payload()
+                    .decode::<AgentDependencyRegistrationReceipt>(
+                        AGENT_DEPENDENCY_REGISTRATION_RECEIPT_PAYLOAD_TYPE,
+                    )
+                    .map(|_| ())
+                    .map_err(
+                        |_| crate::choreography::AgentChoreographyError::UnsettleableRefusal {
+                            kind: AgentExchangeKind::DependencyRegistration,
+                            code: "dependency-registration-receipt-undecodable".to_string(),
+                        },
+                    )
+            }
             AgentExchangeKind::DependencyRegistration if !result.is_accepted() => {
                 // A refused registration settles only under the upstream's
-                // definitive answers: forged, ceiling reached, or unable to
-                // bound the record. Each means the upstream holds no registry
-                // entry and never will, so the dependent resolves the edge
-                // itself on settlement. `task-not-created` deliberately stays
-                // outstanding instead — the upstream may yet be created, and
+                // definitive answers, and the dependent then resolves the
+                // edge itself on settlement. `dependency-registration-forged`
+                // is identity — no re-drive changes it.
+                // `task-dependents-exhausted` is the registry ceiling: the
+                // registry only ever grows, so pre-terminal the refusal
+                // repeats identically for as long as both entities live, and
+                // the edge resolves failed now rather than re-driving
+                // unbounded — the `task-dependency-limit-exceeded` precedent
+                // of `conversation_terminal_notice_refusal_settles`. Two
+                // refusals deliberately stay outstanding instead, because
+                // the upstream is saying *not yet*, never *never*.
+                // `task-not-created`: the upstream may yet be created, and
                 // the receiver does not memoize this class of refusal, so a
-                // racing create converges on the next re-drive. A
-                // never-created upstream leaves the dependent durably
-                // `Blocked`, the documented stuck-dependency struggle signal.
+                // racing create converges on the next re-drive.
+                // `task-state-too-large`: the bound that refused is one the
+                // upstream itself relaxes — a pre-terminal task charges a
+                // registration the growth-reserve headroom its remaining
+                // lifecycle still needs, the terminal-answer path sits
+                // before the bounds check, and a terminal task charges
+                // nothing — so the very registration that will not fit today
+                // is answered once the upstream terminalizes, with an
+                // accepted receipt carrying the true outcome. Settling on it
+                // would fail the edge — and cancel the dependent under the
+                // default policy — over a refusal the upstream is about to
+                // stop making, when the upstream may yet complete. A
+                // never-created or never-terminalizing upstream leaves the
+                // dependent durably `Blocked`, the documented
+                // stuck-dependency struggle signal.
                 match result.status().rejection_code() {
-                    Some(
-                        "dependency-registration-forged"
-                        | "task-dependents-exhausted"
-                        | "task-state-too-large",
-                    ) => Ok(()),
+                    Some("dependency-registration-forged" | "task-dependents-exhausted") => Ok(()),
                     code => Err(
                         crate::choreography::AgentChoreographyError::UnsettleableRefusal {
                             kind: AgentExchangeKind::DependencyRegistration,
@@ -11200,8 +11305,10 @@ impl AgentExchangeParticipant for AgentTaskParticipant {
         if envelope.kind() == AgentExchangeKind::DependencyRegistration {
             // The upstream answered — recorded, answered with its terminal
             // outcome, or refused under a definitive code. The edge's marker
-            // settles either way, and an outcome carried on the receipt
-            // applies here, owing whatever the application owes.
+            // settles once the answer is readable — `check_settle` keeps an
+            // unreadable receipt outstanding, and the hook re-checks before
+            // it flips — and an outcome carried on the receipt applies here,
+            // owing whatever the application owes.
             return settle_dependency_registration_exchange(state, envelope, result, now);
         }
         if envelope.kind() == AgentExchangeKind::DependencyOutcome {
@@ -14184,6 +14291,10 @@ pub enum AgentTaskError {
     },
     /// An agent-owned task was created without an assignee.
     MissingAssignee,
+    /// A human-owned creation carried a team binding: a board claim exists to
+    /// name the *agent* that serves a task, so it can never resolve a
+    /// human-owned one.
+    TeamNotAgentOwned,
     /// A handoff command was refused without recording a transfer
     /// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)).
     ///
@@ -14406,6 +14517,7 @@ impl AgentTaskError {
             Self::AlreadyCreated { .. } => "task-already-created",
             Self::Terminal { .. } => "task-terminal",
             Self::MissingAssignee => "task-missing-assignee",
+            Self::TeamNotAgentOwned => "task-team-not-agent-owned",
             Self::HandoffRefused { code, .. } => code,
             Self::SubmissionRefused { code, .. } => code,
             Self::TeamClaimRefused { code, .. } => code,
@@ -14467,6 +14579,11 @@ impl Display for AgentTaskError {
             Self::MissingAssignee => {
                 write!(f, "an agent-owned task must name the agent it is created for")
             }
+            Self::TeamNotAgentOwned => write!(
+                f,
+                "a board-governed creation requires an agent-owned definition; a human-owned \
+                 task takes no assignee for a claim to name"
+            ),
             Self::HandoffRefused { code, message } => {
                 write!(f, "the handoff was refused ({code}): {message}")
             }

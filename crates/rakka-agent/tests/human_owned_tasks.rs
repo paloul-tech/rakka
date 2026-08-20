@@ -1072,3 +1072,175 @@ async fn an_unsatisfiable_definition_is_refused_at_declaration() {
         "an agent-owned task may still require evidence: its run can carry artifacts"
     );
 }
+
+/// A human-owned creation carrying a team binding is refused at the door.
+/// The board exists to decide which *agent* serves a task — a claim records
+/// an assignee and mints toward an assignment generation, neither of which a
+/// human-owned task has — so admitting the pairing would strand every claim
+/// `Initiated` forever while durably falsifying `assignee`.
+#[tokio::test]
+async fn a_human_owned_creation_with_a_team_binding_is_refused() {
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    let error = fx
+        .apply_task_command_at(
+            &human_scope(),
+            AgentTaskEntityCommand::Create {
+                operation_id: creation_op(HUMAN_TASK),
+                creation: Box::new(AgentTaskCreation {
+                    definition: task_definition().with_ownership(AgentTaskOwnership::Human),
+                    input: AgentTaskContent::inline(json!({ "ticket": 9 }))
+                        .expect("the input is inline-bounded"),
+                    assignee: None,
+                    team: Some(
+                        rakka_agent::AgentTeamId::new("support-team").expect("the id is valid"),
+                    ),
+                    goal: None,
+                    goal_mode: Default::default(),
+                    goal_spec: None,
+                    parent: None,
+                    dependencies: Vec::new(),
+                    escrow: None,
+                    wake: None,
+                    delegation: None,
+                    telemetry: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect_err("the pairing is refused");
+    assert_eq!(error.code(), "task-team-not-agent-owned");
+
+    // Nothing durable: the refused creation left no task behind.
+    let state = load_agent_task_state(&fx.tasks, &human_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads");
+    assert!(
+        state.is_none_or(|state| state.task().is_none()),
+        "a refused creation persists no task"
+    );
+}
+
+/// The record-level half of the same door: a board claim reaching a record
+/// persisted *before* the creation door existed — human-owned with a team
+/// binding — fails closed instead of latching `Initiated` forever, and it
+/// answers the *registered* `team-claim-wrong-team` code, because deployed
+/// boards enumerate the claim codes they may settle and a fresh code would
+/// leave the claim exchange re-driving forever.
+#[tokio::test]
+async fn a_board_claim_on_a_pre_door_human_owned_record_fails_closed() {
+    use rakka_persistence::DurableStateStore;
+
+    let fx = Fixture::new(ScriptedDispatcher::with_adapter(
+        DeterministicModelAdapter::new(),
+    ));
+    let team = rakka_agent::AgentTeamScope::new(
+        tenant(),
+        rakka_agent::AgentTeamId::new("support-team").expect("the id is valid"),
+    )
+    .expect("the team scope is valid");
+
+    // The legacy record: created agent-owned on the board posture — the
+    // shape the door admits — then rewritten human-owned through its
+    // serialized form, exactly what a store persisted before the door holds.
+    fx.apply_task_command_at(
+        &human_scope(),
+        AgentTaskEntityCommand::Create {
+            operation_id: creation_op(HUMAN_TASK),
+            creation: Box::new(AgentTaskCreation {
+                definition: task_definition(),
+                input: AgentTaskContent::inline(json!({ "ticket": 9 }))
+                    .expect("the input is inline-bounded"),
+                assignee: None,
+                team: Some(rakka_agent::AgentTeamId::new("support-team").expect("the id is valid")),
+                goal: None,
+                goal_mode: Default::default(),
+                goal_spec: None,
+                parent: None,
+                dependencies: Vec::new(),
+                escrow: None,
+                wake: None,
+                delegation: None,
+                telemetry: Default::default(),
+            }),
+        },
+    )
+    .await
+    .expect("the board task creates");
+    let mut entity = rakka_agent::AgentTaskEntityStore::new(
+        human_scope(),
+        fx.tasks.clone(),
+        fx.agents.clone(),
+        fx.history.clone(),
+    );
+    let persistence_id = entity.persistence_id();
+    let record = fx
+        .tasks
+        .load(&persistence_id)
+        .await
+        .expect("the record loads")
+        .expect("the record exists");
+    let mut value = serde_json::to_value(&record.state).expect("the state serializes");
+    value["task"]["definition"]["ownership"] = json!("human");
+    value["task"]["status"] = json!("waiting-for-input");
+    let legacy: rakka_agent::AgentTaskState =
+        serde_json::from_value(value).expect("the legacy record loads");
+    fx.tasks
+        .compare_and_set(&persistence_id, record.revision, legacy)
+        .await
+        .expect("the legacy record seeds");
+
+    // The board's claim decision arrives, exactly as the team entity sends
+    // it. It must refuse — under the registered code, with the true reason —
+    // and record nothing.
+    let member = rakka_agent::AgentId::new("worker-a").expect("the member id is valid");
+    let claim = rakka_agent::team_claim_id_for(&team, human_scope().task(), &member, 1)
+        .expect("the claim id derives");
+    let operation_id =
+        rakka_agent::team_claim_operation_id(&tenant(), &claim).expect("the operation id derives");
+    let payload = rakka_agent::AgentExchangePayload::encode(
+        rakka_agent::AGENT_TEAM_CLAIM_PAYLOAD_TYPE,
+        &rakka_agent::AgentTeamClaimCommand {
+            team: team.clone(),
+            claim,
+            task: human_scope().task().clone(),
+            epoch: 1,
+            action: rakka_agent::AgentTeamClaimAction::Claim {
+                member: member.clone(),
+            },
+            policy_revision: AgentRevisionNumber::INITIAL,
+            lease_expires_at: AgentTimestampMillis::new(60_000),
+        },
+    )
+    .expect("the payload encodes");
+    let envelope = rakka_agent::AgentExchangeEnvelope::new(
+        operation_id.clone(),
+        rakka_agent::AgentExchangeKind::TeamClaim,
+        rakka_agent::AgentEntityAddress::Team(team),
+        rakka_agent::AgentEntityAddress::Task(human_scope()),
+        payload,
+        rakka_agent_workflow::AgentCorrelationId::new(operation_id.as_str()),
+        fx.now(),
+    )
+    .expect("the envelope is valid");
+    let reply = entity
+        .accept(&envelope, &fx.router, fx.now())
+        .await
+        .expect("the delivery succeeds");
+    assert_eq!(
+        reply.result().status().rejection_code(),
+        Some("team-claim-wrong-team"),
+        "the claim fails closed under the registered code"
+    );
+
+    // Nothing latched: no claim record, no falsified assignee.
+    let state = load_agent_task_state(&fx.tasks, &human_scope(), &AgentSchemaPolicy::default())
+        .await
+        .expect("the state loads")
+        .expect("the task exists");
+    let task = state.task().expect("the task stands");
+    assert!(task.team_claim.is_none(), "no claim was recorded");
+    assert!(task.assignee.is_none(), "no assignee was falsified");
+    assert_eq!(task.status, AgentTaskStatus::WaitingForInput);
+}
