@@ -10,6 +10,10 @@ use tracing::Instrument;
 use crate::{GrpcResult, RAKKA_GRPC_ERROR_CODE_METADATA};
 
 /// Records latency and outcome labels for one gRPC adapter request.
+// `tonic::Status` is the protocol's error type: the generated service traits
+// fix `Result<_, Status>`, so the future this helper wraps cannot box its
+// error without splitting the adapter from the contract it instruments.
+#[allow(clippy::result_large_err)]
 pub async fn record_grpc_request_metrics<T>(
     recorder: &dyn MetricsRecorder,
     service: &str,

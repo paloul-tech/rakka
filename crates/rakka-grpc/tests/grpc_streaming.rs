@@ -218,6 +218,9 @@ async fn bidirectional_response_drop_cancels_blocked_inbound_pump() {
     assert_status_error_code(&status, "stream-cancelled");
 }
 
+// The stream's items are `Result<_, tonic::Status>` by the protocol contract,
+// so the collector's error is not ours to box.
+#[allow(clippy::result_large_err)]
 async fn collect_response_values(
     mut stream: GrpcResponseStream<StreamReply>,
 ) -> GrpcResult<Vec<i64>> {
