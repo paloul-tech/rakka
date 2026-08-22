@@ -654,6 +654,73 @@ pub(crate) fn conversation_terminal_notice_refusal_settles(code: &str) -> bool {
     )
 }
 
+/// Whether one refusal code definitively settles a handoff result at its
+/// initiating task.
+///
+/// The same two-ended classifier discipline as
+/// [`team_terminal_notice_refusal_settles`]: the task settles its owed
+/// exchange only on the source run's definitive answers — the notice was
+/// forged, or the run holds no such handoff — and the run declines to
+/// memoize every other refusal it mints, so the two ends agree by
+/// construction. The one refusal outside this set the run actually
+/// produces, `handoff-result-undecodable`, is the canonical *not yet*: a
+/// payload a newer task serialized mid rolling upgrade decodes once the
+/// run's owner upgrades, and memoizing it would answer every re-drive from
+/// the journal while the run never terminalizes `HandedOff`.
+pub(crate) fn handoff_result_refusal_settles(code: &str) -> bool {
+    matches!(code, "handoff-forged" | "handoff-not-held")
+}
+
+/// Whether one refusal code definitively settles a team-claim exchange at
+/// its initiating team's board.
+///
+/// The same two-ended classifier discipline: the board settles a refused
+/// claim action only on the task's arbitration answers, and the task
+/// declines to memoize everything else — a claim command this binary
+/// cannot decode, an `unsupported-exchange` from an owner that predates
+/// the kind — so a re-driven decision re-runs the arm once an owner can
+/// answer it (the rolling-upgrade rule). `team-claim-forged` settles too,
+/// the forged-is-definitive precedent of every sibling classifier: only a
+/// sender other than the team the command names can ever receive it, so
+/// no re-drive of the genuine board's exchange changes the answer, and
+/// leaving it unmemoized would just re-run a forged sender's arm — and
+/// its durable write — on every delivery.
+pub(crate) fn team_claim_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "team-claim-stale-epoch"
+            | "team-claim-already-owned"
+            | "team-claim-assignment-inflight"
+            | "team-claim-task-terminal"
+            | "team-claim-task-unknown"
+            | "team-claim-wrong-team"
+            | "team-claim-task-cancelling"
+            | "team-claim-handoff-pending"
+            | "team-claim-limit-exceeded"
+            | "team-claim-forged"
+            | "task-state-too-large"
+            | "team-release-assignment-inflight"
+            | "team-release-unknown"
+    )
+}
+
+/// Whether one refusal code definitively settles a team-claim result at its
+/// initiating task.
+///
+/// The same two-ended classifier discipline: the task settles its owed
+/// exchange only on the board's definitive answers — no team exists under
+/// the scope, the board holds no such entry, or the notice was forged —
+/// and the team declines to memoize everything else, so a result payload
+/// the board's binary cannot decode mid rolling upgrade re-runs on the
+/// next drive instead of replaying the inability for the whole applied
+/// window.
+pub(crate) fn team_claim_result_refusal_settles(code: &str) -> bool {
+    matches!(
+        code,
+        "team-not-found" | "team-claim-unknown" | "team-claim-forged"
+    )
+}
+
 /// One coordination capability descriptor: the policy payload behind one
 /// [`AgentCoordinationCapabilityKind`]
 /// ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).

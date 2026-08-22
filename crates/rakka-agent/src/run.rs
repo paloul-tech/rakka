@@ -5953,6 +5953,26 @@ impl AgentExchangeParticipant for AgentRunParticipant {
                     }),
                 }
             }
+            AgentExchangeKind::HandoffResult if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the run is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. The arm's own
+                // version-skew refusal, `handoff-result-undecodable`,
+                // therefore re-runs on the next drive instead of answering
+                // every re-drive from the journal for the whole applied
+                // window — which would leave the task re-driving an owed
+                // result forever while the run never terminalizes
+                // `HandedOff`.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::handoff_result_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::HandoffResult,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
             _ => Ok(()),
         }
     }

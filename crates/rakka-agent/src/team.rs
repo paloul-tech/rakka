@@ -1298,29 +1298,38 @@ impl AgentExchangeParticipant for AgentTeamParticipant {
     ) -> Result<(), AgentChoreographyError> {
         match envelope.kind() {
             AgentExchangeKind::TeamClaim if !result.is_accepted() => {
-                // A refused claim action settles only under the task's
-                // definitive arbitration answers. Every other refusal — an
+                // The initiator half of the shared classifier: a refused
+                // claim action settles only under the task's definitive
+                // arbitration answers. Every other refusal — an
                 // `unsupported-exchange` from an owner that predates the
                 // kind, a payload it could not decode — leaves the exchange
                 // outstanding for re-drive until an owner that can answer it
-                // does (the rolling-upgrade rule).
+                // does (the rolling-upgrade rule), and the task's receiver
+                // half keeps that class unmemoized so the re-drive actually
+                // re-runs the arm.
                 match result.status().rejection_code() {
-                    Some(
-                        "team-claim-stale-epoch"
-                        | "team-claim-already-owned"
-                        | "team-claim-assignment-inflight"
-                        | "team-claim-task-terminal"
-                        | "team-claim-task-unknown"
-                        | "team-claim-wrong-team"
-                        | "team-claim-task-cancelling"
-                        | "team-claim-handoff-pending"
-                        | "team-claim-limit-exceeded"
-                        | "task-state-too-large"
-                        | "team-release-assignment-inflight"
-                        | "team-release-unknown",
-                    ) => Ok(()),
+                    Some(code) if crate::coordination::team_claim_refusal_settles(code) => Ok(()),
                     code => Err(AgentChoreographyError::UnsettleableRefusal {
                         kind: AgentExchangeKind::TeamClaim,
+                        code: code.unwrap_or_default().to_string(),
+                    }),
+                }
+            }
+            AgentExchangeKind::TeamClaimResult if !result.is_accepted() => {
+                // The receiver half of the shared classifier: the team is
+                // this exchange's receiver, and the host memoizes only the
+                // refusals classified definitive here. A result payload this
+                // binary cannot decode therefore re-runs on the next drive
+                // instead of answering every re-drive from the journal for
+                // the whole applied window — which would leave the task
+                // re-driving its owed result forever while the board entry
+                // never settles.
+                match result.status().rejection_code() {
+                    Some(code) if crate::coordination::team_claim_result_refusal_settles(code) => {
+                        Ok(())
+                    }
+                    code => Err(AgentChoreographyError::UnsettleableRefusal {
+                        kind: AgentExchangeKind::TeamClaimResult,
                         code: code.unwrap_or_default().to_string(),
                     }),
                 }
