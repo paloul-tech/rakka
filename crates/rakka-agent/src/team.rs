@@ -1438,26 +1438,43 @@ fn apply_claim_result(
                 run,
                 member,
             } => {
-                entry.status = AgentTeamBoardEntryStatus::Active;
-                entry.last_code = None;
-                if let Some(claim) = entry.claim.as_mut() {
-                    claim.generation_echo = Some(*generation);
-                    claim.run_echo = Some(run.clone());
+                // Idempotence past the applied window, the
+                // [`apply_team_terminal`] Done-echo precedent: the filled
+                // activation echo is the durable proof this very settlement
+                // applied — the journal absorbs a redelivery inside its
+                // window, and the echo absorbs it past eviction — so a
+                // re-driven notice re-records nothing. Re-running the arm
+                // would append a second `ClaimSettled` row for one operation,
+                // corrupting the replayable history log, and would clobber
+                // whatever shape the entry has legitimately moved to since
+                // (a member's release in flight, an eager terminal close).
+                let settled = entry.status == AgentTeamBoardEntryStatus::Done
+                    || entry
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.generation_echo.is_some());
+                if !settled {
+                    entry.status = AgentTeamBoardEntryStatus::Active;
+                    entry.last_code = None;
+                    if let Some(claim) = entry.claim.as_mut() {
+                        claim.generation_echo = Some(*generation);
+                        claim.run_echo = Some(run.clone());
+                    }
+                    let claim_id = notice.claim.clone();
+                    let member = member.clone();
+                    state.record_history(|sequence| {
+                        AgentTeamHistoryEntry::new(
+                            sequence,
+                            AgentTeamHistoryKind::ClaimSettled,
+                            operation_id,
+                            now,
+                        )
+                        .with_task(task_id)
+                        .with_claim(claim_id)
+                        .with_member(member)
+                        .with_detail("activated")
+                    });
                 }
-                let claim_id = notice.claim.clone();
-                let member = member.clone();
-                state.record_history(|sequence| {
-                    AgentTeamHistoryEntry::new(
-                        sequence,
-                        AgentTeamHistoryKind::ClaimSettled,
-                        operation_id,
-                        now,
-                    )
-                    .with_task(task_id)
-                    .with_claim(claim_id)
-                    .with_member(member)
-                    .with_detail("activated")
-                });
             }
             AgentTeamClaimOutcome::Refused { code } => {
                 if matches!(
