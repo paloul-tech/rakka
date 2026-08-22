@@ -1001,7 +1001,11 @@ async fn token_exhaustion_refuses_the_next_turn_and_never_parks() {
         )
         .await
         .expect_err("the exhausted budget refuses the next turn");
-    assert_eq!(refused.code(), "tokens");
+    // The wire code names the family under the conversation's uniform
+    // prefix; the exhausted dimension rides the display detail. The bare
+    // dimension label ("tokens") was never a conversation-* code and
+    // collided with the metric-label vocabulary.
+    assert_eq!(refused.code(), "conversation-budget-exhausted");
 
     let snapshot = fx
         .conversation_snapshot_at(&conversation_scope())
@@ -1315,4 +1319,281 @@ async fn an_early_end_from_a_moderator_without_the_moderation_capability_refuses
         AgentConversationStatus::Active,
         "the refusal terminalized nothing"
     );
+}
+
+/// A finite token grant can bar the final round the all-rounds rule needs:
+/// exhaustion refuses rather than parks, so with the early end forbidden and
+/// no deadline the conversation would stay active forever once the grant
+/// runs out. The door refuses the shape — and each road to a terminal state
+/// makes it admissible again.
+#[tokio::test]
+async fn an_all_rounds_conversation_with_a_barred_final_round_refuses_at_creation() {
+    let mut wedged = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
+        &["alpha", "beta"],
+    );
+    wedged.completion = AgentConversationCompletionRule::AllRounds;
+    wedged.tokens = Some(100);
+    let refused = fixture()
+        .await
+        .apply_conversation_command_at(&conversation_scope(), create_command(wedged))
+        .await
+        .expect_err("a token grant that can bar the final round leaves no road to terminal");
+    assert_eq!(refused.code(), "conversation-completion-unreachable");
+
+    // A deadline rescues the shape: expiry is a terminal state.
+    let mut with_deadline = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
+        &["alpha", "beta"],
+    );
+    with_deadline.completion = AgentConversationCompletionRule::AllRounds;
+    with_deadline.tokens = Some(100);
+    with_deadline.max_wall_clock_millis = Some(60_000);
+    fixture()
+        .await
+        .apply_conversation_command_at(&conversation_scope(), create_command(with_deadline))
+        .await
+        .expect("a deadline is a road to terminal");
+
+    // A permitted early end rescues it: the moderator's move remains.
+    let mut with_end = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    );
+    with_end.completion = AgentConversationCompletionRule::AllRounds;
+    with_end.tokens = Some(100);
+    fixture()
+        .await
+        .apply_conversation_command_at(&conversation_scope(), create_command(with_end))
+        .await
+        .expect("the early end is a road to terminal");
+
+    // And without a token grant, completing every round is the road: no
+    // consumable can bar a turn, so the final round always closes.
+    let mut unbudgeted = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL).without_early_end(),
+        &["alpha", "beta"],
+    );
+    unbudgeted.completion = AgentConversationCompletionRule::AllRounds;
+    fixture()
+        .await
+        .apply_conversation_command_at(&conversation_scope(), create_command(unbudgeted))
+        .await
+        .expect("an unbudgeted all-rounds conversation always completes");
+}
+
+/// One identity near its 256-byte legal maximum, tagged so the roster stays
+/// distinct.
+fn long_identity(prefix: &str, index: usize) -> String {
+    let tag = format!("{prefix}-{index}-");
+    let mut value = tag.clone();
+    value.push_str(&"x".repeat(250 - tag.len()));
+    value
+}
+
+/// The creation door's admission is a promise: a conversation it admits can
+/// never wedge on `conversation-state-too-large` mid-protocol. Long-but-legal
+/// identities were the counterexample — fixed per-entry reserves charged a
+/// 320-byte operation-log entry and a 1 KiB history entry while the real
+/// entries carried ~600-byte composed operation ids — so this drives a
+/// maximal-identity, maximal-policy conversation through every round and
+/// requires it to complete.
+#[tokio::test]
+async fn long_but_legal_identities_cannot_wedge_an_admitted_conversation() {
+    let fx = fixture().await;
+    let speakers: Vec<String> = (0..8)
+        .map(|index| long_identity("speaker", index))
+        .collect();
+    let speaker_refs: Vec<&str> = speakers.iter().map(String::as_str).collect();
+
+    // Every identity near its legal maximum — the tenant included, so the
+    // composed operation ids reach the sizes the per-entry reserves must
+    // hold. The speakers are instantiated at that tenant with the
+    // moderation grant the turn door reads.
+    let long_tenant = rakka_agent::TenantId::new(long_identity("tenant", 0));
+    for speaker in &speaker_refs {
+        let scope = rakka_agent::AgentScope::new(long_tenant.clone(), agent(speaker))
+            .expect("the agent scope is valid");
+        let mut envelope = rakka_agent::AgentAuthorityEnvelope::empty();
+        envelope
+            .coordination_capabilities
+            .insert(rakka_agent::AgentCoordinationCapabilityKind::Moderation);
+        fx.instantiate_agent_with_envelope_at(scope, envelope).await;
+    }
+
+    let moderator = long_identity("moderator", 0);
+    {
+        let scope = rakka_agent::AgentScope::new(long_tenant.clone(), agent(&moderator))
+            .expect("the agent scope is valid");
+        let mut envelope = rakka_agent::AgentAuthorityEnvelope::empty();
+        envelope
+            .coordination_capabilities
+            .insert(rakka_agent::AgentCoordinationCapabilityKind::Moderation);
+        fx.instantiate_agent_with_envelope_at(scope, envelope).await;
+    }
+
+    let conversation_id =
+        AgentConversationId::new(long_identity("panel", 0)).expect("the conversation id is valid");
+    let scope = AgentConversationScope::new(long_tenant.clone(), conversation_id.clone())
+        .expect("the conversation scope is valid");
+
+    // Moderator-directed at every hard cap: sixteen 16-turn rounds, each a
+    // designate/speak alternation the moderator closes — the densest ledger
+    // and operation-log churn a policy can declare.
+    let mut wide = creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL)
+            .with_max_rounds(16)
+            .with_max_turns_per_round(16)
+            .with_max_messages(16)
+            .with_max_message_bytes(1024),
+        &speaker_refs,
+    );
+    wide.moderator = agent(&moderator);
+    wide.mode = AgentConversationMode::ModeratorDirected;
+    wide.completion = AgentConversationCompletionRule::AllRounds;
+    let create = AgentConversationEntityCommand::Create {
+        operation_id: rakka_agent::conversation_create_operation_id(&long_tenant, &conversation_id)
+            .expect("the operation id derives"),
+        creation: Box::new(wide),
+    };
+    fx.apply_conversation_command_at(&scope, create)
+        .await
+        .expect("the maximal-identity policy passes the creation door");
+
+    let body = "x".repeat(1000);
+    let submit_turn = |round: u64,
+                       turn: u32,
+                       participant: AgentId,
+                       direction: Option<AgentConversationDirection>| {
+        let operation_id = conversation_turn_operation_id(
+            &long_tenant,
+            &conversation_id,
+            round,
+            turn,
+            &participant,
+            &conversation_turn_content_digest(&body, direction.as_ref()),
+        )
+        .expect("the operation id derives");
+        AgentConversationEntityCommand::SubmitTurn {
+            operation_id,
+            submit: Box::new(AgentConversationTurnSubmit {
+                round,
+                turn,
+                participant,
+                body: body.clone(),
+                direction,
+                usage: AgentBudgetConsumption::zero(),
+            }),
+        }
+    };
+    for round in 0..16_u64 {
+        let mut turn = 0_u32;
+        for speaker in &speakers {
+            let designate = submit_turn(
+                round,
+                turn,
+                agent(&moderator),
+                Some(AgentConversationDirection::Designate(agent(speaker))),
+            );
+            fx.apply_conversation_command_at(&scope, designate)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round} turn {turn} must record, refused {}: an admitted \
+                         conversation wedged mid-protocol",
+                        error.code()
+                    )
+                });
+            turn += 1;
+            let speak = submit_turn(round, turn, agent(speaker), None);
+            fx.apply_conversation_command_at(&scope, speak)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round} turn {turn} must record, refused {}: an admitted \
+                         conversation wedged mid-protocol",
+                        error.code()
+                    )
+                });
+            turn += 1;
+            if turn >= 14 {
+                break;
+            }
+        }
+        let close = submit_turn(
+            round,
+            turn,
+            agent(&moderator),
+            Some(AgentConversationDirection::CloseRound),
+        );
+        fx.apply_conversation_command_at(&scope, close)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "round {round} close must record, refused {}: an admitted \
+                     conversation wedged mid-protocol",
+                    error.code()
+                )
+            });
+    }
+
+    let snapshot = fx
+        .conversation_snapshot_at(&scope)
+        .await
+        .expect("the completed conversation snapshots");
+    assert_eq!(snapshot.status, AgentConversationStatus::Ended);
+    assert_eq!(
+        snapshot.terminal_reason,
+        Some(AgentConversationTerminalReason::RoundsComplete),
+        "completing the final round ended the conversation"
+    );
+}
+
+/// An operation id no per-entry reserve could hold refuses at the command
+/// door before anything durable records it — the guard that makes the
+/// creation door's per-entry charges an actual upper bound.
+#[tokio::test]
+async fn an_oversized_operation_id_refuses_before_anything_durable() {
+    let fx = created_fixture(creation(
+        AgentModerationPolicy::new(AgentRevisionNumber::INITIAL),
+        &["alpha", "beta"],
+    ))
+    .await;
+
+    let oversized = AgentOperationId::new(
+        AgentOperationKind::TaskCreation,
+        [
+            "s".repeat(256),
+            "s".repeat(256),
+            "s".repeat(256),
+            "s".repeat(256),
+        ],
+    )
+    .expect("each segment is individually legal");
+    let refused = fx
+        .apply_conversation_command_at(
+            &conversation_scope(),
+            AgentConversationEntityCommand::SubmitTurn {
+                operation_id: oversized,
+                submit: Box::new(AgentConversationTurnSubmit {
+                    round: 0,
+                    turn: 0,
+                    participant: agent("alpha"),
+                    body: "an opening".to_string(),
+                    direction: None,
+                    usage: AgentBudgetConsumption::zero(),
+                }),
+            },
+        )
+        .await
+        .expect_err("an id past the admission cap refuses");
+    assert_eq!(refused.code(), "conversation-operation-id-too-large");
+
+    let snapshot = fx
+        .conversation_snapshot_at(&conversation_scope())
+        .await
+        .expect("the conversation snapshots");
+    assert_eq!(snapshot.turns.len(), 0, "nothing durable recorded");
+    assert_eq!(snapshot.round, 0);
+    assert_eq!(snapshot.turn_in_round, 0);
 }

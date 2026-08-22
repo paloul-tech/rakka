@@ -183,6 +183,23 @@ async fn the_snapshot_answers_from_durable_state_with_telemetry_unavailable() {
     .expect("the point query answers")
     .expect("the run exists");
     assert_eq!(again, snapshot);
+
+    // The additive-field compatibility posture the struct's own docs
+    // promise: a snapshot serialized before `has_accepted_result` existed
+    // still deserializes, loading the field unset — the same rule every
+    // other additive field in the family carries.
+    let mut before_field = serde_json::to_value(&snapshot).expect("the snapshot serializes");
+    before_field
+        .as_object_mut()
+        .expect("the snapshot serializes as an object")
+        .remove("has_accepted_result")
+        .expect("the field is present on a current snapshot");
+    let decoded: rakka_agent::AgentOperationalSnapshot =
+        serde_json::from_value(before_field).expect("a pre-field snapshot still deserializes");
+    assert!(
+        !decoded.has_accepted_result,
+        "a pre-field snapshot loads with the fact unset"
+    );
 }
 
 /// A run parked behind an approval checkpoint reports the wait, the gated

@@ -124,10 +124,16 @@ pub const DEFAULT_AGENT_CONVERSATION_ENTITY_TYPE: &str = "RakkaAgentConversation
 /// beside even a *default* ledger and ring — so the creation-time arithmetic
 /// it was paired with was not an upper bound on anything.
 ///
-/// Sized so every policy the hard caps admit provably fits: the wedge the
-/// creation-time guard exists to prevent is then impossible by construction
-/// rather than merely refused at the door.
-pub const AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES: usize = 128 * 1024;
+/// Sized so every policy the hard caps admit provably fits **at maximal
+/// identity lengths**: the wedge the creation-time guard exists to prevent
+/// is then impossible by construction rather than merely refused at the
+/// door. The per-entry reserves below charge identities at
+/// [`crate::identity::AGENT_IDENTITY_MAX_LENGTH`] and operation ids at
+/// [`AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES`] — an earlier 128 KiB
+/// figure paired with fixed 320-byte and 1 KiB entry reserves under-charged
+/// long-but-legal identities by up to 4x, so a conversation the door
+/// admitted could still wedge on `conversation-state-too-large` mid-round.
+pub const AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES: usize = 256 * 1024;
 
 /// Bytes held back from the materialized bound so a settle transition never
 /// finds the record too large to write.
@@ -163,19 +169,45 @@ pub const AGENT_CONVERSATION_REASON_MAX_BYTES: usize = 256;
 pub const AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES: usize = 128;
 
 /// Bytes the creation-time worst-case arithmetic reserves per transcript
-/// message *beside* its body — the coordinate, speaker id, timestamp, and
-/// JSON envelope around it.
-pub const AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES: usize = 128;
+/// message *beside* its body — the coordinate, the speaker id at its
+/// [`crate::identity::AGENT_IDENTITY_MAX_LENGTH`] maximum, the timestamp,
+/// and the JSON envelope around it. The ring stores the speaker *by id*,
+/// unlike the turn ledger's positional coordinate, so the reserve must
+/// charge the id at its legal maximum.
+pub const AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES: usize = 384;
 
 /// Bytes the creation-time worst-case arithmetic reserves per resolved
-/// operation the deduplication log remembers: its id and the full outcome it
-/// echoes.
-pub const AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES: usize = 320;
+/// operation the deduplication log remembers: its id at the
+/// [`AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES`] admission cap and the full
+/// outcome it echoes — whose `current_speaker` is an id at its legal
+/// maximum.
+pub const AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES: usize = 1536;
 
 /// Bytes the creation-time worst-case arithmetic reserves per history entry
-/// waiting in the outbox — including a detail at
-/// [`AGENT_CONVERSATION_DETAIL_MAX_LENGTH`].
-pub const AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES: usize = 1024;
+/// waiting in the outbox: the operation id at its admission cap, a
+/// participant id at its legal maximum, a detail at
+/// [`AGENT_CONVERSATION_DETAIL_MAX_LENGTH`], and the envelope. The one
+/// provenance-bearing entry the terminalizing early end records is charged
+/// separately by [`AGENT_CONVERSATION_PROVENANCE_ENTRY_RESERVE_BYTES`].
+pub const AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES: usize = 2048;
+
+/// Extra bytes the arithmetic reserves for the single history entry that
+/// carries an accepted early end's principal and free-text reason: at most
+/// one such entry ever exists, because the early end terminalizes the
+/// conversation in the transition that records it.
+pub const AGENT_CONVERSATION_PROVENANCE_ENTRY_RESERVE_BYTES: usize = 1024;
+
+/// Maximum bytes of one operation id a conversation command accepts.
+///
+/// Operation ids flatten caller-chosen segments without a composition
+/// bound, and the entity stores them verbatim in its operation log and
+/// history outbox — so the per-entry reserves above are honest only if the
+/// door refuses an id no reserve could hold. Sized to admit every id the
+/// coordination derivations can mint at maximal legal segments (a kind
+/// label, tenant, conversation, and participant at 256 bytes each, the
+/// round and turn, and a 64-hex digest come to well under 900 bytes) with
+/// margin for application-derived shapes.
+pub const AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES: usize = 1024;
 
 /// Bytes the creation-time worst-case arithmetic reserves for everything
 /// outside the turn ledger, the transcript ring, the operation log, and the
@@ -775,11 +807,16 @@ impl AgentConversationHistoryEntry {
     /// The reason is truncated to [`AGENT_CONVERSATION_REASON_MAX_BYTES`] on
     /// a character boundary; `end_early` refuses an over-long one before
     /// reaching here, so truncation is the defensive half of that bound.
+    /// The principal is bounded the same way: it is caller-shaped free text
+    /// with no identity validation behind it, and the provenance entry's
+    /// byte reserve holds only because this stores at most
+    /// [`AGENT_CONVERSATION_DETAIL_MAX_LENGTH`] of it — the full value
+    /// stays on the wire-layer audit records.
     fn with_provenance(mut self, provenance: &AgentRevisionProvenance, reason: &str) -> Self {
-        self.principal = Some(format!(
+        self.principal = Some(bounded_detail(format!(
             "{}:{}",
             provenance.principal.principal_type, provenance.principal.principal_id
-        ));
+        )));
         if !reason.is_empty() {
             let mut bounded = reason.to_string();
             if bounded.len() > AGENT_CONVERSATION_REASON_MAX_BYTES {
@@ -2573,12 +2610,30 @@ fn probe_turn_echo(
     Some(Ok(()))
 }
 
+/// Refuses an operation id no per-entry reserve could hold.
+///
+/// Checked at every command door before its transition can store the id in
+/// the operation log or a history entry: the creation-time worst-case
+/// arithmetic charges ids at [`AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES`],
+/// and that charge is an upper bound only because this guard makes it one.
+fn require_bounded_operation_id(operation_id: &AgentOperationId) -> AgentConversationResult<()> {
+    let bytes = operation_id.as_str().len();
+    if bytes > AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES {
+        return Err(AgentConversationError::OperationIdTooLarge {
+            bytes,
+            maximum: AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn create_conversation(
     state: &mut AgentConversationState,
     operation_id: &AgentOperationId,
     creation: AgentConversationCreation,
     now: AgentTimestampMillis,
 ) -> AgentConversationResult<()> {
+    require_bounded_operation_id(operation_id)?;
     if state.conversation.is_some() {
         return Err(AgentConversationError::AlreadyCreated {
             scope: state.scope.clone(),
@@ -2615,16 +2670,25 @@ fn create_conversation(
         });
     }
     // A conversation must have some road to a terminal state, or the
-    // governing task waits on a signal that can never come. Under the
-    // moderator-decides rule the round ceiling only *parks* the cursor, so
-    // the early end is the sole exit — and forbidding it without a
-    // wall-clock deadline leaves none at all. Refused at the door, beside
-    // the other wedge guards, because there is no later moment at which the
-    // configuration could become satisfiable.
-    if creation.completion == AgentConversationCompletionRule::ModeratorDecides
-        && !creation.policy.moderator_may_end_early
-        && creation.max_wall_clock_millis.is_none()
-    {
+    // governing task waits on a signal that can never come. Refused at the
+    // door, beside the other wedge guards, because there is no later moment
+    // at which the configuration could become satisfiable. Two shapes have
+    // no road. Under the moderator-decides rule the round ceiling only
+    // *parks* the cursor, so the early end is the sole exit — and
+    // forbidding it without a wall-clock deadline leaves none at all. Under
+    // the all-rounds rule completing the final round is a real exit, but a
+    // token ceiling can bar it first: exhaustion refuses every further turn
+    // rather than parking, so with the early end forbidden and no deadline
+    // the conversation stays active forever once the grant runs out. A
+    // deadline rescues either shape (expiry is a terminal state), and a
+    // permitted early end rescues both (the moderator's move remains).
+    let no_exit_beyond_turns =
+        !creation.policy.moderator_may_end_early && creation.max_wall_clock_millis.is_none();
+    let turns_barred = match creation.completion {
+        AgentConversationCompletionRule::ModeratorDecides => true,
+        AgentConversationCompletionRule::AllRounds => creation.tokens.is_some(),
+    };
+    if no_exit_beyond_turns && turns_barred {
         return Err(AgentConversationError::CompletionUnreachable);
     }
     if let Some(reference) = &creation.transcript_ref {
@@ -2656,8 +2720,11 @@ fn create_conversation(
             .saturating_add(AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES));
     let operations = AGENT_CONVERSATION_OPERATION_LOG_CAPACITY
         * AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES;
+    // The one provenance-bearing entry the terminalizing early end records
+    // is charged once beside the generic per-entry reserve.
     let outbox = AGENT_CONVERSATION_PENDING_HISTORY_CAPACITY
-        * AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES;
+        * AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES
+        + AGENT_CONVERSATION_PROVENANCE_ENTRY_RESERVE_BYTES;
     let worst_case = ledger + ring + operations + outbox + AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES;
     let maximum = AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES
         .saturating_sub(AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES);
@@ -2889,6 +2956,7 @@ fn record_turn(
     permits_moderation: bool,
     now: AgentTimestampMillis,
 ) -> AgentConversationResult<()> {
+    require_bounded_operation_id(operation_id)?;
     // The facade answers the ledger echo before initiating this transition;
     // re-probing keeps the pure transition self-contained for any caller
     // that reaches it directly.
@@ -3077,6 +3145,7 @@ fn end_early(
     reason: String,
     now: AgentTimestampMillis,
 ) -> AgentConversationResult<()> {
+    require_bounded_operation_id(operation_id)?;
     admit_end_early(state, moderator, expected_round, &reason, now)?;
     // The moderation door guards the early end exactly as it guards the
     // turn ([specification 8.8](../../../docs/plans/rakka-agent/spec.md)).
@@ -3658,6 +3727,15 @@ pub enum AgentConversationError {
         /// The effective ceiling.
         maximum: usize,
     },
+    /// The command's operation id exceeds the bounded ceiling the entity's
+    /// per-entry reserves charge; admitting it would let one caller-minted
+    /// id erode the arithmetic that keeps the state bound unreachable.
+    OperationIdTooLarge {
+        /// The id's size.
+        bytes: usize,
+        /// The effective ceiling.
+        maximum: usize,
+    },
     /// The completion rule and the early-end policy leave no reachable
     /// terminal state.
     CompletionUnreachable,
@@ -3738,8 +3816,12 @@ impl AgentConversationError {
             Self::TurnsExhausted { .. } => "conversation-turns-exhausted",
             Self::MessageTooLarge { .. } => "conversation-message-too-large",
             Self::TurnUsageImplausible { .. } => "conversation-turn-usage-too-large",
-            Self::BudgetExhausted(exhaustion) => exhaustion.code(),
+            // The dimension rides the display detail; the code names the
+            // family under the conversation's uniform prefix rather than
+            // leaking the bare dimension label ("tokens") as a wire code.
+            Self::BudgetExhausted(_) => "conversation-budget-exhausted",
             Self::ReasonTooLarge { .. } => "conversation-reason-too-large",
+            Self::OperationIdTooLarge { .. } => "conversation-operation-id-too-large",
             Self::CompletionUnreachable => "conversation-completion-unreachable",
             Self::EndNotPermitted => "conversation-end-not-permitted",
             Self::EndNotModerator { .. } => "conversation-end-not-moderator",
@@ -3872,9 +3954,13 @@ impl Display for AgentConversationError {
                 f,
                 "the early-end reason is {bytes} bytes; the ceiling is {maximum}"
             ),
+            Self::OperationIdTooLarge { bytes, maximum } => write!(
+                f,
+                "the operation id is {bytes} bytes; the ceiling is {maximum}"
+            ),
             Self::CompletionUnreachable => f.write_str(
-                "a moderator-decides conversation that forbids the early end and sets no \
-                 wall-clock deadline can never reach a terminal state",
+                "the completion rule, the early-end policy, the budgets, and the deadline \
+                 together leave no reachable terminal state",
             ),
             Self::EndNotPermitted => {
                 f.write_str("the policy forbids the moderator from ending early")
@@ -4064,5 +4150,200 @@ mod owed_notice_tests {
             after.revision, planted.revision,
             "a record that owes nothing is written by nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+    use crate::identity::{AgentOperationKind, TenantId};
+
+    /// The largest operation id the admission cap admits, built from
+    /// maximal legal segments.
+    fn capped_operation_id() -> AgentOperationId {
+        let id = AgentOperationId::new(
+            AgentOperationKind::TaskCreation,
+            [
+                "s".repeat(256),
+                "s".repeat(256),
+                "s".repeat(256),
+                "s".repeat(230),
+            ],
+        )
+        .expect("each segment is individually legal");
+        assert!(
+            id.as_str().len() <= AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES,
+            "the fixture id must sit at or under the admission cap"
+        );
+        assert!(
+            id.as_str().len() > AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES - 32,
+            "the fixture id must sit near the admission cap to prove the reserve"
+        );
+        id
+    }
+
+    fn maximal_agent_id() -> AgentId {
+        AgentId::new("a".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH))
+            .expect("a maximal-length agent id is legal")
+    }
+
+    /// The door's worst-case arithmetic at every hard cap must fit under the
+    /// effective bound — the mirror of the team record's pin, so the
+    /// mid-protocol overflow wedge stays impossible by construction rather
+    /// than merely refused at the door.
+    #[test]
+    fn the_hard_cap_worst_case_fits_under_the_effective_bound() {
+        let ledger = crate::coordination::AGENT_CONVERSATION_MAX_ROUNDS as usize
+            * crate::coordination::AGENT_CONVERSATION_MAX_TURNS_PER_ROUND as usize
+            * AGENT_CONVERSATION_TURN_RECORD_RESERVE_BYTES;
+        let ring = crate::coordination::AGENT_CONVERSATION_MAX_MESSAGES as usize
+            * (crate::coordination::AGENT_CONVERSATION_MESSAGE_MAX_BYTES
+                + AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES);
+        let operations = AGENT_CONVERSATION_OPERATION_LOG_CAPACITY
+            * AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES;
+        let outbox = AGENT_CONVERSATION_PENDING_HISTORY_CAPACITY
+            * AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES
+            + AGENT_CONVERSATION_PROVENANCE_ENTRY_RESERVE_BYTES;
+        let worst = ledger + ring + operations + outbox + AGENT_CONVERSATION_FIXED_OVERHEAD_BYTES;
+        let effective = AGENT_CONVERSATION_MATERIALIZED_MAX_BYTES
+            - AGENT_CONVERSATION_STATE_GROWTH_RESERVE_BYTES;
+        assert!(
+            worst <= effective,
+            "the hard-cap worst case ({worst} bytes) must fit under the \
+             effective bound ({effective} bytes)"
+        );
+    }
+
+    /// Each per-entry reserve must hold a real worst-shaped entry, or the
+    /// door's sum is not an upper bound on what `check_bounds` measures.
+    #[test]
+    fn every_per_entry_reserve_holds_its_worst_shaped_entry() {
+        let log_entry = AgentConversationOperationLogEntry {
+            operation_id: capped_operation_id(),
+            outcome: AgentConversationOutcome {
+                status: AgentConversationStatus::Active,
+                terminal_reason: Some(AgentConversationTerminalReason::RoundsComplete),
+                round: u64::MAX,
+                turn_in_round: u32::MAX,
+                current_speaker: Some(maximal_agent_id()),
+                turns_recorded: u64::MAX,
+                messages: usize::MAX,
+            },
+        };
+        let bytes = serde_json::to_vec(&log_entry)
+            .expect("the entry serializes")
+            .len();
+        assert!(
+            bytes <= AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES,
+            "a worst-shaped operation-log entry ({bytes} bytes) must fit its \
+             reserve ({AGENT_CONVERSATION_OPERATION_LOG_ENTRY_RESERVE_BYTES})"
+        );
+
+        let history_entry = AgentConversationHistoryEntry::new(
+            AgentConversationHistorySequence::FIRST,
+            AgentConversationHistoryKind::TurnRecorded,
+            capped_operation_id(),
+            AgentTimestampMillis::new(u64::MAX),
+        )
+        .with_participant(maximal_agent_id())
+        .with_coordinate(u64::MAX, u32::MAX)
+        .with_detail("d".repeat(AGENT_CONVERSATION_DETAIL_MAX_LENGTH));
+        let bytes = serde_json::to_vec(&history_entry)
+            .expect("the entry serializes")
+            .len();
+        assert!(
+            bytes <= AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES,
+            "a worst-shaped history entry ({bytes} bytes) must fit its \
+             reserve ({AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES})"
+        );
+
+        // The one provenance-bearing entry the terminalizing early end
+        // records: the generic reserve plus the provenance reserve holds
+        // the bounded principal and reason beside everything above.
+        let provenance = AgentRevisionProvenance {
+            principal: rakka_agent_workflow::PrincipalRef {
+                principal_type: "p".repeat(256),
+                principal_id: "i".repeat(1024),
+                display_name: None,
+            },
+            accepted_at: AgentTimestampMillis::new(u64::MAX),
+            causation_id: rakka_agent_workflow::AgentCausationId::new("cause"),
+            audit_ref: rakka_agent_workflow::AgentAuditEventId::new("audit"),
+        };
+        let ended = AgentConversationHistoryEntry::new(
+            AgentConversationHistorySequence::FIRST,
+            AgentConversationHistoryKind::Ended,
+            capped_operation_id(),
+            AgentTimestampMillis::new(u64::MAX),
+        )
+        .with_participant(maximal_agent_id())
+        .with_round(u64::MAX)
+        .with_detail(AgentConversationTerminalReason::ModeratorEnded.code())
+        .with_provenance(
+            &provenance,
+            &"r".repeat(AGENT_CONVERSATION_REASON_MAX_BYTES),
+        );
+        let bytes = serde_json::to_vec(&ended)
+            .expect("the entry serializes")
+            .len();
+        let reserve = AGENT_CONVERSATION_HISTORY_ENTRY_RESERVE_BYTES
+            + AGENT_CONVERSATION_PROVENANCE_ENTRY_RESERVE_BYTES;
+        assert!(
+            bytes <= reserve,
+            "the provenance-bearing entry ({bytes} bytes) must fit the \
+             generic reserve plus the provenance reserve ({reserve})"
+        );
+
+        let message = AgentConversationMessage {
+            round: u64::MAX,
+            turn: u32::MAX,
+            speaker: maximal_agent_id(),
+            body: "b".repeat(crate::coordination::AGENT_CONVERSATION_MESSAGE_MAX_BYTES),
+            at: AgentTimestampMillis::new(u64::MAX),
+        };
+        let bytes = serde_json::to_vec(&message)
+            .expect("the message serializes")
+            .len();
+        let reserve = crate::coordination::AGENT_CONVERSATION_MESSAGE_MAX_BYTES
+            + AGENT_CONVERSATION_MESSAGE_RECORD_RESERVE_BYTES;
+        assert!(
+            bytes <= reserve,
+            "a worst-shaped ring message ({bytes} bytes) must fit its body \
+             ceiling plus record reserve ({reserve})"
+        );
+    }
+
+    /// A maximal-identity TenantId still derives a create id under the
+    /// admission cap: the cap must never refuse an id the coordination
+    /// derivations can legitimately mint.
+    #[test]
+    fn every_derivable_conversation_operation_id_passes_the_admission_cap() {
+        let tenant = TenantId::new("t".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH));
+        let conversation =
+            AgentConversationId::new("c".repeat(crate::identity::AGENT_IDENTITY_MAX_LENGTH))
+                .expect("a maximal conversation id is legal");
+        let create = crate::coordination::conversation_create_operation_id(&tenant, &conversation)
+            .expect("the create id derives");
+        assert!(create.as_str().len() <= AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES);
+
+        let turn = crate::coordination::conversation_turn_operation_id(
+            &tenant,
+            &conversation,
+            u64::MAX,
+            u32::MAX,
+            &maximal_agent_id(),
+            &crate::coordination::conversation_turn_content_digest("body", None),
+        )
+        .expect("the turn id derives");
+        assert!(turn.as_str().len() <= AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES);
+
+        let end = crate::coordination::conversation_end_operation_id(
+            &tenant,
+            &conversation,
+            u64::MAX,
+            &"r".repeat(AGENT_CONVERSATION_REASON_MAX_BYTES),
+        )
+        .expect("the end id derives");
+        assert!(end.as_str().len() <= AGENT_CONVERSATION_OPERATION_ID_MAX_BYTES);
     }
 }

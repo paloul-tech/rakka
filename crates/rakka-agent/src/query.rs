@@ -694,6 +694,8 @@ pub struct AgentOperationalSnapshot {
     /// Whether the task has accepted a result this run proposed. Captured
     /// before redaction: the snapshot's own `accepted_result` is always
     /// stripped, so a reader gating on it would gate on nothing.
+    /// Snapshots serialized before this field load with it unset.
+    #[serde(default)]
     pub has_accepted_result: bool,
     /// The bounded label of the wait the run is in, when it is waiting.
     pub wait_reason: Option<String>,
