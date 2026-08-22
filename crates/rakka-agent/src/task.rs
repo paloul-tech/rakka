@@ -379,6 +379,20 @@ pub const AGENT_TASK_REFUSAL_STALE_GENERATION: &str = "stale-assignment-generati
 /// is wire and durable surface — it never changes.
 pub const AGENT_TASK_REFUSAL_CANCEL_REQUESTED: &str = "task-cancel-requested";
 
+/// Resolution code of a handoff the terminal transition settled because the
+/// task ended while the transfer was still unresolved
+/// ([specification 8.9](../../../docs/plans/rakka-agent/spec.md)'s
+/// single-attempt rule, terminal arm).
+///
+/// A pending transfer must not cross the terminal boundary unresolved — the
+/// owed handoff result derives only from a settled provenance — so the
+/// terminalization settles it. A result accepted from the transfer's own
+/// minted generation settles `Accepted`; every other terminal flavor settles
+/// `Refused` under this code, which reaches the source run through its
+/// handoff-result notice. The string is wire and durable surface — it never
+/// changes.
+pub const AGENT_TASK_HANDOFF_TERMINAL_CODE: &str = "handoff-task-terminal";
+
 /// Payload type of the [`AgentTaskOutcome`] an accepted
 /// [`AgentExchangeKind::Creation`] reply carries.
 ///
@@ -5910,6 +5924,43 @@ fn terminate(
             status: task.status,
         });
     }
+    // A pending transfer must not cross the terminal boundary unresolved:
+    // every handoff-result derivation gates on a settled provenance, so an
+    // `Initiated` cell surviving the terminal would leave the owed exchange
+    // underivable and the stashed source run fenced forever, with no
+    // converging re-drive. The resolution is decided here, at the one
+    // terminalization choke point, from durable facts. A result accepted
+    // from the very generation the transfer minted is the target durably
+    // holding responsibility — its acceptance reply may still be in flight,
+    // and that reply's settle is a no-op once the assignment retires below —
+    // so the transfer settles `Accepted`. Every other terminal flavor
+    // resolves the single-attempt offer without an accepted target: the
+    // task ended first, and the source resumes from the refusal exactly as
+    // it does from any other definitive resolution.
+    let resolved_handoff = if task.handoff.as_deref().is_some_and(|h| !h.is_settled()) {
+        let accepted_by_target = matches!(reason, AgentTaskTerminalReason::ResultAccepted)
+            && task
+                .assignment
+                .as_ref()
+                .zip(task.handoff.as_deref())
+                .is_some_and(|(assignment, handoff)| {
+                    handoff.target_generation == Some(assignment.generation)
+                });
+        let assignment = task.assignment.clone();
+        task.handoff.as_deref_mut().map(|handoff| {
+            if accepted_by_target {
+                handoff.status = AgentTaskHandoffStatus::Accepted;
+            } else {
+                handoff.status = AgentTaskHandoffStatus::Refused {
+                    code: AGENT_TASK_HANDOFF_TERMINAL_CODE.to_string(),
+                };
+            }
+            handoff.settled_at = Some(now);
+            (accepted_by_target, handoff.handoff.clone(), assignment)
+        })
+    } else {
+        None
+    };
     task.status = reason.status();
     task.terminal_reason = Some(reason.clone());
     // A terminal task fences its run: the assignment is retired, so a late
@@ -5929,6 +5980,30 @@ fn terminate(
         )
         .with_detail(reason.code())
     });
+    if let Some((accepted, handoff_id, assignment)) = resolved_handoff {
+        state.record_history(|sequence| {
+            let entry = AgentTaskHistoryEntry::new(
+                sequence,
+                if accepted {
+                    AgentTaskHistoryKind::HandoffAccepted
+                } else {
+                    AgentTaskHistoryKind::HandoffRefused
+                },
+                operation_id.clone(),
+                status,
+                now,
+            )
+            .with_detail(if accepted {
+                handoff_id.to_string()
+            } else {
+                AGENT_TASK_HANDOFF_TERMINAL_CODE.to_string()
+            });
+            match &assignment {
+                Some(assignment) => entry.with_assignment(assignment),
+                None => entry,
+            }
+        });
+    }
     if let Some(detail) = goal_row {
         record_wake_history(
             state,
