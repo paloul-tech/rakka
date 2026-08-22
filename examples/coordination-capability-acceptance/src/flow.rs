@@ -320,13 +320,10 @@ async fn settle_team(world: &World) {
         .await;
 }
 
-/// Settles one task; see [`settle_team`] for why every settle restarts.
+/// Settles one task; no passivation ritual, for the reason [`settle_team`]
+/// gives — the task's settle pass re-materializes from the durable record
+/// too, so the sweep on a long-lived resident observes the service's writes.
 async fn settle_task(world: &World, scope: &AgentTaskScope) {
-    let _ = rakka_agent::passivate_agent_task_entity(
-        &world.sharding,
-        world.task_registration.key(),
-        scope,
-    );
     let entity = registered_agent_task_entity_ref(&world.task_registration, scope);
     let _ = entity
         .ask(
@@ -336,9 +333,10 @@ async fn settle_task(world: &World, scope: &AgentTaskScope) {
         .await;
 }
 
-/// Settles the conversation; see [`settle_team`] for why every settle restarts.
+/// Settles the conversation; no passivation ritual, for the reason
+/// [`settle_team`] gives — the conversation's settle pass re-materializes
+/// from the durable record too.
 async fn settle_conversation(world: &World) {
-    let _ = passivate_conversation(world);
     let entity = registered_agent_conversation_entity_ref(
         &world.conversation_registration,
         &conversation_scope(),
@@ -557,13 +555,10 @@ async fn run_state(world: &World, scope: &AgentRunScope) -> rakka_agent::AgentRu
         .expect("the run exists")
 }
 
-/// Settles one run; see [`settle_team`] for why every settle restarts.
+/// Settles one run; no passivation ritual, for the reason [`settle_team`]
+/// gives — the run's settle pass re-materializes from the durable record
+/// too.
 async fn settle_run(world: &World, scope: &AgentRunScope) {
-    let _ = rakka_agent::passivate_agent_run_entity(
-        &world.sharding,
-        world.run_registration.key(),
-        scope,
-    );
     let entity = rakka_agent::registered_agent_run_entity_ref(&world.run_registration, scope);
     let _ = entity
         .ask(

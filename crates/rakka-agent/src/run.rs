@@ -6242,6 +6242,16 @@ where
         Ok(state)
     }
 
+    /// Re-reads the durable record unconditionally, without the public
+    /// recovery counter: a sweep's re-materialization is residency hygiene,
+    /// not a recovery event, and counting every sweep would drown the
+    /// signal the recovery metric exists to surface.
+    async fn rematerialize(&mut self, now: AgentTimestampMillis) -> AgentRunResult<()> {
+        self.host.recover(now).await?;
+        self.recovered = true;
+        Ok(())
+    }
+
     /// The currently recovered state.
     pub fn state(&self) -> AgentRunResult<&AgentRunState> {
         Ok(self.host.state()?)
@@ -6642,10 +6652,11 @@ where
     /// Cranks the loop from durable state alone: advance, dispatch, drive.
     ///
     /// It is safe to call at any time and from any node, because every step reads
-    /// what it needs from the durable record. Calling it after a transition, after
-    /// recovery, or from a sweep are the same operation — which is exactly what
-    /// makes a run that was lost between persisting a wait and dispatching the
-    /// effect it waits on recoverable.
+    /// what it needs from the durable record — the pass re-materializes that
+    /// record first, so a sweep never trusts this facade's cache. Calling it
+    /// after a transition, after recovery, or from a sweep are the same
+    /// operation — which is exactly what makes a run that was lost between
+    /// persisting a wait and dispatching the effect it waits on recoverable.
     ///
     /// Each *advance* is one bounded transition and one compare-and-set, and the
     /// pass stops as soon as the loop reaches a durable wait. Both fences —
@@ -6657,7 +6668,16 @@ where
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentRunResult<AgentRunProgress> {
-        self.ensure_recovered(now).await?;
+        // Re-materialized unconditionally, not merely healed: a run has two
+        // writers by construction — the exchange couriers reach it through
+        // transports holding their *own* store handles. The command path
+        // survives a stale cache because its compare-and-set loses, drops
+        // the record, and the retry re-reads — but a sweep that decides it
+        // owes nothing from a stale cache performs zero writes, never
+        // conflicts, and so would never re-read. `apply` stays on the inner
+        // pass: its transition just committed through this facade, so its
+        // cache is the head it wrote.
+        self.rematerialize(now).await?;
         // A sweep can resolve the group too — an await that closed over
         // members which had all already settled advances here, and a member
         // send that fails definitively settles here — so a direct sweep

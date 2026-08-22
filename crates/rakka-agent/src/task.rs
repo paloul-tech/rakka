@@ -12953,15 +12953,27 @@ where
     /// Decides the assignment when the task awaits one, flushes the history the
     /// task owes, and drives the exchanges it owes.
     ///
-    /// It is safe to call at any time and from any node: every step reads what it
-    /// needs from durable state, so calling it after a transition, after recovery,
-    /// or on a timer are the same operation.
+    /// It is safe to call at any time and from any node: the pass
+    /// re-materializes the durable record first, so every step reads what it
+    /// needs from durable state — not from this facade's cache — and calling
+    /// it after a transition, after recovery, or on a timer are the same
+    /// operation.
     pub async fn settle_side_effects(
         &mut self,
         router: &AgentExchangeRouter,
         now: AgentTimestampMillis,
     ) -> AgentTaskResult<AgentTaskProgress> {
-        self.ensure_recovered(now).await?;
+        // Re-materialized unconditionally, not merely healed: a task has two
+        // writers by construction — every wire command reaches it through
+        // the A2A service's *own* store handle. The command path survives a
+        // stale cache because its compare-and-set loses, drops the record,
+        // and the retry re-reads — but a sweep that decides it owes nothing
+        // from a stale cache performs zero writes, never conflicts, and so
+        // would never re-read, leaving an owed decision stalled on an
+        // otherwise idle task until an unrelated command happened to lose a
+        // race. The durable-outbox re-drive guarantee is only as good as
+        // this read.
+        self.recover(now).await?;
         // The settle pass commits transitions of its own — an assignment
         // decision here, a settlement inside the drive — so it stands behind
         // the same headroom fence as every command and exchange: a backlog is
