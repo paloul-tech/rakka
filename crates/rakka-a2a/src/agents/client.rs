@@ -156,12 +156,11 @@ where
     }
 
     fn principal_metadata(principal: &PrincipalRef) -> Value {
-        let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
-        if let Some(display) = &principal.display_name {
-            encoded.push(':');
-            encoded.push_str(display);
-        }
-        Value::String(encoded)
+        // The shared encoder keeps colon-free principals on the compact
+        // string and spells colon-bearing ids (SPIFFE, ARN) as the object
+        // form, so the identity the authorizer binds is the one that was
+        // configured, never a truncation at the first colon.
+        crate::mapping::principal_ref_to_value(principal)
     }
 }
 
@@ -451,7 +450,13 @@ where
         Box::pin(async move {
             match self
                 .service
-                .get_task(&Self::params(), self.tenant.as_deref(), task, None)
+                .get_task(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    task,
+                    self.principal.as_ref(),
+                    None,
+                )
                 .await
             {
                 Ok(task) => client_view(&task).map(Some),
@@ -465,9 +470,19 @@ where
 
     fn cancel_task<'a>(&'a self, task: &'a str) -> AgentClientFuture<'a, AgentClientTaskView> {
         Box::pin(async move {
+            // The configured identity rides the request metadata exactly as
+            // it does on every send: the transport documents a fixed caller
+            // identity, and a cancellation authorized as no one would
+            // silently diverge from that contract.
+            let metadata = self.principal.as_ref().map(|principal| {
+                std::collections::HashMap::from([(
+                    META_PRINCIPAL_REF.to_string(),
+                    Self::principal_metadata(principal),
+                )])
+            });
             let request = CancelTaskRequest {
                 id: task.to_string(),
-                metadata: None,
+                metadata,
                 tenant: self.tenant.clone(),
             };
             let task = self
@@ -534,7 +549,13 @@ where
         Box::pin(async move {
             let events = self
                 .service
-                .replay_task_events(&Self::params(), self.tenant.as_deref(), task, after_cursor)
+                .replay_task_events(
+                    &Self::params(),
+                    self.tenant.as_deref(),
+                    task,
+                    self.principal.as_ref(),
+                    after_cursor,
+                )
                 .await
                 .map_err(client_error)?;
             Ok(events

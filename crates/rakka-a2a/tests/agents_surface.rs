@@ -496,14 +496,14 @@ async fn duplicate_sends_create_one_task_one_run_one_turn() {
     // to it monotonically.
     let task = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     assert_eq!(task.status.state, TaskState::Completed);
 
     let events = fixture
         .service
-        .replay_task_events(&params(), Some(TENANT), &task_id, None)
+        .replay_task_events(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("events should replay");
     assert!(!events.is_empty());
@@ -827,7 +827,7 @@ async fn cancellation_projects_the_authoritative_condition() {
 
     let final_view = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     let mut task = fixture.task(&task_id);
@@ -889,7 +889,7 @@ async fn a_metadata_refresh_preserves_the_created_context() {
     // refresh rather than being lost with it.
     let read = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task should read");
     assert_eq!(read.context_id, "conv-42");

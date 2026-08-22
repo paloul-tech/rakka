@@ -505,7 +505,7 @@ async fn a_handoff_transfers_the_same_task_across_the_a2a_surface() {
     // projection sync keeps it truthful after bootstrap.
     fixture
         .service
-        .get_task(&params(), Some(TENANT), TASK, None)
+        .get_task(&params(), Some(TENANT), TASK, None, None)
         .await
         .expect("the projection bootstraps");
 
@@ -553,7 +553,7 @@ async fn a_handoff_transfers_the_same_task_across_the_a2a_surface() {
     // echoes the transfer for the sender's identity check.
     let public = fixture
         .service
-        .get_task(&params(), Some(TENANT), TASK, None)
+        .get_task(&params(), Some(TENANT), TASK, None, None)
         .await
         .expect("the public task reads");
     assert_eq!(public.id, TASK);

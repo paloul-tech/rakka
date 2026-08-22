@@ -1036,7 +1036,7 @@ async fn a_terminated_conversation_echoes_on_its_governing_tasks_projection() {
     // The read path serves — and heals — the echo beside the task's status.
     let task = fixture
         .service
-        .get_task(&params(), Some(TENANT), &task_id, None)
+        .get_task(&params(), Some(TENANT), &task_id, None, None)
         .await
         .expect("the task reads");
     let collaboration = task

@@ -15,7 +15,7 @@ use rakka_a2a::agents::{
     management_request_message, A2AAgentTarget, A2AStaticAgentCatalog, AgentManagementCommand,
     AgentManagementRequest, RakkaAgentA2AError, RakkaAgentA2AService,
     AGENT_COLLABORATION_EXTENSION_URI, AGENT_COLLABORATION_SCHEMA_VERSION,
-    AGENT_MANAGEMENT_SCHEMA_VERSION, META_COLLABORATION,
+    AGENT_MANAGEMENT_SCHEMA_VERSION, META_AGENT_RESULT, META_COLLABORATION,
 };
 use rakka_a2a::auth::{
     A2AAuthorizationDecision, A2AAuthorizationRequest, A2AAuthorizer, A2AOperation,
@@ -836,6 +836,143 @@ async fn opposing_verbs_never_share_an_operation_identity() {
     assert!(
         !team.members.contains_key(&member("newcomer")),
         "the member actually left the roster"
+    );
+}
+
+/// One verb, two decisions, one reused deduplication key: the operation id
+/// binds the decision's own content, so a claim on a second task is its own
+/// durable operation even when the caller keyed it exactly like its claim on
+/// the first. Without the cluster digest in the derived id, the second claim
+/// below was answered from the first claim's memo as a success-shaped
+/// `Duplicate` — the caller believed the second task was claimed while the
+/// board never decided anything about it.
+#[tokio::test]
+async fn one_verb_with_two_payloads_never_shares_an_operation_identity() {
+    let fixture = Fixture::new();
+    fixture.board_world().await;
+
+    // A second board entry, so one member holds two distinct claim
+    // decisions. Post-before-creation is the board's supported shape; the
+    // decision under test is the board's own, not the task's arbitration.
+    let mut team = AgentTeamEntityStore::new(
+        team_scope(),
+        fixture.teams.clone(),
+        fixture.team_history.clone(),
+    );
+    let now = fixture.now();
+    team.recover(now).await.expect("the team recovers");
+    team.apply(
+        AgentTeamEntityCommand::PostTask {
+            operation_id: AgentOperationId::new(
+                AgentOperationKind::TeamOperation,
+                [TENANT, TEAM, "post-second"],
+            )
+            .expect("the operation id derives"),
+            task: AgentTaskId::new("board-ticket-2").expect("the task id is valid"),
+            posted_by: member(MEMBER_A),
+        },
+        &fixture.router,
+        fixture.now(),
+    )
+    .await
+    .expect("the second post applies");
+    drop(team);
+
+    // The first claim commits under the caller's stable key.
+    let response = fixture
+        .service
+        .send(
+            &params(),
+            &send_request(team_message("claim-by-a", claim_cluster(MEMBER_A, 0))),
+        )
+        .await
+        .expect("the first claim is served");
+    let payload = response_payload(&response);
+    assert!(
+        payload.get("Applied").is_some(),
+        "the first claim applies: {payload}"
+    );
+
+    // The second claim reuses the same deduplication key against a different
+    // task: its own decision, never the first claim's memo.
+    let second = team_message(
+        "claim-by-a",
+        json!({
+            "schema": AGENT_COLLABORATION_SCHEMA_VERSION,
+            "team": TEAM,
+            "operation": "claim",
+            "task": "board-ticket-2",
+            "member": MEMBER_A,
+            "expected-epoch": 0,
+        }),
+    );
+    let response = fixture
+        .service
+        .send(&params(), &send_request(second))
+        .await
+        .expect("the second claim is served");
+    let payload = response_payload(&response);
+    assert!(
+        payload.get("Applied").is_some(),
+        "the second claim applies rather than answering the first claim's memo: {payload}"
+    );
+    let team = fixture.team_snapshot().await;
+    let entry = team
+        .board
+        .iter()
+        .find(|entry| entry.task.as_str() == "board-ticket-2")
+        .expect("the board holds the second task");
+    assert_eq!(entry.claim_epoch, 1, "the board decided the second claim");
+}
+
+/// A management message carrying a typed-result binding is refused whole:
+/// dispatching it as a management command would execute that command while
+/// silently dropping the submission — the caller would believe its approval
+/// was recorded while the human-owned task stayed open.
+#[tokio::test]
+async fn a_management_message_cannot_carry_a_result_binding() {
+    let fixture = Fixture::new();
+    fixture.instantiate(&member(MEMBER_A)).await;
+
+    let request = AgentManagementRequest {
+        schema: AGENT_MANAGEMENT_SCHEMA_VERSION,
+        command: AgentManagementCommand::Describe {
+            agent: MEMBER_A.to_string(),
+        },
+    };
+    let mut message = management_request_message(&request);
+    message.message_id = "result-engaged".to_string();
+    message.task_id = Some("approval-1".to_string());
+    message.metadata = Some(
+        [
+            (META_DEDUPLICATION_KEY.to_string(), json!("result-engaged")),
+            (
+                META_AGENT_RESULT.to_string(),
+                json!({
+                    "definition": "approve-refund",
+                    "definition-version": 1,
+                    "result-schema": "approval",
+                    "result-schema-version": 1,
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let error = fixture
+        .service
+        .send(&params(), &send_request(message))
+        .await
+        .expect_err("the double engagement fails closed");
+    assert!(
+        matches!(
+            &error,
+            RakkaAgentA2AError::Unsupported {
+                operation: "agent-management",
+                ..
+            }
+        ),
+        "the refusal names the double engagement, got {error:?}"
     );
 }
 

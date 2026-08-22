@@ -329,7 +329,7 @@ async fn an_authenticated_submission_completes_the_human_task() {
     // Before the submission the public view waits on input.
     let waiting = fixture
         .service
-        .get_task(&params(), None, HUMAN_TASK, None)
+        .get_task(&params(), None, HUMAN_TASK, None, None)
         .await
         .expect("the view reads");
     assert_eq!(waiting.status.state, TaskState::InputRequired);
@@ -958,4 +958,119 @@ async fn the_typed_client_converges_on_retry_without_an_explicit_key() {
         .expect("the corrected submission completes");
     assert_eq!(corrected.state, AgentClientTaskState::Completed);
     assert_eq!(corrected.context, "ctx-42");
+}
+
+/// A colon-bearing principal id — a SPIFFE URI, an ARN, an OIDC subject —
+/// reaches the authorizer and the durable provenance verbatim: the encoders
+/// switch to the object spelling the decoder has always accepted, so the id
+/// no longer truncates at its first colon before authorization binds it.
+#[tokio::test]
+async fn a_colon_bearing_principal_id_reaches_authorization_unbroken() {
+    struct RequireWorkloadIdentity;
+
+    #[async_trait]
+    impl A2AAuthorizer for RequireWorkloadIdentity {
+        async fn authorize(
+            &self,
+            request: &A2AAuthorizationRequest<'_>,
+        ) -> A2AAuthorizationDecision {
+            if request.operation == A2AOperation::SubmitTaskResult {
+                let principal = request.principal.expect("the principal rides the check");
+                if principal.principal_id != "spiffe://mesh/approval-host" {
+                    return A2AAuthorizationDecision::Deny;
+                }
+            }
+            A2AAuthorizationDecision::Allow
+        }
+    }
+
+    let fixture = Fixture::with_authorizer(Arc::new(RequireWorkloadIdentity));
+    fixture.create_human_task().await;
+
+    let workload = PrincipalRef {
+        principal_type: "service".to_string(),
+        principal_id: "spiffe://mesh/approval-host".to_string(),
+        display_name: None,
+    };
+    let transport = A2AAgentClientTransport::new(fixture.service.clone())
+        .with_tenant(TENANT)
+        .with_principal(workload);
+    let client = RakkaAgentClient::new(transport);
+    let completed = client
+        .submit_task_result(AgentClientTaskResultRequest {
+            task: HUMAN_TASK.to_string(),
+            result: json!({ "answer": "approved" }),
+            definition: TASK_DEFINITION.to_string(),
+            definition_version: 1,
+            result_schema: "order-result".to_string(),
+            result_schema_version: 1,
+            deduplication_key: Some("workload-submit".to_string()),
+            ..AgentClientTaskResultRequest::default()
+        })
+        .await
+        .expect("the workload identity authorizes unbroken");
+    assert_eq!(completed.state, AgentClientTaskState::Completed);
+
+    // The durable provenance carries the full id, in the unambiguous
+    // spelling: never a join that truncated at the first colon.
+    let snapshot = fixture.snapshot().await;
+    let accepted = snapshot
+        .accepted_result
+        .as_deref()
+        .expect("the result stands");
+    let recorded = accepted.principal.as_deref().expect("provenance recorded");
+    assert!(
+        recorded.contains("spiffe://mesh/approval-host"),
+        "the durable provenance holds the whole id, got {recorded}"
+    );
+}
+
+/// The transport's configured identity rides every call — the reads and the
+/// cancellation included: an authorizer requiring an authenticated principal
+/// on `GetTask`, `SubscribeToTask`, and `CancelTask` serves the same client
+/// that creates and submits, instead of denying three calls silently
+/// authorized as no one.
+#[tokio::test]
+async fn the_typed_client_carries_its_principal_on_reads_and_cancellation() {
+    struct RequirePrincipalEverywhere;
+
+    #[async_trait]
+    impl A2AAuthorizer for RequirePrincipalEverywhere {
+        async fn authorize(
+            &self,
+            request: &A2AAuthorizationRequest<'_>,
+        ) -> A2AAuthorizationDecision {
+            if request.principal.is_none() {
+                return A2AAuthorizationDecision::Deny;
+            }
+            A2AAuthorizationDecision::Allow
+        }
+    }
+
+    let fixture = Fixture::with_authorizer(Arc::new(RequirePrincipalEverywhere));
+    fixture.create_human_task().await;
+
+    let transport = A2AAgentClientTransport::new(fixture.service.clone())
+        .with_tenant(TENANT)
+        .with_principal(principal());
+    let client = RakkaAgentClient::new(transport);
+
+    let view = client
+        .task(HUMAN_TASK)
+        .await
+        .expect("the read authorizes under the configured identity")
+        .expect("the task exists");
+    assert_eq!(view.task.as_str(), HUMAN_TASK);
+
+    let events = client
+        .task_events(HUMAN_TASK, None)
+        .await
+        .expect("the replay authorizes under the configured identity");
+    assert!(!events.is_empty(), "the healed projection has events");
+
+    let cancelled = client
+        .cancel_task(HUMAN_TASK)
+        .await
+        .expect("the cancellation authorizes under the configured identity");
+    assert_eq!(cancelled.task.as_str(), HUMAN_TASK);
 }

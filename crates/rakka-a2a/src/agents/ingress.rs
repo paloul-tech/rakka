@@ -278,13 +278,25 @@ pub fn normalize_agent_send(
             // per-member or per-task deduplication key would have its Leave
             // answered with the Join's memoized outcome, or its Release
             // absorbed by the prior Claim's, a success-shaped reply for a
-            // decision the board never made.
+            // decision the board never made. The cluster digest is the other
+            // half of that identity: the verb alone still lets one reused
+            // key alias two *different* decisions under the same verb —
+            // Claim(task A) absorbed by Claim(task B)'s memo — so the
+            // decision's own content (task, member, target, epoch, body)
+            // rides the id the way the conversation arm's coordinates and
+            // the handoff arm's forced discriminator do. A pure retry
+            // re-serializes to the same canonical digest and converges; a
+            // different decision derives a different operation, whatever
+            // deduplication key the caller reused.
+            let cluster_digest =
+                rakka_agent::AgentContentDigest::of_json(&cluster.to_value()).value;
             let operation_id = AgentOperationId::new(
                 kind,
                 [
                     tenant.as_str(),
                     team.as_str(),
                     cluster.operation.as_label(),
+                    cluster_digest.as_str(),
                     discriminator.as_str(),
                 ],
             )?;
@@ -731,7 +743,12 @@ pub fn agent_task_result_command(
         }));
     };
     let submission = rakka_agent::AgentHumanResultSubmission {
-        principal: format!("{}:{}", principal.principal_type, principal.principal_id),
+        // The durable provenance label must stay unambiguous for
+        // colon-bearing ids: the compact join makes ("user:a", "b") and
+        // ("user", "a:b") byte-identical, so those switch to the canonical
+        // JSON object while every colon-free principal keeps the exact
+        // string existing records carry.
+        principal: crate::mapping::principal_provenance_label(principal),
         definition_id: rakka_agent::AgentTaskDefinitionId::new(&binding.definition)?,
         definition_version: rakka_agent::AgentRevisionNumber::new(binding.definition_version),
         result_schema: rakka_agent::AgentSchemaRef::new(

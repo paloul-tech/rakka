@@ -157,12 +157,14 @@ where
             AgentCollaborationMetadata::from_record(record).to_value(),
         );
         if let Some(principal) = self.principal.as_ref() {
-            let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
-            if let Some(display) = &principal.display_name {
-                encoded.push(':');
-                encoded.push_str(display);
-            }
-            metadata.insert(META_PRINCIPAL_REF.to_string(), Value::String(encoded));
+            // The shared encoder keeps colon-free principals on the compact
+            // string and spells colon-bearing ids (SPIFFE, ARN) as the
+            // object form, so the identity the authorizer binds is the one
+            // that was configured, never a truncation at the first colon.
+            metadata.insert(
+                META_PRINCIPAL_REF.to_string(),
+                crate::mapping::principal_ref_to_value(principal),
+            );
         }
         // Egress injection (specification 17.5): the record's committed
         // context rides the standard W3C keys; invalid context injects
@@ -225,9 +227,9 @@ fn echoes_delegation(task: &Task, delegation: &AgentDelegationRecord) -> bool {
 /// attempt errors under the effect's idempotent attempt bound, which the
 /// derived deduplication key makes safe. `task-already-created` never reaches
 /// this map from the send path: the executor disambiguates it against the
-/// held task's collaboration echo first, because the child's deduplication
-/// window is bounded and an aged-out replay of this delegation's own send
-/// earns the same refusal a genuine conflict does.
+/// held task's durable delegation provenance first, because the child's
+/// deduplication window is bounded and an aged-out replay of this
+/// delegation's own send earns the same refusal a genuine conflict does.
 fn finding_for_error(error: RakkaAgentA2AError) -> Result<AgentA2aSendFinding, AgentDispatchError> {
     match error {
         RakkaAgentA2AError::Unsupported {
@@ -322,36 +324,69 @@ where
                     // refusal has two honest readings: a genuine conflict, or
                     // a replay of this delegation's own send whose create
                     // operation aged out of the child's operation log. The
-                    // held task's collaboration echo — recorded at its
-                    // durable creation — decides which: an echoing child is
-                    // this delegation's, converged exactly as an in-window
-                    // replay would have been, and only a child this identity
-                    // does not own is reported as the conflict of
-                    // specification 6.6.
-                    let held = match self
+                    // held task's durable delegation provenance — recorded at
+                    // its creation — decides which: a child naming this
+                    // delegation is its own, converged exactly as an
+                    // in-window replay would have been, and only a child this
+                    // identity does not own is reported as the conflict of
+                    // specification 6.6. The probe reads the durable snapshot
+                    // directly — never `tasks/get`, whose deployment
+                    // authorization gates external callers while this probe
+                    // is the deployment's own recovery step: an authorizer
+                    // that denies the principal-less read must not convert an
+                    // aged-out replay into a definitive refusal that strands
+                    // the durably created child. A probe that cannot answer
+                    // stays a retryable attempt for the same reason.
+                    return match self
                         .service
-                        .get_task(
-                            &ServiceParams::new(),
-                            Some(scope.tenant().as_str()),
-                            scope.task().as_str(),
-                            None,
-                        )
+                        .authoritative_task_view(scope.tenant().as_str(), scope.task().as_str())
                         .await
                     {
-                        Ok(held) => held,
-                        Err(error) => return finding_for_error(error),
-                    };
-                    if !echoes_delegation(&held, delegation) {
-                        return Ok(AgentA2aSendFinding::Conflict {
-                            code: "delegation-child-conflict".to_string(),
+                        Ok(Some((snapshot, run))) => {
+                            let owned = snapshot.delegation.as_deref().is_some_and(|provenance| {
+                                provenance.delegation == delegation.delegation
+                            });
+                            if !owned {
+                                return Ok(AgentA2aSendFinding::Conflict {
+                                    code: "delegation-child-conflict".to_string(),
+                                    message: format!(
+                                        "the peer holds already-created task {}, which this \
+                                         delegation's identity does not own",
+                                        snapshot.scope.task()
+                                    ),
+                                });
+                            }
+                            let child_task = snapshot.scope.task().clone();
+                            let peer_status =
+                                peer_status_label(&super::projection::agent_task_state(
+                                    super::projection::AgentTaskCondition {
+                                        task: snapshot.status,
+                                        run,
+                                    },
+                                ));
+                            Ok(AgentA2aSendFinding::Sent {
+                                child_task,
+                                child_run: None,
+                                peer_status: peer_status.to_string(),
+                            })
+                        }
+                        // The entity said the child exists, but its durable
+                        // record cannot be read yet: contradiction, not
+                        // proof — the attempt stays retryable rather than
+                        // resuming the parent beside a child it may own.
+                        Ok(None) => Err(AgentDispatchError::Invocation {
+                            code: "delegation-child-unreadable",
                             message: format!(
-                                "the peer holds already-created task {}, which this delegation's \
-                                 identity does not own",
-                                held.id
+                                "the peer reported task {} already created, but its durable \
+                                 state is not readable yet; the deduplicated send re-drives",
+                                scope.task()
                             ),
-                        });
-                    }
-                    held
+                        }),
+                        Err(error) => Err(AgentDispatchError::Invocation {
+                            code: error.code(),
+                            message: error.to_string(),
+                        }),
+                    };
                 }
                 Err(error) => return finding_for_error(error),
             };

@@ -599,6 +599,21 @@ where
                          collaboration cluster would be silently dropped",
             });
         }
+        // The typed-result binding is the other engagement that can ride a
+        // send's metadata, and it conflicts for the same reason: this path
+        // reads only principal/deduplication/audit keys, so a management
+        // message carrying `io.rakka.agent.result` would execute the
+        // management command while the submission — and the human-owned task
+        // waiting on it — was silently dropped behind a success-shaped
+        // management reply. The non-management path refuses the same mixing
+        // as `result-binding-conflicts-with-collaboration`.
+        if metadata.contains_key(super::ingress::META_AGENT_RESULT) {
+            return Err(RakkaAgentA2AError::Unsupported {
+                operation: "agent-management",
+                reason: "a management message cannot carry a typed-result binding; the \
+                         submission would be silently dropped",
+            });
+        }
         let (tenant, _source) = canonical_tenant(
             self.tenant_resolver.as_ref(),
             self.default_tenant.as_deref(),
@@ -929,6 +944,11 @@ where
     /// Serves one `tasks/get` from the authoritative durable snapshot,
     /// healing the public projection when it lags.
     ///
+    /// `principal` is the authenticated caller the deployment authorizer
+    /// binds — the same explicit parameter
+    /// [`Self::replay_coordination_events`] carries, because the wire
+    /// `tasks/get` shape has no metadata channel for one.
+    ///
     /// # Errors
     ///
     /// Fails closed on an unresolved tenant, authorization denial, or an
@@ -938,10 +958,11 @@ where
         params: &ServiceParams,
         request_tenant: Option<&str>,
         task_id: &str,
+        principal: Option<&PrincipalRef>,
         history_length: Option<i32>,
     ) -> RakkaAgentA2AResult<Task> {
         let now = self.clock.now();
-        let normalized = normalize_agent_cancel(
+        let mut normalized = normalize_agent_cancel(
             self.tenant_resolver.as_ref(),
             self.default_tenant.as_deref(),
             params,
@@ -949,6 +970,9 @@ where
             task_id,
             &HashMap::new(),
         )?;
+        // The read normalizes over empty metadata, so the explicit caller
+        // identity is the only principal this authorization can see.
+        normalized.principal = principal.cloned();
         self.authorize(A2AOperation::GetTask, &normalized).await?;
         let snapshot = self.task_snapshot(&normalized, now).await?.ok_or_else(|| {
             RakkaAgentA2AError::TaskNotFound {
@@ -1028,9 +1052,10 @@ where
         params: &ServiceParams,
         request_tenant: Option<&str>,
         task_id: &str,
+        principal: Option<&PrincipalRef>,
         after_cursor: Option<&str>,
     ) -> RakkaAgentA2AResult<Vec<crate::task::A2ATaskEvent>> {
-        let normalized = normalize_agent_cancel(
+        let mut normalized = normalize_agent_cancel(
             self.tenant_resolver.as_ref(),
             self.default_tenant.as_deref(),
             params,
@@ -1038,6 +1063,11 @@ where
             task_id,
             &HashMap::new(),
         )?;
+        // The read normalizes over empty metadata, so the explicit caller
+        // identity is the only principal this authorization can see — the
+        // posture `replay_coordination_events` set for principal-bearing
+        // reads.
+        normalized.principal = principal.cloned();
         self.authorize(A2AOperation::SubscribeToTask, &normalized)
             .await?;
         self.projections

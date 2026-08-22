@@ -978,6 +978,64 @@ fn telemetry_context(
         })
 }
 
+/// Encodes a principal ref for the `io.rakka.principal.ref` metadata key.
+///
+/// The compact `type:id[:display]` string is kept byte-identical for every
+/// principal whose components are colon-free — the shape existing clients
+/// parse — but it cannot spell a colon-bearing component: `splitn` decoding
+/// makes `("user:a", "b")` and `("user", "a:b")` the same bytes, so a SPIFFE
+/// URI, ARN, or OIDC subject would silently truncate at the first colon
+/// before authorization ever saw it. Those principals ride the object form
+/// instead, which [`principal_ref_from_value`] has always accepted and which
+/// round-trips every component verbatim.
+pub(crate) fn principal_ref_to_value(principal: &PrincipalRef) -> Value {
+    let colon_free = !principal.principal_type.contains(':')
+        && !principal.principal_id.contains(':')
+        && !principal
+            .display_name
+            .as_deref()
+            .is_some_and(|display| display.contains(':'));
+    if colon_free {
+        let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
+        if let Some(display) = &principal.display_name {
+            encoded.push(':');
+            encoded.push_str(display);
+        }
+        return Value::String(encoded);
+    }
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "type".to_string(),
+        Value::String(principal.principal_type.clone()),
+    );
+    map.insert(
+        "id".to_string(),
+        Value::String(principal.principal_id.clone()),
+    );
+    if let Some(display) = &principal.display_name {
+        map.insert("displayName".to_string(), Value::String(display.clone()));
+    }
+    Value::Object(map)
+}
+
+/// Encodes a principal for a durable provenance string field.
+///
+/// Colon-free components keep the compact `type:id` join every existing
+/// record carries; a colon-bearing component switches to the canonical JSON
+/// object (which no legacy join can collide with — a join never starts with
+/// `{`), so `("user:a", "b")` and `("user", "a:b")` stay distinguishable in
+/// the durable record instead of collapsing to the same bytes.
+pub(crate) fn principal_provenance_label(principal: &PrincipalRef) -> String {
+    if !principal.principal_type.contains(':') && !principal.principal_id.contains(':') {
+        return format!("{}:{}", principal.principal_type, principal.principal_id);
+    }
+    serde_json::json!({
+        "type": principal.principal_type,
+        "id": principal.principal_id,
+    })
+    .to_string()
+}
+
 pub(crate) fn principal_ref_from_value(value: &Value) -> A2AMappingResult<PrincipalRef> {
     match value {
         Value::String(value) => {
@@ -1210,6 +1268,55 @@ mod tests {
             policy,
             AgentTimestampMillis::new(10),
         )
+    }
+
+    #[test]
+    fn principal_refs_round_trip_colon_bearing_ids_unbroken() {
+        // Colon-free principals keep the compact string byte-identical to
+        // what existing clients parse.
+        let plain = PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+        };
+        let encoded = principal_ref_to_value(&plain);
+        assert_eq!(encoded, Value::String("user:alice:Alice".to_string()));
+        let decoded = principal_ref_from_value(&encoded).expect("the compact form decodes");
+        assert_eq!(decoded, plain);
+
+        // A colon-bearing id rides the object form and round-trips verbatim
+        // instead of truncating at its first colon under `splitn` decoding.
+        let workload = PrincipalRef {
+            principal_type: "service".to_string(),
+            principal_id: "spiffe://mesh/agent-host".to_string(),
+            display_name: None,
+        };
+        let encoded = principal_ref_to_value(&workload);
+        assert!(
+            matches!(&encoded, Value::Object(_)),
+            "a colon-bearing id must not use the ambiguous join, got {encoded}"
+        );
+        let decoded = principal_ref_from_value(&encoded).expect("the object form decodes");
+        assert_eq!(decoded, workload);
+
+        // The durable provenance label stays the compact join for colon-free
+        // principals and switches to the canonical object otherwise, so
+        // ("user:a", "b") and ("user", "a:b") never collapse to one string.
+        assert_eq!(principal_provenance_label(&plain), "user:alice");
+        let ambiguous_left = PrincipalRef {
+            principal_type: "user:a".to_string(),
+            principal_id: "b".to_string(),
+            display_name: None,
+        };
+        let ambiguous_right = PrincipalRef {
+            principal_type: "user".to_string(),
+            principal_id: "a:b".to_string(),
+            display_name: None,
+        };
+        assert_ne!(
+            principal_provenance_label(&ambiguous_left),
+            principal_provenance_label(&ambiguous_right),
+        );
     }
 
     #[test]

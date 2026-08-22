@@ -166,12 +166,14 @@ where
             AgentHandoffCollaborationMetadata::from_record(record).to_value(),
         );
         if let Some(principal) = self.principal.as_ref() {
-            let mut encoded = format!("{}:{}", principal.principal_type, principal.principal_id);
-            if let Some(display) = &principal.display_name {
-                encoded.push(':');
-                encoded.push_str(display);
-            }
-            metadata.insert(META_PRINCIPAL_REF.to_string(), Value::String(encoded));
+            // The shared encoder keeps colon-free principals on the compact
+            // string and spells colon-bearing ids (SPIFFE, ARN) as the
+            // object form, so the identity the authorizer binds is the one
+            // that was configured, never a truncation at the first colon.
+            metadata.insert(
+                META_PRINCIPAL_REF.to_string(),
+                crate::mapping::principal_ref_to_value(principal),
+            );
         }
         // Egress injection (specification 17.5): the record's committed
         // context rides the standard W3C keys; invalid context injects
